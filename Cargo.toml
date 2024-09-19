@@ -1,0 +1,10 @@
+[package]
+name = "zion"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[[bin]]
+name = "zion_cli"
+path = "example/zion_cli.rs"
