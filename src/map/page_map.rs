@@ -1,11 +1,17 @@
 use std::alloc;
 use std::cmp::min;
+use std::fs::File;
 use std::mem::MaybeUninit;
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::utils::data::PageTable;
+use crate::utils::{decode_u64, NAN_PID, ROOT_PID};
+use crate::{OpCode, Options};
 
 const SLOT_SIZE: u64 = 1u64 << 16;
-const INIT_ID: u64 = 0;
 
 /// NOTE: zero addr indicate empty
 pub struct PageMap {
@@ -19,11 +25,18 @@ pub struct PageMap {
 // object on stack, and then copy to heap, for large object, it may cause stack overflow
 // https://github.com/rust-lang/rust/issues/53827
 /// NOTE: require `T` is zeroable
+#[cfg(debug_assertions)]
 fn box_new<T>() -> Box<T> {
     unsafe {
-        let ptr = alloc::alloc(alloc::Layout::new::<T>()) as *mut T;
+        let ptr = alloc::alloc_zeroed(alloc::Layout::new::<T>()) as *mut T;
+
         Box::from_raw(ptr)
     }
+}
+
+#[cfg(not(debug_assertions))]
+fn box_new<T: Default>() -> Box<T> {
+    Box::new(T::default())
 }
 
 impl Default for PageMap {
@@ -32,37 +45,36 @@ impl Default for PageMap {
             l1: box_new(),
             l2: box_new(),
             l3: box_new(),
-            next: AtomicU64::new(INIT_ID),
+            next: AtomicU64::new(ROOT_PID),
         }
     }
 }
 
 impl PageMap {
-    /// return page id on success
-    pub fn map(&mut self, addr: u64) -> Option<u64> {
-        let mut pid = self.next.load(Ordering::Acquire);
+    pub fn map(&self, addr: u64) -> Option<u64> {
+        let mut pid = self.next.load(Ordering::Relaxed);
         let mut cnt = 0;
 
         while cnt < MAX_ID {
             match self.index(pid).compare_exchange(
-                INIT_ID,
+                NAN_PID,
                 addr,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(x) => {
-                    assert_eq!(x, INIT_ID);
-                    self.next.fetch_add(1, Ordering::Release);
+                    assert_eq!(x, NAN_PID);
+                    self.next.fetch_add(1, Ordering::AcqRel);
                     break;
                 }
-                Err(cur) => {
+                Err(_) => {
                     // here the `next` may not equal to `pid`
-                    let new = if pid + 1 == MAX_ID { INIT_ID } else { pid + 1 };
+                    let new = if pid + 1 == MAX_ID { ROOT_PID } else { pid + 1 };
                     match self
                         .next
                         .compare_exchange(pid, new, Ordering::AcqRel, Ordering::Acquire)
                     {
-                        Ok(x) => pid = new,
+                        Ok(_) => pid = new,
                         Err(x) => pid = x,
                     }
                 }
@@ -77,8 +89,12 @@ impl PageMap {
         }
     }
 
-    pub fn unmap(&mut self, mut pid: u64) {
-        self.index(pid).store(INIT_ID, Ordering::Release);
+    pub fn unmap(&self, mut pid: u64, addr: u64) {
+        let ok = self
+            .index(pid)
+            .compare_exchange(addr, NAN_PID, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        assert!(ok);
         loop {
             let curr = self.next.load(Ordering::Relaxed);
             let smaller = min(pid, curr);
@@ -93,10 +109,10 @@ impl PageMap {
     }
 
     pub fn get(&self, pid: u64) -> u64 {
-        self.index(pid).load(Ordering::Acquire)
+        self.index(pid).load(Ordering::Relaxed)
     }
 
-    fn index(&self, pid: u64) -> &AtomicU64 {
+    pub fn index(&self, pid: u64) -> &AtomicU64 {
         if pid < L3_FANOUT {
             self.l3.index(pid)
         } else if pid < L2_FANOUT {
@@ -108,6 +124,12 @@ impl PageMap {
         } else {
             unreachable!()
         }
+    }
+
+    /// return `old` on success, `current value` on error
+    pub fn cas(&self, pid: u64, old: u64, new: u64) -> Result<u64, u64> {
+        self.index(pid)
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
     }
 }
 
@@ -186,13 +208,56 @@ const MAX_ID: u64 = L1_FANOUT - 1;
 build_layer!(Layer2, Layer3, L2_FANOUT);
 build_layer!(Layer1, Layer2, L1_FANOUT);
 
+impl PageMap {
+    fn load_map(this: &Self, name: &PathBuf) -> Result<(), OpCode> {
+        let mut f = File::options()
+            .read(true)
+            .open(name)
+            .map_err(|_| OpCode::IoError)?;
+
+        PageTable::deserialize(&mut f, |e| {
+            let (pid, addr) = (e.page_id(), e.page_addr());
+            let (id, off) = decode_u64(addr);
+            // NOTE: it's correct iff when file_id is not wrapping
+            if this.get(pid) < addr {
+                log::debug!("pid {} addr {} file_id {} off {}", pid, addr, id, off);
+                this.index(pid).store(addr, Ordering::Relaxed);
+            }
+        });
+        Ok(())
+    }
+
+    pub fn rebuild(this: &Self, opt: &Arc<Options>) -> Result<(), OpCode> {
+        let dir = std::fs::read_dir(&opt.db_path).map_err(|_| OpCode::IoError)?;
+        for i in dir {
+            let filename = i.map_err(|_| OpCode::IoError)?.file_name();
+            let name = filename.to_str().ok_or(OpCode::Unknown)?;
+            if name.starts_with(Options::MAP_PREFIX) {
+                let path = Path::new(&opt.db_path).join(name);
+                Self::load_map(this, &path)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn new(opt: Arc<Options>) -> Result<Self, OpCode> {
+        let this = Self::default();
+        Self::rebuild(&this, &opt)?;
+        Ok(this)
+    }
+}
+
 #[cfg(test)]
-mod tests {
-    use crate::map::page_map::{Layer1, PageMap, INIT_ID, L1_FANOUT, L2_FANOUT, L3_FANOUT};
+mod test {
+    use crate::map::page_map::{PageMap, L1_FANOUT, L2_FANOUT, L3_FANOUT, NAN_PID};
+
+    fn addr(a: u64) -> u64 {
+        a * 2
+    }
 
     #[test]
     fn test_page_map() {
-        let mut table = PageMap::default();
+        let table = PageMap::default();
         let pids = vec![
             0,
             1,
@@ -206,18 +271,17 @@ mod tests {
             L1_FANOUT,
             L1_FANOUT + 1,
         ];
-
         let mut mapped_pid = vec![];
 
         for i in &pids {
-            let pid = table.map(*i * 2).unwrap();
+            let pid = table.map(addr(*i)).unwrap();
             mapped_pid.push(pid);
-            assert_eq!(table.get(pid), *i * 2);
+            assert_eq!(table.get(pid), addr(*i));
         }
 
-        for i in &mapped_pid {
-            table.unmap(*i);
-            assert_eq!(table.get(*i), INIT_ID);
+        for (idx, pid) in mapped_pid.iter().enumerate() {
+            table.unmap(*pid, addr(pids[idx]));
+            assert_eq!(table.get(*pid), NAN_PID);
         }
 
         assert_eq!(pids.len(), mapped_pid.len());

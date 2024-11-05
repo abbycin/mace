@@ -1,46 +1,117 @@
-use std::path::Path;
+use std::sync::Arc;
+
+pub(crate) use store::store::Store;
+use tree::{data::Value, tree::Tree};
+pub use utils::{options::Options, OpCode};
 
 mod cc;
-mod log;
 mod map;
 mod store;
+mod tree;
 mod utils;
+pub use tree::Val;
 
-pub(crate) use map::{buffer_map::BufferMap, page_map::PageMap};
-pub(crate) use utils::{options::Options, OpCode};
-
-const ROOT_PID: u64 = 0;
-
-pub struct Store {
-    tab: PageMap,
-    buffer: BufferMap,
+pub struct Mace {
+    store: Arc<Store>,
+    tree: Tree,
 }
 
-impl Store {
-    fn new(opt: Options) -> Self {
+impl Mace {
+    pub fn new(opt: Options) -> Result<Self, OpCode> {
+        let store = Arc::new(Store::new(opt)?);
+        let this = Self {
+            store: store.clone(),
+            tree: Tree::new(store)?,
+        };
+
+        Ok(this)
+    }
+
+    pub fn put<'b, K, V>(&self, key: K, val: V) -> Result<(), OpCode>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let gsn = 0;
+        self.tree.put(gsn, key.as_ref(), Value::Put(val.as_ref()))
+    }
+
+    pub fn del(&self, key: impl AsRef<[u8]>) -> Result<Vec<u8>, OpCode> {
+        let gsn = 0;
+        self.tree.del(gsn, key.as_ref()).map(|x| x.to_vec())
+    }
+
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Val, OpCode> {
+        let gsn = 0;
+        self.tree.get(gsn, key.as_ref())
+    }
+
+    #[allow(dead_code)]
+    fn scan(&self, _from: &[u8], _to: &[u8]) {
         todo!()
     }
 
-    fn put(&mut self, key: &[u8], val: &[u8]) -> OpCode {
-        // Physical Page ID
-        let ppid = self.tab.get(ROOT_PID);
-        // NOTE: we use SWIP introduced by LeanStore, it's unnecessary to lookup in a buffer manager
-        todo!()
+    pub fn options(&self) -> Arc<Options> {
+        self.store.opt.clone()
     }
+}
 
-    fn del(&mut self, key: &[u8]) -> OpCode {
-        todo!()
-    }
+#[cfg(test)]
+mod test {
+    use crate::{Mace, OpCode, Options};
 
-    fn get(&self, key: &[u8]) -> &[u8] {
-        todo!()
-    }
+    #[test]
+    fn test_lib() -> Result<(), OpCode> {
+        let opt = Options::default();
+        let _ = std::fs::remove_dir_all(&opt.db_path);
+        let m = Mace::new(opt)?;
+        let cnt = 10;
+        let mut pairs = Vec::new();
 
-    fn replace(&mut self, key: &[u8], val: &[u8]) -> OpCode {
-        todo!()
-    }
+        for i in 0..cnt {
+            pairs.push((format!("key{}", i), format!("val{}", i)));
+        }
 
-    fn scan(&self, key_start: &[u8], key_end: &[u8]) {
-        todo!()
+        for i in 0..cnt {
+            m.put(&pairs[i].0, &pairs[i].1)?;
+        }
+
+        for i in 0..cnt {
+            let v = m.get(&pairs[i].0).expect("can't find key");
+            assert_eq!(v.to_vec().as_slice(), pairs[i].1.as_bytes());
+        }
+
+        for i in 0..cnt {
+            if i % 2 == 0 {
+                assert!(m.del(&pairs[i].0).is_ok());
+            }
+        }
+
+        for i in 0..cnt {
+            let v = m.get(&pairs[i].0);
+
+            if i % 2 == 0 {
+                assert!(v.is_err());
+            } else {
+                assert_eq!(v.unwrap().to_vec().as_slice(), pairs[i].1.as_bytes());
+            }
+        }
+        drop(m);
+
+        let m = Mace::new(Options::default())?;
+
+        for i in 0..cnt {
+            let v = m.get(&pairs[i].0);
+
+            if i % 2 == 0 {
+                assert!(v.is_err());
+            } else {
+                assert_eq!(v.unwrap().to_vec().as_slice(), pairs[i].1.as_bytes());
+            }
+        }
+
+        assert!(m.del("foo").is_err());
+
+        Ok(())
     }
 }

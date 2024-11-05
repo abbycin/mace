@@ -1,0 +1,9 @@
+[package]
+name = "logger"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2.161"
+chrono = "0.4.38"
+log = "0.4.22"

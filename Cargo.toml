@@ -1,10 +1,19 @@
 [package]
-name = "zion"
+name = "mace"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+crc32c = "0.6.8"
+dashmap = "6.1.0"
+rand = "0.8.5"
+log = "0.4.22"
 
-[[bin]]
-name = "zion_cli"
-path = "example/zion_cli.rs"
+[dev-dependencies]
+logger = { path = "./deps/logger" }
+
+[[example]]
+name = "basic"
+
+[[test]]
+name = "tree"

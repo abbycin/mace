@@ -1,4 +1,8 @@
 /target
+*.bak
+*.~
+*.swp
 .idea
 .vscode
 .cache
+DESIGN.*

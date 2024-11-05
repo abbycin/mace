@@ -5,6 +5,7 @@ struct Tuple {
     command_id: u32,
 }
 
+#[repr(C)]
 struct ChainedTuple {
     tuple: Tuple,
     oldest_tx: u32,
