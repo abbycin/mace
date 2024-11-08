@@ -907,7 +907,7 @@ mod test {
 
         let b1 = ByteArray::alloc(delta1.size());
         let b2 = ByteArray::alloc(delta2.size());
-        let b3 = ByteArray::alloc(delta2.size());
+        let b3 = ByteArray::alloc(delta3.size());
 
         let pg1 = Page::<&[u8], Index>::from(b1);
         let pg2 = Page::<&[u8], Index>::from(b2);
@@ -942,5 +942,10 @@ mod test {
         ];
 
         must_match(expact.into_iter(), pg);
+
+        ByteArray::free(b1);
+        ByteArray::free(b2);
+        ByteArray::free(b3);
+        ByteArray::free(b);
     }
 }
