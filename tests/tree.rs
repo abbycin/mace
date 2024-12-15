@@ -1,12 +1,12 @@
-use mace::{Mace, OpCode, Options};
+use mace::{Mace, OpCode, Options, RandomPath};
 use rand::{self, seq::SliceRandom};
 
 #[test]
 fn test_tree() -> Result<(), OpCode> {
-    let mut opt = Options::default();
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
     opt.page_size_threshold = 1024;
-    opt.db_path = "/tmp/tree".into();
-    let _ = std::fs::remove_dir_all(&opt.db_path);
+    let _ = std::fs::remove_dir_all(&opt.db_root);
 
     let m = Mace::new(opt)?;
     let mut pairs = Vec::new();
@@ -25,7 +25,7 @@ fn test_tree() -> Result<(), OpCode> {
 
     for (k, x) in &pairs {
         let v = m.get(k).expect("failed to get value");
-        assert_eq!(v.to_vec().as_slice(), x.as_bytes());
+        assert_eq!(v.put(), &x.as_bytes());
     }
 
     Ok(())

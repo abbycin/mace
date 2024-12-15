@@ -1,5 +1,3 @@
-use std::fmt::Debug;
-
 use crate::utils::byte_array::ByteArray;
 
 pub trait IPageIter: Iterator {
@@ -9,7 +7,7 @@ pub trait IPageIter: Iterator {
 pub trait IKey: ICodec + Clone + Copy + Ord {
     fn raw(&self) -> &[u8];
 
-    fn separator(&self) -> Self;
+    fn to_string(&self) -> String;
 }
 
 pub trait ICodec {
@@ -20,6 +18,18 @@ pub trait ICodec {
     fn decode_from(raw: ByteArray) -> Self;
 }
 
-pub trait IVal: ICodec + Clone + Copy + Ord + Debug {
+pub trait IVal: ICodec + Copy + Clone {
     fn to_string(&self) -> String;
+}
+
+pub trait IValCodec: Copy {
+    fn size(&self) -> usize;
+
+    fn encode(&self, to: &mut [u8]);
+
+    fn decode(from: &[u8]) -> Self;
+
+    fn to_string(&self) -> String;
+
+    fn data(&self) -> &[u8];
 }

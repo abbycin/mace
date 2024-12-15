@@ -1,5 +1,5 @@
 use std::alloc::{alloc, dealloc, Layout};
-use std::{ops::Range, ptr};
+use std::ptr;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -24,17 +24,6 @@ impl ByteArray {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn zero(&self, range: Range<usize>) {
-        unsafe {
-            std::ptr::write_bytes(self.data.offset(range.start as isize), 0, range.count());
-        }
-    }
-
-    pub fn offset(&self, off: isize) -> *mut u8 {
-        unsafe { self.data.offset(off) }
-    }
-
     pub fn len(&self) -> usize {
         self.size
     }
@@ -55,19 +44,23 @@ impl ByteArray {
     }
 
     pub fn add(&self, n: usize) -> Self {
+        debug_assert!(n <= self.size);
         ByteArray::new(unsafe { self.data.add(n) }, self.size - n)
     }
 
-    pub fn sub_array(&self, range: Range<usize>) -> Self {
-        unsafe { Self::new(self.data.offset(range.start as isize), range.len()) }
+    pub fn sub_array(&self, off: usize, len: usize) -> Self {
+        debug_assert!(off + len <= self.size);
+        unsafe { Self::new(self.data.add(off), len) }
     }
 
-    pub fn to_slice<'a, T>(&self, off: isize, cnt: usize) -> &'a [T] {
-        unsafe { std::slice::from_raw_parts(self.data.offset(off) as *const T, cnt) }
+    pub fn as_slice<'a, T>(&self, off: usize, cnt: usize) -> &'a [T] {
+        debug_assert!(off + cnt <= self.size);
+        unsafe { std::slice::from_raw_parts(self.data.add(off) as *const T, cnt) }
     }
 
-    pub fn to_mut_slice<'a, T>(&self, off: isize, cnt: usize) -> &'a mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.data.offset(off) as *mut T, cnt) }
+    pub fn as_mut_slice<'a, T>(&self, off: usize, cnt: usize) -> &'a mut [T] {
+        debug_assert!(off + cnt <= self.size);
+        unsafe { std::slice::from_raw_parts_mut(self.data.add(off) as *mut T, cnt) }
     }
 }
 

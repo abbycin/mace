@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use super::data::FlushData;
+use super::data::{FlushData, FrameFlag};
 
 /// ```text
 ///  +-----------------+
@@ -44,6 +44,7 @@ impl PageFileBuilder {
         let file = File::options()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(path)
             .expect("can't create page file");
 
@@ -56,8 +57,11 @@ impl PageFileBuilder {
 
     /// deleted addresses were handled by mapping file, the tombstone is already reclaimed (as is)
     fn add(&mut self, frame: FrameOwner) {
-        if frame.is_normal() {
-            self.normal.push(frame);
+        match frame.flag() {
+            FrameFlag::Normal | FrameFlag::Slotted => {
+                self.normal.push(frame);
+            }
+            _ => {}
         }
     }
 
@@ -97,6 +101,7 @@ impl MapFileBuilder {
         let file = File::options()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(path)
             .expect("can't create map file");
 
@@ -113,21 +118,31 @@ impl MapFileBuilder {
     }
 
     fn add(&mut self, frame: FrameOwner) {
-        if frame.is_delete() {
-            let mut d = frame.raw_mut().load_data().expect("invalid frame");
-            for i in d.deleted_entries() {
-                self.nr_delete += 1;
-                self.delete_delta.extend_from_slice(&i.to_le_bytes());
+        match frame.flag() {
+            FrameFlag::Deleted => {
+                let d = frame.raw_mut().load_data().expect("invalid frame");
+                for i in d {
+                    self.nr_delete += 1;
+                    self.delete_delta.extend_from_slice(&i.to_le_bytes());
+                }
             }
-        } else if frame.is_normal() {
-            self.nr_active += 1;
-            let (pid, addr, sz) = (frame.page_id(), frame.addr(), frame.size());
-            // NOTE: keep original pid -> addr mapping
-            self.table.add(pid, addr);
-            let map = AddrMap::new(decode_u64(addr).1, self.off, frame.payload_size());
-            self.off += sz;
-            self.active_delta.extend_from_slice(&map.as_slice());
-        } // else ignore tombstone
+            FrameFlag::Normal => {
+                self.nr_active += 1;
+                let (pid, addr, sz) = (frame.page_id(), frame.addr(), frame.size());
+                // NOTE: keep original pid -> addr mapping
+                self.table.add(pid, addr);
+                let map = AddrMap::new(decode_u64(addr).1, self.off, frame.payload_size());
+                self.off += sz;
+                self.active_delta.extend_from_slice(map.as_slice());
+            }
+            FrameFlag::Slotted => {
+                self.off += frame.size();
+            }
+            FrameFlag::Unknown => {
+                unreachable!("invalid frame {:?}", decode_u64(frame.addr()))
+            }
+            _ => {} // ignore tombstone
+        }
     }
 
     /// ```text
@@ -188,6 +203,7 @@ fn flush_data(src: &FlushData, opt: &Arc<Options>) {
         map_file.add(frame.shallow_copy());
     }
 
+    log::debug!("flush data {}", src.id());
     page_file.build();
     map_file.build();
 
@@ -195,27 +211,30 @@ fn flush_data(src: &FlushData, opt: &Arc<Options>) {
 }
 
 fn flush_thread(rx: Receiver<FlushData>, opt: Arc<Options>, sync: Arc<Notifier>) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut q = VecDeque::new();
-        'outer: while !sync.is_quit() {
-            loop {
-                match rx.recv_timeout(Duration::from_millis(1)) {
-                    Ok(x) => q.push_back(x),
-                    Err(RecvTimeoutError::Disconnected) => break 'outer,
-                    _ => break,
+    std::thread::Builder::new()
+        .name("flush".into())
+        .spawn(move || {
+            log::debug!("start flush thread");
+            let mut q = VecDeque::new();
+            'outer: while !sync.is_quit() {
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(1)) {
+                        Ok(x) => q.push_back(x),
+                        Err(RecvTimeoutError::Disconnected) => break 'outer,
+                        _ => break,
+                    }
+                }
+
+                while let Some(data) = q.pop_front() {
+                    // NOTE: the data is a frame array
+                    flush_data(&data, &opt);
                 }
             }
-
-            // log::debug!("flush data... is quit {}", sync.is_quit());
-            while let Some(data) = q.pop_front() {
-                // NOTE: the data is a frame array
-                log::debug!("flush {} rest {}", data.id(), q.len());
-                flush_data(&data, &opt);
-            }
-        }
-        drop(rx);
-        sync.notify_done();
-    })
+            drop(rx);
+            sync.notify_done();
+            log::debug!("stop flush thread");
+        })
+        .expect("can't build flush thread")
 }
 
 struct Notifier {
@@ -238,9 +257,7 @@ impl Notifier {
     }
 
     fn wait_done(&self) {
-        let _guard = self
-            .cond
-            .wait_while(self.done.lock().unwrap(), |x| *x != true);
+        let _guard = self.cond.wait_while(self.done.lock().unwrap(), |x| !(*x));
     }
 
     fn notify_quit(&self) {

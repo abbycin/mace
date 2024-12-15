@@ -9,6 +9,7 @@ thread_local! {
     static G_TID: Cell<i32> = Cell::new(0);
 }
 static mut G_LOGGER: Logger = Logger { sink: Vec::new() };
+static G_INIIED: Mutex<bool> = Mutex::new(false);
 
 const G_CONSOLE: &'static str = "console";
 const G_FILE: &'static str = "file";
@@ -125,9 +126,15 @@ impl Sink for File {
 }
 
 impl Logger {
+    fn is_set() -> bool {
+        *G_INIIED.lock().unwrap()
+    }
     pub fn init() -> &'static mut Self {
-        log::set_logger(Self::get()).unwrap();
-        log::set_max_level(LevelFilter::Trace);
+        if !Self::is_set() {
+            *G_INIIED.lock().unwrap() = true;
+            log::set_logger(Self::get()).unwrap();
+            log::set_max_level(LevelFilter::Trace);
+        }
         return Self::get();
     }
 

@@ -1,4 +1,3 @@
-use std::alloc;
 use std::cmp::min;
 use std::fs::File;
 use std::mem::MaybeUninit;
@@ -8,7 +7,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::utils::data::PageTable;
-use crate::utils::{decode_u64, NAN_PID, ROOT_PID};
+use crate::utils::{NULL_PID, ROOT_PID};
 use crate::{OpCode, Options};
 
 const SLOT_SIZE: u64 = 1u64 << 16;
@@ -25,18 +24,12 @@ pub struct PageMap {
 // object on stack, and then copy to heap, for large object, it may cause stack overflow
 // https://github.com/rust-lang/rust/issues/53827
 /// NOTE: require `T` is zeroable
-#[cfg(debug_assertions)]
 fn box_new<T>() -> Box<T> {
+    use std::alloc;
     unsafe {
         let ptr = alloc::alloc_zeroed(alloc::Layout::new::<T>()) as *mut T;
-
         Box::from_raw(ptr)
     }
-}
-
-#[cfg(not(debug_assertions))]
-fn box_new<T: Default>() -> Box<T> {
-    Box::new(T::default())
 }
 
 impl Default for PageMap {
@@ -51,32 +44,43 @@ impl Default for PageMap {
 }
 
 impl PageMap {
-    pub fn map(&self, addr: u64) -> Option<u64> {
+    /// alloc a pid with value euqal to pid
+    pub fn alloc(&self) -> Option<u64> {
         let mut pid = self.next.load(Ordering::Relaxed);
         let mut cnt = 0;
 
         while cnt < MAX_ID {
             match self.index(pid).compare_exchange(
-                NAN_PID,
+                NULL_PID,
+                pid,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(pid),
+                Err(_) => pid = self.next.fetch_add(1, Ordering::Relaxed),
+            }
+            cnt += 1;
+        }
+        None
+    }
+
+    pub fn map(&self, addr: u64) -> Option<u64> {
+        let mut pid = self.next.fetch_add(1, Ordering::Release);
+        let mut cnt = 0;
+
+        while cnt < MAX_ID {
+            match self.index(pid).compare_exchange(
+                NULL_PID,
                 addr,
                 Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::Relaxed,
             ) {
                 Ok(x) => {
-                    assert_eq!(x, NAN_PID);
-                    self.next.fetch_add(1, Ordering::AcqRel);
+                    assert_eq!(x, NULL_PID);
                     break;
                 }
                 Err(_) => {
-                    // here the `next` may not equal to `pid`
-                    let new = if pid + 1 == MAX_ID { ROOT_PID } else { pid + 1 };
-                    match self
-                        .next
-                        .compare_exchange(pid, new, Ordering::AcqRel, Ordering::Acquire)
-                    {
-                        Ok(_) => pid = new,
-                        Err(x) => pid = x,
-                    }
+                    pid = self.next.fetch_add(1, Ordering::Release);
                 }
             }
             cnt += 1;
@@ -89,21 +93,19 @@ impl PageMap {
         }
     }
 
-    pub fn unmap(&self, mut pid: u64, addr: u64) {
-        let ok = self
-            .index(pid)
-            .compare_exchange(addr, NAN_PID, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        assert!(ok);
+    pub fn unmap(&self, pid: u64, addr: u64) {
+        self.index(pid)
+            .compare_exchange(addr, NULL_PID, Ordering::AcqRel, Ordering::Relaxed)
+            .expect("can't fail");
+        let mut curr = self.next.load(Ordering::Relaxed);
         loop {
-            let curr = self.next.load(Ordering::Relaxed);
             let smaller = min(pid, curr);
             match self
                 .next
-                .compare_exchange(curr, smaller, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(curr, smaller, Ordering::AcqRel, Ordering::Relaxed)
             {
                 Ok(_) => break,
-                Err(x) => pid = x,
+                Err(x) => curr = x,
             }
         }
     }
@@ -129,7 +131,7 @@ impl PageMap {
     /// return `old` on success, `current value` on error
     pub fn cas(&self, pid: u64, old: u64, new: u64) -> Result<u64, u64> {
         self.index(pid)
-            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
     }
 }
 
@@ -161,7 +163,7 @@ macro_rules! build_layer {
         impl Drop for $layer {
             fn drop(&mut self) {
                 for indirect in &self.0 {
-                    let ptr = indirect.load(Ordering::Acquire);
+                    let ptr = indirect.load(Ordering::Relaxed);
                     if !ptr.is_null() {
                         unsafe {
                             drop(Box::from_raw(ptr));
@@ -175,7 +177,7 @@ macro_rules! build_layer {
             fn index(&self, pos: u64) -> &AtomicU64 {
                 let r = pos / $fanout;
                 let c = pos % $fanout;
-                let layer = self.0[r as usize].load(Ordering::Relaxed);
+                let layer = self.0[r as usize].load(Ordering::Acquire);
                 let layer = unsafe { layer.as_ref().unwrap_or_else(|| self.get(r as usize)) };
                 layer.index(c)
             }
@@ -187,7 +189,7 @@ macro_rules! build_layer {
                     null_mut(),
                     new,
                     Ordering::AcqRel,
-                    Ordering::Acquire,
+                    Ordering::Relaxed,
                 ) {
                     unsafe {
                         drop(Box::from_raw(new));
@@ -217,10 +219,8 @@ impl PageMap {
 
         PageTable::deserialize(&mut f, |e| {
             let (pid, addr) = (e.page_id(), e.page_addr());
-            let (id, off) = decode_u64(addr);
             // NOTE: it's correct iff when file_id is not wrapping
             if this.get(pid) < addr {
-                log::debug!("pid {} addr {} file_id {} off {}", pid, addr, id, off);
                 this.index(pid).store(addr, Ordering::Relaxed);
             }
         });
@@ -228,12 +228,12 @@ impl PageMap {
     }
 
     pub fn rebuild(this: &Self, opt: &Arc<Options>) -> Result<(), OpCode> {
-        let dir = std::fs::read_dir(&opt.db_path).map_err(|_| OpCode::IoError)?;
+        let dir = std::fs::read_dir(&opt.db_root).map_err(|_| OpCode::IoError)?;
         for i in dir {
             let filename = i.map_err(|_| OpCode::IoError)?.file_name();
             let name = filename.to_str().ok_or(OpCode::Unknown)?;
             if name.starts_with(Options::MAP_PREFIX) {
-                let path = Path::new(&opt.db_path).join(name);
+                let path = Path::new(&opt.db_root).join(name);
                 Self::load_map(this, &path)?;
             }
         }
@@ -249,7 +249,7 @@ impl PageMap {
 
 #[cfg(test)]
 mod test {
-    use crate::map::page_map::{PageMap, L1_FANOUT, L2_FANOUT, L3_FANOUT, NAN_PID};
+    use crate::map::page_map::{PageMap, L1_FANOUT, L2_FANOUT, L3_FANOUT, NULL_PID};
 
     fn addr(a: u64) -> u64 {
         a * 2
@@ -281,7 +281,7 @@ mod test {
 
         for (idx, pid) in mapped_pid.iter().enumerate() {
             table.unmap(*pid, addr(pids[idx]));
-            assert_eq!(table.get(*pid), NAN_PID);
+            assert_eq!(table.get(*pid), NULL_PID);
         }
 
         assert_eq!(pids.len(), mapped_pid.len());

@@ -2,18 +2,22 @@ use std::path::{Path, PathBuf};
 
 use super::OpCode;
 
-const FIXED_TMP_DIR: &str = "mace_tmp";
 const DEFAULT_WRITE_BUFFER_SIZE: usize = 1 << 20;
 const DEFAULT_PAGE_SIZE: usize = 16 << 10;
 const DEFAULT_CACHE_CAPACITY: usize = 256;
 const DEFAULT_EVICT_PCT: usize = 10;
 
 /// mace database configuration options
+#[derive(Clone)]
 pub struct Options {
     /// should we create a new instance or panic when recover a database was failed
     pub panic_on_recover: bool,
+    /// allow bind thread to current running CPU core
+    pub bind_core: bool,
+    /// is temperary storage, if true, db_root will be unlinked when quit
+    pub tmp_store: bool,
     /// where to store database files
-    pub db_path: String,
+    pub db_root: PathBuf,
     ///  meta file
     pub meta_name: String,
     /// how many worker thread will be created <br>
@@ -33,37 +37,17 @@ pub struct Options {
     pub buffer_count: u32,
     /// when should we consolidate delta chain
     pub consolidate_threshold: u8,
+    /// WAL ring buffer size
+    pub wal_buffer_size: usize,
 }
 
 impl Options {
-    pub const MAP_PREFIX: &'static str = "db.map_";
-    pub const PAGE_PREFIX: &'static str = "db.page_";
-
-    pub fn map_file(&self, id: u32) -> PathBuf {
-        Path::new(&self.db_path).join(format!("{}{}", Self::MAP_PREFIX, id))
-    }
-
-    pub fn page_file(&self, id: u32) -> PathBuf {
-        Path::new(&self.db_path).join(format!("{}{}", Self::PAGE_PREFIX, id))
-    }
-
-    fn validate(&self) -> Result<(), OpCode> {
-        if self.write_buffer_size < self.page_size_threshold * 2 {
-            return Err(OpCode::Invalid);
-        }
-        if self.page_size_threshold == 0 {
-            return Err(OpCode::Invalid);
-        }
-        return Ok(());
-    }
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        let tmp = std::env::temp_dir().join(FIXED_TMP_DIR);
+    pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
             panic_on_recover: false,
-            db_path: tmp.to_string_lossy().to_string(),
+            bind_core: false,
+            tmp_store: false,
+            db_root: db_root.as_ref().to_path_buf(),
             meta_name: "meta.json".into(),
             worker_thread_count: 4,
             page_size_threshold: DEFAULT_PAGE_SIZE,
@@ -73,14 +57,43 @@ impl Default for Options {
             buffer_size: 4 << 20, // 4MB
             buffer_count: 256,    // total 100MB
             consolidate_threshold: 8,
+            wal_buffer_size: 2 << 20,
         }
     }
 }
 
-#[test]
-fn test_conf_default() {
-    let c: Options = Default::default();
+impl Options {
+    pub const MAP_PREFIX: &'static str = "db.map_";
+    pub const PAGE_PREFIX: &'static str = "db.page_";
 
-    assert_eq!(c.db_path, "/tmp/".to_string() + FIXED_TMP_DIR);
-    assert_eq!(c.worker_thread_count, 4);
+    pub fn map_file(&self, id: u32) -> PathBuf {
+        self.db_root.join(format!("{}{}", Self::MAP_PREFIX, id))
+    }
+
+    pub fn page_file(&self, id: u32) -> PathBuf {
+        self.db_root.join(format!("{}{}", Self::PAGE_PREFIX, id))
+    }
+
+    pub fn wal_file(&self) -> PathBuf {
+        self.db_root.join("db.wal")
+    }
+
+    #[allow(dead_code)]
+    fn validate(&self) -> Result<(), OpCode> {
+        if self.write_buffer_size < self.page_size_threshold * 2 {
+            return Err(OpCode::Invalid);
+        }
+        if self.page_size_threshold == 0 {
+            return Err(OpCode::Invalid);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Options {
+    fn drop(&mut self) {
+        if self.tmp_store {
+            let _ = std::fs::remove_dir_all(&self.db_root);
+        }
+    }
 }

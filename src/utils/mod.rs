@@ -1,16 +1,26 @@
+use std::{
+    cell::RefCell,
+    ops::{Deref, Range},
+    path::{Path, PathBuf},
+};
+
+use rand::{rngs::ThreadRng, Rng};
+
+pub(crate) mod block;
 pub mod byte_array;
 pub(crate) mod data;
 pub mod options;
 pub(crate) mod queue;
+pub(crate) mod traits;
 
-pub(crate) const NAN_PID: u64 = 0;
+pub(crate) const NULL_PID: u64 = 0;
 pub(crate) const ROOT_PID: u64 = 1;
 pub(crate) const NEXT_ID: u32 = 1;
+pub(crate) const INIT_CMD: u32 = 1;
+pub(crate) const NULL_CMD: u32 = u32::MAX;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum OpCode {
-    Ok,
-    Duplicate,
     NotFound,
     TooLarge,
     NeedMore,
@@ -18,6 +28,7 @@ pub enum OpCode {
     Invalid,
     NoSpace,
     IoError,
+    AbortTx,
     Unknown,
 }
 
@@ -25,52 +36,21 @@ pub(crate) const fn align_up(n: usize, align: usize) -> usize {
     (n + (align - 1)) & !(align - 1)
 }
 
-#[repr(u8)]
-#[derive(Copy, Clone)]
-pub enum TxnState {
-    Idle,
-    Start,
-    Commit,
-    Abort,
+#[allow(dead_code)]
+pub(crate) const fn align_down(n: usize, align: usize) -> usize {
+    n & !(align - 1)
 }
 
 #[repr(u8)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum IsolationLevel {
     SI,
     SSI,
 }
 
-#[repr(u8)]
-#[derive(Copy, Clone)]
-pub enum TxnMode {
-    Short,
-    Long,
-}
-
-const _: () = assert!(size_of::<TxnState>() == 1);
 const _: () = assert!(size_of::<IsolationLevel>() == 1);
-const _: () = assert!(size_of::<TxnMode>() == 1);
 
-// BwTree Related Stuffs
-
-#[repr(u8)]
-enum NodeType {
-    Delta,
-    Base,
-}
-
-#[repr(u8)]
-enum OpType {
-    Insert,
-    Update,
-    Remove,
-    Flush,
-    Merge,
-    Split,
-}
-
-pub(crate) fn is_power_of_2(x: usize) -> bool {
+pub(crate) const fn is_power_of_2(x: usize) -> bool {
     if x == 0 {
         false
     } else {
@@ -126,9 +106,78 @@ pub(crate) const fn decode_u64(x: u64) -> (u32, u32) {
     ((x >> 32) as u32, (x & ((1 << 32) - 1)) as u32)
 }
 
+thread_local! {
+    pub static G_RAND: RefCell<ThreadRng> = RefCell::new(rand::thread_rng());
+}
+
+pub fn rand_range(range: Range<usize>) -> usize {
+    G_RAND.with_borrow_mut(|x| x.gen_range(range))
+}
+
 static_assert!(size_of::<usize>() == 8, "exepct 64 bits pointer width");
 
 static_assert!(size_of::<usize>() == 8, "exepct 64 bits pointer width");
+
+pub struct RandomPath {
+    path: PathBuf,
+    del: bool,
+}
+
+impl Default for RandomPath {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RandomPath {
+    fn gen() -> PathBuf {
+        let tmp = std::env::temp_dir();
+        let path = Path::new(&tmp);
+        loop {
+            let r = rand_range(1000..1000000);
+            let p = path.join(format!("mace_tmp_{}", r));
+            if !p.exists() {
+                return p;
+            }
+        }
+    }
+
+    pub fn tmp() -> Self {
+        Self {
+            path: Self::gen(),
+            del: true,
+        }
+    }
+
+    pub fn new() -> Self {
+        Self {
+            path: Self::gen(),
+            del: false,
+        }
+    }
+
+    pub fn unlink(&self) {
+        if self.path.exists() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+impl Deref for RandomPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl Drop for RandomPath {
+    fn drop(&mut self) {
+        if self.del {
+            self.unlink();
+        }
+    }
+}
 
 #[cfg(test)]
 mod test {

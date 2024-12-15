@@ -1,5 +1,4 @@
 use std::{
-    alloc::alloc_zeroed,
     cell::Cell,
     ptr::null_mut,
     sync::{
@@ -10,7 +9,6 @@ use std::{
 
 use crate::{
     map::data::FrameFlag,
-    static_assert,
     utils::{next_power_of_2, queue::Queue, raw_ptr_to_ref, NEXT_ID},
     OpCode,
 };
@@ -24,11 +22,10 @@ use crate::map::cache::Cache;
 use crate::utils::byte_array::ByteArray;
 use crate::utils::options::Options;
 use crate::utils::{decode_u64, encode_u64};
-use std::alloc::{dealloc, Layout};
 use std::collections::HashMap;
 use std::sync::atomic::{
     AtomicU16,
-    Ordering::{AcqRel, Acquire, Relaxed},
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
 use std::sync::RwLock;
 
@@ -41,8 +38,6 @@ struct Arena {
     /// page id
     id: Cell<u32>,
 }
-
-static_assert!(size_of::<Arena>() == 32);
 
 impl Arena {
     const STATE_FREE: u16 = 1;
@@ -91,15 +86,11 @@ impl Arena {
         }
     }
 
-    fn to(&self, off: u32) -> &mut Frame {
-        unsafe { &mut *self.load(off) }
-    }
-
     fn alloc_at(&self, off: u32, size: u32) -> Result<(u64, u32, FrameOwner), OpCode> {
-        let frame = self.to(off);
+        let frame = unsafe { &mut *self.load(off) };
         let addr = encode_u64(self.id.get(), off);
 
-        frame.init(addr, FrameFlag::Normal);
+        frame.init(addr, FrameFlag::Unknown);
         frame.set_size(size);
         Ok((addr, self.id.get(), FrameOwner::from(frame as *mut Frame)))
     }
@@ -114,7 +105,7 @@ impl Arena {
     }
 
     fn used(&self) -> ByteArray {
-        self.raw.sub_array(0..self.offset.load(Relaxed) as usize)
+        self.raw.sub_array(0, self.offset.load(Acquire) as usize)
     }
 
     fn load(&self, off: u32) -> *mut Frame {
@@ -122,19 +113,19 @@ impl Arena {
     }
 
     fn is_sealed(&self) -> bool {
-        self.state.load(Relaxed) == Self::STATE_SEALED
+        self.state.load(Acquire) == Self::STATE_SEALED
     }
 
     fn mark_sealed(&self) {
-        self.state.store(Self::STATE_SEALED, Relaxed);
+        self.state.store(Self::STATE_SEALED, Release);
     }
 
     fn is_flushed(&self) -> bool {
-        self.state.load(Relaxed) == Self::STATE_FLUSHED
+        self.state.load(Acquire) == Self::STATE_FLUSHED
     }
 
     fn mark_flushed(&self) {
-        self.state.store(Self::STATE_FLUSHED, Relaxed);
+        self.state.store(Self::STATE_FLUSHED, Release);
     }
 
     fn is_flushable(&self) -> bool {
@@ -142,26 +133,22 @@ impl Arena {
     }
 
     fn mark_flushable(&self) {
-        self.refcnt.store(0, Relaxed);
+        self.refcnt.store(0, Release);
         self.mark_sealed();
     }
 
     fn refs(&self) -> u16 {
-        self.refcnt.load(Relaxed)
+        self.refcnt.load(Acquire)
     }
 
     #[inline(always)]
     fn inc_ref(&self) {
-        self.refcnt.fetch_add(1, Relaxed);
+        self.refcnt.fetch_add(1, AcqRel);
     }
 
     fn dec_ref(&self) {
-        let x = self.refcnt.fetch_sub(1, Relaxed);
+        let x = self.refcnt.fetch_sub(1, AcqRel);
         assert!(x > 0);
-    }
-
-    fn destroy(&self) {
-        ByteArray::free(self.raw);
     }
 }
 
@@ -183,17 +170,20 @@ struct Pool {
     opt: Arc<Options>,
 }
 
+unsafe impl Sync for Pool {}
+unsafe impl Send for Pool {}
+
 fn free_arena(a: *mut Arena) {
     unsafe {
-        (*a).destroy();
-        dealloc(a as *mut u8, Layout::new::<Arena>());
+        ByteArray::free((*a).raw);
+        drop(Box::from_raw(a));
     }
 }
 
 impl Pool {
     fn find_next_id(opt: &Arc<Options>) -> Result<u32, OpCode> {
         let mut next_id = 0;
-        let dir = std::fs::read_dir(&opt.db_path).map_err(|_| OpCode::IoError)?;
+        let dir = std::fs::read_dir(&opt.db_root).map_err(|_| OpCode::IoError)?;
 
         for i in dir {
             let f = i.map_err(|_| OpCode::IoError)?.file_name();
@@ -218,8 +208,8 @@ impl Pool {
         Ok(Self {
             bufs: RwLock::new(HashMap::new()),
             flush: Flush::new(opt.clone()),
-            freelist: Queue::new(q_cap, Some(Box::new(|a| free_arena(a)))),
-            junks: Queue::new(q_cap, Some(Box::new(|a| free_arena(a)))),
+            freelist: Queue::new(q_cap, Some(Box::new(free_arena))),
+            junks: Queue::new(q_cap, Some(Box::new(free_arena))),
             cur: AtomicPtr::new(null_mut()),
             cap,
             cnt: Mutex::new(0),
@@ -249,19 +239,18 @@ impl Pool {
             let a = raw_ptr_to_ref(a);
             let map = self.files.clone();
             let opt = self.opt.clone();
-            let r = self.flush.tx.send(FlushData::new(
-                id,
-                a.used(),
-                Box::new(move || {
-                    let mut files = map.write().expect("can't lock write");
-                    files.insert(id, FileReader::new(&opt, id));
-                    a.mark_flushed();
-                }),
-            ));
-            // flusher was existed
-            if r.is_err() {
-                unimplemented!()
-            }
+            self.flush
+                .tx
+                .send(FlushData::new(
+                    id,
+                    a.used(),
+                    Box::new(move || {
+                        let mut files = map.write().expect("can't lock write");
+                        files.insert(id, FileReader::new(&opt, id));
+                        a.mark_flushed();
+                    }),
+                ))
+                .expect("channel closed");
         }
     }
 
@@ -280,33 +269,32 @@ impl Pool {
         }
     }
 
-    fn get_or_alloc(&self) -> Option<*mut Arena> {
-        loop {
-            if let Ok(ptr) = self.freelist.pop() {
-                let id = self.next_id.fetch_add(1, Relaxed);
-                let p = raw_ptr_to_ref(ptr);
-                p.reset(id);
-                return Some(ptr);
-            } else {
-                let mut lk = self.cnt.lock().expect("lock failed");
-
-                if *lk > self.cap {
-                    return None;
-                }
-                *lk += 1;
-
-                let a = unsafe {
-                    let a = alloc_zeroed(Layout::new::<Arena>()) as *mut Arena;
-                    std::ptr::write(a, Arena::new(0, self.buf_size));
-                    a
-                };
-                self.freelist.push(a).expect("no space");
-            }
-        }
+    fn init_arena(&self, ptr: *mut Arena) {
+        let p = raw_ptr_to_ref(ptr);
+        let id = self.next_id.fetch_add(1, Relaxed);
+        debug_assert_ne!(id, 0);
+        p.reset(id);
+        log::debug!("alloc buffer id {}", id);
     }
 
-    /// FIXME: it will cause busy-wait when write speed > flush speed
-    fn install_new(&self) {
+    fn get_or_alloc(&self) -> Option<*mut Arena> {
+        if let Ok(ptr) = self.freelist.pop() {
+            self.init_arena(ptr);
+            return Some(ptr);
+        }
+
+        let mut lk = self.cnt.lock().expect("lock failed");
+        if *lk > self.cap {
+            return None;
+        }
+        *lk += 1;
+
+        let a = Box::into_raw(Box::new(Arena::new(NEXT_ID, self.buf_size)));
+        self.init_arena(a);
+        Some(a)
+    }
+
+    fn gc(&self) {
         let cnt = self.junks.count();
         for _ in 0..cnt {
             if let Ok(x) = self.junks.pop() {
@@ -318,30 +306,38 @@ impl Pool {
                 }
             }
         }
+    }
 
-        if let Some(p) = self.get_or_alloc() {
-            let cur = self.cur.load(Relaxed);
-            if self.cur.compare_exchange(cur, p, AcqRel, Acquire).is_ok() {
-                if !cur.is_null() {
-                    self.junks.push(cur).expect("no space");
-                }
+    /// NOTE: busy-wait when write speed > flush speed
+    fn install_new(&self) {
+        let p = loop {
+            let Some(p) = self.get_or_alloc() else {
+                self.gc();
+                continue;
+            };
+            break p;
+        };
 
+        let cur = self.cur.load(Relaxed);
+        match self.cur.compare_exchange(cur, p, AcqRel, Acquire) {
+            Ok(_) => {
                 let mut bufs = self.bufs.write().expect("can't lock write");
                 let a = raw_ptr_to_ref(p);
                 bufs.insert(a.id.get(), p);
             }
-            // else
-            // new arena was already installed by other thread
+            Err(_) => {
+                self.freelist.push(p).expect("no space"); // recycle
+            }
         }
     }
 
     fn flush_all(&self) {
         let buf = self.bufs.read().expect("can't lock read");
-        let mut tmp: Vec<(u32, &Arena)> =
-            buf.iter().map(|(k, v)| (*k, raw_ptr_to_ref(*v))).collect();
+        let tmp: Vec<(u32, *mut Arena)> = buf.iter().map(|(k, v)| (*k, *v)).collect();
         drop(buf);
 
-        for (id, a) in &tmp {
+        for (id, x) in &tmp {
+            let a = raw_ptr_to_ref(*x);
             a.mark_flushable();
             assert!(a.is_flushable());
             self.flush_arena(a, *id);
@@ -350,11 +346,10 @@ impl Pool {
         let mut cnt = 0;
         let expect = tmp.len();
         while cnt != expect {
-            if let Some((id, a)) = tmp.pop() {
+            for (_, x) in &tmp {
+                let a = raw_ptr_to_ref(*x);
                 if a.is_flushed() {
                     cnt += 1;
-                } else {
-                    tmp.push((id, a));
                 }
             }
         }
@@ -411,6 +406,7 @@ impl Buffers {
         dst
     }
 
+    #[allow(unused)]
     pub fn cache(&self, addr: u64) {
         let (id, off) = decode_u64(addr);
         if let Some(a) = self.pool.get(id) {
@@ -433,7 +429,6 @@ impl Buffers {
         if let Some(a) = self.pool.get(id) {
             let x = FrameOwner::from(a.load(off));
             debug_assert_eq!(x.addr(), addr);
-            // NOTE: this may conflict with SysTxn::commit, we'd better remove the cache in systxn
             return Ok(self.copy_to_cache(addr, x));
         }
 

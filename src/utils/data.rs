@@ -19,6 +19,7 @@ impl PageFooter {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct MapFooter {
     pub file_id: u32,
     pub nr_active: u32,
@@ -121,8 +122,8 @@ impl PageTable {
         let mut buf = Vec::new();
 
         self.data
-            .iter()
-            .map(|(_, e)| {
+            .values()
+            .map(|e| {
                 buf.extend_from_slice(e.as_slice());
             })
             .count();
@@ -195,11 +196,12 @@ mod test {
     };
 
     use crate::{
-        map::data::{FrameFlag, FrameOwner},
-        tree::{
+        index::{
             data::{Key, Value},
-            page::{Delta, DeltaType, NodeType, Page},
+            page::{DeltaType, NodeType, Page},
+            Delta,
         },
+        map::data::{FrameFlag, FrameOwner},
         utils::{data::MapFooter, decode_u64},
     };
 
@@ -261,24 +263,24 @@ mod test {
 
         let (k, v) = ("key", "val");
         let mut delta = Delta::new(DeltaType::Data, NodeType::Leaf)
-            .from_item((Key::new(k.as_bytes(), gsn), Value::Put(v.as_bytes())));
+            .with_item((Key::new(k.as_bytes(), gsn, 0), Value::Put(v.as_bytes())));
         let alloc_size = delta.size();
 
         let mut f = FrameOwner::alloc(alloc_size);
-        f.init(addr, FrameFlag::Normal);
+        f.init(addr, FrameFlag::Unknown);
         f.set_pid(pid);
 
         assert_eq!(delta.size(), f.payload_size() as usize);
 
-        let page = Page::from(f.payload());
-        delta.build(&page);
-        let h = page.header();
+        let mut page = Page::from(f.payload());
+        delta.build(&mut page);
+        let h = page.header_mut();
         h.meta.set_epoch(666);
         h.set_link(addr);
 
         let mut table = PageTable::default();
         let mut file = FakeFile::default();
-        let mut hasher = FakeHasher::default();
+        let mut hasher = FakeHasher;
 
         let mut buf = [0u8; size_of::<MapFooter>()];
         let ft = unsafe { &mut *(buf.as_mut_ptr() as *mut MapFooter) };
@@ -295,7 +297,7 @@ mod test {
         ft.serialize(&mut file);
 
         let (mut d_pid, mut d_addr) = (0, 0);
-        let _ = PageTable::deserialize(&mut file, |e| {
+        PageTable::deserialize(&mut file, |e| {
             d_pid = e.page_id();
             d_addr = e.page_addr();
         });

@@ -1,7 +1,7 @@
 use super::page::Page;
-use super::traits::IKey;
-use super::traits::IVal;
-use crate::map::data::FrameOwner;
+use super::IAlloc;
+use crate::map::data::{FrameFlag, FrameOwner};
+use crate::utils::traits::{IKey, IVal};
 use crate::OpCode;
 use crate::Store;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// [`SysTxn`] works on a block of buffer, it never undo, instead it mark the dirty
 /// data as tombstone, which will be cleaned by Garbage Collector later
 pub struct SysTxn<'a> {
-    store: &'a Store,
+    pub store: &'a Store,
     buffers: HashMap<u64, FrameOwner>,
     read_only_buffer: Vec<Arc<FrameOwner>>,
     page_ids: Vec<(u64, u64)>,
@@ -34,6 +34,10 @@ impl<'a> SysTxn<'a> {
     fn commit(&mut self) {
         self.page_ids.clear();
         self.buffers.clear();
+        // NOTE: some frames allocated but failed in cas are also cleand here, since they were
+        // marked as tombstone on cas failed (if we don't do that, we have to traverse buffers to
+        // determine which id should be delayed for releasing buffer and be marked tombstone here,
+        // it's a little bit more overhead and complicate)
         for (id, cnt) in &self.buffer_id {
             for _ in 0..*cnt {
                 self.store.buffer.release_buffer(*id);
@@ -50,38 +54,38 @@ impl<'a> SysTxn<'a> {
         self.read_only_buffer.clear();
     }
 
-    pub fn alloc<K, V>(&mut self, size: usize) -> Result<(u64, Page<K, V>), OpCode>
-    where
-        K: IKey,
-        V: IVal,
-    {
+    fn alloc_raw(&mut self, size: usize) -> Result<(u64, FrameOwner), OpCode> {
         let (addr, buff_id, frame) = self.store.buffer.alloc(size as u32, true)?;
 
-        let payload = frame.payload();
+        let copy = frame.shallow_copy();
         self.buffers.insert(addr, frame);
         self.inc_buffer_use_cnt(buff_id);
-        Ok((addr, Page::from(payload)))
+        Ok((addr, copy))
+    }
+
+    pub fn alloc<K: IKey, V: IVal>(&mut self, size: usize) -> Result<(u64, Page<K, V>), OpCode> {
+        self.alloc_raw(size)
+            .map(|(x, y)| (x, Page::from(y.payload())))
     }
 
     pub fn map(&mut self, addr: u64) -> u64 {
         let frame = self.buffers.get_mut(&addr).expect("invalid page addr");
-        if frame.is_tombstone() {
+        if matches!(frame.flag(), FrameFlag::TombStone) {
             panic!("bad insert");
         }
 
         let pid = self.store.page.map(addr).expect("no page slot");
-        log::info!("mapping pid {} addr {}", pid, addr);
         frame.set_pid(pid);
         self.page_ids.push((pid, addr));
         pid
     }
 
     pub fn update(&mut self, pid: u64, old: u64, new: u64) -> Result<(), u64> {
-        // single file, linear increment
-        assert!(new > old);
-        if let Err(cur) = self.store.page.cas(pid, old, new) {
-            return Err(cur);
-        }
+        self.store.page.cas(pid, old, new).inspect_err(|_| {
+            // NOTE: if retry ok, it will be set to non-tombstone
+            let f = self.buffers.get_mut(&new).expect("invalid addr");
+            f.set_tombstone();
+        })?;
 
         let frame = self.buffers.get_mut(&new).expect("invalid addr");
         frame.set_pid(pid);
@@ -90,9 +94,6 @@ impl<'a> SysTxn<'a> {
     }
 
     pub fn replace(&mut self, pid: u64, old: u64, new: u64, junks: &[u64]) -> Result<(), OpCode> {
-        // single file, linear increment
-        assert!(new > old);
-
         let addr = self.apply_junks(junks);
         self.update(pid, old, new).map_err(|_| {
             let frame = self.buffers.get_mut(&addr).expect("invalid addr");
@@ -103,7 +104,7 @@ impl<'a> SysTxn<'a> {
     }
 
     fn apply_junks(&mut self, junks: &[u64]) -> u64 {
-        let size = junks.len() * size_of::<u64>();
+        let size = std::mem::size_of_val(junks);
         let (addr, buff_id, mut frame) = self
             .store
             .buffer
@@ -113,8 +114,7 @@ impl<'a> SysTxn<'a> {
         // required
         frame.set_delete();
 
-        let mut frameref = frame.load_data().expect("invalid frame");
-        let a = frameref.deleted_entries();
+        let a = frame.load_data().expect("invalid frame");
         assert_eq!(a.len(), junks.len());
         a.copy_from_slice(junks);
 
@@ -148,5 +148,15 @@ impl Drop for SysTxn<'_> {
                 self.store.buffer.release_buffer(*id);
             }
         }
+    }
+}
+
+impl IAlloc for SysTxn<'_> {
+    fn allocate(&mut self, size: usize) -> Result<(u64, FrameOwner), OpCode> {
+        self.alloc_raw(size)
+    }
+
+    fn page_size(&self) -> usize {
+        self.store.opt.page_size_threshold
     }
 }

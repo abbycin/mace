@@ -4,7 +4,6 @@ use std::hash::Hasher;
 use std::io::Write;
 use std::{
     alloc::{alloc, dealloc, Layout},
-    marker::PhantomData,
     ops::{Deref, DerefMut},
 };
 
@@ -12,17 +11,19 @@ use std::{
 /// deleted data, a tombstone is a single deleted data in current page file
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
+#[allow(unused)]
 pub enum FrameFlag {
     Normal = 1,
     Deleted = 2,
     TombStone = 3,
+    Slotted = 4,
     Unknown,
 }
 
 /// NOTE: the data's heighest 8 bits are used as frame flag
 #[repr(C)]
 pub(crate) struct Frame {
-    data: u64,
+    pid: u64,
     /// encode_u64(file_id, offset)
     addr: u64,
     /// the size excluding [`Frame`] itself (i.e., it's payload size)
@@ -41,10 +42,11 @@ impl Frame {
     pub fn init(&mut self, addr: u64, flag: FrameFlag) {
         self.addr = addr;
         self.flag = flag;
+        self.pid = 0;
     }
 
     pub fn size(&self) -> u32 {
-        Self::alloc_size(self.size as u32)
+        Self::alloc_size(self.size)
     }
 
     pub fn addr(&self) -> u64 {
@@ -60,35 +62,34 @@ impl Frame {
     }
 
     pub fn set_pid(&mut self, pid: u64) {
-        assert_eq!(self.flag, FrameFlag::Normal);
-        self.data = pid;
+        debug_assert_eq!(self.pid, 0);
+        debug_assert!(self.flag == FrameFlag::Unknown || self.flag == FrameFlag::TombStone);
+        self.pid = pid;
+        self.flag = FrameFlag::Normal;
     }
 
     pub fn page_id(&self) -> u64 {
-        self.data
+        self.pid
     }
 
-    pub fn is_normal(&self) -> bool {
-        self.flag == FrameFlag::Normal
+    pub fn flag(&self) -> FrameFlag {
+        self.flag
     }
 
     pub fn set_tombstone(&mut self) {
         self.flag = FrameFlag::TombStone;
     }
 
-    pub fn is_tombstone(&self) -> bool {
-        self.flag == FrameFlag::TombStone
-    }
-
     pub fn set_delete(&mut self) {
         self.flag = FrameFlag::Deleted;
     }
 
-    pub fn is_delete(&self) -> bool {
-        self.flag == FrameFlag::Deleted
+    pub fn set_slotted(&mut self) {
+        debug_assert_eq!(self.flag, FrameFlag::Unknown);
+        self.flag = FrameFlag::Slotted;
     }
 
-    pub fn load_data<'a>(&mut self) -> Option<FrameRef<'a>> {
+    pub fn load_data<'a>(&mut self) -> Option<&'a mut [u64]> {
         match self.flag {
             FrameFlag::Deleted => {
                 let sz = self.payload_size() as usize / size_of::<u64>();
@@ -99,17 +100,7 @@ impl Frame {
                     std::slice::from_raw_parts_mut(ptr, sz)
                 };
 
-                Some(FrameRef::Dealloc(DeallocRef {
-                    pages: ids,
-                    page_idx: 0,
-                }))
-            }
-            FrameFlag::Normal => {
-                let ptr = unsafe { (self as *mut Frame).offset(1).cast::<u8>() };
-                Some(FrameRef::Page(PageRef::new(
-                    ptr,
-                    self.payload_size() as usize,
-                )))
+                Some(ids)
             }
             _ => None,
         }
@@ -121,6 +112,9 @@ pub(crate) struct FrameOwner {
     owned: bool,
 }
 
+unsafe impl Send for FrameOwner {}
+unsafe impl Sync for FrameOwner {}
+
 impl FrameOwner {
     pub(crate) fn alloc(size: usize) -> Self {
         let real_size = Frame::alloc_size(size as u32);
@@ -128,6 +122,7 @@ impl FrameOwner {
             raw: unsafe { alloc(Layout::array::<u8>(real_size as usize).unwrap()) as *mut Frame },
             owned: true,
         };
+        this.flag = FrameFlag::Unknown;
         this.size = size as u32;
         this
     }
@@ -203,52 +198,6 @@ impl Drop for FrameOwner {
                 );
             }
         }
-    }
-}
-
-pub enum FrameRef<'a> {
-    Page(PageRef<'a>),
-    Dealloc(DeallocRef<'a>),
-}
-
-impl<'a> FrameRef<'a> {
-    pub fn to_page(&mut self) -> &mut PageRef<'a> {
-        match self {
-            FrameRef::Page(p) => p,
-            _ => panic!("bad function call"),
-        }
-    }
-
-    pub fn deleted_entries(&mut self) -> &mut [u64] {
-        match self {
-            FrameRef::Dealloc(x) => x.pages,
-            _ => panic!("bad function all"),
-        }
-    }
-}
-
-pub struct PageRef<'a> {
-    raw: ByteArray,
-    _marker: PhantomData<&'a ()>,
-}
-
-pub struct DeallocRef<'a> {
-    /// a list of disk addr
-    pages: &'a mut [u64],
-    /// current index in [`DeallocRef::pages`]
-    page_idx: usize,
-}
-
-impl PageRef<'_> {
-    fn new(ptr: *const u8, size: usize) -> Self {
-        Self {
-            raw: ByteArray::new(ptr as *mut u8, size),
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn raw(&self) -> ByteArray {
-        self.raw
     }
 }
 

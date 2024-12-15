@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git commit" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message if
+# it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-commit".
+
+curdir=${PWD}
+
+echo "perform cargo fix and cargo fmt"
+cargo fix --allow-dirty --allow-staged && cargo fmt
+
+if [ $? -ne 0 ]
+then
+	exit 1
+fi
+
+diff=$(git diff)
+if [ "${diff}" != "" ]
+then
+	echo "\033[34mfixed and formated, please add or stash\033[0m"
+	exit 1
+fi
+
+exec </dev/tty
+printf "\e[31mtype yes to commit: \e[0m"
+read yes
+if [ $yes = "yes" ]
+then
+	exit 0
+fi
+echo "commit aborted"
+exit 1
+exec <&-

@@ -1,0 +1,8 @@
+[package]
+name = "coreid"
+version = "0.1.0"
+edition = "2021"
+authors = ["abbytsing@gmail.com"]
+
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))'.dependencies]
+libc = "^0.2.0"

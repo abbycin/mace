@@ -1,0 +1,8 @@
+/target
+*.bak
+*.~
+*.swp
+.idea
+.vscode
+.cache
+Cargo.lock

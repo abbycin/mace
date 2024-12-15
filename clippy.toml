@@ -1,0 +1,2 @@
+type-complexity-threshold = 500
+allow-private-module-inception = true

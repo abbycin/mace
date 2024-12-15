@@ -3,7 +3,7 @@ use std::{
     collections::BinaryHeap,
 };
 
-use super::traits::{IKey, IPageIter, IVal};
+use crate::utils::traits::{IKey, IPageIter, IVal};
 
 pub struct ItemIter<T> {
     item: Option<T>,
@@ -19,11 +19,6 @@ impl<T> Default for ItemIter<T> {
     }
 }
 
-// // for all inherit hierchy
-// impl<T> IPageValue for T where T: ICodec + Clone + Copy {}
-
-/// [`ItemIter`] related
-/// ----------------------------------------
 impl<T: Clone> ItemIter<T> {
     pub fn new(item: T) -> Self {
         Some(item).into()
@@ -73,7 +68,7 @@ where
     }
 }
 
-impl<'a, K, V> Iterator for SliceIter<'a, K, V>
+impl<K, V> Iterator for SliceIter<'_, K, V>
 where
     K: IKey,
     V: IVal,
@@ -91,7 +86,7 @@ where
     }
 }
 
-impl<'a, K, V> IPageIter for SliceIter<'a, K, V>
+impl<K, V> IPageIter for SliceIter<'_, K, V>
 where
     K: IKey,
     V: IVal,

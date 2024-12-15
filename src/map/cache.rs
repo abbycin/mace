@@ -8,21 +8,15 @@ use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::HashSet;
 use std::sync::atomic::{
     AtomicU8,
-    Ordering::{AcqRel, Acquire, Relaxed},
+    Ordering::{Relaxed, Release},
 };
 use std::sync::Arc;
 
 use super::data::FrameOwner;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C, align(64))]
 struct Addr(u64);
-
-impl Default for Addr {
-    fn default() -> Self {
-        Self(0)
-    }
-}
 
 impl From<u64> for Addr {
     fn from(value: u64) -> Self {
@@ -46,7 +40,7 @@ impl Entry {
         let old = self.state.load(Relaxed);
         let new = std::cmp::max(CD_EVICT, old.saturating_sub(1));
 
-        match self.state.compare_exchange(old, new, AcqRel, Acquire) {
+        match self.state.compare_exchange(old, new, Release, Relaxed) {
             Ok(o) => Ok(o),
             Err(_) => Err(OpCode::Again),
         }
@@ -57,7 +51,7 @@ impl Entry {
 
         loop {
             let new = std::cmp::min(old + 1, CD_WARM);
-            match self.state.compare_exchange(old, new, AcqRel, Relaxed) {
+            match self.state.compare_exchange(old, new, Release, Relaxed) {
                 Ok(_) => break,
                 Err(e) => old = e,
             }
@@ -150,9 +144,7 @@ impl Cache {
 
     /// NOTE: the variables are guarded by lock (from dashmap)
     pub(crate) fn get(&self, addr: u64) -> Option<Arc<FrameOwner>> {
-        let Some(item) = self.map.get_mut(&addr) else {
-            return None;
-        };
+        let item = self.map.get_mut(&addr)?;
         let e = item.value();
         e.warm_up();
         Some(e.data.as_ref().expect("none frame").clone())
@@ -208,10 +200,12 @@ mod test {
     use crate::map::cache::Cache;
     use crate::map::data::{Frame, FrameFlag, FrameOwner};
     use crate::utils::options::Options;
+    use crate::RandomPath;
     use std::sync::Arc;
 
     fn runner() -> bool {
-        let mut opt = Options::default();
+        let path = RandomPath::tmp();
+        let mut opt = Options::new(&*path);
         opt.cache_capacity = 256;
         let c = Arc::new(Cache::new(&opt));
         let size = Frame::FRAME_LEN;
@@ -219,7 +213,7 @@ mod test {
         for i in 0..4 {
             let mut frame = FrameOwner::alloc(size);
             if i == 3 {
-                frame.init(0, FrameFlag::Normal);
+                frame.init(0, FrameFlag::Unknown);
                 frame.set_pid(233);
             }
             c.put(i, Arc::new(frame));
@@ -235,7 +229,7 @@ mod test {
                 for j in b..e {
                     cache.get(3);
                     let mut frame = FrameOwner::alloc(size);
-                    frame.init(0, FrameFlag::Normal);
+                    frame.init(0, FrameFlag::Unknown);
                     cache.put(j, Arc::new(frame));
                 }
             }));

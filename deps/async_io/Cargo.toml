@@ -1,0 +1,16 @@
+[package]
+name = "async_io"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.69"
+
+[package.metadata.cargo-out-dir]
+build = "OUT_DIR"
+
+[dependencies]
+
+[examples]
+io = "io"
