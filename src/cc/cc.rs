@@ -1,5 +1,5 @@
 use std::cmp;
-use std::cmp::{max, min};
+use std::cmp::min;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::{collections::HashSet, sync::RwLock};
@@ -71,7 +71,7 @@ impl ConcurrencyControl {
 
     #[allow(dead_code)]
     pub fn visible_to_all(&self, ctx: &Context, txid: u64) -> bool {
-        txid < ctx.wmk_info.wmk_odlest.load(Relaxed)
+        txid < ctx.wmk_oldest.load(Relaxed)
     }
 
     /// check `txid` is visible to worker `wid` with txn with `start_ts`
@@ -92,6 +92,9 @@ impl ConcurrencyControl {
 
         match w.txn.level {
             IsolationLevel::SI | IsolationLevel::SSI => {
+                if txid > start_ts {
+                    return false;
+                }
                 if self.global_wmk_tx > txid {
                     return true;
                 }
@@ -121,22 +124,15 @@ impl ConcurrencyControl {
     /// collect water mark for safe consolidation, currently only [`WmkInfo::wmk_of_old`] is used
     pub fn collect_wmk(&self, ctx: &Context) {
         // 1/n probability, balance overhead
-        if rand_range(0..ctx.workers().len()) != 0 {
+        let workers = ctx.workers();
+
+        if rand_range(0..workers.len()) != 0 {
             return;
         }
 
-        // concurrent executing is not allowed
-        let Ok(_lk) = ctx.wmk_info.mutex.try_lock() else {
-            return;
-        };
-
-        let wlk = ctx.workers();
-        let workers: Vec<SyncWorker> = wlk.values().copied().collect();
-        drop(wlk);
-
         let mut oldest_tx = u64::MAX;
 
-        for w in &workers {
+        for w in workers.iter() {
             let cur_tx = w.tx_id.load(Acquire);
             if cur_tx == 0 {
                 continue;
@@ -145,11 +141,9 @@ impl ConcurrencyControl {
             oldest_tx = min(cur_tx, oldest_tx);
         }
 
-        ctx.wmk_info.oldest_tx.store(oldest_tx, Relaxed);
-
         let mut g_old = u64::MAX;
 
-        for w in &workers {
+        for w in workers.iter() {
             let cc = &w.cc;
 
             // no gc happened before
@@ -161,7 +155,7 @@ impl ConcurrencyControl {
                 continue;
             }
 
-            let local_wmk_old = cc.commit_tree.lcb(ctx.wmk_info.oldest_tx.load(Relaxed));
+            let local_wmk_old = cc.commit_tree.lcb(oldest_tx);
 
             cc.wmk_oldest_tx.store(local_wmk_old, Release);
 
@@ -174,13 +168,18 @@ impl ConcurrencyControl {
         }
 
         if g_old != u64::MAX {
-            ctx.wmk_info.update_wmk(g_old);
+            ctx.wmk_oldest.store(g_old, Release);
         }
     }
 
     #[allow(dead_code)]
     pub fn show(&self) {
         log::debug!("------------ cache ----------");
+        log::debug!(
+            "wmk_oldest_tx {} global_wmk_tx {}",
+            self.wmk_oldest_tx.load(Relaxed),
+            self.global_wmk_tx
+        );
         for i in 0..self.cached_cts.len() {
             let (s, c) = (self.cached_sts[i], self.cached_cts[i]);
             log::debug!("start {} commit {}", s, c);
@@ -201,7 +200,7 @@ impl CommitTree {
     pub fn new() -> Self {
         Self {
             log: Vec::new(),
-            cap: 0,
+            cap: coreid::cores_online(),
             lk: RwLock::new(()),
         }
     }
@@ -244,11 +243,6 @@ impl CommitTree {
         }
     }
 
-    pub fn update_cap(&mut self, cap: usize) {
-        let _lk = self.lk.write().expect("can't lock write");
-        self.cap = max(self.cap, cap);
-    }
-
     pub fn append(&mut self, start: u64, commit: u64) {
         let _lk = self.lk.write().expect("can't lock write");
         self.log.push((commit, start));
@@ -264,7 +258,7 @@ impl CommitTree {
         set.insert(self.log[self.log.len() - 1]);
         drop(rlk);
 
-        for w in ctx.workers().values() {
+        for w in ctx.workers().iter() {
             if this_worker == w.id {
                 continue;
             }
@@ -299,7 +293,6 @@ mod test {
     #[test]
     fn commit_tree() {
         let mut t = CommitTree::new();
-        t.update_cap(10);
 
         t.append(1, 2);
         t.append(3, 4);

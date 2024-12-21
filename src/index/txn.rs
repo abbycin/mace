@@ -2,11 +2,14 @@ use crate::{
     cc::{
         context::Context,
         data::Record,
-        wal::{IWalReader, PayloadType, WalDel, WalFileReader, WalPut, WalReplace, WalUpdate},
+        wal::{PayloadType, WalDel, WalFileReader, WalPut, WalReplace, WalUpdate},
         worker::SyncWorker,
     },
     index::{data::Value, tree::Tree, Key},
-    utils::{IsolationLevel, INIT_CMD},
+    utils::{
+        traits::{IKey, IVal},
+        IsolationLevel, INIT_CMD,
+    },
     OpCode,
 };
 use std::{
@@ -76,57 +79,167 @@ impl TxnKV {
         r
     }
 
-    pub fn put<K, V>(&self, k: K, v: V) -> Result<(), OpCode>
+    fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<Val<Record>>, OpCode>
     where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
+        F: FnMut(&Option<(Key, Val<Record>)>, u64, u32, SyncWorker) -> Result<(), OpCode>,
     {
         let start_ts = self.w.txn.start_ts;
-        let mut w = self.w;
-        let (wid, cmd_id) = (w.id, self.cmd_id());
-        let (key, v) = (Key::new(k.as_ref(), start_ts, cmd_id), v.as_ref());
+        let (wid, cmd_id) = (self.w.id, self.cmd_id());
+        let key = Key::new(k, start_ts, cmd_id);
+        let val = Value::Put(Record::normal(wid, unsafe {
+            // shutup compiler
+            std::slice::from_raw_parts(v.as_ptr(), v.len())
+        }));
 
-        w.txn.modified = true;
-        w.logging.record_update(
-            self.tree.id(),
-            start_ts,
-            cmd_id,
-            WalPut::new(key.raw.len(), v.len()),
-            key.raw,
-            v,
-        );
-        self.tree.put(key, Value::Put(Record::normal(wid, v)))
+        self.tree
+            .update(key, val, |opt| f(opt, start_ts, cmd_id, self.w))
     }
 
-    pub fn replace<T>(&self, k: T, v: T) -> Result<Val<Record>, OpCode>
+    fn put_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<(), OpCode> {
+        self.modify(k, v, |opt, start_ts, cmd_id, mut w| {
+            let r = match opt {
+                None => Ok(()),
+                Some((rk, rv)) => {
+                    let t = rv.unwrap();
+                    if rv.is_put()
+                        || !w
+                            .cc
+                            .is_visible_to(&self.ctx, self.w, t.worker_id(), start_ts, rk.txid)
+                    {
+                        Err(OpCode::AbortTx)
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            if r.is_ok() && !*logged {
+                *logged = true;
+                w.txn.modified = true;
+                w.logging
+                    .record_update(cmd_id, WalPut::new(k.len(), v.len()), k, [].as_slice(), v);
+            }
+            r
+        })
+        .map(|_| ())
+    }
+
+    fn update_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<Val<Record>, OpCode> {
+        self.modify(k, v, |opt, start_ts, cmd_id, mut w| match opt {
+            None => Err(OpCode::NotFound),
+            Some((rk, rv)) => {
+                if rv.is_del() {
+                    return Err(OpCode::NotFound);
+                }
+                let t = rv.unwrap();
+                if !w
+                    .cc
+                    .is_visible_to(&self.ctx, self.w, t.worker_id(), start_ts, rk.txid)
+                {
+                    return Err(OpCode::AbortTx);
+                }
+
+                if !*logged {
+                    w.txn.modified = true;
+                    *logged = true;
+                    w.logging.record_update(
+                        cmd_id,
+                        WalReplace::new(
+                            t.worker_id(),
+                            rk.cmd,
+                            rk.txid,
+                            rk.raw.len(),
+                            t.data().len(),
+                            v.len(),
+                        ),
+                        rk.raw,
+                        t.data(),
+                        v,
+                    );
+                }
+                Ok(())
+            }
+        })
+        .map(|x| x.unwrap())
+    }
+
+    pub fn put<T>(&self, k: T, v: T) -> Result<(), OpCode>
     where
         T: AsRef<[u8]>,
     {
-        let start_ts = self.w.txn.start_ts;
-        let mut w = self.w;
-        let (wid, cmd_id) = (w.id, self.cmd_id());
-        let (k, v) = (Key::new(k.as_ref(), start_ts, cmd_id), v.as_ref());
-        let (rk, rv) = self.tree.get::<Record>(k)?;
-        let t = rv.unwrap();
+        let mut logged = false;
+        self.put_impl(k.as_ref(), v.as_ref(), &mut logged)
+    }
 
-        if rv.is_put()
-            && w.cc
-                .is_visible_to(&self.ctx, self.w, t.worker_id(), start_ts, rk.txid)
-        {
-            w.txn.modified = true;
-            w.logging.record_update(
-                self.tree.id(),
-                start_ts,
-                cmd_id,
-                WalReplace::new(t.worker_id(), 0, rk.txid, k.raw.len(), v.len()),
-                k.raw,
-                t.data(),
-            );
-            self.tree.put(k, Value::Put(Record::normal(wid, v)))?;
-            Ok(rv)
-        } else {
-            Err(OpCode::AbortTx)
+    pub fn update<T>(&self, k: T, v: T) -> Result<Val<Record>, OpCode>
+    where
+        T: AsRef<[u8]>,
+    {
+        let mut logged = false;
+        self.update_impl(k.as_ref(), v.as_ref(), &mut logged)
+    }
+
+    pub fn upsert<T>(&self, k: T, v: T) -> Result<Option<Val<Record>>, OpCode>
+    where
+        T: AsRef<[u8]>,
+    {
+        let mut logged = false;
+        let (k, v) = (k.as_ref(), v.as_ref());
+
+        if self.put_impl(k, v, &mut logged).is_ok() {
+            return Ok(None);
         }
+
+        assert!(!logged);
+
+        self.update_impl(k, v, &mut logged).map(Some)
+    }
+
+    pub fn del<T>(&self, k: T) -> Result<Val<Record>, OpCode>
+    where
+        T: AsRef<[u8]>,
+    {
+        let mut w = self.w;
+        let (wid, start_ts) = (w.id, w.txn.start_ts);
+        let key = Key::new(k.as_ref(), start_ts, self.cmd_id());
+        let val = Value::Del(Record::remove(wid));
+        let mut logged = false;
+
+        self.tree
+            .update(key, val, |opt| match opt {
+                None => Err(OpCode::NotFound),
+                Some((rk, rv)) => {
+                    if rv.is_del() {
+                        return Err(OpCode::NotFound);
+                    }
+                    let t = rv.unwrap();
+                    if !w
+                        .cc
+                        .is_visible_to(&self.ctx, self.w, t.worker_id(), start_ts, rk.txid)
+                    {
+                        return Err(OpCode::AbortTx);
+                    }
+
+                    if !logged {
+                        logged = true;
+                        w.txn.modified = true;
+                        w.logging.record_update(
+                            key.cmd,
+                            WalDel::new(
+                                t.worker_id(),
+                                rk.cmd,
+                                rk.txid,
+                                rk.raw.len(),
+                                t.data().len(),
+                            ),
+                            rk.raw,
+                            t.data(),
+                            [].as_slice(),
+                        );
+                    }
+                    Ok(())
+                }
+            })
+            .map(|x| x.unwrap())
     }
 
     #[inline]
@@ -135,37 +248,6 @@ impl TxnKV {
         K: AsRef<[u8]>,
     {
         get_impl(&self.ctx, &self.tree, self.w, k, self.cmd_id()).map(|x| x.1)
-    }
-
-    pub fn del<K>(&self, k: K) -> Result<Val<Record>, OpCode>
-    where
-        K: AsRef<[u8]>,
-    {
-        let mut w = self.w;
-        let (wid, start_ts) = (w.id, w.txn.start_ts);
-        let key = Key::new(k.as_ref(), self.w.txn.start_ts, self.cmd_id());
-        let (rk, rv) = self.tree.get::<Record>(key)?;
-
-        debug_assert_eq!(rk.raw, key.raw);
-        let t = rv.unwrap();
-        if rv.is_put()
-            && w.cc
-                .is_visible_to(&self.ctx, self.w, t.worker_id(), start_ts, rk.txid)
-        {
-            w.txn.modified = true;
-            w.logging.record_update(
-                self.tree.id(),
-                start_ts,
-                key.cmd,
-                WalDel::new(t.worker_id(), rk.cmd, rk.txid, rk.raw.len(), t.data().len()),
-                rk.raw,
-                t.data(),
-            );
-            self.tree.del(key, Value::Del(Record::remove(wid)))?;
-            Ok(rv)
-        } else {
-            Err(OpCode::AbortTx)
-        }
     }
 }
 
@@ -198,11 +280,11 @@ impl Tx {
             "only SI is supported at present"
         );
 
-        let mut w = self.ctx.get_worker();
+        let mut w = self.ctx.worker(coreid::current_core());
         let id = w.id;
         w.txn.reset(start_ts, level);
         w.tx_id.store(start_ts, Relaxed);
-        w.cc.global_wmk_tx = self.ctx.wmk_info.wmk_odlest.load(Relaxed);
+        w.cc.global_wmk_tx = self.ctx.wmk_oldest.load(Relaxed);
         w.cc.commit_tree.compact(&self.ctx, id);
         w
     }
@@ -218,7 +300,8 @@ impl Tx {
     pub fn begin(&self, level: IsolationLevel) -> TxnKV {
         let start_ts = self.ctx.alloc_oracle();
         let mut w = self.init(level, start_ts);
-        w.logging.record_begin(start_ts);
+        w.logging.reset(self.tree.id() as u16, start_ts);
+        w.logging.record_begin();
         TxnKV::new(self.ctx.clone(), self.tree.clone(), w)
     }
 
@@ -229,7 +312,7 @@ impl Tx {
         let txid = txn.start_ts;
 
         if !w.txn.modified {
-            w.logging.record_commit(txid);
+            w.logging.record_commit();
             w.logging.record_end(txid);
             kv.unbind_core();
             return;
@@ -245,7 +328,7 @@ impl Tx {
         // we have no remote dependency, since we are append-only
         w.logging.append_txn(txn);
 
-        w.logging.record_commit(txid);
+        w.logging.record_commit();
         w.cc.collect_wmk(&self.ctx);
         w.logging.wait_commit(txn.commit_ts);
         w.logging.record_end(txid);
@@ -259,18 +342,21 @@ impl Tx {
                 let ins = update.put();
                 let k = Key::new(ins.key(), txid, kv.cmd_id());
                 let v = Value::Del(Record::remove(w.id));
-                self.tree.del(k, v).expect("can't be wrong");
+                log::debug!("rollback insert {} {}", k.to_string(), v.to_string());
+                self.tree.put(k, v).expect("can't be wrong");
             }
             PayloadType::Update => {
                 let upd = update.update();
                 let k = Key::new(upd.key(), txid, kv.cmd_id());
-                let v = Value::Put(Record::normal(upd.wid(), upd.val()));
+                let v = Value::Put(Record::normal(upd.wid(), upd.old_val()));
+                log::debug!("rollback update {} {}", k.to_string(), v.to_string());
                 self.tree.put(k, v).expect("can't be wrong");
             }
             PayloadType::Delete => {
                 let del = update.del();
                 let k = Key::new(del.key(), txid, kv.cmd_id());
                 let v = Value::Put(Record::normal(w.id, del.val()));
+                log::debug!("rollback delete {} {}", k.to_string(), v.to_string());
                 self.tree.put(k, v).expect("can't be wrong");
             }
         }
@@ -283,7 +369,8 @@ impl Tx {
         let len = self.ctx.commiter.wal_len() as u64;
         let mut reader = WalFileReader::new(self.ctx.opt.wal_file(), len);
 
-        reader.read_txn(txid, |update| {
+        reader.collect(txid);
+        reader.apply(|update| {
             self.rollback_impl(update, kv, w, txid);
         });
     }
@@ -293,7 +380,7 @@ impl Tx {
         let mut w = kv.w;
         let txid = w.txn.start_ts;
 
-        w.logging.record_abort(txid);
+        w.logging.record_abort();
 
         if w.txn.modified {
             w.logging.wait_flush();
@@ -307,7 +394,7 @@ impl Tx {
 
 #[cfg(test)]
 mod test {
-    use crate::{utils::IsolationLevel, Db, OpCode, Options, RandomPath};
+    use crate::{utils::IsolationLevel, Mace, OpCode, Options, RandomPath};
 
     #[test]
     fn txnkv() -> Result<(), OpCode> {
@@ -315,7 +402,7 @@ mod test {
         let _ = std::fs::remove_dir_all(&*path);
         let mut opt = Options::new(&*path);
         opt.bind_core = true;
-        let db = Db::open(opt)?;
+        let db = Mace::open(opt)?;
         let (k1, k2) = ("beast".as_bytes(), "senpai".as_bytes());
         let (v1, v2) = ("114514".as_bytes(), "1919810".as_bytes());
         let tx = db.default();
@@ -374,6 +461,63 @@ mod test {
             tx.commit(kv);
         }
 
+        {
+            let kv = tx.begin(IsolationLevel::SI);
+            kv.put("1", "10")?;
+            tx.commit(kv);
+
+            let kv = tx.begin(IsolationLevel::SI);
+            kv.update("1", "11").expect("can't replace");
+            tx.rollback(kv);
+
+            let kv = tx.view(IsolationLevel::SI);
+            let x = kv.get("1").expect("can't get");
+            assert_eq!(x.data(), "10".as_bytes());
+        }
+
+        {
+            let kv = tx.begin(IsolationLevel::SI);
+            kv.put("2", "20")?;
+            kv.update("2", "21")?;
+            let r = kv.get("2").unwrap();
+            assert_eq!(r.data(), "21".as_bytes());
+            kv.del("2")?;
+            tx.rollback(kv);
+
+            let kv = tx.view(IsolationLevel::SI);
+            let x = kv.get("2");
+            assert!(x.is_err());
+        }
+
+        let tx = db.get("upsert").unwrap();
+
+        {
+            let kv = tx.begin(IsolationLevel::SI);
+            kv.put("1", "10")?;
+            tx.commit(kv);
+
+            let kv = tx.begin(IsolationLevel::SI);
+            kv.upsert("1", "11").expect("can't replace");
+            tx.rollback(kv);
+
+            let kv = tx.view(IsolationLevel::SI);
+            let x = kv.get("1").expect("can't get");
+            assert_eq!(x.data(), "10".as_bytes());
+        }
+
+        {
+            let kv = tx.begin(IsolationLevel::SI);
+            kv.put("2", "20")?;
+            kv.upsert("2", "21")?;
+            let r = kv.get("2").unwrap();
+            assert_eq!(r.data(), "21".as_bytes());
+            kv.del("2")?;
+            tx.rollback(kv);
+
+            let kv = tx.view(IsolationLevel::SI);
+            let x = kv.get("2");
+            assert!(x.is_err());
+        }
         Ok(())
     }
 }

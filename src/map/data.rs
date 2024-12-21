@@ -124,6 +124,7 @@ impl FrameOwner {
         };
         this.flag = FrameFlag::Unknown;
         this.size = size as u32;
+        this.pid = 0;
         this
     }
 

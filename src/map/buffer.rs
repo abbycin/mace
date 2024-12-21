@@ -419,9 +419,9 @@ impl Buffers {
     }
 
     /// NOTE: the loaded buffer is with a frame, and the return value is offset after the frame
-    pub fn load(&self, addr: u64) -> Result<Arc<FrameOwner>, OpCode> {
+    pub fn load(&self, addr: u64) -> Arc<FrameOwner> {
         if let Some(x) = self.cache.get(addr) {
-            return Ok(x);
+            return x;
         }
 
         let (id, off) = decode_u64(addr);
@@ -429,7 +429,7 @@ impl Buffers {
         if let Some(a) = self.pool.get(id) {
             let x = FrameOwner::from(a.load(off));
             debug_assert_eq!(x.addr(), addr);
-            return Ok(self.copy_to_cache(addr, x));
+            return self.copy_to_cache(addr, x);
         }
 
         // NOTE: multiple threads may load data from the same addr, we allow this to happen, since
@@ -447,10 +447,10 @@ impl Buffers {
         }
     }
 
-    fn load_frame(&self, r: &FileReader, addr: u64, off: u32) -> Result<Arc<FrameOwner>, OpCode> {
+    fn load_frame(&self, r: &FileReader, addr: u64, off: u32) -> Arc<FrameOwner> {
         let f = r.read_addr(off);
         let a = Arc::new(f);
         self.cache.put(addr, a.clone());
-        Ok(a)
+        a
     }
 }

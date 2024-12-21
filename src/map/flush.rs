@@ -41,12 +41,18 @@ struct PageFileBuilder {
 
 impl PageFileBuilder {
     fn new(path: PathBuf) -> Self {
-        let file = File::options()
+        let file = match File::options()
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)
-            .expect("can't create page file");
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("{}", e);
+                panic!("can't open file {}", e);
+            }
+        };
 
         Self {
             file,
@@ -98,12 +104,18 @@ struct MapFileBuilder {
 
 impl MapFileBuilder {
     fn new(file_id: u32, path: PathBuf) -> Self {
-        let file = File::options()
+        let file = match File::options()
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)
-            .expect("can't create map file");
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("{}", e);
+                panic!("can't open file {}", e);
+            }
+        };
 
         Self {
             file,

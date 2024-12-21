@@ -87,6 +87,8 @@ pub struct Logging {
     wait_txn: RwLock<VecDeque<Transaction>>,
     buffer: Block,
     ctx: Arc<GroupCommitter>,
+    txid: u64,
+    tree_id: u16,
 }
 
 unsafe impl Sync for Logging {}
@@ -192,16 +194,16 @@ impl Logging {
         self.desc.update_wal(new_tail);
     }
 
-    pub fn record_update<T>(&mut self, tree: u64, txid: u64, cmd: u32, w: T, k: &[u8], v: &[u8])
+    pub fn record_update<T>(&mut self, cmd: u32, w: T, k: &[u8], ov: &[u8], nv: &[u8])
     where
         T: IWalCodec,
     {
-        let payload_size = w.encoded_len() + k.len() + v.len();
+        let payload_size = w.encoded_len() + k.len() + ov.len() + nv.len();
         let gsn = self.ctx.gsn.fetch_add(1, Relaxed);
         let u = WalUpdate::new(
-            tree as u16,
+            self.tree_id,
             self.worker_id,
-            txid,
+            self.txid,
             cmd,
             payload_size,
             gsn,
@@ -209,11 +211,11 @@ impl Logging {
         );
         self.prev_gsn = gsn; // update to latest one
         let a = self.alloc_entry(u.encoded_len() + payload_size);
-        let mut b = LogBuilder::new(self, a, txid, gsn);
-        b.add(u).add(w).add(k).add(v).build();
+        let mut b = LogBuilder::new(self, a, self.txid, gsn);
+        b.add(u).add(w).add(k).add(ov).add(nv).build();
     }
 
-    fn add_entry<T: IWalCodec>(&mut self, w: T, txid: u64) {
+    fn add_entry<T: IWalCodec>(&mut self, w: T) {
         let size = w.encoded_len();
         let a = self.alloc_entry(size);
         w.encode_to(a.sub_array(0, size));
@@ -221,47 +223,43 @@ impl Logging {
         self.desc.set(&WalDesc {
             version: 0,
             gsn: self.ctx.gsn.fetch_add(1, Relaxed),
-            txid,
+            txid: self.txid,
             wal_tail: old + size,
         });
     }
 
-    pub fn record_begin(&mut self, txid: u64) {
-        self.add_entry(
-            WalBegin {
-                wal_type: EntryType::Begin,
-                txid,
-            },
-            txid,
-        );
+    pub fn reset(&mut self, tree_id: u16, start_ts: u64) {
+        self.tree_id = tree_id;
+        self.txid = start_ts;
+    }
+
+    pub fn record_begin(&mut self) {
+        self.add_entry(WalBegin {
+            wal_type: EntryType::Begin,
+            txid: self.txid,
+        });
     }
 
     pub fn record_end(&mut self, txid: u64) {
-        self.add_entry(
-            WalEnd {
-                wal_type: EntryType::End,
-                txid,
-            },
+        self.add_entry(WalEnd {
+            wal_type: EntryType::End,
             txid,
-        );
+        });
     }
 
-    pub fn record_commit(&mut self, txid: u64) {
-        self.add_entry(
-            WalCommit {
-                wal_type: EntryType::Commit,
-                txid,
-            },
-            txid,
-        );
+    pub fn record_commit(&mut self) {
+        self.add_entry(WalCommit {
+            wal_type: EntryType::Commit,
+            txid: self.txid,
+        });
     }
 
-    pub fn record_abort(&mut self, txid: u64) {
+    pub fn record_abort(&mut self) {
         let w = WalAbort {
             wal_type: EntryType::Abort,
-            txid,
+            txid: self.txid,
         };
-        self.add_entry(w, txid);
+        self.add_entry(w);
     }
 
     pub fn record_clr(&mut self, txid: u64, next_undo_gsn: u64) {
@@ -270,7 +268,7 @@ impl Logging {
             txid,
             next_undo_gsn,
         };
-        self.add_entry(w, txid);
+        self.add_entry(w);
     }
 
     // FIXME: recover `prev_gsn`
@@ -287,6 +285,8 @@ impl Logging {
             wait_txn: RwLock::new(VecDeque::new()),
             buffer,
             ctx,
+            txid: 0,
+            tree_id: 0,
         }
     }
 
@@ -363,7 +363,7 @@ impl GroupCommitter {
         }
     }
 
-    pub(crate) fn run(&self, workers: Arc<RwLock<HashMap<usize, SyncWorker>>>) {
+    pub(crate) fn run(&self, workers: Arc<Vec<SyncWorker>>) {
         let mut desc = HashMap::new();
 
         while self.state.load(Relaxed) == GC_WORKING {
@@ -395,13 +395,13 @@ impl GroupCommitter {
 
     fn collect(
         &self,
-        workers: &Arc<RwLock<HashMap<usize, SyncWorker>>>,
+        workers: &Arc<Vec<SyncWorker>>,
         desc: &mut HashMap<u16, WalDesc>,
     ) -> (u64, u64) {
         let mut min_flush_gsn = u64::MAX;
         let mut min_flush_txid = u64::MAX;
 
-        for (_, w) in workers.read().expect("can't lock read").iter() {
+        for w in workers.iter() {
             let mut d = if let Some(x) = desc.get(&w.id) {
                 *x
             } else {
@@ -471,12 +471,12 @@ impl GroupCommitter {
 
     fn commit_txn(
         &self,
-        workers: &Arc<RwLock<HashMap<usize, SyncWorker>>>,
+        workers: &Arc<Vec<SyncWorker>>,
         min_flush_txid: u64,
         min_flush_gsn: u64,
         desc: &HashMap<u16, WalDesc>,
     ) {
-        for (_, w) in workers.read().expect("can't lock read").iter() {
+        for w in workers.iter() {
             let Some(d) = desc.get(&w.id) else {
                 continue;
             };
@@ -541,7 +541,8 @@ mod test {
         let buffer_size = 512;
         let mut l = Logging::new(ctx, buffer_size, 0);
 
-        l.record_begin(1);
+        l.reset(0, 1);
+        l.record_begin();
         let mut desc = WalDesc::default();
         l.desc.get(&mut desc);
         assert_eq!(desc.wal_tail, size_of::<WalBegin>());
@@ -550,7 +551,7 @@ mod test {
 
         let (k, v) = ("mo".as_bytes(), "ha".as_bytes());
         let ins = WalPut::new(2, 2);
-        l.record_update(1, 1, 1, ins, k, v);
+        l.record_update(1, ins, k, [].as_slice(), v);
 
         l.desc.get(&mut desc);
         let size = size_of::<WalBegin>()

@@ -27,7 +27,8 @@ use crate::{
 use core::str;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 #[derive(Clone, Copy)]
@@ -132,11 +133,19 @@ impl IPageIter for RegistryIter<'_> {
     }
 }
 
+const NR_LOCKS: usize = 64;
+const LOCKS_MASK: usize = NR_LOCKS - 1;
+
+#[derive(Clone, Copy)]
+#[repr(align(64))]
+struct CachePadding;
+
 #[derive(Clone)]
 pub struct Tree {
     store: Arc<Store>,
     root_index: Index,
     name: Arc<String>,
+    locks: Arc<[Mutex<CachePadding>; NR_LOCKS]>,
 }
 
 #[derive(Clone)]
@@ -210,7 +219,7 @@ impl Registry {
             return Err(OpCode::Again);
         }
         map.remove(&tree.root_index.pid);
-        self.tree.del::<&[u8]>(
+        self.tree.put::<&[u8]>(
             Key::new(tree.name().as_bytes(), 0, 0),
             Value::Del([].as_slice()),
         )
@@ -223,6 +232,7 @@ impl Tree {
             store: store.clone(),
             root_index: Index::new(root_pid, 0),
             name: Arc::new(name),
+            locks: Arc::new([const { Mutex::new(CachePadding) }; NR_LOCKS]),
         }
     }
 
@@ -231,6 +241,7 @@ impl Tree {
             store: store.clone(),
             root_index: Index::new(root_pid, 0),
             name: Arc::new(name),
+            locks: Arc::new([const { Mutex::new(CachePadding) }; NR_LOCKS]),
         };
 
         // build an empty page with no key-value
@@ -263,6 +274,12 @@ impl Tree {
         self.root_index.pid == ROOT_PID
     }
 
+    fn lock(&self, key: u64) -> MutexGuard<CachePadding> {
+        self.locks[key as usize & LOCKS_MASK]
+            .lock()
+            .expect("can't lock")
+    }
+
     fn walk_page<F, K, V>(&self, mut addr: u64, mut f: F) -> Result<(), OpCode>
     where
         F: FnMut(Arc<FrameOwner>, u64, Page<K, V>) -> bool,
@@ -270,7 +287,7 @@ impl Tree {
         V: IVal,
     {
         while addr != 0 {
-            let frame = self.store.buffer.load(addr).expect("can't load addr");
+            let frame = self.store.buffer.load(addr);
             let page = Page::<K, V>::from(frame.payload());
             let next = page.header().link();
 
@@ -301,17 +318,17 @@ impl Tree {
         }
     }
 
-    fn page_view<'b>(&self, pid: u64, range: Range<'b>) -> Result<View<'b>, OpCode> {
+    fn page_view<'b>(&self, pid: u64, range: Range<'b>) -> View<'b> {
         let addr = self.store.page.get(pid);
         assert_ne!(addr, 0);
-        let f = self.store.buffer.load(addr)?;
+        let f = self.store.buffer.load(addr);
         let b = f.payload();
-        Ok(View {
+        View {
             page_id: pid,
             page_addr: addr,
             info: b.into(),
             range,
-        })
+        }
     }
 
     fn try_find_leaf<T>(
@@ -327,7 +344,7 @@ impl Tree {
         let mut parent = None;
 
         loop {
-            let view = self.page_view(index.pid, range)?;
+            let view = self.page_view(index.pid, range);
 
             // split may happen during search, in this case new created node are
             // not inserted into parent yet, the insert is halfly done, the
@@ -447,7 +464,7 @@ impl Tree {
                     // for non-root page, we can retry update unless the epoch
                     // was changed
                     if view.page_id != self.root_index.pid {
-                        let f = self.store.buffer.load(cur_addr)?;
+                        let f = self.store.buffer.load(cur_addr);
                         let b = f.payload();
                         let hdr: PageHeader = b.into();
                         // no split happen
@@ -480,12 +497,119 @@ impl Tree {
         }
     }
 
-    pub fn del<T>(&self, key: Key, val: Value<T>) -> Result<(), OpCode>
+    fn search<T>(&self, addr: u64, key: &Key) -> Option<(Key, Val<T>)>
     where
         T: IValCodec,
     {
-        debug_assert!(val.is_del());
-        self.put(key, val)
+        let mut r = None;
+        let _ = self.walk_page(addr, |f, _, pg: Page<Key, Value<T>>| {
+            let h = pg.header();
+
+            if !h.is_data() {
+                return false;
+            }
+            debug_assert!(h.is_leaf());
+            if let Ok(pos) = pg.search_raw(key) {
+                let (k, v) = pg.get(pos).unwrap();
+                r = Some((k, Val::new(v, f.clone())));
+                return true;
+            }
+            false
+        });
+        r
+    }
+
+    pub fn try_update<T, V>(
+        &self,
+        hash: u64,
+        key: &Key,
+        val: &Value<T>,
+        visible: &mut V,
+    ) -> Result<Option<Val<T>>, OpCode>
+    where
+        T: IValCodec,
+        V: FnMut(&Option<(Key, Val<T>)>) -> Result<(), OpCode>,
+    {
+        let mut txn = self.begin();
+        let (mut view, _) = self.find_leaf::<T>(&mut txn, key).unwrap();
+        if self.need_split(&view) && self.split::<T>(&mut txn, view).is_ok() {
+            return Err(OpCode::Again);
+        }
+
+        let mut delta = Delta::new(DeltaType::Data, NodeType::Leaf).with_item((*key, *val));
+        // NOTE: restrict logical node size
+        if delta.size() > self.store.opt.page_size_threshold {
+            return Err(OpCode::TooLarge);
+        }
+        let (new_addr, mut new_page) = txn.alloc(delta.size())?;
+        debug_assert!(new_addr > view.page_addr);
+        delta.build(&mut new_page);
+
+        let guard = self.lock(hash);
+
+        let r = self.search(view.page_addr, key);
+        visible(&r)?;
+
+        loop {
+            let h = new_page.header_mut();
+            h.set_link(view.page_addr);
+            h.set_depth(view.info.depth().saturating_add(1));
+            h.set_epoch(view.info.epoch());
+
+            match txn.update(view.page_id, view.page_addr, new_addr) {
+                Ok(_) => {
+                    view.page_addr = new_addr;
+                    view.info = *h;
+                    break;
+                }
+                Err(cur_addr) => {
+                    // root split never update it's epoch, we don't know whether
+                    // it split, so retry from the very beginning
+                    // for non-root page, we can retry update unless the epoch
+                    // was changed
+                    if view.page_id != self.root_index.pid {
+                        let f = self.store.buffer.load(cur_addr);
+                        let b = f.payload();
+                        let hdr: PageHeader = b.into();
+                        // no split happen
+                        if hdr.epoch() == view.info.epoch() {
+                            view.page_addr = cur_addr;
+                            view.info = hdr;
+                            continue;
+                        }
+                    }
+                    return Err(OpCode::Again);
+                }
+            }
+        }
+
+        drop(guard);
+
+        let _ = self.try_consolidate::<T>(&mut txn, view);
+        Ok(r.map(|x| x.1.clone()))
+    }
+
+    // NOTE: the `visible` function may be called multiple times
+    pub fn update<T, V>(
+        &self,
+        key: Key,
+        val: Value<T>,
+        mut visible: V,
+    ) -> Result<Option<Val<T>>, OpCode>
+    where
+        T: IValCodec,
+        V: FnMut(&Option<(Key, Val<T>)>) -> Result<(), OpCode>,
+    {
+        let mut hasher = DefaultHasher::new();
+        key.raw.hash(&mut hasher);
+        let h = hasher.finish();
+        loop {
+            match self.try_update(h, &key, &val, &mut visible) {
+                Ok(x) => return Ok(x),
+                Err(OpCode::Again) => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -522,7 +646,7 @@ impl Tree {
                             decode_u64(addr)
                         );
                         if let Some(s) = v.sibling() {
-                            let f = self.store.buffer.load(s.addr()).unwrap();
+                            let f = self.store.buffer.load(s.addr());
                             let slotted = SlottedPage::<Ver, T>::from(f.payload());
                             slotted.show();
                         }
@@ -576,7 +700,7 @@ impl Tree {
     {
         let ver = Ver::new(start_ts, NULL_CMD);
         while addr != 0 {
-            let frame = self.store.buffer.load(addr).expect("bad addr");
+            let frame = self.store.buffer.load(addr);
             let page = SlottedPage::<Ver, T>::from(frame.payload());
             let h = page.header();
 
@@ -722,7 +846,7 @@ impl Tree {
 
     fn get_txid(&self) -> u64 {
         use std::sync::atomic::Ordering::Relaxed;
-        self.store.context.wmk_info.wmk_odlest.load(Relaxed)
+        self.store.context.wmk_oldest.load(Relaxed)
     }
 
     fn do_consolidate<'a, F, I, K, V>(
@@ -771,7 +895,7 @@ impl Tree {
         let (ptr, len) = (src_key.raw.as_ptr(), src_key.raw.len());
 
         while addr != 0 {
-            let frame = self.store.buffer.load(addr).expect("invalid addr");
+            let frame = self.store.buffer.load(addr);
             let pg = SlottedPage::<Ver, T>::from(frame.payload());
             let h = pg.header();
             txn.pin_frame(&frame);
@@ -913,7 +1037,8 @@ impl Tree {
         // it's important to apply split-delta's epoch to left entry, this will
         // prevent parent_update from being executed again for the same delta
         let lidx = Index::new(view.page_id, view.info.epoch());
-        let b = self.store.buffer.load(view.page_addr)?.payload();
+        let f = self.store.buffer.load(view.page_addr);
+        let b = f.payload();
         let page = Page::from(b);
         let (split_key, split_idx) = {
             // the `page` is a `split-delta` see `Self::split_non_root`
@@ -978,7 +1103,7 @@ impl Tree {
         // reset delta chain (either put to left or right child may cause error)
         assert_eq!(view.info.depth(), 1);
 
-        let f = self.store.buffer.load(view.page_addr)?;
+        let f = self.store.buffer.load(view.page_addr);
         let b = f.payload();
         let page = Page::<K, V>::from(b);
         let Some((sep_key, li, ri)) = Self::find_page_splitter(page) else {
@@ -1023,7 +1148,7 @@ impl Tree {
             return self.split_root::<K, V>(txn, view);
         }
 
-        let f = self.store.buffer.load(view.page_addr)?;
+        let f = self.store.buffer.load(view.page_addr);
         let b = f.payload();
         let page = Page::<K, V>::from(b);
         let Some((sep, _, ri)) = Self::find_page_splitter(page) else {
@@ -1118,7 +1243,7 @@ mod test {
     }
 
     fn del_test(t: &Tree, k: Key, v: Value<&[u8]>) {
-        t.del(k, v).unwrap();
+        t.put(k, v).unwrap();
     }
 
     #[test]

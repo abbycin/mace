@@ -15,9 +15,3 @@ async_io = { path = "deps/async_io" }
 
 [dev-dependencies]
 logger = { path = "deps/logger" }
-
-[[example]]
-name = "basic"
-
-[[test]]
-name = "tree"

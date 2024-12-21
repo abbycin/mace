@@ -1,6 +1,7 @@
 #![allow(unused)]
 
 use std::{
+    cmp::min,
     ffi::c_int,
     fs::File,
     io,
@@ -17,6 +18,8 @@ use crate::{
 
 pub(crate) trait IWalCodec {
     fn encoded_len(&self) -> usize;
+
+    fn size() -> usize;
 
     fn encode_to(&self, b: ByteArray);
 
@@ -178,8 +181,12 @@ macro_rules! impl_codec {
                 size_of::<Self>()
             }
 
+            fn size() -> usize {
+                size_of::<Self>()
+            }
+
             fn encode_to(&self, b: ByteArray) {
-                let src = to_slice(self);
+                let src = self.to_slice();
                 debug_assert_eq!(src.len(), b.len());
                 let dst = b.as_mut_slice(0, b.len());
                 dst.copy_from_slice(src);
@@ -247,7 +254,8 @@ pub(crate) struct WalReplace {
     prev_cmd: u32,
     prev_txid: u64,
     pub(crate) klen: u32,
-    pub(crate) vlen: u32,
+    pub(crate) ov_len: u32,
+    pub(crate) nv_len: u32,
 }
 
 impl WalReplace {
@@ -256,7 +264,8 @@ impl WalReplace {
         prev_cmd: u32,
         prev_txid: u64,
         klen: usize,
-        vlen: usize,
+        ov_len: usize,
+        nv_len: usize,
     ) -> Self {
         Self {
             payload_type: PayloadType::Update,
@@ -264,7 +273,8 @@ impl WalReplace {
             prev_cmd,
             prev_txid,
             klen: klen as u32,
-            vlen: vlen as u32,
+            ov_len: ov_len as u32,
+            nv_len: nv_len as u32,
         }
     }
 
@@ -283,8 +293,15 @@ impl WalReplace {
         self.get(size_of::<Self>(), self.klen as usize)
     }
 
-    pub(crate) fn val(&self) -> &[u8] {
-        self.get(size_of::<Self>() + self.klen as usize, self.vlen as usize)
+    pub(crate) fn old_val(&self) -> &[u8] {
+        self.get(size_of::<Self>() + self.klen as usize, self.ov_len as usize)
+    }
+
+    pub(crate) fn new_val(&self) -> &[u8] {
+        self.get(
+            size_of::<Self>() + (self.klen + self.ov_len) as usize,
+            self.nv_len as usize,
+        )
     }
 }
 
@@ -336,10 +353,16 @@ impl IWalCodec for &[u8] {
         self.len()
     }
 
+    fn size() -> usize {
+        unreachable!("slice has no static size")
+    }
+
     fn encode_to(&self, b: ByteArray) {
         debug_assert_eq!(self.len(), b.len());
-        let dst = b.as_mut_slice(0, b.len());
-        dst.copy_from_slice(self);
+        if b.len() != 0 {
+            let dst = b.as_mut_slice(0, b.len());
+            dst.copy_from_slice(self);
+        }
     }
 
     fn to_slice(&self) -> &[u8] {
@@ -347,190 +370,121 @@ impl IWalCodec for &[u8] {
     }
 }
 
-fn to_slice<T>(x: &T) -> &[u8] {
-    unsafe {
-        let ptr = x as *const T as *const u8;
-        std::slice::from_raw_parts(ptr, size_of::<T>())
-    }
-}
-
-pub(crate) trait IWalReader {
-    fn ok(&self) -> bool;
-
-    fn offset(&self) -> u64;
-
-    fn inc_offset(&mut self, count: usize);
-
-    fn len(&self) -> u64;
-
-    fn read_at(&mut self, buf: &mut [u8], off: u64) -> io::Result<()>;
-
-    fn apply_update<F>(&mut self, off: u64, len: usize, f: F)
-    where
-        F: FnMut(&WalUpdate);
-
-    fn read_txn<F>(&mut self, txn: u64, mut f: F)
-    where
-        F: FnMut(&WalUpdate),
-    {
-        // assume all entry headers size is less than 64
-        let mut buf = [0u8; 64];
-        while self.ok() {
-            if let Err(e) = self.read_at(&mut buf, self.offset()) {
-                log::info!("read wal error {}", e);
-                break;
-            }
-            let ty: EntryType = buf[0].into();
-            match ty {
-                EntryType::Padding => {
-                    let pad = ptr_to::<WalPadding>(buf.as_mut_ptr());
-                    self.inc_offset(pad.encoded_len() + pad.len as usize);
-                }
-                EntryType::Update => {
-                    let u = ptr_to::<WalUpdate>(buf.as_mut_ptr());
-                    let len = u.encoded_len() + u.size as usize;
-                    if u.tx_id != txn {
-                        self.inc_offset(len);
-                        continue;
-                    }
-                    let len = u.encoded_len() + u.size as usize;
-                    self.apply_update(self.offset(), len, &mut f);
-                    self.inc_offset(len);
-                }
-                EntryType::Clr => {
-                    let c = ptr_to::<WalCLR>(buf.as_mut_ptr());
-                    self.inc_offset(c.encoded_len());
-                }
-                EntryType::Abort | EntryType::Begin | EntryType::Commit | EntryType::End => {
-                    let w = ptr_to::<WalBegin>(buf.as_mut_ptr());
-                    self.inc_offset(size_of::<WalBegin>());
-                }
-                EntryType::CkptBeg => {
-                    self.inc_offset(size_of::<WalCkptBeg>());
-                }
-                EntryType::CkptEnd => {
-                    let c = ptr_to::<WalCkptEnd>(buf.as_mut_ptr());
-                    self.inc_offset(c.active_txn as usize * size_of::<u64>());
-                }
-                _ => panic!("invalid wal"),
-            }
-        }
-    }
-}
-
-pub(crate) struct WalBufReader {
-    data: *mut u8,
-    pos: usize,
-    end: usize,
-}
-
-impl WalBufReader {
-    pub(crate) fn new(data: *mut u8, beg: usize, end: usize) -> Self {
-        Self {
-            data,
-            pos: beg,
-            end,
-        }
-    }
-}
-
-impl IWalReader for WalBufReader {
-    fn ok(&self) -> bool {
-        self.pos != self.end
-    }
-
-    fn offset(&self) -> u64 {
-        self.pos as u64
-    }
-
-    fn inc_offset(&mut self, count: usize) {
-        self.pos += count;
-    }
-
-    fn len(&self) -> u64 {
-        (self.end - self.pos) as u64
-    }
-
-    fn read_at(&mut self, buf: &mut [u8], off: u64) -> io::Result<()> {
-        if buf.len() + off as usize > self.end {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "end of buffer",
-            ));
-        }
-        let src = unsafe { std::slice::from_raw_parts(self.data.add(off as usize), buf.len()) };
-        buf.copy_from_slice(src);
-        Ok(())
-    }
-
-    fn apply_update<F>(&mut self, off: u64, len: usize, mut f: F)
-    where
-        F: FnMut(&WalUpdate),
-    {
-        debug_assert!(off as usize + len <= self.end);
-        let ptr = unsafe { self.data.add(off as usize).cast::<WalUpdate>() };
-        let u = raw_ptr_to_ref(ptr);
-        f(u);
-    }
-}
-
 pub(crate) struct WalFileReader {
     page_size: usize,
-    // file: c_int,
     file: File,
     pos: u64,
     eof: u64,
+    wal: Vec<(u64, usize)>,
 }
 
 impl WalFileReader {
     pub(crate) fn new(path: PathBuf, wal_len: u64) -> Self {
-        // let file = AsyncIO::fopen(path, false);
-        let file = File::options().read(true).open(path).unwrap();
+        let file = match File::options().read(true).open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("{}", e);
+                panic!("can't open file {}", e);
+            }
+        };
         Self {
             page_size: AsyncIO::page_size(),
             file,
             pos: 0,
             eof: wal_len,
+            wal: Vec::new(),
         }
     }
 
     pub(crate) fn seek_to_checkpoint(&mut self) {
         // checkpoint is not supported for now
     }
-}
-
-impl IWalReader for WalFileReader {
-    fn ok(&self) -> bool {
-        self.offset() < self.len()
-    }
-
-    fn offset(&self) -> u64 {
-        self.pos
-    }
 
     fn inc_offset(&mut self, count: usize) {
         self.pos += count as u64;
     }
 
-    fn len(&self) -> u64 {
-        self.eof
+    fn valid(ty: EntryType, len: usize) -> bool {
+        let sz = match ty {
+            EntryType::Abort | EntryType::Begin | EntryType::Commit | EntryType::End => {
+                WalAbort::size()
+            }
+            EntryType::Update => WalUpdate::size(),
+            EntryType::Clr => WalCLR::size(),
+            EntryType::Padding => WalPadding::size(),
+            EntryType::CkptBeg => WalCkptBeg::size(),
+            EntryType::CkptEnd => WalCkptEnd::size(),
+            _ => unreachable!("invalid type {}", ty as u8),
+        };
+        len >= sz
     }
 
-    fn read_at(&mut self, buf: &mut [u8], off: u64) -> io::Result<()> {
-        // AsyncIO::fread(self.file, buf, off)
-        self.file.read_exact_at(buf, off)
-    }
-
-    fn apply_update<F>(&mut self, off: u64, len: usize, mut f: F)
+    pub fn apply<F>(&mut self, mut f: F)
     where
         F: FnMut(&WalUpdate),
     {
-        // let e = Block::aligned_alloc(len, self.page_size);
-        let mut e = Block::alloc(len);
-        self.read_at(e.get_mut_slice(0, len), off)
-            .expect("can't be wrong");
-        let u = raw_ptr_to_ref(e.data().cast::<WalUpdate>());
-        f(u);
+        let mut e = Block::alloc(4096);
+        while let Some((pos, size)) = self.wal.pop() {
+            if e.len() < size {
+                e.realloc(size);
+            }
+            self.file
+                .read_exact_at(e.get_mut_slice(0, size), pos)
+                .expect("can't be wrong");
+            let u = raw_ptr_to_ref(e.data().cast::<WalUpdate>());
+            f(u);
+        }
+    }
+
+    pub fn collect(&mut self, txn: u64) {
+        // assume all entry headers size is less than 64
+        let mut buf = [0u8; 64];
+        while self.pos < self.eof {
+            let rest = min((self.eof - self.pos) as usize, buf.len());
+            let data = &mut buf[0..rest];
+            if let Err(e) = self.file.read_exact_at(data, self.pos) {
+                log::info!("read wal error {}", e);
+                break;
+            }
+            let ty: EntryType = data[0].into();
+            if !Self::valid(ty, data.len()) {
+                break;
+            }
+
+            match ty {
+                EntryType::Padding => {
+                    let pad = ptr_to::<WalPadding>(data.as_mut_ptr());
+                    self.inc_offset(pad.encoded_len() + pad.len as usize);
+                }
+                EntryType::Update => {
+                    let u = ptr_to::<WalUpdate>(data.as_mut_ptr());
+                    let len = u.encoded_len() + u.size as usize;
+                    if u.tx_id != txn {
+                        self.inc_offset(len);
+                        continue;
+                    }
+                    let len = u.encoded_len() + u.size as usize;
+                    self.wal.push((self.pos, len));
+                    self.inc_offset(len);
+                }
+                EntryType::Clr => {
+                    let c = ptr_to::<WalCLR>(data.as_mut_ptr());
+                    self.inc_offset(c.encoded_len());
+                }
+                EntryType::Abort | EntryType::Begin | EntryType::Commit | EntryType::End => {
+                    let w = ptr_to::<WalBegin>(data.as_mut_ptr());
+                    self.inc_offset(size_of::<WalBegin>());
+                }
+                EntryType::CkptBeg => {
+                    self.inc_offset(size_of::<WalCkptBeg>());
+                }
+                EntryType::CkptEnd => {
+                    let c = ptr_to::<WalCkptEnd>(data.as_mut_ptr());
+                    self.inc_offset(c.active_txn as usize * size_of::<u64>());
+                }
+                _ => panic!("invalid wal"),
+            }
+        }
     }
 }
 

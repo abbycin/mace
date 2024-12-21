@@ -59,10 +59,13 @@ impl FileReader {
         let map = Self::init_map(opt, id);
 
         // load data file
-        let file = File::options()
-            .read(true)
-            .open(opt.page_file(id))
-            .expect("can't load page file");
+        let file = match File::options().read(true).open(opt.page_file(id)) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("{}", e);
+                panic!("can't open file {}", e);
+            }
+        };
         Self {
             id,
             file: Arc::new(file),

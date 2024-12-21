@@ -13,7 +13,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use mace::{Db, IsolationLevel, OpCode, Options, RandomPath, Tx, TxnKV};
+use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath, Tx, TxnKV};
 
 macro_rules! prelude {
     ($($core:expr),+) => {
@@ -323,29 +323,29 @@ fn history() -> Result<(), OpCode> {
     let (mut s1, mut s2, _e) = prelude!(2, 3);
 
     s1.begin();
-    s1.put("1", "10");
-    s1.put("1", "11");
+    s1.replace("1", "10").unwrap();
+    s1.replace("1", "11").unwrap();
     s1.commit();
 
     s2.begin();
 
     s1.begin();
-    s1.put("1", "13");
-    s1.put("1", "14");
+    s1.replace("1", "13").unwrap();
+    s1.replace("1", "14").unwrap();
     s1.commit();
 
     s1.begin();
-    s1.put("1", "15");
-    s1.put("1", "16");
+    s1.replace("1", "15").unwrap();
+    s1.replace("1", "16").unwrap();
     s1.commit();
 
     s1.begin();
-    s1.put("1", "17");
+    s1.replace("1", "17").unwrap();
     s1.commit();
 
     s1.begin();
-    s1.put("2", "20");
-    s1.put("1", "18");
+    s1.replace("2", "20").unwrap();
+    s1.replace("1", "18").unwrap();
     s1.commit();
 
     let r = s2.get("1").unwrap();
@@ -360,7 +360,7 @@ fn history() -> Result<(), OpCode> {
 
 struct Executor {
     map: HashMap<usize, (Arc<SyncClosure>, Arc<AtomicBool>)>,
-    db: Db,
+    db: Mace,
     handle: Vec<Option<JoinHandle<()>>>,
 }
 
@@ -387,7 +387,7 @@ impl Executor {
 
         opt.tmp_store = tmp;
         opt.bind_core = false;
-        let db = Db::open(opt).unwrap();
+        let db = Mace::open(opt).unwrap();
 
         let mut map = HashMap::new();
         let mut handle = Vec::new();
@@ -619,7 +619,7 @@ impl Session {
         let (k, v) = (SyncPtr::from(k.as_ref()), SyncPtr::from(v.as_ref()));
         let mut rv = None;
         self.cond.set_fn(Closure::new(|| {
-            let r = kv.replace(k.data(), v.data());
+            let r = kv.update(k.data(), v.data());
             rv = Some(r.map(|x| x.data().to_vec()));
         }));
         self.sync();

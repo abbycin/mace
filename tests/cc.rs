@@ -4,14 +4,14 @@ use std::{
 };
 
 use coreid::bind_core;
-use mace::{Db, IsolationLevel, OpCode, Options, RandomPath, Tx};
+use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath, Tx};
 use rand::{seq::SliceRandom, thread_rng};
 
 #[test]
 fn put_get() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
-    let db = Db::open(opt)?;
+    let db = Mace::open(opt)?;
     let tx = db.default();
 
     let n = 1000;
@@ -121,7 +121,7 @@ fn to_str(x: &[u8]) -> &str {
 fn get_del() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
-    let db = Db::open(opt)?;
+    let db = Mace::open(opt)?;
     let tx = db.default();
 
     let n = 1000;

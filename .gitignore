@@ -6,3 +6,4 @@
 .vscode
 .cache
 DESIGN.*
+Cargo.lock

@@ -1,4 +1,4 @@
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, dealloc, realloc, Layout};
 
 use super::{align_up, byte_array::ByteArray};
 
@@ -71,6 +71,15 @@ impl Block {
         debug_assert!(len <= self.len as usize);
 
         unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) }
+    }
+
+    pub(crate) fn realloc(&mut self, size: usize) {
+        assert_eq!(self.align, 0);
+        self.data = unsafe {
+            let layout = Layout::array::<u8>(self.len as usize).unwrap();
+            realloc(self.data, layout, size)
+        };
+        self.len = size as u32;
     }
 }
 

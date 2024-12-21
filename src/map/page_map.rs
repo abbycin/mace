@@ -211,11 +211,14 @@ build_layer!(Layer2, Layer3, L2_FANOUT);
 build_layer!(Layer1, Layer2, L1_FANOUT);
 
 impl PageMap {
-    fn load_map(this: &Self, name: &PathBuf) -> Result<(), OpCode> {
-        let mut f = File::options()
-            .read(true)
-            .open(name)
-            .map_err(|_| OpCode::IoError)?;
+    fn load_map(this: &Self, name: &PathBuf) {
+        let mut f = match File::options().read(true).open(name) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("{}", e);
+                panic!("can't open file {}", e);
+            }
+        };
 
         PageTable::deserialize(&mut f, |e| {
             let (pid, addr) = (e.page_id(), e.page_addr());
@@ -224,7 +227,6 @@ impl PageMap {
                 this.index(pid).store(addr, Ordering::Relaxed);
             }
         });
-        Ok(())
     }
 
     pub fn rebuild(this: &Self, opt: &Arc<Options>) -> Result<(), OpCode> {
@@ -234,7 +236,7 @@ impl PageMap {
             let name = filename.to_str().ok_or(OpCode::Unknown)?;
             if name.starts_with(Options::MAP_PREFIX) {
                 let path = Path::new(&opt.db_root).join(name);
-                Self::load_map(this, &path)?;
+                Self::load_map(this, &path);
             }
         }
         Ok(())
