@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use crate::{number_to_slice, slice_to_number, utils::traits::IValCodec};
 
 #[derive(Clone, PartialEq, Eq, Copy, Debug)]
@@ -77,5 +79,37 @@ impl IValCodec for Record<'_> {
 
     fn data(&self) -> &[u8] {
         self.data
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
+pub struct Ver {
+    pub txid: u64,
+    pub cmd: u32,
+}
+
+impl Ver {
+    pub fn new(txid: u64, cmd: u32) -> Self {
+        Self { txid, cmd }
+    }
+
+    pub fn len() -> usize {
+        size_of::<u64>() + size_of::<u32>()
+    }
+}
+
+impl PartialOrd for Ver {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ver {
+    /// new to old
+    fn cmp(&self, other: &Self) -> Ordering {
+        match other.txid.cmp(&self.txid) {
+            Ordering::Equal => other.cmd.cmp(&self.cmd),
+            o => o,
+        }
     }
 }

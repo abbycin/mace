@@ -211,10 +211,11 @@ mod test {
         let size = Frame::FRAME_LEN;
 
         for i in 0..4 {
-            let mut frame = FrameOwner::alloc(size);
+            let frame = FrameOwner::alloc(size);
             if i == 3 {
-                frame.init(0, FrameFlag::Unknown);
-                frame.set_pid(233);
+                let mut view = frame.view();
+                view.init(0, FrameFlag::Unknown);
+                view.set_pid(233);
             }
             c.put(i, Arc::new(frame));
             c.get(3);
@@ -228,8 +229,8 @@ mod test {
             v.push(std::thread::spawn(move || {
                 for j in b..e {
                     cache.get(3);
-                    let mut frame = FrameOwner::alloc(size);
-                    frame.init(0, FrameFlag::Unknown);
+                    let frame = FrameOwner::alloc(size);
+                    frame.view().init(0, FrameFlag::Unknown);
                     cache.put(j, Arc::new(frame));
                 }
             }));

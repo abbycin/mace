@@ -8,6 +8,8 @@ pub struct ByteArray {
     size: usize,
 }
 
+unsafe impl Send for ByteArray {}
+
 impl ByteArray {
     pub fn alloc(size: usize) -> Self {
         let ptr = unsafe { alloc(Layout::array::<u8>(size).unwrap()) };
@@ -32,17 +34,7 @@ impl ByteArray {
         self.data
     }
 
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        self.data = std::ptr::null_mut();
-        self.size = 0;
-    }
-
-    #[allow(dead_code)]
-    pub fn is_null(&self) -> bool {
-        self.data.is_null()
-    }
-
+    #[allow(unused)]
     pub fn add(&self, n: usize) -> Self {
         debug_assert!(n <= self.size);
         ByteArray::new(unsafe { self.data.add(n) }, self.size - n)
@@ -69,31 +61,6 @@ impl Default for ByteArray {
         Self {
             data: ptr::null_mut(),
             size: 0,
-        }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::utils::byte_array::ByteArray;
-    use std::alloc::{alloc, dealloc, Layout};
-
-    #[test]
-    fn test_byte_array() {
-        let size = 32;
-        let b = unsafe {
-            let ptr = alloc(Layout::array::<u8>(size).unwrap());
-            ByteArray::new(ptr, size)
-        };
-
-        let mut a = b;
-        a.reset();
-
-        assert!(a.is_null());
-        assert!(!b.is_null());
-
-        unsafe {
-            dealloc(b.data(), Layout::array::<u8>(size).unwrap());
         }
     }
 }

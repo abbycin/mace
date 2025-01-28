@@ -1,26 +1,31 @@
 use log::{LevelFilter, Metadata, Record};
-use std::cell::{Cell, RefCell};
+use std::cell::{OnceCell, RefCell};
 use std::io::Write;
 use std::path::Path;
 use std::ptr::addr_of_mut;
 use std::sync::Mutex;
 
 thread_local! {
-    static G_TID: Cell<i32> = Cell::new(0);
+    static G_TID: OnceCell<i32> = OnceCell::new();
 }
+#[cfg(not(target_os = "linux"))]
+static G_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
 static mut G_LOGGER: Logger = Logger { sink: Vec::new() };
 static G_INIIED: Mutex<bool> = Mutex::new(false);
 
 const G_CONSOLE: &'static str = "console";
 const G_FILE: &'static str = "file";
 
+#[cfg(target_os = "linux")]
 fn get_tid() -> i32 {
-    unsafe {
-        if G_TID.get() == 0 {
-            G_TID.set(libc::gettid());
-        }
-        return G_TID.get();
-    }
+    G_TID.with(|x| *x.get_or_init(|| unsafe { libc::gettid() }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_tid() -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    G_TID.with(|x| *x.get_or_init(|| G_ID.fetch_add(1, Relaxed)))
 }
 
 /// a simple sync logger which impl log::Log

@@ -4,14 +4,14 @@ version = "0.1.0"
 edition = "2021"
 authors = ["abbytsing@gmail.com"]
 rust-version = "1.82"
+readme = "README.md"
 
 [dependencies]
 crc32c = "0.6.8"
 dashmap = "6.1.0"
 rand = "0.8.5"
 log = "0.4.22"
-coreid = { path = "deps/coreid" }
-async_io = { path = "deps/async_io" }
+io = { path = "deps/io" }
 
 [dev-dependencies]
 logger = { path = "deps/logger" }

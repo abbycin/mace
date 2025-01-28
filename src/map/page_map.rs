@@ -1,14 +1,9 @@
 use std::cmp::min;
-use std::fs::File;
 use std::mem::MaybeUninit;
-use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::sync::Arc;
 
-use crate::utils::data::PageTable;
 use crate::utils::{NULL_PID, ROOT_PID};
-use crate::{OpCode, Options};
 
 const SLOT_SIZE: u64 = 1u64 << 16;
 
@@ -209,45 +204,6 @@ const MAX_ID: u64 = L1_FANOUT - 1;
 
 build_layer!(Layer2, Layer3, L2_FANOUT);
 build_layer!(Layer1, Layer2, L1_FANOUT);
-
-impl PageMap {
-    fn load_map(this: &Self, name: &PathBuf) {
-        let mut f = match File::options().read(true).open(name) {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("{}", e);
-                panic!("can't open file {}", e);
-            }
-        };
-
-        PageTable::deserialize(&mut f, |e| {
-            let (pid, addr) = (e.page_id(), e.page_addr());
-            // NOTE: it's correct iff when file_id is not wrapping
-            if this.get(pid) < addr {
-                this.index(pid).store(addr, Ordering::Relaxed);
-            }
-        });
-    }
-
-    pub fn rebuild(this: &Self, opt: &Arc<Options>) -> Result<(), OpCode> {
-        let dir = std::fs::read_dir(&opt.db_root).map_err(|_| OpCode::IoError)?;
-        for i in dir {
-            let filename = i.map_err(|_| OpCode::IoError)?.file_name();
-            let name = filename.to_str().ok_or(OpCode::Unknown)?;
-            if name.starts_with(Options::MAP_PREFIX) {
-                let path = Path::new(&opt.db_root).join(name);
-                Self::load_map(this, &path);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn new(opt: Arc<Options>) -> Result<Self, OpCode> {
-        let this = Self::default();
-        Self::rebuild(&this, &opt)?;
-        Ok(this)
-    }
-}
 
 #[cfg(test)]
 mod test {

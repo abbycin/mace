@@ -8,6 +8,7 @@ use rand::{rngs::ThreadRng, Rng};
 
 pub(crate) mod block;
 pub mod byte_array;
+pub(crate) mod countblock;
 pub(crate) mod data;
 pub mod options;
 pub(crate) mod queue;
@@ -15,9 +16,13 @@ pub(crate) mod traits;
 
 pub(crate) const NULL_PID: u64 = 0;
 pub(crate) const ROOT_PID: u64 = 1;
-pub(crate) const NEXT_ID: u32 = 1;
+pub(crate) const ROOT_TREEID: u64 = 0;
+pub(crate) const NEXT_ID: u16 = 1;
 pub(crate) const INIT_CMD: u32 = 1;
 pub(crate) const NULL_CMD: u32 = u32::MAX;
+/// NOTE: must larger than oldest_txid (which is 0 by default)
+pub(crate) const INIT_ORACLE: u64 = 1;
+pub(crate) const NULL_ORACLE: u64 = u64::MAX;
 
 #[derive(Debug, PartialEq)]
 pub enum OpCode {
@@ -36,7 +41,7 @@ pub(crate) const fn align_up(n: usize, align: usize) -> usize {
     (n + (align - 1)) & !(align - 1)
 }
 
-#[allow(dead_code)]
+#[allow(unused)]
 pub(crate) const fn align_down(n: usize, align: usize) -> usize {
     n & !(align - 1)
 }
@@ -98,12 +103,12 @@ macro_rules! slice_to_number {
     }};
 }
 
-pub(crate) const fn encode_u64(hi: u32, lo: u32) -> u64 {
-    (hi as u64) << 32 | lo as u64
+pub(crate) const fn pack_id(hi: u16, lo: u64) -> u64 {
+    (hi as u64) << 48 | lo
 }
 
-pub(crate) const fn decode_u64(x: u64) -> (u32, u32) {
-    ((x >> 32) as u32, (x & ((1 << 32) - 1)) as u32)
+pub(crate) const fn unpack_id(x: u64) -> (u16, u64) {
+    ((x >> 48) as u16, (x & ((1u64 << 48) - 1)))
 }
 
 thread_local! {
@@ -158,7 +163,11 @@ impl RandomPath {
 
     pub fn unlink(&self) {
         if self.path.exists() {
-            let _ = std::fs::remove_dir_all(&self.path);
+            let _ = if self.path.is_file() {
+                std::fs::remove_file(&self.path)
+            } else {
+                std::fs::remove_dir_all(&self.path)
+            };
         }
     }
 }

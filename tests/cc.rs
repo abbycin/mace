@@ -3,7 +3,6 @@ use std::{
     sync::{Barrier, RwLock},
 };
 
-use coreid::bind_core;
 use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath, Tx};
 use rand::{seq::SliceRandom, thread_rng};
 
@@ -26,56 +25,58 @@ fn put_get() -> Result<(), OpCode> {
 
     std::thread::scope(|s| {
         s.spawn(|| {
-            bind_core(1);
             barrier.wait();
             for i in &elems {
-                let kv = tx.begin(IsolationLevel::SI);
-                let _ = kv.put(*i, *i);
-                tx.commit(kv);
+                let _ = tx.begin(IsolationLevel::SI, |kv| {
+                    let _ = kv.put(*i, *i);
+                    kv.commit()
+                });
             }
         });
 
         s.spawn(|| {
-            bind_core(2);
             barrier.wait();
             for i in &elems {
-                let kv = tx.begin(IsolationLevel::SI);
-                if let Ok(x) = kv.del(*i) {
-                    assert_eq!(x.data(), *i);
-                    del1.write().unwrap().insert(x.data().to_vec());
-                }
-                tx.commit(kv);
+                let _ = tx.begin(IsolationLevel::SI, |kv| {
+                    if let Ok(x) = kv.del(*i) {
+                        assert_eq!(x.data(), *i);
+                        del1.write().unwrap().insert(x.data().to_vec());
+                    }
+                    kv.commit()
+                });
             }
         });
 
         s.spawn(|| {
-            bind_core(3);
             barrier.wait();
             for i in &elems {
-                let kv = tx.begin(IsolationLevel::SI);
-                if let Ok(x) = kv.del(*i) {
-                    assert_eq!(x.data(), *i);
-                    del2.write().unwrap().insert(x.data().to_vec());
-                }
-                tx.commit(kv);
+                let _ = tx.begin(IsolationLevel::SI, |kv| {
+                    if let Ok(x) = kv.del(*i) {
+                        assert_eq!(x.data(), *i);
+                        del2.write().unwrap().insert(x.data().to_vec());
+                    }
+                    kv.commit()
+                });
             }
         });
     });
 
     check(&tx, &elems, &del1, &del2);
 
-    let kv = tx.begin(IsolationLevel::SI);
-    kv.put("foo", "bar").unwrap();
-    tx.commit(kv);
+    let _ = tx.begin(IsolationLevel::SI, |kv| {
+        kv.put("foo", "bar").unwrap();
+        kv.commit()
+    });
 
     let r = db.remove(tx);
     assert!(r.is_ok());
 
     let tx = db.default();
-    let kv = tx.begin(IsolationLevel::SI);
-    let r = kv.get("foo");
-    assert!(r.is_err());
-    tx.commit(kv);
+    let _ = tx.begin(IsolationLevel::SI, |kv| {
+        let r = kv.get("foo");
+        assert!(r.is_err());
+        kv.commit()
+    });
 
     Ok(())
 }
@@ -88,33 +89,30 @@ fn check(
 ) {
     let lk1 = del1.read().unwrap();
     let lk2 = del2.read().unwrap();
-    let kv = tx.view(IsolationLevel::SI);
-    for i in elems.iter() {
-        let tmp = i.to_vec();
-        if lk1.contains(&tmp) || lk2.contains(&tmp) {
-            continue;
+    let _ = tx.view(IsolationLevel::SI, |view| {
+        for i in elems.iter() {
+            let tmp = i.to_vec();
+            if lk1.contains(&tmp) || lk2.contains(&tmp) {
+                continue;
+            }
+            let r = view.get(*i).expect("must exist");
+            if r.data() != *i {
+                assert!(!lk1.contains(r.data()));
+                assert_eq!(r.data(), *i);
+            }
         }
-        let r = kv.get(*i).expect("must exist");
-        if r.data() != *i {
-            assert!(!lk1.contains(r.data()));
-            assert_eq!(r.data(), *i);
+
+        for i in lk1.iter() {
+            let r = view.get(i.as_slice());
+            assert!(r.is_err());
         }
-    }
 
-    for i in lk1.iter() {
-        let r = kv.get(i.as_slice());
-        assert!(r.is_err());
-    }
-
-    for i in lk2.iter() {
-        let r = kv.get(i.as_slice());
-        assert!(r.is_err());
-    }
-}
-
-#[allow(dead_code)]
-fn to_str(x: &[u8]) -> &str {
-    unsafe { std::str::from_utf8_unchecked(x) }
+        for i in lk2.iter() {
+            let r = view.get(i.as_slice());
+            assert!(r.is_err());
+        }
+        Ok(())
+    });
 }
 
 #[test]
@@ -132,14 +130,17 @@ fn get_del() -> Result<(), OpCode> {
     }
 
     for i in &v {
-        let kv = tx.begin(IsolationLevel::SI);
-        kv.put(i.as_bytes(), i.as_bytes()).expect("can't put");
-        tx.commit(kv);
+        let _ = tx.begin(IsolationLevel::SI, |kv| {
+            kv.put(i.as_bytes(), i.as_bytes()).expect("can't put");
+            kv.commit()
+        });
     }
 
     for i in &v {
-        let kv = tx.view(IsolationLevel::SI);
-        kv.get(i.as_bytes()).expect("can't get");
+        let _ = tx.view(IsolationLevel::SI, |view| {
+            view.get(i.as_bytes()).expect("can't get");
+            Ok(())
+        });
     }
 
     let cnt = n / 3;
@@ -153,15 +154,18 @@ fn get_del() -> Result<(), OpCode> {
             break;
         }
         removed.push(k.clone());
-        let kv = tx.begin(IsolationLevel::SI);
-        kv.del(v[i].as_bytes()).expect("can't del");
-        tx.commit(kv);
+        let _ = tx.begin(IsolationLevel::SI, |kv| {
+            kv.del(v[i].as_bytes()).expect("can't del");
+            kv.commit()
+        });
     }
 
     for i in &removed {
-        let kv = tx.view(IsolationLevel::SI);
-        let r = kv.get(i.as_bytes());
-        assert!(r.is_err());
+        let _ = tx.view(IsolationLevel::SI, |view| {
+            let r = view.get(i.as_bytes());
+            assert!(r.is_err());
+            Ok(())
+        });
     }
 
     Ok(())

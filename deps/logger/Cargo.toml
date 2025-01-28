@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 authors = ["abbytsing@gmail.com"]
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.161"
+
+[dependencies]
 chrono = "0.4.38"
 log = "0.4.22"

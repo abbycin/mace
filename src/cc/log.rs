@@ -1,27 +1,37 @@
 use std::{
+    cell::Cell,
     cmp::{max, min, Ordering},
     collections::{HashMap, VecDeque},
-    ffi::c_int,
+    path::PathBuf,
     sync::{
         atomic::{
             AtomicU32, AtomicU64, AtomicUsize,
-            Ordering::{AcqRel, Acquire, Relaxed, Release},
+            Ordering::{Acquire, Relaxed, Release},
         },
-        Arc, RwLock,
+        mpsc::{Receiver, Sender},
+        Arc, Mutex,
     },
 };
 
-use async_io::AsyncIO;
+use io::{File, IoVec, SeekableGatherIO};
 
 use crate::{
     cc::wal::{EntryType, WalPadding},
-    utils::{block::Block, byte_array::ByteArray},
+    map::buffer::Buffers,
+    utils::{
+        block::Block, byte_array::ByteArray, countblock::Countblock, data::Meta, pack_id,
+        unpack_id, NEXT_ID,
+    },
     Options,
 };
 
 use super::{
     cc::Transaction,
-    wal::{IWalCodec, WalAbort, WalBegin, WalCLR, WalCommit, WalEnd, WalUpdate},
+    data::Ver,
+    wal::{
+        CkptMem, IWalCodec, IWalPayload, IWalRec, WalAbort, WalBegin, WalCheckpoint, WalCommit,
+        WalUpdate,
+    },
     worker::SyncWorker,
 };
 
@@ -53,15 +63,15 @@ impl SharedDesc {
 
     // no councurrent write, no lock is required
     fn set(&self, src: &WalDesc) {
-        self.version.fetch_add(1, AcqRel);
+        self.version.fetch_add(1, Acquire);
         unsafe { *self.data = *src };
-        self.version.fetch_add(1, AcqRel);
+        self.version.fetch_add(1, Release);
     }
 
     fn update_wal(&self, tail: usize) {
-        self.version.fetch_add(1, AcqRel);
+        self.version.fetch_add(1, Acquire);
         unsafe { (*self.data).wal_tail = tail }
-        self.version.fetch_add(1, AcqRel);
+        self.version.fetch_add(1, Release);
     }
 }
 
@@ -76,43 +86,100 @@ impl Drop for SharedDesc {
 unsafe impl Send for SharedDesc {}
 unsafe impl Sync for SharedDesc {}
 
+fn set_lsn(data: *mut u8, mut off: usize, end: usize, lsn: &AtomicU64, beg: u64) -> Option<u64> {
+    fn to<T>(x: *mut u8) -> &'static mut T {
+        unsafe { &mut *x.cast::<T>() }
+    }
+
+    let mut last_record_pos = lsn.load(Relaxed);
+    let mut sz = 0;
+    let mut last = None;
+    lsn.store(beg, Relaxed);
+    while off < end {
+        let (p, h) = unsafe {
+            let p = data.add(off);
+            let h = p.read().into();
+            (p, h)
+        };
+
+        // the data is always valid, not need to check
+        sz = match h {
+            EntryType::Abort | EntryType::Begin | EntryType::Commit => {
+                let x = to::<WalBegin>(p);
+                x.set_lsn(last_record_pos);
+                last = Some((h, x.txid));
+                WalAbort::size()
+            }
+            EntryType::Update => {
+                let u = to::<WalUpdate>(p);
+                last = Some((h, u.txid));
+                u.set_lsn(last_record_pos);
+                u.size as usize + u.encoded_len()
+            }
+            EntryType::Padding => {
+                let x = to::<WalPadding>(p);
+                x.len as usize + WalPadding::size()
+            }
+            EntryType::CheckPoint => {
+                let c = to::<WalCheckpoint>(p);
+                c.payload_len() + WalCheckpoint::size()
+            }
+            _ => unreachable!("invalid type {}", h as u8),
+        };
+
+        off += sz;
+        // excluding padding from txn chain
+        if h != EntryType::Padding {
+            last_record_pos = lsn.fetch_add(sz as u64, Relaxed);
+        } else {
+            sz = 0;
+        }
+    }
+    // reset to record start position
+    lsn.fetch_sub(sz as u64, Relaxed);
+
+    if let Some((h, txid)) = last {
+        if matches!(h, EntryType::Update | EntryType::Begin) {
+            return Some(txid);
+        }
+    }
+    None
+}
+
 pub struct Logging {
     worker_id: u16,
     flushed_signal: AtomicUsize,
-    prev_gsn: u64,
     /// circular buffer head and tail
     wal_head: AtomicUsize,
     wal_tail: AtomicUsize,
     desc: SharedDesc,
-    wait_txn: RwLock<VecDeque<Transaction>>,
+    wait_txn: Mutex<VecDeque<Transaction>>,
+    sem: Arc<Countblock>,
     buffer: Block,
-    ctx: Arc<GroupCommitter>,
-    txid: u64,
-    tree_id: u16,
+    fsn: Arc<AtomicU64>,
+    pub(crate) lsn: AtomicU64,
 }
 
 unsafe impl Sync for Logging {}
 unsafe impl Send for Logging {}
 
 pub struct LogBuilder<'a> {
-    log: &'a mut Logging,
+    log: &'a Logging,
     buf: ByteArray,
-    size: usize,
     desc: WalDesc,
 }
 
 impl<'a> LogBuilder<'a> {
-    fn new(l: &'a mut Logging, b: ByteArray, txid: u64, gsn: u64) -> Self {
-        let wal_tail = l.wal_tail.load(Relaxed) + b.len();
+    fn new(l: &'a Logging, b: ByteArray, txid: u64, fsn: u64) -> Self {
+        let old = l.wal_tail.fetch_add(b.len(), Release);
         Self {
             log: l,
             buf: b,
-            size: b.len(),
             desc: WalDesc {
                 version: 0,
-                gsn,
+                fsn,
                 txid,
-                wal_tail,
+                wal_tail: old + b.len(),
             },
         }
     }
@@ -128,9 +195,8 @@ impl<'a> LogBuilder<'a> {
         self
     }
 
-    pub fn build(&mut self) {
-        self.log.wal_tail.fetch_add(self.size, Relaxed);
-        self.log.desc.set(&self.desc);
+    pub fn build(&self) {
+        self.log.update_desc(&self.desc);
     }
 }
 
@@ -138,6 +204,7 @@ impl Logging {
     fn alloc_entry(&self, size: usize) -> ByteArray {
         let len = self.buffer.len();
         loop {
+            self.sem.post();
             let flushed = self.wal_head.load(Relaxed);
             let buffered = self.wal_tail.load(Relaxed);
             if flushed <= buffered {
@@ -194,109 +261,106 @@ impl Logging {
         self.desc.update_wal(new_tail);
     }
 
-    pub fn record_update<T>(&mut self, cmd: u32, w: T, k: &[u8], ov: &[u8], nv: &[u8])
-    where
-        T: IWalCodec,
-    {
-        let payload_size = w.encoded_len() + k.len() + ov.len() + nv.len();
-        let gsn = self.ctx.gsn.fetch_add(1, Relaxed);
-        let u = WalUpdate::new(
-            self.tree_id,
-            self.worker_id,
-            self.txid,
-            cmd,
-            payload_size,
-            gsn,
-            self.prev_gsn,
-        );
-        self.prev_gsn = gsn; // update to latest one
-        let a = self.alloc_entry(u.encoded_len() + payload_size);
-        let mut b = LogBuilder::new(self, a, self.txid, gsn);
-        b.add(u).add(w).add(k).add(ov).add(nv).build();
+    fn update_desc(&self, desc: &WalDesc) {
+        self.desc.set(desc);
+        self.sem.post();
     }
 
-    fn add_entry<T: IWalCodec>(&mut self, w: T) {
-        let size = w.encoded_len();
-        let a = self.alloc_entry(size);
-        w.encode_to(a.sub_array(0, size));
-        let old = self.wal_tail.fetch_add(size, Release);
-        self.desc.set(&WalDesc {
-            version: 0,
-            gsn: self.ctx.gsn.fetch_add(1, Relaxed),
-            txid: self.txid,
-            wal_tail: old + size,
-        });
-    }
-
-    pub fn reset(&mut self, tree_id: u16, start_ts: u64) {
-        self.tree_id = tree_id;
-        self.txid = start_ts;
-    }
-
-    pub fn record_begin(&mut self) {
-        self.add_entry(WalBegin {
-            wal_type: EntryType::Begin,
-            txid: self.txid,
-        });
-    }
-
-    pub fn record_end(&mut self, txid: u64) {
-        self.add_entry(WalEnd {
-            wal_type: EntryType::End,
-            txid,
-        });
-    }
-
-    pub fn record_commit(&mut self) {
-        self.add_entry(WalCommit {
-            wal_type: EntryType::Commit,
-            txid: self.txid,
-        });
-    }
-
-    pub fn record_abort(&mut self) {
-        let w = WalAbort {
-            wal_type: EntryType::Abort,
-            txid: self.txid,
-        };
-        self.add_entry(w);
-    }
-
-    pub fn record_clr(&mut self, txid: u64, next_undo_gsn: u64) {
-        let w = WalCLR {
-            wal_type: EntryType::Clr,
-            txid,
-            next_undo_gsn,
-        };
-        self.add_entry(w);
-    }
-
-    // FIXME: recover `prev_gsn`
-    pub(crate) fn new(ctx: Arc<GroupCommitter>, buffer_size: usize, wid: u16) -> Self {
-        let buffer = Block::aligned_alloc(buffer_size, AsyncIO::SECTOR_SIZE);
+    pub(crate) fn new(
+        fsn: Arc<AtomicU64>,
+        opt: Arc<Options>,
+        wid: u16,
+        sem: Arc<Countblock>,
+    ) -> Self {
+        let buffer = Block::aligned_alloc(opt.buffer_size as usize, 1);
         buffer.zero();
         Self {
             flushed_signal: AtomicUsize::new(0),
-            prev_gsn: 0,
             worker_id: wid,
             wal_head: AtomicUsize::new(0),
             wal_tail: AtomicUsize::new(0),
             desc: SharedDesc::new(),
-            wait_txn: RwLock::new(VecDeque::new()),
+            wait_txn: Mutex::new(VecDeque::new()),
+            sem,
             buffer,
-            ctx,
-            txid: 0,
-            tree_id: 0,
+            fsn,
+            lsn: AtomicU64::new(0),
         }
     }
 
-    pub(crate) fn gsn(&mut self) -> u64 {
-        self.ctx.gsn.load(Relaxed)
+    pub fn record_update<T>(&self, ver: Ver, tree_id: u64, w: T, k: &[u8], ov: &[u8], nv: &[u8])
+    where
+        T: IWalCodec + IWalPayload,
+    {
+        let payload_size = w.encoded_len() + k.len() + ov.len() + nv.len();
+        let fsn = self.fsn.fetch_add(1, Relaxed);
+        let u = WalUpdate {
+            wal_type: EntryType::Update,
+            sub_type: w.sub_type(),
+            worker_id: self.worker_id,
+            size: payload_size as u32,
+            cmd_id: ver.cmd,
+            klen: k.len() as u32,
+            tree_id,
+            txid: ver.txid,
+            prev_addr: 0,
+        };
+        let a = self.alloc_entry(u.encoded_len() + payload_size);
+        let mut b = LogBuilder::new(self, a, ver.txid, fsn);
+        b.add(u).add(k).add(w).add(ov).add(nv).build();
+    }
+
+    fn add_entry<T: IWalCodec>(&self, w: T, txid: u64) {
+        let size = w.encoded_len();
+        let a = self.alloc_entry(size);
+        w.encode_to(a.sub_array(0, size));
+        let old = self.wal_tail.fetch_add(size, Release);
+        self.update_desc(&WalDesc {
+            version: 0,
+            fsn: self.fsn.fetch_add(1, Relaxed),
+            txid,
+            wal_tail: old + size,
+        });
+    }
+
+    pub fn record_begin(&self, txid: u64) {
+        self.add_entry(
+            WalBegin {
+                wal_type: EntryType::Begin,
+                txid,
+                prev_addr: 0,
+            },
+            txid,
+        );
+    }
+
+    pub fn record_commit(&self, txid: u64) {
+        self.add_entry(
+            WalCommit {
+                wal_type: EntryType::Commit,
+                txid,
+                prev_addr: 0,
+            },
+            txid,
+        );
+    }
+
+    pub fn record_abort(&self, txid: u64) {
+        let w = WalAbort {
+            wal_type: EntryType::Abort,
+            txid,
+            prev_addr: 0,
+        };
+        self.add_entry(w, txid);
+    }
+
+    pub(crate) fn fsn(&mut self) -> u64 {
+        self.fsn.load(Relaxed)
     }
 
     pub(crate) fn append_txn(&mut self, txn: Transaction) {
         self.wait_txn
-            .write()
+            .lock()
             .expect("can't lock write")
             .push_back(txn);
     }
@@ -307,13 +371,13 @@ impl Logging {
 
     pub(crate) fn wait_commit(&self, commit_ts: u64) {
         while commit_ts > self.flushed_signal.load(Relaxed) as u64 {
-            std::thread::yield_now();
+            self.sem.post();
         }
     }
 
     pub(crate) fn wait_flush(&self) {
         while self.wal_head.load(Relaxed) != self.wal_tail.load(Relaxed) {
-            std::hint::spin_loop();
+            self.sem.post();
         }
     }
 }
@@ -321,151 +385,190 @@ impl Logging {
 #[derive(Default, Clone, Copy, Debug)]
 struct WalDesc {
     version: u64,
-    gsn: u64,
+    fsn: u64,
     txid: u64,
     wal_tail: usize,
 }
 
-const GC_WORKING: u32 = 1926;
-const GC_STOP: u32 = 114514;
-const GC_STOPPED: u32 = 1919810;
-
-pub struct GroupCommitter {
-    /// global sequence number
-    pub gsn: AtomicU64,
-    wal_size: AtomicUsize,
+pub struct CState {
     state: AtomicU32,
-    fd: c_int,
-    aio: AsyncIO,
 }
 
-impl Drop for GroupCommitter {
-    fn drop(&mut self) {
-        AsyncIO::fclose(self.fd);
-    }
-}
+impl CState {
+    const GC_STARTED: u32 = 1;
+    const GC_WORKING: u32 = 3;
+    const GC_STOP: u32 = 5;
+    const GC_STOPPED: u32 = 7;
 
-impl GroupCommitter {
-    const PER_CORE_DEPTH: usize = 64;
-    /// FIXME: recover `gsn`
-    pub(crate) fn new(opt: Arc<Options>) -> Self {
-        let fd = AsyncIO::fopen(opt.wal_file(), false, false);
-        if fd < 0 {
-            panic!("open wal file failed");
-        }
-
-        Self {
-            gsn: AtomicU64::new(0),
-            wal_size: AtomicUsize::new(AsyncIO::fsize(fd) as usize),
-            state: AtomicU32::new(GC_WORKING),
-            fd,
-            aio: AsyncIO::new(coreid::cores_online() * Self::PER_CORE_DEPTH),
-        }
+    pub fn new() -> Arc<Self> {
+        Arc::new(CState {
+            state: AtomicU32::new(Self::GC_STARTED),
+        })
     }
 
-    pub(crate) fn run(&self, workers: Arc<Vec<SyncWorker>>) {
-        let mut desc = HashMap::new();
-
-        while self.state.load(Relaxed) == GC_WORKING {
-            let (min_flush_txid, min_flush_gsn) = self.collect(&workers, &mut desc);
-
-            if !self.aio.is_empty() {
-                self.flush();
-            }
-
-            self.commit_txn(&workers, min_flush_txid, min_flush_gsn, &desc);
-        }
-
-        self.state.store(GC_STOPPED, Relaxed);
+    pub fn mark_working(&self) {
+        self.state.store(Self::GC_WORKING, Relaxed);
     }
 
-    pub(crate) fn signal_stop(&self) {
-        self.state.store(GC_STOP, Relaxed);
+    pub fn mark_done(&self) {
+        self.state.store(Self::GC_STOPPED, Release);
     }
 
-    pub(crate) fn wait(&self) {
-        while self.state.load(Relaxed) != GC_STOPPED {
+    pub fn mark_stop(&self) {
+        self.state.store(Self::GC_STOP, Release);
+    }
+
+    pub fn is_stop(&self) -> bool {
+        self.state.load(Relaxed) == Self::GC_STOP
+    }
+
+    pub fn is_working(&self) -> bool {
+        self.state.load(Relaxed) == Self::GC_WORKING
+    }
+
+    pub fn wait(&self) {
+        while self.state.load(Acquire) != Self::GC_STOPPED {
             std::hint::spin_loop();
         }
     }
+}
 
-    pub(crate) fn wal_len(&self) -> usize {
-        self.wal_size.load(Relaxed)
+pub struct GroupCommitter {
+    /// flush sequence number to check whether a txn can be committed
+    opt: Arc<Options>,
+    meta: Arc<Meta>,
+    /// AIO will use this field until it's completed
+    ckpt: CkptMem,
+    wal_size: Cell<u64>,
+    last_id: u16,
+    last_checkpoint: u64,
+    checkpointed: bool,
+    writer: WalWriter,
+}
+
+impl GroupCommitter {
+    pub(crate) fn new(opt: Arc<Options>, meta: Arc<Meta>) -> Self {
+        let workers = opt.workers;
+        let (id, off) = unpack_id(meta.chkpt.load(Relaxed));
+        assert!(id >= NEXT_ID);
+        let writer = WalWriter::new(opt.wal_file(meta.next_wal.load(Relaxed)));
+
+        Self {
+            opt,
+            meta,
+            ckpt: CkptMem::new(workers),
+            wal_size: Cell::new(writer.pos()),
+            last_id: id,
+            last_checkpoint: off,
+            checkpointed: false,
+            writer,
+        }
+    }
+
+    /// TODO: separate log buffer collection and checkpointing into [`Logging`]
+    pub(crate) fn run(
+        &mut self,
+        ctrl: Arc<CState>,
+        buffer: Arc<Buffers>,
+        workers: Arc<Vec<SyncWorker>>,
+        tx: Arc<Sender<()>>,
+        rx: Receiver<()>,
+        sem: Arc<Countblock>,
+    ) {
+        let mut desc = HashMap::new();
+        let lsn = pack_id(self.last_id, self.wal_size.get());
+        for w in workers.iter() {
+            w.logging.lsn.store(lsn, Release);
+            desc.insert(w.id, WalDesc::default());
+        }
+
+        while !ctrl.is_stop() {
+            sem.wait();
+            let (min_flush_txid, min_fsn) = self.collect(&workers, &mut desc);
+
+            if !self.writer.is_empty() {
+                self.flush();
+                buffer.update_flsn(pack_id(
+                    self.meta.next_wal.load(Acquire),
+                    self.wal_size.get(),
+                ));
+            }
+
+            self.commit_txn(&workers, min_flush_txid, min_fsn, &desc);
+
+            if self.should_switch() {
+                self.switch();
+            }
+
+            if ctrl.is_working() && self.should_stabilize() {
+                self.stabilize(&buffer, tx.clone(), &rx);
+            }
+        }
+
+        ctrl.mark_done();
     }
 
     fn collect(
-        &self,
+        &mut self,
         workers: &Arc<Vec<SyncWorker>>,
         desc: &mut HashMap<u16, WalDesc>,
     ) -> (u64, u64) {
-        let mut min_flush_gsn = u64::MAX;
+        let mut min_fsn = u64::MAX;
         let mut min_flush_txid = u64::MAX;
+        let cur_id = self.meta.next_wal.load(Relaxed);
 
         for w in workers.iter() {
-            let mut d = if let Some(x) = desc.get(&w.id) {
-                *x
-            } else {
-                WalDesc::default()
-            };
-
+            let d = desc.get_mut(&w.id).unwrap();
             let saved_ver = d.version;
-            let version = w.logging.desc.get(&mut d);
+            let version = w.logging.desc.get(d);
             d.version = version;
 
             if version == saved_ver {
                 // current worker has no txn log since last collect
                 continue;
             }
-            desc.insert(w.id, d);
 
             min_flush_txid = min(min_flush_txid, d.txid);
-            min_flush_gsn = min(min_flush_gsn, d.gsn);
+            min_fsn = min(min_fsn, d.fsn);
 
             let wal_head = w.logging.wal_head.load(Relaxed);
             let wal_tail = d.wal_tail;
             let data = w.logging.buffer.data();
 
-            match wal_tail.cmp(&wal_head) {
-                Ordering::Greater => self.enqueue_buf(data, wal_head, wal_tail),
-                Ordering::Less => {
-                    self.enqueue_buf(data, wal_head, w.logging.buffer.len());
-                    self.enqueue_buf(data, 0, wal_tail);
+            let beg = pack_id(cur_id, self.wal_size.get());
+            let txid = match wal_tail.cmp(&wal_head) {
+                Ordering::Greater => {
+                    self.queue_data(data, wal_head, wal_tail);
+                    set_lsn(data, wal_head, wal_tail, &w.logging.lsn, beg)
                 }
-                _ => {}
+                Ordering::Less => {
+                    let len = w.logging.buffer.len();
+
+                    self.queue_data(data, wal_head, len);
+                    let r = set_lsn(data, wal_head, len, &w.logging.lsn, beg);
+
+                    let beg = w.logging.lsn.load(Relaxed);
+                    self.queue_data(data, 0, wal_tail);
+                    set_lsn(data, 0, wal_tail, &w.logging.lsn, beg).map_or(r, Some)
+                }
+                _ => None,
+            };
+
+            if let Some(txid) = txid {
+                // save latest lsn to txid
+                self.ckpt.set(w.id, txid, w.logging.lsn.load(Relaxed));
+            } else {
+                self.ckpt.reset(w.id);
             }
         }
 
-        if !self.aio.is_empty() {
-            while self.aio.is_full() {
-                self.wait_compelte();
-            }
-            self.aio.fsync(self.fd);
-        }
-
-        (min_flush_txid, min_flush_gsn)
+        (min_flush_txid, min_fsn)
     }
 
-    fn flush(&self) {
-        let mut rc = self.aio.sumbit();
-        if rc < 0 {
-            log::error!("aio sumbit failed, rc {}", rc);
-        }
-
-        self.wait_compelte();
-
-        rc = AsyncIO::fdsync(self.fd);
-        if rc < 0 {
-            log::error!("can't sync file data, rc {}", rc);
-        }
-    }
-
-    fn wait_compelte(&self) {
-        while self.aio.wait(1000) < 0 {
-            log::error!(
-                "aio wait failed, rc {} pending {}",
-                AsyncIO::last_error(),
-                self.aio.pending()
-            );
+    fn flush(&mut self) {
+        self.writer.sync();
+        if self.checkpointed {
+            self.meta.update_chkpt(self.last_id, self.last_checkpoint);
         }
     }
 
@@ -473,7 +576,7 @@ impl GroupCommitter {
         &self,
         workers: &Arc<Vec<SyncWorker>>,
         min_flush_txid: u64,
-        min_flush_gsn: u64,
+        min_fsn: u64,
         desc: &HashMap<u16, WalDesc>,
     ) {
         for w in workers.iter() {
@@ -483,10 +586,10 @@ impl GroupCommitter {
             let mut max_flush_ts = 0;
             w.logging.wal_head.store(d.wal_tail, Relaxed);
 
-            let mut lk = w.logging.wait_txn.write().expect("can't lock write");
+            let mut lk = w.logging.wait_txn.lock().expect("can't lock");
             while let Some(txn) = lk.front() {
-                // since the txns in same thread is ordered, the subsequent txns are not ready too
-                if !txn.ready_to_commit(min_flush_txid, min_flush_gsn) {
+                // since the txns in same worker are ordered, the subsequent txns are not ready too
+                if !txn.ready_to_commit(min_flush_txid, min_fsn) {
                     break;
                 }
                 max_flush_ts = max(max_flush_ts, txn.commit_ts);
@@ -500,16 +603,126 @@ impl GroupCommitter {
         }
     }
 
-    fn enqueue_buf(&self, buf: *mut u8, from: usize, to: usize) {
-        while self.aio.is_full() {
-            self.wait_compelte();
-        }
+    fn queue_data(&mut self, buf: *const u8, from: usize, to: usize) {
         let data = unsafe { buf.add(from) };
         let count = to - from;
+        let pos = self.wal_size.get();
 
-        self.aio
-            .prepare_write(self.fd, data, count, self.wal_size.load(Relaxed) as u64);
-        self.wal_size.fetch_add(count, Relaxed);
+        self.writer.queue(data, count);
+        self.wal_size.set(pos + count as u64);
+    }
+
+    #[inline(always)]
+    fn should_switch(&self) -> bool {
+        self.wal_size.get() >= self.opt.wal_file_size as u64
+    }
+
+    fn switch(&mut self) {
+        // we never use the number 0
+        let mut next_wal = self.meta.next_wal.load(Relaxed).wrapping_add(1);
+        if next_wal == 0 {
+            next_wal = NEXT_ID;
+        }
+        self.writer.reset(self.opt.wal_file(next_wal));
+        self.wal_size.set(0);
+        self.meta.next_wal.store(next_wal, Relaxed);
+    }
+
+    #[inline(always)]
+    fn should_stabilize(&self) -> bool {
+        self.wal_size.get() >= self.last_checkpoint + self.opt.chkpt_per_bytes as u64
+    }
+
+    fn stabilize(&mut self, buffer: &Arc<Buffers>, tx: Arc<Sender<()>>, rx: &Receiver<()>) {
+        buffer.stabilize(Box::new(move || {
+            let _ = tx.send(()).inspect_err(|e| {
+                log::error!("can't notify flushed {}", e);
+            });
+        }));
+        let r = rx.recv();
+        assert!(r.is_ok());
+
+        assert_ne!(self.last_id, 0);
+        let prev_addr = pack_id(self.last_id, self.last_checkpoint);
+        self.last_id = self.meta.next_wal.load(Relaxed);
+        self.last_checkpoint = self.wal_size.get(); // point to current position
+
+        let (hdr, data) = self.ckpt.slice(prev_addr);
+        self.queue_data(hdr.0, 0, hdr.1);
+        self.queue_data(data.0, 0, data.1);
+        self.writer.sync();
+        self.checkpointed = true;
+    }
+}
+
+struct WalWriter {
+    file: File,
+    path: PathBuf,
+    queue: Vec<IoVec>,
+}
+
+unsafe impl Send for WalWriter {}
+
+impl WalWriter {
+    fn open_file(path: PathBuf) -> File {
+        File::options()
+            .write(true)
+            .append(true)
+            .create(true)
+            .open(&path)
+            .inspect_err(|x| {
+                log::error!("can't open {:?}, {}", path, x);
+            })
+            .unwrap()
+    }
+
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path: path.clone(),
+            file: Self::open_file(path),
+            queue: Vec::new(),
+        }
+    }
+    fn reset(&mut self, path: PathBuf) {
+        self.path = path.clone();
+        self.sync();
+        self.file = Self::open_file(path);
+    }
+
+    fn queue(&mut self, data: *const u8, len: usize) {
+        self.queue.push(IoVec::new(data, len));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn pos(&self) -> u64 {
+        self.file
+            .size()
+            .inspect_err(|x| {
+                log::error!("can't get metadata of {:?}, {}", self.path, x);
+            })
+            .unwrap()
+    }
+
+    fn sync(&mut self) {
+        let iov = self.queue.as_mut_slice();
+        self.file
+            .write(iov)
+            .inspect_err(|x| log::error!("can't write iov, {}", x))
+            .unwrap();
+        self.file
+            .flush()
+            .inspect_err(|x| log::error!("can't sync {:?}, {}", self.path, x))
+            .unwrap();
+        self.queue.clear();
+    }
+}
+
+impl Drop for WalWriter {
+    fn drop(&mut self) {
+        self.sync();
     }
 }
 
@@ -517,10 +730,12 @@ impl GroupCommitter {
 mod test {
 
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-    use std::sync::atomic::{fence, AtomicBool};
+    use std::sync::atomic::{fence, AtomicBool, AtomicU64};
     use std::sync::Arc;
 
+    use crate::cc::data::Ver;
     use crate::slice_to_number;
+    use crate::utils::countblock::Countblock;
     use crate::utils::raw_ptr_to_ref;
     use crate::{
         cc::{
@@ -530,19 +745,20 @@ mod test {
         static_assert, Options, RandomPath,
     };
 
-    use super::{GroupCommitter, Logging};
+    use super::Logging;
 
     #[test]
     fn logging() {
         let path = RandomPath::tmp();
-        let opt = Arc::new(Options::new(&*path));
+        let mut opt = Options::new(&*path);
+        opt.buffer_size = 512;
+        let opt = Arc::new(opt);
         let _ = std::fs::create_dir_all(&opt.db_root);
-        let ctx = Arc::new(GroupCommitter::new(opt));
-        let buffer_size = 512;
-        let mut l = Logging::new(ctx, buffer_size, 0);
+        let fsn = Arc::new(AtomicU64::new(0));
+        let l = Logging::new(fsn, opt, 0, Arc::new(Countblock::new(1)));
+        let txid = 1;
 
-        l.reset(0, 1);
-        l.record_begin();
+        l.record_begin(txid);
         let mut desc = WalDesc::default();
         l.desc.get(&mut desc);
         assert_eq!(desc.wal_tail, size_of::<WalBegin>());
@@ -550,8 +766,8 @@ mod test {
         assert_eq!(l.wal_tail.load(Relaxed), size_of::<WalBegin>());
 
         let (k, v) = ("mo".as_bytes(), "ha".as_bytes());
-        let ins = WalPut::new(2, 2);
-        l.record_update(1, ins, k, [].as_slice(), v);
+        let ins = WalPut::new(2);
+        l.record_update(Ver::new(txid, 1), 1, ins, k, [].as_slice(), v);
 
         l.desc.get(&mut desc);
         let size = size_of::<WalBegin>()

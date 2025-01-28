@@ -10,9 +10,8 @@ use crate::{
     static_assert,
     utils::{
         byte_array::ByteArray,
-        decode_u64,
         traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
-        NULL_PID,
+        unpack_id, NULL_PID,
     },
 };
 
@@ -242,7 +241,7 @@ impl Debug for PageHeader {
             "PageHeader {{ {:?}, next: {} {:?}, elems: {}, len {} }}",
             self.meta,
             self.link,
-            decode_u64(self.link),
+            unpack_id(self.link),
             self.elems,
             self.len,
         ))
@@ -320,7 +319,7 @@ where
         K::decode_from(raw)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn val_at(&self, pos: usize) -> V {
         let slot = self.offset(pos);
         debug_assert!(self.raw.len() >= slot.len());
@@ -338,7 +337,7 @@ where
         }
     }
 
-    pub fn search_impl<F>(&self, key: &K, f: F) -> Result<usize, usize>
+    pub fn search_by<F>(&self, key: &K, f: F) -> Result<usize, usize>
     where
         F: Fn(&K, &K) -> Ordering,
     {
@@ -363,11 +362,11 @@ where
     }
 
     pub fn search(&self, key: &K) -> Result<usize, usize> {
-        self.search_impl(key, |x, y| x.cmp(y))
+        self.search_by(key, |x, y| x.cmp(y))
     }
 
     pub fn search_raw(&self, key: &K) -> Result<usize, usize> {
-        self.search_impl(key, |x, y| x.raw().cmp(y.raw()))
+        self.search_by(key, |x, y| x.raw().cmp(y.raw()))
     }
 
     #[allow(dead_code)]
@@ -380,7 +379,7 @@ where
                 "{} => {}\t{}",
                 k.to_string(),
                 v.to_string(),
-                decode_u64(addr).1
+                unpack_id(addr).1
             );
         }
         log::debug!("--------------- end --------------");

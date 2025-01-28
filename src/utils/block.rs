@@ -27,7 +27,7 @@ impl Block {
     }
 
     pub(crate) fn alloc(size: usize) -> Self {
-        let layout = Layout::array::<u8>(size).expect("bad layout");
+        let layout = Layout::array::<*const ()>(size).expect("bad layout");
         Self::alloc_impl(size, 0, layout)
     }
 
@@ -37,7 +37,6 @@ impl Block {
         Self::alloc_impl(size, align, layout)
     }
 
-    #[allow(unused)]
     pub(crate) fn zero(&self) {
         let len = if self.align == 0 {
             self.len as usize
@@ -101,7 +100,10 @@ impl Drop for Block {
         if *Self::get_ref(self.refs) == 0 {
             if self.align == 0 {
                 unsafe {
-                    dealloc(self.data, Layout::array::<u8>(self.len as usize).unwrap());
+                    dealloc(
+                        self.data,
+                        Layout::array::<*const ()>(self.len as usize).unwrap(),
+                    );
                 }
             } else {
                 let align = self.align as usize;
@@ -114,7 +116,7 @@ impl Drop for Block {
             }
 
             unsafe {
-                dealloc(self.refs.cast::<u8>(), Layout::new::<u8>());
+                dealloc(self.refs.cast::<u8>(), Layout::new::<u32>());
             }
         }
     }

@@ -1,7 +1,5 @@
 //! [Generalized Isolation Level Definitions](https://pmg.csail.mit.edu/papers/icde00.pdf)
 use std::{
-    backtrace::Backtrace,
-    cell::Cell,
     collections::HashMap,
     sync::{
         atomic::{
@@ -13,7 +11,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath, Tx, TxnKV};
+use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath, TxnKV};
 
 macro_rules! prelude {
     ($($core:expr),+) => {
@@ -28,10 +26,6 @@ macro_rules! prelude {
             ($(e.session($core)),+,e)
         }
     };
-}
-
-thread_local! {
-    static BACKTRACE: Cell<Option<Backtrace>> = const { Cell::new(None) };
 }
 
 #[test]
@@ -220,6 +214,25 @@ fn no_pmp() {
     assert!(r.is_err() && r.err().unwrap() == OpCode::NotFound);
 
     s1.commit();
+
+    let (mut s1, mut s2, mut s3, _e) = prelude!(1, 2, 3);
+
+    s1.begin();
+    s1.put("foo", "bar");
+    s1.commit();
+
+    s2.begin();
+    s3.begin();
+
+    s2.replace("foo", "+1s").unwrap();
+    let r = s3.get("foo");
+    assert!(r.is_ok());
+    assert_eq!(r.unwrap().as_slice(), "bar".as_bytes());
+
+    s2.rollback();
+    let r = s3.get("foo");
+    assert!(r.is_ok());
+    assert_eq!(r.unwrap().as_slice(), "bar".as_bytes());
 }
 
 // lost update
@@ -360,14 +373,13 @@ fn history() -> Result<(), OpCode> {
 
 struct Executor {
     map: HashMap<usize, (Arc<SyncClosure>, Arc<AtomicBool>)>,
-    db: Mace,
+    db: Arc<Mace>,
     handle: Vec<Option<JoinHandle<()>>>,
 }
 
 impl Executor {
-    fn execute(core: usize, quit: Arc<AtomicBool>, cond: Arc<SyncClosure>) -> JoinHandle<()> {
+    fn execute(quit: Arc<AtomicBool>, cond: Arc<SyncClosure>) -> JoinHandle<()> {
         std::thread::spawn(move || {
-            coreid::bind_core(core);
             let p = cond.consumer();
             while !quit.load(Acquire) {
                 p.wait();
@@ -381,18 +393,17 @@ impl Executor {
         Self::launch2(core, true)
     }
 
-    fn launch2(core: &[usize], tmp: bool) -> Self {
+    fn launch2(workers: &[usize], tmp: bool) -> Self {
         let path = RandomPath::new();
         let mut opt = Options::new(&*path);
 
         opt.tmp_store = tmp;
-        opt.bind_core = false;
-        let db = Mace::open(opt).unwrap();
+        let db = Arc::new(Mace::open(opt).unwrap());
 
         let mut map = HashMap::new();
         let mut handle = Vec::new();
 
-        for c in core {
+        for c in workers {
             let local = Arc::new(AtomicU64::new(Notifier::WAIT));
             let peer = Arc::new(AtomicU64::new(Notifier::WAIT));
             let ln = Notifier {
@@ -406,12 +417,12 @@ impl Executor {
 
             let cond = Arc::new(SyncClosure::new(ln, rn));
             let quit = Arc::new(AtomicBool::new(false));
-            handle.push(Some(Self::execute(*c, quit.clone(), cond.clone())));
+            handle.push(Some(Self::execute(quit.clone(), cond.clone())));
             map.insert(*c, (cond, quit));
         }
 
         let this = Self { map, db, handle };
-        let mut s = this.session(core[0]);
+        let mut s = this.session(workers[0]);
         s.begin();
         s.put("1", "10");
         s.put("2", "20");
@@ -419,10 +430,11 @@ impl Executor {
         this
     }
 
-    fn session(&self, core: usize) -> Session {
-        let (cond, _) = self.map.get(&core).expect("invalid core");
+    fn session(&self, worker: usize) -> Session {
+        let (cond, _) = self.map.get(&worker).expect("invalid core");
+        let db = self.db.clone();
         Session {
-            tx: self.db.default(),
+            db,
             kv: None,
             cond: cond.clone(),
         }
@@ -446,7 +458,7 @@ impl Drop for Executor {
 }
 
 struct Session {
-    tx: Tx,
+    db: Arc<Mace>,
     kv: Option<TxnKV>,
     cond: Arc<SyncClosure>,
 }
@@ -571,16 +583,18 @@ impl SyncClosure {
 
 impl Session {
     fn begin(&mut self) {
+        let tx = self.db.default();
         self.cond.set_fn(Closure::new(|| {
-            self.kv = Some(self.tx.begin(IsolationLevel::SI));
+            self.kv = Some(tx._write(IsolationLevel::SI));
         }));
         self.sync();
     }
 
     fn view(&mut self, k: impl AsRef<[u8]>) -> Result<Vec<u8>, OpCode> {
         let mut rv = None;
+        let tx = self.db.default();
         self.cond.set_fn(Closure::new(|| {
-            let view = self.tx.view(IsolationLevel::SI);
+            let view = tx._read(IsolationLevel::SI);
             rv = Some(view.get(k.as_ref()).map(|x| x.data().to_vec()));
         }));
         self.sync();
@@ -590,7 +604,7 @@ impl Session {
     fn commit(&mut self) {
         self.cond.set_fn(Closure::new(|| {
             let kv = self.kv.take().unwrap();
-            self.tx.commit(kv)
+            let _ = kv.commit();
         }));
         self.sync();
     }
@@ -598,7 +612,7 @@ impl Session {
     fn rollback(&mut self) {
         self.cond.set_fn(Closure::new(|| {
             let kv = self.kv.take().unwrap();
-            self.tx.rollback(kv);
+            let _ = kv.rollback();
         }));
         self.sync();
     }
@@ -630,7 +644,7 @@ impl Session {
         self.get_or_del(k, false)
     }
 
-    #[allow(dead_code)]
+    #[allow(unused)]
     fn del<K: AsRef<[u8]>>(&mut self, k: K) -> Result<Vec<u8>, OpCode> {
         self.get_or_del(k, true)
     }

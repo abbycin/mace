@@ -1,69 +1,38 @@
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::fs::File;
 use std::hash::Hasher;
-use std::io::{Seek, Write};
+use std::io::Write;
 use std::ops::{Deref, DerefMut};
-use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 
-pub struct PageFooter {
-    pub checksum: u64,
-}
+use crc32c::Crc32cHasher;
 
-impl PageFooter {
-    pub fn serialize<IO>(&self, f: &mut IO)
-    where
-        IO: Write,
-    {
-        f.write_all(&self.checksum.to_le_bytes())
-            .expect("can't write page footer");
-    }
-}
+use crate::static_assert;
 
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct MapFooter {
-    pub file_id: u32,
-    pub nr_active: u32,
-    pub nr_deleted: u32,
-    pub nr_mapping: u32,
-    pub checksum: u64,
-}
-
-impl MapFooter {
-    const ACTIVE_ITEM_LEN: usize = size_of::<AddrMap>();
-
-    pub fn active_delta_size(&self) -> usize {
-        Self::ACTIVE_ITEM_LEN * self.nr_active as usize
-    }
-
-    pub fn serialize<IO>(&self, f: &mut IO)
-    where
-        IO: Write,
-    {
-        let s = unsafe {
-            std::slice::from_raw_parts(self as *const MapFooter as *const u8, size_of::<Self>())
-        };
-        f.write_all(s).expect("can't write map footer");
-    }
-}
+use super::{pack_id, rand_range, unpack_id, INIT_ORACLE, NEXT_ID};
 
 #[derive(Clone, Copy, Debug)]
-#[repr(C, align(4))]
+#[repr(packed(1))]
 pub struct RelocMap {
     /// frame offset in page file
-    pub(crate) off: u32,
+    pub(crate) off: u64,
     /// frame's payload length
     pub(crate) len: u32,
 }
 
-#[repr(C, align(4))]
+#[repr(packed(1))]
 pub struct AddrMap {
     /// offset in page map's address
-    pub(crate) key: u32,
+    pub(crate) key: u64,
     pub(crate) val: RelocMap,
 }
 
 impl AddrMap {
-    pub fn new(key: u32, off: u32, len: u32) -> Self {
+    pub const LEN: usize = size_of::<Self>();
+    pub fn new(key: u64, off: u64, len: u32) -> Self {
         Self {
             key,
             val: RelocMap { off, len },
@@ -73,11 +42,12 @@ impl AddrMap {
     pub fn as_slice(&self) -> &[u8] {
         unsafe {
             let p = self as *const Self as *const u8;
-            std::slice::from_raw_parts(p, size_of::<Self>())
+            std::slice::from_raw_parts(p, Self::LEN)
         }
     }
 }
 
+#[repr(packed(1))]
 pub struct MapEntry {
     page_id: u64,
     /// (file_id << 32) | arena_offset
@@ -92,10 +62,6 @@ impl MapEntry {
         }
     }
 
-    fn from_slice(x: &[u8]) -> &Self {
-        unsafe { &*(x.as_ptr() as *const Self) }
-    }
-
     pub fn page_id(&self) -> u64 {
         self.page_id
     }
@@ -107,17 +73,16 @@ impl MapEntry {
 
 #[derive(Default)]
 pub struct PageTable {
-    // pid, gsn, addr, len(offset + len)
+    // pid, addr, len(offset + len)
     data: HashMap<u64, MapEntry>,
 }
 
 impl PageTable {
     pub const ITEM_LEN: usize = size_of::<MapEntry>();
 
-    pub fn serialize<F, H>(&self, file: &mut F, hasher: &mut H) -> usize
+    pub fn serialize<F>(&self, file: &mut F) -> usize
     where
-        F: Write + FileExt,
-        H: Hasher,
+        F: Write,
     {
         let mut buf = Vec::new();
 
@@ -127,10 +92,21 @@ impl PageTable {
                 buf.extend_from_slice(e.as_slice());
             })
             .count();
-        hasher.write(buf.as_slice());
         file.write_all(buf.as_slice())
             .expect("can't write page table");
         buf.len()
+    }
+
+    pub fn hash<H>(&self, h: &mut H)
+    where
+        H: Hasher,
+    {
+        self.data
+            .values()
+            .map(|e| {
+                h.write(e.as_slice());
+            })
+            .count();
     }
 
     pub fn add(&mut self, pid: u64, addr: u64) {
@@ -150,28 +126,6 @@ impl PageTable {
             );
         }
     }
-
-    /// NOTE: the file must be mapping file
-    pub fn deserialize<F, IO>(file: &mut IO, mut f: F)
-    where
-        F: FnMut(&MapEntry),
-        IO: FileExt + Seek,
-    {
-        let mut buf = [0u8; size_of::<MapFooter>()];
-        let file_size = file.seek(std::io::SeekFrom::End(0)).unwrap();
-        let mut off = file_size - buf.len() as u64;
-        file.read_at(&mut buf, off).expect("can't read");
-        let footer = unsafe { &*(buf.as_ptr() as *const MapFooter) };
-
-        let mut data = vec![0u8; PageTable::ITEM_LEN * footer.nr_mapping as usize];
-        off -= data.len() as u64;
-        file.read_at(&mut data, off).expect("can't read");
-        let chunks = data.chunks(Self::ITEM_LEN);
-
-        for c in chunks {
-            f(MapEntry::from_slice(c));
-        }
-    }
 }
 
 impl Deref for PageTable {
@@ -187,122 +141,162 @@ impl DerefMut for PageTable {
     }
 }
 
+const META_COMPLETE: u16 = 114;
+const META_IMCOMPLETE: u16 = 514;
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct Meta {
+    pub oracle: AtomicU64,
+    pub wmk_oldest: AtomicU64,
+    /// the latest page id
+    pub next_data: AtomicU64,
+    /// the page files will never be accessed
+    pub gc_data: AtomicU64,
+    /// the latest checkpoint
+    pub chkpt: AtomicU64,
+    pub next_wal: AtomicU16,
+    pub state: AtomicU16,
+    pub checksum: AtomicU32,
+    padding: [u8; 16], // manually align to cacheline size
+}
+
+static_assert!(size_of::<Meta>() == 64);
+
+impl Meta {
+    pub fn new() -> Self {
+        let id = pack_id(NEXT_ID, 0);
+        Self {
+            oracle: AtomicU64::new(INIT_ORACLE),
+            wmk_oldest: AtomicU64::new(0),
+            next_data: AtomicU64::new(id),
+            gc_data: AtomicU64::new(id),
+            chkpt: AtomicU64::new(id),
+            next_wal: AtomicU16::new(NEXT_ID),
+            state: AtomicU16::new(META_IMCOMPLETE),
+            checksum: AtomicU32::new(0),
+            padding: [const { 0u8 }; 16],
+        }
+    }
+
+    pub fn reset(&self) {
+        let id = pack_id(NEXT_ID, 0);
+        self.oracle.store(INIT_ORACLE, Relaxed);
+        self.wmk_oldest.store(0, Relaxed);
+        self.next_data.store(id, Relaxed);
+        self.gc_data.store(id, Relaxed);
+        self.chkpt.store(id, Relaxed);
+        self.next_wal.store(NEXT_ID, Relaxed);
+        self.state.store(META_IMCOMPLETE, Relaxed);
+        self.checksum.store(0, Relaxed);
+    }
+
+    pub fn crc32(&self) -> u32 {
+        let mut h = Crc32cHasher::new(0);
+        h.write_u64(self.oracle.load(Relaxed));
+        // not calc wmk_oldest on purpose
+        h.write_u64(self.next_data.load(Relaxed));
+        h.write_u64(self.gc_data.load(Relaxed));
+        h.write_u64(self.chkpt.load(Relaxed));
+        h.write_u16(self.next_wal.load(Relaxed));
+        h.write_u16(self.state.load(Relaxed));
+        h.finish() as u32
+    }
+
+    pub fn deserialize(data: &[u8]) -> Self {
+        let mut tmp = Self::new();
+        let ptr = &mut tmp as *mut Self as *mut u8;
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(ptr, size_of::<Self>());
+            dst.copy_from_slice(data);
+        }
+        tmp
+    }
+
+    pub fn update_file(&self, id: u16, off: u64) {
+        assert_ne!(id, 0);
+        self.next_data.store(pack_id(id, off), Relaxed);
+    }
+
+    pub fn update_oldest_file(&self, id: u16, off: u64) {
+        self.gc_data.store(pack_id(id, off), Relaxed);
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.state.load(Relaxed) == META_COMPLETE
+    }
+
+    pub fn oldest_file(&self) -> u16 {
+        unpack_id(self.gc_data.load(Relaxed)).0
+    }
+
+    pub fn current_file(&self) -> u16 {
+        unpack_id(self.next_data.load(Relaxed)).0
+    }
+
+    pub fn update_chkpt(&self, id: u16, off: u64) {
+        assert_ne!(id, 0);
+        self.chkpt.store(pack_id(id, off), Relaxed);
+    }
+
+    fn serialize(&self) -> &[u8] {
+        self.checksum.store(self.crc32(), Relaxed);
+        let ptr = self as *const Self as *const u8;
+        unsafe { std::slice::from_raw_parts(ptr, size_of::<Self>()) }
+    }
+
+    pub fn sync(&self, path: PathBuf, complete: bool) {
+        let root = Path::new("/");
+        let parent = path.parent().unwrap_or(root);
+        let tmp = parent.join(format!("meta_{}", rand_range(114..514)));
+
+        let mut f = File::options()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&tmp)
+            .expect("can't open meta file");
+
+        let state = if complete {
+            META_COMPLETE
+        } else {
+            META_IMCOMPLETE
+        };
+        self.state.store(state, Relaxed);
+        f.write_all(self.serialize())
+            .expect("can't write meta file");
+        f.sync_all().expect("can't sync meta file");
+
+        std::fs::rename(tmp, path).expect("can't fail");
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use std::{
-        hash::Hasher,
-        io::{Seek, SeekFrom, Write},
-        os::unix::fs::FileExt,
-    };
+    use crate::utils::data::META_COMPLETE;
+    use std::sync::atomic::Ordering::Relaxed;
 
-    use crate::{
-        index::{
-            data::{Key, Value},
-            page::{DeltaType, NodeType, Page},
-            Delta,
-        },
-        map::data::{FrameFlag, FrameOwner},
-        utils::{data::MapFooter, decode_u64},
-    };
-
-    use super::PageTable;
-
-    #[derive(Default)]
-    struct FakeFile {
-        data: Vec<u8>,
-        off: u64,
-    }
-
-    impl FileExt for FakeFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-            let off = offset as usize;
-            let s = self.data.as_slice();
-            buf.copy_from_slice(&s[off..(off + buf.len())]);
-            Ok(buf.len())
-        }
-
-        fn write_at(&self, _buf: &[u8], _offset: u64) -> std::io::Result<usize> {
-            unimplemented!()
-        }
-    }
-
-    impl Write for FakeFile {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.data.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            unimplemented!()
-        }
-    }
-
-    impl Seek for FakeFile {
-        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-            match pos {
-                SeekFrom::Current(x) => self.off += x as u64,
-                SeekFrom::Start(x) => self.off = x,
-                SeekFrom::End(x) => self.off = self.data.len() as u64 - x as u64,
-            }
-
-            Ok(self.off)
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeHasher;
-    impl Hasher for FakeHasher {
-        fn write(&mut self, _buf: &[u8]) {}
-        fn finish(&self) -> u64 {
-            unimplemented!()
-        }
-    }
+    use super::Meta;
 
     #[test]
-    fn test_page_table() {
-        let (pid, addr, gsn) = (114, 514, 19268);
+    fn meta_s11n() {
+        let meta = Meta::new();
 
-        let (k, v) = ("key", "val");
-        let mut delta = Delta::new(DeltaType::Data, NodeType::Leaf)
-            .with_item((Key::new(k.as_bytes(), gsn, 0), Value::Put(v.as_bytes())));
-        let alloc_size = delta.size();
+        meta.state.store(META_COMPLETE, Relaxed);
+        meta.next_data.store(1, Relaxed);
+        meta.oracle.store(5, Relaxed);
 
-        let mut f = FrameOwner::alloc(alloc_size);
-        f.init(addr, FrameFlag::Unknown);
-        f.set_pid(pid);
+        let mut buf = vec![0u8; size_of::<Meta>()];
+        let s = buf.as_mut_slice();
+        s.copy_from_slice(meta.serialize());
 
-        assert_eq!(delta.size(), f.payload_size() as usize);
+        let tmp = Meta::deserialize(s);
 
-        let mut page = Page::from(f.payload());
-        delta.build(&mut page);
-        let h = page.header_mut();
-        h.meta.set_epoch(666);
-        h.set_link(addr);
+        assert_eq!(tmp.crc32(), tmp.checksum.load(Relaxed));
 
-        let mut table = PageTable::default();
-        let mut file = FakeFile::default();
-        let mut hasher = FakeHasher;
-
-        let mut buf = [0u8; size_of::<MapFooter>()];
-        let ft = unsafe { &mut *(buf.as_mut_ptr() as *mut MapFooter) };
-        let (file_id, _) = decode_u64(addr);
-        ft.checksum = 1;
-        ft.nr_active = 1;
-        ft.nr_deleted = 0;
-        ft.file_id = file_id;
-        ft.nr_mapping = 1;
-
-        table.add(pid, addr);
-        table.serialize(&mut file, &mut hasher);
-
-        ft.serialize(&mut file);
-
-        let (mut d_pid, mut d_addr) = (0, 0);
-        PageTable::deserialize(&mut file, |e| {
-            d_pid = e.page_id();
-            d_addr = e.page_addr();
-        });
-
-        assert_eq!(pid, d_pid);
-        assert_eq!(addr, d_addr);
+        let path = std::env::temp_dir().join("meta");
+        tmp.sync(path.clone(), true);
+        assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
     }
 }

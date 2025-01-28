@@ -1,17 +1,18 @@
 use std::{collections::VecDeque, iter::Peekable};
 
 use crate::{
+    cc::data::Ver,
     index::data::SLOT_LEN,
     utils::traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
     OpCode,
 };
 
 use super::{
-    data::{Sibling, Value, Ver},
+    data::{Sibling, Value},
     iter::{ItemIter, SliceIter},
     page::{self, DeltaType, LeafMergeIter, Meta, NodeType, Page, PageHeader},
     slotted::{self, SlottedPage},
-    IAlloc, Key,
+    FrameView, IAlloc, Key,
 };
 
 pub(crate) struct Delta<T> {
@@ -151,13 +152,9 @@ where
         self.iter = Some(iter);
     }
 
-    pub(crate) fn build<A: IAlloc>(
-        &mut self,
-        a: &mut A,
-    ) -> Result<(u64, Page<Key, Value<T>>), OpCode> {
-        let (addr, b) = a.allocate(self.header.len as usize)?;
+    pub(crate) fn build<A: IAlloc>(&mut self, a: &mut A) -> Result<FrameView, OpCode> {
+        let b = a.allocate(self.header.len as usize)?;
         let mut page = Page::<Key, Value<T>>::from(b.payload());
-
         *page.header_mut() = self.header;
         let mut builder = page::PageBuilder::from(&page.raw(), self.header.elems as usize);
 
@@ -187,7 +184,7 @@ where
             pos += 1;
         }
 
-        Ok((addr, page))
+        Ok(b)
     }
 
     fn save_versions<A: IAlloc>(
@@ -206,8 +203,9 @@ where
         while sz > 0 {
             let n = if sz > pg_sz { sz - pg_sz } else { sz };
             let alloc_sz = n + cnt * SLOT_LEN + slotted::HEADER_LEN;
-            let (addr, mut b) = a.allocate(alloc_sz)?;
+            let mut b = a.allocate(alloc_sz)?;
             b.set_slotted();
+            let addr = b.addr();
             let mut pg = SlottedPage::<Ver, T>::new(b.payload());
             let mut real = 0;
 
@@ -244,12 +242,12 @@ mod test {
         index::{
             data::Value,
             page::{DeltaType, LeafMergeIter, NodeType},
-            FrameOwner, IAlloc, Key,
+            FrameView, IAlloc, Key,
         },
-        map::data::FrameFlag,
+        map::data::{FrameFlag, FrameOwner},
     };
 
-    use super::FuseBuilder;
+    use super::{page::Page, FuseBuilder};
 
     struct Arena {
         map: HashMap<u64, FrameOwner>,
@@ -264,18 +262,18 @@ mod test {
             }
         }
 
-        fn alloc(&mut self, size: usize) -> (u64, FrameOwner) {
-            let mut b = FrameOwner::alloc(size);
+        fn alloc(&mut self, size: usize) -> FrameView {
+            let b = FrameOwner::alloc(size);
             let addr = b.data().data() as u64;
-            b.init(addr, FrameFlag::Unknown);
-            let copy = b.shallow_copy();
+            let mut copy = b.view();
+            copy.init(addr, FrameFlag::Unknown);
             self.map.insert(addr, b);
-            (addr, copy)
+            copy
         }
     }
 
     impl IAlloc for Arena {
-        fn allocate(&mut self, size: usize) -> Result<(u64, FrameOwner), crate::OpCode> {
+        fn allocate(&mut self, size: usize) -> Result<FrameView, crate::OpCode> {
             Ok(self.alloc(size))
         }
 
@@ -307,8 +305,9 @@ mod test {
 
         b.prepare(iter);
 
-        let (addr, page) = b.build(&mut arena).unwrap();
+        let f = b.build(&mut arena).unwrap();
 
+        let (addr, page) = (f.addr(), Page::<Key, Value<&[u8]>>::from(f.payload()));
         page.show(addr);
     }
 }

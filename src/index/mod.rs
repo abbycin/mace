@@ -6,16 +6,14 @@ pub(crate) mod tree;
 pub use data::Key;
 pub use tree::Val;
 mod builder;
+pub(crate) mod registry;
 mod slotted;
 pub(crate) mod txn;
 
-#[cfg(test)]
-pub(crate) use builder::Delta;
-
-use crate::{map::data::FrameOwner, OpCode};
+use crate::{map::data::FrameView, OpCode};
 
 trait IAlloc {
-    fn allocate(&mut self, size: usize) -> Result<(u64, FrameOwner), OpCode>;
+    fn allocate(&mut self, size: usize) -> Result<FrameView, OpCode>;
 
     fn page_size(&self) -> usize;
 }

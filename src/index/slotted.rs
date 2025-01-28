@@ -95,7 +95,7 @@ where
         K::decode_from(self.raw.sub_array(slot.key_off(), slot.key_len()))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn val_at(&self, pos: usize) -> Value<V> {
         let slot = self.slot(pos);
         Value::<V>::decode_from(self.raw.sub_array(slot.val_off(), slot.val_len()))
@@ -157,7 +157,7 @@ where
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[allow(unused)]
     pub(crate) fn show(&self) {
         let h = self.header();
 
@@ -171,10 +171,7 @@ where
 #[cfg(test)]
 mod test {
 
-    use crate::{
-        index::data::{Value, Ver},
-        utils::block::Block,
-    };
+    use crate::{cc::data::Ver, index::data::Value, utils::block::Block};
 
     use super::SlottedPage;
 

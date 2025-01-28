@@ -127,12 +127,12 @@ impl<T> Queue<T> {
         prod_tail.wrapping_sub(cons_tail) & self.mask
     }
 
-    #[allow(dead_code)]
+    #[allow(unused)]
     pub fn is_full(&self) -> bool {
         self.count() == self.cap
     }
 
-    #[allow(dead_code)]
+    #[allow(unused)]
     pub fn is_empty(&self) -> bool {
         self.count() == 0
     }

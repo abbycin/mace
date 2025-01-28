@@ -13,8 +13,8 @@ use super::worker::SyncWorker;
 pub struct Transaction {
     pub start_ts: u64,
     pub commit_ts: u64,
-    /// max gsn observed in current txn
-    pub max_gsn: u64,
+    /// max fsn observed in current txn
+    pub max_fsn: u64,
     pub modified: bool,
     pub level: IsolationLevel,
 }
@@ -24,7 +24,7 @@ impl Transaction {
         Self {
             start_ts: 0,
             commit_ts: 0,
-            max_gsn: 0,
+            max_fsn: 0,
             modified: false,
             level: IsolationLevel::SI,
         }
@@ -37,8 +37,8 @@ impl Transaction {
         self.level = level;
     }
 
-    pub(crate) fn ready_to_commit(&self, min_flush_txid: u64, min_flush_gsn: u64) -> bool {
-        self.max_gsn <= min_flush_gsn && self.start_ts <= min_flush_txid
+    pub(crate) fn ready_to_commit(&self, min_flush_txid: u64, min_fsn: u64) -> bool {
+        self.max_fsn <= min_fsn && self.start_ts <= min_flush_txid
     }
 }
 
@@ -57,21 +57,16 @@ pub struct ConcurrencyControl {
 }
 
 impl ConcurrencyControl {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(workers: usize) -> Self {
         Self {
-            commit_tree: CommitTree::new(),
-            cached_sts: vec![0; coreid::cores_online()],
-            cached_cts: vec![0; coreid::cores_online()],
+            commit_tree: CommitTree::new(workers),
+            cached_sts: vec![0; workers],
+            cached_cts: vec![0; workers],
             wmk_oldest_tx: AtomicU64::new(0),
             latest_cts: AtomicU64::new(0),
             last_latest_cts: AtomicU64::new(0),
             global_wmk_tx: 0,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn visible_to_all(&self, ctx: &Context, txid: u64) -> bool {
-        txid < ctx.wmk_oldest.load(Relaxed)
     }
 
     /// check `txid` is visible to worker `wid` with txn with `start_ts`
@@ -168,7 +163,7 @@ impl ConcurrencyControl {
         }
 
         if g_old != u64::MAX {
-            ctx.wmk_oldest.store(g_old, Release);
+            ctx.update_wmk(g_old);
         }
     }
 
@@ -197,10 +192,10 @@ pub struct CommitTree {
 }
 
 impl CommitTree {
-    pub fn new() -> Self {
+    pub fn new(workers: usize) -> Self {
         Self {
             log: Vec::new(),
-            cap: coreid::cores_online(),
+            cap: workers,
             lk: RwLock::new(()),
         }
     }
@@ -292,7 +287,7 @@ mod test {
 
     #[test]
     fn commit_tree() {
-        let mut t = CommitTree::new();
+        let mut t = CommitTree::new(10);
 
         t.append(1, 2);
         t.append(3, 4);

@@ -1,92 +1,70 @@
 use std::path::{Path, PathBuf};
 
-use super::OpCode;
-
-const DEFAULT_WRITE_BUFFER_SIZE: usize = 1 << 20;
-const DEFAULT_PAGE_SIZE: usize = 16 << 10;
-const DEFAULT_CACHE_CAPACITY: usize = 256;
-const DEFAULT_EVICT_PCT: usize = 10;
-
-/// mace database configuration options
 #[derive(Clone)]
 pub struct Options {
-    /// should we create a new instance or panic when recover a database was failed
-    pub panic_on_recover: bool,
-    /// allow bind thread to current running CPU core
-    pub bind_core: bool,
+    /// hardware concurrency count, range in [1, cores]
+    pub workers: usize,
     /// is temperary storage, if true, db_root will be unlinked when quit
     pub tmp_store: bool,
     /// where to store database files
     pub db_root: PathBuf,
-    ///  meta file
-    pub meta_name: String,
-    /// how many worker thread will be created <br>
-    /// **NOTE: the value can't be changed once set**
-    pub worker_thread_count: u8,
-    /// page arena size
-    pub write_buffer_size: usize,
-    /// smaller than half of arena size
-    pub page_size_threshold: usize,
     /// cache memory size, unit in element count, not element size
     pub cache_capacity: usize,
     /// percent of items will evict at once, default is 10%
     pub cache_evict_pct: usize,
     /// buffer pool element size
     pub buffer_size: u32,
-    /// buffer pool element count
+    /// buffer pool element count, must > 2
     pub buffer_count: u32,
+    /// B+ Tree node size, mut less than half of [`Self::buffer_size`]
+    pub page_size: usize,
     /// when should we consolidate delta chain
     pub consolidate_threshold: u8,
-    /// WAL ring buffer size
+    /// WAL ring buffer size, must greater than [`Self::page_size`]
     pub wal_buffer_size: usize,
+    /// start checkpoint every [`Self::chkpt_per_bytes`] data was written to WAL
+    pub chkpt_per_bytes: usize,
+    /// WAL file size limit which will trigger switch to new WAL file
+    pub wal_file_size: usize,
+    /// the rest space at least twice big than [`Self::data_file_size`]
+    /// must greater than [`Self::buffer_size`] and less than 2^48
+    pub data_file_size: usize,
 }
 
 impl Options {
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
-            panic_on_recover: false,
-            bind_core: false,
+            workers: std::thread::available_parallelism().unwrap().get(),
             tmp_store: false,
             db_root: db_root.as_ref().to_path_buf(),
-            meta_name: "meta.json".into(),
-            worker_thread_count: 4,
-            page_size_threshold: DEFAULT_PAGE_SIZE,
-            write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
-            cache_capacity: DEFAULT_CACHE_CAPACITY,
-            cache_evict_pct: DEFAULT_EVICT_PCT,
+            cache_capacity: 1024, // 1024 items
+            cache_evict_pct: 10,  // 10 %
             buffer_size: 4 << 20, // 4MB
-            buffer_count: 256,    // total 100MB
-            consolidate_threshold: 8,
-            wal_buffer_size: 2 << 20,
+            buffer_count: 3,      // total 12MB
+            page_size: 16 << 10,  // 16KB
+            consolidate_threshold: 16,
+            wal_buffer_size: 4 << 20,  // 4MB
+            chkpt_per_bytes: 4 << 20,  // 4MB
+            wal_file_size: 100 << 20,  // 10MB
+            data_file_size: 100 << 20, // 100 MB
         }
     }
 }
 
 impl Options {
-    pub const MAP_PREFIX: &'static str = "db.map_";
-    pub const PAGE_PREFIX: &'static str = "db.page_";
+    pub const DATA_PREFIX: &'static str = "data_";
+    pub const WAL_PREFIX: &'static str = "wal_";
 
-    pub fn map_file(&self, id: u32) -> PathBuf {
-        self.db_root.join(format!("{}{}", Self::MAP_PREFIX, id))
+    pub fn data_file(&self, id: u16) -> PathBuf {
+        self.db_root.join(format!("{}{}", Self::DATA_PREFIX, id))
     }
 
-    pub fn page_file(&self, id: u32) -> PathBuf {
-        self.db_root.join(format!("{}{}", Self::PAGE_PREFIX, id))
+    pub fn wal_file(&self, id: u16) -> PathBuf {
+        self.db_root.join(format!("{}{}", Self::WAL_PREFIX, id))
     }
 
-    pub fn wal_file(&self) -> PathBuf {
-        self.db_root.join("db.wal")
-    }
-
-    #[allow(dead_code)]
-    fn validate(&self) -> Result<(), OpCode> {
-        if self.write_buffer_size < self.page_size_threshold * 2 {
-            return Err(OpCode::Invalid);
-        }
-        if self.page_size_threshold == 0 {
-            return Err(OpCode::Invalid);
-        }
-        Ok(())
+    pub fn meta_file(&self) -> PathBuf {
+        self.db_root.join("meta")
     }
 }
 
