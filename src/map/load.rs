@@ -1,9 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf};
 
 use io::{File, SeekableGatherIO};
 
 use super::data::{DataLoader, FrameOwner};
-use crate::{utils::data::RelocMap, Options};
+use crate::utils::data::RelocMap;
 
 pub struct FileReader {
     path: PathBuf,
@@ -33,16 +33,16 @@ impl FileReader {
         loader.offset()
     }
 
-    pub fn new(opt: &Arc<Options>, id: u16) -> Option<Self> {
-        let path = opt.data_file(id);
+    pub fn new(path: PathBuf) -> Option<Self> {
         let loader = Self::open_file(&path, 0)?;
         let mut map = HashMap::new();
+        log::trace!("load {:?} off {}", path, loader.offset());
         let off = Self::init_map(loader, &mut map);
 
         let file = match File::options().read(true).open(&path) {
             Ok(f) => f,
             Err(e) => {
-                log::error!("can't open {:?} {}", opt.data_file(id), e);
+                log::error!("can't open {:?} {}", path, e);
                 std::process::abort();
             }
         };
@@ -56,6 +56,7 @@ impl FileReader {
 
     pub fn load(&mut self) {
         let loader = Self::open_file(&self.path, self.off).expect("can't open file");
+        log::trace!("load {:?} off {}", self.path, self.off);
         let off = Self::init_map(loader, &mut self.map);
         self.off = off;
     }
@@ -64,7 +65,7 @@ impl FileReader {
         let m = self.map.get(&off)?;
         let frame = FrameOwner::alloc(m.len as usize);
 
-        let b = frame.data();
+        let b = frame.payload();
         let dst = b.as_mut_slice(0, b.len());
         self.file.read(dst, m.off).expect("can't read");
 

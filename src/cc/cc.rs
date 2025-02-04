@@ -46,7 +46,7 @@ pub struct ConcurrencyControl {
     pub(crate) commit_tree: CommitTree,
     cached_sts: Vec<u64>,
     cached_cts: Vec<u64>,
-    /// shared local water mark, avoid LCB in read-only txn
+    /// shared local water mark, avoid performing LCB in read-only txn
     wmk_oldest_tx: AtomicU64,
     /// latest commit ts, update everytime a txn was commited
     pub(crate) latest_cts: AtomicU64,

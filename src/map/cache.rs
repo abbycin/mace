@@ -5,12 +5,10 @@ use crate::OpCode;
 use dashmap::DashMap;
 use rand::Rng;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::collections::HashSet;
 use std::sync::atomic::{
     AtomicU8,
     Ordering::{Relaxed, Release},
 };
-use std::sync::Arc;
 
 use super::data::FrameOwner;
 
@@ -30,7 +28,7 @@ pub const CD_EVICT: u8 = 0;
 
 struct Entry {
     addr: u64,
-    data: Option<Arc<FrameOwner>>,
+    data: Option<FrameOwner>,
     slot: usize,
     state: AtomicU8,
 }
@@ -73,7 +71,7 @@ impl Entry {
         }
     }
 
-    fn set(&mut self, addr: u64, data: Arc<FrameOwner>) {
+    fn set(&mut self, addr: u64, data: FrameOwner) {
         self.addr = addr;
         self.data = Some(data);
         self.state.store(CD_WARM, Relaxed);
@@ -111,14 +109,17 @@ impl Cache {
         this
     }
 
-    fn get_entry(&self) -> Box<Entry> {
-        loop {
+    fn get_entry(&self) -> Result<Box<Entry>, OpCode> {
+        let mut count = self.cap;
+        while count > 0 {
             if let Ok(e) = self.freelist.pop() {
-                break e;
+                return Ok(e);
             } else {
                 self.try_evict();
             }
+            count -= 1;
         }
+        Err(OpCode::NoSpace)
     }
 
     fn write(&self, slot: usize, addr: u64) {
@@ -131,8 +132,8 @@ impl Cache {
         unsafe { self.slots.add(slot).read().0 }
     }
 
-    pub(crate) fn put(&self, addr: u64, data: Arc<FrameOwner>) {
-        let mut p = self.get_entry();
+    pub(crate) fn put(&self, addr: u64, data: FrameOwner) -> Result<(), OpCode> {
+        let mut p = self.get_entry()?;
         p.set(addr, data);
         self.write(p.slot, addr);
         // this will happen when multiple threads are load data from same addr, we must handle this
@@ -140,10 +141,11 @@ impl Cache {
         if let Some(old) = self.map.insert(addr, p) {
             self.freelist.push(old).expect("no space");
         }
+        Ok(())
     }
 
     /// NOTE: the variables are guarded by lock (from dashmap)
-    pub(crate) fn get(&self, addr: u64) -> Option<Arc<FrameOwner>> {
+    pub(crate) fn get(&self, addr: u64) -> Option<FrameOwner> {
         let item = self.map.get_mut(&addr)?;
         let e = item.value();
         e.warm_up();
@@ -154,25 +156,19 @@ impl Cache {
         let cap = self.cap;
         let cnt = self.pct;
         let mut rng = rand::thread_rng();
-        let mut set = HashSet::new();
 
         for _ in 0..cnt {
             // NOTE: same addr may be selected multiple times, since it's random selection
             let slot = rng.gen_range(0..cap);
             let addr = self.read(slot);
-            if set.contains(&addr) {
-                continue;
-            }
-            set.insert(addr);
 
             if let Some((_, v)) = self.map.remove_if_mut(&addr, |k, v| {
                 assert_eq!(addr, *k);
-                v.cool_down().map_or(CD_EVICT, |x| {
-                    if x == CD_COOL {
-                        v.reset();
-                    }
-                    x
-                }) == CD_COOL
+                if let Ok(CD_COOL) = v.cool_down() {
+                    v.reset();
+                    return true;
+                }
+                false
             }) {
                 self.freelist.push(v).expect("no space");
             }
@@ -198,9 +194,10 @@ unsafe impl Sync for Cache {}
 #[cfg(test)]
 mod test {
     use crate::map::cache::Cache;
-    use crate::map::data::{Frame, FrameFlag, FrameOwner};
+    use crate::map::data::{Frame, FrameOwner};
     use crate::utils::options::Options;
     use crate::RandomPath;
+
     use std::sync::Arc;
 
     fn runner() -> bool {
@@ -214,10 +211,9 @@ mod test {
             let frame = FrameOwner::alloc(size);
             if i == 3 {
                 let mut view = frame.view();
-                view.init(0, FrameFlag::Unknown);
                 view.set_pid(233);
             }
-            c.put(i, Arc::new(frame));
+            c.put(i, frame).unwrap();
             c.get(3);
         }
 
@@ -230,8 +226,7 @@ mod test {
                 for j in b..e {
                     cache.get(3);
                     let frame = FrameOwner::alloc(size);
-                    frame.view().init(0, FrameFlag::Unknown);
-                    cache.put(j, Arc::new(frame));
+                    cache.put(j, frame).unwrap();
                 }
             }));
         }

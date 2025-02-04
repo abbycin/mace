@@ -1,9 +1,10 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::ops::Deref;
 
 use crate::cc::data::Ver;
 use crate::utils::traits::{ICodec, IKey, IVal, IValCodec};
-use crate::{number_to_slice, slice_to_number, utils::byte_array::ByteArray};
+use crate::{number_to_slice, slice_to_number, utils::bytes::ByteArray};
 
 const KEY_VAL_FIXED_BYTES: usize = 4;
 
@@ -134,6 +135,48 @@ impl ICodec for Ver {
             txid: slice_to_number!(x, u64),
             cmd: slice_to_number!(y, u32),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Id {
+    pub(crate) id: u64,
+}
+
+impl Id {
+    pub(crate) const fn new(id: u64) -> Self {
+        Self { id }
+    }
+}
+
+impl IValCodec for Id {
+    fn size(&self) -> usize {
+        size_of::<u64>()
+    }
+
+    fn encode(&self, to: &mut [u8]) {
+        number_to_slice!(self.id, to);
+    }
+
+    fn decode(from: &[u8]) -> Self {
+        Self {
+            id: slice_to_number!(from, u64),
+        }
+    }
+
+    fn to_string(&self) -> String {
+        format!("{}", self.id)
+    }
+
+    fn data(&self) -> &[u8] {
+        thread_local! {
+            static ARRAY: RefCell<[u8; 8]> = const { RefCell::new(const { [0u8; 8] }) };
+        }
+        ARRAY.with(|x| {
+            let mut dst = x.borrow_mut();
+            number_to_slice!(self.id, dst.as_mut_slice());
+            unsafe { std::slice::from_raw_parts(dst.as_ptr(), dst.len()) }
+        })
     }
 }
 
@@ -498,7 +541,7 @@ impl Slot {
 #[cfg(test)]
 mod test {
     use crate::utils::{
-        byte_array::ByteArray,
+        bytes::ByteArray,
         traits::{ICodec, IValCodec},
     };
 

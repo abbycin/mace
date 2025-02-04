@@ -1,15 +1,14 @@
 use super::IAlloc;
-use crate::map::data::{Frame, FrameFlag, FrameOwner, FrameView};
+use crate::map::data::{Frame, FrameFlag, FrameOwner, FrameRef};
 use crate::OpCode;
 use crate::Store;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
 
 pub struct SysTxn<'a> {
     pub store: &'a Store,
     /// arena list
-    buffers: Vec<(usize, FrameView)>,
-    read_only_buffer: Vec<Arc<FrameOwner>>,
+    buffers: Vec<(usize, FrameRef)>,
+    read_only_buffer: Vec<FrameOwner>,
     page_ids: Vec<(u64, u64)>,
 }
 
@@ -37,22 +36,24 @@ impl<'a> SysTxn<'a> {
         self.buffers.clear();
     }
 
-    pub fn pin_frame(&mut self, f: &Arc<FrameOwner>) {
-        self.read_only_buffer.push(f.clone());
+    pub fn pin(&mut self, f: FrameOwner) {
+        self.read_only_buffer.push(f);
     }
 
     pub fn unpin_all(&mut self) {
         self.read_only_buffer.clear();
     }
 
-    pub fn alloc(&mut self, size: usize) -> Result<FrameView, OpCode> {
-        let (buff_id, frame) = self.store.buffer.alloc(size as u32)?;
+    pub fn alloc(&mut self, size: usize) -> Result<FrameRef, OpCode> {
+        let (buff_id, frame) = self.store.buffer.alloc(size as u32).inspect_err(|e| {
+            log::error!("alloc memory fail, {:?}", e);
+        })?;
 
         self.buffers.push((buff_id, frame));
         Ok(frame)
     }
 
-    pub fn map(&mut self, frame: &mut FrameView) -> u64 {
+    pub fn map(&mut self, frame: &mut FrameRef) -> u64 {
         if matches!(frame.flag(), FrameFlag::TombStone) {
             panic!("bad insert");
         }
@@ -64,7 +65,7 @@ impl<'a> SysTxn<'a> {
         pid
     }
 
-    pub fn update(&mut self, pid: u64, old: u64, frame: &mut FrameView) -> Result<(), u64> {
+    pub fn update(&mut self, pid: u64, old: u64, frame: &mut FrameRef) -> Result<(), u64> {
         let new = frame.addr();
         self.store.page.cas(pid, old, new).inspect_err(|_| {
             // NOTE: if retry ok, it will be set to non-tombstone
@@ -76,7 +77,7 @@ impl<'a> SysTxn<'a> {
         Ok(())
     }
 
-    pub fn update_unchecked(&mut self, pid: u64, frame: &mut FrameView) {
+    pub fn update_unchecked(&mut self, pid: u64, frame: &mut FrameRef) {
         self.store.page.index(pid).store(frame.addr(), Relaxed);
         frame.set_pid(pid);
         self.commit();
@@ -86,7 +87,7 @@ impl<'a> SysTxn<'a> {
 impl Drop for SysTxn<'_> {
     fn drop(&mut self) {
         for (pid, addr) in &self.page_ids {
-            self.store.page.unmap(*pid, *addr);
+            self.store.page.unmap(*pid, *addr).expect("can't go wrong");
         }
         self.read_only_buffer.clear();
 
@@ -100,7 +101,7 @@ impl Drop for SysTxn<'_> {
 }
 
 impl IAlloc for SysTxn<'_> {
-    fn allocate(&mut self, size: usize) -> Result<FrameView, OpCode> {
+    fn allocate(&mut self, size: usize) -> Result<FrameRef, OpCode> {
         self.alloc(size)
     }
 

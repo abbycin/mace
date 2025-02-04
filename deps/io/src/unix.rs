@@ -76,7 +76,6 @@ impl File {
 impl Drop for File {
     fn drop(&mut self) {
         unsafe {
-            fsync(self.file);
             close(self.file);
         }
     }

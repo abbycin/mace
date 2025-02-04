@@ -22,42 +22,48 @@ fn flush_data(msg: &FlushData, opt: &Arc<Options>) {
 
     let mut size = 0;
     if msg.still() {
+        let flush_all = msg.is_force();
         for f in msg.iter {
             if f.set_state(Frame::STATE_INACTIVE, Frame::STATE_DEAD) == Frame::STATE_INACTIVE {
                 size += f.size();
-                builder.add(f);
+                builder.add(f, flush_all);
             }
         }
     }
 
     let path = opt.data_file(msg.id());
+    let mut f = match File::options().append(true).create(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("can't open {:?}, {:?}", path, e);
+            panic!("fatal error, path {:?}, error {:?}", path, e);
+        }
+    };
+    let off = f
+        .seek(std::io::SeekFrom::End(0))
+        .inspect_err(|e| {
+            log::error!("can't seek file {:?}, error {}", path, e);
+            panic!("fatal error, path {:?}, error {}", path, e);
+        })
+        .unwrap();
+    let mut cur_pos = off;
 
     if !builder.is_empty() {
-        let f = File::options().append(true).create(true).open(&path);
-        if f.is_err() {
-            log::error!("can't open {:?}, {:?}", path, f.err().unwrap());
-            std::process::abort();
-        }
-        let mut f = f.unwrap();
-        let Ok(off) = f.seek(std::io::SeekFrom::End(0)) else {
-            log::error!("can't seek file {:?}", path);
-            std::process::abort();
-        };
-
-        builder.build(off, &mut f);
+        cur_pos += builder.build(off, &mut f);
         let _ = f.sync_all().map_err(|x| {
             log::error!("can't sync {:?} {}", path, x);
-            std::process::abort();
+            panic!("fatal error");
         });
-        log::debug!(
-            "flush dirty {} frames, size {} off {}",
+        log::trace!(
+            "flush dirty {} frames, size {} off {} end {}",
             builder.len(),
             size,
-            off
+            off,
+            cur_pos
         );
     }
 
-    msg.mark_done();
+    msg.mark_done(cur_pos);
 }
 
 fn flush_thread(rx: Receiver<FlushData>, opt: Arc<Options>, sync: Arc<Notifier>) -> JoinHandle<()> {

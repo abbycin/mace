@@ -16,7 +16,7 @@ pub struct Context {
     pub(crate) opt: Arc<Options>,
     /// maybe a bottleneck
     /// contains oldest, txid less than or equal to it can be purged
-    meta: Arc<Meta>,
+    pub(crate) meta: Arc<Meta>,
     workers: Arc<Vec<SyncWorker>>,
     active_workers: Queue<SyncWorker>,
     ctrl: Arc<CState>,

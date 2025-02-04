@@ -12,7 +12,7 @@ unsafe impl Send for ByteArray {}
 
 impl ByteArray {
     pub fn alloc(size: usize) -> Self {
-        let ptr = unsafe { alloc(Layout::array::<u8>(size).unwrap()) };
+        let ptr = unsafe { alloc(Layout::from_size_align(size, size_of::<*const ()>()).unwrap()) };
         Self::new(ptr, size)
     }
 
@@ -22,7 +22,10 @@ impl ByteArray {
 
     pub fn free(b: Self) {
         unsafe {
-            dealloc(b.data, Layout::array::<u8>(b.size).unwrap());
+            dealloc(
+                b.data,
+                Layout::from_size_align(b.size, size_of::<*const ()>()).unwrap(),
+            );
         }
     }
 

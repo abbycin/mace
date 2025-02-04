@@ -15,7 +15,7 @@ use crate::static_assert;
 use super::{pack_id, rand_range, unpack_id, INIT_ORACLE, NEXT_ID};
 
 #[derive(Clone, Copy, Debug)]
-#[repr(packed(1))]
+#[repr(C, packed(1))]
 pub struct RelocMap {
     /// frame offset in page file
     pub(crate) off: u64,
@@ -23,7 +23,8 @@ pub struct RelocMap {
     pub(crate) len: u32,
 }
 
-#[repr(packed(1))]
+#[derive(Debug)]
+#[repr(C, packed(1))]
 pub struct AddrMap {
     /// offset in page map's address
     pub(crate) key: u64,
@@ -47,7 +48,8 @@ impl AddrMap {
     }
 }
 
-#[repr(packed(1))]
+#[derive(Debug)]
+#[repr(C, packed(1))]
 pub struct MapEntry {
     page_id: u64,
     /// (file_id << 32) | arena_offset
@@ -101,12 +103,7 @@ impl PageTable {
     where
         H: Hasher,
     {
-        self.data
-            .values()
-            .map(|e| {
-                h.write(e.as_slice());
-            })
-            .count();
+        self.data.values().map(|e| h.write(e.as_slice())).count();
     }
 
     pub fn add(&mut self, pid: u64, addr: u64) {
@@ -148,17 +145,20 @@ const META_IMCOMPLETE: u16 = 514;
 #[repr(C)]
 pub struct Meta {
     pub oracle: AtomicU64,
+    /// oldest flushed txid
     pub wmk_oldest: AtomicU64,
-    /// the latest page id
+    /// the latest data file id
     pub next_data: AtomicU64,
+    /// a shared variable to indicate if any arena was flushed
+    pub flushed: AtomicU64,
     /// the page files will never be accessed
-    pub gc_data: AtomicU64,
+    pub next_gc: AtomicU64,
     /// the latest checkpoint
-    pub chkpt: AtomicU64,
+    pub ckpt: AtomicU64,
     pub next_wal: AtomicU16,
     pub state: AtomicU16,
     pub checksum: AtomicU32,
-    padding: [u8; 16], // manually align to cacheline size
+    padding: [u8; 8], // manually align to cacheline size
 }
 
 static_assert!(size_of::<Meta>() == 64);
@@ -170,12 +170,13 @@ impl Meta {
             oracle: AtomicU64::new(INIT_ORACLE),
             wmk_oldest: AtomicU64::new(0),
             next_data: AtomicU64::new(id),
-            gc_data: AtomicU64::new(id),
-            chkpt: AtomicU64::new(id),
+            flushed: AtomicU64::new(id),
+            next_gc: AtomicU64::new(id),
+            ckpt: AtomicU64::new(id),
             next_wal: AtomicU16::new(NEXT_ID),
             state: AtomicU16::new(META_IMCOMPLETE),
             checksum: AtomicU32::new(0),
-            padding: [const { 0u8 }; 16],
+            padding: [const { 0u8 }; 8],
         }
     }
 
@@ -184,8 +185,8 @@ impl Meta {
         self.oracle.store(INIT_ORACLE, Relaxed);
         self.wmk_oldest.store(0, Relaxed);
         self.next_data.store(id, Relaxed);
-        self.gc_data.store(id, Relaxed);
-        self.chkpt.store(id, Relaxed);
+        self.next_gc.store(id, Relaxed);
+        self.ckpt.store(id, Relaxed);
         self.next_wal.store(NEXT_ID, Relaxed);
         self.state.store(META_IMCOMPLETE, Relaxed);
         self.checksum.store(0, Relaxed);
@@ -196,8 +197,8 @@ impl Meta {
         h.write_u64(self.oracle.load(Relaxed));
         // not calc wmk_oldest on purpose
         h.write_u64(self.next_data.load(Relaxed));
-        h.write_u64(self.gc_data.load(Relaxed));
-        h.write_u64(self.chkpt.load(Relaxed));
+        h.write_u64(self.next_gc.load(Relaxed));
+        h.write_u64(self.ckpt.load(Relaxed));
         h.write_u16(self.next_wal.load(Relaxed));
         h.write_u16(self.state.load(Relaxed));
         h.finish() as u32
@@ -218,16 +219,12 @@ impl Meta {
         self.next_data.store(pack_id(id, off), Relaxed);
     }
 
-    pub fn update_oldest_file(&self, id: u16, off: u64) {
-        self.gc_data.store(pack_id(id, off), Relaxed);
-    }
-
     pub fn is_complete(&self) -> bool {
         self.state.load(Relaxed) == META_COMPLETE
     }
 
     pub fn oldest_file(&self) -> u16 {
-        unpack_id(self.gc_data.load(Relaxed)).0
+        unpack_id(self.next_gc.load(Relaxed)).0
     }
 
     pub fn current_file(&self) -> u16 {
@@ -236,7 +233,7 @@ impl Meta {
 
     pub fn update_chkpt(&self, id: u16, off: u64) {
         assert_ne!(id, 0);
-        self.chkpt.store(pack_id(id, off), Relaxed);
+        self.ckpt.store(pack_id(id, off), Relaxed);
     }
 
     fn serialize(&self) -> &[u8] {

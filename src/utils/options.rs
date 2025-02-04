@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 pub struct Options {
     /// hardware concurrency count, range in [1, cores]
     pub workers: usize,
+    /// garbage collection cycle (milliseconds)
+    pub gc_timeout: u64,
+    /// percentage of active data in [`Self::buffer_size`], ratio below that will trigger GC
+    pub gc_ratio: u8,
     /// is temperary storage, if true, db_root will be unlinked when quit
     pub tmp_store: bool,
     /// where to store database files
@@ -23,11 +27,15 @@ pub struct Options {
     /// WAL ring buffer size, must greater than [`Self::page_size`]
     pub wal_buffer_size: usize,
     /// start checkpoint every [`Self::chkpt_per_bytes`] data was written to WAL
-    pub chkpt_per_bytes: usize,
+    pub ckpt_per_bytes: usize,
+    /// the number checkpoints that a txn can cross, ie, the length limit of a txn, if a txn length
+    /// exceed the limit, it will be forcibly aborted
+    pub max_ckpt_per_txn: usize,
     /// WAL file size limit which will trigger switch to new WAL file
     pub wal_file_size: usize,
-    /// the rest space at least twice big than [`Self::data_file_size`]
-    /// must greater than [`Self::buffer_size`] and less than 2^48
+    /// the available disk space at least two [`Self::data_file_size`] <br>
+    /// must greater than [`Self::buffer_size`] and less than 2^40 <br>
+    /// the maximum size that can be managed by mace is: (2^16 - 1) * 2^40 ~= 64PB
     pub data_file_size: usize,
 }
 
@@ -36,17 +44,20 @@ impl Options {
         Self {
             workers: std::thread::available_parallelism().unwrap().get(),
             tmp_store: false,
+            gc_timeout: 60 * 1000, // 60s
+            gc_ratio: 80,          // 80%
             db_root: db_root.as_ref().to_path_buf(),
-            cache_capacity: 1024, // 1024 items
+            cache_capacity: 2048, // 2048 items
             cache_evict_pct: 10,  // 10 %
             buffer_size: 4 << 20, // 4MB
             buffer_count: 3,      // total 12MB
             page_size: 16 << 10,  // 16KB
             consolidate_threshold: 16,
-            wal_buffer_size: 4 << 20,  // 4MB
-            chkpt_per_bytes: 4 << 20,  // 4MB
-            wal_file_size: 100 << 20,  // 10MB
-            data_file_size: 100 << 20, // 100 MB
+            wal_buffer_size: 4 << 20, // 4MB
+            ckpt_per_bytes: 4 << 20,  // 4MB
+            max_ckpt_per_txn: 1024,   // 4GB
+            wal_file_size: 100 << 20, // 100MB
+            data_file_size: 4 << 30,  // 4GB
         }
     }
 }
@@ -54,6 +65,7 @@ impl Options {
 impl Options {
     pub const DATA_PREFIX: &'static str = "data_";
     pub const WAL_PREFIX: &'static str = "wal_";
+    pub const WAL_FREEZED: &'static str = "freezed_wal_";
 
     pub fn data_file(&self, id: u16) -> PathBuf {
         self.db_root.join(format!("{}{}", Self::DATA_PREFIX, id))
@@ -61,6 +73,10 @@ impl Options {
 
     pub fn wal_file(&self, id: u16) -> PathBuf {
         self.db_root.join(format!("{}{}", Self::WAL_PREFIX, id))
+    }
+
+    pub fn wal_backup(&self, id: u16) -> PathBuf {
+        self.db_root.join(format!("{}{}", Self::WAL_FREEZED, id))
     }
 
     pub fn meta_file(&self) -> PathBuf {
