@@ -9,6 +9,7 @@ use crate::{
     utils::{IsolationLevel, INIT_CMD, NULL_CMD},
     OpCode,
 };
+use std::sync::atomic::Ordering::Relaxed;
 use std::{cell::Cell, sync::Arc};
 
 use super::{registry::Registry, Val};
@@ -33,22 +34,23 @@ fn get_impl<'a, K: AsRef<[u8]>>(
 
 pub struct TxnKV {
     ctx: Arc<Context>,
-    mgr: Registry,
     tree: Tree,
     w: SyncWorker,
     seq: Cell<u32>,
     is_end: Cell<bool>,
+    limit: usize,
 }
 
 impl TxnKV {
     fn new(mgr: Registry, tree: Tree, w: SyncWorker) -> Self {
+        let limit = mgr.store.opt.max_ckpt_per_txn;
         Self {
             ctx: mgr.store.context.clone(),
-            mgr,
             tree,
             w,
             seq: Cell::new(INIT_CMD),
             is_end: Cell::new(false),
+            limit,
         }
     }
 
@@ -58,13 +60,21 @@ impl TxnKV {
         r
     }
 
+    fn should_abort(&self) -> Result<(), OpCode> {
+        if self.is_end.get() {
+            return Err(OpCode::Invalid);
+        }
+        if self.w.ckpt_cnt.load(Relaxed) >= self.limit {
+            return Err(OpCode::AbortTx);
+        }
+        Ok(())
+    }
+
     fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<Val<Record>>, OpCode>
     where
         F: FnMut(&Option<(Key, Val<Record>)>, Ver, SyncWorker) -> Result<(), OpCode>,
     {
-        if self.is_end.get() {
-            return Err(OpCode::Invalid);
-        }
+        self.should_abort()?;
         let start_ts = self.w.txn.start_ts;
         let (wid, cmd_id) = (self.w.id, self.cmd_id());
         let key = Key::new(k, start_ts, cmd_id);
@@ -95,7 +105,7 @@ impl TxnKV {
                 w.txn.modified = true;
                 w.logging.record_update(
                     ver,
-                    self.tree.seq(),
+                    self.tree.id(),
                     WalPut::new(v.len()),
                     k,
                     [].as_slice(),
@@ -127,7 +137,7 @@ impl TxnKV {
                     *logged = true;
                     w.logging.record_update(
                         ver,
-                        self.tree.seq(),
+                        self.tree.id(),
                         WalReplace::new(t.data().len(), v.len()),
                         rk.raw,
                         t.data(),
@@ -176,9 +186,7 @@ impl TxnKV {
     where
         T: AsRef<[u8]>,
     {
-        if self.is_end.get() {
-            return Err(OpCode::Invalid);
-        }
+        self.should_abort()?;
         let mut w = self.w;
         let (wid, start_ts) = (w.id, w.txn.start_ts);
         let key = Key::new(k.as_ref(), start_ts, self.cmd_id());
@@ -205,7 +213,7 @@ impl TxnKV {
                         w.txn.modified = true;
                         w.logging.record_update(
                             *key.ver(),
-                            self.tree.seq(),
+                            self.tree.id(),
                             WalDel::new(t.data().len()),
                             rk.raw,
                             t.data(),
@@ -219,6 +227,7 @@ impl TxnKV {
     }
 
     pub fn commit(&self) -> Result<(), OpCode> {
+        self.should_abort()?;
         if !self.is_end.get() {
             self.w.commit(&self.ctx);
             self.is_end.set(true);
@@ -228,7 +237,7 @@ impl TxnKV {
 
     pub fn rollback(&self) -> Result<(), OpCode> {
         if !self.is_end.get() {
-            self.w.rollback(self.mgr.clone(), &self.ctx);
+            self.w.rollback(&self.ctx, &self.tree);
             self.is_end.set(true);
         }
         Ok(())
@@ -273,7 +282,6 @@ impl Drop for TxnView {
     }
 }
 
-#[derive(Clone)]
 pub struct Tx {
     pub(crate) ctx: Arc<Context>,
     pub(crate) tree: Tree,
@@ -281,6 +289,9 @@ pub struct Tx {
 }
 
 impl Tx {
+    pub fn id(&self) -> u64 {
+        self.tree.id()
+    }
     /// read-only txn
     pub fn view<F>(&self, level: IsolationLevel, f: F) -> Result<(), OpCode>
     where
@@ -312,6 +323,23 @@ impl Tx {
     }
 }
 
+impl Clone for Tx {
+    fn clone(&self) -> Self {
+        self.mgr.inc_ref(self.tree.id());
+        Self {
+            ctx: self.ctx.clone(),
+            tree: self.tree.clone(),
+            mgr: self.mgr.clone(),
+        }
+    }
+}
+
+impl Drop for Tx {
+    fn drop(&mut self) {
+        self.mgr.dec_ref(self.tree.id());
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::{utils::IsolationLevel, Mace, OpCode, Options, RandomPath};
@@ -321,7 +349,7 @@ mod test {
         let path = RandomPath::tmp();
         let _ = std::fs::remove_dir_all(&*path);
         let opt = Options::new(&*path);
-        let db = Mace::open(opt)?;
+        let db = Mace::new(opt)?;
         let (k1, k2) = ("beast".as_bytes(), "senpai".as_bytes());
         let (v1, v2) = ("114514".as_bytes(), "1919810".as_bytes());
         let tx = db.default();
@@ -407,7 +435,7 @@ mod test {
             })?;
         }
 
-        let tx = db.get("upsert");
+        let tx = db.alloc().unwrap();
 
         {
             tx.begin(IsolationLevel::SI, |kv| {

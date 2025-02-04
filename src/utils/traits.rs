@@ -1,4 +1,4 @@
-use crate::utils::byte_array::ByteArray;
+use crate::utils::bytes::ByteArray;
 
 pub trait IPageIter: Iterator {
     fn rewind(&mut self);

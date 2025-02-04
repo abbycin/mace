@@ -9,9 +9,10 @@ use rand::{seq::SliceRandom, thread_rng};
 #[test]
 fn put_get() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
-    let opt = Options::new(&*path);
-    let db = Mace::open(opt)?;
-    let tx = db.default();
+    let mut opt = Options::new(&*path);
+    opt.buffer_count = 5;
+    let db = Mace::new(opt)?;
+    let tx = db.alloc().unwrap();
 
     let n = 1000;
     let mut container = Vec::with_capacity(n);
@@ -68,16 +69,6 @@ fn put_get() -> Result<(), OpCode> {
         kv.commit()
     });
 
-    let r = db.remove(tx);
-    assert!(r.is_ok());
-
-    let tx = db.default();
-    let _ = tx.begin(IsolationLevel::SI, |kv| {
-        let r = kv.get("foo");
-        assert!(r.is_err());
-        kv.commit()
-    });
-
     Ok(())
 }
 
@@ -119,7 +110,7 @@ fn check(
 fn get_del() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
-    let db = Mace::open(opt)?;
+    let db = Mace::new(opt)?;
     let tx = db.default();
 
     let n = 1000;

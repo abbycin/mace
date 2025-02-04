@@ -4,6 +4,7 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::utils::{NULL_PID, ROOT_PID};
+use crate::OpCode;
 
 const SLOT_SIZE: u64 = 1u64 << 16;
 
@@ -88,10 +89,10 @@ impl PageMap {
         }
     }
 
-    pub fn unmap(&self, pid: u64, addr: u64) {
+    pub fn unmap(&self, pid: u64, addr: u64) -> Result<(), OpCode> {
         self.index(pid)
             .compare_exchange(addr, NULL_PID, Ordering::AcqRel, Ordering::Relaxed)
-            .expect("can't fail");
+            .map_err(|_| OpCode::Again)?;
         let mut curr = self.next.load(Ordering::Relaxed);
         loop {
             let smaller = min(pid, curr);
@@ -103,6 +104,7 @@ impl PageMap {
                 Err(x) => curr = x,
             }
         }
+        Ok(())
     }
 
     pub fn get(&self, pid: u64) -> u64 {
@@ -207,7 +209,7 @@ build_layer!(Layer1, Layer2, L1_FANOUT);
 
 #[cfg(test)]
 mod test {
-    use crate::map::page_map::{PageMap, L1_FANOUT, L2_FANOUT, L3_FANOUT, NULL_PID};
+    use crate::map::table::{PageMap, L1_FANOUT, L2_FANOUT, L3_FANOUT, NULL_PID};
 
     fn addr(a: u64) -> u64 {
         a * 2
@@ -238,7 +240,7 @@ mod test {
         }
 
         for (idx, pid) in mapped_pid.iter().enumerate() {
-            table.unmap(*pid, addr(pids[idx]));
+            table.unmap(*pid, addr(pids[idx])).unwrap();
             assert_eq!(table.get(*pid), NULL_PID);
         }
 

@@ -1,11 +1,18 @@
-use std::{cell::RefCell, cmp::max, collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    cmp::max,
+    collections::{hash_map::Entry, BTreeMap, HashMap},
+    rc::Rc,
+};
 
 use io::{File, SeekableGatherIO};
 
 use crate::{
-    index::{data::Value, registry::Registry, Key},
-    slice_to_number, static_assert,
-    utils::{block::Block, byte_array::ByteArray, unpack_id, INIT_CMD, NEXT_ID, NULL_ORACLE},
+    index::{data::Value, tree::Tree, Key},
+    static_assert,
+    utils::{
+        block::Block, bytes::ByteArray, unpack_id, INIT_CMD, NEXT_ID, NULL_ORACLE, ROOT_TREEID,
+    },
     Record,
 };
 
@@ -38,6 +45,8 @@ pub(crate) enum EntryType {
     Commit,
     Abort,
     CheckPoint,
+    TreePut,
+    TreeDel,
     Unknown,
 }
 
@@ -51,8 +60,6 @@ impl From<u8> for EntryType {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PayloadType {
-    MgrPut,
-    MgrDel,
     Insert,
     Update,
     Delete,
@@ -120,11 +127,23 @@ static_assert!(size_of::<WalCommit>() == size_of::<WalBegin>());
 #[derive(Debug)]
 pub(crate) struct WalCheckpoint {
     pub(crate) wal_type: EntryType,
+    /// snapshot of current oracle
+    pub(crate) txid: u64,
     /// previous checkpoint's file + offset
     pub(crate) prev_addr: u64,
     // same to worker count
     pub(crate) active_txn_cnt: u16,
     // follows txid-addr map
+}
+
+#[repr(C, packed(1))]
+#[derive(Debug)]
+pub(crate) struct WalTree {
+    pub(crate) wal_type: EntryType,
+    pub(crate) txid: u64,
+    /// same to txid on creation
+    pub(crate) id: u64,
+    pub(crate) pid: u64,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -151,6 +170,7 @@ impl CkptMem {
         Self {
             hdr: WalCheckpoint {
                 wal_type: EntryType::CheckPoint,
+                txid: 0,
                 prev_addr: 0,
                 active_txn_cnt: 0,
             },
@@ -178,7 +198,12 @@ impl CkptMem {
         x.addr = addr;
     }
 
-    pub(crate) fn slice(&mut self, prev_addr: u64) -> ((*const u8, usize), (*const u8, usize)) {
+    pub(crate) fn slice(
+        &mut self,
+        txid: u64,
+        prev_addr: u64,
+    ) -> ((*const u8, usize), (*const u8, usize)) {
+        self.hdr.txid = txid;
         self.hdr.prev_addr = prev_addr;
         self.hdr.active_txn_cnt = self.fill_txn() as u16;
 
@@ -217,6 +242,34 @@ impl WalCheckpoint {
     }
 }
 
+impl WalTree {
+    pub(crate) fn new(is_put: bool, id: u64, txid: u64, pid: u64) -> Self {
+        Self {
+            wal_type: if is_put {
+                EntryType::TreePut
+            } else {
+                EntryType::TreeDel
+            },
+            txid,
+            id,
+            pid,
+        }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    // fixed
+    pub(crate) fn tree_id(&self) -> u64 {
+        ROOT_TREEID
+    }
+
+    pub(crate) fn root_pid(&self) -> u64 {
+        self.pid
+    }
+}
+
 impl WalUpdate {
     pub(crate) fn sub_type(&self) -> PayloadType {
         self.sub_type
@@ -246,14 +299,6 @@ impl WalUpdate {
 
     pub(crate) fn del(&self) -> &WalDel {
         self.cast_to::<WalDel>()
-    }
-
-    pub(crate) fn mgr_put(&self) -> &WalMgrPut {
-        self.cast_to::<WalMgrPut>()
-    }
-
-    pub(crate) fn mgr_del(&self) -> &WalMgrDel {
-        self.cast_to::<WalMgrDel>()
     }
 
     pub(crate) fn clr(&self) -> &WalClr {
@@ -313,50 +358,7 @@ impl_codec!(WalBegin);
 impl_codec!(WalCommit);
 impl_codec!(WalAbort);
 impl_codec!(WalCheckpoint);
-
-#[repr(C, packed(1))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct WalMgrPut {
-    seq: u64,
-}
-
-#[derive(Debug)]
-#[repr(C, packed(1))]
-pub(crate) struct WalMgrDel {
-    seq: u64,
-}
-
-impl_codec!(WalMgrPut);
-impl_codec!(WalMgrDel);
-
-macro_rules! impl_mgr {
-    ($s: ty) => {
-        impl $s {
-            pub(crate) fn new(seq: u64) -> Self {
-                Self { seq }
-            }
-
-            pub(crate) fn id(&self) -> u64 {
-                self.seq
-            }
-
-            pub(crate) fn pid_slice(&self) -> &[u8] {
-                let ptr = self as *const Self;
-                unsafe {
-                    let ptr = ptr.add(1).cast::<u8>();
-                    std::slice::from_raw_parts(ptr, size_of::<u64>())
-                }
-            }
-
-            pub(crate) fn pid(&self) -> u64 {
-                slice_to_number!(self.pid_slice(), u64)
-            }
-        }
-    };
-}
-
-impl_mgr!(WalMgrPut);
-impl_mgr!(WalMgrDel);
+impl_codec!(WalTree);
 
 #[repr(C, packed(1))]
 #[derive(Clone, Copy, Debug)]
@@ -473,18 +475,6 @@ impl WalClr {
 
 impl_codec!(WalClr);
 
-impl IWalPayload for WalMgrPut {
-    fn sub_type(&self) -> PayloadType {
-        PayloadType::MgrPut
-    }
-}
-
-impl IWalPayload for WalMgrDel {
-    fn sub_type(&self) -> PayloadType {
-        PayloadType::MgrDel
-    }
-}
-
 impl IWalPayload for WalPut {
     fn sub_type(&self) -> PayloadType {
         PayloadType::Insert
@@ -533,6 +523,7 @@ impl IWalCodec for &[u8] {
 
 pub(crate) fn wal_record_sz(e: EntryType) -> usize {
     match e {
+        EntryType::TreeDel | EntryType::TreePut => WalTree::size(),
         EntryType::Abort | EntryType::Begin | EntryType::Commit => WalAbort::size(),
         EntryType::Update => WalUpdate::size(),
         EntryType::Padding => WalPadding::size(),
@@ -541,18 +532,18 @@ pub(crate) fn wal_record_sz(e: EntryType) -> usize {
     }
 }
 
-pub(crate) struct WalReader {
+pub(crate) struct WalReader<'a> {
     map: RefCell<BTreeMap<u16, (Rc<File>, u64)>>,
-    ctx: Arc<Context>,
-    mgr: Registry,
+    trees: RefCell<HashMap<u64, Tree>>,
+    ctx: &'a Context,
 }
 
-impl WalReader {
-    pub(crate) fn new(mgr: Registry) -> Self {
+impl<'a> WalReader<'a> {
+    pub(crate) fn new(ctx: &'a Context) -> Self {
         Self {
             map: RefCell::new(BTreeMap::new()),
-            ctx: mgr.store.context.clone(),
-            mgr,
+            trees: RefCell::new(HashMap::new()),
+            ctx,
         }
     }
 
@@ -576,7 +567,10 @@ impl WalReader {
     }
 
     // for rollback, the worker should be same to caller, but can be arbitratry for recovery
-    pub(crate) fn rollback(&self, block: &mut Block, txid: u64, addr: u64) {
+    pub(crate) fn rollback<F>(&self, block: &mut Block, txid: u64, addr: u64, get_tree: F)
+    where
+        F: Fn(u64) -> Tree,
+    {
         let (mut id, mut pos) = unpack_id(addr);
         let mut cmd = INIT_CMD;
         let mut last_worker = 0;
@@ -618,7 +612,13 @@ impl WalReader {
                         assert_eq!({ u.txid }, txid);
                         assert!(pos + usz as u64 <= end);
                         last_worker = u.worker_id as usize;
-                        let next = self.undo(f.clone(), block, pos, sz, usz, &mut cmd);
+                        if block.len() < usz {
+                            block.realloc(usz);
+                        }
+                        let s = block.get_mut_slice(sz, usz - sz);
+                        f.read(s, pos + sz as u64).unwrap();
+                        let next =
+                            self.undo(ptr_to::<WalUpdate>(block.data()), &mut cmd, &get_tree);
                         let (prev_id, prev_pos) = unpack_id(next);
                         pos = prev_pos;
                         if prev_id != id {
@@ -633,22 +633,10 @@ impl WalReader {
         }
     }
 
-    fn undo(
-        &self,
-        f: Rc<File>,
-        block: &mut Block,
-        beg: u64,
-        off: usize,
-        size: usize,
-        cmd: &mut u32,
-    ) -> u64 {
-        if block.len() < size {
-            block.realloc(size);
-        }
-        let s = block.get_mut_slice(off, size - off);
-        f.read(s, beg + off as u64).unwrap();
-        let c = ptr_to::<WalUpdate>(block.data());
-
+    fn undo<F>(&self, c: &WalUpdate, cmd: &mut u32, get_tree: &F) -> u64
+    where
+        F: Fn(u64) -> Tree,
+    {
         let (tombstone, data) = match c.sub_type() {
             PayloadType::Insert => {
                 let i = c.put();
@@ -666,7 +654,6 @@ impl WalReader {
                 let x = c.clr();
                 return x.undo_next;
             }
-            PayloadType::MgrDel | PayloadType::MgrPut => unreachable!("mgr never rollback"),
         };
 
         *cmd = max(c.cmd_id, *cmd);
@@ -688,7 +675,15 @@ impl WalReader {
             data,
         );
 
-        let tree = self.mgr.get_by_id(c.tree_id).expect("can't find tree");
+        let mut trees = self.trees.borrow_mut();
+        let e = trees.entry(c.tree_id);
+        let tree = match e {
+            Entry::Occupied(ref x) => x.get(),
+            Entry::Vacant(x) => {
+                let t = get_tree(c.tree_id);
+                x.insert(t)
+            }
+        };
         tree.put(Key::new(raw, c.txid, *cmd), val)
             .expect("can't go wrong");
         c.prev_addr

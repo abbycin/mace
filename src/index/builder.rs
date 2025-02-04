@@ -12,7 +12,7 @@ use super::{
     iter::{ItemIter, SliceIter},
     page::{self, DeltaType, LeafMergeIter, Meta, NodeType, Page, PageHeader},
     slotted::{self, SlottedPage},
-    FrameView, IAlloc, Key,
+    FrameRef, IAlloc, Key,
 };
 
 pub(crate) struct Delta<T> {
@@ -152,7 +152,7 @@ where
         self.iter = Some(iter);
     }
 
-    pub(crate) fn build<A: IAlloc>(&mut self, a: &mut A) -> Result<FrameView, OpCode> {
+    pub(crate) fn build<A: IAlloc>(&mut self, a: &mut A) -> Result<FrameRef, OpCode> {
         let b = a.allocate(self.header.len as usize)?;
         let mut page = Page::<Key, Value<T>>::from(b.payload());
         *page.header_mut() = self.header;
@@ -242,9 +242,9 @@ mod test {
         index::{
             data::Value,
             page::{DeltaType, LeafMergeIter, NodeType},
-            FrameView, IAlloc, Key,
+            FrameRef, IAlloc, Key,
         },
-        map::data::{FrameFlag, FrameOwner},
+        map::data::FrameOwner,
     };
 
     use super::{page::Page, FuseBuilder};
@@ -262,18 +262,17 @@ mod test {
             }
         }
 
-        fn alloc(&mut self, size: usize) -> FrameView {
+        fn alloc(&mut self, size: usize) -> FrameRef {
             let b = FrameOwner::alloc(size);
             let addr = b.data().data() as u64;
-            let mut copy = b.view();
-            copy.init(addr, FrameFlag::Unknown);
+            let copy = b.view();
             self.map.insert(addr, b);
             copy
         }
     }
 
     impl IAlloc for Arena {
-        fn allocate(&mut self, size: usize) -> Result<FrameView, crate::OpCode> {
+        fn allocate(&mut self, size: usize) -> Result<FrameRef, crate::OpCode> {
             Ok(self.alloc(size))
         }
 

@@ -11,7 +11,7 @@ fn intact_meta() {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut saved = opt.clone();
-    let db = Mace::open(opt).unwrap();
+    let db = Mace::new(opt).unwrap();
     let nr_kv = 10;
     let tx = db.default();
     let mut pair = Vec::with_capacity(nr_kv);
@@ -39,7 +39,7 @@ fn intact_meta() {
     drop(db);
 
     saved.tmp_store = true;
-    let db = Mace::open(saved).unwrap();
+    let db = Mace::new(saved).unwrap();
     let tx = db.default();
     let _ = tx.view(IsolationLevel::SI, |view| {
         for (i, (k, v)) in pair.iter().enumerate() {
@@ -69,7 +69,7 @@ fn bad_meta() {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::open(opt).unwrap();
+    let db = Mace::new(opt).unwrap();
 
     let tx = db.default();
 
@@ -88,7 +88,7 @@ fn bad_meta() {
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::open(save).unwrap();
+    let db = Mace::new(save).unwrap();
     let tx = db.default();
 
     let _ = tx.view(IsolationLevel::SI, |kv| {
@@ -107,7 +107,7 @@ fn crash_again() {
     let mut save = opt.clone();
 
     {
-        let db = Mace::open(opt).unwrap();
+        let db = Mace::new(opt).unwrap();
         let tx = db.default();
         let _ = tx.begin(IsolationLevel::SI, |kv| {
             kv.put("foo", "bar").unwrap();
@@ -123,7 +123,7 @@ fn crash_again() {
     break_meta(save.meta_file());
 
     {
-        let db = Mace::open(save.clone()).unwrap();
+        let db = Mace::new(save.clone()).unwrap();
         let tx = db.default();
 
         let _ = tx.begin(IsolationLevel::SI, |kv| {
@@ -141,7 +141,7 @@ fn crash_again() {
 
     {
         save.tmp_store = true;
-        let db = Mace::open(save.clone()).unwrap();
+        let db = Mace::new(save.clone()).unwrap();
         let tx = db.default();
 
         let _ = tx.view(IsolationLevel::SI, |view| {
@@ -163,7 +163,7 @@ where
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::open(opt).unwrap();
+    let db = Mace::new(opt).unwrap();
 
     let tx = db.default();
     let _ = tx.begin(IsolationLevel::SI, |kv| {
@@ -178,7 +178,7 @@ where
     f(&save, 1);
 
     save.tmp_store = true;
-    let db = Mace::open(save).unwrap();
+    let db = Mace::new(save).unwrap();
     let tx = db.default();
     let _ = tx.view(IsolationLevel::SI, |view| {
         let x = view.get("114514").expect("not found");
@@ -208,7 +208,7 @@ fn recover_after_insert() {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::open(opt).unwrap();
+    let db = Mace::new(opt).unwrap();
     let mut pairs = Vec::new();
 
     let tx = db.default();
@@ -229,7 +229,7 @@ fn recover_after_insert() {
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::open(save).unwrap();
+    let db = Mace::new(save).unwrap();
     let tx = db.default();
     let _ = tx.view(IsolationLevel::SI, |view| {
         for (k, v) in &pairs {
@@ -249,7 +249,7 @@ fn put_update(remov_data: bool) {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::open(opt).unwrap();
+    let db = Mace::new(opt).unwrap();
     let mut pairs = Vec::new();
     let mut new_pairs = Vec::new();
 
@@ -258,7 +258,7 @@ fn put_update(remov_data: bool) {
         new_pairs.push((format!("key_{}", i), format!("new_val_{}", i)));
     }
 
-    let tx = db.get("moha");
+    let tx = db.alloc().unwrap();
     for (k, v) in &pairs {
         let _ = tx.begin(IsolationLevel::SI, |kv| {
             kv.put(k, v).unwrap();
@@ -296,8 +296,8 @@ fn put_update(remov_data: bool) {
     }
 
     save.tmp_store = true;
-    let db = Mace::open(save).unwrap();
-    let tx = db.get("moha");
+    let db = Mace::new(save).unwrap();
+    let tx = db.get(tx.id()).unwrap();
 
     let _ = tx.view(IsolationLevel::SI, |view| {
         for (k, v) in &new_pairs {
@@ -313,7 +313,7 @@ fn recover_after_remove() {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::open(opt).unwrap();
+    let db = Mace::new(opt).unwrap();
     let mut pairs = Vec::new();
 
     for i in 0..1000 {
@@ -339,7 +339,7 @@ fn recover_after_remove() {
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::open(save).unwrap();
+    let db = Mace::new(save).unwrap();
     let tx = db.default();
     let _ = tx.view(IsolationLevel::SI, |view| {
         for (k, _) in &pairs {
@@ -354,10 +354,10 @@ fn recover_after_remove() {
 fn ckpt_wal(keys: usize, ckpt_per: usize, wal_len: usize) {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.chkpt_per_bytes = ckpt_per;
+    opt.ckpt_per_bytes = ckpt_per;
     opt.wal_file_size = wal_len;
     let mut save = opt.clone();
-    let db = Mace::open(opt).unwrap();
+    let db = Mace::new(opt).unwrap();
     let mut data = Vec::new();
 
     for i in 0..keys {
@@ -386,7 +386,7 @@ fn ckpt_wal(keys: usize, ckpt_per: usize, wal_len: usize) {
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::open(save).unwrap();
+    let db = Mace::new(save).unwrap();
     let tx = db.default();
     let _ = tx.view(IsolationLevel::SI, |view| {
         for (k, v) in &data {
@@ -415,10 +415,10 @@ fn recover_from_middle() {
 fn long_txn_impl(before: bool) {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.chkpt_per_bytes = 256;
+    opt.ckpt_per_bytes = 256;
     opt.wal_file_size = 1024;
     let mut save = opt.clone();
-    let db = Mace::open(opt).unwrap();
+    let db = Mace::new(opt).unwrap();
     let b = Arc::new(Barrier::new(2));
     let mut pair = Vec::new();
 
@@ -461,7 +461,7 @@ fn long_txn_impl(before: bool) {
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::open(save).unwrap();
+    let db = Mace::new(save).unwrap();
     let tx = db.default();
     let _ = tx.view(IsolationLevel::SI, |view| {
         for (k, v) in &pair {

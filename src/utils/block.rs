@@ -1,6 +1,6 @@
 use std::alloc::{alloc, dealloc, realloc, Layout};
 
-use super::{align_up, byte_array::ByteArray};
+use super::{align_up, bytes::ByteArray};
 
 pub(crate) struct Block {
     data: *mut u8,

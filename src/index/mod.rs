@@ -10,10 +10,10 @@ pub(crate) mod registry;
 mod slotted;
 pub(crate) mod txn;
 
-use crate::{map::data::FrameView, OpCode};
+use crate::{map::data::FrameRef, OpCode};
 
 trait IAlloc {
-    fn allocate(&mut self, size: usize) -> Result<FrameView, OpCode>;
+    fn allocate(&mut self, size: usize) -> Result<FrameRef, OpCode>;
 
     fn page_size(&self) -> usize;
 }

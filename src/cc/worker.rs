@@ -2,7 +2,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         atomic::{
-            AtomicU64,
+            AtomicU64, AtomicUsize,
             Ordering::{Relaxed, Release},
         },
         Arc,
@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    index::registry::Registry,
+    index::tree::Tree,
     utils::{block::Block, countblock::Countblock},
     IsolationLevel, Options,
 };
@@ -24,6 +24,8 @@ use super::{
 
 pub struct Worker {
     pub cc: ConcurrencyControl,
+    pub ckpt_cnt: AtomicUsize,
+    pub ckpt: AtomicU64,
     pub txn: Transaction,
     pub logging: Logging,
     /// a snapshot of [`Transaction::start_ts`] which will be used across threads
@@ -35,6 +37,8 @@ impl Worker {
     fn new(fsn: Arc<AtomicU64>, id: u16, opt: Arc<Options>, sem: Arc<Countblock>) -> Self {
         Self {
             cc: ConcurrencyControl::new(opt.workers),
+            ckpt_cnt: AtomicUsize::new(0),
+            ckpt: AtomicU64::new(0),
             txn: Transaction::new(),
             logging: Logging::new(fsn, opt, id, sem),
             tx_id: AtomicU64::new(0),
@@ -69,6 +73,8 @@ impl SyncWorker {
 
         let id = self.id;
         self.txn.reset(start_ts, level);
+        self.ckpt_cnt.store(0, Relaxed);
+        self.ckpt.store(ctx.meta.ckpt.load(Relaxed), Relaxed);
         self.tx_id.store(start_ts, Relaxed);
         self.cc.global_wmk_tx = ctx.wmk_oldest();
         self.cc.commit_tree.compact(ctx, id);
@@ -110,7 +116,7 @@ impl SyncWorker {
         w.logging.wait_commit(txn.commit_ts);
     }
 
-    pub(crate) fn rollback(&self, mgr: Registry, ctx: &Context) {
+    pub(crate) fn rollback(&self, ctx: &Context, tree: &Tree) {
         let txid = self.txn.start_ts;
         if !self.txn.modified {
             self.logging.record_abort(txid);
@@ -119,8 +125,10 @@ impl SyncWorker {
         let mut w = *self;
         w.logging.wait_flush();
         let mut block = Block::alloc(1024);
-        let reader = WalReader::new(mgr);
-        reader.rollback(&mut block, txid, w.logging.lsn.load(Relaxed));
+        let reader = WalReader::new(ctx);
+        reader.rollback(&mut block, txid, w.logging.lsn.load(Relaxed), |_| {
+            tree.clone()
+        });
 
         // since we are append-only, we must update CommitTree to make the rollbacked data visible
         // for example: worker 1 set foo = bar then commit, worker 2 del foo, then rollback, if we

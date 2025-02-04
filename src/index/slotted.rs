@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::marker::PhantomData;
 
 use crate::index::data::Value;
-use crate::utils::byte_array::ByteArray;
+use crate::utils::bytes::ByteArray;
 use crate::utils::traits::{ICodec, IKey, IVal, IValCodec};
 use crate::utils::OpCode;
 

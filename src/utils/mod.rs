@@ -7,9 +7,10 @@ use std::{
 use rand::{rngs::ThreadRng, Rng};
 
 pub(crate) mod block;
-pub mod byte_array;
+pub(crate) mod bytes;
 pub(crate) mod countblock;
 pub(crate) mod data;
+pub(crate) mod lru;
 pub mod options;
 pub(crate) mod queue;
 pub(crate) mod traits;
@@ -17,11 +18,13 @@ pub(crate) mod traits;
 pub(crate) const NULL_PID: u64 = 0;
 pub(crate) const ROOT_PID: u64 = 1;
 pub(crate) const ROOT_TREEID: u64 = 0;
+pub(crate) const DEFAULT_TREEID: u64 = 1;
 pub(crate) const NEXT_ID: u16 = 1;
+pub(crate) const NULL_ID: u16 = u16::MAX;
 pub(crate) const INIT_CMD: u32 = 1;
 pub(crate) const NULL_CMD: u32 = u32::MAX;
-/// NOTE: must larger than oldest_txid (which is 0 by default)
-pub(crate) const INIT_ORACLE: u64 = 1;
+/// NOTE: must larger than wmk_oldest_tx(which is 0 by default) and ROOT_TREEID and DEFAULT_TREEID
+pub(crate) const INIT_ORACLE: u64 = 2;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
 
 #[derive(Debug, PartialEq)]
@@ -34,6 +37,8 @@ pub enum OpCode {
     NoSpace,
     IoError,
     AbortTx,
+    Duplicated,
+    DbFull,
     Unknown,
 }
 
@@ -103,12 +108,14 @@ macro_rules! slice_to_number {
     }};
 }
 
+pub(crate) const SEG_BITS: u64 = 48;
+
 pub(crate) const fn pack_id(hi: u16, lo: u64) -> u64 {
-    (hi as u64) << 48 | lo
+    ((hi as u64) << SEG_BITS) | lo
 }
 
 pub(crate) const fn unpack_id(x: u64) -> (u16, u64) {
-    ((x >> 48) as u16, (x & ((1u64 << 48) - 1)))
+    ((x >> SEG_BITS) as u16, (x & ((1u64 << SEG_BITS) - 1)))
 }
 
 thread_local! {

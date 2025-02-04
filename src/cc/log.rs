@@ -1,5 +1,4 @@
 use std::{
-    cell::Cell,
     cmp::{max, min, Ordering},
     collections::{HashMap, VecDeque},
     path::PathBuf,
@@ -19,8 +18,8 @@ use crate::{
     cc::wal::{EntryType, WalPadding},
     map::buffer::Buffers,
     utils::{
-        block::Block, byte_array::ByteArray, countblock::Countblock, data::Meta, pack_id,
-        unpack_id, NEXT_ID,
+        block::Block, bytes::ByteArray, countblock::Countblock, data::Meta, pack_id, unpack_id,
+        NEXT_ID,
     },
     Options,
 };
@@ -30,7 +29,7 @@ use super::{
     data::Ver,
     wal::{
         CkptMem, IWalCodec, IWalPayload, IWalRec, WalAbort, WalBegin, WalCheckpoint, WalCommit,
-        WalUpdate,
+        WalTree, WalUpdate,
     },
     worker::SyncWorker,
 };
@@ -104,6 +103,7 @@ fn set_lsn(data: *mut u8, mut off: usize, end: usize, lsn: &AtomicU64, beg: u64)
 
         // the data is always valid, not need to check
         sz = match h {
+            EntryType::TreePut | EntryType::TreeDel => WalTree::size(),
             EntryType::Abort | EntryType::Begin | EntryType::Commit => {
                 let x = to::<WalBegin>(p);
                 x.set_lsn(last_record_pos);
@@ -128,8 +128,11 @@ fn set_lsn(data: *mut u8, mut off: usize, end: usize, lsn: &AtomicU64, beg: u64)
         };
 
         off += sz;
-        // excluding padding from txn chain
-        if h != EntryType::Padding {
+        // excluding padding and tree from txn chain, they are not involved in rollback
+        if !matches!(
+            h,
+            EntryType::Padding | EntryType::TreeDel | EntryType::TreePut
+        ) {
             last_record_pos = lsn.fetch_add(sz as u64, Relaxed);
         } else {
             sz = 0;
@@ -354,6 +357,14 @@ impl Logging {
         self.add_entry(w, txid);
     }
 
+    pub(crate) fn record_put(&self, id: u64, txid: u64, pid: u64) {
+        self.add_entry(WalTree::new(true, id, txid, pid), txid);
+    }
+
+    pub(crate) fn record_del(&self, id: u64, txid: u64, pid: u64) {
+        self.add_entry(WalTree::new(false, id, txid, pid), txid);
+    }
+
     pub(crate) fn fsn(&mut self) -> u64 {
         self.fsn.load(Relaxed)
     }
@@ -439,9 +450,10 @@ pub struct GroupCommitter {
     meta: Arc<Meta>,
     /// AIO will use this field until it's completed
     ckpt: CkptMem,
-    wal_size: Cell<u64>,
-    last_id: u16,
-    last_checkpoint: u64,
+    wal_size: u64,
+    flushed_size: usize,
+    last_ckpt_id: u16,
+    last_ckpt_pos: u64,
     checkpointed: bool,
     writer: WalWriter,
 }
@@ -449,17 +461,20 @@ pub struct GroupCommitter {
 impl GroupCommitter {
     pub(crate) fn new(opt: Arc<Options>, meta: Arc<Meta>) -> Self {
         let workers = opt.workers;
-        let (id, off) = unpack_id(meta.chkpt.load(Relaxed));
+        let (id, off) = unpack_id(meta.ckpt.load(Relaxed));
         assert!(id >= NEXT_ID);
-        let writer = WalWriter::new(opt.wal_file(meta.next_wal.load(Relaxed)));
+        let next_wal = meta.next_wal.load(Relaxed);
+        let writer = WalWriter::new(opt.wal_file(next_wal));
+        let pos = writer.pos();
 
         Self {
             opt,
             meta,
             ckpt: CkptMem::new(workers),
-            wal_size: Cell::new(writer.pos()),
-            last_id: id,
-            last_checkpoint: off,
+            wal_size: pos,
+            flushed_size: 0,
+            last_ckpt_id: id,
+            last_ckpt_pos: off,
             checkpointed: false,
             writer,
         }
@@ -476,7 +491,7 @@ impl GroupCommitter {
         sem: Arc<Countblock>,
     ) {
         let mut desc = HashMap::new();
-        let lsn = pack_id(self.last_id, self.wal_size.get());
+        let lsn = pack_id(self.last_ckpt_id, self.wal_size);
         for w in workers.iter() {
             w.logging.lsn.store(lsn, Release);
             desc.insert(w.id, WalDesc::default());
@@ -488,10 +503,7 @@ impl GroupCommitter {
 
             if !self.writer.is_empty() {
                 self.flush();
-                buffer.update_flsn(pack_id(
-                    self.meta.next_wal.load(Acquire),
-                    self.wal_size.get(),
-                ));
+                buffer.update_flsn(pack_id(self.meta.next_wal.load(Acquire), self.wal_size));
             }
 
             self.commit_txn(&workers, min_flush_txid, min_fsn, &desc);
@@ -501,7 +513,11 @@ impl GroupCommitter {
             }
 
             if ctrl.is_working() && self.should_stabilize() {
-                self.stabilize(&buffer, tx.clone(), &rx);
+                // count ckpt per txn
+                for w in workers.iter() {
+                    w.ckpt_cnt.fetch_add(1, Relaxed);
+                }
+                self.request_stabilize(&buffer, &tx, &rx);
             }
         }
 
@@ -535,7 +551,7 @@ impl GroupCommitter {
             let wal_tail = d.wal_tail;
             let data = w.logging.buffer.data();
 
-            let beg = pack_id(cur_id, self.wal_size.get());
+            let beg = pack_id(cur_id, self.wal_size);
             let txid = match wal_tail.cmp(&wal_head) {
                 Ordering::Greater => {
                     self.queue_data(data, wal_head, wal_tail);
@@ -568,7 +584,10 @@ impl GroupCommitter {
     fn flush(&mut self) {
         self.writer.sync();
         if self.checkpointed {
-            self.meta.update_chkpt(self.last_id, self.last_checkpoint);
+            self.meta
+                .update_chkpt(self.last_ckpt_id, self.last_ckpt_pos);
+            self.meta.sync(self.opt.meta_file(), false);
+            self.checkpointed = false;
         }
     }
 
@@ -606,48 +625,63 @@ impl GroupCommitter {
     fn queue_data(&mut self, buf: *const u8, from: usize, to: usize) {
         let data = unsafe { buf.add(from) };
         let count = to - from;
-        let pos = self.wal_size.get();
 
         self.writer.queue(data, count);
-        self.wal_size.set(pos + count as u64);
+        self.wal_size += count as u64;
+        self.flushed_size += count;
     }
 
     #[inline(always)]
     fn should_switch(&self) -> bool {
-        self.wal_size.get() >= self.opt.wal_file_size as u64
+        self.wal_size >= self.opt.wal_file_size as u64
     }
 
     fn switch(&mut self) {
         // we never use the number 0
-        let mut next_wal = self.meta.next_wal.load(Relaxed).wrapping_add(1);
+        let current = self.meta.next_wal.load(Relaxed);
+        let mut next_wal = current.wrapping_add(1);
         if next_wal == 0 {
             next_wal = NEXT_ID;
         }
+        log::info!("roll wal from {} to {}", current, next_wal);
+        self.wal_size = 0;
         self.writer.reset(self.opt.wal_file(next_wal));
-        self.wal_size.set(0);
         self.meta.next_wal.store(next_wal, Relaxed);
     }
 
     #[inline(always)]
     fn should_stabilize(&self) -> bool {
-        self.wal_size.get() >= self.last_checkpoint + self.opt.chkpt_per_bytes as u64
+        self.flushed_size >= self.opt.ckpt_per_bytes
     }
 
-    fn stabilize(&mut self, buffer: &Arc<Buffers>, tx: Arc<Sender<()>>, rx: &Receiver<()>) {
-        buffer.stabilize(Box::new(move || {
+    fn request_stabilize(
+        &mut self,
+        buffer: &Arc<Buffers>,
+        tx: &Arc<Sender<()>>,
+        rx: &Receiver<()>,
+    ) {
+        if !buffer.should_stabilize() {
+            return;
+        }
+
+        let tx = tx.clone();
+        buffer.stabilize(Box::new(move |_| {
             let _ = tx.send(()).inspect_err(|e| {
                 log::error!("can't notify flushed {}", e);
             });
         }));
+
+        log::info!("checkpoint {:?}", (self.last_ckpt_id, self.last_ckpt_pos));
+        self.flushed_size = 0;
         let r = rx.recv();
         assert!(r.is_ok());
 
-        assert_ne!(self.last_id, 0);
-        let prev_addr = pack_id(self.last_id, self.last_checkpoint);
-        self.last_id = self.meta.next_wal.load(Relaxed);
-        self.last_checkpoint = self.wal_size.get(); // point to current position
+        assert_ne!(self.last_ckpt_id, 0);
+        let prev_addr = pack_id(self.last_ckpt_id, self.last_ckpt_pos);
+        self.last_ckpt_id = self.meta.next_wal.load(Relaxed);
+        self.last_ckpt_pos = self.wal_size; // point to current position
 
-        let (hdr, data) = self.ckpt.slice(prev_addr);
+        let (hdr, data) = self.ckpt.slice(self.meta.oracle.load(Relaxed), prev_addr);
         self.queue_data(hdr.0, 0, hdr.1);
         self.queue_data(data.0, 0, data.1);
         self.writer.sync();

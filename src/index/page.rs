@@ -9,7 +9,7 @@ use crate::{
     index::data::Key,
     static_assert,
     utils::{
-        byte_array::ByteArray,
+        bytes::ByteArray,
         traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
         unpack_id, NULL_PID,
     },
@@ -111,7 +111,7 @@ impl Meta {
     }
 
     pub fn set_epoch(&mut self, epoch: u64) {
-        self.0 = epoch << 16 | self.0 & 0xffff;
+        self.0 = (epoch << 16) | self.0 & 0xffff;
     }
 
     pub fn depth(&self) -> u8 {
@@ -123,7 +123,7 @@ impl Meta {
     }
 
     pub fn set_depth(&mut self, depth: u8) {
-        self.0 = (self.0 & !(0xff << 8)) | (depth as u64) << 8;
+        self.0 = (self.0 & !(0xff << 8)) | ((depth as u64) << 8);
     }
 
     pub fn is_leaf(&self) -> bool {
@@ -223,6 +223,8 @@ pub struct PageHeader {
     pub meta: Meta,
     /// physical link to delta or base page (file_id + offset)
     link: u64,
+    /// tree_id
+    pub tree_id: u64,
     /// NOTE: the page has same count of both key-value and key-index pair
     pub elems: u32,
     /// logical page size (including header)
@@ -273,7 +275,7 @@ impl DerefMut for PageHeader {
 }
 
 pub const PAGE_HEADER_SIZE: usize = size_of::<PageHeader>();
-static_assert!(PAGE_HEADER_SIZE == 24);
+static_assert!(PAGE_HEADER_SIZE == 32);
 
 impl<K, V> From<ByteArray> for Page<K, V>
 where
@@ -319,7 +321,6 @@ where
         K::decode_from(raw)
     }
 
-    #[cfg(test)]
     pub fn val_at(&self, pos: usize) -> V {
         let slot = self.offset(pos);
         debug_assert!(self.raw.len() >= slot.len());
@@ -337,7 +338,7 @@ where
         }
     }
 
-    pub fn search_by<F>(&self, key: &K, f: F) -> Result<usize, usize>
+    fn search_by<F>(&self, key: &K, f: F) -> Result<usize, usize>
     where
         F: Fn(&K, &K) -> Ordering,
     {
@@ -662,10 +663,10 @@ mod test {
     use crate::index::page::{
         DeltaType, NodeType, Page, PageMergeIter, PAGE_HEADER_SIZE, SLOT_LEN,
     };
-    use crate::utils::byte_array::ByteArray;
+    use crate::utils::block::Block;
     use crate::utils::traits::{ICodec, IKey, IVal};
 
-    use super::{IntlMergeIter, Meta, RangeIter, NULL_INDEX};
+    use super::{IntlMergeIter, Meta, PageHeader, RangeIter, NULL_INDEX};
 
     #[test]
     fn test_meta() {
@@ -704,7 +705,8 @@ mod test {
             .map(|(k, v)| (Key::new(k.as_bytes(), 0, 0), (Value::Put(v.as_bytes()))))
             .collect();
         let mut delta = Delta::new(DeltaType::Data, NodeType::Leaf).with_slice(&kv);
-        let a = ByteArray::alloc(delta.size());
+        let x = Block::aligned_alloc(delta.size(), align_of::<PageHeader>());
+        let a = x.view(0, x.len());
         let mut page = Page::from(a);
 
         delta.build(&mut page);
@@ -746,8 +748,6 @@ mod test {
             Ok(_) => unreachable!(),
             Err(pos) => assert_eq!(pos, pairs.len()),
         }
-
-        ByteArray::free(a);
     }
 
     fn must_match<I, K, V>(src: I, p: Page<K, V>)
@@ -780,9 +780,12 @@ mod test {
         let mut delta2 = Delta::new(DeltaType::Data, NodeType::Intl).with_slice(&s2);
         let mut delta3 = Delta::new(DeltaType::Data, NodeType::Intl).with_slice(&s3);
 
-        let b1 = ByteArray::alloc(delta1.size());
-        let b2 = ByteArray::alloc(delta2.size());
-        let b3 = ByteArray::alloc(delta3.size());
+        let x1 = Block::aligned_alloc(delta1.size(), align_of::<PageHeader>());
+        let x2 = Block::aligned_alloc(delta1.size(), align_of::<PageHeader>());
+        let x3 = Block::aligned_alloc(delta1.size(), align_of::<PageHeader>());
+        let b1 = x1.view(0, x1.len());
+        let b2 = x2.view(0, x2.len());
+        let b3 = x3.view(0, x3.len());
 
         let mut pg1 = Page::<&[u8], Index>::from(b1);
         let mut pg2 = Page::<&[u8], Index>::from(b2);
@@ -804,7 +807,8 @@ mod test {
 
         let iter = IntlMergeIter::new(PageMergeIter::new(builder.build(), None), 0);
         let mut delta = Delta::new(DeltaType::Data, NodeType::Intl).from(iter);
-        let b = ByteArray::alloc(delta.size());
+        let x4 = Block::aligned_alloc(delta.size(), align_of::<PageHeader>());
+        let b = x4.view(0, x4.len());
         let mut pg = Page::<&[u8], Index>::from(b);
 
         delta.build(&mut pg);
@@ -817,10 +821,5 @@ mod test {
         ];
 
         must_match(expact.into_iter(), pg);
-
-        ByteArray::free(b1);
-        ByteArray::free(b2);
-        ByteArray::free(b3);
-        ByteArray::free(b);
     }
 }
