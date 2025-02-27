@@ -6,37 +6,42 @@ use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use crc32c::Crc32cHasher;
 
-use crate::static_assert;
+use super::{pack_id, rand_range, INIT_ORACLE, NEXT_ID};
 
-use super::{pack_id, rand_range, unpack_id, INIT_ORACLE, NEXT_ID};
+/// logical id and physical id are same length
+pub(crate) const ID_LEN: usize = size_of::<u32>();
+/// packed logical id and offset
+pub(crate) const JUNK_LEN: usize = size_of::<u64>();
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed(1))]
-pub struct RelocMap {
+pub struct Reloc {
     /// frame offset in page file
-    pub(crate) off: u64,
+    pub(crate) off: u32,
     /// frame's payload length
     pub(crate) len: u32,
+    /// index in reclocation table
+    pub(crate) seq: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, packed(1))]
 pub struct AddrMap {
-    /// offset in page map's address
+    /// pack_id(lid, off)
     pub(crate) key: u64,
-    pub(crate) val: RelocMap,
+    pub(crate) val: Reloc,
 }
 
 impl AddrMap {
     pub const LEN: usize = size_of::<Self>();
-    pub fn new(key: u64, off: u64, len: u32) -> Self {
+    pub fn new(key: u64, off: u32, len: u32, seq: u32) -> Self {
         Self {
             key,
-            val: RelocMap { off, len },
+            val: Reloc { off, len, seq },
         }
     }
 
@@ -48,7 +53,7 @@ impl AddrMap {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, packed(1))]
 pub struct MapEntry {
     page_id: u64,
@@ -138,8 +143,8 @@ impl DerefMut for PageTable {
     }
 }
 
-const META_COMPLETE: u16 = 114;
-const META_IMCOMPLETE: u16 = 514;
+const META_COMPLETE: u32 = 114;
+const META_IMCOMPLETE: u32 = 514;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -147,36 +152,28 @@ pub struct Meta {
     pub oracle: AtomicU64,
     /// oldest flushed txid
     pub wmk_oldest: AtomicU64,
-    /// the latest data file id
-    pub next_data: AtomicU64,
-    /// a shared variable to indicate if any arena was flushed
-    pub flushed: AtomicU64,
-    /// the page files will never be accessed
-    pub next_gc: AtomicU64,
     /// the latest checkpoint
     pub ckpt: AtomicU64,
-    pub next_wal: AtomicU16,
-    pub state: AtomicU16,
+    /// the latest data file id
+    pub next_data: AtomicU32,
+    pub next_wal: AtomicU32,
+    pub state: AtomicU32,
     pub checksum: AtomicU32,
-    padding: [u8; 8], // manually align to cacheline size
 }
 
-static_assert!(size_of::<Meta>() == 64);
-
 impl Meta {
+    pub const LEN: usize = size_of::<Self>();
+
     pub fn new() -> Self {
         let id = pack_id(NEXT_ID, 0);
         Self {
             oracle: AtomicU64::new(INIT_ORACLE),
             wmk_oldest: AtomicU64::new(0),
-            next_data: AtomicU64::new(id),
-            flushed: AtomicU64::new(id),
-            next_gc: AtomicU64::new(id),
+            next_data: AtomicU32::new(NEXT_ID),
             ckpt: AtomicU64::new(id),
-            next_wal: AtomicU16::new(NEXT_ID),
-            state: AtomicU16::new(META_IMCOMPLETE),
+            next_wal: AtomicU32::new(NEXT_ID),
+            state: AtomicU32::new(META_IMCOMPLETE),
             checksum: AtomicU32::new(0),
-            padding: [const { 0u8 }; 8],
         }
     }
 
@@ -184,8 +181,7 @@ impl Meta {
         let id = pack_id(NEXT_ID, 0);
         self.oracle.store(INIT_ORACLE, Relaxed);
         self.wmk_oldest.store(0, Relaxed);
-        self.next_data.store(id, Relaxed);
-        self.next_gc.store(id, Relaxed);
+        self.next_data.store(NEXT_ID, Relaxed);
         self.ckpt.store(id, Relaxed);
         self.next_wal.store(NEXT_ID, Relaxed);
         self.state.store(META_IMCOMPLETE, Relaxed);
@@ -196,11 +192,10 @@ impl Meta {
         let mut h = Crc32cHasher::new(0);
         h.write_u64(self.oracle.load(Relaxed));
         // not calc wmk_oldest on purpose
-        h.write_u64(self.next_data.load(Relaxed));
-        h.write_u64(self.next_gc.load(Relaxed));
         h.write_u64(self.ckpt.load(Relaxed));
-        h.write_u16(self.next_wal.load(Relaxed));
-        h.write_u16(self.state.load(Relaxed));
+        h.write_u32(self.next_data.load(Relaxed));
+        h.write_u32(self.next_wal.load(Relaxed));
+        h.write_u32(self.state.load(Relaxed));
         h.finish() as u32
     }
 
@@ -208,30 +203,17 @@ impl Meta {
         let mut tmp = Self::new();
         let ptr = &mut tmp as *mut Self as *mut u8;
         unsafe {
-            let dst = std::slice::from_raw_parts_mut(ptr, size_of::<Self>());
+            let dst = std::slice::from_raw_parts_mut(ptr, Self::LEN);
             dst.copy_from_slice(data);
         }
         tmp
-    }
-
-    pub fn update_file(&self, id: u16, off: u64) {
-        assert_ne!(id, 0);
-        self.next_data.store(pack_id(id, off), Relaxed);
     }
 
     pub fn is_complete(&self) -> bool {
         self.state.load(Relaxed) == META_COMPLETE
     }
 
-    pub fn oldest_file(&self) -> u16 {
-        unpack_id(self.next_gc.load(Relaxed)).0
-    }
-
-    pub fn current_file(&self) -> u16 {
-        unpack_id(self.next_data.load(Relaxed)).0
-    }
-
-    pub fn update_chkpt(&self, id: u16, off: u64) {
+    pub fn update_chkpt(&self, id: u32, off: u32) {
         assert_ne!(id, 0);
         self.ckpt.store(pack_id(id, off), Relaxed);
     }
@@ -239,19 +221,21 @@ impl Meta {
     fn serialize(&self) -> &[u8] {
         self.checksum.store(self.crc32(), Relaxed);
         let ptr = self as *const Self as *const u8;
-        unsafe { std::slice::from_raw_parts(ptr, size_of::<Self>()) }
+        unsafe { std::slice::from_raw_parts(ptr, Self::LEN) }
     }
 
     pub fn sync(&self, path: PathBuf, complete: bool) {
-        let root = Path::new("/");
-        let parent = path.parent().unwrap_or(root);
-        let tmp = parent.join(format!("meta_{}", rand_range(114..514)));
-
+        let s = format!(
+            "{}_{}",
+            path.as_os_str().to_str().unwrap(),
+            rand_range(114..514)
+        );
+        let tmp = Path::new(&s);
         let mut f = File::options()
             .write(true)
             .truncate(true)
             .create(true)
-            .open(&tmp)
+            .open(tmp)
             .expect("can't open meta file");
 
         let state = if complete {
@@ -263,6 +247,7 @@ impl Meta {
         f.write_all(self.serialize())
             .expect("can't write meta file");
         f.sync_all().expect("can't sync meta file");
+        drop(f);
 
         std::fs::rename(tmp, path).expect("can't fail");
     }
@@ -283,7 +268,7 @@ mod test {
         meta.next_data.store(1, Relaxed);
         meta.oracle.store(5, Relaxed);
 
-        let mut buf = vec![0u8; size_of::<Meta>()];
+        let mut buf = vec![0u8; Meta::LEN];
         let s = buf.as_mut_slice();
         s.copy_from_slice(meta.serialize());
 

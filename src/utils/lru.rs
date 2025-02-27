@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     hash::Hash,
     ptr::{self},
+    sync::Mutex,
 };
+
+use super::spooky::spooky_hash;
 
 struct Node<K, V> {
     key: Option<K>,
@@ -40,21 +43,24 @@ impl<K, V> Default for Node<K, V> {
     }
 }
 
-pub(crate) struct Lru<K, V> {
+#[repr(align(64))]
+struct LruInner<K, V> {
     head: *mut Node<K, V>,
-    map: HashMap<K, *mut Node<K, V>>,
-    cap: usize,
-    size: usize,
+    map: Mutex<HashMap<K, *mut Node<K, V>>>,
 }
 
-unsafe impl<K, V> Send for Lru<K, V> {}
-unsafe impl<K, V> Sync for Lru<K, V> {}
+// it's large than 64 on macos
+#[cfg(not(target_os = "macos"))]
+crate::static_assert!(size_of::<LruInner<u32, io::File>>() == 64);
 
-impl<K, V> Lru<K, V>
+unsafe impl<K, V> Send for LruInner<K, V> {}
+unsafe impl<K, V> Sync for LruInner<K, V> {}
+
+impl<K, V> LruInner<K, V>
 where
     K: Eq + Hash + Clone,
 {
-    pub(crate) fn new(cap: usize) -> Self {
+    pub(crate) fn new() -> Self {
         let p = Box::into_raw(Box::new(Node::default()));
         unsafe {
             (*p).next = p;
@@ -62,65 +68,52 @@ where
         }
         Self {
             head: p,
-            map: HashMap::new(),
-            cap,
-            size: 0,
+            map: Mutex::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn add(&mut self, k: K, v: V) -> Option<&mut V> {
-        let e = self.map.get(&k);
-        let r = if e.is_none() {
+    pub(crate) fn add(&self, cap: usize, k: K, v: V) {
+        let mut map = self.map.lock().unwrap();
+        let e = map.get(&k);
+        if e.is_none() {
             let node = Box::new(Node::new(k.clone(), v));
             let p = Box::into_raw(node);
-            self.map.insert(k, p);
+            map.insert(k, p);
             self.push_back(p);
-            self.size += 1;
-            unsafe { (*p).val.as_mut() }
         } else {
             let e = e.unwrap();
             unsafe {
                 (*(*e)).set_val(v);
             }
             self.move_back(*e);
-            unsafe { (*(*e)).val.as_mut() }
         };
 
-        if self.size > self.cap {
+        if map.len() > cap {
             let node = self.front();
             unsafe {
-                self.size -= 1;
                 let key = (*node).key.take().unwrap();
-                self.map.remove(&key);
+                map.remove(&key);
                 self.remove_node(node);
                 let _ = Box::from_raw(node);
             }
         }
-        r
     }
 
     pub fn get(&self, k: &K) -> Option<&V> {
-        self.map.get(k).map(|x| {
+        let map = self.map.lock().unwrap();
+        map.get(k).map(|x| {
             self.move_back(*x);
             unsafe { (*(*x)).val.as_ref().unwrap() }
         })
     }
 
-    pub fn get_mut(&self, k: &K) -> Option<&mut V> {
-        self.map.get(k).map(|x| {
-            self.move_back(*x);
-            unsafe { (*(*x)).val.as_mut().unwrap() }
-        })
-    }
-
-    #[allow(unused)]
-    pub fn del(&mut self, k: &K) {
-        if let Some(node) = self.map.remove(k) {
+    pub fn del(&self, k: &K) {
+        let mut map = self.map.lock().unwrap();
+        if let Some(node) = map.remove(k) {
             self.remove_node(node);
             unsafe {
                 let _ = Box::from_raw(node);
             }
-            self.size -= 1;
         }
     }
 
@@ -152,36 +145,76 @@ where
     }
 }
 
-impl<K, V> Drop for Lru<K, V> {
+impl<K, V> Drop for LruInner<K, V> {
     fn drop(&mut self) {
         unsafe {
             let mut p = (*self.head).next;
             (*self.head).next = ptr::null_mut();
-
             while !p.is_null() {
-                let prev = (*p).next;
+                let next = (*p).next;
                 drop(Box::from_raw(p));
-                p = prev;
+                p = next;
             }
         }
     }
 }
 
-#[test]
-fn lru() {
-    let mut m = Lru::new(3);
+pub const LRU_SHARD: usize = 32;
+const LRU_SHARD_MASK: usize = LRU_SHARD - 1;
 
-    m.add(1, 1);
-    m.add(1, 2);
+pub(crate) struct Lru<V> {
+    shard: [LruInner<u32, V>; LRU_SHARD],
+    cap: usize,
+}
 
-    assert_eq!(m.get(&1).unwrap(), &2);
+impl<V> Lru<V> {
+    pub(crate) fn new(cap: usize) -> Self {
+        let cap = cap / LRU_SHARD;
+        Self {
+            shard: std::array::from_fn(|_| LruInner::new()),
+            cap,
+        }
+    }
 
-    m.add(2, 2);
-    m.add(3, 3);
-    m.add(4, 4);
+    #[inline(always)]
+    fn get_shard(k: u32) -> usize {
+        spooky_hash(k as u64) as usize & LRU_SHARD_MASK
+    }
 
-    assert_eq!(m.get(&1), None);
-    assert_eq!(m.get(&2).unwrap(), &2);
-    assert_eq!(m.get(&3).unwrap(), &3);
-    assert_eq!(m.get(&4).unwrap(), &4);
+    pub(crate) fn add(&self, k: u32, v: V) {
+        self.shard[Self::get_shard(k)].add(self.cap, k, v);
+    }
+
+    pub(crate) fn get(&self, k: u32) -> Option<&V> {
+        self.shard[Self::get_shard(k)].get(&k)
+    }
+
+    pub(crate) fn del(&self, k: u32) {
+        self.shard[Self::get_shard(k)].del(&k);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::utils::lru::LruInner;
+
+    #[test]
+    fn lru() {
+        let m = LruInner::new();
+        let cap = 3;
+
+        m.add(cap, 1, 1);
+        m.add(cap, 1, 2);
+
+        assert_eq!(m.get(&1).unwrap(), &2);
+
+        m.add(cap, 2, 2);
+        m.add(cap, 3, 3);
+        m.add(cap, 4, 4);
+
+        assert_eq!(m.get(&1), None);
+        assert_eq!(m.get(&2).unwrap(), &2);
+        assert_eq!(m.get(&3).unwrap(), &3);
+        assert_eq!(m.get(&4).unwrap(), &4);
+    }
 }

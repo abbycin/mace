@@ -265,7 +265,7 @@ mod test {
         fn alloc(&mut self, size: usize) -> FrameRef {
             let b = FrameOwner::alloc(size);
             let addr = b.data().data() as u64;
-            let copy = b.view();
+            let copy = b.as_ref();
             self.map.insert(addr, b);
             copy
         }

@@ -210,7 +210,7 @@ mod test {
         for i in 0..4 {
             let frame = FrameOwner::alloc(size);
             if i == 3 {
-                let mut view = frame.view();
+                let mut view = frame.as_ref();
                 view.set_pid(233);
             }
             c.put(i, frame).unwrap();

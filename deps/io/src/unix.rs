@@ -6,17 +6,17 @@ use std::{
 };
 
 use libc::{
-    c_int, close, fstat, fsync, ftruncate, iovec, open, preadv, stat, writev, EINTR, O_APPEND,
-    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY,
+    c_int, close, fstat, fsync, ftruncate, iovec, open, preadv, stat, write, writev, EINTR,
+    O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY,
 };
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
 use libc::__error;
 
 #[cfg(target_os = "linux")]
 use libc::__errno_location;
 
-use crate::{OpenOptions, SeekableGatherIO};
+use crate::{GatherIO, OpenOptions};
 
 pub struct File {
     file: i32,
@@ -45,7 +45,7 @@ impl OpenOptions {
     }
 }
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
 #[inline]
 fn errno() -> i32 {
     unsafe { *__error() }
@@ -81,7 +81,7 @@ impl Drop for File {
     }
 }
 
-impl SeekableGatherIO for File {
+impl GatherIO for File {
     fn read(&self, data: &mut [u8], pos: u64) -> Result<(), std::io::Error> {
         let rc = unsafe {
             let iov = iovec {
@@ -100,7 +100,24 @@ impl SeekableGatherIO for File {
         Ok(())
     }
 
-    fn write(&mut self, data: &mut [crate::IoVec]) -> Result<(), std::io::Error> {
+    fn write(&mut self, data: &[u8]) -> Result<(), io::Error> {
+        loop {
+            unsafe {
+                let rc = write(self.file, data.as_ptr().cast::<c_void>(), data.len());
+                if rc <= 0 {
+                    if errno() == EINTR {
+                        // the call was interrupted by a signal before any data was written
+                        continue;
+                    }
+                    return Err(io::Error::from_raw_os_error(errno()));
+                }
+                assert_eq!(rc as usize, data.len());
+                return Ok(());
+            }
+        }
+    }
+
+    fn writev(&mut self, data: &mut [crate::IoVec]) -> Result<(), std::io::Error> {
         let mut count = data.len() as c_int;
         let mut iov = data.as_mut_ptr().cast::<iovec>();
 
@@ -130,7 +147,7 @@ impl SeekableGatherIO for File {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), std::io::Error> {
+    fn sync(&mut self) -> Result<(), std::io::Error> {
         let rc = unsafe { fsync(self.file) };
         if rc < 0 {
             return Err(io::Error::from_raw_os_error(errno()));

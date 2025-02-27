@@ -32,14 +32,14 @@ impl Mace {
     pub fn new(opt: Options) -> Result<Self, OpCode> {
         let opt = Arc::new(opt);
         let mut recover = Recovery::new(opt.clone());
-        let (meta, table) = recover.phase1();
-        let store = Arc::new(Store::new(table, opt.clone(), meta.clone())?);
+        let (meta, table, mapping) = recover.phase1();
+        let store = Arc::new(Store::new(table, opt.clone(), meta.clone(), mapping)?);
         let mgr = Registry::new(store.clone());
 
         recover.phase2(meta.clone(), &mgr);
         meta.sync(opt.meta_file(), false);
         store.start();
-        let handle = start_gc(mgr.clone(), meta.clone());
+        let handle = start_gc(mgr.clone(), meta.clone(), store.buffer.mapping.clone());
         let default_tree = mgr.open_default()?;
 
         Ok(Self {

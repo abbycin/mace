@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use io::{File, SeekableGatherIO};
+use io::{File, GatherIO};
 
 use crate::cc::data::Ver;
 use crate::cc::wal::{
@@ -17,11 +17,12 @@ use crate::index::data::{Id, Value};
 use crate::index::registry::Registry;
 use crate::index::tree::Tree;
 use crate::index::Key;
-use crate::map::data::DataLoader;
+use crate::map::data::DataFooter;
+use crate::map::Mapping;
 use crate::utils::block::Block;
 use crate::utils::data::MapEntry;
 use crate::utils::traits::IValCodec;
-use crate::utils::{pack_id, unpack_id, NULL_CMD, NULL_ORACLE};
+use crate::utils::{pack_id, raw_ptr_to_ref, unpack_id, NULL_CMD, NULL_ORACLE};
 use crate::{
     map::table::PageMap,
     utils::{data::Meta, NEXT_ID},
@@ -38,10 +39,10 @@ enum State {
 
 pub(crate) struct Recovery {
     opt: Arc<Options>,
-    buf: [u8; size_of::<Meta>()],
+    buf: [u8; Meta::LEN],
     state: State,
     /// file_id, (ver, (offset, len))
-    dirty_table: Vec<(u16, BTreeMap<Ver, (u64, u32)>)>,
+    dirty_table: Vec<(u32, BTreeMap<Ver, (u64, u32)>)>,
     /// txid, last lsn
     undo_table: BTreeMap<u64, u64>,
 }
@@ -54,22 +55,22 @@ impl Recovery {
 
         Self {
             opt,
-            buf: [const { 0u8 }; size_of::<Meta>()],
+            buf: [const { 0u8 }; Meta::LEN],
             state: State::New,
             dirty_table: Vec::new(),
             undo_table: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn phase1(&mut self) -> (Arc<Meta>, PageMap) {
+    pub(crate) fn phase1(&mut self) -> (Arc<Meta>, PageMap, Mapping) {
         let meta = self.check();
-
+        let mut mapping = Mapping::new(self.opt.clone());
         let map = match self.state {
             State::New => PageMap::default(),
-            State::Damaged => self.enumerate(&meta),
-            State::Ok => self.load(&meta),
+            State::Damaged => self.enumerate(&meta, &mut mapping),
+            State::Ok => self.load(&meta, &mut mapping),
         };
-        (Arc::new(meta), map)
+        (Arc::new(meta), map, mapping)
     }
 
     pub(crate) fn phase2(&mut self, meta: Arc<Meta>, mgr: &Registry) {
@@ -180,7 +181,7 @@ impl Recovery {
         let mut pos;
         let mut oracle = 0;
 
-        for i in 0..=u16::MAX {
+        for i in 0..=u32::MAX {
             let id = cur.wrapping_add(i);
             let path = self.opt.wal_file(id);
             if !path.exists() {
@@ -195,7 +196,7 @@ impl Recovery {
             static_assert!(size_of::<EntryType>() == 1);
             let mut map = BTreeMap::new();
 
-            pos = off;
+            pos = off as u64;
             off = 0;
 
             log::trace!("{:?} pos {} end {}", path, pos, end);
@@ -230,7 +231,8 @@ impl Recovery {
                     EntryType::Begin => {
                         let b = ptr_to::<WalBegin>(ptr);
                         log::trace!("{:?}", b);
-                        self.undo_table.insert(b.txid, pack_id(id, pos - sz as u64));
+                        self.undo_table
+                            .insert(b.txid, pack_id(id, pos as u32 - sz as u32));
                         oracle = max(b.txid, oracle);
                     }
                     EntryType::CheckPoint => {
@@ -268,8 +270,10 @@ impl Recovery {
                         let len = sz + u.payload_len();
                         log::trace!("{pos} => {:?}", u);
                         let beg = pos - sz as u64;
-                        let lsn = self.undo_table.get_mut(&{ u.txid }).expect("must exist");
-                        *lsn = pack_id(id, beg); // update to latest record position
+
+                        if let Some(lsn) = self.undo_table.get_mut(&{ u.txid }) {
+                            *lsn = pack_id(id, beg as u32); // update to latest record position
+                        }
                         self.handle_update(len, &mut f, &mut map, beg, buf, mgr);
                         pos += u.payload_len() as u64;
                     }
@@ -354,7 +358,7 @@ impl Recovery {
         }
 
         let stat = f.metadata().expect("can't get metadata of meta file");
-        if stat.len() as usize != size_of::<Meta>() {
+        if stat.len() as usize != Meta::LEN {
             self.state = State::Damaged;
             log::warn!("corrupted meta file, ignore it");
             return Meta::new();
@@ -377,25 +381,22 @@ impl Recovery {
         meta
     }
 
-    fn load(&mut self, meta: &Meta) -> PageMap {
+    fn load(&mut self, meta: &Meta, mapping: &mut Mapping) -> PageMap {
         let table = PageMap::default();
+        let mut maps = Vec::new();
 
-        for i in meta.oldest_file()..=meta.current_file() {
-            let f = self.opt.data_file(i);
-            // page files are enumerated
-            if !f.exists() {
-                log::error!("lost data file `{:?}`, stop load", f);
-                std::process::abort();
+        Self::readdir(&self.opt.db_root, |name, modified| {
+            if name.starts_with(Options::DATA_PREFIX) {
+                let v: Vec<&str> = name.split(Options::DATA_PREFIX).collect();
+                let id = v[1].parse::<u32>().expect("invalid number");
+                maps.push((modified, id));
             }
-            let mut file = DataLoader::new(&f, 0).unwrap();
-            while let Some(d) = file.get_meta() {
-                if !d.is_intact() {
-                    log::error!("corrupted data file `{:?}`, stop load", f);
-                    std::process::abort();
-                }
-                self.build_table(d.maps(), &table);
-            }
-        }
+        });
+
+        maps.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+        let maps: Vec<u32> = maps.iter().map(|x| x.1).collect();
+
+        self.load_data(&maps, meta, &table, mapping);
 
         assert_eq!(self.state, State::Ok);
         table
@@ -415,7 +416,7 @@ impl Recovery {
         }
     }
 
-    fn load_wal(&self, logs: &[u16], meta: &Meta) {
+    fn load_wal(&self, logs: &[u32], meta: &Meta) {
         let mut oracle = meta.oracle.load(Relaxed);
         let mut ckpt = meta.ckpt.load(Relaxed);
         // assume WAL header is less than it
@@ -469,7 +470,7 @@ impl Recovery {
                         // we will keep looking for the next checkpoint (the latest one)
                         let c = ptr_to::<WalCheckpoint>(buf.as_ptr());
                         oracle = max(oracle, c.txid);
-                        ckpt = pack_id(*i, pos - sz as u64);
+                        ckpt = pack_id(*i, (pos - sz as u64) as u32);
                         pos += c.payload_len() as u64;
                         find_ckpt = true;
                     }
@@ -484,45 +485,28 @@ impl Recovery {
         meta.ckpt.store(ckpt, Relaxed);
     }
 
-    fn load_data(&self, maps: &[u16], meta: &Meta, table: &PageMap) {
+    fn load_data(&self, maps: &[u32], meta: &Meta, table: &PageMap, mapping: &mut Mapping) {
         let mut last_id = NEXT_ID;
-        let mut nth_buff = 0;
         // old to new
-        for (seq, i) in maps.iter().enumerate() {
+        for i in maps.iter() {
             let i = *i;
-            let path = self.opt.data_file(i);
-            if !path.exists() {
-                panic!("lost data file {:?}", path);
+            if let Ok(data) = mapping.add(i, true) {
+                let d = raw_ptr_to_ref(data.data().cast::<DataFooter>());
+                self.build_table(d.entries(), table);
+                last_id = i;
+            } else {
+                // either last data file or compacted data file, ignore them
+                let name = self.opt.data_file(i);
+                log::info!("unlink imcomplete file {:?}", name);
+                std::fs::remove_file(name).expect("never happen");
             }
-            nth_buff = 0;
-            let mut file = DataLoader::new(&path, 0).unwrap();
-            while let Some(d) = file.get_meta() {
-                if !d.is_intact() {
-                    log::error!("corrupted data file `{:?}`, stop load", path);
-                    std::process::abort();
-                }
-                nth_buff += 1;
-                self.build_table(d.maps(), table);
-            }
-
-            // abort, if the imcomplete one is not the last one
-            if !file.is_complete() {
-                if seq != maps.len() - 1 {
-                    log::error!("corrupted map file `{:?}`", path);
-                    std::process::abort();
-                }
-                file.truncate();
-            }
-
-            last_id = i;
         }
 
-        // if it's corrupted we will overwrite it or else alloc a new one
-        meta.update_file(last_id, nth_buff * self.opt.buffer_size as u64);
-        meta.next_gc.store(pack_id(last_id, 0), Relaxed);
+        // TODO: handle id overflow
+        meta.next_data.store(last_id + 1, Relaxed);
     }
 
-    fn enumerate(&mut self, meta: &Meta) -> PageMap {
+    fn enumerate(&mut self, meta: &Meta, mapping: &mut Mapping) -> PageMap {
         let table = PageMap::default();
         let mut logs = Vec::new();
         let mut maps = Vec::new();
@@ -530,11 +514,11 @@ impl Recovery {
         Self::readdir(&self.opt.db_root, |name, modified| {
             if name.starts_with(Options::WAL_PREFIX) {
                 let v: Vec<&str> = name.split(Options::WAL_PREFIX).collect();
-                let id = v[1].parse::<u16>().expect("inavlid number");
+                let id = v[1].parse::<u32>().expect("inavlid number");
                 logs.push((modified, id));
             } else if name.starts_with(Options::DATA_PREFIX) {
                 let v: Vec<&str> = name.split(Options::DATA_PREFIX).collect();
-                let id = v[1].parse::<u16>().expect("invalid number");
+                let id = v[1].parse::<u32>().expect("invalid number");
                 maps.push((modified, id));
             }
         });
@@ -548,8 +532,8 @@ impl Recovery {
         logs.sort_by(|x, y| x.0.cmp(&y.0));
         maps.sort_by(|x, y| x.0.cmp(&y.0));
 
-        let logs: Vec<u16> = logs.iter().map(|(_, i)| *i).collect();
-        let maps: Vec<u16> = maps.iter().map(|(_, i)| *i).collect();
+        let logs: Vec<u32> = logs.iter().map(|(_, i)| *i).collect();
+        let maps: Vec<u32> = maps.iter().map(|(_, i)| *i).collect();
 
         // correct the initial value
         meta.update_chkpt(*logs.first().unwrap(), 0);
@@ -559,7 +543,7 @@ impl Recovery {
         // traverse from the last checkpoint
         if !maps.is_empty() {
             self.load_wal(&logs, meta);
-            self.load_data(&maps, meta, &table);
+            self.load_data(&maps, meta, &table, mapping);
         }
 
         table

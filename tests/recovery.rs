@@ -158,7 +158,7 @@ fn crash_again() {
 
 fn lost_impl<F>(f: F)
 where
-    F: Fn(&Options, u16),
+    F: Fn(&Options, u32),
 {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
@@ -245,7 +245,7 @@ fn recover_after_update() {
     put_update(false);
 }
 
-fn put_update(remov_data: bool) {
+fn put_update(remove_data: bool) {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
@@ -285,13 +285,17 @@ fn put_update(remov_data: bool) {
 
     drop(db);
     break_meta(save.meta_file());
-    if remov_data {
-        for i in 1.. {
-            let p = save.data_file(i);
-            if !p.exists() {
-                break;
+    if remove_data {
+        let entries = std::fs::read_dir(&save.db_root).unwrap();
+        for e in entries {
+            let e = e.unwrap();
+            let file = e.path();
+            let name = e.file_name();
+            let s = name.to_str().unwrap();
+
+            if s.starts_with(Options::DATA_PREFIX) {
+                std::fs::remove_file(file).unwrap();
             }
-            std::fs::remove_file(p).unwrap();
         }
     }
 
@@ -351,10 +355,10 @@ fn recover_after_remove() {
     });
 }
 
-fn ckpt_wal(keys: usize, ckpt_per: usize, wal_len: usize) {
+fn ckpt_wal(keys: usize, wal_len: u32) {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.ckpt_per_bytes = ckpt_per;
+    opt.buffer_count = 1 << 10;
     opt.wal_file_size = wal_len;
     let mut save = opt.clone();
     let db = Mace::new(opt).unwrap();
@@ -372,13 +376,11 @@ fn ckpt_wal(keys: usize, ckpt_per: usize, wal_len: usize) {
         kv.commit()
     });
 
-    for _ in 0..keys {
-        for (k, v) in &data {
-            let _ = tx.begin(IsolationLevel::SI, |kv| {
-                kv.update(k, v).unwrap();
-                kv.commit()
-            });
-        }
+    for (k, v) in &data {
+        let _ = tx.begin(IsolationLevel::SI, |kv| {
+            kv.update(k, v).unwrap();
+            kv.commit()
+        });
     }
 
     drop(db);
@@ -399,23 +401,17 @@ fn ckpt_wal(keys: usize, ckpt_per: usize, wal_len: usize) {
 
 #[test]
 fn checkpoint() {
-    ckpt_wal(3, 512, 10 << 20);
+    ckpt_wal(1000, 1 << 20);
 }
 
 #[test]
 fn roll_log() {
-    ckpt_wal(5, 256, 1024);
-}
-
-#[test]
-fn recover_from_middle() {
-    ckpt_wal(4, 256, 1024);
+    ckpt_wal(1000, 50 << 10);
 }
 
 fn long_txn_impl(before: bool) {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.ckpt_per_bytes = 256;
     opt.wal_file_size = 1024;
     let mut save = opt.clone();
     let db = Mace::new(opt).unwrap();

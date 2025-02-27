@@ -7,12 +7,11 @@ use std::{
             AtomicU32, AtomicU64, AtomicUsize,
             Ordering::{Acquire, Relaxed, Release},
         },
-        mpsc::{Receiver, Sender},
         Arc, Mutex,
     },
 };
 
-use io::{File, IoVec, SeekableGatherIO};
+use io::{File, GatherIO, IoVec};
 
 use crate::{
     cc::wal::{EntryType, WalPadding},
@@ -448,12 +447,11 @@ pub struct GroupCommitter {
     /// flush sequence number to check whether a txn can be committed
     opt: Arc<Options>,
     meta: Arc<Meta>,
-    /// AIO will use this field until it's completed
+    last_flush: u32,
     ckpt: CkptMem,
-    wal_size: u64,
-    flushed_size: usize,
-    last_ckpt_id: u16,
-    last_ckpt_pos: u64,
+    wal_size: u32,
+    last_ckpt_id: u32,
+    last_ckpt_pos: u32,
     checkpointed: bool,
     writer: WalWriter,
 }
@@ -465,14 +463,14 @@ impl GroupCommitter {
         assert!(id >= NEXT_ID);
         let next_wal = meta.next_wal.load(Relaxed);
         let writer = WalWriter::new(opt.wal_file(next_wal));
-        let pos = writer.pos();
+        let pos = writer.pos() as u32;
 
         Self {
             opt,
+            last_flush: meta.next_data.load(Relaxed),
             meta,
             ckpt: CkptMem::new(workers),
             wal_size: pos,
-            flushed_size: 0,
             last_ckpt_id: id,
             last_ckpt_pos: off,
             checkpointed: false,
@@ -486,8 +484,6 @@ impl GroupCommitter {
         ctrl: Arc<CState>,
         buffer: Arc<Buffers>,
         workers: Arc<Vec<SyncWorker>>,
-        tx: Arc<Sender<()>>,
-        rx: Receiver<()>,
         sem: Arc<Countblock>,
     ) {
         let mut desc = HashMap::new();
@@ -512,12 +508,11 @@ impl GroupCommitter {
                 self.switch();
             }
 
-            if ctrl.is_working() && self.should_stabilize() {
+            if ctrl.is_working() && self.try_stabilize() {
                 // count ckpt per txn
                 for w in workers.iter() {
                     w.ckpt_cnt.fetch_add(1, Relaxed);
                 }
-                self.request_stabilize(&buffer, &tx, &rx);
             }
         }
 
@@ -582,7 +577,10 @@ impl GroupCommitter {
     }
 
     fn flush(&mut self) {
-        self.writer.sync();
+        self.writer.flush();
+        if self.opt.sync_on_write {
+            self.writer.sync();
+        }
         if self.checkpointed {
             self.meta
                 .update_chkpt(self.last_ckpt_id, self.last_ckpt_pos);
@@ -627,13 +625,12 @@ impl GroupCommitter {
         let count = to - from;
 
         self.writer.queue(data, count);
-        self.wal_size += count as u64;
-        self.flushed_size += count;
+        self.wal_size += count as u32;
     }
 
     #[inline(always)]
     fn should_switch(&self) -> bool {
-        self.wal_size >= self.opt.wal_file_size as u64
+        self.wal_size >= self.opt.wal_file_size
     }
 
     fn switch(&mut self) {
@@ -649,32 +646,16 @@ impl GroupCommitter {
         self.meta.next_wal.store(next_wal, Relaxed);
     }
 
-    #[inline(always)]
-    fn should_stabilize(&self) -> bool {
-        self.flushed_size >= self.opt.ckpt_per_bytes
-    }
+    fn try_stabilize(&mut self) -> bool {
+        let curr = self.meta.next_data.load(Relaxed);
 
-    fn request_stabilize(
-        &mut self,
-        buffer: &Arc<Buffers>,
-        tx: &Arc<Sender<()>>,
-        rx: &Receiver<()>,
-    ) {
-        if !buffer.should_stabilize() {
-            return;
+        if curr == self.last_flush {
+            return false;
         }
 
-        let tx = tx.clone();
-        buffer.stabilize(Box::new(move |_| {
-            let _ = tx.send(()).inspect_err(|e| {
-                log::error!("can't notify flushed {}", e);
-            });
-        }));
+        self.last_flush = curr;
 
         log::info!("checkpoint {:?}", (self.last_ckpt_id, self.last_ckpt_pos));
-        self.flushed_size = 0;
-        let r = rx.recv();
-        assert!(r.is_ok());
 
         assert_ne!(self.last_ckpt_id, 0);
         let prev_addr = pack_id(self.last_ckpt_id, self.last_ckpt_pos);
@@ -684,8 +665,9 @@ impl GroupCommitter {
         let (hdr, data) = self.ckpt.slice(self.meta.oracle.load(Relaxed), prev_addr);
         self.queue_data(hdr.0, 0, hdr.1);
         self.queue_data(data.0, 0, data.1);
-        self.writer.sync();
+        self.writer.flush();
         self.checkpointed = true;
+        true
     }
 }
 
@@ -719,7 +701,7 @@ impl WalWriter {
     }
     fn reset(&mut self, path: PathBuf) {
         self.path = path.clone();
-        self.sync();
+        self.flush();
         self.file = Self::open_file(path);
     }
 
@@ -740,23 +722,26 @@ impl WalWriter {
             .unwrap()
     }
 
-    fn sync(&mut self) {
+    fn flush(&mut self) {
         let iov = self.queue.as_mut_slice();
         self.file
-            .write(iov)
+            .writev(iov)
             .inspect_err(|x| log::error!("can't write iov, {}", x))
             .unwrap();
+        self.queue.clear();
+    }
+
+    fn sync(&mut self) {
         self.file
-            .flush()
+            .sync()
             .inspect_err(|x| log::error!("can't sync {:?}, {}", self.path, x))
             .unwrap();
-        self.queue.clear();
     }
 }
 
 impl Drop for WalWriter {
     fn drop(&mut self) {
-        self.sync();
+        self.flush();
     }
 }
 

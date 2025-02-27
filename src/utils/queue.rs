@@ -154,8 +154,8 @@ impl<T> Drop for Queue<T> {
     }
 }
 
-unsafe impl<T: Copy> Send for Queue<T> {}
-unsafe impl<T: Copy> Sync for Queue<T> {}
+unsafe impl<T> Send for Queue<T> {}
+unsafe impl<T> Sync for Queue<T> {}
 
 #[cfg(test)]
 mod test {

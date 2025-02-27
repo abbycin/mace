@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use io::{File, SeekableGatherIO};
+use io::{File, GatherIO};
 
 use crate::{
     index::{data::Value, tree::Tree, Key},
@@ -533,7 +533,7 @@ pub(crate) fn wal_record_sz(e: EntryType) -> usize {
 }
 
 pub(crate) struct WalReader<'a> {
-    map: RefCell<BTreeMap<u16, (Rc<File>, u64)>>,
+    map: RefCell<BTreeMap<u32, (Rc<File>, u64)>>,
     trees: RefCell<HashMap<u64, Tree>>,
     ctx: &'a Context,
 }
@@ -547,7 +547,7 @@ impl<'a> WalReader<'a> {
         }
     }
 
-    fn get_file(&self, id: u16) -> Option<(Rc<File>, u64)> {
+    fn get_file(&self, id: u32) -> Option<(Rc<File>, u64)> {
         assert!(id >= NEXT_ID);
         const MAX_OPEN_FILES: usize = 10;
         let mut map = self.map.borrow_mut();
@@ -571,9 +571,10 @@ impl<'a> WalReader<'a> {
     where
         F: Fn(u64) -> Tree,
     {
-        let (mut id, mut pos) = unpack_id(addr);
+        let (mut id, pos) = unpack_id(addr);
         let mut cmd = INIT_CMD;
         let mut last_worker = 0;
+        let mut pos = pos as u64;
 
         'outer: loop {
             let (f, end) = match self.get_file(id) {
@@ -620,7 +621,7 @@ impl<'a> WalReader<'a> {
                         let next =
                             self.undo(ptr_to::<WalUpdate>(block.data()), &mut cmd, &get_tree);
                         let (prev_id, prev_pos) = unpack_id(next);
-                        pos = prev_pos;
+                        pos = prev_pos as u64;
                         if prev_id != id {
                             id = prev_id;
                             break;

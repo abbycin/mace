@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::{IoVec, OpenOptions, SeekableGatherIO};
+use crate::{GatherIO, IoVec, OpenOptions};
 
 pub struct File {
     file: std::fs::File,
@@ -33,7 +33,7 @@ impl File {
     }
 }
 
-impl SeekableGatherIO for File {
+impl GatherIO for File {
     fn read(&self, data: &mut [u8], pos: u64) -> Result<(), io::Error> {
         let mut n = 0;
         let sz = data.len();
@@ -50,7 +50,11 @@ impl SeekableGatherIO for File {
         Ok(())
     }
 
-    fn write(&mut self, iov: &mut [IoVec]) -> Result<(), io::Error> {
+    fn write(&mut self, data: &[u8]) -> Result<(), io::Error> {
+        self.file.write_all(data)
+    }
+
+    fn writev(&mut self, iov: &mut [IoVec]) -> Result<(), io::Error> {
         for x in iov {
             let s = unsafe { std::slice::from_raw_parts(x.data, x.len) };
             self.file.write_all(s)?;
@@ -58,7 +62,7 @@ impl SeekableGatherIO for File {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), io::Error> {
+    fn sync(&mut self) -> Result<(), io::Error> {
         self.file.sync_all()
     }
 

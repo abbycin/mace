@@ -398,6 +398,7 @@ impl Executor {
         let mut opt = Options::new(&*path);
 
         opt.tmp_store = tmp;
+        opt.workers = workers.len();
         let db = Arc::new(Mace::new(opt).unwrap());
 
         let mut map = HashMap::new();

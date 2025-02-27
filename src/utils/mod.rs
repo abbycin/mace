@@ -6,21 +6,24 @@ use std::{
 
 use rand::{rngs::ThreadRng, Rng};
 
+pub(crate) mod bitmap;
 pub(crate) mod block;
 pub(crate) mod bytes;
 pub(crate) mod countblock;
 pub(crate) mod data;
 pub(crate) mod lru;
-pub mod options;
+pub(crate) mod options;
 pub(crate) mod queue;
+mod spooky;
 pub(crate) mod traits;
 
 pub(crate) const NULL_PID: u64 = 0;
 pub(crate) const ROOT_PID: u64 = 1;
 pub(crate) const ROOT_TREEID: u64 = 0;
 pub(crate) const DEFAULT_TREEID: u64 = 1;
-pub(crate) const NEXT_ID: u16 = 1;
-pub(crate) const NULL_ID: u16 = u16::MAX;
+pub(crate) const NEXT_ID: u32 = 1;
+pub(crate) const INVALID_ID: u32 = 0;
+pub(crate) const NULL_ID: u32 = u32::MAX;
 pub(crate) const INIT_CMD: u32 = 1;
 pub(crate) const NULL_CMD: u32 = u32::MAX;
 /// NOTE: must larger than wmk_oldest_tx(which is 0 by default) and ROOT_TREEID and DEFAULT_TREEID
@@ -30,6 +33,7 @@ pub(crate) const NULL_ORACLE: u64 = u64::MAX;
 #[derive(Debug, PartialEq)]
 pub enum OpCode {
     NotFound,
+    BadData,
     TooLarge,
     NeedMore,
     Again,
@@ -108,14 +112,17 @@ macro_rules! slice_to_number {
     }};
 }
 
-pub(crate) const SEG_BITS: u64 = 48;
+pub(crate) const SEG_BITS: u64 = 32;
 
-pub(crate) const fn pack_id(hi: u16, lo: u64) -> u64 {
-    ((hi as u64) << SEG_BITS) | lo
+pub(crate) const fn pack_id(hi: u32, lo: u32) -> u64 {
+    ((hi as u64) << SEG_BITS) | lo as u64
 }
 
-pub(crate) const fn unpack_id(x: u64) -> (u16, u64) {
-    ((x >> SEG_BITS) as u16, (x & ((1u64 << SEG_BITS) - 1)))
+pub(crate) const fn unpack_id(x: u64) -> (u32, u32) {
+    (
+        (x >> SEG_BITS) as u32,
+        (x & ((1u64 << SEG_BITS) - 1)) as u32,
+    )
 }
 
 thread_local! {
@@ -135,19 +142,14 @@ pub struct RandomPath {
     del: bool,
 }
 
-impl Default for RandomPath {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RandomPath {
-    fn gen() -> PathBuf {
-        let tmp = std::env::temp_dir();
-        let path = Path::new(&tmp);
+    const PREFIX: &'static str = "mace_tmp_";
+
+    fn gen(root: &PathBuf) -> PathBuf {
+        let path = Path::new(&root);
         loop {
             let r = rand_range(1000..1000000);
-            let p = path.join(format!("mace_tmp_{}", r));
+            let p = path.join(format!("{}{}", Self::PREFIX, r));
             if !p.exists() {
                 return p;
             }
@@ -156,14 +158,21 @@ impl RandomPath {
 
     pub fn tmp() -> Self {
         Self {
-            path: Self::gen(),
+            path: Self::gen(&std::env::temp_dir()),
             del: true,
         }
     }
 
     pub fn new() -> Self {
         Self {
-            path: Self::gen(),
+            path: Self::gen(&std::env::temp_dir()),
+            del: false,
+        }
+    }
+
+    pub fn from_root(root: &PathBuf) -> Self {
+        Self {
+            path: Self::gen(root),
             del: false,
         }
     }

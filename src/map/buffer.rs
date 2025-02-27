@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     cmp::max,
     fmt::Debug,
     ops::Deref,
@@ -10,14 +11,18 @@ use std::{
 
 use crate::{
     map::data::FrameFlag,
-    utils::{data::Meta, lru::Lru, raw_ptr_to_ref, NEXT_ID, NULL_ID, NULL_ORACLE},
+    static_assert,
+    utils::{
+        countblock::Countblock, data::Meta, raw_ptr_to_ref, INVALID_ID, NEXT_ID, NULL_ID,
+        NULL_ORACLE,
+    },
     OpCode,
 };
 
 use super::{
     data::{ArenaIter, FlushData, Frame, FrameOwner, FrameRef},
     flush::Flush,
-    load::FileReader,
+    load::Mapping,
 };
 use crate::map::cache::Cache;
 use crate::utils::bytes::ByteArray;
@@ -27,21 +32,22 @@ use std::sync::atomic::{
     AtomicU16,
     Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
-use std::sync::RwLock;
 
+// use C repr to fix the layout
+#[repr(C)]
 pub(crate) struct Arena {
     raw: ByteArray,
     idx: u16,
     state: AtomicU16,
     refcnt: AtomicU32,
-    stable: AtomicU32,
     offset: AtomicU32,
-    /// indicate that whether the arena is in current round
-    tick: Arc<AtomicU64>,
     flsn: AtomicU64,
-    file_id: AtomicU64,
-    borrow_cnt: AtomicU64,
+    id: Cell<u32>,
+    borrow_cnt: AtomicU32,
+    padding: [u8; 16],
 }
+
+static_assert!(size_of::<Arena>() == 64);
 
 impl Arena {
     /// memory can be allocated
@@ -58,27 +64,20 @@ impl Arena {
             raw: ByteArray::alloc(cap as usize),
             state: AtomicU16::new(Self::FLUSH),
             refcnt: AtomicU32::new(0),
-            stable: AtomicU32::new(0),
             offset: AtomicU32::new(0),
-            tick: Arc::new(AtomicU64::new(0)),
             flsn: AtomicU64::new(0),
             idx: idx as u16,
-            file_id: AtomicU64::new(0),
-            borrow_cnt: AtomicU64::new(0),
+            id: Cell::new(INVALID_ID),
+            borrow_cnt: AtomicU32::new(0),
+            padding: const { [0u8; 16] },
         }
     }
 
-    fn reset(&self, id: u16, off: u64) {
-        self.tick.fetch_add(1, Relaxed);
-        self.set_file_id(pack_id(id, off));
+    fn reset(&self, id: u32) {
+        self.id.set(id);
         self.flsn.store(0, Relaxed);
         assert_eq!(self.state(), Self::HOT);
-        self.stable.store(0, Relaxed);
         self.offset.store(0, Relaxed);
-    }
-
-    fn iter(&self) -> ArenaIter {
-        ArenaIter::new(self.raw, self.stable.load(Relaxed))
     }
 
     fn alloc_size(&self, size: u32) -> Result<u32, OpCode> {
@@ -107,9 +106,8 @@ impl Arena {
     }
 
     fn alloc_at(&self, off: u32, size: u32) -> (usize, FrameRef) {
-        let frame = unsafe { &mut *self.load_impl(off) };
-        let (id, beg) = unpack_id(self.file_id());
-        let addr = pack_id(id, beg + off as u64);
+        let frame = unsafe { &mut *self.load(off) };
+        let addr = pack_id(self.id.get(), off);
 
         frame.init(&self.refcnt, addr, FrameFlag::Unknown);
         frame.set_size(size);
@@ -127,11 +125,6 @@ impl Arena {
             self.dec_ref();
         })?;
         Ok(self.alloc_at(offset, size))
-    }
-
-    fn update_stable(&self, off: u64) {
-        let arena_off = off - unpack_id(self.file_id()).1;
-        self.stable.store(arena_off as u32, Relaxed);
     }
 
     /// CAS is only necessary when it was in `release_buffer`
@@ -153,13 +146,8 @@ impl Arena {
         ArenaIter::new(self.raw, self.offset.load(Relaxed))
     }
 
-    fn load_impl(&self, off: u32) -> *mut Frame {
+    fn load(&self, off: u32) -> *mut Frame {
         unsafe { self.raw.data().add(off as usize).cast::<Frame>() }
-    }
-
-    fn load(&self, off: u64) -> *mut Frame {
-        let beg = unpack_id(self.file_id()).1;
-        self.load_impl((off - beg) as u32)
     }
 
     fn set_state(&self, cur: u16, new: u16) -> u16 {
@@ -185,11 +173,11 @@ impl Arena {
         assert!(x > 0);
     }
 
-    fn borrowed(&self) {
+    fn inc_borrow(&self) {
         self.borrow_cnt.fetch_add(1, Relaxed);
     }
 
-    fn returned(&self) {
+    fn dec_borrow(&self) {
         self.borrow_cnt.fetch_sub(1, Relaxed);
     }
 
@@ -197,16 +185,9 @@ impl Arena {
         self.borrow_cnt.load(Relaxed) == 0
     }
 
-    fn tick(&self) -> Arc<AtomicU64> {
-        self.tick.clone()
-    }
-
-    fn file_id(&self) -> u64 {
-        self.file_id.load(Relaxed)
-    }
-
-    fn set_file_id(&self, x: u64) {
-        self.file_id.store(x, Relaxed);
+    #[inline(always)]
+    fn id(&self) -> u32 {
+        self.id.get()
     }
 }
 
@@ -224,26 +205,22 @@ impl Debug for Arena {
             .field("idx", &self.idx)
             .field("state", &self.state)
             .field("refcnt", &self.refcnt)
-            .field("stable", &self.stable)
             .field("offset", &self.offset)
-            .field("tick", &self.tick)
             .field("flsn", &unpack_id(self.flsn.load(Relaxed)))
-            .field("fild_id", &unpack_id(self.file_id.load(Relaxed)))
+            .field("id", &self.id.get())
             .field("borrow_cnt", &self.borrow_cnt)
             .finish()
     }
 }
 
 struct Pool {
-    files: FileMap,
     flush: Flush,
+    sem: Arc<Countblock>,
     buf: Vec<Handle>,
     free: AtomicUsize,
     seal: AtomicUsize,
     flsn: AtomicU64,
     cur: AtomicPtr<Arena>,
-    buf_size: u64,
-    max_file_size: u64,
     meta: Arc<Meta>,
 }
 
@@ -278,7 +255,12 @@ impl Pool {
         Box::into_raw(x)
     }
 
-    fn new(opt: Arc<Options>, files: FileMap, meta: Arc<Meta>) -> Result<Self, OpCode> {
+    fn new(
+        opt: Arc<Options>,
+        sem: Arc<Countblock>,
+        mapping: Arc<Mapping>,
+        meta: Arc<Meta>,
+    ) -> Result<Self, OpCode> {
         let cap = opt.buffer_count as usize;
         let mut buf = Vec::with_capacity(cap);
 
@@ -290,87 +272,59 @@ impl Pool {
         let free = AtomicUsize::new(1);
 
         let this = Self {
-            files,
-            flush: Flush::new(opt.clone()),
+            flush: Flush::new(mapping),
+            sem,
             buf,
             free,
             seal: AtomicUsize::new(0),
             flsn: AtomicU64::new(NULL_ORACLE),
             cur: AtomicPtr::new(h.raw),
-            buf_size: opt.buffer_size as u64,
-            max_file_size: opt.data_file_size as u64,
             meta,
         };
 
-        let (id, off) = this.next()?;
-        this.update_next(id, off);
+        let id = this.gen_id()?;
         h.set_state(Arena::FLUSH, Arena::HOT);
-        h.reset(id, off);
+        h.reset(id);
         Ok(this)
     }
 
-    // we can update flsn either here or where arena was cooled to WARM
-    fn release(&self, idx: usize, off: u64) {
+    // we MUST update flsn rather than where arena was cooled to WARM
+    fn release(&self, idx: usize) {
         let h = self.buf.get(idx).expect("index out of range");
         assert!(matches!(h.state(), Arena::HOT | Arena::WARM));
         h.dec_ref();
-        h.update_stable(off);
+        h.update_flsn(self.flsn.load(Relaxed));
         self.try_flush();
     }
 
-    fn stabilize(&self, f: Box<dyn Fn(u64)>) {
-        let cur = self.current();
-        let tick = cur.tick();
-        let iter = if matches!(cur.state(), Arena::HOT | Arena::WARM) {
-            cur.iter()
-        } else {
-            ArenaIter::default()
-        };
-
-        let data = FlushData::new(true, unpack_id(cur.file_id()).0, tick, iter, f);
-        self.flush
-            .tx
-            .send(data)
-            .inspect_err(|e| {
-                log::error!("can't stabilize arena {}", e);
-            })
-            .unwrap();
-    }
-
-    fn should_stabilize(&self) -> bool {
-        self.try_flush();
-        let seal = self.seal.load(Relaxed);
-
-        // the previous arena is COLD or FLUSH
-        seal == self.current().idx as usize
-    }
-
-    fn load_f<F>(&self, id: u16, off: u64, mut cb: F) -> Option<FrameOwner>
+    fn load_f<F>(&self, id: u32, off: u32, mut cb: F) -> Option<FrameOwner>
     where
         F: FnMut(FrameOwner) -> FrameOwner,
     {
-        let file_id = pack_id(id, off / self.buf_size * self.buf_size);
         let cur = self.current();
-        if cur.file_id() == file_id {
+        let cur_id = cur.id();
+
+        if cur_id == id {
             return Some(FrameOwner::from(cur.load(off)));
         }
 
         let idx = cur.idx as usize;
         let n = self.buf.len();
         let mut i = (n + idx - 1) % n;
+        // NOTE: the logical id of arena may not be contiguous (because of GC)
         while i != idx {
             let h = self.buf[i];
-            h.borrowed();
+            h.inc_borrow();
             if !matches!(h.state(), Arena::WARM | Arena::COLD) {
-                h.returned();
+                h.dec_borrow();
                 break;
             }
-            if h.file_id() == file_id {
+            if h.id() == id {
                 let r = cb(FrameOwner::from(h.load(off)));
-                h.returned();
+                h.dec_borrow();
                 return Some(r);
             }
-            h.returned();
+            h.dec_borrow();
             i = (n + i - 1) % n;
         }
         None
@@ -413,30 +367,20 @@ impl Pool {
     fn flush(&self, h: Handle) {
         assert_eq!(h.state(), Arena::COLD);
 
-        let file_id = h.file_id();
-        let (id, _) = unpack_id(file_id);
-        let meta = self.meta.clone();
-        assert!(id > 0);
-        let files = self.files.clone();
-        let cb = move |pos| {
+        let id = h.id();
+        assert!(id > INVALID_ID);
+        let sem = self.sem.clone();
+
+        let cb = move || {
             let x = h.set_state(Arena::COLD, Arena::FLUSH);
             assert_eq!(x, Arena::COLD);
-            let lk = files.write().expect("can't lock write");
-            if let Some(f) = lk.get_mut(&id) {
-                f.load();
-            }
-            log::trace!(
-                "flushed {:?} current {:?}",
-                (id, pos),
-                unpack_id(meta.next_data.load(Relaxed))
-            );
-            meta.flushed.store(pack_id(id, pos), Relaxed);
+            sem.post();
         };
 
         let _ = self
             .flush
             .tx
-            .send(FlushData::new(false, id, h.tick(), h.used(), Box::new(cb)))
+            .send(FlushData::new(id, h.used(), Box::new(cb)))
             .inspect_err(|x| {
                 log::error!("can't send flush data {:?}", x);
                 std::process::abort();
@@ -453,41 +397,29 @@ impl Pool {
         let idx = self.free.load(Acquire);
         let p = self.buf[idx];
         let next = (idx + 1) % self.buf.len();
-        let (id, off) = self.next()?;
+        let id = self.gen_id()?;
 
         log::debug!("swap arena {} => {}", idx, next);
         while !p.balanced() || p.set_state(Arena::FLUSH, Arena::HOT) != Arena::FLUSH {
-            std::hint::spin_loop();
+            self.try_flush();
         }
-        p.reset(id, off);
+        p.reset(id);
         self.free.store(next, Release); // release ordering is required
 
-        match self.cur.compare_exchange(cur.raw, p.raw, Relaxed, Relaxed) {
-            Ok(_) => self.update_next(id, off),
-            Err(_) => unreachable!("never happen"),
-        }
+        self.cur
+            .compare_exchange(cur.raw, p.raw, Relaxed, Relaxed)
+            .expect("never happen");
         Ok(())
     }
 
-    fn next(&self) -> Result<(u16, u64), OpCode> {
-        let (mut id, mut off) = unpack_id(self.meta.next_data.load(Relaxed));
+    fn gen_id(&self) -> Result<u32, OpCode> {
+        let id = self.meta.next_data.fetch_add(1, Relaxed);
 
-        if off >= self.max_file_size {
-            off = 0;
-            if id == NULL_ID {
-                id = NEXT_ID;
-            } else {
-                id += 1;
-            }
-            if id == self.meta.oldest_file() {
-                return Err(OpCode::DbFull);
-            }
+        // TODO: deal with id exhaustion
+        if id == NULL_ID {
+            return Err(OpCode::DbFull);
         }
-        Ok((id, off))
-    }
-
-    fn update_next(&self, id: u16, off: u64) {
-        self.meta.update_file(id, off + self.buf_size);
+        Ok(id)
     }
 
     fn flush_all(&self) {
@@ -532,28 +464,27 @@ impl Drop for Pool {
     }
 }
 
-type FileMap = Arc<RwLock<Lru<u16, FileReader>>>;
-
 pub struct Buffers {
-    opt: Arc<Options>,
-    pool: Pool,
     cache: Cache,
-    files: FileMap,
+    pool: Pool,
+    pub mapping: Arc<Mapping>,
 }
 
 impl Buffers {
-    const MAX_CACHED_META: usize = 16;
-    pub fn new(opt: Arc<Options>, meta: Arc<Meta>) -> Result<Self, OpCode> {
-        let files = Arc::new(RwLock::new(Lru::new(Self::MAX_CACHED_META)));
+    pub fn new(
+        opt: Arc<Options>,
+        sem: Arc<Countblock>,
+        meta: Arc<Meta>,
+        mapping: Mapping,
+    ) -> Result<Self, OpCode> {
+        let mapping = Arc::new(mapping);
         Ok(Self {
-            opt: opt.clone(),
-            pool: Pool::new(opt.clone(), files.clone(), meta)?,
             cache: Cache::new(&opt),
-            files,
+            pool: Pool::new(opt, sem, mapping.clone(), meta)?,
+            mapping,
         })
     }
 
-    /// NOTE: mutable buffer will never be cached, the result is the raw data with frame header
     pub fn alloc(&self, size: u32) -> Result<(usize, FrameRef), OpCode> {
         loop {
             let a = self.pool.current();
@@ -563,7 +494,6 @@ impl Buffers {
                 Err(OpCode::Again) => continue,
                 Err(OpCode::NeedMore) => {
                     if a.set_state(Arena::HOT, Arena::WARM) == Arena::HOT {
-                        a.update_flsn(self.pool.flsn.load(Relaxed));
                         self.pool.install_new(a)?;
                     }
                 }
@@ -580,16 +510,8 @@ impl Buffers {
         self.pool.quit()
     }
 
-    pub fn release_buffer(&self, buffer_id: usize, off: u64) {
-        self.pool.release(buffer_id, off);
-    }
-
-    pub fn should_stabilize(&self) -> bool {
-        self.pool.should_stabilize()
-    }
-
-    pub fn stabilize(&self, f: Box<dyn Fn(u64)>) {
-        self.pool.stabilize(f);
+    pub fn release_buffer(&self, buffer_id: usize) {
+        self.pool.release(buffer_id);
     }
 
     pub fn update_flsn(&self, flsn: u64) {
@@ -607,10 +529,6 @@ impl Buffers {
     }
 
     pub fn load(&self, addr: u64) -> FrameOwner {
-        if let Some(x) = self.cache.get(addr) {
-            return x;
-        }
-
         let (id, off) = unpack_id(addr);
 
         assert!(id > 0);
@@ -620,28 +538,17 @@ impl Buffers {
             return f;
         }
 
+        if let Some(x) = self.cache.get(addr) {
+            return x;
+        }
+
         loop {
-            if let Some(f) = self.load_from_file(id, off) {
+            if let Some(f) = self.mapping.load(addr) {
                 if let Err(e) = self.cache.put(addr, f.clone()) {
                     log::warn!("cache is full, {:?}", e);
                 }
                 return f;
             }
         }
-    }
-
-    fn load_from_file(&self, id: u16, off: u64) -> Option<FrameOwner> {
-        let lk = self.files.read().expect("can't lock read");
-        if let Some(r) = lk.get(&id) {
-            return r.read_at(off);
-        }
-        drop(lk);
-
-        let mut lk = self.files.try_write().ok()?;
-        let path = self.opt.data_file(id);
-        let r = FileReader::new(path)?;
-        let f = r.read_at(off);
-        lk.add(id, r);
-        f
     }
 }

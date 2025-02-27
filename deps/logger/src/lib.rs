@@ -3,6 +3,8 @@ use std::cell::{OnceCell, RefCell};
 use std::io::Write;
 use std::path::Path;
 use std::ptr::addr_of_mut;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Mutex;
 
 thread_local! {
@@ -11,7 +13,10 @@ thread_local! {
 #[cfg(not(target_os = "linux"))]
 static G_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
-static mut G_LOGGER: Logger = Logger { sink: Vec::new() };
+static mut G_LOGGER: Logger = Logger {
+    sink: Vec::new(),
+    abort_on_error: AtomicBool::new(false),
+};
 static G_INIIED: Mutex<bool> = Mutex::new(false);
 
 const G_CONSOLE: &'static str = "console";
@@ -31,6 +36,7 @@ fn get_tid() -> i32 {
 /// a simple sync logger which impl log::Log
 pub struct Logger {
     sink: Vec<Mutex<RefCell<Box<dyn Sink>>>>,
+    abort_on_error: AtomicBool,
 }
 
 trait Sink: Send + Sync {
@@ -61,6 +67,17 @@ impl log::Log for Logger {
             if let Ok(p) = p.lock() {
                 p.borrow_mut().sink(&s);
             }
+        }
+
+        if record.level() == log::LevelFilter::Error && self.should_abort() {
+            let bt = std::backtrace::Backtrace::force_capture();
+            let buf = format!("{}", bt);
+            for p in &self.sink {
+                if let Ok(p) = p.lock() {
+                    p.borrow_mut().sink(&buf);
+                }
+            }
+            std::process::abort();
         }
     }
 
@@ -157,6 +174,15 @@ impl Logger {
             }
         }
         return None;
+    }
+
+    fn should_abort(&self) -> bool {
+        self.abort_on_error.load(Relaxed)
+    }
+
+    pub fn abort_on_error(&mut self, flag: bool) -> &mut Self {
+        self.abort_on_error.store(flag, Relaxed);
+        self
     }
 
     pub fn add_console(&mut self) -> &mut Self {

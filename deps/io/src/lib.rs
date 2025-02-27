@@ -11,12 +11,14 @@ impl IoVec {
     }
 }
 
-pub trait SeekableGatherIO {
+pub trait GatherIO {
     fn read(&self, data: &mut [u8], pos: u64) -> Result<(), io::Error>;
 
-    fn write(&mut self, data: &mut [IoVec]) -> Result<(), io::Error>;
+    fn write(&mut self, data: &[u8]) -> Result<(), io::Error>;
 
-    fn flush(&mut self) -> Result<(), io::Error>;
+    fn writev(&mut self, data: &mut [IoVec]) -> Result<(), io::Error>;
+
+    fn sync(&mut self) -> Result<(), io::Error>;
 
     fn truncate(&self, to: u64) -> Result<(), io::Error>;
 

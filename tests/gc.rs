@@ -4,11 +4,13 @@ use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath};
 
 #[test]
 fn gc_data() {
-    let path = RandomPath::tmp();
+    let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.gc_timeout = 10;
-    opt.buffer_size = 1 << 20;
-    opt.data_file_size = 1 << 20;
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 20;
+    opt.gc_ratio = 10;
+    opt.buffer_size = 512 << 10;
     let db = Mace::new(opt).unwrap();
 
     let tx = db.default();
@@ -34,7 +36,22 @@ fn gc_data() {
         })
         .unwrap();
     }
-    assert!(!db.options().data_file(1).exists());
+
+    let mut count = 0;
+    let mut max_id = 0;
+    let dir = std::fs::read_dir(&db.options().db_root).unwrap();
+    for d in dir {
+        let x = d.unwrap();
+        let f = x.file_name();
+        let name = f.to_str().unwrap();
+        if name.starts_with(Options::DATA_PREFIX) {
+            let v: Vec<&str> = name.split(Options::DATA_PREFIX).collect();
+            let id = v[1].parse::<u32>().expect("invalid number");
+            count += 1;
+            max_id = max_id.max(id);
+        }
+    }
+    assert!(count < max_id);
 }
 
 #[test]
@@ -42,7 +59,7 @@ fn abort_txn() {
     let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.max_ckpt_per_txn = 1;
-    opt.ckpt_per_bytes = 512;
+    opt.buffer_size = 50 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt).unwrap();
 
     let tx = db.default();
@@ -50,17 +67,15 @@ fn abort_txn() {
     let h = std::thread::spawn(move || {
         let _ = ctx.begin(IsolationLevel::SI, |kv| {
             kv.put("foo", "bar")?;
-            sleep(Duration::from_millis(200));
+            sleep(Duration::from_millis(100));
             let r = kv.commit();
             assert!(r.is_err() && r.err().unwrap() == OpCode::AbortTx);
             Ok(())
         });
     });
 
-    sleep(Duration::from_millis(100));
-
     let _ = tx.begin(IsolationLevel::SI, |kv| {
-        for i in 0..10 {
+        for i in 0..200 {
             let x = format!("key_{}", i);
             kv.put(&x, &x)?;
         }
@@ -76,7 +91,7 @@ fn gc_wal() {
     let mut opt = Options::new(&*path);
     opt.wal_file_size = 4096;
     opt.gc_timeout = 2;
-    opt.ckpt_per_bytes = 512;
+    opt.buffer_size = 100 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt).unwrap();
     let tx = db.default();
     let mut data = Vec::new();

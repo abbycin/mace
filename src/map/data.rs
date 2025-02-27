@@ -1,23 +1,101 @@
-use crc32c::{crc32c_combine, Crc32cHasher};
-use io::{File, SeekableGatherIO};
+use crc32c::Crc32cHasher;
+use io::{File, GatherIO};
 
+use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
-use crate::utils::data::{AddrMap, MapEntry, PageTable};
+use crate::utils::data::{AddrMap, MapEntry, PageTable, Reloc, ID_LEN, JUNK_LEN};
 use crate::utils::{align_up, unpack_id};
 use crate::utils::{bytes::ByteArray, raw_ptr_to_ref, raw_ptr_to_ref_mut};
 use crate::OpCode;
+use std::alloc::alloc_zeroed;
 use std::cmp::min;
 use std::hash::Hasher;
 use std::io::Write;
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
-use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering::{Relaxed, Release};
 use std::{
-    alloc::{alloc, dealloc, Layout},
+    alloc::{dealloc, Layout},
     ops::{Deref, DerefMut},
 };
+
+/// NOTE: the field expect `file_id` will be changed, up1 and up2 change when new write, nr_active
+/// and active_size change when flush have new deallocate frame point to current file_id
+pub(crate) struct FileStat {
+    pub(crate) file_id: u32,
+    pub(crate) up1: u32,
+    pub(crate) up2: u32,
+    pub(crate) nr_active: u32,
+    pub(crate) active_size: u32,
+    // the following two field will never change
+    pub(crate) total: u32,
+    pub(crate) total_size: u32,
+    /// when an active frame was deallocated, mask it in the bitmap
+    pub(crate) dealloc: BitMap,
+    pub(crate) refcnt: AtomicU32,
+}
+
+impl FileStat {
+    pub(crate) fn update(&mut self, reloc: Reloc, now: u32) {
+        self.nr_active -= 1;
+        self.active_size -= reloc.len;
+        if !self.dealloc.full() {
+            self.dealloc.set(reloc.seq);
+        } else {
+            log::error!("invalid function call, {:?}", reloc);
+        }
+        // make sure monotonically increasing
+        if self.up1 < now {
+            self.up1 = self.up2;
+            self.up2 = now;
+        }
+    }
+}
+
+/// it must be protected by a lock
+pub(crate) struct StatHandle {
+    raw: *mut FileStat,
+}
+
+unsafe impl Send for StatHandle {}
+unsafe impl Sync for StatHandle {}
+
+impl From<*mut FileStat> for StatHandle {
+    fn from(raw: *mut FileStat) -> Self {
+        Self { raw }
+    }
+}
+
+impl Deref for StatHandle {
+    type Target = FileStat;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.raw }
+    }
+}
+
+impl DerefMut for StatHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.raw }
+    }
+}
+
+impl Clone for StatHandle {
+    fn clone(&self) -> Self {
+        self.refcnt.fetch_add(1, Release);
+        Self { raw: self.raw }
+    }
+}
+
+impl Drop for StatHandle {
+    fn drop(&mut self) {
+        if self.refcnt.fetch_sub(1, Release) == 1 {
+            unsafe {
+                drop(Box::from_raw(self.raw));
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -25,7 +103,9 @@ pub enum FrameFlag {
     Normal = 1,
     TombStone = 3,
     Slotted = 5,
-    Unknown = 7,
+    /// a frame contains addrs point to other arena
+    Junk = 11,
+    Unknown = 13,
 }
 
 #[derive(Debug)]
@@ -41,15 +121,11 @@ pub(crate) struct Frame {
     size: u32,
     flag: FrameFlag,
     owned: u8,
-    state: AtomicU16,
     refcnt: AtomicU32,
 }
 
 impl Frame {
     pub(crate) const FRAME_LEN: usize = size_of::<Self>();
-    pub(crate) const STATE_ACTIVE: u16 = 13;
-    pub(crate) const STATE_INACTIVE: u16 = 17;
-    pub(crate) const STATE_DEAD: u16 = 23;
 
     pub fn alloc_size(request: u32) -> u32 {
         align_up(Self::FRAME_LEN + request as usize, size_of::<usize>()) as u32
@@ -63,17 +139,6 @@ impl Frame {
         self.owned = 0;
         self.borrowed = cnt;
         self.refcnt.store(0, Relaxed);
-        self.state.store(Self::STATE_ACTIVE, Relaxed);
-    }
-
-    pub fn set_state(&self, current: u16, new: u16) -> u16 {
-        self.state
-            .compare_exchange(current, new, Relaxed, Relaxed)
-            .unwrap_or_else(|x| x)
-    }
-
-    pub fn state(&self) -> u16 {
-        self.state.load(Relaxed)
     }
 
     // only can be use when traverse arena and deallocate frame itself
@@ -121,6 +186,18 @@ impl Frame {
         debug_assert_eq!(self.flag, FrameFlag::Unknown);
         self.flag = FrameFlag::Slotted;
     }
+
+    pub fn fill_junk(&mut self, junks: &[u64]) {
+        self.flag = FrameFlag::Junk;
+        let ptr = self as *mut Self;
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(
+                ptr.add(1).cast::<u64>(),
+                self.payload_size() as usize / JUNK_LEN,
+            )
+        };
+        dst.copy_from_slice(junks);
+    }
 }
 
 pub(crate) struct FrameOwner {
@@ -141,15 +218,15 @@ impl FrameOwner {
     pub(crate) fn alloc(size: usize) -> Self {
         let real_size = Frame::alloc_size(size as u32);
         let raw = unsafe {
-            let f = alloc(Layout::array::<*const ()>(real_size as usize).unwrap()).cast::<Frame>();
-            (*f).size = size as u32;
-            (*f).flag = FrameFlag::Unknown;
-            (*f).pid = 0;
-            (*f).owned = 1;
-            (*f).borrowed = null();
-            (*f).refcnt.store(1, Relaxed);
-            f
+            let f = alloc_zeroed(Layout::array::<*const ()>(real_size as usize).unwrap())
+                .cast::<Frame>();
+            &mut *f
         };
+        raw.size = size as u32;
+        raw.flag = FrameFlag::Unknown;
+        raw.owned = 1;
+        raw.borrowed = null();
+        raw.refcnt.store(1, Relaxed);
         Self { raw }
     }
 
@@ -164,7 +241,7 @@ impl FrameOwner {
     }
 
     #[cfg(test)]
-    pub(crate) fn view(&self) -> FrameRef {
+    pub(crate) fn as_ref(&self) -> FrameRef {
         FrameRef::new(self.raw)
     }
 
@@ -265,49 +342,24 @@ impl FrameRef {
 }
 
 pub(crate) struct FlushData {
-    /// force flush all frames in iterator
-    force: bool,
-    id: u16,
-    now: u64,
-    tick: Arc<AtomicU64>,
+    id: u32,
     pub(crate) iter: ArenaIter,
-    cb: Box<dyn Fn(u64)>,
+    cb: Box<dyn FnOnce()>,
 }
 
 unsafe impl Send for FlushData {}
 
 impl FlushData {
-    pub fn new(
-        force: bool,
-        id: u16,
-        tick: Arc<AtomicU64>,
-        iter: ArenaIter,
-        cb: Box<dyn Fn(u64)>,
-    ) -> Self {
-        Self {
-            force,
-            id,
-            now: tick.load(Relaxed),
-            tick,
-            iter,
-            cb,
-        }
+    pub fn new(id: u32, iter: ArenaIter, cb: Box<dyn FnOnce()>) -> Self {
+        Self { id, iter, cb }
     }
 
-    pub fn still(&self) -> bool {
-        self.tick.load(Relaxed) == self.now
-    }
-
-    pub fn is_force(&self) -> bool {
-        self.force
-    }
-
-    pub fn id(&self) -> u16 {
+    pub fn id(&self) -> u32 {
         self.id
     }
 
-    pub fn mark_done(&self, cur_pos: u64) {
-        (self.cb)(cur_pos)
+    pub fn mark_done(self) {
+        (self.cb)()
     }
 }
 
@@ -351,21 +403,37 @@ impl Iterator for ArenaIter {
         Some(f)
     }
 }
-
+/// the layout of a flushed arena is:
+/// ```text
+/// high                                                                            low
+/// +--------+-------+------+-------------+-------+---------------------------------+
+/// | footer | lids | map entries | relocations | junks |  frames (normal, slotted) |
+/// +--------+------+-------+-------------+-------+---------------------------------+
+///
+/// ```
 #[repr(C, packed(1))]
 #[derive(Default, Debug)]
-pub(crate) struct DataHeader {
-    nr_map: u32,
-    nr_reloc: u32,
-    crc: u64,
-    len: u64,
-    real_crc: u64,
+pub(crate) struct DataFooter {
+    pub(crate) up2: u32,
+    /// logical id entries
+    pub(crate) nr_lid: u32,
+    /// page table
+    pub(crate) nr_entry: u32,
+    /// item's relocation table
+    pub(crate) nr_reloc: u32,
+    /// count of junks
+    pub(crate) nr_junk: u32,
+    /// active frames, only calculate the Normal and Slotted
+    pub(crate) nr_active: u32,
+    /// active frame size, also the initial total size
+    pub(crate) active_size: u32,
+    pub(crate) crc: u32,
 }
 
-impl DataHeader {
+impl DataFooter {
     pub(crate) const LEN: usize = size_of::<Self>();
 
-    fn serialize<W: Write>(&self, w: &mut W) {
+    pub(crate) fn serialize<W: Write>(&self, w: &mut W) {
         let s = unsafe {
             let p = self as *const Self;
             std::slice::from_raw_parts(p.cast::<u8>(), size_of::<Self>())
@@ -373,8 +441,20 @@ impl DataHeader {
         w.write_all(s).expect("can't write");
     }
 
-    fn _size(nr_map: u32, nr_reloc: u32) -> usize {
-        nr_map as usize * PageTable::ITEM_LEN + nr_reloc as usize * AddrMap::LEN + Self::LEN
+    fn lid_pos(&self) -> usize {
+        Self::LEN
+    }
+
+    fn entry_pos(&self) -> usize {
+        Self::LEN + self.lid_len()
+    }
+
+    fn reloc_pos(&self) -> usize {
+        self.entry_pos() + self.nr_entry as usize * PageTable::ITEM_LEN
+    }
+
+    fn meta_len(&self) -> usize {
+        self.lid_len() + self.entry_len() + self.reloc_len()
     }
 
     fn get<T>(&self, off: usize, n: usize) -> &[T] {
@@ -385,66 +465,66 @@ impl DataHeader {
         }
     }
 
-    fn meta(&self) -> &[u8] {
-        self.get(Self::LEN, self.meta_size() - Self::LEN)
+    fn entry_slice(&self) -> &[u8] {
+        self.get(self.entry_pos(), self.entry_len())
     }
 
-    pub(crate) fn meta_size(&self) -> usize {
-        Self::_size(self.nr_map, self.nr_reloc)
+    fn reloc_slice(&self) -> &[u8] {
+        self.get(self.reloc_pos(), self.reloc_len())
     }
 
-    /// total size including header itself
-    pub(crate) fn size(&self) -> usize {
-        self.meta_size() + self.len as usize
+    fn lid_slice(&self) -> &[u8] {
+        self.get(self.lid_pos(), self.lid_len())
     }
 
-    pub(crate) fn maps(&self) -> &[MapEntry] {
-        let off = Self::LEN;
-        self.get(off, self.nr_map as usize)
+    fn lid_len(&self) -> usize {
+        self.nr_lid as usize * ID_LEN
+    }
+
+    fn entry_len(&self) -> usize {
+        self.nr_entry as usize * PageTable::ITEM_LEN
+    }
+
+    fn reloc_len(&self) -> usize {
+        self.nr_reloc as usize * AddrMap::LEN
+    }
+
+    fn junk_len(&self) -> usize {
+        self.nr_junk as usize * JUNK_LEN
+    }
+
+    pub(crate) fn lids(&self) -> &[u32] {
+        self.get(self.lid_pos(), self.nr_lid as usize)
+    }
+
+    pub(crate) fn entries(&self) -> &[MapEntry] {
+        self.get(self.entry_pos(), self.nr_entry as usize)
     }
 
     pub(crate) fn relocs(&self) -> &[AddrMap] {
-        let off = Self::LEN + self.nr_map as usize * PageTable::ITEM_LEN;
-        self.get(off, self.nr_reloc as usize)
-    }
-
-    pub(crate) fn is_intact(&self) -> bool {
-        if self.real_crc != self.crc {
-            log::error!("invalid checksum, expect {} get {}", { self.crc }, {
-                self.real_crc
-            });
-            false
-        } else {
-            true
-        }
+        self.get(self.reloc_pos(), self.nr_reloc as usize)
     }
 }
 
 pub(crate) struct DataBuilder {
     nr_rel: u32,
-    table: PageTable,
+    nr_junk: u32,
+    nr_active: u32,
+    active_size: u32,
+    pub(crate) junks: Vec<FrameRef>,
+    entry: PageTable,
     reloc: Vec<u8>,
     frames: Vec<FrameRef>,
-}
-
-impl Deref for DataBuilder {
-    type Target = Vec<FrameRef>;
-    fn deref(&self) -> &Self::Target {
-        &self.frames
-    }
-}
-
-impl DerefMut for DataBuilder {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.frames
-    }
 }
 
 impl DataBuilder {
     fn add_impl(&mut self, f: FrameRef) {
         if f.flag() == FrameFlag::Normal {
-            self.table.add(f.page_id(), f.addr());
+            self.entry.add(f.page_id(), f.addr());
         }
+        // including Slotted
+        self.nr_active += 1;
+        self.active_size += f.payload_size();
         self.nr_rel += 1;
         self.frames.push(f);
     }
@@ -452,188 +532,261 @@ impl DataBuilder {
     pub(crate) fn new() -> Self {
         Self {
             nr_rel: 0,
-            table: PageTable::default(),
+            nr_junk: 0,
+            nr_active: 0,
+            active_size: 0,
+            junks: Vec::new(),
+            entry: PageTable::default(),
             reloc: Vec::new(),
             frames: Vec::new(),
         }
     }
 
-    pub(crate) fn add(&mut self, f: FrameRef, flush_all: bool) {
+    pub(crate) fn add(&mut self, f: FrameRef) {
         match f.flag() {
             FrameFlag::Normal | FrameFlag::Slotted => {
-                debug_assert_eq!(f.state(), Frame::STATE_DEAD);
                 self.add_impl(f);
             }
-            FrameFlag::TombStone if flush_all => {
-                self.add_impl(f);
+            FrameFlag::Junk => {
+                self.nr_junk += f.payload_size() / JUNK_LEN as u32;
+                self.junks.push(f);
             }
+            FrameFlag::TombStone => {}
             FrameFlag::Unknown => unreachable!("invalid frame {:?}", unpack_id(f.addr())),
-            _ => {}
         }
     }
 
-    pub(crate) fn build<W>(&mut self, off: u64, w: &mut W) -> u64
+    pub(crate) fn is_empty(&self) -> bool {
+        self.frames.is_empty() && self.junks.is_empty()
+    }
+
+    pub(crate) fn active_frames(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub(crate) fn build<W>(&mut self, w: &mut W, up2: u32)
     where
         W: Write,
     {
-        let hdr_sz = DataHeader::_size(self.table.len() as u32, self.nr_rel) as u64;
-        let mut pos = off + hdr_sz;
-        let mut body = Crc32cHasher::default();
+        let mut pos = 0;
+        let mut crc = Crc32cHasher::default();
 
-        for f in &self.frames {
-            let reloc = AddrMap::new(unpack_id(f.addr()).1, pos, f.payload_size());
-            pos += f.payload_size() as u64;
+        for (seq, f) in self.frames.iter().enumerate() {
+            let reloc = AddrMap::new(f.addr(), pos, f.payload_size(), seq as u32);
+            pos += f.payload_size();
             self.reloc.extend_from_slice(reloc.as_slice());
-            body.write(f.payload_slice());
-        }
-        let len = pos - off - hdr_sz;
-        let mut meta = Crc32cHasher::default();
-
-        self.table.hash(&mut meta);
-        meta.write(self.reloc.as_slice());
-
-        let hdr = DataHeader {
-            nr_map: self.table.len() as u32,
-            nr_reloc: self.nr_rel,
-            crc: crc32c_combine(meta.finish() as u32, body.finish() as u32, len as usize) as u64,
-            len,
-            real_crc: 0,
-        };
-
-        hdr.serialize(w);
-
-        // meta
-        self.table.serialize(w);
-        w.write_all(self.reloc.as_slice()).expect("cant' write");
-
-        // body
-        for f in &self.frames {
+            crc.write(f.payload_slice());
             f.serialize(w);
         }
 
-        len + hdr_sz
+        for f in &self.junks {
+            crc.write(f.payload_slice());
+            f.serialize(w);
+        }
+
+        crc.write(self.reloc.as_slice());
+        w.write_all(self.reloc.as_slice()).unwrap();
+
+        self.entry.hash(&mut crc);
+        self.entry.serialize(w);
+
+        let hdr = DataFooter {
+            up2,
+            nr_lid: 0,
+            nr_entry: self.entry.len() as u32,
+            nr_reloc: self.nr_rel,
+            nr_junk: self.nr_junk,
+            nr_active: self.nr_active,
+            active_size: self.active_size,
+            crc: crc.finish() as u32,
+        };
+
+        hdr.serialize(w);
     }
 }
 
-pub(crate) struct DataLoader {
+pub(crate) struct DataMetaReader {
     file: File,
+    pos: usize,
     off: u64,
-    end: u64,
-    hdr: Block,
+    buf: Block,
+    validate: bool,
 }
 
-impl DataLoader {
-    const BUF_LEN: usize = 2048;
+impl DataMetaReader {
+    const BUF_LEN: usize = DataFooter::LEN;
 
-    pub(crate) fn new<T: AsRef<Path>>(path: T, off: u64) -> Result<Self, OpCode> {
+    fn open<T: AsRef<Path>>(path: T, validate: bool) -> Result<Self, OpCode> {
         let file = File::options()
             .read(true)
-            .write(true)
             .trunc(false)
             .open(&path.as_ref().to_path_buf())
             .map_err(|x| {
                 log::warn!("can't open {:?} {}", path.as_ref(), x);
                 OpCode::IoError
             })?;
-
-        let end = file.size().expect("can't get file size");
-        if end == off {
-            return Err(OpCode::NoSpace);
+        let off = file.size().expect("can't get file size");
+        if off < DataFooter::LEN as u64 {
+            return Err(OpCode::NeedMore);
         }
 
         Ok(Self {
             file,
+            pos: 0,
             off,
-            end,
-            hdr: Block::alloc(Self::BUF_LEN),
+            buf: Block::alloc(Self::BUF_LEN),
+            validate,
         })
     }
 
-    pub(crate) fn read_only(file: File, off: u64) -> Self {
-        let end = file.size().expect("can't get file size");
-        Self {
-            file,
-            off,
-            end,
-            hdr: Block::alloc(Self::BUF_LEN),
+    pub(crate) fn new<T: AsRef<Path>>(path: T, validate_data: bool) -> Result<Self, OpCode> {
+        Self::open(path, validate_data)
+    }
+
+    pub(crate) fn get_meta(&mut self) -> Result<&DataFooter, OpCode> {
+        let crc = self.read_meta().map_err(|e| {
+            log::error!("io error {}", e);
+            OpCode::IoError
+        })?;
+        let f = raw_ptr_to_ref(self.buf.data().cast::<DataFooter>());
+
+        if crc != f.crc {
+            log::error!("bad checksum, expect {} get {}", { f.crc }, crc);
+            Err(OpCode::BadData)
+        } else {
+            Ok(f)
         }
     }
 
-    fn crc_data(&mut self, mut off: u64) -> Option<&DataHeader> {
-        let mut h = Crc32cHasher::default();
-        let hdr = raw_ptr_to_ref_mut(self.hdr.data().cast::<DataHeader>());
-        let mut buf = [0u8; 1024];
-        let mut size = hdr.size() - hdr.meta_size();
+    pub(crate) fn get_junk(&mut self) -> Result<Vec<u64>, OpCode> {
+        let f = raw_ptr_to_ref(self.buf.data().cast::<DataFooter>());
+        if f.junk_len() == 0 {
+            return Ok(Vec::new());
+        }
+        let mut v: Vec<u64> = Vec::with_capacity(f.junk_len() / JUNK_LEN);
+        let off = self.off - f.junk_len() as u64;
+        let s = unsafe {
+            let ptr = v.as_mut_ptr().cast::<u8>();
+            std::slice::from_raw_parts_mut(ptr, f.junk_len())
+        };
+        self.file.read(s, off).map_err(|e| {
+            log::error!("read error {}", e);
+            OpCode::IoError
+        })?;
 
-        h.write(hdr.meta());
-        while size > 0 {
-            let len = min(size, buf.len());
+        Ok(v)
+    }
+
+    fn read_meta(&mut self) -> Result<u32, std::io::Error> {
+        Self::get_footer(self)?;
+        let f = raw_ptr_to_ref(self.buf.data().cast::<DataFooter>());
+        self.get_lid(f)?;
+        self.get_entry(f)?;
+        self.get_reloc(f)?;
+        if self.validate {
+            self.calc_crc(f)
+        } else {
+            Ok(f.crc)
+        }
+    }
+
+    fn get_footer(&mut self) -> Result<(), std::io::Error> {
+        let flen = DataFooter::LEN;
+        let s = self.buf.get_mut_slice(0, flen);
+        self.off -= flen as u64;
+
+        self.file.read(s, self.off)?;
+        self.pos += flen;
+
+        let footer = raw_ptr_to_ref(s.as_mut_ptr().cast::<DataFooter>());
+        if flen + footer.meta_len() > self.buf.len() {
+            self.buf.realloc(footer.meta_len() + flen);
+        }
+
+        Ok(())
+    }
+
+    fn get_lid(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
+        if f.lid_len() > 0 {
+            self.off -= f.lid_len() as u64;
+            let s = self.buf.get_mut_slice(self.pos, f.lid_len());
+
+            self.file.read(s, self.off)?;
+            self.pos += f.lid_len();
+        }
+        Ok(())
+    }
+
+    fn get_entry(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
+        if f.entry_len() > 0 {
+            self.off -= f.entry_len() as u64;
+            let s = self.buf.get_mut_slice(self.pos, f.entry_len());
+
+            self.file.read(s, self.off)?;
+            self.pos += f.entry_len();
+        }
+        Ok(())
+    }
+
+    fn get_reloc(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
+        if f.reloc_len() > 0 {
+            self.off -= f.reloc_len() as u64;
+            let s = self.buf.get_mut_slice(self.pos, f.reloc_len());
+
+            self.file.read(s, self.off)?;
+            self.pos += f.reloc_len();
+            assert_eq!(self.pos, self.buf.len());
+        }
+        Ok(())
+    }
+
+    fn calc_crc(&self, f: &DataFooter) -> Result<u32, std::io::Error> {
+        let mut buf = [0u8; 4096];
+        let mut h = Crc32cHasher::default();
+        let end = self.off;
+        let mut off = 0;
+
+        while off < end {
+            let len = min((end - off) as usize, buf.len());
             let s = &mut buf[0..len];
-            self.file.read(s, off).ok()?;
+            self.file.read(s, off)?;
             off += len as u64;
-            size -= len;
             h.write(s);
         }
 
-        self.off += hdr.size() as u64;
-        hdr.real_crc = h.finish();
-        Some(hdr)
+        h.write(f.reloc_slice());
+        h.write(f.entry_slice());
+        h.write(f.lid_slice());
+
+        Ok(h.finish() as u32)
     }
 
-    pub(crate) fn get_meta(&mut self) -> Option<&DataHeader> {
-        let off = size_of::<DataHeader>();
-        let size = {
-            let s = self.hdr.get_mut_slice(0, off);
-            self.file.read(s, self.off).ok()?;
-            let hdr = raw_ptr_to_ref(s.as_mut_ptr().cast::<DataHeader>());
-            hdr.meta_size()
-        };
-
-        if size > self.hdr.len() {
-            self.hdr.realloc(size);
-        }
-
-        let s = self.hdr.get_mut_slice(off, size - off);
-        self.file.read(s, self.off + off as u64).ok()?;
-        self.crc_data(self.off + size as u64)
-    }
-
-    pub(crate) fn is_complete(&self) -> bool {
-        self.off == self.end
-    }
-
-    pub(crate) fn offset(&self) -> u64 {
-        self.off
-    }
-
-    pub(crate) fn truncate(&self) {
-        self.file.truncate(self.off).expect("can't truncate file");
+    pub(crate) fn take(self) -> (File, Block) {
+        (self.file, self.buf)
     }
 }
 
 #[cfg(test)]
 mod test {
     use std::fs::File;
-    use std::sync::atomic::Ordering::Relaxed;
 
-    use crate::{map::data::Frame, utils::unpack_id, RandomPath};
+    use crate::{utils::NEXT_ID, RandomPath};
 
-    use super::{DataBuilder, DataLoader, FrameOwner};
+    use super::{DataBuilder, DataMetaReader, FrameOwner};
 
     #[test]
     fn dump_load() {
         let path = RandomPath::tmp();
         let f = FrameOwner::alloc(233);
         let (pid, addr) = (114514, 1919810);
-        let mut view = f.view();
+        let mut view = f.as_ref();
 
         view.set_addr(addr);
         view.set_pid(pid);
 
         let mut builder = DataBuilder::new();
 
-        f.state.store(Frame::STATE_DEAD, Relaxed);
-        builder.add(view, false);
+        builder.add(view);
 
         let mut file = File::options()
             .write(true)
@@ -641,15 +794,13 @@ mod test {
             .create(true)
             .open(&*path)
             .unwrap();
-        builder.build(0, &mut file);
+        builder.build(&mut file, NEXT_ID);
 
-        let mut loader = DataLoader::new(&*path, 0).unwrap();
+        let mut loader = DataMetaReader::new(&*path, true).unwrap();
 
         let d = loader.get_meta().unwrap();
-        let map = d.maps();
+        let map = d.entries();
         let reloc = d.relocs();
-
-        assert!(d.is_intact());
 
         assert_eq!(map.len(), 1);
         assert_eq!(reloc.len(), 1);
@@ -659,8 +810,8 @@ mod test {
         assert_eq!(m.page_addr(), addr);
 
         let r = &reloc[0];
-        assert_eq!({ r.key }, unpack_id(addr).1);
-        assert_eq!({ r.val.off }, d.meta_size() as u64);
+        assert_eq!({ r.key }, addr);
+        assert_eq!({ r.val.off }, 0);
         assert_eq!({ r.val.len }, f.payload_size());
     }
 }

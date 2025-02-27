@@ -1,5 +1,6 @@
 use super::IAlloc;
-use crate::map::data::{Frame, FrameFlag, FrameOwner, FrameRef};
+use crate::map::data::{FrameFlag, FrameOwner, FrameRef};
+use crate::utils::data::JUNK_LEN;
 use crate::OpCode;
 use crate::Store;
 use std::sync::atomic::Ordering::Relaxed;
@@ -9,6 +10,7 @@ pub struct SysTxn<'a> {
     /// arena list
     buffers: Vec<(usize, FrameRef)>,
     read_only_buffer: Vec<FrameOwner>,
+    junks: Vec<FrameOwner>,
     page_ids: Vec<(u64, u64)>,
 }
 
@@ -18,6 +20,7 @@ impl<'a> SysTxn<'a> {
             store,
             buffers: Vec::new(),
             read_only_buffer: Vec::new(),
+            junks: Vec::new(),
             page_ids: Vec::new(),
         }
     }
@@ -28,16 +31,18 @@ impl<'a> SysTxn<'a> {
         // marked as tombstone on cas failed (if we don't do that, we have to traverse buffers to
         // determine which id should be delayed for releasing buffer and be marked tombstone here,
         // it's a little bit more overhead and complicate)
-        for (id, f) in &self.buffers {
-            let r = f.set_state(Frame::STATE_ACTIVE, Frame::STATE_INACTIVE);
-            debug_assert_eq!(r, Frame::STATE_ACTIVE);
-            self.store.buffer.release_buffer(*id, f.addr());
+        for (id, _) in &self.buffers {
+            self.store.buffer.release_buffer(*id);
         }
         self.buffers.clear();
     }
 
     pub fn pin(&mut self, f: FrameOwner) {
         self.read_only_buffer.push(f);
+    }
+
+    pub fn gc(&mut self, f: FrameOwner) {
+        self.junks.push(f);
     }
 
     pub fn unpin_all(&mut self) {
@@ -70,11 +75,27 @@ impl<'a> SysTxn<'a> {
         self.store.page.cas(pid, old, new).inspect_err(|_| {
             // NOTE: if retry ok, it will be set to non-tombstone
             frame.set_tombstone();
+            self.junks.clear();
         })?;
 
+        Self::apply_junks(self);
         frame.set_pid(pid);
         self.commit();
         Ok(())
+    }
+
+    fn apply_junks(&mut self) {
+        // the junks maybe from multiple arenas
+        let junks: Vec<u64> = self.junks.iter().map(|x| x.addr()).collect();
+
+        if !junks.is_empty() {
+            let sz = junks.len() * JUNK_LEN;
+
+            let (id, mut junk) = self.store.buffer.alloc(sz as u32).expect("no memory");
+            junk.fill_junk(&junks);
+            self.store.buffer.release_buffer(id);
+        }
+        self.junks.clear();
     }
 
     pub fn update_unchecked(&mut self, pid: u64, frame: &mut FrameRef) {
@@ -90,12 +111,11 @@ impl Drop for SysTxn<'_> {
             self.store.page.unmap(*pid, *addr).expect("can't go wrong");
         }
         self.read_only_buffer.clear();
+        self.junks.clear();
 
         for (id, f) in self.buffers.iter_mut() {
             f.set_tombstone();
-            let r = f.set_state(Frame::STATE_ACTIVE, Frame::STATE_INACTIVE);
-            debug_assert_eq!(r, Frame::STATE_ACTIVE);
-            self.store.buffer.release_buffer(*id, f.addr());
+            self.store.buffer.release_buffer(*id);
         }
     }
 }

@@ -427,18 +427,14 @@ impl ICodec for Index {
         let (pid, epoch) = to.split_at_mut(8);
         number_to_slice!(self.pid, pid);
         number_to_slice!(self.epoch, epoch);
-        // to.copy_from_slice(&self.ptr.to_le_bytes());
     }
 
     fn decode_from(raw: ByteArray) -> Self {
         debug_assert!(raw.len() >= 16);
-        // let mut bytes = [0u8; size_of::<u64>()];
-        // bytes.copy_from_slice(unsafe { std::slice::from_raw_parts(raw.data(), raw.len()) });
         let s = raw.as_mut_slice(0, Self::len());
         let (pid, epoch) = s.split_at(8);
 
         Self {
-            // ptr: u64::from_le_bytes(bytes),
             pid: slice_to_number!(pid, u64),
             epoch: slice_to_number!(epoch, u64),
         }

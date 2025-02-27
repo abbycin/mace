@@ -21,7 +21,7 @@ use crate::{
         traits::{IKey, IPageIter, IVal, IValCodec},
         unpack_id, NULL_CMD, NULL_PID, ROOT_PID,
     },
-    OpCode, Record, Store,
+    OpCode, Store,
 };
 use std::{collections::VecDeque, sync::Arc};
 
@@ -209,6 +209,7 @@ impl Tree {
         });
     }
 
+    // TODO: Garbage collect the unmapped frames (including it's sibling)
     // caller must ensure we are the only one who is accessing the tree
     pub fn remove_all(&self) {
         self.remove_dfs(self.root_index.pid);
@@ -732,7 +733,7 @@ impl Tree {
 
         let _ = self.walk_page(view.page_addr, |frame, _, pg| {
             let h = pg.header();
-            txn.pin(frame);
+            txn.gc(frame);
 
             match h.delta_type() {
                 DeltaType::Data => {
@@ -806,7 +807,7 @@ impl Tree {
             let frame = self.store.buffer.load(addr);
             let pg = SlottedPage::<Ver, T>::from(frame.payload());
             let h = pg.header();
-            txn.pin(frame);
+            txn.gc(frame);
 
             for i in 0..h.elems as usize {
                 let (k, v) = pg.get(i);
@@ -828,7 +829,7 @@ impl Tree {
 
         let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<Key, Value<T>>| {
             let h = pg.header();
-            txn.pin(frame);
+            txn.gc(frame);
 
             debug_assert!(h.is_leaf());
 
@@ -910,44 +911,17 @@ impl Tree {
         }
     }
 
-    pub(crate) fn force_consolidate(&self, pid: u64) -> Result<(), OpCode> {
-        const RANGE: Range = Range::new();
-        let (f, view) = Tree::page_view(&self.store, pid, RANGE);
-        let mut txn = self.begin();
-
-        if view.info.is_split() {
-            // trigger parent-update first, then force consolidate
-            let page = Page::<&[u8], Index>::from(f.payload());
-            let _ = self.try_find_leaf::<Record>(&mut txn, page.key_at(0));
-            let (_, view) = Tree::page_view(&self.store, pid, RANGE);
-            self.consolidate::<Record>(&mut txn, view).map(|_| ())
-        } else {
-            self.consolidate::<Record>(&mut txn, view).map(|_| ())
-        }
-    }
-
-    fn consolidate_and_smo<'a, T>(
-        &'a self,
-        txn: &mut SysTxn,
-        mut view: View<'a>,
-    ) -> Result<(), OpCode>
-    where
-        T: IValCodec + 'a,
-    {
-        view = self.consolidate::<T>(txn, view)?;
-        if self.need_split(&view) {
-            return self.split::<T>(txn, view);
-        }
-        // TODO: when consolidate result no delta, we should perform `merge`
-        Ok(())
-    }
-
-    fn try_consolidate<'a, T>(&'a self, txn: &mut SysTxn, view: View<'a>) -> Result<(), OpCode>
+    fn try_consolidate<'a, T>(&'a self, txn: &mut SysTxn, mut view: View<'a>) -> Result<(), OpCode>
     where
         T: IValCodec + 'a,
     {
         if self.need_consolidate(&view.info) {
-            self.consolidate_and_smo::<T>(txn, view)
+            view = self.consolidate::<T>(txn, view)?;
+            if self.need_split(&view) {
+                return self.split::<T>(txn, view);
+            }
+            // TODO: when consolidate result no delta, we should perform `merge`
+            Ok(())
         } else {
             Ok(())
         }
@@ -1172,8 +1146,8 @@ mod test {
     fn new_mgr<T: AsRef<Path>>(path: T) -> Result<Registry, OpCode> {
         let _ = std::fs::remove_dir_all(&path);
         let opt = Arc::new(Options::new(&path));
-        let (meta, table) = Recovery::new(opt.clone()).phase1();
-        let store = Arc::new(Store::new(table, opt, meta.clone()).unwrap());
+        let (meta, table, mapping) = Recovery::new(opt.clone()).phase1();
+        let store = Arc::new(Store::new(table, opt, meta.clone(), mapping).unwrap());
         Ok(Registry::new(store))
     }
 
@@ -1289,8 +1263,8 @@ mod test {
         let mut opt = Options::new(&*path);
         opt.consolidate_threshold = 4;
         let opt = Arc::new(opt);
-        let (meta, table) = Recovery::new(opt.clone()).phase1();
-        let store = Arc::new(Store::new(table, opt, meta.clone()).unwrap());
+        let (meta, table, mapping) = Recovery::new(opt.clone()).phase1();
+        let store = Arc::new(Store::new(table, opt, meta.clone(), mapping).unwrap());
         let mgr = Registry::new(store);
         let s = mgr.create_tree()?;
 

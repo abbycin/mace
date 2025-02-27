@@ -81,6 +81,7 @@ impl Registry {
         let pid = self.store.page.alloc().expect("no space");
         let w = self.store.context.alloc();
         w.logging.record_put(tree_id, txid, pid);
+        w.logging.wait_flush(); // make sure the tree is flushed before txn starts
         self.store.context.free(w);
 
         self.init_tree(tree_id, pid, txid)
@@ -139,6 +140,7 @@ impl Registry {
 
         let w = self.store.context.alloc();
         w.logging.record_del(tree.id(), txid, pid);
+        w.logging.wait_flush(); // make sure the tree is flushed before txn starts
         self.store.context.free(w);
 
         self.tree

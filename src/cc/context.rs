@@ -9,7 +9,6 @@ use super::log::{CState, GroupCommitter};
 use super::worker::SyncWorker;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Relaxed, Release};
-use std::sync::mpsc::channel;
 use std::sync::Arc;
 
 pub struct Context {
@@ -35,18 +34,20 @@ fn group_commit_thread(
         .name("group_commiter".into())
         .spawn(move || {
             log::debug!("start group commiter");
-            let (tx, rx) = channel();
-            let tx = Arc::new(tx);
-            gc.run(ctrl, buffer, worker, tx, rx, sem);
+            gc.run(ctrl, buffer, worker, sem);
             log::debug!("stop group commiter");
         })
         .expect("can't spawn group commit thread");
 }
 
 impl Context {
-    pub fn new(opt: Arc<Options>, buffer: Arc<Buffers>, meta: Arc<Meta>) -> Arc<Self> {
+    pub fn new(
+        opt: Arc<Options>,
+        sem: Arc<Countblock>,
+        buffer: Arc<Buffers>,
+        meta: Arc<Meta>,
+    ) -> Arc<Self> {
         let cores = opt.workers;
-        let sem = Arc::new(Countblock::new(cores));
         let gc = GroupCommitter::new(opt.clone(), meta.clone());
         let mut w = Vec::with_capacity(cores);
         let ctrl = CState::new();
