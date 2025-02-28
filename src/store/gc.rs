@@ -344,6 +344,9 @@ impl GarbageCollector {
                 // remove entries that are about to be unmapped or do not exist
                 junks.retain(|addr| {
                     let (logical_id, _) = unpack_id(*addr);
+                    if logical_id == x.logical_id {
+                        return false;
+                    }
                     !unmapped.contains(&logical_id) && self.map.stats.contains_key(&logical_id)
                 });
 
