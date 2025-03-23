@@ -12,7 +12,7 @@ fn to_str(x: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(x) }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
 pub struct Key<'a> {
     pub raw: &'a [u8],
     ver: Ver,
@@ -272,11 +272,13 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub enum Value<T> {
     Put(T),
     Del(T),
     Sib(Sibling<T>),
+    #[default]
+    Unused,
 }
 
 impl<T> Value<T>
@@ -288,6 +290,7 @@ where
             Value::Put(x) => x.size(),
             Value::Del(x) => x.size(),
             Value::Sib(x) => x.size(),
+            Value::Unused => unreachable!(),
         }
     }
 
@@ -296,6 +299,7 @@ where
             Value::Del(_) => true,
             Value::Put(_) => false,
             Value::Sib(x) => x.is_tombstone(),
+            Value::Unused => unreachable!(),
         }
     }
 
@@ -311,6 +315,7 @@ where
             Value::Put(ref x) => x,
             Value::Del(ref x) => x,
             Value::Sib(ref x) => x.as_ref(),
+            Value::Unused => unreachable!(),
         }
     }
 }
@@ -346,6 +351,7 @@ where
                 id[0] = VALUE_SIB_BIT;
                 x.encode(payload);
             }
+            Value::Unused => unreachable!(),
         }
     }
 
@@ -376,6 +382,7 @@ where
             Value::Del(x) => format!("<del, {}>", x.to_string()),
             Value::Put(x) => format!("<put, {}>", x.to_string()),
             Value::Sib(x) => format!("<sib, {}>", x.to_string()),
+            Value::Unused => unreachable!(),
         }
     }
 }

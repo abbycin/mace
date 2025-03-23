@@ -274,7 +274,7 @@ impl Logging {
         wid: u16,
         sem: Arc<Countblock>,
     ) -> Self {
-        let buffer = Block::aligned_alloc(opt.buffer_size as usize, 1);
+        let buffer = Block::aligned_alloc(opt.wal_buffer_size, 1);
         buffer.zero();
         Self {
             flushed_signal: AtomicUsize::new(0),
@@ -487,6 +487,7 @@ impl GroupCommitter {
         sem: Arc<Countblock>,
     ) {
         let mut desc = HashMap::new();
+        let mut wait = true;
         let lsn = pack_id(self.last_ckpt_id, self.wal_size);
         for w in workers.iter() {
             w.logging.lsn.store(lsn, Release);
@@ -494,7 +495,9 @@ impl GroupCommitter {
         }
 
         while !ctrl.is_stop() {
-            sem.wait();
+            if wait {
+                sem.wait();
+            }
             let (min_flush_txid, min_fsn) = self.collect(&workers, &mut desc);
 
             if !self.writer.is_empty() {
@@ -502,7 +505,7 @@ impl GroupCommitter {
                 buffer.update_flsn(pack_id(self.meta.next_wal.load(Acquire), self.wal_size));
             }
 
-            self.commit_txn(&workers, min_flush_txid, min_fsn, &desc);
+            wait = self.commit_txn(&workers, min_flush_txid, min_fsn, &desc);
 
             if self.should_switch() {
                 self.switch();
@@ -595,11 +598,10 @@ impl GroupCommitter {
         min_flush_txid: u64,
         min_fsn: u64,
         desc: &HashMap<u16, WalDesc>,
-    ) {
+    ) -> bool {
+        let mut wait_count = 0;
         for w in workers.iter() {
-            let Some(d) = desc.get(&w.id) else {
-                continue;
-            };
+            let d = desc.get(&w.id).expect("never happen");
             let mut max_flush_ts = 0;
             w.logging.wal_head.store(d.wal_tail, Relaxed);
 
@@ -612,12 +614,14 @@ impl GroupCommitter {
                 max_flush_ts = max(max_flush_ts, txn.commit_ts);
                 lk.pop_front();
             }
+            wait_count += lk.len();
             drop(lk);
 
             if max_flush_ts != 0 {
                 w.logging.signal_flushed(max_flush_ts as usize);
             }
         }
+        wait_count == 0
     }
 
     fn queue_data(&mut self, buf: *const u8, from: usize, to: usize) {
@@ -770,7 +774,7 @@ mod test {
     fn logging() {
         let path = RandomPath::tmp();
         let mut opt = Options::new(&*path);
-        opt.buffer_size = 512;
+        opt.wal_buffer_size = 512;
         let opt = Arc::new(opt);
         let _ = std::fs::create_dir_all(&opt.db_root);
         let fsn = Arc::new(AtomicU64::new(0));

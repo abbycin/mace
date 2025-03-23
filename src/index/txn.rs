@@ -12,24 +12,40 @@ use crate::{
 use std::sync::atomic::Ordering::Relaxed;
 use std::{cell::Cell, sync::Arc};
 
-use super::{registry::Registry, Val};
+use super::{registry::Registry, tree::SeekIter, ValRef};
 
 fn get_impl<'a, K: AsRef<[u8]>>(
-    ctx: &Arc<Context>,
+    ctx: &Context,
     tree: &Tree,
     w: SyncWorker,
     k: K,
-    cmd: u32,
-) -> Result<(u64, Val<Record<'a>>), OpCode> {
+) -> Result<ValRef<Record<'a>>, OpCode> {
+    #[cfg(feature = "check_empty_key")]
+    assert!(k.as_ref().len() > 0, "key must be non-empty");
+
     let start_ts = w.txn.start_ts;
-    let key = Key::new(k.as_ref(), start_ts, cmd);
+    let key = Key::new(k.as_ref(), start_ts, NULL_CMD);
     let mut mw = w;
     let r = tree.traverse::<Record, _>(key, |txid, t| {
         mw.cc.is_visible_to(ctx, w, t.worker_id(), start_ts, txid)
     })?;
 
-    debug_assert!(!r.1.unwrap().is_tombstone());
+    debug_assert!(!r.unwrap().is_tombstone());
     Ok(r)
+}
+
+fn seek_impl<K>(ctx: Arc<Context>, tree: &Tree, w: SyncWorker, prefix: K) -> SeekIter<Record>
+where
+    K: AsRef<[u8]>,
+{
+    #[cfg(feature = "check_empty_key")]
+    assert!(prefix.as_ref().len() > 0, "prefix must be non-empty");
+
+    let start_ts = w.txn.start_ts;
+    let mut mw = w;
+    SeekIter::<Record>::new(tree, prefix, move |txid, t| {
+        mw.cc.is_visible_to(&ctx, w, t.worker_id(), start_ts, txid)
+    })
 }
 
 pub struct TxnKV {
@@ -70,10 +86,13 @@ impl TxnKV {
         Ok(())
     }
 
-    fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<Val<Record>>, OpCode>
+    fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<ValRef<Record>>, OpCode>
     where
-        F: FnMut(&Option<(Key, Val<Record>)>, Ver, SyncWorker) -> Result<(), OpCode>,
+        F: FnMut(&Option<(Key, ValRef<Record>)>, Ver, SyncWorker) -> Result<(), OpCode>,
     {
+        #[cfg(feature = "check_empty_key")]
+        assert!(k.as_ref().len() > 0, "key must be non-empty");
+
         self.should_abort()?;
         let start_ts = self.w.txn.start_ts;
         let (wid, cmd_id) = (self.w.id, self.cmd_id());
@@ -117,7 +136,7 @@ impl TxnKV {
         .map(|_| ())
     }
 
-    fn update_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<Val<Record>, OpCode> {
+    fn update_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<ValRef<Record>, OpCode> {
         self.modify(k, v, |opt, ver, mut w| match opt {
             None => Err(OpCode::NotFound),
             Some((rk, rv)) => {
@@ -150,25 +169,28 @@ impl TxnKV {
         .map(|x| x.unwrap())
     }
 
-    pub fn put<T>(&self, k: T, v: T) -> Result<(), OpCode>
+    pub fn put<K, V>(&self, k: K, v: V) -> Result<(), OpCode>
     where
-        T: AsRef<[u8]>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
     {
         let mut logged = false;
         self.put_impl(k.as_ref(), v.as_ref(), &mut logged)
     }
 
-    pub fn update<T>(&self, k: T, v: T) -> Result<Val<Record>, OpCode>
+    pub fn update<K, V>(&self, k: K, v: V) -> Result<ValRef<Record>, OpCode>
     where
-        T: AsRef<[u8]>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
     {
         let mut logged = false;
         self.update_impl(k.as_ref(), v.as_ref(), &mut logged)
     }
 
-    pub fn upsert<T>(&self, k: T, v: T) -> Result<Option<Val<Record>>, OpCode>
+    pub fn upsert<K, V>(&self, k: K, v: V) -> Result<Option<ValRef<Record>>, OpCode>
     where
-        T: AsRef<[u8]>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
     {
         let mut logged = false;
         let (k, v) = (k.as_ref(), v.as_ref());
@@ -182,7 +204,7 @@ impl TxnKV {
         self.update_impl(k, v, &mut logged).map(Some)
     }
 
-    pub fn del<T>(&self, k: T) -> Result<Val<Record>, OpCode>
+    pub fn del<T>(&self, k: T) -> Result<ValRef<Record>, OpCode>
     where
         T: AsRef<[u8]>,
     {
@@ -244,11 +266,20 @@ impl TxnKV {
     }
 
     #[inline]
-    pub fn get<K>(&self, k: K) -> Result<Val<Record>, OpCode>
+    pub fn get<K>(&self, k: K) -> Result<ValRef<Record>, OpCode>
     where
         K: AsRef<[u8]>,
     {
-        get_impl(&self.ctx, &self.tree, self.w, k, self.cmd_id()).map(|x| x.1)
+        get_impl(&self.ctx, &self.tree, self.w, k)
+    }
+
+    /// this function will keep a reference to `prefix`, so don't drop `prefix` until the iterator has been consumed
+    #[inline]
+    pub fn seek<K>(&self, prefix: K) -> SeekIter<Record>
+    where
+        K: AsRef<[u8]>,
+    {
+        seek_impl(self.ctx.clone(), &self.tree, self.w, prefix)
     }
 }
 
@@ -271,8 +302,17 @@ impl TxnView {
     }
 
     #[inline]
-    pub fn get<K: AsRef<[u8]>>(&self, k: K) -> Result<Val<Record>, OpCode> {
-        get_impl(&self.ctx, &self.tree, self.w, k, NULL_CMD).map(|x| x.1)
+    pub fn get<K: AsRef<[u8]>>(&self, k: K) -> Result<ValRef<Record>, OpCode> {
+        get_impl(&self.ctx, &self.tree, self.w, k)
+    }
+
+    /// this function will keep a reference to `prefix`, so don't drop `prefix` until the iterator has been consumed
+    #[inline]
+    pub fn seek<K>(&self, prefix: K) -> SeekIter<Record>
+    where
+        K: AsRef<[u8]>,
+    {
+        seek_impl(self.ctx.clone(), &self.tree, self.w, prefix)
     }
 }
 
@@ -289,13 +329,17 @@ pub struct Tx {
 }
 
 impl Tx {
+    pub fn show(&self) {
+        self.tree.show::<Record>();
+    }
+
     pub fn id(&self) -> u64 {
         self.tree.id()
     }
     /// read-only txn
-    pub fn view<F>(&self, level: IsolationLevel, f: F) -> Result<(), OpCode>
+    pub fn view<F>(&self, level: IsolationLevel, mut f: F) -> Result<(), OpCode>
     where
-        F: Fn(TxnView) -> Result<(), OpCode>,
+        F: FnMut(TxnView) -> Result<(), OpCode>,
     {
         f(self._read(level))
     }

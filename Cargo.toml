@@ -1,6 +1,6 @@
 [package]
 name = "mace"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 authors = ["abbytsing@gmail.com"]
 rust-version = "1.82"
@@ -15,3 +15,11 @@ io = { path = "deps/io" }
 
 [dev-dependencies]
 logger = { path = "deps/logger" }
+
+[features]
+default = []
+check_empty_key = []
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -16,7 +16,7 @@ mod index;
 mod map;
 mod store;
 mod utils;
-pub use index::Val;
+pub use index::ValRef;
 
 #[derive(Clone)]
 pub struct Mace {

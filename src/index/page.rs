@@ -223,8 +223,6 @@ pub struct PageHeader {
     pub meta: Meta,
     /// physical link to delta or base page (file_id + offset)
     link: u64,
-    /// tree_id
-    pub tree_id: u64,
     /// NOTE: the page has same count of both key-value and key-index pair
     pub elems: u32,
     /// logical page size (including header)
@@ -275,7 +273,7 @@ impl DerefMut for PageHeader {
 }
 
 pub const PAGE_HEADER_SIZE: usize = size_of::<PageHeader>();
-static_assert!(PAGE_HEADER_SIZE == 32);
+static_assert!(PAGE_HEADER_SIZE == 24);
 
 impl<K, V> From<ByteArray> for Page<K, V>
 where
@@ -562,12 +560,54 @@ impl<'a, T: IValCodec> LeafMergeIter<'a, T> {
         self.index = 0;
     }
 
+    pub fn reset(&mut self) {
+        self.index = 0;
+        self.data.clear();
+    }
+
     pub fn sort(&mut self) {
-        self.data.sort_by(|x, y| x.0.cmp(&y.0));
+        self.data.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+    }
+
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&(Key<'a>, Value<T>)) -> bool,
+    {
+        if self.data.is_empty() {
+            return;
+        }
+        self.sort();
+
+        let len = self.data.len();
+        let mut l = 0;
+        let mut last = self.data[0].0.raw;
+        let mut group = 0;
+
+        for r in 1..=len {
+            if r == len || self.data[r].0.raw != last {
+                let cur = self.data[group];
+
+                if !cur.1.is_del() && f(&cur) {
+                    if l != group {
+                        self.data[l] = cur;
+                    }
+                    l += 1;
+                }
+
+                if r < len {
+                    last = self.data[r].0.raw;
+                    group = r;
+                }
+            }
+        }
+        self.data.resize(l, Default::default());
     }
 
     // remove duplicated version or tombstone less than txid
     pub fn purge(&mut self, txid: u64) {
+        if self.data.is_empty() {
+            return;
+        }
         let mut tmp = Vec::with_capacity(self.data.len() * 2 / 3);
         let mut last_key = None;
         let mut skip_dup = false;

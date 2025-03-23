@@ -10,30 +10,28 @@ use std::sync::atomic::{
     Ordering::{Relaxed, Release},
 };
 
-use super::data::FrameOwner;
-
-#[derive(Clone, Copy, Default)]
-#[repr(C, align(64))]
-struct Addr(u64);
-
-impl From<u64> for Addr {
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
+pub(crate) trait DeepCopy: Clone {
+    fn deep_copy(self) -> Self;
 }
 
 pub const CD_WARM: u8 = 2;
 pub const CD_COOL: u8 = 1;
 pub const CD_EVICT: u8 = 0;
 
-struct Entry {
+struct Entry<T>
+where
+    T: DeepCopy,
+{
     addr: u64,
-    data: Option<FrameOwner>,
+    data: Option<T>,
     slot: usize,
     state: AtomicU8,
 }
 
-impl Entry {
+impl<T> Entry<T>
+where
+    T: DeepCopy,
+{
     fn cool_down(&self) -> Result<u8, OpCode> {
         let old = self.state.load(Relaxed);
         let new = std::cmp::max(CD_EVICT, old.saturating_sub(1));
@@ -71,30 +69,36 @@ impl Entry {
         }
     }
 
-    fn set(&mut self, addr: u64, data: FrameOwner) {
+    fn set(&mut self, addr: u64, data: T) {
         self.addr = addr;
         self.data = Some(data);
         self.state.store(CD_WARM, Relaxed);
     }
 }
 
-pub(crate) struct Cache {
-    slots: *mut Addr,
+pub(crate) struct Cache<T>
+where
+    T: DeepCopy,
+{
+    slots: *mut u64,
     /// map disk address to cache slot id
-    map: DashMap<u64, Box<Entry>>,
+    map: DashMap<u64, Box<Entry<T>>>,
     /// contains removed slot id
-    freelist: Queue<Box<Entry>>,
+    freelist: Queue<Box<Entry<T>>>,
     cap: usize,
     pct: usize,
 }
 
-impl Cache {
+impl<T> Cache<T>
+where
+    T: DeepCopy,
+{
     pub(crate) fn new(opt: &Options) -> Self {
         let cap = opt.cache_capacity;
         let pct = cap * opt.cache_evict_pct / 100;
 
         let this = Self {
-            slots: unsafe { alloc_zeroed(Layout::array::<Addr>(cap).unwrap()) as *mut Addr },
+            slots: unsafe { alloc_zeroed(Layout::array::<u64>(cap).unwrap()) as *mut u64 },
             map: DashMap::new(),
             freelist: Queue::new(next_power_of_2(cap) as u32, None),
             cap,
@@ -109,7 +113,7 @@ impl Cache {
         this
     }
 
-    fn get_entry(&self) -> Result<Box<Entry>, OpCode> {
+    fn get_entry(&self) -> Result<Box<Entry<T>>, OpCode> {
         let mut count = self.cap;
         while count > 0 {
             if let Ok(e) = self.freelist.pop() {
@@ -124,28 +128,33 @@ impl Cache {
 
     fn write(&self, slot: usize, addr: u64) {
         unsafe {
-            self.slots.add(slot).write(addr.into());
+            self.slots.add(slot).write(addr);
         }
     }
 
     fn read(&self, slot: usize) -> u64 {
-        unsafe { self.slots.add(slot).read().0 }
+        unsafe { self.slots.add(slot).read() }
     }
 
-    pub(crate) fn put(&self, addr: u64, data: FrameOwner) -> Result<(), OpCode> {
+    pub(crate) fn put(&self, addr: u64, data: T) -> Result<T, OpCode> {
+        if let Some(x) = self.get(addr) {
+            return Ok(x);
+        }
+
         let mut p = self.get_entry()?;
-        p.set(addr, data);
+        let f = data.deep_copy();
+        p.set(addr, f.clone());
         self.write(p.slot, addr);
         // this will happen when multiple threads are load data from same addr, we must handle this
         // case to avoid resource leak
         if let Some(old) = self.map.insert(addr, p) {
             self.freelist.push(old).expect("no space");
         }
-        Ok(())
+        Ok(f)
     }
 
     /// NOTE: the variables are guarded by lock (from dashmap)
-    pub(crate) fn get(&self, addr: u64) -> Option<FrameOwner> {
+    pub(crate) fn get(&self, addr: u64) -> Option<T> {
         let item = self.map.get_mut(&addr)?;
         let e = item.value();
         e.warm_up();
@@ -176,20 +185,23 @@ impl Cache {
     }
 }
 
-impl Drop for Cache {
+impl<T> Drop for Cache<T>
+where
+    T: DeepCopy,
+{
     fn drop(&mut self) {
         while let Ok(_box) = self.freelist.pop() {}
         unsafe {
             dealloc(
                 self.slots as *mut u8,
-                Layout::array::<Addr>(self.cap).unwrap(),
+                Layout::array::<u64>(self.cap).unwrap(),
             );
         }
     }
 }
 
-unsafe impl Send for Cache {}
-unsafe impl Sync for Cache {}
+unsafe impl<T: DeepCopy> Send for Cache<T> {}
+unsafe impl<T: DeepCopy> Sync for Cache<T> {}
 
 #[cfg(test)]
 mod test {

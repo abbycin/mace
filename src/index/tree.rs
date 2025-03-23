@@ -3,12 +3,13 @@ use super::{
     iter::{ItemIter, MergeIterBuilder},
     page::{
         DeltaType, IntlMergeIter, IntlPage, LeafMergeIter, LeafPage, NodeType, Page, PageHeader,
-        PageMergeIter, RangeIter,
+        PageMergeIter, RangeIter, PAGE_HEADER_SIZE,
     },
     slotted::SlottedPage,
     systxn::SysTxn,
 };
 
+use crate::utils::NULL_ORACLE;
 use crate::{
     cc::data::Ver,
     index::{
@@ -18,7 +19,7 @@ use crate::{
     map::data::FrameOwner,
     utils::{
         bytes::ByteArray,
-        traits::{IKey, IPageIter, IVal, IValCodec},
+        traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
         unpack_id, NULL_CMD, NULL_PID, ROOT_PID,
     },
     OpCode, Store,
@@ -76,7 +77,7 @@ impl Range<'_> {
 }
 
 #[derive(Clone)]
-pub struct Val<T>
+pub struct ValRef<T>
 where
     T: IValCodec,
 {
@@ -84,7 +85,7 @@ where
     _owner: FrameOwner,
 }
 
-impl<T> Val<T>
+impl<T> ValRef<T>
 where
     T: IValCodec,
 {
@@ -96,23 +97,15 @@ where
         self.raw.as_ref().data()
     }
 
-    pub fn unwrap(&self) -> &T {
+    pub(crate) fn unwrap(&self) -> &T {
         self.raw.as_ref()
     }
 
-    pub fn put(&self) -> &T {
-        match self.raw {
-            Value::Put(ref data) => data,
-            Value::Sib(ref s) => s.as_ref(),
-            _ => panic!("user should ensure it's a put"),
-        }
-    }
-
-    pub fn is_put(&self) -> bool {
+    pub(crate) fn is_put(&self) -> bool {
         !self.is_del()
     }
 
-    pub fn is_del(&self) -> bool {
+    pub(crate) fn is_del(&self) -> bool {
         self.raw.is_del()
     }
 }
@@ -245,18 +238,17 @@ impl Tree {
         Ok(())
     }
 
-    fn find_leaf<K, T>(
+    fn find_leaf<T>(
         &self,
         txn: &mut SysTxn,
-        key: &K,
+        key: &[u8],
     ) -> Result<(View<'_>, Option<View<'_>>), OpCode>
     where
-        K: IKey,
         T: IValCodec,
     {
         loop {
             txn.unpin_all();
-            match self.try_find_leaf::<T>(txn, key.raw()) {
+            match self.try_find_leaf::<T>(txn, key) {
                 Ok((view, parent)) => return Ok((view, parent)),
                 Err(OpCode::Again) => continue,
                 Err(e) => unreachable!("invalid error {:?}", e),
@@ -297,7 +289,8 @@ impl Tree {
         let mut parent = None;
 
         loop {
-            let (_, view) = Self::page_view(&self.store, index.pid, range);
+            let (frame, view) = Self::page_view(&self.store, index.pid, range);
+            txn.pin(frame);
 
             // split may happen during search, in this case new created node are
             // not inserted into parent yet, the insert is halfly done, the
@@ -306,9 +299,14 @@ impl Tree {
             // since we simplified the `find_child` process to handle data only,
             // if any other modification operation is allowed, will cause leaf
             // node disordered, by the way, any operation (including lookup)
-            // will go through this function and check the condition
+            // will go through this function and check the conditionW
             if view.info.epoch() != index.epoch {
-                let _ = self.parent_update::<T>(txn, view, parent);
+                if self.parent_update::<T>(txn, view, parent).is_ok() {
+                    // get rid of those keys were moved to new node, for prefix scan
+                    while self.consolidate::<T>(txn, view).is_err() {
+                        std::hint::spin_loop();
+                    }
+                }
                 // simplified: retry from root, thanks to the large fanout
                 return Err(OpCode::Again);
             }
@@ -316,17 +314,16 @@ impl Tree {
             if view.info.is_leaf() {
                 return Ok((view, parent));
             }
+            parent = Some(view);
 
             let (child_index, child_range) = self
-                .find_child(txn, key, &view)
+                .find_child(txn, key, view.page_addr)
                 .expect("child is always exist in B-Tree");
             index = child_index;
             range.key_pq = child_range.key_pq;
             if let Some(key_qr) = child_range.key_qr {
                 range.key_qr = Some(key_qr);
             }
-
-            parent = Some(view);
         }
     }
 
@@ -334,12 +331,12 @@ impl Tree {
         &self,
         txn: &mut SysTxn,
         key: &[u8],
-        view: &View,
+        addr: u64,
     ) -> Option<(Index, Range<'a>)> {
         let mut child = None;
 
         // stop when the child is in range
-        let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<&[u8], Index>| {
+        let _ = self.walk_page(addr, |frame, _, pg: Page<&[u8], Index>| {
             debug_assert!(pg.header().is_intl());
 
             // skip inner `split-delta`
@@ -379,6 +376,105 @@ impl Tree {
         child
     }
 
+    fn possible_successor<T>(
+        &self,
+        txn: &mut SysTxn,
+        key: &[u8],
+        prefix: &[u8],
+    ) -> Option<(FrameOwner, Option<&[u8]>)>
+    where
+        T: IValCodec,
+    {
+        let mut index = self.root_index;
+        let mut range = Range::new();
+        let mut parent = None;
+        let mut successor = None;
+        let mut found = false;
+
+        loop {
+            let (frame, view) = Self::page_view(&self.store, index.pid, range);
+            if view.info.epoch() != index.epoch {
+                if self.parent_update::<T>(txn, view, parent).is_ok() {
+                    let _ = self.consolidate::<T>(txn, view);
+                }
+                // reset and retry
+                index = self.root_index;
+                range = Range::new();
+                parent = None;
+                successor = None;
+                found = false;
+                txn.unpin_all();
+                continue;
+            }
+
+            if view.info.is_leaf() {
+                return Some((frame, successor));
+            }
+            parent = Some(view);
+            txn.pin(frame);
+
+            let mut child = None;
+            let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<&[u8], Index>| {
+                let h = pg.header();
+                if h.is_data() {
+                    let (pos, l, r) = match pg.search(&key) {
+                        Ok(pos) => (
+                            Some(pos),
+                            pg.get(pos),
+                            pos.checked_add(1).and_then(|next| pg.get(next)),
+                        ),
+                        Err(pos) => (
+                            pos.checked_sub(1),
+                            pos.checked_sub(1).and_then(|prev| pg.get(prev)),
+                            pg.get(pos),
+                        ),
+                    };
+
+                    debug_assert!((pos.is_some() && l.is_some()) || (pos.is_none() && l.is_none()));
+
+                    if let Some((ikey, index)) = l {
+                        let pos = pos.expect("can't be None");
+                        txn.pin(frame);
+                        // we will continue to find the insert position even `found` was set, it's
+                        // necessary for performing `parent_update` correctly
+                        if !found {
+                            found = true;
+                            // move to next node
+                            if let Some((k, _)) = pg.get(pos + 1) {
+                                if k.starts_with(prefix) {
+                                    successor = Some(k);
+                                }
+                            }
+                        }
+                        if index != NULL_INDEX {
+                            let range = Range {
+                                key_pq: ikey,
+                                key_qr: r.map(|(key_qr, _)| key_qr),
+                            };
+                            child = Some((index, range));
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+
+            if let Some((child_index, child_range)) = child {
+                index = child_index;
+                range.key_pq = child_range.key_pq;
+                if let Some(key_qr) = child_range.key_qr {
+                    range.key_qr = Some(key_qr);
+                }
+                continue;
+            }
+
+            // terminate when we are reached the end of parent and can't find successor
+            if view.info.is_base() {
+                return None;
+            }
+        }
+    }
+
     fn prepend<K, T, F>(
         &self,
         txn: &mut SysTxn,
@@ -394,7 +490,7 @@ impl Tree {
     {
         let mut delta = Delta::new(DeltaType::Data, NodeType::Leaf).with_item((*key, *val));
         // NOTE: restrict logical node size
-        if delta.size() > self.store.opt.page_size {
+        if delta.size() > self.store.opt.page_size - PAGE_HEADER_SIZE {
             return Err(OpCode::TooLarge);
         }
         let mut f = txn.alloc(delta.size())?;
@@ -409,7 +505,6 @@ impl Tree {
             h.set_link(view.page_addr);
             h.set_depth(view.info.depth().saturating_add(1));
             h.set_epoch(view.info.epoch());
-            h.tree_id = self.id();
 
             match txn.update(view.page_id, view.page_addr, &mut f) {
                 Ok(_) => {
@@ -447,7 +542,7 @@ impl Tree {
         T: IValCodec,
     {
         let mut txn = self.begin();
-        let (mut view, _) = self.find_leaf::<K, T>(&mut txn, key).unwrap();
+        let (mut view, _) = self.find_leaf::<T>(&mut txn, key.raw()).unwrap();
 
         if self.need_split(&view) && self.split::<T>(&mut txn, view).is_ok() {
             return Err(OpCode::Again);
@@ -475,7 +570,7 @@ impl Tree {
         }
     }
 
-    fn search<T>(&self, addr: u64, key: &Key) -> Option<(Key, Val<T>)>
+    fn search<T>(&self, addr: u64, key: &Key) -> Option<(Key, ValRef<T>)>
     where
         T: IValCodec,
     {
@@ -489,7 +584,7 @@ impl Tree {
             debug_assert!(h.is_leaf());
             if let Ok(pos) = pg.search_raw(key) {
                 let (k, v) = pg.get(pos).unwrap();
-                r = Some((k, Val::new(v, f.clone())));
+                r = Some((k, ValRef::new(v, f.clone())));
                 return true;
             }
             false
@@ -503,13 +598,13 @@ impl Tree {
         key: &Key,
         val: &Value<T1>,
         visible: &mut V,
-    ) -> Result<Option<Val<T2>>, OpCode>
+    ) -> Result<Option<ValRef<T2>>, OpCode>
     where
         T1: IValCodec,
         T2: IValCodec,
-        V: FnMut(&Option<(Key, Val<T2>)>) -> Result<(), OpCode>,
+        V: FnMut(&Option<(Key, ValRef<T2>)>) -> Result<(), OpCode>,
     {
-        let (mut view, _) = self.find_leaf::<Key, T2>(txn, key).unwrap();
+        let (mut view, _) = self.find_leaf::<T2>(txn, key.raw).unwrap();
         if self.need_split(&view) && self.split::<T2>(txn, view).is_ok() {
             return Err(OpCode::Again);
         }
@@ -529,11 +624,11 @@ impl Tree {
         key: Key,
         val: Value<T1>,
         mut visible: V,
-    ) -> Result<Option<Val<T2>>, OpCode>
+    ) -> Result<Option<ValRef<T2>>, OpCode>
     where
         T1: IValCodec,
         T2: IValCodec,
-        V: FnMut(&Option<(Key, Val<T2>)>) -> Result<(), OpCode>,
+        V: FnMut(&Option<(Key, ValRef<T2>)>) -> Result<(), OpCode>,
     {
         let mut txn = self.begin();
         loop {
@@ -561,14 +656,18 @@ impl Tree {
                 let h: PageHeader = f.payload().into();
                 if h.is_intl() {
                     let pg = IntlPage::from(f.payload());
+                    let mut pids = Vec::with_capacity(h.elems as usize);
                     for i in 0..h.elems as usize {
                         if let Some((_, v)) = pg.get(i) {
+                            pids.push(v.pid);
                             q.push_back(v.pid);
                         }
                     }
+                    log::info!("intl {} => {:?}", f.page_id(), pids);
                 }
 
                 if h.is_leaf() && !h.is_split() {
+                    log::info!("pid {}", f.page_id());
                     let pg = LeafPage::<T>::from(f.payload());
                     for i in 0..h.elems as usize {
                         let (k, v) = pg.get(i).unwrap();
@@ -593,13 +692,13 @@ impl Tree {
 
     /// return the latest key-val pair, by using Ikey::raw(), thanks to MVCC, the first match one is
     /// the latest one
-    pub fn get<K, T>(&self, key: K) -> Result<(K, Val<T>), OpCode>
+    pub fn get<K, T>(&self, key: K) -> Result<(K, ValRef<T>), OpCode>
     where
         K: IKey,
         T: IValCodec,
     {
         let mut txn = self.begin();
-        let (view, _) = self.find_leaf::<K, T>(&mut txn, &key)?;
+        let (view, _) = self.find_leaf::<T>(&mut txn, key.raw())?;
         let mut data = Err(OpCode::NotFound);
         let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<K, Value<T>>| {
             if pg.header().is_data() {
@@ -607,7 +706,7 @@ impl Tree {
                     let (k, v) = pg.get(pos).unwrap();
                     data = Ok((
                         k,
-                        Val {
+                        ValRef {
                             raw: v,
                             _owner: frame.clone(),
                         },
@@ -625,7 +724,7 @@ impl Tree {
         start_ts: u64,
         mut addr: u64,
         visible: &mut F,
-    ) -> Result<(Ver, Val<T>), OpCode>
+    ) -> Result<ValRef<T>, OpCode>
     where
         T: IValCodec,
         F: FnMut(u64, &T) -> bool,
@@ -644,13 +743,10 @@ impl Tree {
                     if v.is_del() {
                         return Err(OpCode::NotFound);
                     }
-                    return Ok((
-                        k,
-                        Val {
-                            raw: v,
-                            _owner: frame,
-                        },
-                    ));
+                    return Ok(ValRef {
+                        raw: v,
+                        _owner: frame,
+                    });
                 }
             }
             addr = h.link;
@@ -658,14 +754,14 @@ impl Tree {
         Err(OpCode::NotFound)
     }
 
-    pub fn traverse<T, F>(&self, key: Key, mut visible: F) -> Result<(u64, Val<T>), OpCode>
+    pub fn traverse<T, F>(&self, key: Key, mut visible: F) -> Result<ValRef<T>, OpCode>
     where
         T: IValCodec,
         F: FnMut(u64, &T) -> bool,
     {
         let mut txn = self.begin();
-        let (view, _) = self.find_leaf::<Key, T>(&mut txn, &key)?;
-        let mut latest: Option<(Ver, Val<T>)> = None;
+        let (view, _) = self.find_leaf::<T>(&mut txn, key.raw)?;
+        let mut latest: Option<ValRef<T>> = None;
         let _ = self.walk_page(view.page_addr, |f, _, pg: Page<Key, Value<T>>| {
             let h = pg.header();
             if !h.is_data() {
@@ -677,24 +773,24 @@ impl Tree {
             };
             let (k, v) = pg.get(pos).unwrap();
             if visible(k.txid, v.as_ref()) {
-                latest = Some((*k.ver(), Val::new(v, f)));
+                latest = Some(ValRef::new(v, f));
                 return true;
             }
-            // all rest `raw` is checked here
+            // all rest `raw` will be checked here
             if let Some(s) = v.sibling() {
-                if let Ok((ver, val)) = self.traverse_sibling(key.txid, s.addr(), &mut visible) {
-                    latest = Some((ver, val));
+                if let Ok(val) = self.traverse_sibling(key.txid, s.addr(), &mut visible) {
+                    latest = Some(val);
                 }
                 return true;
             }
             // check next delta
             false
         });
-        latest.map_or(Err(OpCode::NotFound), |(k, v)| {
+        latest.map_or(Err(OpCode::NotFound), |v| {
             if v.is_del() {
                 Err(OpCode::NotFound)
             } else {
-                Ok((k.txid, v))
+                Ok(v)
             }
         })
     }
@@ -731,13 +827,13 @@ impl Tree {
         let mut info = view.info;
         let mut split = None;
 
+        // intl page never perform partial consolidation
         let _ = self.walk_page(view.page_addr, |frame, _, pg| {
             let h = pg.header();
             txn.gc(frame);
 
             match h.delta_type() {
                 DeltaType::Data => {
-                    // TODO: restrict base page size (must less than an arena)
                     builder.add(RangeIter::new(pg, 0..h.elems as usize));
                 }
                 DeltaType::Split => {
@@ -783,9 +879,7 @@ impl Tree {
         let h = new_page.header_mut();
         h.set_epoch(view.info.epoch());
         h.set_depth(info.depth());
-        assert_eq!(info.link(), 0); // since we are full consolidated (see TODO in collect_delta)
-        h.set_link(0);
-        h.tree_id = self.id();
+        h.set_link(info.link());
 
         txn.update(view.page_id, view.page_addr, &mut frame)
             .map(|_| {
@@ -796,18 +890,21 @@ impl Tree {
             .map_err(|_| OpCode::Again)
     }
 
-    fn add_sibling<'a, T: IValCodec>(
+    fn add_sibling<'a, T, F>(
         &'a self,
-        txn: &mut SysTxn,
         raw: &'a [u8],
         b: &mut LeafMergeIter<'a, T>,
         mut addr: u64,
-    ) {
+        mut save_fn: F,
+    ) where
+        T: IValCodec,
+        F: FnMut(FrameOwner),
+    {
         while addr != 0 {
             let frame = self.store.buffer.load(addr);
             let pg = SlottedPage::<Ver, T>::from(frame.payload());
             let h = pg.header();
-            txn.gc(frame);
+            save_fn(frame);
 
             for i in 0..h.elems as usize {
                 let (k, v) = pg.get(i);
@@ -821,11 +918,13 @@ impl Tree {
         &'a self,
         txn: &mut SysTxn,
         view: &View<'a>,
-    ) -> (LeafMergeIter<'a, T>, PageHeader) {
-        let cap = view.info.depth() as usize;
-        let mut b = LeafMergeIter::new(cap);
+        b: &mut LeafMergeIter<'a, T>,
+    ) -> PageHeader {
         let mut info = view.info;
         let mut split = None;
+        let mut sz = 0;
+        let limit = (self.store.opt.page_size - PAGE_HEADER_SIZE) * 2;
+        let is_root = self.is_root(view.page_id);
 
         let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<Key, Value<T>>| {
             let h = pg.header();
@@ -834,21 +933,29 @@ impl Tree {
             debug_assert!(h.is_leaf());
 
             if h.is_data() {
-                // TODO: restrict base base size (must less than an arena)
                 for i in 0..h.elems as usize {
                     let (k, v) = pg.get(i).unwrap();
                     if let Some(sp) = split {
-                        if k.raw > sp {
+                        if k.raw >= sp {
                             // split was happened only after consolidation, thus only the base page
-                            // will contain keys > split key
+                            // will contain keys > split key, the rest kvs were splitted to another
+                            // node, so break
                             debug_assert!(h.is_base());
                             break;
                         }
                     }
+                    if !is_root {
+                        sz += k.packed_size() + v.packed_size();
+                        // we must consume the split-delta to make sure there's at most one split -
+                        // delta in delta chain
+                        if sz > limit && split.is_none() {
+                            return true;
+                        }
+                    }
                     if let Some(s) = v.sibling() {
                         // add latest version first
-                        b.add(Key::new(k.raw, k.txid, k.cmd), s.to(*v.as_ref()));
-                        self.add_sibling(txn, k.raw, &mut b, s.addr());
+                        b.add(k, s.to(*v.as_ref()));
+                        self.add_sibling::<T, _>(k.raw, b, s.addr(), |f| txn.gc(f));
                     } else {
                         b.add(k, v);
                     }
@@ -861,7 +968,7 @@ impl Tree {
             info = *h;
             false
         });
-        (b, info)
+        info
     }
 
     fn consolidate_leaf<'a, T: IValCodec>(
@@ -869,7 +976,9 @@ impl Tree {
         txn: &mut SysTxn,
         mut view: View<'a>,
     ) -> Result<View<'a>, OpCode> {
-        let (mut iter, info) = self.collect_leaf(txn, &view);
+        let cap = view.info.depth() as usize;
+        let mut iter = LeafMergeIter::new(cap);
+        let info = self.collect_leaf(txn, &view, &mut iter);
         iter.purge(self.get_txid());
 
         let mut builder = FuseBuilder::<T>::new(info.delta_type(), info.node_type());
@@ -881,9 +990,7 @@ impl Tree {
         let h = new_page.header_mut();
         h.set_epoch(view.info.epoch());
         h.set_depth(info.depth());
-        assert_eq!(info.link(), 0); // see TODO in collect_leaf
-        h.set_link(0);
-        h.tree_id = self.id();
+        h.set_link(info.link());
 
         assert_eq!(h.delta_type(), info.delta_type());
         assert_eq!(h.node_type(), info.node_type());
@@ -928,11 +1035,11 @@ impl Tree {
     }
 
     /// NOTE: this is the second phase of `split` smo
-    fn parent_update<T>(
+    fn parent_update<'a, T>(
         &self,
         txn: &mut SysTxn,
         view: View,
-        parent: Option<View>,
+        parent: Option<View<'a>>,
     ) -> Result<(), OpCode>
     where
         T: IValCodec,
@@ -960,6 +1067,7 @@ impl Tree {
         } else {
             vec![(lkey, lidx), (split_key, split_idx)]
         };
+
         let mut d = Delta::new(DeltaType::Data, NodeType::Intl).with_slice(&entry_delta);
         let mut f = txn.alloc(d.size())?;
         let (new_addr, mut new_page) = (f.addr(), Page::from(f.payload()));
@@ -972,7 +1080,6 @@ impl Tree {
         h.set_depth(m.depth().saturating_add(1));
         h.set_epoch(m.epoch());
         h.set_link(parent.page_addr);
-        h.tree_id = self.id();
 
         txn.update(parent.page_id, parent.page_addr, &mut f)
             .map(|_| {
@@ -980,8 +1087,10 @@ impl Tree {
                 parent.info = *new_page.header();
             })
             .map_err(|_| OpCode::Again)?;
-
-        let _ = self.try_consolidate::<T>(txn, parent);
+        // force consolidate make it ordered for prefix scan
+        while self.consolidate::<T>(txn, parent).is_err() {
+            std::hint::spin_loop();
+        }
         Ok(())
     }
 
@@ -1055,12 +1164,17 @@ impl Tree {
             .map_err(|_| OpCode::Again)
     }
 
+    #[inline(always)]
+    fn is_root(&self, pid: u64) -> bool {
+        self.root_index.pid == pid
+    }
+
     fn split_non_root<K, V>(&self, txn: &mut SysTxn, view: View) -> Result<(), OpCode>
     where
         K: IKey,
         V: IVal,
     {
-        if view.page_id == self.root_index.pid {
+        if self.is_root(view.page_id) {
             return self.split_root::<K, V>(txn, view);
         }
 
@@ -1092,7 +1206,6 @@ impl Tree {
         h.set_epoch(view.info.epoch() + 1); // identify a split
         h.set_depth(view.info.depth().saturating_add(1));
         h.set_link(view.page_addr);
-        h.tree_id = self.id();
 
         txn.update(view.page_id, view.page_addr, &mut f)
             .map_err(|_| OpCode::Again)?;
@@ -1123,6 +1236,150 @@ impl Tree {
             NodeType::Intl => self.split_non_root::<&[u8], Index>(txn, view),
             NodeType::Leaf => self.split_non_root::<Key, Value<T>>(txn, view),
         }
+    }
+}
+
+pub struct SeekIter<'a, T>
+where
+    T: IValCodec,
+{
+    tree: &'a Tree,
+    curr: Vec<u8>,
+    next: Vec<u8>,
+    prefix: &'a [u8],
+    frames: VecDeque<FrameOwner>,
+    iter: LeafMergeIter<'a, T>,
+    check: Box<dyn FnMut(u64, &T) -> bool>,
+    finish: bool,
+    stop: bool,
+}
+
+impl<'a, T> SeekIter<'a, T>
+where
+    T: IValCodec + 'a,
+{
+    pub(crate) fn new<K, F>(tree: &'a Tree, prefix: K, f: F) -> Self
+    where
+        K: AsRef<[u8]>,
+        F: FnMut(u64, &T) -> bool + 'static,
+    {
+        let prefix = Self::extend_lifetime(prefix.as_ref());
+
+        let mut this = Self {
+            tree,
+            curr: Self::pre_prefix(prefix),
+            next: Self::next_prefix(prefix),
+            prefix,
+            frames: VecDeque::new(),
+            iter: LeafMergeIter::new(64),
+            check: Box::new(f),
+            finish: false,
+            stop: false,
+        };
+        this.collect_frames();
+        this
+    }
+
+    fn next_prefix(prefix: &[u8]) -> Vec<u8> {
+        debug_assert!(!prefix.is_empty());
+        let mut x = prefix.to_vec();
+        if *x.last().unwrap() == u8::MAX {
+            x.push(0);
+        } else {
+            *x.last_mut().unwrap() += 1;
+        }
+        x
+    }
+
+    fn pre_prefix(prefix: &[u8]) -> Vec<u8> {
+        debug_assert!(!prefix.is_empty());
+        let mut x = prefix.to_vec();
+        if *x.last().unwrap() > 0 {
+            *x.last_mut().unwrap() -= 1;
+        } else {
+            x.pop();
+        }
+        x
+    }
+
+    #[inline]
+    fn has_prefix(pg: &Page<Key, Value<T>>, pos: usize, prefix: &[u8]) -> bool {
+        pg.key_at(pos).raw.starts_with(prefix)
+    }
+
+    fn collect_frames(&mut self) {
+        if !self.finish {
+            let mut txn = self.tree.begin();
+            if let Some((f, next)) =
+                self.tree
+                    .possible_successor::<T>(&mut txn, &self.curr, self.prefix)
+            {
+                self.iter.reset();
+                let mut key = Key::new([].as_slice(), NULL_ORACLE, NULL_CMD);
+                self.tree
+                    .walk_page(f.addr(), |frame, _, pg: Page<Key, Value<T>>| {
+                        let h = pg.header();
+                        if h.is_data() {
+                            debug_assert!(h.is_leaf());
+                            key.raw = &self.curr;
+                            let lo = pg.search_raw(&key).unwrap_or_else(|x| x);
+                            if lo == h.elems as usize || !Self::has_prefix(&pg, lo, self.prefix) {
+                                return false;
+                            }
+                            key.raw = &self.next;
+                            let hi = pg.search_raw(&key).unwrap_or_else(|x| x);
+                            for i in lo..hi {
+                                let (k, v) = pg.get(i).unwrap();
+                                if let Some(s) = v.sibling() {
+                                    self.iter.add(k, s.to(*v.as_ref()));
+                                    self.tree.add_sibling(k.raw, &mut self.iter, s.addr(), |f| {
+                                        self.frames.push_back(f)
+                                    });
+                                } else {
+                                    self.iter.add(k, v);
+                                }
+                            }
+                            self.frames.push_back(frame);
+                        }
+                        false
+                    })
+                    .unwrap();
+                // retain visible and latest keys
+                self.iter
+                    .retain(|&(k, v)| (*self.check)(k.txid, v.as_ref()));
+                self.curr = next.unwrap_or_default().to_vec();
+                self.finish = self.curr.is_empty();
+            }
+            return;
+        }
+        self.stop = true;
+    }
+
+    #[inline]
+    const fn extend_lifetime(x: &[u8]) -> &'static [u8] {
+        unsafe { std::slice::from_raw_parts(x.as_ptr(), x.len()) }
+    }
+
+    fn get_next(&mut self) -> Option<<Self as Iterator>::Item> {
+        while !self.stop {
+            if let Some((k, v)) = self.iter.next() {
+                return Some((k.raw, v.as_ref().data()));
+            }
+
+            self.collect_frames();
+        }
+        None
+    }
+}
+
+impl<'a, T> Iterator for SeekIter<'a, T>
+where
+    T: IValCodec + 'a,
+{
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.get_next()
     }
 }
 
@@ -1280,7 +1537,7 @@ mod test {
         let r = s.traverse::<&[u8], _>(Key::new(raw, 1, u32::MAX), |txid, _v| txid < 2);
         assert!(r.is_ok());
         let out = r.unwrap();
-        assert_eq!(out.1.data(), "11".as_bytes());
+        assert_eq!(out.data(), "11".as_bytes());
 
         Ok(())
     }

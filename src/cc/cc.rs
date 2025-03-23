@@ -277,7 +277,7 @@ impl CommitTree {
         for p in set {
             self.log.push(p);
         }
-        self.log.sort();
+        self.log.sort_unstable();
     }
 }
 

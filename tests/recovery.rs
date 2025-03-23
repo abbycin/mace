@@ -358,7 +358,8 @@ fn recover_after_remove() {
 fn ckpt_wal(keys: usize, wal_len: u32) {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.buffer_count = 1 << 10;
+    opt.buffer_count = 10;
+    opt.buffer_size = 512 << 10;
     opt.wal_file_size = wal_len;
     let mut save = opt.clone();
     let db = Mace::new(opt).unwrap();

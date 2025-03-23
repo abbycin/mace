@@ -20,6 +20,8 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+use super::cache::DeepCopy;
+
 /// NOTE: the field expect `file_id` will be changed, up1 and up2 change when new write, nr_active
 /// and active_size change when flush have new deallocate frame point to current file_id
 pub(crate) struct FileStat {
@@ -200,6 +202,23 @@ impl Frame {
     }
 }
 
+impl DeepCopy for FrameOwner {
+    fn deep_copy(self) -> Self {
+        if self.owned == 1 {
+            return self;
+        }
+        let other = FrameOwner::alloc(self.payload_size() as usize);
+        debug_assert_eq!(self.size(), other.size());
+        let src = self.payload();
+        let dst = other.payload();
+        assert_eq!(src.len(), dst.len());
+        unsafe {
+            std::ptr::copy(src.data(), dst.data(), dst.len());
+        }
+        other
+    }
+}
+
 pub(crate) struct FrameOwner {
     raw: *mut Frame,
 }
@@ -253,15 +272,6 @@ impl FrameOwner {
     pub(crate) fn payload(&self) -> ByteArray {
         let ptr = unsafe { self.raw.add(1).cast::<u8>() };
         ByteArray::new(ptr, self.payload_size() as usize)
-    }
-
-    pub(crate) fn copy_to(&self, other: &FrameOwner) {
-        let src = self.payload();
-        let dst = other.payload();
-        assert_eq!(src.len(), dst.len());
-        unsafe {
-            std::ptr::copy(src.data(), dst.data(), dst.len());
-        }
     }
 }
 

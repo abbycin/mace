@@ -465,7 +465,7 @@ impl Drop for Pool {
 }
 
 pub struct Buffers {
-    cache: Cache,
+    cache: Cache<FrameOwner>,
     pool: Pool,
     pub mapping: Arc<Mapping>,
 }
@@ -519,13 +519,10 @@ impl Buffers {
         self.pool.update_flsn(flsn);
     }
 
+    #[inline]
     fn cache(&self, src: FrameOwner) -> FrameOwner {
         let addr = src.addr();
-        let dst = FrameOwner::alloc(src.payload_size() as usize);
-        debug_assert_eq!(src.size(), dst.size());
-        src.copy_to(&dst);
-        self.cache.put(addr, dst.clone()).expect("can't is full");
-        dst
+        self.cache.put(addr, src).expect("can't is full")
     }
 
     pub fn load(&self, addr: u64) -> FrameOwner {

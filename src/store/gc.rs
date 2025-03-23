@@ -452,7 +452,7 @@ impl<'a> ReWriter<'a> {
         let mut crc = Crc32cHasher::default();
         let mut reloc: Vec<u8> = Vec::new();
 
-        self.items.sort_by(|x, y| x.id.cmp(&y.id));
+        self.items.sort_unstable_by(|x, y| x.id.cmp(&y.id));
 
         for item in &self.items {
             let reader = File::options()

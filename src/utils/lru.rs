@@ -49,7 +49,7 @@ struct LruInner<K, V> {
     map: Mutex<HashMap<K, *mut Node<K, V>>>,
 }
 
-// it's large than 64 on macos
+// it's larger than 64 on macOS
 #[cfg(not(target_os = "macos"))]
 crate::static_assert!(size_of::<LruInner<u32, io::File>>() == 64);
 

@@ -82,7 +82,7 @@ impl IValCodec for Record<'_> {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
+#[derive(Default, PartialEq, Eq, Clone, Copy, Hash, Debug)]
 pub struct Ver {
     pub txid: u64,
     pub cmd: u32,

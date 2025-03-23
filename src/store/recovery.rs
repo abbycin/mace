@@ -28,7 +28,7 @@ use crate::{
     utils::{data::Meta, NEXT_ID},
     Options,
 };
-use crate::{static_assert, OpCode, Record, Val};
+use crate::{static_assert, OpCode, Record, ValRef};
 
 #[derive(Debug, PartialEq, Eq)]
 enum State {
@@ -107,7 +107,7 @@ impl Recovery {
     }
 
     #[inline]
-    fn get<'a, T>(tree: &'a Tree, raw: &'a [u8]) -> Result<(Key<'a>, Val<T>), OpCode>
+    fn get<'a, T>(tree: &'a Tree, raw: &'a [u8]) -> Result<(Key<'a>, ValRef<T>), OpCode>
     where
         T: IValCodec,
     {
@@ -529,8 +529,8 @@ impl Recovery {
         }
 
         // sort by modified time, the latest wal is the last element in ids
-        logs.sort_by(|x, y| x.0.cmp(&y.0));
-        maps.sort_by(|x, y| x.0.cmp(&y.0));
+        logs.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+        maps.sort_unstable_by(|x, y| x.0.cmp(&y.0));
 
         let logs: Vec<u32> = logs.iter().map(|(_, i)| *i).collect();
         let maps: Vec<u32> = maps.iter().map(|(_, i)| *i).collect();

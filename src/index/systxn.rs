@@ -47,6 +47,7 @@ impl<'a> SysTxn<'a> {
 
     pub fn unpin_all(&mut self) {
         self.read_only_buffer.clear();
+        self.junks.clear();
     }
 
     pub fn alloc(&mut self, size: usize) -> Result<FrameRef, OpCode> {

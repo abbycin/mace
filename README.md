@@ -1,37 +1,26 @@
 # mace
-An embedded key-value storage engine with ACID support. Although it is still under development, you can try it out
 
-```rust
-use mace::{IsolationLevel, Mace, OpCode, Options};
+An embedded key-value storage engine based on Bw-Tree and supporting ACID
 
-fn main() -> Result<(), OpCode> {
-    let opt = Options::new(std::env::temp_dir().join("mace"));
-    let db = Mace::new(opt)?;
-    let tx = db.default();
+example see [demo.rs](examples/demo.rs)
 
-    // start a read-write Txn
-    tx.begin(IsolationLevel::SI, |kv| {
-        kv.put("foo", "bar")?;
-        kv.commit()?;
-
-        let r = kv.get("foo")?;
-        assert_eq!(r.data(), "bar".as_bytes());
-        Ok(())
-    })?;
-
-    // rollback
-    tx.begin(IsolationLevel::SI, |kv| {
-        kv.put("mo", "ha")?;
-        kv.rollback()
-    })?;
-
-    // start a read-only Txn
-    tx.view(IsolationLevel::SI, |view| {
-        let r = view.get("foo")?;
-        assert_eq!(r.data(), "bar".as_bytes());
-        let r = view.get("mo");
-        assert_eq!(r.err().unwrap(), OpCode::NotFound);
-        Ok(())
-    })
-}
 ```
+cargo run --example demo
+```
+
+single-threaded read/write benchmarks see [bench.rs](tests/bench.rs)
+
+```
+cargo test --test bench --release -- --nocapture
+```
+
+### highlights
+
+- B+ tree like read performance with LSM tree write performance
+- non-blocking concurrent reads and writes (MVCC)
+- scalable lock-free implementation
+- flash-optimized log-structured storage
+
+### caveats
+
+still in the very early stages

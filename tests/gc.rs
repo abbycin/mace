@@ -1,5 +1,3 @@
-use std::{thread::sleep, time::Duration};
-
 use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath};
 
 #[test]
@@ -63,26 +61,16 @@ fn abort_txn() {
     let db = Mace::new(opt).unwrap();
 
     let tx = db.default();
-    let ctx = tx.clone();
-    let h = std::thread::spawn(move || {
-        let _ = ctx.begin(IsolationLevel::SI, |kv| {
-            kv.put("foo", "bar")?;
-            sleep(Duration::from_millis(100));
-            let r = kv.commit();
-            assert!(r.is_err() && r.err().unwrap() == OpCode::AbortTx);
-            Ok(())
-        });
-    });
 
-    let _ = tx.begin(IsolationLevel::SI, |kv| {
-        for i in 0..200 {
+    let r = tx.begin(IsolationLevel::SI, |kv| {
+        for i in 0..500 {
             let x = format!("key_{}", i);
             kv.put(&x, &x)?;
         }
         kv.commit()
     });
 
-    h.join().unwrap();
+    assert!(r.is_err() && r.err().unwrap() == OpCode::AbortTx);
 }
 
 #[test]

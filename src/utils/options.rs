@@ -48,12 +48,12 @@ impl Options {
             gc_timeout: 60 * 1000, // 60s
             gc_ratio: 80,          // 80%
             db_root: db_root.as_ref().to_path_buf(),
-            file_cache: 512,      // each shard has 16 entries
-            cache_capacity: 2048, // 2048 items
-            cache_evict_pct: 10,  // 10 %
-            buffer_size: 4 << 20, // 4MB
-            buffer_count: 3,      // total 12MB
-            page_size: 16 << 10,  // 16KB
+            file_cache: 512,       // each shard has 16 entries
+            cache_capacity: 2048,  // 2048 items
+            cache_evict_pct: 10,   // 10%
+            buffer_size: 64 << 20, // 64MB
+            buffer_count: 3,       // total 192MB
+            page_size: 8 << 10,    // 8KB
             consolidate_threshold: 16,
             wal_buffer_size: 4 << 20,    // 4MB
             max_ckpt_per_txn: 1_000_000, // 1 million
