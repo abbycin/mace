@@ -5,7 +5,7 @@ use crate::map::Mapping;
 use crate::utils::countblock::Countblock;
 use crate::utils::data::Meta;
 use crate::utils::NULL_PID;
-use crate::{OpCode, Options};
+use crate::{OpCode, Options, ROOT_PID};
 use std::sync::Arc;
 
 pub struct Store {
@@ -40,8 +40,8 @@ impl Store {
     }
 
     // since NEXT_ID starts from 1, the ROOT's addr can't be 0 when it's not first run
-    pub(crate) fn is_fresh(&self, root_pid: u64) -> bool {
-        self.page.get(root_pid) == NULL_PID
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.page.get(ROOT_PID) == NULL_PID
     }
 
     pub(crate) fn start(&self) {

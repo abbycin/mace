@@ -6,68 +6,109 @@ use crate::{
         worker::SyncWorker,
     },
     index::{data::Value, tree::Tree, Key},
-    utils::{IsolationLevel, INIT_CMD, NULL_CMD},
+    utils::{INIT_CMD, NULL_CMD},
     OpCode,
 };
-use std::sync::atomic::Ordering::Relaxed;
-use std::{cell::Cell, sync::Arc};
+use std::sync::{atomic::Ordering::Relaxed, Arc};
+use std::{cell::Cell, sync::atomic::AtomicU32};
 
-use super::{registry::Registry, tree::SeekIter, ValRef};
+use super::{tree::SeekIter, ValRef};
+
+struct Guard<'a> {
+    ctx: &'a Context,
+    w: SyncWorker,
+    refcnt: Arc<AtomicU32>,
+}
+
+impl Clone for Guard<'_> {
+    fn clone(&self) -> Self {
+        self.refcnt.fetch_add(1, Relaxed);
+        Self {
+            ctx: self.ctx,
+            w: self.w,
+            refcnt: self.refcnt.clone(),
+        }
+    }
+}
+
+impl Guard<'_> {
+    fn destroy(&self) {
+        if self.refcnt.fetch_sub(1, Relaxed) == 1 {
+            self.ctx.free_worker(self.w);
+        }
+    }
+}
 
 fn get_impl<'a, K: AsRef<[u8]>>(
     ctx: &Context,
     tree: &Tree,
-    w: SyncWorker,
+    mut w: SyncWorker,
     k: K,
 ) -> Result<ValRef<Record<'a>>, OpCode> {
     #[cfg(feature = "check_empty_key")]
     assert!(k.as_ref().len() > 0, "key must be non-empty");
 
+    let wid = w.id;
     let start_ts = w.txn.start_ts;
     let key = Key::new(k.as_ref(), start_ts, NULL_CMD);
-    let mut mw = w;
     let r = tree.traverse::<Record, _>(key, |txid, t| {
-        mw.cc.is_visible_to(ctx, w, t.worker_id(), start_ts, txid)
+        w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid)
     })?;
 
     debug_assert!(!r.unwrap().is_tombstone());
     Ok(r)
 }
 
-fn seek_impl<K>(ctx: Arc<Context>, tree: &Tree, w: SyncWorker, prefix: K) -> SeekIter<Record>
+// NOTE: SeekIter lives at least as long as Mace, but the worker may be shared among several Txns
+fn seek_impl<'a, 'b, K>(
+    ctx: &'a Context,
+    tree: &'a Tree,
+    mut w: SyncWorker,
+    prefix: K,
+    g: Guard<'a>,
+) -> SeekIter<'a, 'b, Record<'b>>
 where
     K: AsRef<[u8]>,
 {
     #[cfg(feature = "check_empty_key")]
     assert!(prefix.as_ref().len() > 0, "prefix must be non-empty");
 
+    let wid = w.id;
     let start_ts = w.txn.start_ts;
-    let mut mw = w;
-    SeekIter::<Record>::new(tree, prefix, move |txid, t| {
-        mw.cc.is_visible_to(&ctx, w, t.worker_id(), start_ts, txid)
-    })
+    SeekIter::<Record>::new(
+        tree,
+        prefix,
+        move |txid, t| w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid),
+        move || {
+            g.destroy();
+        },
+    )
 }
 
-pub struct TxnKV {
-    ctx: Arc<Context>,
-    tree: Tree,
-    w: SyncWorker,
+pub struct TxnKV<'a> {
+    g: Guard<'a>,
+    tree: &'a Tree,
     seq: Cell<u32>,
     is_end: Cell<bool>,
     limit: usize,
 }
 
-impl TxnKV {
-    fn new(mgr: Registry, tree: Tree, w: SyncWorker) -> Self {
-        let limit = mgr.store.opt.max_ckpt_per_txn;
-        Self {
-            ctx: mgr.store.context.clone(),
+impl<'a> TxnKV<'a> {
+    pub(crate) fn new(ctx: &'a Context, tree: &'a Tree) -> Result<Self, OpCode> {
+        let mut w = ctx.alloc_worker()?;
+        w.begin(ctx);
+        let limit = tree.store.opt.max_ckpt_per_txn;
+        Ok(Self {
+            g: Guard {
+                ctx,
+                w,
+                refcnt: Arc::new(AtomicU32::new(1)),
+            },
             tree,
-            w,
             seq: Cell::new(INIT_CMD),
             is_end: Cell::new(false),
             limit,
-        }
+        })
     }
 
     fn cmd_id(&self) -> u32 {
@@ -77,10 +118,7 @@ impl TxnKV {
     }
 
     fn should_abort(&self) -> Result<(), OpCode> {
-        if self.is_end.get() {
-            return Err(OpCode::Invalid);
-        }
-        if self.w.ckpt_cnt.load(Relaxed) >= self.limit {
+        if self.g.w.ckpt_cnt.load(Relaxed) >= self.limit {
             return Err(OpCode::AbortTx);
         }
         Ok(())
@@ -94,12 +132,13 @@ impl TxnKV {
         assert!(k.as_ref().len() > 0, "key must be non-empty");
 
         self.should_abort()?;
-        let start_ts = self.w.txn.start_ts;
-        let (wid, cmd_id) = (self.w.id, self.cmd_id());
+        let start_ts = self.g.w.txn.start_ts;
+        let (wid, cmd_id) = (self.g.w.id, self.cmd_id());
         let key = Key::new(k, start_ts, cmd_id);
         let val = Value::Put(Record::normal(wid, v));
 
-        self.tree.update(key, val, |opt| f(opt, *key.ver(), self.w))
+        self.tree
+            .update(key, val, |opt| f(opt, *key.ver(), self.g.w))
     }
 
     fn put_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<(), OpCode> {
@@ -109,9 +148,13 @@ impl TxnKV {
                 Some((rk, rv)) => {
                     let t = rv.unwrap();
                     if rv.is_put()
-                        || !w
-                            .cc
-                            .is_visible_to(&self.ctx, self.w, t.worker_id(), ver.txid, rk.txid)
+                        || !w.cc.is_visible_to(
+                            self.g.ctx,
+                            self.g.w.id,
+                            t.worker_id(),
+                            ver.txid,
+                            rk.txid,
+                        )
                     {
                         Err(OpCode::AbortTx)
                     } else {
@@ -122,14 +165,8 @@ impl TxnKV {
             if r.is_ok() && !*logged {
                 *logged = true;
                 w.txn.modified = true;
-                w.logging.record_update(
-                    ver,
-                    self.tree.id(),
-                    WalPut::new(v.len()),
-                    k,
-                    [].as_slice(),
-                    v,
-                );
+                w.logging
+                    .record_update(ver, WalPut::new(v.len()), k, [].as_slice(), v);
             }
             r
         })
@@ -146,7 +183,7 @@ impl TxnKV {
                 let t = rv.unwrap();
                 if !w
                     .cc
-                    .is_visible_to(&self.ctx, self.w, t.worker_id(), ver.txid, rk.txid)
+                    .is_visible_to(self.g.ctx, self.g.w.id, t.worker_id(), ver.txid, rk.txid)
                 {
                     return Err(OpCode::AbortTx);
                 }
@@ -156,7 +193,6 @@ impl TxnKV {
                     *logged = true;
                     w.logging.record_update(
                         ver,
-                        self.tree.id(),
                         WalReplace::new(t.data().len(), v.len()),
                         rk.raw,
                         t.data(),
@@ -209,7 +245,7 @@ impl TxnKV {
         T: AsRef<[u8]>,
     {
         self.should_abort()?;
-        let mut w = self.w;
+        let mut w = self.g.w;
         let (wid, start_ts) = (w.id, w.txn.start_ts);
         let key = Key::new(k.as_ref(), start_ts, self.cmd_id());
         let val = Value::Del(Record::remove(wid));
@@ -223,10 +259,13 @@ impl TxnKV {
                         return Err(OpCode::NotFound);
                     }
                     let t = rv.unwrap();
-                    if !w
-                        .cc
-                        .is_visible_to(&self.ctx, self.w, t.worker_id(), start_ts, rk.txid)
-                    {
+                    if !w.cc.is_visible_to(
+                        self.g.ctx,
+                        self.g.w.id,
+                        t.worker_id(),
+                        start_ts,
+                        rk.txid,
+                    ) {
                         return Err(OpCode::AbortTx);
                     }
 
@@ -235,7 +274,6 @@ impl TxnKV {
                         w.txn.modified = true;
                         w.logging.record_update(
                             *key.ver(),
-                            self.tree.id(),
                             WalDel::new(t.data().len()),
                             rk.raw,
                             t.data(),
@@ -248,18 +286,20 @@ impl TxnKV {
             .map(|x| x.unwrap())
     }
 
-    pub fn commit(&self) -> Result<(), OpCode> {
+    pub fn commit(self) -> Result<(), OpCode> {
         self.should_abort()?;
-        if !self.is_end.get() {
-            self.w.commit(&self.ctx);
-            self.is_end.set(true);
-        }
+        self.g.w.commit(self.g.ctx);
+        self.is_end.set(true);
         Ok(())
     }
 
-    pub fn rollback(&self) -> Result<(), OpCode> {
+    pub fn rollback(self) -> Result<(), OpCode> {
+        self.rollback_impl()
+    }
+
+    fn rollback_impl(&self) -> Result<(), OpCode> {
         if !self.is_end.get() {
-            self.w.rollback(&self.ctx, &self.tree);
+            self.g.w.rollback(self.g.ctx, self.tree);
             self.is_end.set(true);
         }
         Ok(())
@@ -270,123 +310,67 @@ impl TxnKV {
     where
         K: AsRef<[u8]>,
     {
-        get_impl(&self.ctx, &self.tree, self.w, k)
+        get_impl(self.g.ctx, self.tree, self.g.w, k)
     }
 
-    /// this function will keep a reference to `prefix`, so don't drop `prefix` until the iterator has been consumed
     #[inline]
-    pub fn seek<K>(&self, prefix: K) -> SeekIter<Record>
+    pub fn seek<'b, K>(&self, prefix: K) -> SeekIter<'a, 'b, Record<'b>>
     where
         K: AsRef<[u8]>,
     {
-        seek_impl(self.ctx.clone(), &self.tree, self.w, prefix)
+        seek_impl(self.g.ctx, self.tree, self.g.w, prefix, self.g.clone())
     }
 }
 
-impl Drop for TxnKV {
+impl Drop for TxnKV<'_> {
     fn drop(&mut self) {
-        let _ = self.rollback();
-        self.ctx.free(self.w);
+        let _ = self.rollback_impl();
+        self.g.destroy();
     }
 }
 
-pub struct TxnView {
-    ctx: Arc<Context>,
-    tree: Tree,
-    w: SyncWorker,
+pub struct TxnView<'a> {
+    g: Guard<'a>,
+    tree: &'a Tree,
 }
 
-impl TxnView {
-    fn new(ctx: Arc<Context>, tree: Tree, w: SyncWorker) -> Self {
-        Self { ctx, tree, w }
+impl<'a> TxnView<'a> {
+    pub(crate) fn new(ctx: &'a Context, tree: &'a Tree) -> Result<Self, OpCode> {
+        let mut w = ctx.alloc_worker()?;
+        w.view(ctx);
+        Ok(Self {
+            g: Guard {
+                ctx,
+                w,
+                refcnt: Arc::new(AtomicU32::new(1)),
+            },
+            tree,
+        })
     }
 
     #[inline]
     pub fn get<K: AsRef<[u8]>>(&self, k: K) -> Result<ValRef<Record>, OpCode> {
-        get_impl(&self.ctx, &self.tree, self.w, k)
+        get_impl(self.g.ctx, self.tree, self.g.w, k)
     }
 
-    /// this function will keep a reference to `prefix`, so don't drop `prefix` until the iterator has been consumed
     #[inline]
-    pub fn seek<K>(&self, prefix: K) -> SeekIter<Record>
+    pub fn seek<'b, K>(&self, prefix: K) -> SeekIter<'a, 'b, Record<'b>>
     where
         K: AsRef<[u8]>,
     {
-        seek_impl(self.ctx.clone(), &self.tree, self.w, prefix)
+        seek_impl(self.g.ctx, self.tree, self.g.w, prefix, self.g.clone())
     }
 }
 
-impl Drop for TxnView {
+impl Drop for TxnView<'_> {
     fn drop(&mut self) {
-        self.ctx.free(self.w);
-    }
-}
-
-pub struct Tx {
-    pub(crate) ctx: Arc<Context>,
-    pub(crate) tree: Tree,
-    pub(crate) mgr: Registry,
-}
-
-impl Tx {
-    pub fn show(&self) {
-        self.tree.show::<Record>();
-    }
-
-    pub fn id(&self) -> u64 {
-        self.tree.id()
-    }
-    /// read-only txn
-    pub fn view<F>(&self, level: IsolationLevel, mut f: F) -> Result<(), OpCode>
-    where
-        F: FnMut(TxnView) -> Result<(), OpCode>,
-    {
-        f(self._read(level))
-    }
-
-    /// the user must commit, otherwise, when leaving clouser, the transaction will be rolled back
-    pub fn begin<F>(&self, level: IsolationLevel, mut f: F) -> Result<(), OpCode>
-    where
-        F: FnMut(TxnKV) -> Result<(), OpCode>,
-    {
-        f(self._write(level))
-    }
-
-    #[doc(hidden)]
-    pub fn _write(&self, level: IsolationLevel) -> TxnKV {
-        let mut w = self.ctx.alloc();
-        w.begin(&self.ctx, level);
-        TxnKV::new(self.mgr.clone(), self.tree.clone(), w)
-    }
-
-    #[doc(hidden)]
-    pub fn _read(&self, level: IsolationLevel) -> TxnView {
-        let mut w = self.ctx.alloc();
-        w.view(&self.ctx, level);
-        TxnView::new(self.ctx.clone(), self.tree.clone(), w)
-    }
-}
-
-impl Clone for Tx {
-    fn clone(&self) -> Self {
-        self.mgr.inc_ref(self.tree.id());
-        Self {
-            ctx: self.ctx.clone(),
-            tree: self.tree.clone(),
-            mgr: self.mgr.clone(),
-        }
-    }
-}
-
-impl Drop for Tx {
-    fn drop(&mut self) {
-        self.mgr.dec_ref(self.tree.id());
+        self.g.destroy();
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{utils::IsolationLevel, Mace, OpCode, Options, RandomPath};
+    use crate::{Mace, OpCode, Options, RandomPath};
 
     #[test]
     fn txnkv() -> Result<(), OpCode> {
@@ -396,124 +380,103 @@ mod test {
         let db = Mace::new(opt)?;
         let (k1, k2) = ("beast".as_bytes(), "senpai".as_bytes());
         let (v1, v2) = ("114514".as_bytes(), "1919810".as_bytes());
-        let tx = db.default();
 
-        tx.begin(IsolationLevel::SI, |kv| {
-            kv.put(k1, v1).expect("can't put");
-            kv.put(k2, v2).expect("can't put");
+        let kv = db.begin()?;
+        kv.put(k1, v1).expect("can't put");
+        kv.put(k2, v2).expect("can't put");
 
-            let r = kv.get(k1).expect("can't get");
-            assert_eq!(r.data(), v1);
-            let r = kv.get(k2).expect("can't get");
-            assert_eq!(r.data(), v2);
+        let r = kv.get(k1).expect("can't get");
+        assert_eq!(r.data(), v1);
+        let r = kv.get(k2).expect("can't get");
+        assert_eq!(r.data(), v2);
 
-            let r = kv.del(k1).expect("can't del");
-            assert_eq!(r.data(), v1);
-            kv.commit()
-        })?;
+        let r = kv.del(k1).expect("can't del");
+        assert_eq!(r.data(), v1);
+        kv.commit()?;
 
-        tx.begin(IsolationLevel::SI, |kv| {
-            let r = kv.get(k1);
-            assert!(r.is_err());
+        let kv = db.begin()?;
+        let r = kv.get(k1);
+        assert!(r.is_err());
 
-            let r = kv.get(k2).expect("can't get");
-            assert_eq!(r.data(), v2);
+        let r = kv.get(k2).expect("can't get");
+        assert_eq!(r.data(), v2);
 
-            let r = kv.del(k2).expect("can't del");
-            assert_eq!(r.data(), v2);
-            kv.rollback()
-        })?;
+        let r = kv.del(k2).expect("can't del");
+        assert_eq!(r.data(), v2);
+        kv.rollback()?;
 
-        tx.begin(IsolationLevel::SI, |kv| {
-            let r = kv.get(k1);
-            assert!(r.is_err());
-            let r = kv.del(k2).expect("can't del");
-            assert_eq!(r.data(), v2);
-            let r = kv.del(k2);
-            assert!(r.is_err());
+        let kv = db.begin()?;
+        let r = kv.get(k1);
+        assert!(r.is_err());
+        let r = kv.del(k2).expect("can't del");
+        assert_eq!(r.data(), v2);
+        let r = kv.del(k2);
+        assert!(r.is_err());
 
-            kv.commit()
-        })?;
+        kv.commit()?;
 
-        tx.begin(IsolationLevel::SI, |kv| {
-            let r = kv.get(k1);
-            assert!(r.is_err());
-            let r = kv.get(k2);
-            assert!(r.is_err());
+        let kv = db.begin()?;
+        let r = kv.get(k1);
+        assert!(r.is_err());
+        let r = kv.get(k2);
+        assert!(r.is_err());
 
-            kv.commit()
-        })?;
+        kv.commit()?;
 
         {
-            tx.begin(IsolationLevel::SI, |kv| {
-                kv.put("1", "10")?;
-                kv.commit()
-            })?;
+            let kv = db.begin()?;
+            kv.put("1", "10")?;
+            kv.commit()?;
 
-            tx.begin(IsolationLevel::SI, |kv| {
-                kv.update("1", "11").expect("can't replace");
-                kv.rollback()
-            })?;
+            let kv = db.begin()?;
+            kv.update("1", "11").expect("can't replace");
+            kv.rollback()?;
 
-            tx.view(IsolationLevel::SI, |view| {
-                let x = view.get("1").expect("can't get");
-                assert_eq!(x.data(), "10".as_bytes());
-                Ok(())
-            })?;
+            let view = db.view()?;
+            let x = view.get("1").expect("can't get");
+            assert_eq!(x.data(), "10".as_bytes());
         }
 
         {
-            tx.begin(IsolationLevel::SI, |kv| {
-                kv.put("2", "20")?;
-                kv.update("2", "21")?;
-                let r = kv.get("2").unwrap();
-                assert_eq!(r.data(), "21".as_bytes());
-                kv.del("2")?;
-                kv.rollback()
-            })?;
+            let kv = db.begin()?;
+            kv.put("2", "20")?;
+            kv.update("2", "21")?;
+            let r = kv.get("2").unwrap();
+            assert_eq!(r.data(), "21".as_bytes());
+            kv.del("2")?;
+            kv.rollback()?;
 
-            tx.view(IsolationLevel::SI, |view| {
-                let x = view.get("2");
-                assert!(x.is_err());
-                Ok(())
-            })?;
-        }
-
-        let tx = db.alloc().unwrap();
-
-        {
-            tx.begin(IsolationLevel::SI, |kv| {
-                kv.put("1", "10")?;
-                kv.commit()
-            })?;
-
-            tx.begin(IsolationLevel::SI, |kv| {
-                kv.upsert("1", "11").expect("can't replace");
-                kv.rollback()
-            })?;
-
-            tx.view(IsolationLevel::SI, |view| {
-                let x = view.get("1").expect("can't get");
-                assert_eq!(x.data(), "10".as_bytes());
-                Ok(())
-            })?;
+            let view = db.view()?;
+            let x = view.get("2");
+            assert!(x.is_err());
         }
 
         {
-            tx.begin(IsolationLevel::SI, |kv| {
-                kv.put("2", "20")?;
-                kv.upsert("2", "21")?;
-                let r = kv.get("2").unwrap();
-                assert_eq!(r.data(), "21".as_bytes());
-                kv.del("2")?;
-                kv.rollback()
-            })?;
+            let kv = db.begin()?;
+            kv.put("11", "10")?;
+            kv.commit()?;
 
-            tx.view(IsolationLevel::SI, |view| {
-                let x = view.get("2");
-                assert!(x.is_err());
-                Ok(())
-            })?;
+            let kv = db.begin()?;
+            kv.upsert("11", "11").expect("can't replace");
+            kv.rollback()?;
+
+            let view = db.view()?;
+            let x = view.get("11").expect("can't get");
+            assert_eq!(x.data(), "10".as_bytes());
+        }
+
+        {
+            let kv = db.begin()?;
+            kv.put("22", "20")?;
+            kv.upsert("22", "21")?;
+            let r = kv.get("22").unwrap();
+            assert_eq!(r.data(), "21".as_bytes());
+            kv.del("22")?;
+            kv.rollback()?;
+
+            let view = db.view()?;
+            let x = view.get("22");
+            assert!(x.is_err());
         }
         Ok(())
     }

@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 pub use cc::data::Record;
-pub use index::txn::{Tx, TxnKV, TxnView};
-use index::{registry::Registry, tree::Tree};
+pub use index::tree::SeekIter;
+use index::tree::Tree;
+pub use index::txn::{TxnKV, TxnView};
 pub(crate) use store::store::Store;
 use store::{
     gc::{start_gc, Handle},
     recovery::Recovery,
 };
-use utils::data::Meta;
-pub use utils::{options::Options, IsolationLevel, OpCode, RandomPath};
+use utils::{data::Meta, ROOT_PID};
+pub use utils::{options::Options, OpCode, RandomPath};
 
 mod cc;
 mod index;
@@ -18,87 +19,77 @@ mod store;
 mod utils;
 pub use index::ValRef;
 
-#[derive(Clone)]
-pub struct Mace {
+struct Inner {
     store: Arc<Store>,
-    mgr: Registry,
     meta: Arc<Meta>,
     gc: Handle,
-    default_tree: Tree,
+    tree: Tree,
     opt: Arc<Options>,
 }
 
-impl Mace {
-    pub fn new(opt: Options) -> Result<Self, OpCode> {
-        let opt = Arc::new(opt);
-        let mut recover = Recovery::new(opt.clone());
-        let (meta, table, mapping) = recover.phase1();
-        let store = Arc::new(Store::new(table, opt.clone(), meta.clone(), mapping)?);
-        let mgr = Registry::new(store.clone());
-
-        recover.phase2(meta.clone(), &mgr);
-        meta.sync(opt.meta_file(), false);
-        store.start();
-        let handle = start_gc(mgr.clone(), meta.clone(), store.buffer.mapping.clone());
-        let default_tree = mgr.open_default()?;
-
-        Ok(Self {
-            store,
-            mgr,
-            meta,
-            gc: handle,
-            default_tree,
-            opt,
-        })
-    }
-
-    pub fn default(&self) -> Tx {
-        Tx {
-            ctx: self.store.context.clone(),
-            tree: self.default_tree.clone(),
-            mgr: self.mgr.clone(),
-        }
-    }
-
-    pub fn alloc(&self) -> Result<Tx, OpCode> {
-        let tree = self.mgr.create_tree()?;
-        Ok(Tx {
-            ctx: self.store.context.clone(),
-            tree,
-            mgr: self.mgr.clone(),
-        })
-    }
-
-    pub fn get(&self, id: u64) -> Result<Tx, OpCode> {
-        let tree = self.mgr.get_tree(id)?;
-
-        Ok(Tx {
-            ctx: self.store.context.clone(),
-            tree,
-            mgr: self.mgr.clone(),
-        })
-    }
-
-    pub fn remove(&self, id: u64) -> Result<(), OpCode> {
-        self.gc.pause();
-        let r = self.mgr.remove_tree(id);
-        self.gc.resume();
-        r
-    }
-
-    pub fn options(&self) -> &Options {
-        &self.opt
-    }
-
-    fn quit(&self) {
+impl Drop for Inner {
+    fn drop(&mut self) {
         self.gc.quit();
         self.store.quit();
         self.meta.sync(self.store.opt.meta_file(), true);
     }
 }
 
-impl Drop for Mace {
-    fn drop(&mut self) {
-        self.quit();
+#[derive(Clone)]
+pub struct Mace {
+    inner: Arc<Inner>,
+}
+
+impl Mace {
+    fn open(store: Arc<Store>) -> Tree {
+        if store.is_fresh() {
+            let pid = store.page.alloc().expect("no space");
+            assert_eq!(pid, ROOT_PID);
+            Tree::new(store, ROOT_PID)
+        } else {
+            Tree::load(store, ROOT_PID)
+        }
+    }
+    pub fn new(opt: Options) -> Result<Self, OpCode> {
+        let opt = Arc::new(opt);
+        let mut recover = Recovery::new(opt.clone());
+        let (meta, table, mapping) = recover.phase1();
+        let store = Arc::new(Store::new(table, opt.clone(), meta.clone(), mapping)?);
+        let tree = Self::open(store.clone());
+
+        recover.phase2(meta.clone(), &tree);
+        meta.sync(opt.meta_file(), false);
+        store.start();
+        let handle = start_gc(store.clone(), meta.clone(), store.buffer.mapping.clone());
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                store,
+                meta,
+                gc: handle,
+                tree,
+                opt,
+            }),
+        })
+    }
+
+    pub fn begin(&self) -> Result<TxnKV, OpCode> {
+        TxnKV::new(&self.inner.store.context, &self.inner.tree)
+    }
+
+    pub fn view(&self) -> Result<TxnView, OpCode> {
+        TxnView::new(&self.inner.store.context, &self.inner.tree)
+    }
+
+    pub fn options(&self) -> &Options {
+        &self.inner.opt
+    }
+
+    pub fn pause_gc(&self) {
+        self.inner.gc.pause();
+    }
+
+    pub fn resume_gc(&self) {
+        self.inner.gc.resume();
     }
 }

@@ -1,13 +1,13 @@
+use std::alloc::{alloc_zeroed, Layout};
 use std::cmp;
 use std::cmp::min;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::{collections::HashSet, sync::RwLock};
 
-use crate::utils::{rand_range, IsolationLevel};
+use crate::utils::rand_range;
 
 use super::context::Context;
-use super::worker::SyncWorker;
 
 #[derive(Clone, Copy)]
 pub struct Transaction {
@@ -16,7 +16,6 @@ pub struct Transaction {
     /// max fsn observed in current txn
     pub max_fsn: u64,
     pub modified: bool,
-    pub level: IsolationLevel,
 }
 
 impl Transaction {
@@ -26,15 +25,13 @@ impl Transaction {
             commit_ts: 0,
             max_fsn: 0,
             modified: false,
-            level: IsolationLevel::SI,
         }
     }
 
-    pub(crate) fn reset(&mut self, start_ts: u64, level: IsolationLevel) {
+    pub(crate) fn reset(&mut self, start_ts: u64) {
         self.start_ts = start_ts;
         self.commit_ts = 0;
         self.modified = false;
-        self.level = level;
     }
 
     pub(crate) fn ready_to_commit(&self, min_flush_txid: u64, min_fsn: u64) -> bool {
@@ -42,10 +39,14 @@ impl Transaction {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+#[repr(align(64))]
+struct Ts(u64);
+
 pub struct ConcurrencyControl {
     pub(crate) commit_tree: CommitTree,
-    cached_sts: Vec<u64>,
-    cached_cts: Vec<u64>,
+    cached_sts: Vec<Ts>,
+    cached_cts: Vec<Ts>,
     /// shared local water mark, avoid performing LCB in read-only txn
     wmk_oldest_tx: AtomicU64,
     /// latest commit ts, update everytime a txn was commited
@@ -53,64 +54,71 @@ pub struct ConcurrencyControl {
     /// snapshot of latest_cts in gc
     pub(crate) last_latest_cts: AtomicU64,
     /// snapshot of global water mark, for short circuit visibility checking
-    pub(crate) global_wmk_tx: u64,
+    pub(crate) global_wmk_tx: AtomicU64,
 }
 
 impl ConcurrencyControl {
+    fn alloc(count: usize) -> Vec<Ts> {
+        unsafe {
+            let layout = Layout::from_size_align(count * size_of::<Ts>(), align_of::<Ts>())
+                .expect("bad layout");
+            let raw = alloc_zeroed(layout).cast::<Ts>();
+            Vec::from_raw_parts(raw, count, count)
+        }
+    }
     pub(crate) fn new(workers: usize) -> Self {
         Self {
             commit_tree: CommitTree::new(workers),
-            cached_sts: vec![0; workers],
-            cached_cts: vec![0; workers],
+            cached_sts: Self::alloc(workers),
+            cached_cts: Self::alloc(workers),
             wmk_oldest_tx: AtomicU64::new(0),
             latest_cts: AtomicU64::new(0),
             last_latest_cts: AtomicU64::new(0),
-            global_wmk_tx: 0,
+            global_wmk_tx: AtomicU64::new(0),
         }
     }
 
+    // NOTE: it's thread-safe
     /// check `txid` is visible to worker `wid` with txn with `start_ts`
     pub fn is_visible_to(
         &mut self,
         ctx: &Context,
-        w: SyncWorker,
-        wid: u16,
+        self_wid: u16,
+        other_wid: u16,
         start_ts: u64,
         txid: u64,
     ) -> bool {
         // if txid was created on same worker, it's visible to later txn
-        if w.id == wid {
+        if self_wid == other_wid {
             return true;
         }
 
-        let wid = wid as usize;
+        let wid = other_wid as usize;
 
-        match w.txn.level {
-            IsolationLevel::SI | IsolationLevel::SSI => {
-                if txid > start_ts {
-                    return false;
-                }
-                if self.global_wmk_tx > txid {
-                    return true;
-                }
+        // NOTE: The following applies only to SI
+        if txid > start_ts {
+            return false;
+        }
 
-                // short circuit
-                if self.cached_sts[wid] == start_ts {
-                    return self.cached_cts[wid] >= txid;
-                }
+        if self.global_wmk_tx.load(Relaxed) > txid {
+            return true;
+        }
 
-                if self.cached_cts[wid] >= txid {
-                    return true;
-                }
+        // short circuit
+        if self.cached_sts[wid].0 == start_ts {
+            return self.cached_cts[wid].0 >= txid;
+        }
 
-                // slow path
-                let lcb = ctx.worker(wid).cc.commit_tree.lcb(start_ts);
-                if lcb != 0 {
-                    self.cached_sts[wid] = start_ts;
-                    self.cached_cts[wid] = lcb;
-                    return lcb >= txid;
-                }
-            }
+        if self.cached_cts[wid].0 >= txid {
+            return true;
+        }
+
+        // slow path
+        let lcb = ctx.worker(wid).cc.commit_tree.lcb(start_ts);
+        if lcb != 0 {
+            self.cached_sts[wid].0 = start_ts;
+            self.cached_cts[wid].0 = lcb;
+            return lcb >= txid;
         }
 
         false
@@ -173,11 +181,11 @@ impl ConcurrencyControl {
         log::debug!(
             "wmk_oldest_tx {} global_wmk_tx {}",
             self.wmk_oldest_tx.load(Relaxed),
-            self.global_wmk_tx
+            self.global_wmk_tx.load(Relaxed)
         );
         for i in 0..self.cached_cts.len() {
             let (s, c) = (self.cached_sts[i], self.cached_cts[i]);
-            log::debug!("start {} commit {}", s, c);
+            log::debug!("start {} commit {}", s.0, c.0);
         }
         log::debug!("-------------- lcb -----------");
         self.commit_tree.show();
@@ -264,7 +272,6 @@ impl CommitTree {
                 continue;
             }
 
-            // avoid dead-lock, see `get_worker`
             let lk = self.lk.read().expect("can't lock read");
             if let Some(c) = Self::lcb_impl(&self.log, txid) {
                 set.insert(self.log[c]);

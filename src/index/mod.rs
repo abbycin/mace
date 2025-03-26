@@ -6,7 +6,6 @@ pub(crate) mod tree;
 pub use data::Key;
 pub use tree::ValRef;
 mod builder;
-pub(crate) mod registry;
 mod slotted;
 pub(crate) mod txn;
 

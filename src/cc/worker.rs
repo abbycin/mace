@@ -12,7 +12,7 @@ use std::{
 use crate::{
     index::tree::Tree,
     utils::{block::Block, countblock::Countblock},
-    IsolationLevel, Options,
+    Options,
 };
 
 use super::{
@@ -65,28 +65,23 @@ impl SyncWorker {
         drop(b);
     }
 
-    fn init(&mut self, level: IsolationLevel, ctx: &Context, start_ts: u64) {
-        assert!(
-            level == IsolationLevel::SI,
-            "only SI is supported at present"
-        );
-
+    fn init(&mut self, ctx: &Context, start_ts: u64) {
         let id = self.id;
-        self.txn.reset(start_ts, level);
+        self.txn.reset(start_ts);
         self.ckpt_cnt.store(0, Relaxed);
         self.ckpt.store(ctx.meta.ckpt.load(Relaxed), Relaxed);
         self.tx_id.store(start_ts, Relaxed);
-        self.cc.global_wmk_tx = ctx.wmk_oldest();
+        self.cc.global_wmk_tx.store(ctx.wmk_oldest(), Relaxed);
         self.cc.commit_tree.compact(ctx, id);
     }
 
-    pub(crate) fn view(&mut self, ctx: &Arc<Context>, level: IsolationLevel) {
-        self.init(level, ctx, ctx.load_oracle());
+    pub(crate) fn view(&mut self, ctx: &Context) {
+        self.init(ctx, ctx.load_oracle());
     }
 
-    pub(crate) fn begin(&mut self, ctx: &Context, level: IsolationLevel) -> u64 {
+    pub(crate) fn begin(&mut self, ctx: &Context) -> u64 {
         let start_ts = ctx.alloc_oracle();
-        self.init(level, ctx, start_ts);
+        self.init(ctx, start_ts);
         self.logging.record_begin(start_ts);
         start_ts
     }
@@ -126,9 +121,7 @@ impl SyncWorker {
         w.logging.wait_flush();
         let mut block = Block::alloc(1024);
         let reader = WalReader::new(ctx);
-        reader.rollback(&mut block, txid, w.logging.lsn.load(Relaxed), |_| {
-            tree.clone()
-        });
+        reader.rollback(&mut block, txid, w.logging.lsn.load(Relaxed), tree);
 
         // since we are append-only, we must update CommitTree to make the rollbacked data visible
         // for example: worker 1 set foo = bar then commit, worker 2 del foo, then rollback, if we

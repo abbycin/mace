@@ -1,6 +1,6 @@
 use std::{ops::Deref, time::Instant};
 
-use mace::{IsolationLevel, Mace, Options, RandomPath};
+use mace::{Mace, Options, RandomPath};
 
 #[test]
 fn bench() {
@@ -11,7 +11,6 @@ fn bench() {
     opt.tmp_store = true;
     let db = Mace::new(opt).unwrap();
 
-    let tx = db.default();
     let cap = 100000;
     let mut pair = Vec::with_capacity(cap);
 
@@ -21,24 +20,19 @@ fn bench() {
 
     let b = Instant::now();
     for k in &pair {
-        tx.begin(IsolationLevel::SI, |kv| {
-            kv.put(k, k)?;
-            kv.commit()
-        })
-        .unwrap();
+        let kv = db.begin().unwrap();
+        kv.put(k, k).unwrap();
+        kv.commit().unwrap();
     }
 
     let e1 = b.elapsed();
 
     let b = Instant::now();
     for k in &pair {
-        tx.view(IsolationLevel::SI, |view| {
-            view.get(k)?;
-            Ok(())
-        })
-        .unwrap();
+        let view = db.view().unwrap();
+        view.get(k).unwrap();
     }
 
     let e2 = b.elapsed();
-    println!("put {} get {}", e1.as_millis(), e2.as_millis());
+    println!("put {}ms get {}ms", e1.as_millis(), e2.as_millis());
 }

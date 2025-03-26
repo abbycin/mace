@@ -11,24 +11,22 @@ use io::{File, GatherIO};
 use crate::cc::data::Ver;
 use crate::cc::wal::{
     ptr_to, wal_record_sz, EntryType, PayloadType, WalAbort, WalBegin, WalCheckpoint, WalPadding,
-    WalReader, WalTree, WalUpdate,
+    WalReader, WalUpdate,
 };
-use crate::index::data::{Id, Value};
-use crate::index::registry::Registry;
+use crate::index::data::Value;
 use crate::index::tree::Tree;
 use crate::index::Key;
 use crate::map::data::DataFooter;
 use crate::map::Mapping;
 use crate::utils::block::Block;
 use crate::utils::data::MapEntry;
-use crate::utils::traits::IValCodec;
 use crate::utils::{pack_id, raw_ptr_to_ref, unpack_id, NULL_CMD, NULL_ORACLE};
 use crate::{
     map::table::PageMap,
     utils::{data::Meta, NEXT_ID},
     Options,
 };
-use crate::{static_assert, OpCode, Record, ValRef};
+use crate::{static_assert, Record};
 
 #[derive(Debug, PartialEq, Eq)]
 enum State {
@@ -73,7 +71,7 @@ impl Recovery {
         (Arc::new(meta), map, mapping)
     }
 
-    pub(crate) fn phase2(&mut self, meta: Arc<Meta>, mgr: &Registry) {
+    pub(crate) fn phase2(&mut self, meta: Arc<Meta>, tree: &Tree) {
         let mut oracle = meta.oracle.load(Relaxed);
         if self.state == State::Damaged {
             // NOTE: the wal_id is already the latest one, but there maybe wal file after it and there
@@ -82,12 +80,12 @@ impl Recovery {
             let mut block = Block::alloc(self.opt.buffer_size as usize);
 
             // analyze and redo starts from latest checkpoint
-            let cur_oracle = self.analyze(addr, &mut block, mgr);
+            let cur_oracle = self.analyze(addr, &mut block, tree);
             if !self.dirty_table.is_empty() {
-                self.redo(&mut block, mgr);
+                self.redo(&mut block, tree);
             }
             if !self.undo_table.is_empty() {
-                self.undo(&mut block, mgr);
+                self.undo(&mut block, tree);
             }
             // that's why we call it oracle, or else keep using the intact oracle in meta
             oracle = max(oracle, cur_oracle) + 1;
@@ -106,43 +104,6 @@ impl Recovery {
         }
     }
 
-    #[inline]
-    fn get<'a, T>(tree: &'a Tree, raw: &'a [u8]) -> Result<(Key<'a>, ValRef<T>), OpCode>
-    where
-        T: IValCodec,
-    {
-        tree.get::<Key<'a>, T>(Key::new(raw, NULL_ORACLE, NULL_CMD))
-    }
-
-    // if data is intact the sub trees are always in latest version, or else retore them from WAL
-    fn handle_tree(&mut self, mgr: &Registry, t: &WalTree) {
-        let tree = mgr.search(t.tree_id()).expect("invalid tree");
-        assert!(tree.is_mgr());
-        let raw = t.id().to_le_bytes();
-        let r = Self::get::<&[u8]>(&tree, &raw[..]);
-
-        // sub tree is not exist or is older than wal record
-        let lost = r
-            .map(|(k, _)| k.txid < t.txid)
-            .map_err(|_| true)
-            .unwrap_or_else(|x| x);
-
-        // we must create the tree before we can check the key is latest
-        if lost {
-            match t.wal_type {
-                EntryType::TreePut => {
-                    log::info!("restore sub tree {} ver {}", t.root_pid(), { t.txid });
-                    mgr.init_tree(t.id, t.pid, t.txid);
-                }
-                EntryType::TreeDel => {
-                    log::info!("remove sub tree {} ver {}", t.root_pid(), { t.txid });
-                    mgr.destroy_tree(t.id, t.pid, t.txid);
-                }
-                _ => unreachable!("invalid entry type {:?}", t.wal_type),
-            }
-        }
-    }
-
     fn handle_update(
         &mut self,
         len: usize,
@@ -150,24 +111,21 @@ impl Recovery {
         map: &mut BTreeMap<Ver, (u64, u32)>,
         beg: u64,
         buf: &mut [u8],
-        mgr: &Registry,
+        tree: &Tree,
     ) {
         assert!(len < buf.len());
         f.read(&mut buf[0..len], beg).unwrap();
 
         let u = ptr_to::<WalUpdate>(buf.as_ptr());
-        let Some(tree) = mgr.search(u.tree_id) else {
-            log::error!("invalid tree {:?}", u);
-            mgr.tree.show::<Id>();
-            panic!("invalid tree {:?}", u);
-        };
         let ver = Ver::new(u.txid, u.cmd_id);
 
         debug_assert!(!map.contains_key(&ver));
 
         let raw = u.key();
         let sz = len as u32;
-        let r = Self::get::<Record>(&tree, raw).map(|(k, _)| *k.ver());
+        let r = tree
+            .get::<Key, Record>(Key::new(raw, NULL_ORACLE, NULL_CMD))
+            .map(|(k, _)| *k.ver());
 
         // check whether the key is exits in data or is latest
         let lost = r.map(|v| v > ver).map_err(|_| true).unwrap_or_else(|x| x);
@@ -176,7 +134,7 @@ impl Recovery {
         }
     }
 
-    fn analyze(&mut self, addr: u64, block: &mut Block, mgr: &Registry) -> u64 {
+    fn analyze(&mut self, addr: u64, block: &mut Block, tree: &Tree) -> u64 {
         let (cur, mut off) = unpack_id(addr);
         let mut pos;
         let mut oracle = 0;
@@ -218,11 +176,6 @@ impl Recovery {
                 pos += sz as u64;
                 let ptr = buf.as_ptr();
                 match et {
-                    EntryType::TreeDel | EntryType::TreePut => {
-                        let t = ptr_to::<WalTree>(ptr);
-                        oracle = max(oracle, t.txid);
-                        self.handle_tree(mgr, t);
-                    }
                     EntryType::Commit | EntryType::Abort => {
                         let a = ptr_to::<WalAbort>(ptr);
                         log::trace!("{:?}", a);
@@ -274,7 +227,7 @@ impl Recovery {
                         if let Some(lsn) = self.undo_table.get_mut(&{ u.txid }) {
                             *lsn = pack_id(id, beg as u32); // update to latest record position
                         }
-                        self.handle_update(len, &mut f, &mut map, beg, buf, mgr);
+                        self.handle_update(len, &mut f, &mut map, beg, buf, tree);
                         pos += u.payload_len() as u64;
                     }
                     _ => {
@@ -296,7 +249,7 @@ impl Recovery {
         oracle
     }
 
-    fn redo(&self, block: &mut Block, mgr: &Registry) {
+    fn redo(&self, block: &mut Block, tree: &Tree) {
         for (id, table) in &self.dirty_table {
             let path = self.opt.wal_file(*id);
             if !path.exists() {
@@ -309,7 +262,6 @@ impl Recovery {
                 let c = ptr_to::<WalUpdate>(block.data());
                 let ok = c.key();
                 let key = Key::new(ok, c.txid, c.cmd_id);
-                let tree = mgr.search(c.tree_id).unwrap();
                 let r = match c.sub_type() {
                     PayloadType::Insert => {
                         let i = c.put();
@@ -340,12 +292,10 @@ impl Recovery {
         }
     }
 
-    fn undo(&self, block: &mut Block, mgr: &Registry) {
-        let reader = WalReader::new(&mgr.store.context);
+    fn undo(&self, block: &mut Block, tree: &Tree) {
+        let reader = WalReader::new(&tree.store.context);
         for (txid, addr) in &self.undo_table {
-            reader.rollback(block, *txid, *addr, |id| {
-                mgr.search(id).expect("invalid tree id")
-            });
+            reader.rollback(block, *txid, *addr, tree);
         }
     }
 
@@ -450,10 +400,6 @@ impl Recovery {
                 log::trace!("load wal {:?}", h);
 
                 match h {
-                    EntryType::TreeDel | EntryType::TreePut => {
-                        let t = ptr_to::<WalTree>(buf.as_ptr());
-                        oracle = max(oracle, t.txid);
-                    }
                     EntryType::Begin => {
                         let b = ptr_to::<WalBegin>(buf.as_ptr());
                         oracle = max(oracle, b.txid);

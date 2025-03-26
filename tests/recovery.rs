@@ -1,4 +1,4 @@
-use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath};
+use mace::{Mace, OpCode, Options, RandomPath};
 use std::{
     fs::File,
     io::Write,
@@ -13,46 +13,40 @@ fn intact_meta() {
     let mut saved = opt.clone();
     let db = Mace::new(opt).unwrap();
     let nr_kv = 10;
-    let tx = db.default();
     let mut pair = Vec::with_capacity(nr_kv);
 
     for i in 0..nr_kv {
         pair.push((format!("key_{i}"), format!("val_{i}")));
     }
 
-    let _ = tx.begin(IsolationLevel::SI, |kv| {
-        for (k, v) in &pair {
-            kv.put(k, v).expect("can't insert kv");
-        }
-        kv.commit()
-    });
+    let kv = db.begin().unwrap();
+    for (k, v) in &pair {
+        kv.put(k, v).expect("can't insert kv");
+    }
+    kv.commit().unwrap();
 
-    let _ = tx.begin(IsolationLevel::SI, |kv| {
-        for (i, (k, _)) in pair.iter().enumerate() {
-            if i % 2 == 0 {
-                kv.del(k).expect("can't del");
-            }
+    let kv = db.begin().unwrap();
+    for (i, (k, _)) in pair.iter().enumerate() {
+        if i % 2 == 0 {
+            kv.del(k).expect("can't del");
         }
-        kv.commit()
-    });
+    }
+    kv.commit().unwrap();
 
     drop(db);
 
     saved.tmp_store = true;
     let db = Mace::new(saved).unwrap();
-    let tx = db.default();
-    let _ = tx.view(IsolationLevel::SI, |view| {
-        for (i, (k, v)) in pair.iter().enumerate() {
-            if i % 2 == 0 {
-                let r = view.get(k);
-                assert!(r.is_err());
-            } else {
-                let r = view.get(k).expect("can't get key");
-                assert_eq!(r.data(), v.as_bytes());
-            }
+    let view = db.view().unwrap();
+    for (i, (k, v)) in pair.iter().enumerate() {
+        if i % 2 == 0 {
+            let r = view.get(k);
+            assert!(r.is_err());
+        } else {
+            let r = view.get(k).expect("can't get key");
+            assert_eq!(r.data(), v.as_bytes());
         }
-        Ok(())
-    });
+    }
 }
 
 fn break_meta(path: PathBuf) {
@@ -71,17 +65,13 @@ fn bad_meta() {
     let mut save = opt.clone();
     let db = Mace::new(opt).unwrap();
 
-    let tx = db.default();
+    let kv = db.begin().unwrap();
+    kv.put("114514", "1919810").unwrap();
+    kv.commit().unwrap();
 
-    let _ = tx.begin(IsolationLevel::SI, |kv| {
-        kv.put("114514", "1919810").unwrap();
-        kv.commit()
-    });
-
-    let _ = tx.begin(IsolationLevel::SI, |kv| {
-        kv.put("mo", "ha").unwrap();
-        Ok(())
-    });
+    let kv = db.begin().unwrap();
+    kv.put("mo", "ha").unwrap();
+    kv.rollback().unwrap();
 
     drop(db);
 
@@ -89,15 +79,12 @@ fn bad_meta() {
 
     save.tmp_store = true;
     let db = Mace::new(save).unwrap();
-    let tx = db.default();
 
-    let _ = tx.view(IsolationLevel::SI, |kv| {
-        let x = kv.get("114514").expect("not found");
-        assert_eq!(x.data(), "1919810".as_bytes());
-        let x = kv.get("mo");
-        assert!(x.is_err());
-        Ok(())
-    });
+    let view = db.view().unwrap();
+    let x = view.get("114514").expect("not found");
+    assert_eq!(x.data(), "1919810".as_bytes());
+    let x = view.get("mo");
+    assert!(x.is_err());
 }
 
 #[test]
@@ -108,33 +95,28 @@ fn crash_again() {
 
     {
         let db = Mace::new(opt).unwrap();
-        let tx = db.default();
-        let _ = tx.begin(IsolationLevel::SI, |kv| {
-            kv.put("foo", "bar").unwrap();
-            kv.commit()
-        });
+        let kv = db.begin().unwrap();
+        kv.put("foo", "bar").unwrap();
+        kv.commit().unwrap();
 
-        let _ = tx.begin(IsolationLevel::SI, |kv| {
-            kv.put("mo", "+1s").unwrap();
-            Ok(())
-        });
+        let kv = db.begin().unwrap();
+        kv.put("mo", "+1s").unwrap();
+        // implicitly rollback
     }
 
     break_meta(save.meta_file());
 
     {
         let db = Mace::new(save.clone()).unwrap();
-        let tx = db.default();
 
-        let _ = tx.begin(IsolationLevel::SI, |kv| {
-            let x = kv.get("foo").expect("not found");
-            assert_eq!(x.data(), "bar".as_bytes());
-            let x = kv.get("mo");
-            assert!(x.is_err());
+        let kv = db.begin().unwrap();
+        let x = kv.get("foo").expect("not found");
+        assert_eq!(x.data(), "bar".as_bytes());
+        let x = kv.get("mo");
+        assert!(x.is_err());
 
-            kv.put("114", "514").unwrap();
-            Ok(())
-        });
+        kv.put("114", "514").unwrap();
+        // implicitly rollback
     }
 
     break_meta(save.meta_file());
@@ -142,17 +124,14 @@ fn crash_again() {
     {
         save.tmp_store = true;
         let db = Mace::new(save.clone()).unwrap();
-        let tx = db.default();
 
-        let _ = tx.view(IsolationLevel::SI, |view| {
-            let r = view.get("foo").expect("not found");
-            assert_eq!(r.data(), "bar".as_bytes());
-            let r = view.get("mo");
-            assert!(r.is_err());
-            let r = view.get("114");
-            assert!(r.is_err());
-            Ok(())
-        });
+        let view = db.view().unwrap();
+        let r = view.get("foo").expect("not found");
+        assert_eq!(r.data(), "bar".as_bytes());
+        let r = view.get("mo");
+        assert!(r.is_err());
+        let r = view.get("114");
+        assert!(r.is_err());
     }
 }
 
@@ -165,13 +144,11 @@ where
     let mut save = opt.clone();
     let db = Mace::new(opt).unwrap();
 
-    let tx = db.default();
-    let _ = tx.begin(IsolationLevel::SI, |kv| {
-        kv.put("114514", "1919810").unwrap();
-        kv.commit()
-    });
+    let kv = db.begin().unwrap();
+    kv.put("114514", "1919810").unwrap();
+    kv.commit().unwrap();
 
-    let _ = tx.begin(IsolationLevel::SI, |_| Ok(()));
+    let _ = db.begin().unwrap();
 
     drop(db);
 
@@ -179,12 +156,9 @@ where
 
     save.tmp_store = true;
     let db = Mace::new(save).unwrap();
-    let tx = db.default();
-    let _ = tx.view(IsolationLevel::SI, |view| {
-        let x = view.get("114514").expect("not found");
-        assert_eq!(x.data(), "1919810".as_bytes());
-        Ok(())
-    });
+    let view = db.view().unwrap();
+    let x = view.get("114514").expect("not found");
+    assert_eq!(x.data(), "1919810".as_bytes());
 }
 
 #[test]
@@ -211,18 +185,16 @@ fn recover_after_insert() {
     let db = Mace::new(opt).unwrap();
     let mut pairs = Vec::new();
 
-    let tx = db.default();
     for i in 0..1000 {
         pairs.push((format!("key_{}", i), format!("val_{}", i)));
     }
 
-    let _ = tx.begin(IsolationLevel::SI, |kv| {
-        for (k, v) in &pairs {
-            kv.put(k, v).unwrap();
-        }
+    let kv = db.begin().unwrap();
+    for (k, v) in &pairs {
+        kv.put(k, v).unwrap();
+    }
 
-        kv.commit()
-    });
+    kv.commit().unwrap();
 
     drop(db);
 
@@ -230,14 +202,11 @@ fn recover_after_insert() {
 
     save.tmp_store = true;
     let db = Mace::new(save).unwrap();
-    let tx = db.default();
-    let _ = tx.view(IsolationLevel::SI, |view| {
-        for (k, v) in &pairs {
-            let r = view.get(k).unwrap();
-            assert_eq!(r.data(), v.as_bytes());
-        }
-        Ok(())
-    });
+    let view = db.view().unwrap();
+    for (k, v) in &pairs {
+        let r = view.get(k).unwrap();
+        assert_eq!(r.data(), v.as_bytes());
+    }
 }
 
 #[test]
@@ -258,31 +227,27 @@ fn put_update(remove_data: bool) {
         new_pairs.push((format!("key_{}", i), format!("new_val_{}", i)));
     }
 
-    let tx = db.alloc().unwrap();
     for (k, v) in &pairs {
-        let _ = tx.begin(IsolationLevel::SI, |kv| {
-            kv.put(k, v).unwrap();
-            kv.commit()
-        });
+        let kv = db.begin().unwrap();
+        kv.put(k, v).unwrap();
+        kv.commit().unwrap();
     }
 
     for _ in 0..3 {
         for (k, v) in &new_pairs {
-            let _ = tx.begin(IsolationLevel::SI, |kv| {
-                kv.update(k, v).unwrap();
-                kv.commit()
-            });
+            let kv = db.begin().unwrap();
+            kv.update(k, v).unwrap();
+            kv.commit().unwrap();
         }
     }
 
-    let _ = tx.view(IsolationLevel::SI, |view| {
-        for (k, v) in &new_pairs {
-            let r = view.get(k).expect("not found");
-            assert_eq!(r.data(), v.as_bytes());
-        }
-        Ok(())
-    });
+    let view = db.view().unwrap();
+    for (k, v) in &new_pairs {
+        let r = view.get(k).expect("not found");
+        assert_eq!(r.data(), v.as_bytes());
+    }
 
+    drop(view);
     drop(db);
     break_meta(save.meta_file());
     if remove_data {
@@ -301,15 +266,12 @@ fn put_update(remove_data: bool) {
 
     save.tmp_store = true;
     let db = Mace::new(save).unwrap();
-    let tx = db.get(tx.id()).unwrap();
 
-    let _ = tx.view(IsolationLevel::SI, |view| {
-        for (k, v) in &new_pairs {
-            let r = view.get(k).expect("not found");
-            assert_eq!(r.data(), v.as_bytes());
-        }
-        Ok(())
-    });
+    let view = db.view().unwrap();
+    for (k, v) in &new_pairs {
+        let r = view.get(k).expect("not found");
+        assert_eq!(r.data(), v.as_bytes());
+    }
 }
 
 #[test]
@@ -324,19 +286,16 @@ fn recover_after_remove() {
         pairs.push((format!("key_{}", i), format!("val_{}", i)));
     }
 
-    let tx = db.default();
     for (k, v) in &pairs {
-        let _ = tx.begin(IsolationLevel::SI, |kv| {
-            kv.put(k, v).unwrap();
-            kv.commit()
-        });
+        let kv = db.begin().unwrap();
+        kv.put(k, v).unwrap();
+        kv.commit().unwrap();
     }
 
     for (k, _) in &pairs {
-        let _ = tx.begin(IsolationLevel::SI, |kv| {
-            kv.del(k).unwrap();
-            kv.commit()
-        });
+        let kv = db.begin().unwrap();
+        kv.del(k).unwrap();
+        kv.commit().unwrap();
     }
 
     drop(db);
@@ -344,15 +303,12 @@ fn recover_after_remove() {
 
     save.tmp_store = true;
     let db = Mace::new(save).unwrap();
-    let tx = db.default();
-    let _ = tx.view(IsolationLevel::SI, |view| {
-        for (k, _) in &pairs {
-            let r = view.get(k);
-            assert!(r.is_err());
-            assert_eq!(r.err().unwrap(), OpCode::NotFound);
-        }
-        Ok(())
-    });
+    let view = db.view().unwrap();
+    for (k, _) in &pairs {
+        let r = view.get(k);
+        assert!(r.is_err());
+        assert_eq!(r.err().unwrap(), OpCode::NotFound);
+    }
 }
 
 fn ckpt_wal(keys: usize, wal_len: u32) {
@@ -369,19 +325,16 @@ fn ckpt_wal(keys: usize, wal_len: u32) {
         data.push((format!("key_{}", i), format!("val_{}", i)));
     }
 
-    let tx = db.default();
-    let _ = tx.begin(IsolationLevel::SI, |kv| {
-        for (k, v) in &data {
-            kv.put(k, v).unwrap();
-        }
-        kv.commit()
-    });
+    let kv = db.begin().unwrap();
+    for (k, v) in &data {
+        kv.put(k, v).unwrap();
+    }
+    kv.commit().unwrap();
 
     for (k, v) in &data {
-        let _ = tx.begin(IsolationLevel::SI, |kv| {
-            kv.update(k, v).unwrap();
-            kv.commit()
-        });
+        let kv = db.begin().unwrap();
+        kv.update(k, v).unwrap();
+        kv.commit().unwrap();
     }
 
     drop(db);
@@ -390,14 +343,11 @@ fn ckpt_wal(keys: usize, wal_len: u32) {
 
     save.tmp_store = true;
     let db = Mace::new(save).unwrap();
-    let tx = db.default();
-    let _ = tx.view(IsolationLevel::SI, |view| {
-        for (k, v) in &data {
-            let r = view.get(k).expect("not found");
-            assert_eq!(r.data(), v.as_bytes());
-        }
-        Ok(())
-    });
+    let view = db.view().unwrap();
+    for (k, v) in &data {
+        let r = view.get(k).expect("not found");
+        assert_eq!(r.data(), v.as_bytes());
+    }
 }
 
 #[test]
@@ -423,30 +373,26 @@ fn long_txn_impl(before: bool) {
         pair.push((format!("key_{}", i), format!("key_{}", i)));
     }
 
-    let tx = db.default();
-    let ctx = tx.clone();
     let cb = b.clone();
+    let db2 = db.clone();
     let t = std::thread::spawn(move || {
-        let _ = ctx.begin(IsolationLevel::SI, |kv| {
-            kv.put("foo", "bar").unwrap();
-            kv.commit()
-        });
+        let kv = db2.begin().unwrap();
+        kv.put("foo", "bar").unwrap();
+        kv.commit().unwrap();
 
         cb.wait();
-        let _ = ctx.begin(IsolationLevel::SI, |kv| {
-            kv.put("mo", "+1s").unwrap();
-            Ok(())
-        });
+        let kv = db2.begin().unwrap();
+        kv.put("mo", "+1s").unwrap();
+        // implicitly rollback
     });
 
     if before {
         b.wait();
     }
     for (k, v) in &pair {
-        let _ = tx.begin(IsolationLevel::SI, |kv| {
-            kv.put(k, v).unwrap();
-            kv.commit()
-        });
+        let kv = db.begin().unwrap();
+        kv.put(k, v).unwrap();
+        kv.commit().unwrap();
     }
 
     if !before {
@@ -459,19 +405,16 @@ fn long_txn_impl(before: bool) {
 
     save.tmp_store = true;
     let db = Mace::new(save).unwrap();
-    let tx = db.default();
-    let _ = tx.view(IsolationLevel::SI, |view| {
-        for (k, v) in &pair {
-            let r = view.get(k).expect("not found");
-            assert_eq!(r.data(), v.as_bytes());
-        }
+    let view = db.view().unwrap();
+    for (k, v) in &pair {
+        let r = view.get(k).expect("not found");
+        assert_eq!(r.data(), v.as_bytes());
+    }
 
-        let r = view.get("foo").expect("not found");
-        assert_eq!(r.data(), "bar".as_bytes());
-        let r = view.get("mo");
-        assert!(r.is_err() && r.err().unwrap() == OpCode::NotFound);
-        Ok(())
-    });
+    let r = view.get("foo").expect("not found");
+    assert_eq!(r.data(), "bar".as_bytes());
+    let r = view.get("mo");
+    assert!(r.is_err() && r.err().unwrap() == OpCode::NotFound);
 }
 
 #[test]

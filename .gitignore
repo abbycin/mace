@@ -5,5 +5,4 @@
 .idea
 .vscode
 .cache
-DESIGN.*
 Cargo.lock

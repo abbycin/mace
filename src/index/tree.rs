@@ -9,7 +9,6 @@ use super::{
     systxn::SysTxn,
 };
 
-use crate::utils::NULL_ORACLE;
 use crate::{
     cc::data::Ver,
     index::{
@@ -20,49 +19,17 @@ use crate::{
     utils::{
         bytes::ByteArray,
         traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
-        unpack_id, NULL_CMD, NULL_PID, ROOT_PID,
+        unpack_id, NULL_CMD,
     },
     OpCode, Store,
 };
+use crate::{utils::NULL_ORACLE, Record};
 use std::{collections::VecDeque, sync::Arc};
 
-struct RegistryIter<'a> {
-    iter: PageMergeIter<'a, Key<'a>, Value<&'a [u8]>>,
-    last: Option<&'a [u8]>,
-}
-
-impl<'a> RegistryIter<'a> {
-    fn new(iter: PageMergeIter<'a, Key<'a>, Value<&'a [u8]>>, _txid: u64) -> Self {
-        Self { iter, last: None }
-    }
-}
-
-impl<'a> Iterator for RegistryIter<'a> {
-    type Item = (Key<'a>, Value<&'a [u8]>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        for (k, v) in &mut self.iter {
-            if let Some(last) = self.last {
-                if k.raw == last {
-                    continue;
-                }
-            }
-            self.last = Some(k.raw);
-            return Some((k, v));
-        }
-        None
-    }
-}
-
-impl IPageIter for RegistryIter<'_> {
-    fn rewind(&mut self) {
-        self.iter.rewind();
-        self.last = None;
-    }
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Range<'a> {
+    /// left and right boundary key of current page, key_pq is routing to current page, while key_qr
+    /// is routing to new allocated split page
     key_pq: &'a [u8],
     key_qr: Option<&'a [u8]>,
 }
@@ -111,36 +78,30 @@ where
 }
 
 #[derive(Clone, Copy)]
-pub struct View<'a> {
+pub struct View {
     pub page_id: u64,
     pub page_addr: u64,
     pub info: PageHeader,
-    /// left and right boundary key of current page, key_pq is routing to current page, while key_qr
-    /// is routing to new allocated split page
-    pub range: Range<'a>,
 }
 
 #[derive(Clone)]
 pub struct Tree {
     pub(crate) store: Arc<Store>,
     root_index: Index,
-    id: u64,
 }
 
 impl Tree {
-    pub fn load(store: Arc<Store>, root_pid: u64, id: u64) -> Self {
+    pub fn load(store: Arc<Store>, root_pid: u64) -> Self {
         Self {
             store: store.clone(),
             root_index: Index::new(root_pid, 0),
-            id,
         }
     }
 
-    pub fn new(store: Arc<Store>, root_pid: u64, id: u64) -> Self {
+    pub fn new(store: Arc<Store>, root_pid: u64) -> Self {
         let this = Self {
             store: store.clone(),
             root_index: Index::new(root_pid, 0),
-            id,
         };
 
         this.init();
@@ -160,62 +121,9 @@ impl Tree {
         txn.update_unchecked(self.root_index.pid, &mut f);
     }
 
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub fn root_pid(&self) -> u64 {
-        self.root_index.pid
-    }
-
-    fn remove_dfs(&self, pid: u64) {
-        let mut link = self.store.page.get(pid);
-        let saved = link;
-
-        while link != NULL_PID {
-            let f = self.store.buffer.load(link);
-            let h: PageHeader = f.payload().into();
-
-            if h.is_leaf() && h.is_split() {
-                let pg = Page::<&[u8], Index>::from(f.payload());
-                let idx = pg.val_at(0);
-                // the split-delta may be already unmapped, because it may co-exist in leaf and intl
-                // we must perform CAS in case the pid was reused
-                let _ = self.store.page.unmap(idx.pid, link).inspect_err(|_| {
-                    log::warn!("pid {} to {:?} already unmapped", idx.pid, unpack_id(link));
-                });
-                break;
-            }
-
-            if h.is_intl() {
-                let pg = Page::<&[u8], Index>::from(f.payload());
-                for i in (0..h.elems as usize).rev() {
-                    let idx = pg.val_at(i);
-                    self.remove_dfs(idx.pid);
-                }
-            }
-            link = h.link();
-        }
-
-        let _ = self.store.page.unmap(pid, saved).inspect_err(|_| {
-            log::warn!("pid {} to {:?} already unmapped", pid, unpack_id(saved));
-        });
-    }
-
-    // TODO: Garbage collect the unmapped frames (including it's sibling)
-    // caller must ensure we are the only one who is accessing the tree
-    pub fn remove_all(&self) {
-        self.remove_dfs(self.root_index.pid);
-    }
-
     #[inline]
     pub(crate) fn begin(&self) -> SysTxn {
         SysTxn::new(&self.store)
-    }
-
-    #[inline]
-    pub fn is_mgr(&self) -> bool {
-        self.root_index.pid == ROOT_PID
     }
 
     fn walk_page<F, K, V>(&self, mut addr: u64, mut f: F) -> Result<(), OpCode>
@@ -238,17 +146,15 @@ impl Tree {
         Ok(())
     }
 
-    fn find_leaf<T>(
-        &self,
-        txn: &mut SysTxn,
-        key: &[u8],
-    ) -> Result<(View<'_>, Option<View<'_>>), OpCode>
+    fn find_leaf<T>(&self, key: &[u8]) -> Result<(View, Option<View>), OpCode>
     where
         T: IValCodec,
     {
+        // used to pin frame that referenced by range
+        let mut guard = Vec::new();
         loop {
-            txn.unpin_all();
-            match self.try_find_leaf::<T>(txn, key) {
+            guard.clear();
+            match self.try_find_leaf::<T>(&mut guard, key) {
                 Ok((view, parent)) => return Ok((view, parent)),
                 Err(OpCode::Again) => continue,
                 Err(e) => unreachable!("invalid error {:?}", e),
@@ -256,31 +162,23 @@ impl Tree {
         }
     }
 
-    pub(crate) fn page_view<'b>(
-        store: &Store,
-        pid: u64,
-        range: Range<'b>,
-    ) -> (FrameOwner, View<'b>) {
+    pub(crate) fn page_view(store: &Store, pid: u64) -> View {
         let addr = store.page.get(pid);
         assert_ne!(addr, 0);
         let f = store.buffer.load(addr);
         let b = f.payload();
-        (
-            f,
-            View {
-                page_id: pid,
-                page_addr: addr,
-                info: b.into(),
-                range,
-            },
-        )
+        View {
+            page_id: pid,
+            page_addr: addr,
+            info: b.into(),
+        }
     }
 
     fn try_find_leaf<T>(
         &self,
-        txn: &mut SysTxn,
+        guard: &mut Vec<FrameOwner>,
         key: &[u8],
-    ) -> Result<(View<'_>, Option<View<'_>>), OpCode>
+    ) -> Result<(View, Option<View>), OpCode>
     where
         T: IValCodec,
     {
@@ -289,23 +187,20 @@ impl Tree {
         let mut parent = None;
 
         loop {
-            let (frame, view) = Self::page_view(&self.store, index.pid, range);
-            txn.pin(frame);
+            let view = Self::page_view(&self.store, index.pid);
 
-            // split may happen during search, in this case new created node are
+            // split may happen during search, in this case new created nodes are
             // not inserted into parent yet, the insert is halfly done, the
             // search can reach the `split delta` whose epoch are not equal to
             // previous one, and any modification operation CAN NOT proceed,
             // since we simplified the `find_child` process to handle data only,
             // if any other modification operation is allowed, will cause leaf
             // node disordered, by the way, any operation (including lookup)
-            // will go through this function and check the conditionW
+            // will go through this function and check the condition
             if view.info.epoch() != index.epoch {
-                if self.parent_update::<T>(txn, view, parent).is_ok() {
+                if self.parent_update::<T>(view, parent, range).is_ok() {
                     // get rid of those keys were moved to new node, for prefix scan
-                    while self.consolidate::<T>(txn, view).is_err() {
-                        std::hint::spin_loop();
-                    }
+                    self.force_consolidate::<T>(view.page_id);
                 }
                 // simplified: retry from root, thanks to the large fanout
                 return Err(OpCode::Again);
@@ -317,7 +212,7 @@ impl Tree {
             parent = Some(view);
 
             let (child_index, child_range) = self
-                .find_child(txn, key, view.page_addr)
+                .find_child(guard, key, view.page_addr)
                 .expect("child is always exist in B-Tree");
             index = child_index;
             range.key_pq = child_range.key_pq;
@@ -329,7 +224,7 @@ impl Tree {
 
     fn find_child<'a>(
         &self,
-        txn: &mut SysTxn,
+        guard: &mut Vec<FrameOwner>,
         key: &[u8],
         addr: u64,
     ) -> Option<(Index, Range<'a>)> {
@@ -365,7 +260,7 @@ impl Tree {
                             key_pq,
                             key_qr: r.map(|(key_qr, _)| key_qr),
                         };
-                        txn.pin(frame);
+                        guard.push(frame);
                         child = Some((index, range));
                         return true;
                     }
@@ -376,12 +271,7 @@ impl Tree {
         child
     }
 
-    fn possible_successor<T>(
-        &self,
-        txn: &mut SysTxn,
-        key: &[u8],
-        prefix: &[u8],
-    ) -> Option<(FrameOwner, Option<&[u8]>)>
+    fn possible_successor<T>(&self, key: &[u8], prefix: &[u8]) -> Option<(u64, Option<Vec<u8>>)>
     where
         T: IValCodec,
     {
@@ -390,12 +280,14 @@ impl Tree {
         let mut parent = None;
         let mut successor = None;
         let mut found = false;
+        // used to pin frame that referenced by range
+        let mut guard = Vec::new();
 
         loop {
-            let (frame, view) = Self::page_view(&self.store, index.pid, range);
+            let view = Self::page_view(&self.store, index.pid);
             if view.info.epoch() != index.epoch {
-                if self.parent_update::<T>(txn, view, parent).is_ok() {
-                    let _ = self.consolidate::<T>(txn, view);
+                if self.parent_update::<T>(view, parent, range).is_ok() {
+                    let _ = self.consolidate::<T>(view);
                 }
                 // reset and retry
                 index = self.root_index;
@@ -403,15 +295,14 @@ impl Tree {
                 parent = None;
                 successor = None;
                 found = false;
-                txn.unpin_all();
+                guard.clear();
                 continue;
             }
 
             if view.info.is_leaf() {
-                return Some((frame, successor));
+                return Some((view.page_addr, successor));
             }
             parent = Some(view);
-            txn.pin(frame);
 
             let mut child = None;
             let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<&[u8], Index>| {
@@ -434,7 +325,6 @@ impl Tree {
 
                     if let Some((ikey, index)) = l {
                         let pos = pos.expect("can't be None");
-                        txn.pin(frame);
                         // we will continue to find the insert position even `found` was set, it's
                         // necessary for performing `parent_update` correctly
                         if !found {
@@ -442,11 +332,12 @@ impl Tree {
                             // move to next node
                             if let Some((k, _)) = pg.get(pos + 1) {
                                 if k.starts_with(prefix) {
-                                    successor = Some(k);
+                                    successor = Some(k.to_vec());
                                 }
                             }
                         }
                         if index != NULL_INDEX {
+                            guard.push(frame);
                             let range = Range {
                                 key_pq: ikey,
                                 key_qr: r.map(|(key_qr, _)| key_qr),
@@ -477,7 +368,6 @@ impl Tree {
 
     fn prepend<K, T, F>(
         &self,
-        txn: &mut SysTxn,
         view: &mut View,
         key: &K,
         val: &Value<T>,
@@ -493,6 +383,7 @@ impl Tree {
         if delta.size() > self.store.opt.page_size - PAGE_HEADER_SIZE {
             return Err(OpCode::TooLarge);
         }
+        let mut txn = self.begin();
         let mut f = txn.alloc(delta.size())?;
         let (new_addr, mut new_page) = (f.addr(), Page::from(f.payload()));
         debug_assert!(new_addr > view.page_addr);
@@ -541,16 +432,15 @@ impl Tree {
         K: IKey,
         T: IValCodec,
     {
-        let mut txn = self.begin();
-        let (mut view, _) = self.find_leaf::<T>(&mut txn, key.raw()).unwrap();
+        let (mut view, _) = self.find_leaf::<T>(key.raw()).unwrap();
 
-        if self.need_split(&view) && self.split::<T>(&mut txn, view).is_ok() {
+        if self.need_split(&view) && self.split::<T>(view).is_ok() {
             return Err(OpCode::Again);
         }
 
-        self.prepend(&mut txn, &mut view, key, val, |_, _| Ok(()))?;
+        self.prepend(&mut view, key, val, |_, _| Ok(()))?;
 
-        let _ = self.try_consolidate::<T>(&mut txn, view);
+        let _ = self.try_consolidate::<T>(view);
 
         Ok(())
     }
@@ -594,7 +484,6 @@ impl Tree {
 
     fn try_update<T1, T2, V>(
         &self,
-        txn: &mut SysTxn,
         key: &Key,
         val: &Value<T1>,
         visible: &mut V,
@@ -604,17 +493,17 @@ impl Tree {
         T2: IValCodec,
         V: FnMut(&Option<(Key, ValRef<T2>)>) -> Result<(), OpCode>,
     {
-        let (mut view, _) = self.find_leaf::<T2>(txn, key.raw).unwrap();
-        if self.need_split(&view) && self.split::<T2>(txn, view).is_ok() {
+        let (mut view, _) = self.find_leaf::<T2>(key.raw).unwrap();
+        if self.need_split(&view) && self.split::<T2>(view).is_ok() {
             return Err(OpCode::Again);
         }
         let mut r = None;
-        self.prepend(txn, &mut view, key, val, |addr, key| {
+        self.prepend(&mut view, key, val, |addr, key| {
             r = self.search(addr, key);
             visible(&r)
         })?;
 
-        let _ = self.try_consolidate::<T2>(txn, view);
+        let _ = self.try_consolidate::<T2>(view);
         Ok(r.map(|x| x.1.clone()))
     }
 
@@ -630,9 +519,8 @@ impl Tree {
         T2: IValCodec,
         V: FnMut(&Option<(Key, ValRef<T2>)>) -> Result<(), OpCode>,
     {
-        let mut txn = self.begin();
         loop {
-            match self.try_update(&mut txn, &key, &val, &mut visible) {
+            match self.try_update(&key, &val, &mut visible) {
                 Ok(x) => return Ok(x),
                 Err(OpCode::Again) => continue,
                 Err(e) => return Err(e),
@@ -697,8 +585,7 @@ impl Tree {
         K: IKey,
         T: IValCodec,
     {
-        let mut txn = self.begin();
-        let (view, _) = self.find_leaf::<T>(&mut txn, key.raw())?;
+        let (view, _) = self.find_leaf::<T>(key.raw())?;
         let mut data = Err(OpCode::NotFound);
         let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<K, Value<T>>| {
             if pg.header().is_data() {
@@ -759,8 +646,7 @@ impl Tree {
         T: IValCodec,
         F: FnMut(u64, &T) -> bool,
     {
-        let mut txn = self.begin();
-        let (view, _) = self.find_leaf::<T>(&mut txn, key.raw)?;
+        let (view, _) = self.find_leaf::<T>(key.raw)?;
         let mut latest: Option<ValRef<T>> = None;
         let _ = self.walk_page(view.page_addr, |f, _, pg: Page<Key, Value<T>>| {
             let h = pg.header();
@@ -814,9 +700,9 @@ impl Tree {
     // consolidating before split, the possible delta chain:
     // add -> del -> add -> split -> base
     fn collect_delta<'a, K, V>(
-        &'a self,
+        &self,
         txn: &mut SysTxn,
-        view: &View<'a>,
+        view: &View,
     ) -> (PageMergeIter<'a, K, V>, PageHeader)
     where
         K: IKey,
@@ -856,19 +742,15 @@ impl Tree {
         self.store.context.wmk_oldest()
     }
 
-    fn do_consolidate<'a, F, I, K, V>(
-        &'a self,
-        txn: &mut SysTxn,
-        mut view: View<'a>,
-        f: F,
-    ) -> Result<View<'a>, OpCode>
+    fn do_consolidate<'a, F, I, K, V>(&self, mut view: View, f: F) -> Result<View, OpCode>
     where
         F: Fn(PageMergeIter<'a, K, V>, u64) -> I,
         I: IPageIter<Item = (K, V)>,
         K: IKey,
         V: IVal,
     {
-        let (iter, info) = self.collect_delta(txn, &view);
+        let mut txn = self.begin();
+        let (iter, info) = self.collect_delta(&mut txn, &view);
         let iter = f(iter, self.get_txid());
         let mut delta = Delta::new(view.info.delta_type(), view.info.node_type()).from(iter);
         let mut frame = txn.alloc(delta.size())?;
@@ -891,7 +773,7 @@ impl Tree {
     }
 
     fn add_sibling<'a, T, F>(
-        &'a self,
+        &self,
         raw: &'a [u8],
         b: &mut LeafMergeIter<'a, T>,
         mut addr: u64,
@@ -914,11 +796,11 @@ impl Tree {
         }
     }
 
-    fn collect_leaf<'a, T: IValCodec>(
-        &'a self,
+    fn collect_leaf<T: IValCodec>(
+        &self,
         txn: &mut SysTxn,
-        view: &View<'a>,
-        b: &mut LeafMergeIter<'a, T>,
+        view: &View,
+        b: &mut LeafMergeIter<'_, T>,
     ) -> PageHeader {
         let mut info = view.info;
         let mut split = None;
@@ -971,19 +853,16 @@ impl Tree {
         info
     }
 
-    fn consolidate_leaf<'a, T: IValCodec>(
-        &'a self,
-        txn: &mut SysTxn,
-        mut view: View<'a>,
-    ) -> Result<View<'a>, OpCode> {
+    fn consolidate_leaf<T: IValCodec>(&self, mut view: View) -> Result<View, OpCode> {
         let cap = view.info.depth() as usize;
         let mut iter = LeafMergeIter::new(cap);
-        let info = self.collect_leaf(txn, &view, &mut iter);
+        let mut txn = self.begin();
+        let info = self.collect_leaf(&mut txn, &view, &mut iter);
         iter.purge(self.get_txid());
 
         let mut builder = FuseBuilder::<T>::new(info.delta_type(), info.node_type());
         builder.prepare(iter);
-        let mut f = builder.build(txn)?;
+        let mut f = builder.build(&mut txn)?;
         let (new_addr, mut new_page) = (f.addr(), Page::<Key, Value<T>>::from(f.payload()));
         debug_assert!(new_addr > view.page_addr);
 
@@ -1005,27 +884,38 @@ impl Tree {
     }
 
     /// NOTE: consolidate never retry
-    fn consolidate<'a, T>(&'a self, txn: &mut SysTxn, view: View<'a>) -> Result<View<'a>, OpCode>
+    #[inline]
+    fn consolidate<T>(&self, view: View) -> Result<View, OpCode>
     where
-        T: IValCodec + 'a,
+        T: IValCodec,
     {
-        if self.is_mgr() {
-            return self.do_consolidate(txn, view, RegistryIter::new);
-        }
         match view.info.node_type() {
-            NodeType::Intl => self.do_consolidate(txn, view, IntlMergeIter::new),
-            NodeType::Leaf => self.consolidate_leaf::<T>(txn, view),
+            NodeType::Intl => self.do_consolidate(view, IntlMergeIter::new),
+            NodeType::Leaf => self.consolidate_leaf::<T>(view),
         }
     }
 
-    fn try_consolidate<'a, T>(&'a self, txn: &mut SysTxn, mut view: View<'a>) -> Result<(), OpCode>
+    #[inline]
+    fn force_consolidate<T>(&self, pid: u64)
     where
-        T: IValCodec + 'a,
+        T: IValCodec,
+    {
+        loop {
+            let view = Self::page_view(&self.store, pid);
+            if self.consolidate::<T>(view).is_ok() {
+                break;
+            }
+        }
+    }
+
+    fn try_consolidate<T>(&self, mut view: View) -> Result<(), OpCode>
+    where
+        T: IValCodec,
     {
         if self.need_consolidate(&view.info) {
-            view = self.consolidate::<T>(txn, view)?;
+            view = self.consolidate::<T>(view)?;
             if self.need_split(&view) {
-                return self.split::<T>(txn, view);
+                return self.split::<T>(view);
             }
             // TODO: when consolidate result no delta, we should perform `merge`
             Ok(())
@@ -1035,22 +925,20 @@ impl Tree {
     }
 
     /// NOTE: this is the second phase of `split` smo
-    fn parent_update<'a, T>(
+    fn parent_update<T>(
         &self,
-        txn: &mut SysTxn,
         view: View,
-        parent: Option<View<'a>>,
+        mut parent: Option<View>,
+        range: Range<'_>,
     ) -> Result<(), OpCode>
     where
         T: IValCodec,
     {
         assert!(view.info.is_split());
 
-        let Some(mut parent) = parent else {
-            return Err(OpCode::Invalid);
-        };
+        let mut parent = parent.take().ok_or(OpCode::Invalid)?;
 
-        let lkey = view.range.key_pq;
+        let lkey = range.key_pq;
         // it's important to apply split-delta's epoch to left entry, this will
         // prevent parent_update from being executed again for the same delta
         let lidx = Index::new(view.page_id, view.info.epoch());
@@ -1062,12 +950,13 @@ impl Tree {
             page.get(0).expect("invalid page")
         };
         // add placeholder to help find_child
-        let entry_delta = if let Some(rkey) = view.range.key_qr {
+        let entry_delta = if let Some(rkey) = range.key_qr {
             vec![(lkey, lidx), (split_key, split_idx), (rkey, NULL_INDEX)]
         } else {
             vec![(lkey, lidx), (split_key, split_idx)]
         };
 
+        let mut txn = self.begin();
         let mut d = Delta::new(DeltaType::Data, NodeType::Intl).with_slice(&entry_delta);
         let mut f = txn.alloc(d.size())?;
         let (new_addr, mut new_page) = (f.addr(), Page::from(f.payload()));
@@ -1088,9 +977,7 @@ impl Tree {
             })
             .map_err(|_| OpCode::Again)?;
         // force consolidate make it ordered for prefix scan
-        while self.consolidate::<T>(txn, parent).is_err() {
-            std::hint::spin_loop();
-        }
+        self.force_consolidate::<T>(parent.page_id);
         Ok(())
     }
 
@@ -1113,7 +1000,7 @@ impl Tree {
         None
     }
 
-    fn split_root<K, V>(&self, txn: &mut SysTxn, view: View) -> Result<(), OpCode>
+    fn split_root<K, V>(&self, view: View) -> Result<(), OpCode>
     where
         K: IKey,
         V: IVal,
@@ -1131,6 +1018,7 @@ impl Tree {
             return Ok(());
         };
 
+        let mut txn = self.begin();
         let l = {
             let mut d = Delta::new(DeltaType::Data, view.info.node_type()).from(li);
             let mut f = txn.alloc(d.size())?;
@@ -1169,15 +1057,16 @@ impl Tree {
         self.root_index.pid == pid
     }
 
-    fn split_non_root<K, V>(&self, txn: &mut SysTxn, view: View) -> Result<(), OpCode>
+    fn split_non_root<K, V>(&self, view: View) -> Result<(), OpCode>
     where
         K: IKey,
         V: IVal,
     {
         if self.is_root(view.page_id) {
-            return self.split_root::<K, V>(txn, view);
+            return self.split_root::<K, V>(view);
         }
 
+        let mut txn = self.begin();
         let f = self.store.buffer.load(view.page_addr);
         let b = f.payload();
         let page = Page::<K, V>::from(b);
@@ -1225,7 +1114,7 @@ impl Tree {
         view.info.len >= max_size
     }
 
-    fn split<T>(&self, txn: &mut SysTxn, view: View) -> Result<(), OpCode>
+    fn split<T>(&self, view: View) -> Result<(), OpCode>
     where
         T: IValCodec,
     {
@@ -1233,46 +1122,48 @@ impl Tree {
         assert!(view.info.elems > 1);
 
         match view.info.node_type() {
-            NodeType::Intl => self.split_non_root::<&[u8], Index>(txn, view),
-            NodeType::Leaf => self.split_non_root::<Key, Value<T>>(txn, view),
+            NodeType::Intl => self.split_non_root::<&[u8], Index>(view),
+            NodeType::Leaf => self.split_non_root::<Key, Value<T>>(view),
         }
     }
 }
 
-pub struct SeekIter<'a, T>
+pub struct SeekIter<'a, 'b, T = Record<'b>>
 where
-    T: IValCodec,
+    T: IValCodec + 'b,
 {
     tree: &'a Tree,
     curr: Vec<u8>,
     next: Vec<u8>,
-    prefix: &'a [u8],
+    prefix: Vec<u8>,
     frames: VecDeque<FrameOwner>,
-    iter: LeafMergeIter<'a, T>,
-    check: Box<dyn FnMut(u64, &T) -> bool>,
+    iter: LeafMergeIter<'b, T>,
+    check: Box<dyn FnMut(u64, &T) -> bool + 'a>,
+    dtor: Box<dyn Fn() + 'a>,
     finish: bool,
     stop: bool,
 }
 
-impl<'a, T> SeekIter<'a, T>
+impl<'a, 'b, T> SeekIter<'a, 'b, T>
 where
-    T: IValCodec + 'a,
+    T: IValCodec + 'b,
 {
-    pub(crate) fn new<K, F>(tree: &'a Tree, prefix: K, f: F) -> Self
+    pub(crate) fn new<K, F, D>(tree: &'a Tree, prefix: K, f: F, dtor: D) -> Self
     where
         K: AsRef<[u8]>,
-        F: FnMut(u64, &T) -> bool + 'static,
+        F: FnMut(u64, &T) -> bool + 'a,
+        D: Fn() + 'a,
     {
-        let prefix = Self::extend_lifetime(prefix.as_ref());
-
+        let prefix = prefix.as_ref().to_vec();
         let mut this = Self {
             tree,
-            curr: Self::pre_prefix(prefix),
-            next: Self::next_prefix(prefix),
+            curr: Self::pre_prefix(&prefix),
+            next: Self::next_prefix(&prefix),
             prefix,
             frames: VecDeque::new(),
             iter: LeafMergeIter::new(64),
             check: Box::new(f),
+            dtor: Box::new(dtor),
             finish: false,
             stop: false,
         };
@@ -1309,21 +1200,18 @@ where
 
     fn collect_frames(&mut self) {
         if !self.finish {
-            let mut txn = self.tree.begin();
-            if let Some((f, next)) =
-                self.tree
-                    .possible_successor::<T>(&mut txn, &self.curr, self.prefix)
+            if let Some((addr, next)) = self.tree.possible_successor::<T>(&self.curr, &self.prefix)
             {
                 self.iter.reset();
                 let mut key = Key::new([].as_slice(), NULL_ORACLE, NULL_CMD);
                 self.tree
-                    .walk_page(f.addr(), |frame, _, pg: Page<Key, Value<T>>| {
+                    .walk_page(addr, |frame, _, pg: Page<Key, Value<T>>| {
                         let h = pg.header();
                         if h.is_data() {
                             debug_assert!(h.is_leaf());
                             key.raw = &self.curr;
                             let lo = pg.search_raw(&key).unwrap_or_else(|x| x);
-                            if lo == h.elems as usize || !Self::has_prefix(&pg, lo, self.prefix) {
+                            if lo == h.elems as usize || !Self::has_prefix(&pg, lo, &self.prefix) {
                                 return false;
                             }
                             key.raw = &self.next;
@@ -1355,11 +1243,6 @@ where
         self.stop = true;
     }
 
-    #[inline]
-    const fn extend_lifetime(x: &[u8]) -> &'static [u8] {
-        unsafe { std::slice::from_raw_parts(x.as_ptr(), x.len()) }
-    }
-
     fn get_next(&mut self) -> Option<<Self as Iterator>::Item> {
         while !self.stop {
             if let Some((k, v)) = self.iter.next() {
@@ -1368,15 +1251,16 @@ where
 
             self.collect_frames();
         }
+        (*self.dtor)();
         None
     }
 }
 
-impl<'a, T> Iterator for SeekIter<'a, T>
+impl<'b, T> Iterator for SeekIter<'_, 'b, T>
 where
-    T: IValCodec + 'a,
+    T: IValCodec + 'b,
 {
-    type Item = (&'a [u8], &'a [u8]);
+    type Item = (&'b [u8], &'b [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.get_next()
@@ -1385,112 +1269,31 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::path::Path;
     use std::sync::Arc;
 
     use super::{Store, Tree};
-    use crate::index::registry::Registry;
     use crate::store::recovery::Recovery;
     use crate::utils::traits::IValCodec;
 
-    use crate::RandomPath;
     use crate::{
         index::{data::Value, Key},
-        utils::ROOT_PID,
         OpCode, Options,
     };
+    use crate::{RandomPath, ROOT_PID};
 
-    fn new_mgr<T: AsRef<Path>>(path: T) -> Result<Registry, OpCode> {
-        let _ = std::fs::remove_dir_all(&path);
-        let opt = Arc::new(Options::new(&path));
+    fn new_tree(opt: Options) -> Tree {
+        let _ = std::fs::remove_dir_all(&opt.db_root);
+        let opt = Arc::new(opt);
         let (meta, table, mapping) = Recovery::new(opt.clone()).phase1();
         let store = Arc::new(Store::new(table, opt, meta.clone(), mapping).unwrap());
-        Ok(Registry::new(store))
-    }
-
-    fn put_test(t: &Tree, k: Key, v: Value<&[u8]>) {
-        assert!(t.put(k, v).is_ok());
-    }
-
-    fn get_test<const OK: bool>(t: &Tree, k: Key, v: Value<&[u8]>) {
-        let (rk, rv) = t.get::<Key, &[u8]>(k).unwrap();
-        assert!(k == rk);
-        if OK {
-            assert!(rv.is_put());
-            assert!(rv.raw.as_ref() == v.as_ref());
-        } else {
-            assert!(rv.is_del());
-        }
-    }
-
-    fn del_test(t: &Tree, k: Key, v: Value<&[u8]>) {
-        t.put(k, v).unwrap();
-    }
-
-    #[test]
-    fn multiple_tree() -> Result<(), OpCode> {
-        let path = RandomPath::tmp();
-        let mgr = new_mgr(path.clone())?;
-
-        let sb1 = mgr.create_tree()?;
-        let sb2 = mgr.create_tree()?;
-        let (k1, v1) = (
-            Key::new("elder".as_bytes(), 1, 0),
-            Value::Put("naive".as_bytes()),
-        );
-        let (k2, v2) = (
-            Key::new("senpai".as_bytes(), 1, 0),
-            Value::Put("114514".as_bytes()),
-        );
-
-        put_test(&sb1, k1, v1);
-
-        put_test(&sb2, k2, v2);
-
-        get_test::<true>(&sb1, k1, v1);
-        get_test::<true>(&sb2, k2, v2);
-
-        del_test(&sb1, k1, Value::Del("del".as_bytes()));
-        del_test(&sb2, k2, Value::Del("del".as_bytes()));
-
-        get_test::<false>(&sb1, k1, v1);
-        get_test::<false>(&sb2, k2, v2);
-
-        let s1 = mgr.get_tree(sb1.id())?;
-        let s2 = mgr.get_tree(sb2.id())?;
-
-        get_test::<false>(&s1, k1, v1);
-        get_test::<false>(&s2, k2, v2);
-
-        assert!(mgr.tree.get::<Key, &[u8]>(k1).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn more_subtree() -> Result<(), OpCode> {
-        let path = RandomPath::tmp();
-        let mgr = new_mgr(path.clone())?;
-
-        for i in 0..20 {
-            let s = mgr.create_tree()?;
-            assert_eq!(s.root_index.pid, i as u64 + ROOT_PID + 1);
-        }
-
-        let t1 = mgr.get_tree(2)?;
-        let t2 = mgr.get_tree(2)?;
-        let e = mgr.remove_tree(t1.id()).err();
-        assert_eq!(e, Some(OpCode::Again));
-        let o = mgr.remove_tree(t2.id());
-        assert!(o.is_ok());
-
-        Ok(())
+        Tree::new(store, ROOT_PID)
     }
 
     #[test]
     fn traverse() -> Result<(), OpCode> {
         let path = RandomPath::tmp();
-        let mgr = new_mgr(path.clone())?;
-        let s = mgr.create_tree()?;
+        let opt = Options::new(&*path);
+        let s = new_tree(opt);
 
         s.put(
             Key::new("elder".as_bytes(), 1, 0),
@@ -1519,11 +1322,7 @@ mod test {
         let path = RandomPath::tmp();
         let mut opt = Options::new(&*path);
         opt.consolidate_threshold = 4;
-        let opt = Arc::new(opt);
-        let (meta, table, mapping) = Recovery::new(opt.clone()).phase1();
-        let store = Arc::new(Store::new(table, opt, meta.clone(), mapping).unwrap());
-        let mgr = Registry::new(store);
-        let s = mgr.create_tree()?;
+        let s = new_tree(opt);
 
         let raw = "1".as_bytes();
 

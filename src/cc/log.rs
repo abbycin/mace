@@ -28,7 +28,7 @@ use super::{
     data::Ver,
     wal::{
         CkptMem, IWalCodec, IWalPayload, IWalRec, WalAbort, WalBegin, WalCheckpoint, WalCommit,
-        WalTree, WalUpdate,
+        WalUpdate,
     },
     worker::SyncWorker,
 };
@@ -102,7 +102,6 @@ fn set_lsn(data: *mut u8, mut off: usize, end: usize, lsn: &AtomicU64, beg: u64)
 
         // the data is always valid, not need to check
         sz = match h {
-            EntryType::TreePut | EntryType::TreeDel => WalTree::size(),
             EntryType::Abort | EntryType::Begin | EntryType::Commit => {
                 let x = to::<WalBegin>(p);
                 x.set_lsn(last_record_pos);
@@ -127,11 +126,8 @@ fn set_lsn(data: *mut u8, mut off: usize, end: usize, lsn: &AtomicU64, beg: u64)
         };
 
         off += sz;
-        // excluding padding and tree from txn chain, they are not involved in rollback
-        if !matches!(
-            h,
-            EntryType::Padding | EntryType::TreeDel | EntryType::TreePut
-        ) {
+        // excluding padding, it's not involved in rollback
+        if h != EntryType::Padding {
             last_record_pos = lsn.fetch_add(sz as u64, Relaxed);
         } else {
             sz = 0;
@@ -290,7 +286,7 @@ impl Logging {
         }
     }
 
-    pub fn record_update<T>(&self, ver: Ver, tree_id: u64, w: T, k: &[u8], ov: &[u8], nv: &[u8])
+    pub fn record_update<T>(&self, ver: Ver, w: T, k: &[u8], ov: &[u8], nv: &[u8])
     where
         T: IWalCodec + IWalPayload,
     {
@@ -303,7 +299,6 @@ impl Logging {
             size: payload_size as u32,
             cmd_id: ver.cmd,
             klen: k.len() as u32,
-            tree_id,
             txid: ver.txid,
             prev_addr: 0,
         };
@@ -354,14 +349,6 @@ impl Logging {
             prev_addr: 0,
         };
         self.add_entry(w, txid);
-    }
-
-    pub(crate) fn record_put(&self, id: u64, txid: u64, pid: u64) {
-        self.add_entry(WalTree::new(true, id, txid, pid), txid);
-    }
-
-    pub(crate) fn record_del(&self, id: u64, txid: u64, pid: u64) {
-        self.add_entry(WalTree::new(false, id, txid, pid), txid);
     }
 
     pub(crate) fn fsn(&mut self) -> u64 {
@@ -790,7 +777,7 @@ mod test {
 
         let (k, v) = ("mo".as_bytes(), "ha".as_bytes());
         let ins = WalPut::new(2);
-        l.record_update(Ver::new(txid, 1), 1, ins, k, [].as_slice(), v);
+        l.record_update(Ver::new(txid, 1), ins, k, [].as_slice(), v);
 
         l.desc.get(&mut desc);
         let size = size_of::<WalBegin>()

@@ -319,6 +319,7 @@ where
         K::decode_from(raw)
     }
 
+    #[allow(unused)]
     pub fn val_at(&self, pos: usize) -> V {
         let slot = self.offset(pos);
         debug_assert!(self.raw.len() >= slot.len());

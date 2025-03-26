@@ -19,7 +19,6 @@ use io::{File, GatherIO};
 
 use crate::{
     cc::wal::{ptr_to, WalCheckpoint},
-    index::registry::Registry,
     map::{
         data::{DataFooter, DataMetaReader, FileStat},
         Mapping,
@@ -30,7 +29,7 @@ use crate::{
         data::{AddrMap, MapEntry, Meta, PageTable, ID_LEN, JUNK_LEN},
         pack_id, unpack_id, NEXT_ID, NULL_ORACLE,
     },
-    Options,
+    Options, Store,
 };
 
 const GC_QUIT: i32 = -1;
@@ -41,7 +40,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
     std::thread::Builder::new()
         .name("garbage_collector".into())
         .spawn(move || {
-            let timeout = Duration::from_millis(gc.mgr.store.opt.gc_timeout);
+            let timeout = Duration::from_millis(gc.store.opt.gc_timeout);
             let mut pause = false;
 
             loop {
@@ -99,14 +98,14 @@ impl Handle {
     }
 }
 
-pub(crate) fn start_gc(mgr: Registry, meta: Arc<Meta>, map: Arc<Mapping>) -> Handle {
+pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Arc<Mapping>) -> Handle {
     let (tx, rx) = channel();
     let sem = Arc::new(Countblock::new(0));
     let last_ckpt = meta.ckpt.load(Relaxed);
     let gc = GarbageCollector {
         meta,
         map,
-        mgr,
+        store,
         last_ckpt,
     };
     gc_thread(gc, rx, sem.clone());
@@ -158,14 +157,14 @@ impl Score {
 struct GarbageCollector {
     meta: Arc<Meta>,
     map: Arc<Mapping>,
-    mgr: Registry,
+    store: Arc<Store>,
     last_ckpt: u64,
 }
 
 impl GarbageCollector {
     fn process_data(&mut self) {
-        let tgt_ratio = self.mgr.store.opt.gc_ratio as u64;
-        let tgt_size = self.mgr.store.opt.buffer_size;
+        let tgt_ratio = self.store.opt.gc_ratio as u64;
+        let tgt_size = self.store.opt.buffer_size;
 
         'again: loop {
             let mut total = 0u64;
@@ -235,7 +234,7 @@ impl GarbageCollector {
 
         let mut oldest_txid = NULL_ORACLE;
         let mut oldest_ckpt = NULL_ORACLE;
-        for w in self.mgr.store.context.workers().iter() {
+        for w in self.store.context.workers().iter() {
             let ckpt = w.ckpt.load(Relaxed);
             let txid = w.tx_id.load(Relaxed);
 
@@ -245,7 +244,7 @@ impl GarbageCollector {
             }
         }
 
-        let opt = self.mgr.store.opt.clone();
+        let opt = self.store.opt.clone();
         let mut buf = [0u8; size_of::<WalCheckpoint>()];
         let (cur_id, _) = unpack_id(oldest_ckpt);
         let mut end = None;
@@ -292,7 +291,7 @@ impl GarbageCollector {
     }
 
     fn compact(&mut self, victims: Vec<Score>, unmapped: HashSet<u32>, mut unlinked: HashSet<u32>) {
-        let opt = &self.mgr.store.opt;
+        let opt = &self.store.opt;
         let mut builder = ReWriter::new(opt, victims.len());
         let mut lids = HashSet::new();
         let mut dealloc = HashSet::new();

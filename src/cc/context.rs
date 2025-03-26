@@ -3,7 +3,7 @@ use crate::utils::countblock::Countblock;
 use crate::utils::data::Meta;
 use crate::utils::next_power_of_2;
 use crate::utils::queue::Queue;
-use crate::Options;
+use crate::{OpCode, Options};
 
 use super::log::{CState, GroupCommitter};
 use super::worker::SyncWorker;
@@ -20,7 +20,6 @@ pub struct Context {
     active_workers: Queue<SyncWorker>,
     ctrl: Arc<CState>,
     sem: Arc<Countblock>,
-    waiter: Countblock,
 }
 
 fn group_commit_thread(
@@ -69,46 +68,44 @@ impl Context {
             active_workers,
             ctrl,
             sem,
-            waiter: Countblock::new(opt.workers),
         };
 
         Arc::new(this)
     }
 
-    pub fn alloc(&self) -> SyncWorker {
-        loop {
-            self.waiter.wait();
-            if let Ok(w) = self.active_workers.pop() {
-                return w;
-            }
-        }
+    pub fn alloc_worker(&self) -> Result<SyncWorker, OpCode> {
+        self.active_workers.pop()
     }
 
-    pub fn free(&self, w: SyncWorker) {
+    pub fn free_worker(&self, w: SyncWorker) {
         self.active_workers.push(w).expect("no space");
-        self.waiter.post();
     }
 
+    #[inline]
     pub fn worker(&self, wid: usize) -> SyncWorker {
         self.workers[wid]
     }
 
-    pub fn workers(&self) -> Arc<Vec<SyncWorker>> {
-        self.workers.clone()
+    pub fn workers(&self) -> &Vec<SyncWorker> {
+        &self.workers
     }
 
+    #[inline]
     pub(crate) fn wmk_oldest(&self) -> u64 {
         self.meta.wmk_oldest.load(Relaxed)
     }
 
+    #[inline]
     pub(crate) fn update_wmk(&self, x: u64) {
         self.meta.wmk_oldest.store(x, Release);
     }
 
+    #[inline]
     pub(crate) fn load_oracle(&self) -> u64 {
         self.meta.oracle.load(Relaxed)
     }
 
+    #[inline]
     pub(crate) fn alloc_oracle(&self) -> u64 {
         self.meta.oracle.fetch_add(1, Relaxed)
     }

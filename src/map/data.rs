@@ -203,6 +203,7 @@ impl Frame {
 }
 
 impl DeepCopy for FrameOwner {
+    // NOTE: excluding `borrowed`
     fn deep_copy(self) -> Self {
         if self.owned == 1 {
             return self;
@@ -215,6 +216,7 @@ impl DeepCopy for FrameOwner {
         unsafe {
             std::ptr::copy(src.data(), dst.data(), dst.len());
         }
+        debug_assert!(other.borrowed.is_null());
         other
     }
 }

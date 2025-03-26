@@ -44,6 +44,9 @@ impl ByteArray {
     }
 
     pub fn sub_array(&self, off: usize, len: usize) -> Self {
+        if off + len > self.size {
+            log::debug!("===>> off {} len {} size {}", off, len, self.size);
+        }
         debug_assert!(off + len <= self.size);
         unsafe { Self::new(self.data.add(off), len) }
     }

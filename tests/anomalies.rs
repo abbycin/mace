@@ -11,7 +11,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath, TxnKV};
+use mace::{Mace, OpCode, Options, RandomPath, TxnKV};
 
 macro_rules! prelude {
     ($($core:expr),+) => {
@@ -460,7 +460,7 @@ impl Drop for Executor {
 
 struct Session {
     db: Arc<Mace>,
-    kv: Option<TxnKV>,
+    kv: Option<TxnKV<'static>>,
     cond: Arc<SyncClosure>,
 }
 
@@ -584,18 +584,19 @@ impl SyncClosure {
 
 impl Session {
     fn begin(&mut self) {
-        let tx = self.db.default();
         self.cond.set_fn(Closure::new(|| {
-            self.kv = Some(tx._write(IsolationLevel::SI));
+            let kv = unsafe {
+                std::mem::transmute::<mace::TxnKV<'_>, mace::TxnKV<'_>>(self.db.begin().unwrap())
+            };
+            self.kv = Some(kv);
         }));
         self.sync();
     }
 
     fn view(&mut self, k: impl AsRef<[u8]>) -> Result<Vec<u8>, OpCode> {
         let mut rv = None;
-        let tx = self.db.default();
         self.cond.set_fn(Closure::new(|| {
-            let view = tx._read(IsolationLevel::SI);
+            let view = self.db.view().unwrap();
             rv = Some(view.get(k.as_ref()).map(|x| x.data().to_vec()));
         }));
         self.sync();

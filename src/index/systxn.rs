@@ -9,7 +9,6 @@ pub struct SysTxn<'a> {
     pub store: &'a Store,
     /// arena list
     buffers: Vec<(usize, FrameRef)>,
-    read_only_buffer: Vec<FrameOwner>,
     junks: Vec<FrameOwner>,
     page_ids: Vec<(u64, u64)>,
 }
@@ -19,7 +18,6 @@ impl<'a> SysTxn<'a> {
         Self {
             store,
             buffers: Vec::new(),
-            read_only_buffer: Vec::new(),
             junks: Vec::new(),
             page_ids: Vec::new(),
         }
@@ -37,17 +35,8 @@ impl<'a> SysTxn<'a> {
         self.buffers.clear();
     }
 
-    pub fn pin(&mut self, f: FrameOwner) {
-        self.read_only_buffer.push(f);
-    }
-
     pub fn gc(&mut self, f: FrameOwner) {
         self.junks.push(f);
-    }
-
-    pub fn unpin_all(&mut self) {
-        self.read_only_buffer.clear();
-        self.junks.clear();
     }
 
     pub fn alloc(&mut self, size: usize) -> Result<FrameRef, OpCode> {
@@ -111,7 +100,6 @@ impl Drop for SysTxn<'_> {
         for (pid, addr) in &self.page_ids {
             self.store.page.unmap(*pid, *addr).expect("can't go wrong");
         }
-        self.read_only_buffer.clear();
         self.junks.clear();
 
         for (id, f) in self.buffers.iter_mut() {

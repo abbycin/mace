@@ -12,10 +12,7 @@ use std::{
 use crate::{
     map::data::FrameFlag,
     static_assert,
-    utils::{
-        countblock::Countblock, data::Meta, raw_ptr_to_ref, INVALID_ID, NEXT_ID, NULL_ID,
-        NULL_ORACLE,
-    },
+    utils::{countblock::Countblock, data::Meta, raw_ptr_to_ref, INVALID_ID, NULL_ID, NULL_ORACLE},
     OpCode,
 };
 
@@ -73,9 +70,9 @@ impl Arena {
         }
     }
 
-    fn reset(&self, id: u32) {
+    fn reset(&self, id: u32, flsn: u64) {
         self.id.set(id);
-        self.flsn.store(0, Relaxed);
+        self.flsn.store(flsn, Relaxed);
         assert_eq!(self.state(), Self::HOT);
         self.offset.store(0, Relaxed);
     }
@@ -284,7 +281,7 @@ impl Pool {
 
         let id = this.gen_id()?;
         h.set_state(Arena::FLUSH, Arena::HOT);
-        h.reset(id);
+        h.reset(id, this.flsn.load(Relaxed));
         Ok(this)
     }
 
@@ -336,10 +333,6 @@ impl Pool {
         let (oid, opos) = unpack_id(h.flsn.load(Relaxed));
         let flsn = self.flsn.load(Relaxed);
         let (cid, cpos) = unpack_id(flsn);
-
-        if cid < NEXT_ID || oid < NEXT_ID {
-            return;
-        }
 
         let ready = if flsn == NULL_ORACLE {
             true
@@ -403,7 +396,7 @@ impl Pool {
         while !p.balanced() || p.set_state(Arena::FLUSH, Arena::HOT) != Arena::FLUSH {
             self.try_flush();
         }
-        p.reset(id);
+        p.reset(id, self.flsn.load(Relaxed));
         self.free.store(next, Release); // release ordering is required
 
         self.cur

@@ -1,7 +1,7 @@
-use mace::{IsolationLevel, Mace, OpCode, Options, RandomPath};
+use mace::{Mace, OpCode, Options, RandomPath};
 
 #[test]
-fn gc_data() {
+fn gc_data() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
@@ -11,7 +11,6 @@ fn gc_data() {
     opt.buffer_size = 512 << 10;
     let db = Mace::new(opt).unwrap();
 
-    let tx = db.default();
     let cap = 20000;
     let mut pair = Vec::with_capacity(cap);
 
@@ -20,19 +19,14 @@ fn gc_data() {
     }
 
     for k in &pair {
-        tx.begin(IsolationLevel::SI, |kv| {
-            kv.put(k, k)?;
-            kv.commit()
-        })
-        .unwrap();
+        let kv = db.begin().unwrap();
+        kv.put(k, k)?;
+        kv.commit()?;
     }
 
     for k in &pair {
-        tx.view(IsolationLevel::SI, |view| {
-            view.get(k)?;
-            Ok(())
-        })
-        .unwrap();
+        let view = db.view().unwrap();
+        view.get(k)?;
     }
 
     let mut count = 0;
@@ -50,6 +44,7 @@ fn gc_data() {
         }
     }
     assert!(count < max_id);
+    Ok(())
 }
 
 #[test]
@@ -60,15 +55,12 @@ fn abort_txn() {
     opt.buffer_size = 50 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt).unwrap();
 
-    let tx = db.default();
-
-    let r = tx.begin(IsolationLevel::SI, |kv| {
-        for i in 0..500 {
-            let x = format!("key_{}", i);
-            kv.put(&x, &x)?;
-        }
-        kv.commit()
-    });
+    let kv = db.begin().unwrap();
+    for i in 0..500 {
+        let x = format!("key_{}", i);
+        let _ = kv.put(&x, &x);
+    }
+    let r = kv.commit();
 
     assert!(r.is_err() && r.err().unwrap() == OpCode::AbortTx);
 }
@@ -81,7 +73,6 @@ fn gc_wal() {
     opt.gc_timeout = 2;
     opt.buffer_size = 100 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt).unwrap();
-    let tx = db.default();
     let mut data = Vec::new();
 
     for i in 0..1000 {
@@ -89,45 +80,17 @@ fn gc_wal() {
     }
 
     for i in &data {
-        tx.begin(IsolationLevel::SI, |kv| {
-            kv.put(i, i)?;
-            kv.commit()
-        })
-        .unwrap();
+        let kv = db.begin().unwrap();
+        kv.put(i, i).unwrap();
+        kv.commit().unwrap();
     }
 
     for i in &data {
-        tx.view(IsolationLevel::SI, |view| {
-            let r = view.get(i).expect("not found");
-            assert_eq!(r.data(), i.as_bytes());
-            Ok(())
-        })
-        .unwrap();
+        let view = db.view().unwrap();
+        let r = view.get(i).expect("not found");
+        assert_eq!(r.data(), i.as_bytes());
     }
 
     let backup = db.options().wal_backup(1);
     assert!(backup.exists());
-}
-
-#[test]
-fn remove_tree() {
-    let path = RandomPath::tmp();
-    let mut opt = Options::new(&*path);
-    opt.page_size = 2048;
-    let db = Mace::new(opt).unwrap();
-    let tx = db.alloc().unwrap();
-
-    tx.begin(IsolationLevel::SI, |kv| {
-        for i in 0..100 {
-            let s = format!("xx-{}", i);
-            kv.put(&s, &s)?;
-        }
-        kv.commit()
-    })
-    .unwrap();
-
-    db.remove(tx.id()).unwrap();
-
-    let tx = db.get(tx.id());
-    assert!(tx.is_err());
 }

@@ -19,14 +19,12 @@ pub(crate) mod traits;
 
 pub(crate) const NULL_PID: u64 = 0;
 pub(crate) const ROOT_PID: u64 = 1;
-pub(crate) const ROOT_TREEID: u64 = 0;
-pub(crate) const DEFAULT_TREEID: u64 = 1;
 pub(crate) const NEXT_ID: u32 = 1;
 pub(crate) const INVALID_ID: u32 = 0;
 pub(crate) const NULL_ID: u32 = u32::MAX;
 pub(crate) const INIT_CMD: u32 = 1;
 pub(crate) const NULL_CMD: u32 = u32::MAX;
-/// NOTE: must larger than wmk_oldest_tx(which is 0 by default) and ROOT_TREEID and DEFAULT_TREEID
+/// NOTE: must larger than wmk_oldest_tx(which is 0 by default)
 pub(crate) const INIT_ORACLE: u64 = 2;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
 
@@ -46,6 +44,12 @@ pub enum OpCode {
     Unknown,
 }
 
+impl std::fmt::Display for OpCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{:?}", self))
+    }
+}
+
 pub(crate) const fn align_up(n: usize, align: usize) -> usize {
     (n + (align - 1)) & !(align - 1)
 }
@@ -54,15 +58,6 @@ pub(crate) const fn align_up(n: usize, align: usize) -> usize {
 pub(crate) const fn align_down(n: usize, align: usize) -> usize {
     n & !(align - 1)
 }
-
-#[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum IsolationLevel {
-    SI,
-    SSI,
-}
-
-const _: () = assert!(size_of::<IsolationLevel>() == 1);
 
 pub(crate) const fn is_power_of_2(x: usize) -> bool {
     if x == 0 {
@@ -132,8 +127,6 @@ thread_local! {
 pub fn rand_range(range: Range<usize>) -> usize {
     G_RAND.with_borrow_mut(|x| x.gen_range(range))
 }
-
-static_assert!(size_of::<usize>() == 8, "exepct 64 bits pointer width");
 
 static_assert!(size_of::<usize>() == 8, "exepct 64 bits pointer width");
 
