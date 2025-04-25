@@ -5,7 +5,7 @@ use io::{File, GatherIO};
 use crate::{
     index::{data::Value, tree::Tree, Key},
     static_assert,
-    utils::{block::Block, bytes::ByteArray, unpack_id, INIT_CMD, NEXT_ID, NULL_ORACLE},
+    utils::{block::Block, unpack_id, INIT_CMD, NEXT_ID, NULL_ORACLE},
     Record,
 };
 
@@ -20,8 +20,6 @@ pub(crate) trait IWalCodec {
 
     fn size() -> usize;
 
-    fn encode_to(&self, b: ByteArray);
-
     fn to_slice(&self) -> &[u8];
 }
 
@@ -33,6 +31,7 @@ pub(crate) trait IWalPayload {
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub(crate) enum EntryType {
     Padding,
+    Span,
     Update,
     Begin,
     Commit,
@@ -65,10 +64,26 @@ impl From<u8> for PayloadType {
 }
 
 #[repr(C, packed(1))]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct WalPadding {
+    dummy: EntryType,
+}
+
+static_assert!(size_of::<WalPadding>() == 1);
+
+impl Default for WalPadding {
+    fn default() -> Self {
+        Self {
+            dummy: EntryType::Padding,
+        }
+    }
+}
+
+#[repr(C, packed(1))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WalSpan {
     pub(crate) wal_type: EntryType,
-    pub(crate) len: u32,
+    pub(crate) span: u32,
 }
 
 #[repr(C, packed(1))]
@@ -91,7 +106,6 @@ pub(crate) struct WalUpdate {
 pub(crate) struct WalBegin {
     pub(crate) wal_type: EntryType,
     pub(crate) txid: u64,
-    pub(crate) prev_addr: u64,
 }
 
 #[repr(C, packed(1))]
@@ -99,7 +113,6 @@ pub(crate) struct WalBegin {
 pub(crate) struct WalAbort {
     pub(crate) wal_type: EntryType,
     pub(crate) txid: u64,
-    pub(crate) prev_addr: u64,
 }
 
 #[repr(C, packed(1))]
@@ -107,7 +120,6 @@ pub(crate) struct WalAbort {
 pub(crate) struct WalCommit {
     pub(crate) wal_type: EntryType,
     pub(crate) txid: u64,
-    pub(crate) prev_addr: u64,
 }
 
 static_assert!(size_of::<WalCommit>() == size_of::<WalAbort>());
@@ -269,13 +281,6 @@ macro_rules! impl_codec {
                 size_of::<Self>()
             }
 
-            fn encode_to(&self, b: ByteArray) {
-                let src = self.to_slice();
-                debug_assert_eq!(src.len(), b.len());
-                let dst = b.as_mut_slice(0, b.len());
-                dst.copy_from_slice(src);
-            }
-
             fn to_slice(&self) -> &[u8] {
                 unsafe {
                     let ptr = self as *const Self as *const u8;
@@ -284,9 +289,6 @@ macro_rules! impl_codec {
             }
         }
     };
-}
-impl IWalRec for WalPadding {
-    fn set_lsn(&mut self, _lsn: u64) {}
 }
 
 macro_rules! impl_rec {
@@ -300,11 +302,9 @@ macro_rules! impl_rec {
 }
 
 impl_rec!(WalUpdate);
-impl_rec!(WalBegin);
-impl_rec!(WalCommit);
-impl_rec!(WalAbort);
 
 impl_codec!(WalPadding);
+impl_codec!(WalSpan);
 impl_codec!(WalUpdate);
 impl_codec!(WalBegin);
 impl_codec!(WalCommit);
@@ -459,14 +459,6 @@ impl IWalCodec for &[u8] {
         unreachable!("slice has no static size")
     }
 
-    fn encode_to(&self, b: ByteArray) {
-        debug_assert_eq!(self.len(), b.len());
-        if b.len() != 0 {
-            let dst = b.as_mut_slice(0, b.len());
-            dst.copy_from_slice(self);
-        }
-    }
-
     fn to_slice(&self) -> &[u8] {
         self
     }
@@ -477,6 +469,7 @@ pub(crate) fn wal_record_sz(e: EntryType) -> usize {
         EntryType::Abort | EntryType::Begin | EntryType::Commit => WalAbort::size(),
         EntryType::Update => WalUpdate::size(),
         EntryType::Padding => WalPadding::size(),
+        EntryType::Span => WalSpan::size(),
         EntryType::CheckPoint => WalCheckpoint::size(),
         _ => unreachable!("invalid type {}", e as u8),
     }

@@ -54,7 +54,8 @@ impl Context {
         let active_workers = Queue::new(next_power_of_2(cores) as u32, None);
 
         for i in 0..cores {
-            let x = SyncWorker::new(fsn.clone(), i as u16, opt.clone(), sem.clone());
+            let buffer = buffer.clone();
+            let x = SyncWorker::new(fsn.clone(), i as u16, opt.clone(), sem.clone(), buffer);
             active_workers.push(x).unwrap();
             w.push(x);
         }

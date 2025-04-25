@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     cmp::{max, min, Ordering},
     collections::{HashMap, VecDeque},
     path::PathBuf,
@@ -14,7 +15,7 @@ use std::{
 use io::{File, GatherIO, IoVec};
 
 use crate::{
-    cc::wal::{EntryType, WalPadding},
+    cc::wal::{EntryType, WalPadding, WalSpan},
     map::buffer::Buffers,
     utils::{
         block::Block, bytes::ByteArray, countblock::Countblock, data::Meta, pack_id, unpack_id,
@@ -65,12 +66,6 @@ impl SharedDesc {
         unsafe { *self.data = *src };
         self.version.fetch_add(1, Release);
     }
-
-    fn update_wal(&self, tail: usize) {
-        self.version.fetch_add(1, Acquire);
-        unsafe { (*self.data).wal_tail = tail }
-        self.version.fetch_add(1, Release);
-    }
 }
 
 impl Drop for SharedDesc {
@@ -104,7 +99,6 @@ fn set_lsn(data: *mut u8, mut off: usize, end: usize, lsn: &AtomicU64, beg: u64)
         sz = match h {
             EntryType::Abort | EntryType::Begin | EntryType::Commit => {
                 let x = to::<WalBegin>(p);
-                x.set_lsn(last_record_pos);
                 last = Some((h, x.txid));
                 WalAbort::size()
             }
@@ -114,9 +108,10 @@ fn set_lsn(data: *mut u8, mut off: usize, end: usize, lsn: &AtomicU64, beg: u64)
                 u.set_lsn(last_record_pos);
                 u.size as usize + u.encoded_len()
             }
-            EntryType::Padding => {
-                let x = to::<WalPadding>(p);
-                x.len as usize + WalPadding::size()
+            EntryType::Padding => WalPadding::size(),
+            EntryType::Span => {
+                let x = to::<WalSpan>(p);
+                x.span as usize + x.encoded_len()
             }
             EntryType::CheckPoint => {
                 let c = to::<WalCheckpoint>(p);
@@ -127,10 +122,8 @@ fn set_lsn(data: *mut u8, mut off: usize, end: usize, lsn: &AtomicU64, beg: u64)
 
         off += sz;
         // excluding padding, it's not involved in rollback
-        if h != EntryType::Padding {
+        if !matches!(h, EntryType::Padding | EntryType::Span) {
             last_record_pos = lsn.fetch_add(sz as u64, Relaxed);
-        } else {
-            sz = 0;
         }
     }
     // reset to record start position
@@ -144,40 +137,111 @@ fn set_lsn(data: *mut u8, mut off: usize, end: usize, lsn: &AtomicU64, beg: u64)
     None
 }
 
+struct Ring {
+    data: Block,
+    head: AtomicUsize,
+    tail: Cell<usize>,
+}
+
+impl Ring {
+    fn new(cap: usize) -> Self {
+        let data = Block::aligned_alloc(cap, 1);
+        data.zero();
+        assert!(data.len().is_power_of_two());
+        Self {
+            data,
+            head: AtomicUsize::new(0),
+            tail: Cell::new(0),
+        }
+    }
+
+    #[inline]
+    fn avail(&self) -> usize {
+        self.data.len() - (self.tail.get() - self.head.load(Relaxed))
+    }
+
+    // NOTE: the request buffer never wraps around
+    fn prod(&self, size: usize) -> ByteArray {
+        debug_assert!(self.avail() >= size);
+        let mut b = self.tail.get();
+        self.tail.set(b + size);
+
+        b &= self.mask();
+        self.data.view(b, b + size)
+    }
+
+    #[inline]
+    fn cons(&self, pos: usize) {
+        self.head.store(pos, Release);
+    }
+
+    #[inline]
+    fn head(&self) -> usize {
+        self.head.load(Relaxed) & self.mask()
+    }
+
+    #[inline]
+    fn tail(&self) -> usize {
+        self.tail.get() & self.mask()
+    }
+
+    #[inline]
+    fn raw_head(&self) -> usize {
+        self.head.load(Relaxed)
+    }
+
+    #[inline]
+    fn raw_tail(&self) -> usize {
+        self.tail.get()
+    }
+
+    #[inline]
+    fn data(&self) -> *mut u8 {
+        self.data.data()
+    }
+
+    #[inline]
+    fn mask(&self) -> usize {
+        self.data.len() - 1
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
 pub struct Logging {
     worker_id: u16,
     flushed_signal: AtomicUsize,
-    /// circular buffer head and tail
-    wal_head: AtomicUsize,
-    wal_tail: AtomicUsize,
     desc: SharedDesc,
     wait_txn: Mutex<VecDeque<Transaction>>,
     sem: Arc<Countblock>,
-    buffer: Block,
+    ring: Ring,
     fsn: Arc<AtomicU64>,
     pub(crate) lsn: AtomicU64,
+    buffer: Arc<Buffers>,
 }
 
 unsafe impl Sync for Logging {}
 unsafe impl Send for Logging {}
 
-pub struct LogBuilder<'a> {
-    log: &'a Logging,
+pub struct LogBuilder {
     buf: ByteArray,
+    off: usize,
     desc: WalDesc,
 }
 
-impl<'a> LogBuilder<'a> {
-    fn new(l: &'a Logging, b: ByteArray, txid: u64, fsn: u64) -> Self {
-        let old = l.wal_tail.fetch_add(b.len(), Release);
+impl LogBuilder {
+    fn new(b: ByteArray, tail: usize, txid: u64, fsn: u64) -> Self {
         Self {
-            log: l,
             buf: b,
+            off: 0,
             desc: WalDesc {
                 version: 0,
                 fsn,
                 txid,
-                wal_tail: old + b.len(),
+                wal_tail: tail,
             },
         }
     }
@@ -186,80 +250,44 @@ impl<'a> LogBuilder<'a> {
     where
         T: IWalCodec,
     {
-        let len = payload.encoded_len();
-        let b = self.buf.sub_array(0, len);
-        payload.encode_to(b);
-        self.buf = self.buf.sub_array(len, self.buf.len() - len);
+        let src = payload.to_slice();
+        let dst = self.buf.as_mut_slice(self.off, src.len());
+        dst.copy_from_slice(src);
+        self.off += src.len();
+
         self
     }
 
-    pub fn build(&self) {
-        self.log.update_desc(&self.desc);
+    pub fn build(&self, log: &Logging) {
+        log.update_desc(&self.desc);
     }
 }
 
 impl Logging {
-    fn alloc_entry(&self, size: usize) -> ByteArray {
-        let len = self.buffer.len();
-        loop {
-            self.sem.post();
-            let flushed = self.wal_head.load(Relaxed);
-            let buffered = self.wal_tail.load(Relaxed);
-            if flushed <= buffered {
-                let rest = len - buffered;
-                if rest < size {
-                    if rest + flushed < size_of::<WalPadding>() {
-                        continue; // no space for padding
-                    }
-                    self.wrap(len, flushed, buffered);
-                    continue;
-                }
-                break;
-            } else if flushed - buffered < size {
-                continue; // wait entries to be comsumed by group commiter
+    fn alloc(&self, size: usize) -> ByteArray {
+        let rest = self.ring.len() - self.ring.tail();
+        if rest < size {
+            let a = self.ring.prod(rest);
+            if rest < WalSpan::size() {
+                a.as_mut_slice(0, a.len()).fill(WalPadding::default());
+            } else {
+                let span = WalSpan {
+                    wal_type: EntryType::Span,
+                    span: (rest - WalSpan::size()) as u32,
+                };
+                let dst = a.as_mut_slice(0, span.encoded_len());
+                dst.copy_from_slice(span.to_slice());
             }
-            break;
         }
-
-        let beg = self.wal_tail.load(Acquire);
-        let end = beg + size;
-        self.buffer.view(beg, end)
-    }
-
-    fn wrap(&self, len: usize, flushed: usize, buffered: usize) {
-        let rest = len - buffered;
-        let sz = size_of::<WalPadding>();
-        assert!(rest + flushed >= sz);
-        let mut e = WalPadding {
-            wal_type: EntryType::Padding,
-            len: 0,
-        };
-
-        let new_tail = if rest >= sz {
-            e.len = (rest - sz) as u32;
-            e.encode_to(self.buffer.view(buffered, buffered + sz));
-            0
-        } else {
-            e.len = 0;
-            let beg = sz - rest;
-            let src = e.to_slice();
-            let (s1, s2) = src.split_at(rest);
-            let b1 = self.buffer.view(buffered, len);
-            let b2 = self.buffer.view(0, beg);
-
-            let (d1, d2) = (b1.as_mut_slice(0, b1.len()), b2.as_mut_slice(0, b2.len()));
-
-            d1.copy_from_slice(s1);
-            d2.copy_from_slice(s2);
-
-            beg
-        };
-
-        self.wal_tail.store(new_tail, Release);
-        self.desc.update_wal(new_tail);
+        while self.ring.avail() < size {
+            self.sem.post();
+        }
+        self.ring.prod(size)
     }
 
     fn update_desc(&self, desc: &WalDesc) {
+        // notify that we are going to write data to arena
+        self.buffer.mark_dirty();
         self.desc.set(desc);
         self.sem.post();
     }
@@ -269,21 +297,24 @@ impl Logging {
         opt: Arc<Options>,
         wid: u16,
         sem: Arc<Countblock>,
+        buffer: Arc<Buffers>,
     ) -> Self {
-        let buffer = Block::aligned_alloc(opt.wal_buffer_size, 1);
-        buffer.zero();
         Self {
             flushed_signal: AtomicUsize::new(0),
             worker_id: wid,
-            wal_head: AtomicUsize::new(0),
-            wal_tail: AtomicUsize::new(0),
             desc: SharedDesc::new(),
             wait_txn: Mutex::new(VecDeque::new()),
             sem,
-            buffer,
+            ring: Ring::new(opt.wal_buffer_size),
             fsn,
             lsn: AtomicU64::new(0),
+            buffer,
         }
+    }
+
+    #[inline]
+    fn next_fsn(&self) -> u64 {
+        self.fsn.fetch_add(1, Relaxed)
     }
 
     pub fn record_update<T>(&self, ver: Ver, w: T, k: &[u8], ov: &[u8], nv: &[u8])
@@ -291,7 +322,6 @@ impl Logging {
         T: IWalCodec + IWalPayload,
     {
         let payload_size = w.encoded_len() + k.len() + ov.len() + nv.len();
-        let fsn = self.fsn.fetch_add(1, Relaxed);
         let u = WalUpdate {
             wal_type: EntryType::Update,
             sub_type: w.sub_type(),
@@ -302,22 +332,16 @@ impl Logging {
             txid: ver.txid,
             prev_addr: 0,
         };
-        let a = self.alloc_entry(u.encoded_len() + payload_size);
-        let mut b = LogBuilder::new(self, a, ver.txid, fsn);
-        b.add(u).add(k).add(w).add(ov).add(nv).build();
+        let a = self.alloc(u.encoded_len() + payload_size);
+        let mut b = LogBuilder::new(a, self.ring.raw_tail(), ver.txid, self.next_fsn());
+        b.add(u).add(k).add(w).add(ov).add(nv).build(self);
     }
 
     fn add_entry<T: IWalCodec>(&self, w: T, txid: u64) {
         let size = w.encoded_len();
-        let a = self.alloc_entry(size);
-        w.encode_to(a.sub_array(0, size));
-        let old = self.wal_tail.fetch_add(size, Release);
-        self.update_desc(&WalDesc {
-            version: 0,
-            fsn: self.fsn.fetch_add(1, Relaxed),
-            txid,
-            wal_tail: old + size,
-        });
+        let a = self.alloc(size);
+        let mut b = LogBuilder::new(a, self.ring.raw_tail(), txid, self.next_fsn());
+        b.add(w).build(self);
     }
 
     pub fn record_begin(&self, txid: u64) {
@@ -325,7 +349,6 @@ impl Logging {
             WalBegin {
                 wal_type: EntryType::Begin,
                 txid,
-                prev_addr: 0,
             },
             txid,
         );
@@ -336,19 +359,19 @@ impl Logging {
             WalCommit {
                 wal_type: EntryType::Commit,
                 txid,
-                prev_addr: 0,
             },
             txid,
         );
     }
 
     pub fn record_abort(&self, txid: u64) {
-        let w = WalAbort {
-            wal_type: EntryType::Abort,
+        self.add_entry(
+            WalAbort {
+                wal_type: EntryType::Abort,
+                txid,
+            },
             txid,
-            prev_addr: 0,
-        };
-        self.add_entry(w, txid);
+        );
     }
 
     pub(crate) fn fsn(&mut self) -> u64 {
@@ -373,7 +396,7 @@ impl Logging {
     }
 
     pub(crate) fn wait_flush(&self) {
-        while self.wal_head.load(Relaxed) != self.wal_tail.load(Relaxed) {
+        while self.ring.raw_head() != self.ring.raw_tail() {
             self.sem.post();
         }
     }
@@ -489,7 +512,7 @@ impl GroupCommitter {
 
             if !self.writer.is_empty() {
                 self.flush();
-                buffer.update_flsn(pack_id(self.meta.next_wal.load(Acquire), self.wal_size));
+                buffer.update_flsn();
             }
 
             wait = self.commit_txn(&workers, min_flush_txid, min_fsn, &desc);
@@ -532,9 +555,9 @@ impl GroupCommitter {
             min_flush_txid = min(min_flush_txid, d.txid);
             min_fsn = min(min_fsn, d.fsn);
 
-            let wal_head = w.logging.wal_head.load(Relaxed);
-            let wal_tail = d.wal_tail;
-            let data = w.logging.buffer.data();
+            let wal_head = w.logging.ring.head();
+            let wal_tail = d.wal_tail & w.logging.ring.mask();
+            let data = w.logging.ring.data();
 
             let beg = pack_id(cur_id, self.wal_size);
             let txid = match wal_tail.cmp(&wal_head) {
@@ -543,7 +566,7 @@ impl GroupCommitter {
                     set_lsn(data, wal_head, wal_tail, &w.logging.lsn, beg)
                 }
                 Ordering::Less => {
-                    let len = w.logging.buffer.len();
+                    let len = w.logging.ring.len();
 
                     self.queue_data(data, wal_head, len);
                     let r = set_lsn(data, wal_head, len, &w.logging.lsn, beg);
@@ -590,7 +613,7 @@ impl GroupCommitter {
         for w in workers.iter() {
             let d = desc.get(&w.id).expect("never happen");
             let mut max_flush_ts = 0;
-            w.logging.wal_head.store(d.wal_tail, Relaxed);
+            w.logging.ring.cons(d.wal_tail);
 
             let mut lk = w.logging.wait_txn.lock().expect("can't lock");
             while let Some(txn) = lk.front() {
@@ -733,129 +756,5 @@ impl WalWriter {
 impl Drop for WalWriter {
     fn drop(&mut self) {
         self.flush();
-    }
-}
-
-#[cfg(test)]
-mod test {
-
-    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-    use std::sync::atomic::{fence, AtomicBool, AtomicU64};
-    use std::sync::Arc;
-
-    use crate::cc::data::Ver;
-    use crate::slice_to_number;
-    use crate::utils::countblock::Countblock;
-    use crate::utils::raw_ptr_to_ref;
-    use crate::{
-        cc::{
-            log::{IWalCodec, WalBegin, WalDesc, WalPadding, WalUpdate},
-            wal::WalPut,
-        },
-        static_assert, Options, RandomPath,
-    };
-
-    use super::Logging;
-
-    #[test]
-    fn logging() {
-        let path = RandomPath::tmp();
-        let mut opt = Options::new(&*path);
-        opt.wal_buffer_size = 512;
-        let opt = Arc::new(opt);
-        let _ = std::fs::create_dir_all(&opt.db_root);
-        let fsn = Arc::new(AtomicU64::new(0));
-        let l = Logging::new(fsn, opt, 0, Arc::new(Countblock::new(1)));
-        let txid = 1;
-
-        l.record_begin(txid);
-        let mut desc = WalDesc::default();
-        l.desc.get(&mut desc);
-        assert_eq!(desc.wal_tail, size_of::<WalBegin>());
-
-        assert_eq!(l.wal_tail.load(Relaxed), size_of::<WalBegin>());
-
-        let (k, v) = ("mo".as_bytes(), "ha".as_bytes());
-        let ins = WalPut::new(2);
-        l.record_update(Ver::new(txid, 1), ins, k, [].as_slice(), v);
-
-        l.desc.get(&mut desc);
-        let size = size_of::<WalBegin>()
-            + size_of::<WalUpdate>()
-            + ins.encoded_len()
-            + k.encoded_len()
-            + v.encoded_len();
-        assert_eq!(desc.wal_tail, size);
-
-        // simulate wrapping
-
-        l.wal_tail.store(511, Relaxed);
-        l.wal_head.store(3, Relaxed);
-        let flag = AtomicBool::new(false);
-
-        static_assert!(size_of::<WalPadding>() == 5);
-
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                l.alloc_entry(10);
-                while !flag.load(Acquire) {
-                    std::hint::spin_loop();
-                }
-                fence(Release);
-                assert_eq!(l.wal_head.load(Relaxed), 15);
-                let b = l.buffer.view(0, 4);
-                let s = b.as_slice(0, 4);
-                let n = slice_to_number!(s, u32);
-                assert_eq!(n, 0);
-                assert_eq!(l.wal_tail.load(Acquire), 4);
-            });
-            s.spawn(|| {
-                loop {
-                    let n = l.wal_head.fetch_add(1, Release);
-                    if n == 14 {
-                        break;
-                    }
-                }
-                flag.store(true, Release);
-            });
-        });
-
-        l.wal_tail.store(512, Relaxed);
-        l.wal_head.store(3, Relaxed);
-        flag.store(false, Release);
-
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                l.alloc_entry(10);
-                while !flag.load(Acquire) {
-                    std::hint::spin_loop();
-                }
-                fence(Release);
-                assert_eq!(l.wal_head.load(Relaxed), 16);
-                let b = l.buffer.view(0, 5);
-                let s = b.as_slice(1, 4);
-                let n = slice_to_number!(s, u32);
-                assert_eq!(n, 0);
-                assert_eq!(l.wal_tail.load(Acquire), 5);
-            });
-
-            s.spawn(|| {
-                loop {
-                    let n = l.wal_head.fetch_add(1, Release);
-                    if n == 15 {
-                        break;
-                    }
-                }
-                flag.store(true, Release);
-            });
-        });
-
-        l.wal_tail.store(503, Relaxed);
-        l.wal_head.store(10, Relaxed);
-
-        l.alloc_entry(10);
-        let b = l.buffer.view(503, 503 + size_of::<WalPadding>());
-        let w = raw_ptr_to_ref(b.data() as *mut WalPadding);
-        assert_eq!({ w.len }, 512 - 503 - size_of::<WalPadding>() as u32);
     }
 }

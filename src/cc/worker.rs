@@ -11,6 +11,7 @@ use std::{
 
 use crate::{
     index::tree::Tree,
+    map::buffer::Buffers,
     utils::{block::Block, countblock::Countblock},
     Options,
 };
@@ -34,13 +35,19 @@ pub struct Worker {
 }
 
 impl Worker {
-    fn new(fsn: Arc<AtomicU64>, id: u16, opt: Arc<Options>, sem: Arc<Countblock>) -> Self {
+    fn new(
+        fsn: Arc<AtomicU64>,
+        id: u16,
+        opt: Arc<Options>,
+        sem: Arc<Countblock>,
+        buffer: Arc<Buffers>,
+    ) -> Self {
         Self {
             cc: ConcurrencyControl::new(opt.workers),
             ckpt_cnt: AtomicUsize::new(0),
             ckpt: AtomicU64::new(0),
             txn: Transaction::new(),
-            logging: Logging::new(fsn, opt, id, sem),
+            logging: Logging::new(fsn, opt, id, sem, buffer),
             tx_id: AtomicU64::new(0),
             id,
         }
@@ -53,8 +60,14 @@ pub struct SyncWorker {
 }
 
 impl SyncWorker {
-    pub fn new(fsn: Arc<AtomicU64>, id: u16, opt: Arc<Options>, sem: Arc<Countblock>) -> Self {
-        let w = Box::new(Worker::new(fsn, id, opt, sem));
+    pub fn new(
+        fsn: Arc<AtomicU64>,
+        id: u16,
+        opt: Arc<Options>,
+        sem: Arc<Countblock>,
+        buffer: Arc<Buffers>,
+    ) -> Self {
+        let w = Box::new(Worker::new(fsn, id, opt, sem, buffer));
         Self {
             w: Box::into_raw(w),
         }

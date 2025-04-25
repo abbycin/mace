@@ -9,6 +9,7 @@ fn gc_data() -> Result<(), OpCode> {
     opt.gc_timeout = 20;
     opt.gc_ratio = 10;
     opt.buffer_size = 512 << 10;
+    opt.gc_compacted_size = opt.buffer_size;
     let db = Mace::new(opt).unwrap();
 
     let cap = 20000;

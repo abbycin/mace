@@ -3,9 +3,8 @@ use std::ops::Deref;
 
 use crate::cc::data::Ver;
 use crate::utils::traits::{ICodec, IKey, IVal, IValCodec};
+use crate::utils::varint::Varint32;
 use crate::{number_to_slice, slice_to_number, utils::bytes::ByteArray};
-
-const KEY_VAL_FIXED_BYTES: usize = 4;
 
 fn to_str(x: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(x) }
@@ -60,25 +59,23 @@ impl Ord for Key<'_> {
 }
 
 impl ICodec for Key<'_> {
-    // TODO: varint encode
     fn packed_size(&self) -> usize {
-        self.len() + KEY_VAL_FIXED_BYTES
+        self.len() + Varint32::size(self.len() as u32)
     }
 
     fn encode_to(&self, to: &mut [u8]) {
         debug_assert_eq!(to.len(), self.packed_size());
-        let (len, key) = to.split_at_mut(KEY_VAL_FIXED_BYTES);
-        number_to_slice!(self.len() as u32, len);
+        let (len, key) = to.split_at_mut(Varint32::size(to.len() as u32));
+        Varint32::encode(len, self.len() as u32);
         let (num, raw) = key.split_at_mut(Ver::len());
         self.ver.encode_to(num);
         raw.copy_from_slice(self.raw);
     }
 
     fn decode_from(data: ByteArray) -> Self {
-        let len = data.as_mut_slice(0, KEY_VAL_FIXED_BYTES);
-        let len = slice_to_number!(len, u32) as usize;
-        let num = data.sub_array(KEY_VAL_FIXED_BYTES, Ver::len());
-        let raw = data.as_slice(KEY_VAL_FIXED_BYTES + Ver::len(), len - Ver::len());
+        let (len, n) = Varint32::decode(data.as_slice(0, data.len())).unwrap();
+        let num = data.sub_array(n, Ver::len());
+        let raw = data.as_slice(n + Ver::len(), len as usize - Ver::len());
 
         Self {
             raw,
@@ -287,13 +284,14 @@ where
 {
     /// using extra 1 byte for Put or Del, since value can be empty(zero length slice)
     fn packed_size(&self) -> usize {
-        1 + KEY_VAL_FIXED_BYTES + self.len()
+        let len = self.len() + 1;
+        Varint32::size(len as u32) + len
     }
 
     fn encode_to(&self, to: &mut [u8]) {
         debug_assert_eq!(to.len(), self.packed_size());
-        let (len, payload) = to.split_at_mut(KEY_VAL_FIXED_BYTES);
-        number_to_slice!((self.len()) as u32, len);
+        let (len, payload) = to.split_at_mut(Varint32::size(to.len() as u32));
+        Varint32::encode(len, 1 + self.len() as u32);
         let (id, payload) = payload.split_at_mut(1);
         match self {
             Value::Put(x) => {
@@ -313,10 +311,9 @@ where
     }
 
     fn decode_from(raw: ByteArray) -> Self {
-        let len = raw.as_mut_slice(0, KEY_VAL_FIXED_BYTES);
-        let state = slice_to_number!(raw.as_mut_slice(KEY_VAL_FIXED_BYTES, 1), u8);
-        let len = slice_to_number!(len, u32) as usize;
-        let b = raw.as_slice(KEY_VAL_FIXED_BYTES + 1, len);
+        let (len, n) = Varint32::decode(raw.as_slice(0, raw.len())).unwrap();
+        let state = raw.as_mut_slice(n, 1)[0];
+        let b = raw.as_slice(n + 1, (len - 1) as usize);
 
         match state {
             VALUE_DEL_BIT => Value::Del(T::decode(b)),
@@ -417,19 +414,20 @@ impl IKey for &[u8] {
 
 impl ICodec for &[u8] {
     fn packed_size(&self) -> usize {
-        KEY_VAL_FIXED_BYTES + self.len()
+        let len = self.len();
+        Varint32::size(len as u32) + len
     }
 
     fn encode_to(&self, to: &mut [u8]) {
         debug_assert_eq!(to.len(), self.packed_size());
-        let (len, data) = to.split_at_mut(KEY_VAL_FIXED_BYTES);
-        number_to_slice!(self.len() as u32, len);
+        let (len, data) = to.split_at_mut(Varint32::size(to.len() as u32));
+        Varint32::encode(len, self.len() as u32);
         data.copy_from_slice(self);
     }
 
     fn decode_from(raw: ByteArray) -> Self {
-        let len = slice_to_number!(raw.as_slice(0, KEY_VAL_FIXED_BYTES), u32) as usize;
-        raw.as_slice(KEY_VAL_FIXED_BYTES, len)
+        let (len, n) = Varint32::decode(raw.as_slice(0, raw.len())).unwrap();
+        raw.as_slice(n, len as usize)
     }
 }
 
@@ -455,48 +453,7 @@ impl IValCodec for &[u8] {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub(crate) struct Slot {
-    off: u32,
-    sep: u32,
-    len: u32,
-}
-
-pub(crate) const SLOT_LEN: usize = size_of::<Slot>();
-
-impl Slot {
-    pub(crate) fn reset(&mut self, off: u32, sep: u32, len: u32) {
-        self.off = off;
-        self.sep = sep;
-        self.len = len
-    }
-
-    pub(crate) fn from(s: &mut [u8]) -> &mut Self {
-        debug_assert_eq!(s.len(), SLOT_LEN);
-        unsafe { &mut *s.as_mut_ptr().cast::<Self>() }
-    }
-
-    pub(crate) fn key_off(&self) -> usize {
-        self.off as usize
-    }
-
-    pub(crate) fn val_off(&self) -> usize {
-        (self.off + self.sep) as usize
-    }
-
-    pub(crate) fn key_len(&self) -> usize {
-        self.sep as usize
-    }
-
-    pub(crate) fn val_len(&self) -> usize {
-        (self.len - self.sep) as usize
-    }
-
-    #[allow(unused)]
-    pub(crate) fn len(&self) -> usize {
-        self.len as usize
-    }
-}
+pub(crate) const SLOT_LEN: usize = size_of::<u32>();
 
 #[cfg(test)]
 mod test {

@@ -164,7 +164,8 @@ struct GarbageCollector {
 impl GarbageCollector {
     fn process_data(&mut self) {
         let tgt_ratio = self.store.opt.gc_ratio as u64;
-        let tgt_size = self.store.opt.buffer_size;
+        let tgt_size = self.store.opt.gc_compacted_size;
+        let eager = self.store.opt.gc_eager;
 
         'again: loop {
             let mut total = 0u64;
@@ -220,6 +221,9 @@ impl GarbageCollector {
                     self.compact(victims, unmapped, unlinked);
                     continue 'again;
                 }
+            }
+            if eager {
+                self.compact(victims, unmapped, unlinked);
             }
             break;
         }

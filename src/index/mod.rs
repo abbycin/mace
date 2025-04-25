@@ -6,7 +6,6 @@ pub(crate) mod tree;
 pub use data::Key;
 pub use tree::ValRef;
 mod builder;
-mod slotted;
 pub(crate) mod txn;
 
 use crate::{map::data::FrameRef, OpCode};

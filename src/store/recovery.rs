@@ -10,8 +10,8 @@ use io::{File, GatherIO};
 
 use crate::cc::data::Ver;
 use crate::cc::wal::{
-    ptr_to, wal_record_sz, EntryType, PayloadType, WalAbort, WalBegin, WalCheckpoint, WalPadding,
-    WalReader, WalUpdate,
+    ptr_to, wal_record_sz, EntryType, PayloadType, WalAbort, WalBegin, WalCheckpoint, WalReader,
+    WalSpan, WalUpdate,
 };
 use crate::index::data::Value;
 use crate::index::tree::Tree;
@@ -211,9 +211,11 @@ impl Recovery {
                         pos += c.payload_len() as u64;
                     }
                     EntryType::Padding => {
-                        let p = ptr_to::<WalPadding>(ptr);
-                        log::trace!("{:?}", p);
-                        pos += p.len as u64;
+                        // do nothing
+                    }
+                    EntryType::Span => {
+                        let p = ptr_to::<WalSpan>(ptr);
+                        pos += p.span as u64;
                     }
                     EntryType::Update => {
                         let u = ptr_to::<WalUpdate>(ptr);
@@ -262,6 +264,8 @@ impl Recovery {
                 let c = ptr_to::<WalUpdate>(block.data());
                 let ok = c.key();
                 let key = Key::new(ok, c.txid, c.cmd_id);
+                // redo never write log, so we manually make arena flush work
+                tree.store.buffer.update_flsn();
                 let r = match c.sub_type() {
                     PayloadType::Insert => {
                         let i = c.put();
@@ -405,8 +409,11 @@ impl Recovery {
                         oracle = max(oracle, b.txid);
                     }
                     EntryType::Padding => {
-                        let pad = ptr_to::<WalPadding>(buf.as_ptr());
-                        pos += pad.len as u64;
+                        // do nothing
+                    }
+                    EntryType::Span => {
+                        let p = ptr_to::<WalSpan>(buf.as_ptr());
+                        pos += p.span as u64;
                     }
                     EntryType::Update => {
                         let u = ptr_to::<WalUpdate>(buf.as_ptr());

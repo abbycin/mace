@@ -16,6 +16,7 @@ pub(crate) mod options;
 pub(crate) mod queue;
 mod spooky;
 pub(crate) mod traits;
+pub(crate) mod varint;
 
 pub(crate) const NULL_PID: u64 = 0;
 pub(crate) const ROOT_PID: u64 = 1;

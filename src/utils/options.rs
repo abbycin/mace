@@ -9,8 +9,13 @@ pub struct Options {
     pub workers: usize,
     /// garbage collection cycle (milliseconds)
     pub gc_timeout: u64,
-    /// perform GC when garbage ratio exceed this value, range [0, 100]
+    /// perform compaction when garbage ratio exceed this value, range [0, 100]
     pub gc_ratio: u32,
+    /// perform compaction when [`Self::gc_ratio`] is reached
+    pub gc_eager: bool,
+    /// if [`Self::gc_eager`] is not set, the compaction will only be triggered when active data
+    /// size can be compacted into [`Self::gc_compacted_size`], the default setting is [`Self::buffer_size`]
+    pub gc_compacted_size: u32,
     /// is temperary storage, if true, db_root will be unlinked when quit
     pub tmp_store: bool,
     /// where to store database files
@@ -27,9 +32,9 @@ pub struct Options {
     pub buffer_count: u32,
     /// B+ Tree node size, mut less than half of [`Self::buffer_size`]
     pub page_size: usize,
-    /// when should we consolidate delta chain
+    /// when should we consolidate delta chain, the best value is 16
     pub consolidate_threshold: u8,
-    /// WAL ring buffer size, must greater than [`Self::page_size`]
+    /// WAL ring buffer size, must greater than [`Self::page_size`] and must be power of 2
     pub wal_buffer_size: usize,
     /// the count of checkpoints that a txn can span, ie, the length limit of a txn, if a txn length
     /// exceed the limit, it will be forcibly aborted, NOTE: checkpoint was taken when a buffer was
@@ -40,6 +45,8 @@ pub struct Options {
 }
 
 impl Options {
+    pub const DEFAULT_BUFFER_SIZE: u32 = 64 << 20; // 64MB
+
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
             sync_on_write: true,
@@ -47,18 +54,25 @@ impl Options {
             tmp_store: false,
             gc_timeout: 60 * 1000, // 60s
             gc_ratio: 80,          // 80%
+            gc_eager: false,
+            gc_compacted_size: Self::DEFAULT_BUFFER_SIZE,
             db_root: db_root.as_ref().to_path_buf(),
-            file_cache: 512,       // each shard has 16 entries
-            cache_capacity: 2048,  // 2048 items
-            cache_evict_pct: 10,   // 10%
-            buffer_size: 64 << 20, // 64MB
-            buffer_count: 3,       // total 192MB
-            page_size: 8 << 10,    // 8KB
+            file_cache: 512,      // each shard has 16 entries
+            cache_capacity: 2048, // 2048 items
+            cache_evict_pct: 10,  // 10%
+            buffer_size: Self::DEFAULT_BUFFER_SIZE,
+            buffer_count: 3,    // total 192MB
+            page_size: 8 << 10, // 8KB
             consolidate_threshold: 16,
             wal_buffer_size: 4 << 20,    // 4MB
             max_ckpt_per_txn: 1_000_000, // 1 million
             wal_file_size: 100 << 20,    // 100MB
         }
+    }
+
+    /// the length of the kv plus the length of the metadata must be less than this value for now
+    pub fn max_data_size(&self) -> usize {
+        self.wal_buffer_size
     }
 }
 

@@ -37,6 +37,16 @@ impl ByteArray {
         self.data
     }
 
+    pub fn write<T>(&self, pos: usize, val: T) {
+        unsafe {
+            self.data.add(pos).cast::<T>().write_unaligned(val);
+        }
+    }
+
+    pub fn read<T>(&self, pos: usize) -> T {
+        unsafe { self.data.add(pos).cast::<T>().read_unaligned() }
+    }
+
     #[allow(unused)]
     pub fn add(&self, n: usize) -> Self {
         debug_assert!(n <= self.size);
@@ -44,11 +54,13 @@ impl ByteArray {
     }
 
     pub fn sub_array(&self, off: usize, len: usize) -> Self {
-        if off + len > self.size {
-            log::debug!("===>> off {} len {} size {}", off, len, self.size);
-        }
         debug_assert!(off + len <= self.size);
         unsafe { Self::new(self.data.add(off), len) }
+    }
+
+    pub fn skip(&self, off: usize) -> Self {
+        debug_assert!(off <= self.size);
+        unsafe { Self::new(self.data.add(off), self.size - off) }
     }
 
     pub fn as_slice<'a, T>(&self, off: usize, cnt: usize) -> &'a [T] {

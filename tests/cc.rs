@@ -335,3 +335,30 @@ fn range_cross_node() -> Result<(), OpCode> {
 fn to_str(x: &[u8]) -> &str {
     std::str::from_utf8(x).unwrap()
 }
+
+#[test]
+fn big_kv() {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.consolidate_threshold = 3;
+    let db = Mace::new(opt).unwrap();
+    const N: usize = 200;
+    let kv = db.begin().unwrap();
+    let val = vec![233; 56 << 10];
+
+    log::set_max_level(log::LevelFilter::Info);
+
+    for i in 0..N {
+        kv.put(format!("key_{}", i), &val).unwrap();
+    }
+    kv.commit().unwrap();
+
+    let kv = db.begin().unwrap();
+    for i in 0..N {
+        let x = kv.get(format!("key_{}", i));
+        assert!(x.is_ok());
+        assert_eq!(x.unwrap().data(), val.as_slice());
+    }
+    kv.commit().unwrap();
+}

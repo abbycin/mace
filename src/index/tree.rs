@@ -1,11 +1,10 @@
 use super::{
-    data::{Index, Key, Value},
+    data::{Index, Key, Value, SLOT_LEN},
     iter::{ItemIter, MergeIterBuilder},
     page::{
-        DeltaType, IntlMergeIter, IntlPage, LeafMergeIter, LeafPage, NodeType, Page, PageHeader,
-        PageMergeIter, RangeIter, PAGE_HEADER_SIZE,
+        DeltaType, IntlMergeIter, IntlPage, LeafMergeIter, LeafPage, MainPage, MainPageHdr,
+        NodeType, PageMergeIter, RangeIter, MAINPG_HDR_LEN,
     },
-    slotted::SlottedPage,
     systxn::SysTxn,
 };
 
@@ -13,7 +12,7 @@ use crate::{
     cc::data::Ver,
     index::{
         builder::{Delta, FuseBuilder},
-        page::NULL_INDEX,
+        page::{SibPage, NULL_INDEX},
     },
     map::data::FrameOwner,
     utils::{
@@ -81,7 +80,7 @@ where
 pub struct View {
     pub page_id: u64,
     pub page_addr: u64,
-    pub info: PageHeader,
+    pub info: MainPageHdr,
 }
 
 #[derive(Clone)]
@@ -115,7 +114,7 @@ impl Tree {
         let mut delta = Delta::new(DeltaType::Data, NodeType::Leaf).from(iter);
         let mut txn = SysTxn::new(&self.store);
         let mut f = txn.alloc(delta.size()).expect("can't alloc memory");
-        let mut page = Page::from(f.payload());
+        let mut page = MainPage::from(f.payload());
         delta.build(&mut page);
         assert_eq!(page.header().epoch(), 0);
         txn.update_unchecked(self.root_index.pid, &mut f);
@@ -128,13 +127,13 @@ impl Tree {
 
     fn walk_page<F, K, V>(&self, mut addr: u64, mut f: F) -> Result<(), OpCode>
     where
-        F: FnMut(FrameOwner, u64, Page<K, V>) -> bool,
+        F: FnMut(FrameOwner, u64, MainPage<K, V>) -> bool,
         K: IKey,
         V: IVal,
     {
         while addr != 0 {
             let frame = self.store.buffer.load(addr);
-            let page = Page::<K, V>::from(frame.payload());
+            let page = MainPage::<K, V>::from(frame.payload());
             let next = page.header().link();
 
             // NOTE: frame is moved
@@ -231,7 +230,7 @@ impl Tree {
         let mut child = None;
 
         // stop when the child is in range
-        let _ = self.walk_page(addr, |frame, _, pg: Page<&[u8], Index>| {
+        let _ = self.walk_page(addr, |frame, _, pg: MainPage<&[u8], Index>| {
             debug_assert!(pg.header().is_intl());
 
             // skip inner `split-delta`
@@ -305,7 +304,7 @@ impl Tree {
             parent = Some(view);
 
             let mut child = None;
-            let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<&[u8], Index>| {
+            let _ = self.walk_page(view.page_addr, |frame, _, pg: MainPage<&[u8], Index>| {
                 let h = pg.header();
                 if h.is_data() {
                     let (pos, l, r) = match pg.search(&key) {
@@ -379,13 +378,9 @@ impl Tree {
         F: FnMut(u64, &K) -> Result<(), OpCode>,
     {
         let mut delta = Delta::new(DeltaType::Data, NodeType::Leaf).with_item((*key, *val));
-        // NOTE: restrict logical node size
-        if delta.size() > self.store.opt.page_size - PAGE_HEADER_SIZE {
-            return Err(OpCode::TooLarge);
-        }
         let mut txn = self.begin();
         let mut f = txn.alloc(delta.size())?;
-        let (new_addr, mut new_page) = (f.addr(), Page::from(f.payload()));
+        let (new_addr, mut new_page) = (f.addr(), MainPage::from(f.payload()));
         debug_assert!(new_addr > view.page_addr);
         delta.build(&mut new_page);
 
@@ -411,7 +406,7 @@ impl Tree {
                     if view.page_id != self.root_index.pid {
                         let f = self.store.buffer.load(cur_addr);
                         let b = f.payload();
-                        let hdr: PageHeader = b.into();
+                        let hdr: MainPageHdr = b.into();
                         // no split happen
                         if hdr.epoch() == view.info.epoch() {
                             view.page_addr = cur_addr;
@@ -465,7 +460,7 @@ impl Tree {
         T: IValCodec,
     {
         let mut r = None;
-        let _ = self.walk_page(addr, |f, _, pg: Page<Key, Value<T>>| {
+        let _ = self.walk_page(addr, |f, _, pg: MainPage<Key, Value<T>>| {
             let h = pg.header();
 
             if !h.is_data() {
@@ -519,6 +514,10 @@ impl Tree {
         T2: IValCodec,
         V: FnMut(&Option<(Key, ValRef<T2>)>) -> Result<(), OpCode>,
     {
+        let size = key.packed_size() + val.packed_size() + SLOT_LEN + MAINPG_HDR_LEN;
+        if size > self.store.opt.max_data_size() {
+            return Err(OpCode::TooLarge);
+        }
         loop {
             match self.try_update(&key, &val, &mut visible) {
                 Ok(x) => return Ok(x),
@@ -540,8 +539,8 @@ impl Tree {
         log::info!("-------- show tree node {pid} ------------");
         while let Some(pid) = q.pop_front() {
             let addr = self.store.page.get(pid);
-            let _ = self.walk_page(addr, |f, addr, _: Page<Key, Value<T>>| {
-                let h: PageHeader = f.payload().into();
+            let _ = self.walk_page(addr, |f, addr, _: MainPage<Key, Value<T>>| {
+                let h: MainPageHdr = f.payload().into();
                 if h.is_intl() {
                     let pg = IntlPage::from(f.payload());
                     let mut pids = Vec::with_capacity(h.elems as usize);
@@ -567,8 +566,8 @@ impl Tree {
                         );
                         if let Some(s) = v.sibling() {
                             let f = self.store.buffer.load(s.addr());
-                            let slotted = SlottedPage::<Ver, T>::from(f.payload());
-                            slotted.show();
+                            let slotted = SibPage::<Ver, Value<T>>::from(f.payload());
+                            slotted.show(s.addr());
                         }
                     }
                 }
@@ -587,7 +586,7 @@ impl Tree {
     {
         let (view, _) = self.find_leaf::<T>(key.raw())?;
         let mut data = Err(OpCode::NotFound);
-        let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<K, Value<T>>| {
+        let _ = self.walk_page(view.page_addr, |frame, _, pg: MainPage<K, Value<T>>| {
             if pg.header().is_data() {
                 if let Ok(pos) = pg.search_raw(&key) {
                     let (k, v) = pg.get(pos).unwrap();
@@ -619,12 +618,12 @@ impl Tree {
         let ver = Ver::new(start_ts, NULL_CMD);
         while addr != 0 {
             let frame = self.store.buffer.load(addr);
-            let page = SlottedPage::<Ver, T>::from(frame.payload());
+            let page = SibPage::<Ver, Value<T>>::from(frame.payload());
             let h = page.header();
 
             let pos = page.lower_bound(&ver).unwrap_or_else(|pos| pos);
             if pos < h.elems as usize {
-                let (k, v) = page.get(pos);
+                let (k, v) = page.get(pos).unwrap();
 
                 if visible(k.txid, v.as_ref()) {
                     if v.is_del() {
@@ -648,7 +647,7 @@ impl Tree {
     {
         let (view, _) = self.find_leaf::<T>(key.raw)?;
         let mut latest: Option<ValRef<T>> = None;
-        let _ = self.walk_page(view.page_addr, |f, _, pg: Page<Key, Value<T>>| {
+        let _ = self.walk_page(view.page_addr, |f, _, pg: MainPage<Key, Value<T>>| {
             let h = pg.header();
             if !h.is_data() {
                 return false;
@@ -681,7 +680,7 @@ impl Tree {
         })
     }
 
-    fn need_consolidate(&self, info: &PageHeader) -> bool {
+    fn need_consolidate(&self, info: &MainPageHdr) -> bool {
         let mut max_depth = self.store.opt.consolidate_threshold;
         if info.is_intl() {
             // delta has greater impact on inner node
@@ -692,7 +691,7 @@ impl Tree {
     }
 
     fn decode_split_delta<'a>(b: ByteArray) -> (&'a [u8], Index) {
-        let pg = Page::<&[u8], Index>::from(b);
+        let pg = MainPage::<&[u8], Index>::from(b);
         pg.get(0).expect("invalid delta")
     }
 
@@ -703,7 +702,7 @@ impl Tree {
         &self,
         txn: &mut SysTxn,
         view: &View,
-    ) -> (PageMergeIter<'a, K, V>, PageHeader)
+    ) -> (PageMergeIter<'a, K, V>, MainPageHdr)
     where
         K: IKey,
         V: IVal,
@@ -754,7 +753,7 @@ impl Tree {
         let iter = f(iter, self.get_txid());
         let mut delta = Delta::new(view.info.delta_type(), view.info.node_type()).from(iter);
         let mut frame = txn.alloc(delta.size())?;
-        let (new_addr, mut new_page) = (frame.addr(), Page::from(frame.payload()));
+        let (new_addr, mut new_page) = (frame.addr(), MainPage::from(frame.payload()));
         debug_assert!(new_addr > view.page_addr);
 
         delta.build(&mut new_page);
@@ -784,12 +783,12 @@ impl Tree {
     {
         while addr != 0 {
             let frame = self.store.buffer.load(addr);
-            let pg = SlottedPage::<Ver, T>::from(frame.payload());
+            let pg = SibPage::<Ver, Value<T>>::from(frame.payload());
             let h = pg.header();
             save_fn(frame);
 
             for i in 0..h.elems as usize {
-                let (k, v) = pg.get(i);
+                let (k, v) = pg.get(i).unwrap();
                 b.add(Key::new(raw, k.txid, k.cmd), v);
             }
             addr = h.link();
@@ -801,14 +800,14 @@ impl Tree {
         txn: &mut SysTxn,
         view: &View,
         b: &mut LeafMergeIter<'_, T>,
-    ) -> PageHeader {
+    ) -> MainPageHdr {
         let mut info = view.info;
         let mut split = None;
-        let mut sz = 0;
-        let limit = (self.store.opt.page_size - PAGE_HEADER_SIZE) * 2;
+        let mut sz = MAINPG_HDR_LEN;
+        let limit = self.store.opt.max_data_size();
         let is_root = self.is_root(view.page_id);
 
-        let _ = self.walk_page(view.page_addr, |frame, _, pg: Page<Key, Value<T>>| {
+        let _ = self.walk_page(view.page_addr, |frame, _, pg: MainPage<Key, Value<T>>| {
             let h = pg.header();
             txn.gc(frame);
 
@@ -827,7 +826,7 @@ impl Tree {
                         }
                     }
                     if !is_root {
-                        sz += k.packed_size() + v.packed_size();
+                        sz += k.packed_size() + v.packed_size() + SLOT_LEN;
                         // we must consume the split-delta to make sure there's at most one split -
                         // delta in delta chain
                         if sz > limit && split.is_none() {
@@ -863,7 +862,7 @@ impl Tree {
         let mut builder = FuseBuilder::<T>::new(info.delta_type(), info.node_type());
         builder.prepare(iter);
         let mut f = builder.build(&mut txn)?;
-        let (new_addr, mut new_page) = (f.addr(), Page::<Key, Value<T>>::from(f.payload()));
+        let (new_addr, mut new_page) = (f.addr(), MainPage::<Key, Value<T>>::from(f.payload()));
         debug_assert!(new_addr > view.page_addr);
 
         let h = new_page.header_mut();
@@ -871,8 +870,8 @@ impl Tree {
         h.set_depth(info.depth());
         h.set_link(info.link());
 
-        assert_eq!(h.delta_type(), info.delta_type());
-        assert_eq!(h.node_type(), info.node_type());
+        debug_assert_eq!(h.delta_type(), info.delta_type());
+        debug_assert_eq!(h.node_type(), info.node_type());
 
         txn.update(view.page_id, view.page_addr, &mut f)
             .map(|_| {
@@ -944,7 +943,7 @@ impl Tree {
         let lidx = Index::new(view.page_id, view.info.epoch());
         let f = self.store.buffer.load(view.page_addr);
         let b = f.payload();
-        let page = Page::from(b);
+        let page = MainPage::<&[u8], Index, MainPageHdr>::from(b);
         let (split_key, split_idx) = {
             // the `page` is a `split-delta` see `Self::split_non_root`
             page.get(0).expect("invalid page")
@@ -959,7 +958,7 @@ impl Tree {
         let mut txn = self.begin();
         let mut d = Delta::new(DeltaType::Data, NodeType::Intl).with_slice(&entry_delta);
         let mut f = txn.alloc(d.size())?;
-        let (new_addr, mut new_page) = (f.addr(), Page::from(f.payload()));
+        let (new_addr, mut new_page) = (f.addr(), MainPage::from(f.payload()));
         debug_assert!(new_addr > view.page_addr);
 
         d.build(&mut new_page);
@@ -981,7 +980,9 @@ impl Tree {
         Ok(())
     }
 
-    fn find_page_splitter<K, V>(page: Page<K, V>) -> Option<(K, RangeIter<K, V>, RangeIter<K, V>)>
+    fn find_page_splitter<K, V>(
+        page: MainPage<K, V>,
+    ) -> Option<(K, RangeIter<K, V>, RangeIter<K, V>)>
     where
         K: IKey,
         V: IVal,
@@ -1013,7 +1014,7 @@ impl Tree {
 
         let f = self.store.buffer.load(view.page_addr);
         let b = f.payload();
-        let page = Page::<K, V>::from(b);
+        let page = MainPage::<K, V>::from(b);
         let Some((sep_key, li, ri)) = Self::find_page_splitter(page) else {
             return Ok(());
         };
@@ -1022,14 +1023,14 @@ impl Tree {
         let l = {
             let mut d = Delta::new(DeltaType::Data, view.info.node_type()).from(li);
             let mut f = txn.alloc(d.size())?;
-            let mut lpage = Page::from(f.payload());
+            let mut lpage = MainPage::from(f.payload());
             d.build(&mut lpage);
             txn.map(&mut f)
         };
         let r = {
             let mut d = Delta::new(DeltaType::Data, view.info.node_type()).from(ri);
             let mut f = txn.alloc(d.size())?;
-            let mut rpage = Page::from(f.payload());
+            let mut rpage = MainPage::from(f.payload());
             d.build(&mut rpage);
             txn.map(&mut f)
         };
@@ -1044,7 +1045,7 @@ impl Tree {
         // the new root
         let mut delta = Delta::new(DeltaType::Data, NodeType::Intl).with_slice(&s);
         let mut f = txn.alloc(delta.size())?;
-        let (new_addr, mut new_page) = (f.addr(), Page::from(f.payload()));
+        let (new_addr, mut new_page) = (f.addr(), MainPage::from(f.payload()));
         debug_assert!(new_addr > view.page_addr);
 
         delta.build(&mut new_page);
@@ -1069,7 +1070,7 @@ impl Tree {
         let mut txn = self.begin();
         let f = self.store.buffer.load(view.page_addr);
         let b = f.payload();
-        let page = Page::<K, V>::from(b);
+        let page = MainPage::<K, V>::from(b);
         let Some((sep, _, ri)) = Self::find_page_splitter(page) else {
             return Ok(());
         };
@@ -1077,7 +1078,7 @@ impl Tree {
         let rpid: u64 = {
             let mut d = Delta::new(DeltaType::Data, view.info.node_type()).from(ri);
             let mut f = txn.alloc(d.size())?;
-            let mut new_page = Page::from(f.payload());
+            let mut new_page = MainPage::from(f.payload());
 
             d.build(&mut new_page);
             txn.map(&mut f)
@@ -1087,7 +1088,7 @@ impl Tree {
         let mut delta = Delta::new(DeltaType::Split, view.info.node_type())
             .with_item((sep.raw(), Index::new(rpid, 0)));
         let mut f = txn.alloc(delta.size())?;
-        let (new_addr, mut new_page) = (f.addr(), Page::from(f.payload()));
+        let (new_addr, mut new_page) = (f.addr(), MainPage::from(f.payload()));
         debug_assert!(new_addr > view.page_addr);
         delta.build(&mut new_page);
 
@@ -1194,7 +1195,7 @@ where
     }
 
     #[inline]
-    fn has_prefix(pg: &Page<Key, Value<T>>, pos: usize, prefix: &[u8]) -> bool {
+    fn has_prefix(pg: &MainPage<Key, Value<T>>, pos: usize, prefix: &[u8]) -> bool {
         pg.key_at(pos).raw.starts_with(prefix)
     }
 
@@ -1205,7 +1206,7 @@ where
                 self.iter.reset();
                 let mut key = Key::new([].as_slice(), NULL_ORACLE, NULL_CMD);
                 self.tree
-                    .walk_page(addr, |frame, _, pg: Page<Key, Value<T>>| {
+                    .walk_page(addr, |frame, _, pg: MainPage<Key, Value<T>>| {
                         let h = pg.header();
                         if h.is_data() {
                             debug_assert!(h.is_leaf());

@@ -1,10 +1,9 @@
 use std::{
     cell::Cell,
-    cmp::max,
     fmt::Debug,
     ops::Deref,
     sync::{
-        atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize},
+        atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize},
         Arc,
     },
 };
@@ -12,7 +11,7 @@ use std::{
 use crate::{
     map::data::FrameFlag,
     static_assert,
-    utils::{countblock::Countblock, data::Meta, raw_ptr_to_ref, INVALID_ID, NULL_ID, NULL_ORACLE},
+    utils::{countblock::Countblock, data::Meta, raw_ptr_to_ref, INIT_ORACLE, INVALID_ID, NULL_ID},
     OpCode,
 };
 
@@ -25,17 +24,15 @@ use crate::map::cache::Cache;
 use crate::utils::bytes::ByteArray;
 use crate::utils::options::Options;
 use crate::utils::{pack_id, unpack_id};
-use std::sync::atomic::{
-    AtomicU16,
-    Ordering::{AcqRel, Acquire, Relaxed, Release},
-};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 
 // use C repr to fix the layout
 #[repr(C)]
 pub(crate) struct Arena {
     raw: ByteArray,
     idx: u16,
-    state: AtomicU16,
+    state: AtomicU8,
+    dirty: AtomicU8,
     refcnt: AtomicU32,
     offset: AtomicU32,
     flsn: AtomicU64,
@@ -48,18 +45,23 @@ static_assert!(size_of::<Arena>() == 64);
 
 impl Arena {
     /// memory can be allocated
-    const HOT: u16 = 4;
+    const HOT: u8 = 4;
     /// memory no longer available for allocating
-    const WARM: u16 = 3;
+    const WARM: u8 = 3;
     /// waiting for flush
-    const COLD: u16 = 2;
+    const COLD: u8 = 2;
     /// flushed to disk
-    const FLUSH: u16 = 1;
+    const FLUSH: u8 = 1;
+
+    const FRESH: u8 = 0;
+    const STALE: u8 = 1;
+    const DIRTY: u8 = 2;
 
     fn new(cap: u32, idx: usize) -> Self {
         Self {
             raw: ByteArray::alloc(cap as usize),
-            state: AtomicU16::new(Self::FLUSH),
+            state: AtomicU8::new(Self::FLUSH),
+            dirty: AtomicU8::new(Self::FRESH),
             refcnt: AtomicU32::new(0),
             offset: AtomicU32::new(0),
             flsn: AtomicU64::new(0),
@@ -73,6 +75,7 @@ impl Arena {
     fn reset(&self, id: u32, flsn: u64) {
         self.id.set(id);
         self.flsn.store(flsn, Relaxed);
+        self.dirty.store(Self::FRESH, Relaxed);
         assert_eq!(self.state(), Self::HOT);
         self.offset.store(0, Relaxed);
     }
@@ -124,47 +127,52 @@ impl Arena {
         Ok(self.alloc_at(offset, size))
     }
 
-    /// CAS is only necessary when it was in `release_buffer`
-    fn update_flsn(&self, flsn: u64) {
-        let mut old = self.flsn.load(Relaxed);
-        let new = max(old, flsn);
-        loop {
-            match self.flsn.compare_exchange(old, new, Relaxed, Relaxed) {
-                Ok(_) => break,
-                Err(e) if e < new => {
-                    old = e;
-                }
-                Err(_) => break,
-            }
-        }
-    }
-
     fn used(&self) -> ArenaIter {
         ArenaIter::new(self.raw, self.offset.load(Relaxed))
     }
 
+    #[inline]
     fn load(&self, off: u32) -> *mut Frame {
         unsafe { self.raw.data().add(off as usize).cast::<Frame>() }
     }
 
-    fn set_state(&self, cur: u16, new: u16) -> u16 {
+    fn set_state(&self, cur: u8, new: u8) -> u8 {
+        // we don't care if it's success, what we want is the `dirty` flag either be STALE or DIRTY
+        self.set_dirty(Self::FRESH, Self::STALE);
         self.state
             .compare_exchange(cur, new, AcqRel, Acquire)
             .unwrap_or_else(|x| x)
     }
 
-    fn state(&self) -> u16 {
+    #[inline]
+    fn state(&self) -> u8 {
         self.state.load(Relaxed)
+    }
+
+    #[inline(always)]
+    fn set_dirty(&self, cur: u8, new: u8) {
+        let _ = self.dirty.compare_exchange(cur, new, Relaxed, Relaxed);
+    }
+
+    fn mark_dirty(&self) {
+        self.set_dirty(Self::FRESH, Self::DIRTY);
+    }
+
+    #[inline]
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Relaxed) == Self::DIRTY
     }
 
     fn refs(&self) -> u32 {
         self.refcnt.load(Relaxed)
     }
 
+    #[inline]
     fn inc_ref(&self) {
         self.refcnt.fetch_add(1, Release);
     }
 
+    #[inline]
     fn dec_ref(&self) {
         let x = self.refcnt.fetch_sub(1, Relaxed);
         assert!(x > 0);
@@ -178,6 +186,7 @@ impl Arena {
         self.borrow_cnt.fetch_sub(1, Relaxed);
     }
 
+    #[inline]
     fn balanced(&self) -> bool {
         self.borrow_cnt.load(Relaxed) == 0
     }
@@ -274,7 +283,7 @@ impl Pool {
             buf,
             free,
             seal: AtomicUsize::new(0),
-            flsn: AtomicU64::new(NULL_ORACLE),
+            flsn: AtomicU64::new(INIT_ORACLE),
             cur: AtomicPtr::new(h.raw),
             meta,
         };
@@ -285,12 +294,10 @@ impl Pool {
         Ok(this)
     }
 
-    // we MUST update flsn rather than where arena was cooled to WARM
     fn release(&self, idx: usize) {
         let h = self.buf.get(idx).expect("index out of range");
         assert!(matches!(h.state(), Arena::HOT | Arena::WARM));
         h.dec_ref();
-        h.update_flsn(self.flsn.load(Relaxed));
         self.try_flush();
     }
 
@@ -330,19 +337,13 @@ impl Pool {
     fn try_flush(&self) {
         let idx = self.seal.load(Relaxed);
         let h = self.buf[idx];
-        let (oid, opos) = unpack_id(h.flsn.load(Relaxed));
-        let flsn = self.flsn.load(Relaxed);
-        let (cid, cpos) = unpack_id(flsn);
 
-        let ready = if flsn == NULL_ORACLE {
-            true
+        let ready = if h.is_dirty() {
+            let r = self.flsn.load(Relaxed);
+            let l = h.flsn.load(Relaxed);
+            r > l
         } else {
-            // NOTE: we can limit the length of the TXN so that it won't span all wal files
-            if cid < oid {
-                true // log was stabilized and wrapped
-            } else {
-                (cid > oid) || cpos > opos // log was stabilized
-            }
+            h.state() == Arena::WARM
         };
 
         if ready && h.refs() == 0 && h.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
@@ -352,8 +353,8 @@ impl Pool {
         }
     }
 
-    fn update_flsn(&self, flsn: u64) {
-        self.flsn.store(flsn, Release);
+    fn update_flsn(&self) {
+        self.flsn.fetch_add(1, Release);
         self.try_flush();
     }
 
@@ -441,10 +442,6 @@ impl Pool {
         }
     }
 
-    fn start(&self) {
-        self.flsn.store(0, Relaxed);
-    }
-
     fn quit(&self) {
         self.flush_all();
         self.flush.quit();
@@ -495,21 +492,24 @@ impl Buffers {
         }
     }
 
-    pub fn start(&self) {
-        self.pool.start();
-    }
-
     pub fn quit(&self) {
         self.pool.quit()
     }
 
+    #[inline]
     pub fn release_buffer(&self, buffer_id: usize) {
         self.pool.release(buffer_id);
     }
 
-    pub fn update_flsn(&self, flsn: u64) {
-        debug_assert_ne!(flsn, 0);
-        self.pool.update_flsn(flsn);
+    #[inline]
+    pub fn update_flsn(&self) {
+        self.pool.update_flsn();
+    }
+
+    #[inline]
+    pub fn mark_dirty(&self) {
+        let a = self.pool.current();
+        a.mark_dirty();
     }
 
     #[inline]

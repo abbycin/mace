@@ -46,7 +46,6 @@ impl Store {
 
     pub(crate) fn start(&self) {
         self.context.start();
-        self.buffer.start();
     }
 
     pub(crate) fn quit(&self) {
