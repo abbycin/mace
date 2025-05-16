@@ -1,22 +1,21 @@
 use crc32c::Crc32cHasher;
 use io::{File, GatherIO};
 
+use crate::OpCode;
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
-use crate::utils::data::{AddrMap, MapEntry, PageTable, Reloc, ID_LEN, JUNK_LEN};
+use crate::utils::data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, PageTable, Reloc};
 use crate::utils::{align_up, unpack_id};
 use crate::utils::{bytes::ByteArray, raw_ptr_to_ref, raw_ptr_to_ref_mut};
-use crate::OpCode;
 use std::alloc::alloc_zeroed;
 use std::cmp::min;
 use std::hash::Hasher;
-use std::io::Write;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{Relaxed, Release};
 use std::{
-    alloc::{dealloc, Layout},
+    alloc::{Layout, dealloc},
     ops::{Deref, DerefMut},
 };
 
@@ -42,11 +41,7 @@ impl FileStat {
     pub(crate) fn update(&mut self, reloc: Reloc, now: u32) {
         self.nr_active -= 1;
         self.active_size -= reloc.len;
-        if !self.dealloc.full() {
-            self.dealloc.set(reloc.seq);
-        } else {
-            log::error!("invalid function call, {:?}", reloc);
-        }
+        self.dealloc.set(reloc.seq);
         // make sure monotonically increasing
         if self.up1 < now {
             self.up1 = self.up2;
@@ -343,14 +338,6 @@ impl FrameRef {
     fn payload_slice(&self) -> &[u8] {
         self.payload().as_slice(0, self.payload_size() as usize)
     }
-
-    pub(crate) fn serialize<IO>(&self, file: &mut IO)
-    where
-        IO: Write,
-    {
-        let s = self.payload_slice();
-        file.write_all(s).expect("can't write");
-    }
 }
 
 pub(crate) struct FlushData {
@@ -445,12 +432,11 @@ pub(crate) struct DataFooter {
 impl DataFooter {
     pub(crate) const LEN: usize = size_of::<Self>();
 
-    pub(crate) fn serialize<W: Write>(&self, w: &mut W) {
-        let s = unsafe {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        unsafe {
             let p = self as *const Self;
             std::slice::from_raw_parts(p.cast::<u8>(), size_of::<Self>())
-        };
-        w.write_all(s).expect("can't write");
+        }
     }
 
     fn lid_pos(&self) -> usize {
@@ -576,10 +562,7 @@ impl DataBuilder {
         self.frames.len()
     }
 
-    pub(crate) fn build<W>(&mut self, w: &mut W, up2: u32)
-    where
-        W: Write,
-    {
+    pub(crate) fn build(&mut self, w: &mut GatherWriter, up2: u32) {
         let mut pos = 0;
         let mut crc = Crc32cHasher::default();
 
@@ -587,20 +570,24 @@ impl DataBuilder {
             let reloc = AddrMap::new(f.addr(), pos, f.payload_size(), seq as u32);
             pos += f.payload_size();
             self.reloc.extend_from_slice(reloc.as_slice());
-            crc.write(f.payload_slice());
-            f.serialize(w);
+            let s = f.payload_slice();
+            crc.write(s);
+            w.queue(s);
         }
 
         for f in &self.junks {
-            crc.write(f.payload_slice());
-            f.serialize(w);
+            let s = f.payload_slice();
+            crc.write(s);
+            w.queue(s);
         }
 
-        crc.write(self.reloc.as_slice());
-        w.write_all(self.reloc.as_slice()).unwrap();
+        let s = self.reloc.as_slice();
+        crc.write(s);
+        w.queue(s);
 
-        self.entry.hash(&mut crc);
-        self.entry.serialize(w);
+        let s = self.entry.collect();
+        crc.write(&s);
+        w.queue(&s);
 
         let hdr = DataFooter {
             up2,
@@ -613,7 +600,9 @@ impl DataBuilder {
             crc: crc.finish() as u32,
         };
 
-        hdr.serialize(w);
+        w.queue(hdr.as_slice());
+        w.flush();
+        w.sync();
     }
 }
 
@@ -704,7 +693,7 @@ impl DataMetaReader {
 
     fn get_footer(&mut self) -> Result<(), std::io::Error> {
         let flen = DataFooter::LEN;
-        let s = self.buf.get_mut_slice(0, flen);
+        let s = self.buf.mut_slice(0, flen);
         self.off -= flen as u64;
 
         self.file.read(s, self.off)?;
@@ -721,7 +710,7 @@ impl DataMetaReader {
     fn get_lid(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
         if f.lid_len() > 0 {
             self.off -= f.lid_len() as u64;
-            let s = self.buf.get_mut_slice(self.pos, f.lid_len());
+            let s = self.buf.mut_slice(self.pos, f.lid_len());
 
             self.file.read(s, self.off)?;
             self.pos += f.lid_len();
@@ -732,7 +721,7 @@ impl DataMetaReader {
     fn get_entry(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
         if f.entry_len() > 0 {
             self.off -= f.entry_len() as u64;
-            let s = self.buf.get_mut_slice(self.pos, f.entry_len());
+            let s = self.buf.mut_slice(self.pos, f.entry_len());
 
             self.file.read(s, self.off)?;
             self.pos += f.entry_len();
@@ -743,7 +732,7 @@ impl DataMetaReader {
     fn get_reloc(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
         if f.reloc_len() > 0 {
             self.off -= f.reloc_len() as u64;
-            let s = self.buf.get_mut_slice(self.pos, f.reloc_len());
+            let s = self.buf.mut_slice(self.pos, f.reloc_len());
 
             self.file.read(s, self.off)?;
             self.pos += f.reloc_len();
@@ -780,9 +769,10 @@ impl DataMetaReader {
 
 #[cfg(test)]
 mod test {
-    use std::fs::File;
-
-    use crate::{utils::NEXT_ID, RandomPath};
+    use crate::{
+        RandomPath,
+        utils::{NEXT_ID, data::GatherWriter},
+    };
 
     use super::{DataBuilder, DataMetaReader, FrameOwner};
 
@@ -800,12 +790,7 @@ mod test {
 
         builder.add(view);
 
-        let mut file = File::options()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&*path)
-            .unwrap();
+        let mut file = GatherWriter::new(&path);
         builder.build(&mut file, NEXT_ID);
 
         let mut loader = DataMetaReader::new(&*path, true).unwrap();

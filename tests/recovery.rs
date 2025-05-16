@@ -81,6 +81,7 @@ fn bad_meta() {
     let db = Mace::new(save).unwrap();
 
     let view = db.view().unwrap();
+    view.show();
     let x = view.get("114514").expect("not found");
     assert_eq!(x.data(), "1919810".as_bytes());
     let x = view.get("mo");

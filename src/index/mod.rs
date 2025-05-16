@@ -8,7 +8,7 @@ pub use tree::ValRef;
 mod builder;
 pub(crate) mod txn;
 
-use crate::{map::data::FrameRef, OpCode};
+use crate::{OpCode, map::data::FrameRef};
 
 trait IAlloc {
     fn allocate(&mut self, size: usize) -> Result<FrameRef, OpCode>;

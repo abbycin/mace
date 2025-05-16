@@ -1,9 +1,8 @@
 [package]
 name = "mace"
-version = "0.0.4"
-edition = "2021"
+version = "0.0.5"
+edition = "2024"
 authors = ["abbytsing@gmail.com"]
-rust-version = "1.82"
 readme = "README.md"
 
 [dependencies]
@@ -18,7 +17,7 @@ logger = { path = "deps/logger" }
 
 [features]
 default = []
-check_empty_key = []
+extra_check = []
 
 [profile.release]
 opt-level = 3

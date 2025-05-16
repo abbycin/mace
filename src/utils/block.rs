@@ -1,4 +1,4 @@
-use std::alloc::{alloc, dealloc, realloc, Layout};
+use std::alloc::{Layout, alloc, dealloc, realloc};
 
 use super::{align_up, bytes::ByteArray};
 
@@ -66,10 +66,16 @@ impl Block {
         ByteArray::new(unsafe { self.data.add(from) }, to - from)
     }
 
-    pub(crate) fn get_mut_slice(&mut self, off: usize, len: usize) -> &mut [u8] {
+    pub(crate) fn mut_slice<'a>(&self, off: usize, len: usize) -> &'a mut [u8] {
         debug_assert!(len <= self.len as usize);
 
         unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) }
+    }
+
+    pub(crate) fn slice<'a>(&self, off: usize, len: usize) -> &'a [u8] {
+        debug_assert!(len <= self.len as usize);
+
+        unsafe { std::slice::from_raw_parts(self.data.add(off), len) }
     }
 
     pub(crate) fn realloc(&mut self, size: usize) {

@@ -259,16 +259,16 @@ where
 
     pub fn sibling(&self) -> Option<&Sibling<T>> {
         match self {
-            Value::Sib(ref x) => Some(x),
+            Value::Sib(x) => Some(x),
             _ => None,
         }
     }
 
     pub fn as_ref(&self) -> &T {
         match self {
-            Value::Put(ref x) => x,
-            Value::Del(ref x) => x,
-            Value::Sib(ref x) => x.as_ref(),
+            Value::Put(x) => x,
+            Value::Del(x) => x,
+            Value::Sib(x) => x.as_ref(),
             Value::Unused => unreachable!(),
         }
     }

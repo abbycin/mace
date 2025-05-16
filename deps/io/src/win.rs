@@ -34,7 +34,7 @@ impl File {
 }
 
 impl GatherIO for File {
-    fn read(&self, data: &mut [u8], pos: u64) -> Result<(), io::Error> {
+    fn read(&self, data: &mut [u8], pos: u64) -> Result<usize, io::Error> {
         let mut n = 0;
         let sz = data.len();
         let mut off = pos;
@@ -42,16 +42,16 @@ impl GatherIO for File {
             let s = &mut data[n..sz];
             let nbytes = self.file.seek_read(s, off)?;
             if nbytes == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+                break;
             }
             n += nbytes;
             off += nbytes as u64;
         }
-        Ok(())
+        Ok(n)
     }
 
-    fn write(&mut self, data: &[u8]) -> Result<(), io::Error> {
-        self.file.write_all(data)
+    fn write(&mut self, data: &[u8]) -> Result<usize, io::Error> {
+        self.file.write_all(data).map(|_| data.len())
     }
 
     fn writev(&mut self, iov: &mut [IoVec]) -> Result<(), io::Error> {

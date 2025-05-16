@@ -1,10 +1,12 @@
+use std::io::Write;
+
 use mace::{Mace, OpCode, Options, RandomPath};
 
 #[test]
 fn gc_data() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.tmp_store = true;
+    opt.tmp_store = false;
     opt.sync_on_write = false;
     opt.gc_timeout = 20;
     opt.gc_ratio = 10;
@@ -25,9 +27,25 @@ fn gc_data() -> Result<(), OpCode> {
         kv.commit()?;
     }
 
+    let meta = db.options().meta_file();
+
+    drop(db);
+
+    // break the meta file
+    let mut f = std::fs::File::options()
+        .truncate(false)
+        .append(true)
+        .open(meta)
+        .unwrap();
+    f.write_all(&[233]).unwrap();
+
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    let db = Mace::new(opt).unwrap();
+
     for k in &pair {
         let view = db.view().unwrap();
-        view.get(k)?;
+        view.get(k).unwrap();
     }
 
     let mut count = 0;
@@ -57,7 +75,7 @@ fn abort_txn() {
     let db = Mace::new(opt).unwrap();
 
     let kv = db.begin().unwrap();
-    for i in 0..500 {
+    for i in 0..1000 {
         let x = format!("key_{}", i);
         let _ = kv.put(&x, &x);
     }
@@ -72,6 +90,7 @@ fn gc_wal() {
     let mut opt = Options::new(&*path);
     opt.wal_file_size = 4096;
     opt.gc_timeout = 2;
+    opt.workers = 1;
     opt.buffer_size = 100 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt).unwrap();
     let mut data = Vec::new();
@@ -92,6 +111,6 @@ fn gc_wal() {
         assert_eq!(r.data(), i.as_bytes());
     }
 
-    let backup = db.options().wal_backup(1);
+    let backup = db.options().wal_backup(0, 1);
     assert!(backup.exists());
 }

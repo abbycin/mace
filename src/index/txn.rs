@@ -1,18 +1,18 @@
 use crate::{
+    OpCode,
     cc::{
         context::Context,
         data::{Record, Ver},
         wal::{WalDel, WalPut, WalReplace},
         worker::SyncWorker,
     },
-    index::{data::Value, tree::Tree, Key},
+    index::{Key, data::Value, tree::Tree},
     utils::{INIT_CMD, NULL_CMD},
-    OpCode,
 };
-use std::sync::{atomic::Ordering::Relaxed, Arc};
+use std::sync::{Arc, atomic::Ordering::Relaxed};
 use std::{cell::Cell, sync::atomic::AtomicU32};
 
-use super::{tree::SeekIter, ValRef};
+use super::{ValRef, tree::SeekIter};
 
 struct Guard<'a> {
     ctx: &'a Context,
@@ -45,11 +45,11 @@ fn get_impl<'a, K: AsRef<[u8]>>(
     mut w: SyncWorker,
     k: K,
 ) -> Result<ValRef<Record<'a>>, OpCode> {
-    #[cfg(feature = "check_empty_key")]
+    #[cfg(feature = "extra_check")]
     assert!(k.as_ref().len() > 0, "key must be non-empty");
 
     let wid = w.id;
-    let start_ts = w.txn.start_ts;
+    let start_ts = w.start_ts;
     let key = Key::new(k.as_ref(), start_ts, NULL_CMD);
     let r = tree.traverse::<Record, _>(key, |txid, t| {
         w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid)
@@ -70,11 +70,11 @@ fn seek_impl<'a, 'b, K>(
 where
     K: AsRef<[u8]>,
 {
-    #[cfg(feature = "check_empty_key")]
+    #[cfg(feature = "extra_check")]
     assert!(prefix.as_ref().len() > 0, "prefix must be non-empty");
 
     let wid = w.id;
-    let start_ts = w.txn.start_ts;
+    let start_ts = w.start_ts;
     SeekIter::<Record>::new(
         tree,
         prefix,
@@ -128,11 +128,11 @@ impl<'a> TxnKV<'a> {
     where
         F: FnMut(&Option<(Key, ValRef<Record>)>, Ver, SyncWorker) -> Result<(), OpCode>,
     {
-        #[cfg(feature = "check_empty_key")]
+        #[cfg(feature = "extra_check")]
         assert!(k.as_ref().len() > 0, "key must be non-empty");
 
         self.should_abort()?;
-        let start_ts = self.g.w.txn.start_ts;
+        let start_ts = self.g.w.start_ts;
         let (wid, cmd_id) = (self.g.w.id, self.cmd_id());
         let key = Key::new(k, start_ts, cmd_id);
         let val = Value::Put(Record::normal(wid, v));
@@ -164,7 +164,7 @@ impl<'a> TxnKV<'a> {
             };
             if r.is_ok() && !*logged {
                 *logged = true;
-                w.txn.modified = true;
+                w.modified = true;
                 w.logging
                     .record_update(ver, WalPut::new(v.len()), k, [].as_slice(), v);
             }
@@ -189,7 +189,7 @@ impl<'a> TxnKV<'a> {
                 }
 
                 if !*logged {
-                    w.txn.modified = true;
+                    w.modified = true;
                     *logged = true;
                     w.logging.record_update(
                         ver,
@@ -246,7 +246,7 @@ impl<'a> TxnKV<'a> {
     {
         self.should_abort()?;
         let mut w = self.g.w;
-        let (wid, start_ts) = (w.id, w.txn.start_ts);
+        let (wid, start_ts) = (w.id, w.start_ts);
         let key = Key::new(k.as_ref(), start_ts, self.cmd_id());
         let val = Value::Del(Record::remove(wid));
         let mut logged = false;
@@ -271,7 +271,7 @@ impl<'a> TxnKV<'a> {
 
                     if !logged {
                         logged = true;
-                        w.txn.modified = true;
+                        w.modified = true;
                         w.logging.record_update(
                             *key.ver(),
                             WalDel::new(t.data().len()),
@@ -359,6 +359,10 @@ impl<'a> TxnView<'a> {
         K: AsRef<[u8]>,
     {
         seek_impl(self.g.ctx, self.tree, self.g.w, prefix, self.g.clone())
+    }
+
+    pub fn show(&self) {
+        self.tree.show::<Record>();
     }
 }
 

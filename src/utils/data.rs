@@ -1,3 +1,7 @@
+use super::{INIT_ORACLE, NEXT_ID, OpCode, pack_id, rand_range};
+use crate::utils::bitmap::{BITMAP_ELEM_LEN, BitMap, BitmapElemType};
+use crc32c::Crc32cHasher;
+use io::{GatherIO, IoVec};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
@@ -6,11 +10,8 @@ use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicU32, AtomicU64};
-
-use crc32c::Crc32cHasher;
-
-use super::{pack_id, rand_range, INIT_ORACLE, NEXT_ID};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize};
+use std::sync::{Mutex, RwLock};
 
 /// logical id and physical id are same length
 pub(crate) const ID_LEN: usize = size_of::<u32>();
@@ -87,28 +88,12 @@ pub struct PageTable {
 impl PageTable {
     pub const ITEM_LEN: usize = size_of::<MapEntry>();
 
-    pub fn serialize<F>(&self, file: &mut F) -> usize
-    where
-        F: Write,
-    {
+    pub fn collect(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-
-        self.data
-            .values()
-            .map(|e| {
-                buf.extend_from_slice(e.as_slice());
-            })
-            .count();
-        file.write_all(buf.as_slice())
-            .expect("can't write page table");
-        buf.len()
-    }
-
-    pub fn hash<H>(&self, h: &mut H)
-    where
-        H: Hasher,
-    {
-        self.data.values().map(|e| h.write(e.as_slice())).count();
+        self.data.iter().for_each(|x| {
+            buf.extend_from_slice(x.1.as_slice());
+        });
+        buf
     }
 
     pub fn add(&mut self, pid: u64, addr: u64) {
@@ -143,91 +128,367 @@ impl DerefMut for PageTable {
     }
 }
 
-const META_COMPLETE: u32 = 114;
-const META_IMCOMPLETE: u32 = 514;
+pub struct GatherWriter {
+    path: PathBuf,
+    file: io::File,
+    queue: Vec<IoVec>,
+}
+
+unsafe impl Send for GatherWriter {}
+
+impl GatherWriter {
+    const MAX_IOVCNT: usize = 64;
+
+    fn open(path: &PathBuf) -> io::File {
+        io::File::options()
+            .write(true)
+            .append(true)
+            .create(true)
+            .open(path)
+            .inspect_err(|x| {
+                log::error!("can't open {:?}, {}", path, x);
+            })
+            .unwrap()
+    }
+
+    pub fn new(path: &PathBuf) -> Self {
+        Self {
+            path: path.clone(),
+            file: Self::open(path),
+            queue: Vec::new(),
+        }
+    }
+
+    pub fn reset(&mut self, path: &PathBuf) {
+        self.path = path.clone();
+        self.flush();
+        self.file = Self::open(path);
+    }
+
+    pub fn queue(&mut self, data: &[u8]) {
+        if self.queue.len() == Self::MAX_IOVCNT {
+            self.flush();
+        }
+        self.queue.push(data.into());
+    }
+
+    #[allow(unused)]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn pos(&self) -> u64 {
+        self.file
+            .size()
+            .inspect_err(|x| {
+                log::error!("can't get metadata of {:?}, {}", self.path, x);
+            })
+            .unwrap()
+    }
+
+    pub fn write(&mut self, data: &[u8]) {
+        self.file.write(data).unwrap();
+    }
+
+    pub fn flush(&mut self) {
+        let iov = self.queue.as_mut_slice();
+        self.file
+            .writev(iov)
+            .inspect_err(|x| log::error!("can't write iov, {}", x))
+            .unwrap();
+        self.queue.clear();
+    }
+
+    pub fn sync(&mut self) {
+        self.file
+            .sync()
+            .inspect_err(|x| log::error!("can't sync {:?}, {}", self.path, x))
+            .unwrap();
+    }
+}
+
+impl Drop for GatherWriter {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+const META_COMPLETE: u16 = 114;
+const META_IMCOMPLETE: u16 = 514;
+
+#[repr(C)]
+pub struct WalDesc {
+    // TODO: change to u128
+    pub checkpoint: u64,
+    // TODO: change to u64
+    pub wal_id: u32,
+    pub worker: u16,
+    padding: u16,
+    pub checksum: u32,
+}
+
+impl WalDesc {
+    fn new(wid: u16) -> Self {
+        Self {
+            checkpoint: pack_id(NEXT_ID, 0),
+            wal_id: NEXT_ID,
+            worker: wid,
+            padding: 0,
+            checksum: 0,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe {
+            let p = self as *const Self as *const u8;
+            std::slice::from_raw_parts(p, size_of::<WalDesc>())
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe {
+            let p = self as *mut Self as *mut u8;
+            std::slice::from_raw_parts_mut(p, size_of::<WalDesc>())
+        }
+    }
+
+    pub fn crc32(&self) -> u32 {
+        let s = self.as_slice();
+        let src = &s[0..s.len() - size_of::<u32>()];
+        let mut h = Crc32cHasher::default();
+        h.write(src);
+        h.finish() as u32
+    }
+
+    pub fn sync<P>(&mut self, path: P)
+    where
+        P: AsRef<Path>,
+    {
+        let s = format!(
+            "{}_{}",
+            path.as_ref().as_os_str().to_str().unwrap(),
+            rand_range(114..514)
+        );
+        let tmp = Path::new(&s);
+        let mut f = File::options()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(tmp)
+            .expect("can't open desc file");
+
+        self.checksum = self.crc32();
+        f.write_all(self.as_slice()).expect("can't write desc file");
+        f.sync_all().expect("can't sync desc file");
+        drop(f);
+
+        std::fs::rename(tmp, path).expect("can't fail");
+    }
+}
+
+pub struct WalDescHandle {
+    raw: *mut WalDesc,
+    refcnt: *mut AtomicUsize,
+}
+
+impl WalDescHandle {
+    pub fn new(wid: u16) -> Self {
+        Self {
+            raw: Box::into_raw(Box::new(WalDesc::new(wid))),
+            refcnt: Box::into_raw(Box::new(AtomicUsize::new(1))),
+        }
+    }
+}
+
+impl Deref for WalDescHandle {
+    type Target = WalDesc;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.raw }
+    }
+}
+
+impl DerefMut for WalDescHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.raw }
+    }
+}
+
+impl Clone for WalDescHandle {
+    fn clone(&self) -> Self {
+        unsafe {
+            (*self.refcnt).fetch_add(1, Relaxed);
+        }
+        Self {
+            raw: self.raw,
+            refcnt: self.refcnt,
+        }
+    }
+}
+
+impl Drop for WalDescHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let cnt = (*self.refcnt).fetch_sub(1, Relaxed);
+            if cnt == 1 {
+                drop(Box::from_raw(self.raw));
+                drop(Box::from_raw(self.refcnt));
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 #[repr(C)]
-pub struct Meta {
+pub struct MetaInner {
     pub oracle: AtomicU64,
     /// oldest flushed txid
     pub wmk_oldest: AtomicU64,
-    /// the latest checkpoint
-    pub ckpt: AtomicU64,
     /// the latest data file id
     pub next_data: AtomicU32,
-    pub next_wal: AtomicU32,
-    pub state: AtomicU32,
-    pub checksum: AtomicU32,
+    state: AtomicU32,
+    nr_worker: AtomicU16,
+    padding: u16,
+    checksum: AtomicU32,
 }
 
-impl Meta {
-    pub const LEN: usize = size_of::<Self>();
+impl MetaInner {
+    const LEN: usize = size_of::<Self>();
 
-    pub fn new() -> Self {
-        let id = pack_id(NEXT_ID, 0);
+    fn new(workers: usize) -> Self {
         Self {
             oracle: AtomicU64::new(INIT_ORACLE),
             wmk_oldest: AtomicU64::new(0),
             next_data: AtomicU32::new(NEXT_ID),
-            ckpt: AtomicU64::new(id),
-            next_wal: AtomicU32::new(NEXT_ID),
-            state: AtomicU32::new(META_IMCOMPLETE),
+            state: AtomicU32::new(META_IMCOMPLETE as u32),
+            nr_worker: AtomicU16::new(workers as u16),
+            padding: 0,
             checksum: AtomicU32::new(0),
         }
     }
 
-    pub fn reset(&self) {
-        let id = pack_id(NEXT_ID, 0);
-        self.oracle.store(INIT_ORACLE, Relaxed);
-        self.wmk_oldest.store(0, Relaxed);
-        self.next_data.store(NEXT_ID, Relaxed);
-        self.ckpt.store(id, Relaxed);
-        self.next_wal.store(NEXT_ID, Relaxed);
-        self.state.store(META_IMCOMPLETE, Relaxed);
-        self.checksum.store(0, Relaxed);
+    fn slice(&self) -> &[u8] {
+        unsafe {
+            let p = self as *const Self as *const u8;
+            std::slice::from_raw_parts(p, size_of::<Self>())
+        }
     }
 
-    pub fn crc32(&self) -> u32 {
+    pub fn checksum(&self) -> u32 {
+        self.checksum.load(Relaxed)
+    }
+}
+
+#[repr(C)]
+pub struct Meta {
+    pub inner: MetaInner,
+    pub mask: RwLock<BitMap>,
+    pub mtx: Mutex<()>,
+}
+
+impl Deref for Meta {
+    type Target = MetaInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Meta {
+    pub fn new(workers: usize) -> Self {
+        Self {
+            inner: MetaInner::new(workers),
+            mask: RwLock::new(BitMap::new(workers as u32)),
+            mtx: Mutex::new(()),
+        }
+    }
+
+    fn crc32_inner(&self, m: &BitMap) -> u32 {
         let mut h = Crc32cHasher::new(0);
-        h.write_u64(self.oracle.load(Relaxed));
+        for i in m.slice() {
+            h.write_u64(*i);
+        }
+
+        // ------------ footer -----------------
+
+        h.write_u64(self.inner.oracle.load(Relaxed));
         // not calc wmk_oldest on purpose
-        h.write_u64(self.ckpt.load(Relaxed));
-        h.write_u32(self.next_data.load(Relaxed));
-        h.write_u32(self.next_wal.load(Relaxed));
-        h.write_u32(self.state.load(Relaxed));
+        h.write_u32(self.inner.next_data.load(Relaxed));
+        h.write_u32(self.inner.state.load(Relaxed));
+        h.write_u16(self.inner.nr_worker.load(Relaxed));
+        h.write_u16(m.len() as u16);
         h.finish() as u32
     }
 
-    pub fn deserialize(data: &[u8]) -> Self {
-        let mut tmp = Self::new();
-        let ptr = &mut tmp as *mut Self as *mut u8;
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(ptr, Self::LEN);
-            dst.copy_from_slice(data);
+    pub fn calc_crc32(&self) -> u32 {
+        let lk = self.mask.read().unwrap();
+        self.crc32_inner(&lk)
+    }
+
+    pub fn deserialize(data: &[u8], workers: usize) -> Result<Self, OpCode> {
+        let mut inner = MetaInner::new(0);
+        let ptr = &mut inner as *mut MetaInner as *mut u8;
+        let s = unsafe {
+            std::ptr::copy(
+                data.as_ptr().add(data.len() - MetaInner::LEN),
+                ptr,
+                MetaInner::LEN,
+            );
+            let mask_len = data.len() - MetaInner::LEN;
+            if mask_len % BITMAP_ELEM_LEN != 0 {
+                return Err(OpCode::BadData);
+            }
+            let p = data.as_ptr().cast::<BitmapElemType>();
+            let n = mask_len / BITMAP_ELEM_LEN;
+            std::slice::from_raw_parts(p, n)
+        };
+
+        // TODO: we can provide a `shrink` or `enlarge` function to resize worker dynamically when
+        //  it's initialized and before performing any modification
+        if inner.nr_worker.load(Relaxed) != workers as u16 {
+            log::error!(
+                "incorrect number of workers, expect {} real {}",
+                inner.nr_worker.load(Relaxed),
+                workers
+            );
+            return Err(OpCode::Invalid);
         }
-        tmp
+
+        let tmp = Self {
+            inner,
+            mask: RwLock::new(BitMap::from(s)),
+            mtx: Mutex::new(()),
+        };
+        if tmp.calc_crc32() != tmp.checksum() {
+            return Err(OpCode::BadData);
+        }
+        Ok(tmp)
     }
 
     pub fn is_complete(&self) -> bool {
-        self.state.load(Relaxed) == META_COMPLETE
+        self.inner.state.load(Relaxed) == META_COMPLETE as u32
     }
 
-    pub fn update_chkpt(&self, id: u32, off: u32) {
-        assert_ne!(id, 0);
-        self.ckpt.store(pack_id(id, off), Relaxed);
+    fn serialize(&self, m: &BitMap) -> Vec<u8> {
+        let crc = self.crc32_inner(m);
+        self.inner.checksum.store(crc, Relaxed);
+        let mask = unsafe {
+            let s = m.slice();
+            let p = s.as_ptr().cast::<u8>();
+            let n = s.len() * BITMAP_ELEM_LEN;
+            std::slice::from_raw_parts(p, n)
+        };
+
+        let mut s = Vec::with_capacity(mask.len() + size_of::<MetaInner>());
+
+        s.extend_from_slice(mask);
+        s.extend_from_slice(self.inner.slice());
+        s
     }
 
-    fn serialize(&self) -> &[u8] {
-        self.checksum.store(self.crc32(), Relaxed);
-        let ptr = self as *const Self as *const u8;
-        unsafe { std::slice::from_raw_parts(ptr, Self::LEN) }
-    }
-
-    pub fn sync(&self, path: PathBuf, complete: bool) {
+    pub fn sync<P: AsRef<Path>>(&self, path: P, complete: bool) {
+        let _lk = self.mtx.lock().unwrap();
         let s = format!(
             "{}_{}",
-            path.as_os_str().to_str().unwrap(),
+            path.as_ref().as_os_str().to_str().unwrap(),
             rand_range(114..514)
         );
         let tmp = Path::new(&s);
@@ -243,8 +504,9 @@ impl Meta {
         } else {
             META_IMCOMPLETE
         };
-        self.state.store(state, Relaxed);
-        f.write_all(self.serialize())
+        self.inner.state.store(state as u32, Relaxed);
+        let lk = self.mask.read().unwrap();
+        f.write_all(self.serialize(&lk).as_slice())
             .expect("can't write meta file");
         f.sync_all().expect("can't sync meta file");
         drop(f);
@@ -255,30 +517,45 @@ impl Meta {
 
 #[cfg(test)]
 mod test {
-    use crate::utils::data::META_COMPLETE;
-    use std::sync::atomic::Ordering::Relaxed;
+    use io::{File, GatherIO};
+
+    use crate::{
+        RandomPath,
+        utils::{block::Block, data::META_COMPLETE},
+    };
+    use std::{ops::Deref, sync::atomic::Ordering::Relaxed};
 
     use super::Meta;
 
     #[test]
     fn meta_s11n() {
-        let meta = Meta::new();
+        let meta = Meta::new(2);
+        let root = RandomPath::new().deref().clone();
+        let meta_file = root.join("meta");
 
-        meta.state.store(META_COMPLETE, Relaxed);
+        std::fs::create_dir_all(&root).unwrap();
+
+        meta.state.store(META_COMPLETE as u32, Relaxed);
         meta.next_data.store(1, Relaxed);
         meta.oracle.store(5, Relaxed);
+        meta.mask.write().unwrap().set(0);
 
-        let mut buf = vec![0u8; Meta::LEN];
-        let s = buf.as_mut_slice();
-        s.copy_from_slice(meta.serialize());
+        let chksum = meta.calc_crc32();
 
-        let tmp = Meta::deserialize(s);
+        meta.sync(&meta_file, true);
+        assert!(meta_file.exists());
 
-        assert_eq!(tmp.crc32(), tmp.checksum.load(Relaxed));
+        let f = File::options().read(true).open(&meta_file).unwrap();
+        let b = Block::alloc(256);
+        let n = f.read(b.mut_slice(0, b.len()), 0).unwrap();
 
-        let path = std::env::temp_dir().join("meta");
-        tmp.sync(path.clone(), true);
-        assert!(path.exists());
-        std::fs::remove_file(path).unwrap();
+        let tmp = Meta::deserialize(b.slice(0, n), 2).unwrap();
+
+        assert_eq!(tmp.checksum.load(Relaxed), chksum);
+        let tmp_slice = tmp.inner.slice();
+        let old_slice = meta.inner.slice();
+        assert_eq!(old_slice, tmp_slice);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

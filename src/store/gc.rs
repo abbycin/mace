@@ -1,35 +1,36 @@
+use crc32c::Crc32cHasher;
+use io::{File, GatherIO};
+use std::ops::Deref;
 use std::{
     collections::HashSet,
     hash::Hasher,
-    io::Write,
     sync::{
-        atomic::{
-            fence,
-            Ordering::{Acquire, Relaxed, Release},
-        },
-        mpsc::{channel, Receiver, RecvTimeoutError, Sender},
         Arc,
+        atomic::{
+            Ordering::{Acquire, Relaxed, Release},
+            fence,
+        },
+        mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     },
     thread::JoinHandle,
     time::Duration,
 };
 
-use crc32c::Crc32cHasher;
-use io::{File, GatherIO};
-
+use crate::cc::worker::Worker;
 use crate::{
-    cc::wal::{ptr_to, WalCheckpoint},
+    Options, Store,
+    cc::wal::{WalCheckpoint, ptr_to},
     map::{
-        data::{DataFooter, DataMetaReader, FileStat},
         Mapping,
+        data::{DataFooter, DataMetaReader, FileStat},
     },
     utils::{
+        NEXT_ID,
         block::Block,
         countblock::Countblock,
-        data::{AddrMap, MapEntry, Meta, PageTable, ID_LEN, JUNK_LEN},
-        pack_id, unpack_id, NEXT_ID, NULL_ORACLE,
+        data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, Meta, PageTable},
+        pack_id, unpack_id,
     },
-    Options, Store,
 };
 
 const GC_QUIT: i32 = -1;
@@ -101,7 +102,12 @@ impl Handle {
 pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Arc<Mapping>) -> Handle {
     let (tx, rx) = channel();
     let sem = Arc::new(Countblock::new(0));
-    let last_ckpt = meta.ckpt.load(Relaxed);
+    let mut last_ckpt = Vec::with_capacity(store.opt.workers);
+    store
+        .context
+        .workers()
+        .iter()
+        .for_each(|w| last_ckpt.push(w.logging.last_ckpt.load(Relaxed)));
     let gc = GarbageCollector {
         meta,
         map,
@@ -158,7 +164,7 @@ struct GarbageCollector {
     meta: Arc<Meta>,
     map: Arc<Mapping>,
     store: Arc<Store>,
-    last_ckpt: u64,
+    last_ckpt: Vec<u64>,
 }
 
 impl GarbageCollector {
@@ -230,25 +236,20 @@ impl GarbageCollector {
     }
 
     fn process_wal(&mut self) {
-        let ckpt = self.meta.ckpt.load(Relaxed);
-        if self.last_ckpt == ckpt {
-            return;
-        }
-        self.last_ckpt = ckpt;
-
-        let mut oldest_txid = NULL_ORACLE;
-        let mut oldest_ckpt = NULL_ORACLE;
         for w in self.store.context.workers().iter() {
-            let ckpt = w.ckpt.load(Relaxed);
-            let txid = w.tx_id.load(Relaxed);
-
-            if txid < oldest_txid {
-                oldest_txid = txid;
-                oldest_ckpt = ckpt;
+            let id = w.id as usize;
+            let ckpt = w.logging.last_ckpt.load(Relaxed);
+            if self.last_ckpt[id] == ckpt {
+                continue;
             }
+            self.last_ckpt[id] = ckpt;
+            Self::process_one_wal(&self.store.opt, w.deref());
         }
+    }
 
-        let opt = self.store.opt.clone();
+    fn process_one_wal(opt: &Options, w: &Worker) {
+        let mut oldest_ckpt = w.logging.last_ckpt.load(Relaxed);
+
         let mut buf = [0u8; size_of::<WalCheckpoint>()];
         let (cur_id, _) = unpack_id(oldest_ckpt);
         let mut end = None;
@@ -256,8 +257,8 @@ impl GarbageCollector {
 
         let null = pack_id(NEXT_ID, 0);
         while oldest_ckpt != null {
-            let (id, pos) = unpack_id(oldest_ckpt);
-            let path = opt.wal_file(id);
+            let (seq, pos) = unpack_id(oldest_ckpt);
+            let path = opt.wal_file(w.id, seq);
             if !path.exists() {
                 break;
             }
@@ -280,11 +281,11 @@ impl GarbageCollector {
         if end.is_some() {
             let end = end.unwrap();
             for i in beg..=end {
-                let from = opt.wal_file(i);
+                let from = opt.wal_file(w.id, i);
                 if !from.exists() {
                     continue;
                 }
-                let to = opt.wal_backup(i);
+                let to = opt.wal_backup(w.id, i);
                 std::fs::rename(&from, &to)
                     .inspect_err(|e| {
                         log::error!("can't rename {:?} to {:?}, error {:?}", from, to, e);
@@ -446,12 +447,7 @@ impl<'a> ReWriter<'a> {
         let mut seq = 0;
         let mut off = 0;
         let path = self.opt.data_file(id);
-        let mut writer = std::fs::File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+        let mut writer = GatherWriter::new(&path);
         let mut crc = Crc32cHasher::default();
         let mut reloc: Vec<u8> = Vec::new();
 
@@ -467,10 +463,11 @@ impl<'a> ReWriter<'a> {
                 if block.len() < len {
                     block.realloc(len);
                 }
-                let data = block.get_mut_slice(0, len);
+                let data = block.mut_slice(0, len);
                 reader.read(data, e.off as u64)?;
                 crc.write(data);
-                writer.write_all(data)?;
+                // the data will be reused next time, so we write data to file instead of queue it
+                writer.write(data);
 
                 let m = AddrMap::new(e.key, off, e.len, seq);
                 reloc.extend_from_slice(m.as_slice());
@@ -486,20 +483,22 @@ impl<'a> ReWriter<'a> {
             )
         };
         crc.write(junks);
-        writer.write_all(junks)?;
+        writer.queue(junks);
 
-        crc.write(reloc.as_slice());
-        writer.write_all(reloc.as_slice())?;
+        let s = reloc.as_slice();
+        crc.write(s);
+        writer.queue(s);
 
-        self.table.hash(&mut crc);
-        self.table.serialize(&mut writer);
+        let s = self.table.collect();
+        crc.write(&s);
+        writer.queue(&s);
 
         let lids: Vec<u32> = lids.iter().cloned().collect();
 
         let slid =
             unsafe { std::slice::from_raw_parts(lids.as_ptr().cast::<u8>(), lids.len() * ID_LEN) };
         crc.write(slid);
-        writer.write_all(slid)?;
+        writer.queue(slid);
 
         let footer = DataFooter {
             up2,
@@ -512,10 +511,10 @@ impl<'a> ReWriter<'a> {
             crc: crc.finish() as u32,
         };
 
-        footer.serialize(&mut writer);
+        writer.queue(footer.as_slice());
 
-        writer.flush()?;
-        writer.sync_all()?;
+        writer.flush();
+        writer.sync();
         log::info!("compacted to {:?} {:?}", path, footer);
         Ok(())
     }

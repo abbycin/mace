@@ -1,12 +1,13 @@
+//! [A Critique of ANSI SQL Isolation Levels](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf)
 //! [Generalized Isolation Level Definitions](https://pmg.csail.mit.edu/papers/icde00.pdf)
 use std::{
     collections::HashMap,
     sync::{
+        Arc, Mutex,
         atomic::{
             AtomicBool, AtomicU64,
             Ordering::{AcqRel, Acquire, Release},
         },
-        Arc, Mutex,
     },
     thread::JoinHandle,
 };
@@ -307,8 +308,8 @@ fn write_skew() {
     assert_eq!(s2_r1.as_slice(), "10".as_bytes());
     assert_eq!(s2_r2.as_slice(), "20".as_bytes());
 
-    s1.replace("1", "21").unwrap();
-    s2.replace("2", "11").unwrap();
+    s1.replace("1", &s1_r2).unwrap();
+    s2.replace("2", &s2_r1).unwrap();
 
     s1.commit();
     s2.commit();
@@ -325,8 +326,10 @@ fn write_skew() {
     s1.commit();
     s2.commit();
 
-    assert_eq!(r1.as_slice(), "21".as_bytes());
-    assert_eq!(r2.as_slice(), "11".as_bytes());
+    assert_eq!(r1, s1_r2);
+    assert_eq!(r2, s2_r1);
+    // serializable schedule would set "1" and "2" to same value, either "10" or "20", depending on
+    // the order of s1 and s2
     // SI can't prevent write skew, expect panic
     assert_eq!(r1, r2);
 }
@@ -630,7 +633,7 @@ impl Session {
         self.sync();
     }
 
-    fn replace<T: AsRef<[u8]>>(&mut self, k: T, v: T) -> Result<Vec<u8>, OpCode> {
+    fn replace<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, k: K, v: V) -> Result<Vec<u8>, OpCode> {
         let kv = self.kv.as_ref().unwrap();
         let (k, v) = (SyncPtr::from(k.as_ref()), SyncPtr::from(v.as_ref()));
         let mut rv = None;

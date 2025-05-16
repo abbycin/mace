@@ -6,15 +6,21 @@ pub struct IoVec {
 }
 
 impl IoVec {
-    pub fn new(data: *const u8, len: usize) -> Self {
+    pub const fn new(data: *const u8, len: usize) -> Self {
         Self { data, len }
     }
 }
 
-pub trait GatherIO {
-    fn read(&self, data: &mut [u8], pos: u64) -> Result<(), io::Error>;
+impl From<&[u8]> for IoVec {
+    fn from(value: &[u8]) -> Self {
+        unsafe { std::mem::transmute(value) }
+    }
+}
 
-    fn write(&mut self, data: &[u8]) -> Result<(), io::Error>;
+pub trait GatherIO {
+    fn read(&self, data: &mut [u8], pos: u64) -> Result<usize, io::Error>;
+
+    fn write(&mut self, data: &[u8]) -> Result<usize, io::Error>;
 
     fn writev(&mut self, data: &mut [IoVec]) -> Result<(), io::Error>;
 
@@ -54,8 +60,11 @@ impl OpenOptions {
         self
     }
 
+    // when truc is enabled, append will be ignored
     pub fn append(&mut self, on: bool) -> &mut Self {
-        self.append = on;
+        if !self.trunc {
+            self.append = on;
+        }
         self
     }
 

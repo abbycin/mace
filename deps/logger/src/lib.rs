@@ -1,11 +1,12 @@
 use log::{LevelFilter, Metadata, Record};
-use std::cell::{OnceCell, RefCell};
+use std::cell::OnceCell;
 use std::io::Write;
+use std::ops::Deref;
 use std::path::Path;
 use std::ptr::addr_of_mut;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 thread_local! {
     static G_TID: OnceCell<i32> = OnceCell::new();
@@ -14,6 +15,7 @@ thread_local! {
 static G_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
 static mut G_LOGGER: Logger = Logger {
+    mtx_shard: [const { Mutex::new(()) }; 8],
     sink: Vec::new(),
     abort_on_error: AtomicBool::new(false),
 };
@@ -35,8 +37,46 @@ fn get_tid() -> i32 {
 
 /// a simple sync logger which impl log::Log
 pub struct Logger {
-    sink: Vec<Mutex<RefCell<Box<dyn Sink>>>>,
+    mtx_shard: [Mutex<()>; 8],
+    sink: Vec<SinkHandle>,
     abort_on_error: AtomicBool,
+}
+
+struct SinkHandle {
+    raw: *mut dyn Sink,
+}
+
+unsafe impl Send for SinkHandle {}
+unsafe impl Sync for SinkHandle {}
+
+impl SinkHandle {
+    fn new<T>(x: T) -> Self
+    where
+        T: Sink + 'static,
+    {
+        let x = Box::new(x);
+        let raw = Box::into_raw(x);
+        Self { raw }
+    }
+
+    fn as_mut(&self) -> &mut dyn Sink {
+        unsafe { &mut *self.raw }
+    }
+}
+
+impl Deref for SinkHandle {
+    type Target = dyn Sink;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.raw }
+    }
+}
+
+impl Drop for SinkHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Box::from_raw(self.raw);
+        }
+    }
 }
 
 trait Sink: Send + Sync {
@@ -62,30 +102,26 @@ impl log::Log for Logger {
             record.line().unwrap(),
             record.args()
         );
+        let _lk = self.lock();
 
         for p in &self.sink {
-            if let Ok(p) = p.lock() {
-                p.borrow_mut().sink(&s);
-            }
+            p.as_mut().sink(&s);
         }
 
         if record.level() == log::LevelFilter::Error && self.should_abort() {
             let bt = std::backtrace::Backtrace::force_capture();
             let buf = format!("{}", bt);
             for p in &self.sink {
-                if let Ok(p) = p.lock() {
-                    p.borrow_mut().sink(&buf);
-                }
+                p.as_mut().sink(&buf);
             }
             std::process::abort();
         }
     }
 
     fn flush(&self) {
+        let _lk = self.lock();
         for p in &self.sink {
-            if let Ok(p) = p.lock() {
-                p.borrow_mut().flush();
-            }
+            p.as_mut().flush();
         }
     }
 }
@@ -168,8 +204,9 @@ impl Logger {
     }
 
     fn exist(&self, sink: &'static str) -> Option<&mut Self> {
+        let _lk = self.mtx_shard[0].lock().unwrap();
         for i in &self.sink {
-            if i.lock().unwrap().borrow().name() == sink {
+            if i.name() == sink {
                 return Some(Self::get());
             }
         }
@@ -180,6 +217,12 @@ impl Logger {
         self.abort_on_error.load(Relaxed)
     }
 
+    fn lock(&self) -> MutexGuard<()> {
+        self.mtx_shard[get_tid() as usize & (self.mtx_shard.len() - 1)]
+            .lock()
+            .unwrap()
+    }
+
     pub fn abort_on_error(&mut self, flag: bool) -> &mut Self {
         self.abort_on_error.store(flag, Relaxed);
         self
@@ -187,8 +230,7 @@ impl Logger {
 
     pub fn add_console(&mut self) -> &mut Self {
         if self.exist(G_CONSOLE).is_none() {
-            self.sink
-                .push(Mutex::new(RefCell::new(Box::new(Console::new()))));
+            self.sink.push(SinkHandle::new(Console::new()));
         }
         self
     }
@@ -205,7 +247,7 @@ impl Logger {
                     return None;
                 }
                 Ok(f) => {
-                    self.sink.push(Mutex::new(RefCell::new(Box::new(f))));
+                    self.sink.push(SinkHandle::new(f));
                     return Some(self);
                 }
             }
@@ -214,8 +256,9 @@ impl Logger {
     }
 
     fn remove_impl(&mut self, name: &'static str) {
+        let _lk = self.mtx_shard[0].lock().unwrap();
         for (idx, s) in self.sink.iter().enumerate() {
-            if s.lock().unwrap().borrow().name() == name {
+            if s.name() == name {
                 self.sink.remove(idx);
                 break;
             }
@@ -228,6 +271,15 @@ impl Logger {
 
     pub fn remove_console(&mut self) {
         self.remove_impl(G_CONSOLE);
+    }
+}
+
+impl Drop for Logger {
+    fn drop(&mut self) {
+        let _lk = self.lock();
+        for p in &self.sink {
+            p.as_mut().flush();
+        }
     }
 }
 

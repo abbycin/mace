@@ -6,11 +6,11 @@ use index::tree::Tree;
 pub use index::txn::{TxnKV, TxnView};
 pub(crate) use store::store::Store;
 use store::{
-    gc::{start_gc, Handle},
+    gc::{Handle, start_gc},
     recovery::Recovery,
 };
-use utils::{data::Meta, ROOT_PID};
-pub use utils::{options::Options, OpCode, RandomPath};
+pub use utils::{OpCode, RandomPath, options::Options};
+use utils::{ROOT_PID, data::Meta};
 
 mod cc;
 mod index;
@@ -53,11 +53,17 @@ impl Mace {
     pub fn new(opt: Options) -> Result<Self, OpCode> {
         let opt = Arc::new(opt);
         let mut recover = Recovery::new(opt.clone());
-        let (meta, table, mapping) = recover.phase1();
-        let store = Arc::new(Store::new(table, opt.clone(), meta.clone(), mapping)?);
+        let (meta, table, mapping, desc) = recover.phase1();
+        let store = Arc::new(Store::new(
+            table,
+            opt.clone(),
+            meta.clone(),
+            mapping,
+            &desc,
+        )?);
         let tree = Self::open(store.clone());
 
-        recover.phase2(meta.clone(), &tree);
+        recover.phase2(meta.clone(), &desc, &tree);
         meta.sync(opt.meta_file(), false);
         store.start();
         let handle = start_gc(store.clone(), meta.clone(), store.buffer.mapping.clone());

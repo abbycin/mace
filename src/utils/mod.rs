@@ -2,9 +2,10 @@ use std::{
     cell::RefCell,
     ops::{Deref, Range},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicI64, Ordering::Relaxed},
 };
 
-use rand::{rngs::ThreadRng, Rng};
+use rand::{Rng, rngs::ThreadRng};
 
 pub(crate) mod bitmap;
 pub(crate) mod block;
@@ -61,11 +62,7 @@ pub(crate) const fn align_down(n: usize, align: usize) -> usize {
 }
 
 pub(crate) const fn is_power_of_2(x: usize) -> bool {
-    if x == 0 {
-        false
-    } else {
-        x & (x - 1) == 0
-    }
+    if x == 0 { false } else { x & (x - 1) == 0 }
 }
 
 pub(crate) fn next_power_of_2(x: usize) -> usize {
@@ -103,9 +100,7 @@ macro_rules! number_to_slice {
 }
 #[macro_export]
 macro_rules! slice_to_number {
-    ($slice:expr, $num:ty) => {{
-        <$num>::from_le_bytes($slice.try_into().unwrap())
-    }};
+    ($slice:expr, $num:ty) => {{ <$num>::from_le_bytes($slice.try_into().unwrap()) }};
 }
 
 pub(crate) const SEG_BITS: u64 = 32;
@@ -139,11 +134,18 @@ pub struct RandomPath {
 impl RandomPath {
     const PREFIX: &'static str = "mace_tmp_";
 
-    fn gen(root: &PathBuf) -> PathBuf {
+    fn gen_path(root: &PathBuf) -> PathBuf {
+        static TID: AtomicI64 = AtomicI64::new(0);
         let path = Path::new(&root);
         loop {
             let r = rand_range(1000..1000000);
-            let p = path.join(format!("{}{}", Self::PREFIX, r));
+            let p = path.join(format!(
+                "{}{}{}{}",
+                Self::PREFIX,
+                std::process::id(),
+                TID.fetch_add(1, Relaxed),
+                r
+            ));
             if !p.exists() {
                 return p;
             }
@@ -152,21 +154,21 @@ impl RandomPath {
 
     pub fn tmp() -> Self {
         Self {
-            path: Self::gen(&std::env::temp_dir()),
+            path: Self::gen_path(&std::env::temp_dir()),
             del: true,
         }
     }
 
     pub fn new() -> Self {
         Self {
-            path: Self::gen(&std::env::temp_dir()),
+            path: Self::gen_path(&std::env::temp_dir()),
             del: false,
         }
     }
 
-    pub fn from_root(root: &PathBuf) -> Self {
+    pub fn from_root<P: AsRef<Path>>(root: P) -> Self {
         Self {
-            path: Self::gen(root),
+            path: Self::gen_path(&root.as_ref().to_path_buf()),
             del: false,
         }
     }

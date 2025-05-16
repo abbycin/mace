@@ -14,17 +14,18 @@ example see [demo.rs](examples/demo.rs)
 single-threaded read/write benchmarks see [bench.rs](tests/bench.rs)
 
 ```
-λ cargo test --test bench --release -- --nocapture                                                                                                                                                                                                                                                                     
-   Compiling mace v0.0.3 (/home/workspace/gits/github/mace)
-    Finished `release` profile [optimized] target(s) in 7.89s
-     Running tests/bench.rs (target/release/deps/bench-accc8d2811434c5e)
+λ cargo test --test bench --release -- --nocapture
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running tests/bench.rs (target/release/deps/bench-02ae28ec6d08863b)
 
 running 1 test
-db_root "/tmp/mace_tmp_169093"
-put 443ms get 35ms
+db_root "/tmp/mace_tmp_913320470031"
+put       228ms
+hot get   24ms
+cold get  43ms
 test bench ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
 ```
 
 ### highlights
@@ -34,12 +35,6 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 - scalable lock-free implementation
 - flash-optimized log-structured storage
 - cross-platform
-
-### limitations
-
-sine each transaction is bound to a worker, and the default number of workers is the number of CPU cores, it is recommended not to start multiple transactions in the same thread at the same time     
-
-in addition, configuring workers that exceed the number of CPU cores may cause performance degradation
 
 ### caveats
 

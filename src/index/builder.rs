@@ -1,20 +1,20 @@
 use std::collections::VecDeque;
 
 use crate::{
+    OpCode,
     cc::data::Ver,
     index::data::SLOT_LEN,
     utils::traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
-    OpCode,
 };
 
 use super::{
+    FrameRef, IAlloc, Key,
     data::{Sibling, Value},
     iter::{ItemIter, SliceIter},
     page::{
-        self, DeltaType, LeafMergeIter, MainPage, MainPageHdr, Meta, NodeType, SibPage, SibPageHdr,
-        SIBPG_HDR_LEN,
+        self, DeltaType, LeafMergeIter, MainPage, MainPageHdr, Meta, NodeType, SIBPG_HDR_LEN,
+        SibPage, SibPageHdr,
     },
-    FrameRef, IAlloc, Key,
 };
 
 pub(crate) struct Delta<T> {
@@ -254,14 +254,14 @@ mod test {
 
     use crate::{
         index::{
+            FrameRef, IAlloc, Key,
             data::Value,
             page::{DeltaType, LeafMergeIter, NodeType},
-            FrameRef, IAlloc, Key,
         },
         map::data::FrameOwner,
     };
 
-    use super::{page::MainPage, FuseBuilder};
+    use super::{FuseBuilder, page::MainPage};
 
     struct Arena {
         map: HashMap<u64, FrameOwner>,

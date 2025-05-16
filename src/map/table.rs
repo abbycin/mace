@@ -3,8 +3,8 @@ use std::mem::MaybeUninit;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-use crate::utils::{NULL_PID, ROOT_PID};
 use crate::OpCode;
+use crate::utils::{NULL_PID, ROOT_PID};
 
 const SLOT_SIZE: u64 = 1u64 << 16;
 
@@ -82,11 +82,7 @@ impl PageMap {
             cnt += 1;
         }
 
-        if cnt == MAX_ID {
-            None
-        } else {
-            Some(pid)
-        }
+        if cnt == MAX_ID { None } else { Some(pid) }
     }
 
     pub fn unmap(&self, pid: u64, addr: u64) -> Result<(), OpCode> {
@@ -209,7 +205,7 @@ build_layer!(Layer1, Layer2, L1_FANOUT);
 
 #[cfg(test)]
 mod test {
-    use crate::map::table::{PageMap, L1_FANOUT, L2_FANOUT, L3_FANOUT, NULL_PID};
+    use crate::map::table::{L1_FANOUT, L2_FANOUT, L3_FANOUT, NULL_PID, PageMap};
 
     fn addr(a: u64) -> u64 {
         a * 2

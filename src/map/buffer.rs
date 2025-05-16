@@ -3,16 +3,16 @@ use std::{
     fmt::Debug,
     ops::Deref,
     sync::{
-        atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize},
         Arc,
+        atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize},
     },
 };
 
 use crate::{
+    OpCode,
     map::data::FrameFlag,
     static_assert,
-    utils::{countblock::Countblock, data::Meta, raw_ptr_to_ref, INIT_ORACLE, INVALID_ID, NULL_ID},
-    OpCode,
+    utils::{INIT_ORACLE, INVALID_ID, NULL_ID, countblock::Countblock, data::Meta, raw_ptr_to_ref},
 };
 
 use super::{

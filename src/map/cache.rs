@@ -1,10 +1,10 @@
+use crate::OpCode;
 use crate::utils::next_power_of_2;
 use crate::utils::options::Options;
 use crate::utils::queue::Queue;
-use crate::OpCode;
 use dashmap::DashMap;
 use rand::Rng;
-use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::sync::atomic::{
     AtomicU8,
     Ordering::{Relaxed, Release},
@@ -205,10 +205,10 @@ unsafe impl<T: DeepCopy> Sync for Cache<T> {}
 
 #[cfg(test)]
 mod test {
+    use crate::RandomPath;
     use crate::map::cache::Cache;
     use crate::map::data::{Frame, FrameOwner};
     use crate::utils::options::Options;
-    use crate::RandomPath;
 
     use std::sync::Arc;
 

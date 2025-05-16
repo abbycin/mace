@@ -1,15 +1,11 @@
 use crate::map::buffer::Buffers;
-use crate::utils::countblock::Countblock;
-use crate::utils::data::Meta;
-use crate::utils::next_power_of_2;
+use crate::utils::data::{Meta, WalDescHandle};
 use crate::utils::queue::Queue;
 use crate::{OpCode, Options};
 
-use super::log::{CState, GroupCommitter};
 use super::worker::SyncWorker;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::{Relaxed, Release};
 use std::sync::Arc;
+use std::sync::atomic::Ordering::{Relaxed, Release};
 
 pub struct Context {
     pub(crate) opt: Arc<Options>,
@@ -18,57 +14,35 @@ pub struct Context {
     pub(crate) meta: Arc<Meta>,
     workers: Arc<Vec<SyncWorker>>,
     active_workers: Queue<SyncWorker>,
-    ctrl: Arc<CState>,
-    sem: Arc<Countblock>,
-}
-
-fn group_commit_thread(
-    mut gc: GroupCommitter,
-    ctrl: Arc<CState>,
-    buffer: Arc<Buffers>,
-    worker: Arc<Vec<SyncWorker>>,
-    sem: Arc<Countblock>,
-) {
-    std::thread::Builder::new()
-        .name("group_commiter".into())
-        .spawn(move || {
-            log::debug!("start group commiter");
-            gc.run(ctrl, buffer, worker, sem);
-            log::debug!("stop group commiter");
-        })
-        .expect("can't spawn group commit thread");
 }
 
 impl Context {
     pub fn new(
         opt: Arc<Options>,
-        sem: Arc<Countblock>,
         buffer: Arc<Buffers>,
         meta: Arc<Meta>,
+        desc: &[WalDescHandle],
     ) -> Arc<Self> {
         let cores = opt.workers;
-        let gc = GroupCommitter::new(opt.clone(), meta.clone());
+        // NOTE: the elements of desc were ordered by worker id
+        assert_eq!(cores, desc.len());
         let mut w = Vec::with_capacity(cores);
-        let ctrl = CState::new();
-        let fsn = Arc::new(AtomicU64::new(0));
-        let active_workers = Queue::new(next_power_of_2(cores) as u32, None);
-
-        for i in 0..cores {
+        let active_workers = Queue::new(cores.next_power_of_two() as u32, None);
+        for i in desc.iter() {
             let buffer = buffer.clone();
-            let x = SyncWorker::new(fsn.clone(), i as u16, opt.clone(), sem.clone(), buffer);
-            active_workers.push(x).unwrap();
+            let x = SyncWorker::new(i.clone(), meta.clone(), opt.clone(), buffer);
             w.push(x);
         }
-        let workers = Arc::new(w);
-        group_commit_thread(gc, ctrl.clone(), buffer, workers.clone(), sem.clone());
+
+        for x in w.iter().rev() {
+            active_workers.push(*x).unwrap();
+        }
 
         let this = Self {
             opt: opt.clone(),
             meta,
-            workers,
+            workers: Arc::new(w),
             active_workers,
-            ctrl,
-            sem,
         };
 
         Arc::new(this)
@@ -79,7 +53,7 @@ impl Context {
     }
 
     pub fn free_worker(&self, w: SyncWorker) {
-        self.active_workers.push(w).expect("no space");
+        self.active_workers.push(w).unwrap();
     }
 
     #[inline]
@@ -112,14 +86,12 @@ impl Context {
     }
 
     pub(crate) fn start(&self) {
-        self.ctrl.mark_working();
+        self.workers
+            .iter()
+            .for_each(|w| w.logging.enable_checkpoint())
     }
 
     pub(crate) fn quit(&self) {
-        self.sem.quit();
-        self.workers.iter().for_each(|x| x.logging.wait_flush());
-        self.ctrl.mark_stop();
-        self.ctrl.wait();
         self.workers.iter().for_each(|x| x.reclaim());
     }
 }

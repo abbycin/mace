@@ -1,14 +1,13 @@
 use crate::map::data::DataBuilder;
 use crate::utils::countblock::Countblock;
-use crate::utils::data::JUNK_LEN;
+use crate::utils::data::{GatherWriter, JUNK_LEN};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::RecvTimeoutError;
 use std::{
-    fs::File,
     sync::{
-        atomic::Ordering::Relaxed,
-        mpsc::{channel, Receiver, Sender},
         Arc,
+        atomic::Ordering::Relaxed,
+        mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
     time::Duration,
@@ -29,19 +28,12 @@ fn flush_data(msg: FlushData, map: &Mapping) {
 
     if !builder.is_empty() {
         let path = map.opt.data_file(id);
-        let mut f = match File::options().append(true).create(true).open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("can't open {:?}, {:?}", path, e);
-                panic!("fatal error, path {:?}, error {:?}", path, e);
-            }
-        };
-
-        builder.build(&mut f, id);
-        let _ = f.sync_all().map_err(|x| {
-            log::error!("can't sync {:?} {}", path, x);
-            panic!("fatal error");
-        });
+        if !map.opt.db_root.exists() {
+            log::error!("db_root {:?} not exist", path);
+            panic!("db_root {:?} not exist", path);
+        }
+        let mut w = GatherWriter::new(&path);
+        builder.build(&mut w, id);
         log::trace!(
             "flush active {} frames, size {}",
             builder.active_frames(),

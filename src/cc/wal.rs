@@ -1,19 +1,15 @@
-use std::{cell::RefCell, cmp::max, collections::BTreeMap, rc::Rc};
+use std::{cell::RefCell, cmp::max, collections::BTreeMap, fmt::Debug, rc::Rc};
 
 use io::{File, GatherIO};
 
 use crate::{
-    index::{data::Value, tree::Tree, Key},
-    static_assert,
-    utils::{block::Block, unpack_id, INIT_CMD, NEXT_ID, NULL_ORACLE},
     Record,
+    index::{Key, data::Value, tree::Tree},
+    static_assert,
+    utils::{INIT_CMD, NEXT_ID, block::Block, unpack_id},
 };
 
 use super::{context::Context, data::Ver};
-
-pub(crate) trait IWalRec {
-    fn set_lsn(&mut self, lsn: u64);
-}
 
 pub(crate) trait IWalCodec {
     fn encoded_len(&self) -> usize;
@@ -87,7 +83,6 @@ pub(crate) struct WalSpan {
 }
 
 #[repr(C, packed(1))]
-#[derive(Debug)]
 pub(crate) struct WalUpdate {
     pub(crate) wal_type: EntryType,
     pub(crate) sub_type: PayloadType,
@@ -99,6 +94,21 @@ pub(crate) struct WalUpdate {
     pub(crate) klen: u32,
     pub(crate) txid: u64,
     pub(crate) prev_addr: u64,
+}
+
+impl Debug for WalUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalUpdate")
+            .field("wal_type", &self.wal_type)
+            .field("sub_type", &self.sub_type)
+            .field("woker_id", &{ self.worker_id })
+            .field("size", &{ self.size })
+            .field("cmd_id", &{ self.cmd_id })
+            .field("klen", &{ self.klen })
+            .field("txid", &{ self.txid })
+            .field("prev_addr", &unpack_id(self.prev_addr))
+            .finish()
+    }
 }
 
 #[repr(C, packed(1))]
@@ -125,113 +135,14 @@ pub(crate) struct WalCommit {
 static_assert!(size_of::<WalCommit>() == size_of::<WalAbort>());
 static_assert!(size_of::<WalCommit>() == size_of::<WalBegin>());
 
+// NOTE: the wal is not shared among txns, and there's no active txn while create checkpoint, the
+//  checkpoint is only used for identify the log was stabilized or not
 #[repr(C, packed(1))]
 #[derive(Debug)]
 pub(crate) struct WalCheckpoint {
     pub(crate) wal_type: EntryType,
-    /// snapshot of current oracle
-    pub(crate) txid: u64,
     /// previous checkpoint's file + offset
     pub(crate) prev_addr: u64,
-    // same to worker count
-    pub(crate) active_txn_cnt: u16,
-    // follows txid-addr map
-}
-
-#[derive(Default, Clone, Copy, Debug)]
-#[repr(C, packed(1))]
-pub(crate) struct CkptItem {
-    pub(crate) txid: u64,
-    pub(crate) addr: u64,
-}
-
-pub(crate) struct CkptMem {
-    pub(crate) hdr: WalCheckpoint,
-    mask: Vec<CkptItem>,
-    pub(crate) txn: Vec<CkptItem>,
-}
-
-unsafe impl Send for CkptItem {}
-
-impl CkptMem {
-    pub(crate) fn new(workers: usize) -> Self {
-        let mut mask: Vec<CkptItem> = vec![CkptItem::default(); workers];
-        for i in &mut mask {
-            i.txid = NULL_ORACLE;
-        }
-        Self {
-            hdr: WalCheckpoint {
-                wal_type: EntryType::CheckPoint,
-                txid: 0,
-                prev_addr: 0,
-                active_txn_cnt: 0,
-            },
-            mask,
-            txn: Vec::new(),
-        }
-    }
-
-    pub(crate) fn reset(&mut self, worker: u16) {
-        #[cfg(debug_assertions)]
-        assert!((worker as usize) < self.mask.len());
-        self.mask[worker as usize].txid = NULL_ORACLE;
-    }
-
-    pub(crate) fn set(&mut self, worker: u16, txid: u64, addr: u64) {
-        #[cfg(debug_assertions)]
-        {
-            assert!((worker as usize) < self.mask.len());
-            let (id, _) = unpack_id(addr);
-            debug_assert_ne!(id, 0);
-            assert_ne!(txid, 0);
-        }
-        let x = &mut self.mask[worker as usize];
-        x.txid = txid;
-        x.addr = addr;
-    }
-
-    pub(crate) fn slice(
-        &mut self,
-        txid: u64,
-        prev_addr: u64,
-    ) -> ((*const u8, usize), (*const u8, usize)) {
-        self.hdr.txid = txid;
-        self.hdr.prev_addr = prev_addr;
-        self.hdr.active_txn_cnt = self.fill_txn() as u16;
-
-        (
-            (self.hdr.to_slice().as_ptr(), self.hdr.encoded_len()),
-            (
-                self.txn.as_ptr().cast::<u8>(),
-                self.txn.len() * size_of::<CkptItem>(),
-            ),
-        )
-    }
-
-    fn fill_txn(&mut self) -> usize {
-        self.txn.clear();
-        for i in &self.mask {
-            if i.txid != NULL_ORACLE {
-                assert_ne!({ i.txid }, 0);
-                self.txn.push(*i);
-            }
-        }
-        self.txn.len()
-    }
-}
-
-impl WalCheckpoint {
-    pub(crate) fn active_txid(&self) -> &[CkptItem] {
-        let p = self as *const Self;
-        unsafe {
-            let ptr = p.add(1).cast::<CkptItem>();
-            std::slice::from_raw_parts(ptr, self.active_txn_cnt as usize)
-        }
-    }
-
-    pub(crate) fn payload_len(&self) -> usize {
-        self.active_txn_cnt as usize * size_of::<CkptItem>()
-    }
 }
 
 impl WalUpdate {
@@ -290,18 +201,6 @@ macro_rules! impl_codec {
         }
     };
 }
-
-macro_rules! impl_rec {
-    ($s: ty) => {
-        impl IWalRec for $s {
-            fn set_lsn(&mut self, lsn: u64) {
-                self.prev_addr = lsn;
-            }
-        }
-    };
-}
-
-impl_rec!(WalUpdate);
 
 impl_codec!(WalPadding);
 impl_codec!(WalSpan);
@@ -475,6 +374,15 @@ pub(crate) fn wal_record_sz(e: EntryType) -> usize {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Location {
+    pub(crate) wid: u32,
+    pub(crate) seq: u32,
+    /// wal file must not bigger than 4GB
+    pub(crate) off: u32,
+    pub(crate) len: u32,
+}
+
 pub(crate) struct WalReader<'a> {
     map: RefCell<BTreeMap<u32, (Rc<File>, u64)>>,
     ctx: &'a Context,
@@ -488,15 +396,15 @@ impl<'a> WalReader<'a> {
         }
     }
 
-    fn get_file(&self, id: u32) -> Option<(Rc<File>, u64)> {
-        assert!(id >= NEXT_ID);
+    fn get_file(&self, id: u32, seq: u32) -> Option<(Rc<File>, u64)> {
+        assert!(seq >= NEXT_ID);
         const MAX_OPEN_FILES: usize = 10;
         let mut map = self.map.borrow_mut();
         while map.len() > MAX_OPEN_FILES {
             map.pop_first();
         }
-        if let std::collections::btree_map::Entry::Vacant(e) = map.entry(id) {
-            let path = self.ctx.opt.wal_file(id);
+        if let std::collections::btree_map::Entry::Vacant(e) = map.entry(seq) {
+            let path = self.ctx.opt.wal_file(id as u16, seq);
             if !path.exists() {
                 return None;
             }
@@ -504,18 +412,20 @@ impl<'a> WalReader<'a> {
             let len = f.size().unwrap();
             e.insert((Rc::new(f), len));
         }
-        map.get(&id).map(|(x, y)| (x.clone(), *y))
+        map.get(&seq).map(|(x, y)| (x.clone(), *y))
     }
 
-    // for rollback, the worker should be same to caller, but can be arbitratry for recovery
-    pub(crate) fn rollback(&self, block: &mut Block, txid: u64, addr: u64, tree: &Tree) {
-        let (mut id, pos) = unpack_id(addr);
+    // for rollback, the worker should be same to caller, but can be arbitrary for recovery
+    pub(crate) fn rollback(&self, block: &mut Block, txid: u64, addr: Location, tree: &Tree) {
+        let Location {
+            wid, mut seq, off, ..
+        } = addr;
         let mut cmd = INIT_CMD;
         let mut last_worker = 0;
-        let mut pos = pos as u64;
+        let mut pos = off as u64;
 
         'outer: loop {
-            let (f, end) = match self.get_file(id) {
+            let (f, end) = match self.get_file(wid, seq) {
                 None => break, // for rollback, this will not happen, but may happen in recovery
                 Some(f) => {
                     if f.1 == 0 {
@@ -526,7 +436,7 @@ impl<'a> WalReader<'a> {
             };
 
             loop {
-                let s = block.get_mut_slice(0, block.len());
+                let s = block.mut_slice(0, block.len());
                 f.read(&mut s[0..1], pos).unwrap();
                 let h: EntryType = s[0].into();
                 let sz = wal_record_sz(h);
@@ -541,7 +451,7 @@ impl<'a> WalReader<'a> {
                         // we use the same worker in the UPDATE record or else any worker is ok, so
                         // that we can make sure these records will be flushed with the same order
                         // as they were queued
-                        let w = self.ctx.worker(last_worker);
+                        let mut w = self.ctx.worker(last_worker);
                         w.logging.record_abort(txid);
                         break 'outer;
                     }
@@ -551,16 +461,17 @@ impl<'a> WalReader<'a> {
                         assert_eq!({ u.txid }, txid);
                         assert!(pos + usz as u64 <= end);
                         last_worker = u.worker_id as usize;
+                        assert_eq!(last_worker, wid as usize);
                         if block.len() < usz {
                             block.realloc(usz);
                         }
-                        let s = block.get_mut_slice(sz, usz - sz);
+                        let s = block.mut_slice(sz, usz - sz);
                         f.read(s, pos + sz as u64).unwrap();
                         let next = self.undo(ptr_to::<WalUpdate>(block.data()), &mut cmd, tree);
                         let (prev_id, prev_pos) = unpack_id(next);
                         pos = prev_pos as u64;
-                        if prev_id != id {
-                            id = prev_id;
+                        if prev_id != seq {
+                            seq = prev_id;
                             break;
                         }
                     }
@@ -600,7 +511,7 @@ impl<'a> WalReader<'a> {
             Value::Put(Record::normal(c.worker_id, data))
         };
 
-        let w = self.ctx.worker(c.worker_id as usize);
+        let mut w = self.ctx.worker(c.worker_id as usize);
         w.logging.record_update(
             Ver::new(c.txid, *cmd),
             WalClr::new(tombstone, data.len(), c.prev_addr),
@@ -621,7 +532,7 @@ pub(crate) fn ptr_to<T>(x: *const u8) -> &'static T {
 
 #[cfg(test)]
 mod test {
-    use crate::cc::wal::{ptr_to, EntryType, IWalCodec, PayloadType, WalPut, WalUpdate};
+    use crate::cc::wal::{EntryType, IWalCodec, PayloadType, WalPut, WalUpdate, ptr_to};
 
     #[test]
     fn dump_load() {

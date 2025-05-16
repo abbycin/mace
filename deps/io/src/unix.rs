@@ -6,8 +6,8 @@ use std::{
 };
 
 use libc::{
-    c_int, close, fstat, fsync, ftruncate, iovec, open, preadv, stat, write, writev, EINTR,
-    O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY,
+    c_int, close, fstat, fsync, ftruncate, iovec, open, pread, stat, write, writev, EINTR,
+    O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
 };
 
 #[cfg(any(target_os = "freebsd", target_os = "macos"))]
@@ -33,7 +33,9 @@ impl OpenOptions {
             flag = O_RDWR;
         }
 
-        if self.append {
+        if self.trunc {
+            flag |= O_TRUNC;
+        } else if self.append {
             flag |= O_APPEND;
         }
 
@@ -82,25 +84,36 @@ impl Drop for File {
 }
 
 impl GatherIO for File {
-    fn read(&self, data: &mut [u8], pos: u64) -> Result<(), std::io::Error> {
-        let rc = unsafe {
-            let iov = iovec {
-                iov_base: data.as_mut_ptr().cast::<c_void>(),
-                iov_len: data.len(),
-            };
-            preadv(self.file, &iov, 1, pos as i64)
-        };
+    fn read(&self, data: &mut [u8], mut pos: u64) -> Result<usize, std::io::Error> {
+        let mut sz = 0;
+        let end = data.len();
+        while sz < end {
+            let buf = &mut data[sz..];
+            unsafe {
+                let n = pread(
+                    self.file,
+                    buf.as_mut_ptr().cast::<c_void>(),
+                    buf.len(),
+                    pos as i64,
+                );
+                if n < 0 {
+                    if errno() == EINTR {
+                        continue;
+                    }
+                    return Err(io::Error::from_raw_os_error(errno()));
+                }
+                if n == 0 {
+                    break;
+                }
+                pos += n as u64;
+                sz += n as usize;
+            }
+        }
 
-        if rc < 0 {
-            return Err(io::Error::from_raw_os_error(errno()));
-        }
-        if rc == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
-        }
-        Ok(())
+        Ok(sz as usize)
     }
 
-    fn write(&mut self, data: &[u8]) -> Result<(), io::Error> {
+    fn write(&mut self, data: &[u8]) -> Result<usize, io::Error> {
         loop {
             unsafe {
                 let rc = write(self.file, data.as_ptr().cast::<c_void>(), data.len());
@@ -112,12 +125,12 @@ impl GatherIO for File {
                     return Err(io::Error::from_raw_os_error(errno()));
                 }
                 assert_eq!(rc as usize, data.len());
-                return Ok(());
+                return Ok(rc as usize);
             }
         }
     }
 
-    fn writev(&mut self, data: &mut [crate::IoVec]) -> Result<(), std::io::Error> {
+    fn writev(&mut self, data: &mut [crate::IoVec]) -> Result<(), io::Error> {
         let mut count = data.len() as c_int;
         let mut iov = data.as_mut_ptr().cast::<iovec>();
 

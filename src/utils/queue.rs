@@ -1,6 +1,6 @@
-use crate::utils::{is_power_of_2, OpCode};
-use std::alloc::{alloc, dealloc, Layout};
-use std::sync::atomic::{AtomicU32, Ordering};
+use crate::utils::{OpCode, is_power_of_2};
+use std::alloc::{Layout, alloc, dealloc};
+use std::sync::atomic::{AtomicU32, Ordering, fence};
 
 /// we use two pair of prod-{head, tail} and cons-{head, tail} instead of single head-tail pair for
 /// the following reason:
@@ -31,6 +31,8 @@ pub struct Queue<T> {
 }
 
 impl<T> Queue<T> {
+    const SPIN_COUNT: usize = 100;
+
     pub fn new(cap: u32, dtor: Option<Box<dyn Fn(T)>>) -> Self {
         assert!(is_power_of_2(cap as usize));
         let data = unsafe { alloc(Layout::array::<T>(cap as usize).unwrap()) as *mut T };
@@ -56,6 +58,8 @@ impl<T> Queue<T> {
             prod_head = self.prod_head.load(Ordering::Relaxed);
             cons_tail = self.cons_tail.load(Ordering::Relaxed);
 
+            fence(Ordering::Acquire); // forbid l/l reorder in weak model
+
             // no space for producer
             if cap.wrapping_add(cons_tail.wrapping_sub(prod_head)) == 0 {
                 return Err(OpCode::NoSpace);
@@ -69,20 +73,25 @@ impl<T> Queue<T> {
                 break;
             }
         }
+
+        let mut cnt = Self::SPIN_COUNT;
+        // wait other thread finish store `prod_tail`
+        while self.prod_tail.load(Ordering::Acquire) != prod_head {
+            std::hint::spin_loop();
+            cnt -= 1;
+            if cnt == 0 {
+                cnt = Self::SPIN_COUNT;
+                std::thread::yield_now();
+            }
+        }
+
         let idx = prod_head & self.mask;
         unsafe {
             self.data.add(idx as usize).write(x);
         }
 
-        std::sync::atomic::fence(Ordering::Release);
-
-        // wait other thread finish store `prod_tail`
-        while self.prod_tail.load(Ordering::Relaxed) != prod_head {
-            std::thread::yield_now();
-        }
-
         // advance to next, equal to other thread's head
-        self.prod_tail.store(prod_next, Ordering::Relaxed);
+        self.prod_tail.store(prod_next, Ordering::Release);
         Ok(())
     }
 
@@ -94,6 +103,8 @@ impl<T> Queue<T> {
         loop {
             cons_head = self.cons_head.load(Ordering::Relaxed);
             prod_tail = self.prod_tail.load(Ordering::Relaxed);
+
+            fence(Ordering::Acquire); // forbid l/l reorder in weak model
 
             // no space for consumer
             if prod_tail.wrapping_sub(cons_head) == 0 {
@@ -109,15 +120,21 @@ impl<T> Queue<T> {
             }
         }
 
-        std::sync::atomic::fence(Ordering::Acquire);
-
-        while self.cons_tail.load(Ordering::Relaxed) != cons_head {
-            std::thread::yield_now();
+        let mut cnt = Self::SPIN_COUNT;
+        while self.cons_tail.load(Ordering::Acquire) != cons_head {
+            std::hint::spin_loop();
+            cnt -= 1;
+            if cnt == 0 {
+                cnt = Self::SPIN_COUNT;
+                std::thread::yield_now();
+            }
         }
-        self.cons_tail.store(cons_next, Ordering::Release);
 
         let idx = cons_head & self.mask;
-        unsafe { Ok(self.data.add(idx as usize).read()) }
+        let r = unsafe { Ok(self.data.add(idx as usize).read()) };
+
+        self.cons_tail.store(cons_next, Ordering::Release);
+        r
     }
 
     pub fn count(&self) -> u32 {
@@ -159,9 +176,12 @@ unsafe impl<T> Sync for Queue<T> {}
 
 #[cfg(test)]
 mod test {
+
     use crate::utils::queue::Queue;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::utils::rand_range;
+    use std::ops::{Deref, DerefMut};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     #[test]
     fn test_queue() {
@@ -192,5 +212,84 @@ mod test {
 
         let sum = arr.iter().map(|x| x.load(Ordering::Relaxed)).sum::<u64>() as usize;
         assert_eq!(sum, COUNT * LOOP);
+    }
+
+    struct Ctx {
+        cur: usize,
+        last: usize,
+    }
+
+    struct Handle {
+        raw: *mut Ctx,
+    }
+
+    impl Deref for Handle {
+        type Target = Ctx;
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*self.raw }
+        }
+    }
+
+    impl DerefMut for Handle {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            unsafe { &mut *self.raw }
+        }
+    }
+
+    impl Handle {
+        fn new() -> Self {
+            Self {
+                raw: Box::into_raw(Box::new(Ctx { cur: 0, last: 0 })),
+            }
+        }
+
+        fn free(h: Self) {
+            unsafe {
+                let _ = Box::from_raw(h.raw);
+            }
+        }
+    }
+
+    fn delay() {
+        for i in 0..rand_range(1..100) {
+            std::hint::black_box(i);
+        }
+    }
+
+    #[test]
+    fn test_queue2() {
+        let nr_th = std::thread::available_parallelism().unwrap().get();
+        let n = nr_th.next_power_of_two();
+        let q = Arc::new(Queue::new(n as u32, Some(Box::new(Handle::free))));
+        for _ in 0..n {
+            q.push(Handle::new()).unwrap();
+        }
+
+        let nr_loop = 100000;
+        let nr_round = 10;
+        let mut thrd = Vec::new();
+
+        for _ in 0..nr_round {
+            let num = Arc::new(AtomicUsize::new(1));
+            for _ in 0..nr_th {
+                let cq = q.clone();
+                let cn = num.clone();
+                let x = std::thread::spawn(move || {
+                    for _ in 0..nr_loop {
+                        if let Ok(mut x) = cq.pop() {
+                            x.cur = cn.fetch_add(1, Ordering::Relaxed);
+                            delay();
+                            assert!(x.last < x.cur);
+                            cq.push(x).unwrap();
+                        }
+                    }
+                });
+                thrd.push(x);
+            }
+
+            while let Some(x) = thrd.pop() {
+                x.join().unwrap();
+            }
+        }
     }
 }

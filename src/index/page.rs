@@ -9,14 +9,15 @@ use crate::{
     index::data::Key,
     static_assert,
     utils::{
+        NULL_PID,
         bytes::ByteArray,
         traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
-        unpack_id, NULL_PID,
+        unpack_id,
     },
 };
 
 use super::{
-    data::{Index, Value, SLOT_LEN},
+    data::{Index, SLOT_LEN, Value},
     iter::MergeIter,
 };
 
@@ -388,11 +389,7 @@ where
             }
         }
 
-        if lo == cnt {
-            Err(lo)
-        } else {
-            Ok(lo)
-        }
+        if lo == cnt { Err(lo) } else { Ok(lo) }
     }
 
     fn search_by<F>(&self, key: &K, f: F) -> Result<usize, usize>
@@ -769,12 +766,12 @@ mod test {
     use crate::index::data::{Index, Key, Value};
     use crate::index::iter::MergeIterBuilder;
     use crate::index::page::{
-        DeltaType, MainPage, NodeType, PageMergeIter, MAINPG_HDR_LEN, SLOT_LEN,
+        DeltaType, MAINPG_HDR_LEN, MainPage, NodeType, PageMergeIter, SLOT_LEN,
     };
     use crate::utils::block::Block;
     use crate::utils::traits::{ICodec, IKey, IVal};
 
-    use super::{IntlMergeIter, MainPageHdr, Meta, RangeIter, NULL_INDEX};
+    use super::{IntlMergeIter, MainPageHdr, Meta, NULL_INDEX, RangeIter};
 
     #[test]
     fn test_meta() {

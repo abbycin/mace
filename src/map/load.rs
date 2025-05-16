@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{atomic::AtomicU32, Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, atomic::AtomicU32},
 };
 
 use dashmap::DashMap;
@@ -9,8 +9,8 @@ use io::{File, GatherIO};
 
 use super::data::{DataMetaReader, FileStat, FrameOwner, StatHandle};
 use crate::{
-    utils::{bitmap::BitMap, block::Block, data::Reloc, lru::Lru, unpack_id},
     OpCode, Options,
+    utils::{bitmap::BitMap, block::Block, data::Reloc, lru::Lru, unpack_id},
 };
 
 pub(crate) struct FileReader {

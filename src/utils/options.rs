@@ -46,11 +46,15 @@ pub struct Options {
 
 impl Options {
     pub const DEFAULT_BUFFER_SIZE: u32 = 64 << 20; // 64MB
+    pub const MAX_WORKERS: usize = 128;
 
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
             sync_on_write: true,
-            workers: std::thread::available_parallelism().unwrap().get(),
+            workers: std::thread::available_parallelism()
+                .unwrap()
+                .get()
+                .min(Self::MAX_WORKERS),
             tmp_store: false,
             gc_timeout: 60 * 1000, // 60s
             gc_ratio: 80,          // 80%
@@ -63,7 +67,7 @@ impl Options {
             buffer_size: Self::DEFAULT_BUFFER_SIZE,
             buffer_count: 3,    // total 192MB
             page_size: 8 << 10, // 8KB
-            consolidate_threshold: 16,
+            consolidate_threshold: 24,
             wal_buffer_size: 4 << 20,    // 4MB
             max_ckpt_per_txn: 1_000_000, // 1 million
             wal_file_size: 100 << 20,    // 100MB
@@ -85,22 +89,36 @@ impl Options {
         self.db_root.join(format!("{}{}", Self::DATA_PREFIX, id))
     }
 
-    pub fn wal_file(&self, id: u32) -> PathBuf {
-        self.db_root.join(format!("{}{}", Self::WAL_PREFIX, id))
+    pub fn wal_root(&self) -> PathBuf {
+        self.db_root.join("wal")
     }
 
-    pub fn wal_backup(&self, id: u32) -> PathBuf {
-        self.db_root.join(format!("{}{}", Self::WAL_FREEZED, id))
+    pub fn wal_file(&self, wid: u16, seq: u32) -> PathBuf {
+        self.wal_root()
+            .join(format!("{}{}_{}", Self::WAL_PREFIX, wid, seq))
     }
 
+    pub fn wal_backup(&self, wid: u16, seq: u32) -> PathBuf {
+        self.wal_root()
+            .join(format!("{}{}_{}", Self::WAL_FREEZED, wid, seq))
+    }
+
+    pub fn desc_file(&self, wid: u16) -> PathBuf {
+        if wid == u16::MAX {
+            self.db_root.join("meta")
+        } else {
+            self.wal_root().join(format!("meta_{}", wid))
+        }
+    }
     pub fn meta_file(&self) -> PathBuf {
-        self.db_root.join("meta")
+        self.desc_file(u16::MAX)
     }
 }
 
 impl Drop for Options {
     fn drop(&mut self) {
         if self.tmp_store {
+            log::info!("remove db_root {:?}", self.db_root);
             let _ = std::fs::remove_dir_all(&self.db_root);
         }
     }

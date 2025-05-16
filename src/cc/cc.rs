@@ -1,4 +1,4 @@
-use std::alloc::{alloc_zeroed, Layout};
+use std::alloc::{Layout, alloc_zeroed};
 use std::cmp;
 use std::cmp::min;
 use std::sync::atomic::AtomicU64;
@@ -8,36 +8,6 @@ use std::{collections::HashSet, sync::RwLock};
 use crate::utils::rand_range;
 
 use super::context::Context;
-
-#[derive(Clone, Copy)]
-pub struct Transaction {
-    pub start_ts: u64,
-    pub commit_ts: u64,
-    /// max fsn observed in current txn
-    pub max_fsn: u64,
-    pub modified: bool,
-}
-
-impl Transaction {
-    pub(crate) fn new() -> Self {
-        Self {
-            start_ts: 0,
-            commit_ts: 0,
-            max_fsn: 0,
-            modified: false,
-        }
-    }
-
-    pub(crate) fn reset(&mut self, start_ts: u64) {
-        self.start_ts = start_ts;
-        self.commit_ts = 0;
-        self.modified = false;
-    }
-
-    pub(crate) fn ready_to_commit(&self, min_flush_txid: u64, min_fsn: u64) -> bool {
-        self.max_fsn <= min_fsn && self.start_ts <= min_flush_txid
-    }
-}
 
 #[derive(Default, Clone, Copy)]
 #[repr(align(64))]
@@ -262,7 +232,7 @@ impl CommitTree {
         drop(rlk);
 
         for w in ctx.workers().iter() {
-            if this_worker == w.id {
+            if this_worker == w.logging.desc.worker {
                 continue;
             }
 

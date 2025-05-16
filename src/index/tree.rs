@@ -1,28 +1,30 @@
 use super::{
-    data::{Index, Key, Value, SLOT_LEN},
+    data::{Index, Key, SLOT_LEN, Value},
     iter::{ItemIter, MergeIterBuilder},
     page::{
-        DeltaType, IntlMergeIter, IntlPage, LeafMergeIter, LeafPage, MainPage, MainPageHdr,
-        NodeType, PageMergeIter, RangeIter, MAINPG_HDR_LEN,
+        DeltaType, IntlMergeIter, IntlPage, LeafMergeIter, LeafPage, MAINPG_HDR_LEN, MainPage,
+        MainPageHdr, NodeType, PageMergeIter, RangeIter,
     },
     systxn::SysTxn,
 };
 
 use crate::{
+    OpCode, Store,
     cc::data::Ver,
     index::{
         builder::{Delta, FuseBuilder},
-        page::{SibPage, NULL_INDEX},
+        page::{NULL_INDEX, SibPage},
     },
     map::data::FrameOwner,
     utils::{
+        NULL_CMD,
         bytes::ByteArray,
         traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
-        unpack_id, NULL_CMD,
+        unpack_id,
     },
-    OpCode, Store,
 };
-use crate::{utils::NULL_ORACLE, Record};
+use crate::{Record, utils::NULL_ORACLE};
+use std::sync::atomic::Ordering::Relaxed;
 use std::{collections::VecDeque, sync::Arc};
 
 #[derive(Clone)]
@@ -183,7 +185,7 @@ impl Tree {
     {
         let mut index = self.root_index;
         let mut range = Range::new();
-        let mut parent = None;
+        let mut parent: Option<View> = None;
 
         loop {
             let view = Self::page_view(&self.store, index.pid);
@@ -196,8 +198,18 @@ impl Tree {
             // if any other modification operation is allowed, will cause leaf
             // node disordered, by the way, any operation (including lookup)
             // will go through this function and check the condition
+            // NOTE: there's a race condition that multiple threads hold the same
+            // `index` while one of them finished `parent_update` first and even
+            // finished `leaf consolidation`, this will cause rest threads encounter
+            // a non-split `view`, to fix this, we check whether parent was already
+            // updated before `parent_update`
             if view.info.epoch() != index.epoch {
-                if self.parent_update::<T>(view, parent, range).is_ok() {
+                let parent = parent.unwrap();
+                let index = self.store.page.index(parent.page_id);
+                let ok = index
+                    .compare_exchange(parent.page_addr, parent.page_addr, Relaxed, Relaxed)
+                    .is_ok();
+                if ok && self.parent_update::<T>(view, parent, range).is_ok() {
                     // get rid of those keys were moved to new node, for prefix scan
                     self.force_consolidate::<T>(view.page_id);
                 }
@@ -276,7 +288,7 @@ impl Tree {
     {
         let mut index = self.root_index;
         let mut range = Range::new();
-        let mut parent = None;
+        let mut parent: Option<View> = None;
         let mut successor = None;
         let mut found = false;
         // used to pin frame that referenced by range
@@ -285,7 +297,12 @@ impl Tree {
         loop {
             let view = Self::page_view(&self.store, index.pid);
             if view.info.epoch() != index.epoch {
-                if self.parent_update::<T>(view, parent, range).is_ok() {
+                let p = parent.unwrap();
+                let slot = self.store.page.index(p.page_id);
+                let ok = slot
+                    .compare_exchange(p.page_addr, p.page_addr, Relaxed, Relaxed)
+                    .is_ok();
+                if ok && self.parent_update::<T>(view, p, range).is_ok() {
                     let _ = self.consolidate::<T>(view);
                 }
                 // reset and retry
@@ -924,18 +941,11 @@ impl Tree {
     }
 
     /// NOTE: this is the second phase of `split` smo
-    fn parent_update<T>(
-        &self,
-        view: View,
-        mut parent: Option<View>,
-        range: Range<'_>,
-    ) -> Result<(), OpCode>
+    fn parent_update<T>(&self, view: View, mut parent: View, range: Range<'_>) -> Result<(), OpCode>
     where
         T: IValCodec,
     {
         assert!(view.info.is_split());
-
-        let mut parent = parent.take().ok_or(OpCode::Invalid)?;
 
         let lkey = range.key_pq;
         // it's important to apply split-delta's epoch to left entry, this will
@@ -1270,6 +1280,7 @@ where
 
 #[cfg(test)]
 mod test {
+    use std::ops::Deref;
     use std::sync::Arc;
 
     use super::{Store, Tree};
@@ -1277,17 +1288,36 @@ mod test {
     use crate::utils::traits::IValCodec;
 
     use crate::{
-        index::{data::Value, Key},
         OpCode, Options,
+        index::{Key, data::Value},
     };
-    use crate::{RandomPath, ROOT_PID};
+    use crate::{ROOT_PID, RandomPath};
 
-    fn new_tree(opt: Options) -> Tree {
+    struct TreeRef {
+        tree: Tree,
+    }
+
+    impl Deref for TreeRef {
+        type Target = Tree;
+        fn deref(&self) -> &Self::Target {
+            &self.tree
+        }
+    }
+
+    impl Drop for TreeRef {
+        fn drop(&mut self) {
+            self.tree.store.quit();
+        }
+    }
+
+    fn new_tree(opt: Options) -> TreeRef {
         let _ = std::fs::remove_dir_all(&opt.db_root);
         let opt = Arc::new(opt);
-        let (meta, table, mapping) = Recovery::new(opt.clone()).phase1();
-        let store = Arc::new(Store::new(table, opt, meta.clone(), mapping).unwrap());
-        Tree::new(store, ROOT_PID)
+        let (meta, table, mapping, desc) = Recovery::new(opt.clone()).phase1();
+        let store = Arc::new(Store::new(table, opt, meta.clone(), mapping, &desc).unwrap());
+        TreeRef {
+            tree: Tree::new(store, ROOT_PID),
+        }
     }
 
     #[test]

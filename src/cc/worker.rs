@@ -1,55 +1,43 @@
 use std::{
     ops::{Deref, DerefMut},
+    ptr::null_mut,
     sync::{
+        Arc,
         atomic::{
             AtomicU64, AtomicUsize,
             Ordering::{Relaxed, Release},
         },
-        Arc,
     },
 };
 
-use crate::{
-    index::tree::Tree,
-    map::buffer::Buffers,
-    utils::{block::Block, countblock::Countblock},
-    Options,
-};
-
-use super::{
-    cc::{ConcurrencyControl, Transaction},
-    context::Context,
-    log::Logging,
-    wal::WalReader,
-};
+use super::{cc::ConcurrencyControl, context::Context, log::Logging, wal::WalReader};
+use crate::cc::wal::Location;
+use crate::utils::data::{Meta, WalDescHandle};
+use crate::utils::unpack_id;
+use crate::{Options, index::tree::Tree, map::buffer::Buffers, utils::block::Block};
 
 pub struct Worker {
     pub cc: ConcurrencyControl,
-    pub ckpt_cnt: AtomicUsize,
-    pub ckpt: AtomicU64,
-    pub txn: Transaction,
-    pub logging: Logging,
-    /// a snapshot of [`Transaction::start_ts`] which will be used across threads
+    pub ckpt_cnt: Arc<AtomicUsize>,
     pub tx_id: AtomicU64,
+    // a copy of tx_id not shared among threads
+    pub start_ts: u64,
     pub id: u16,
+    pub logging: Logging,
+    pub modified: bool,
 }
 
 impl Worker {
-    fn new(
-        fsn: Arc<AtomicU64>,
-        id: u16,
-        opt: Arc<Options>,
-        sem: Arc<Countblock>,
-        buffer: Arc<Buffers>,
-    ) -> Self {
+    fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<Options>, buffer: Arc<Buffers>) -> Self {
+        let cnt = Arc::new(AtomicUsize::new(0));
         Self {
             cc: ConcurrencyControl::new(opt.workers),
-            ckpt_cnt: AtomicUsize::new(0),
-            ckpt: AtomicU64::new(0),
-            txn: Transaction::new(),
-            logging: Logging::new(fsn, opt, id, sem, buffer),
+            ckpt_cnt: cnt.clone(),
             tx_id: AtomicU64::new(0),
-            id,
+            start_ts: 0,
+            id: desc.worker,
+            logging: Logging::new(cnt, desc, meta, opt, buffer),
+            modified: false,
         }
     }
 }
@@ -59,15 +47,23 @@ pub struct SyncWorker {
     w: *mut Worker,
 }
 
+unsafe impl Send for SyncWorker {}
+unsafe impl Sync for SyncWorker {}
+
+impl Default for SyncWorker {
+    fn default() -> Self {
+        Self { w: null_mut() }
+    }
+}
+
 impl SyncWorker {
     pub fn new(
-        fsn: Arc<AtomicU64>,
-        id: u16,
+        desc: WalDescHandle,
+        meta: Arc<Meta>,
         opt: Arc<Options>,
-        sem: Arc<Countblock>,
         buffer: Arc<Buffers>,
     ) -> Self {
-        let w = Box::new(Worker::new(fsn, id, opt, sem, buffer));
+        let w = Box::new(Worker::new(desc, meta, opt, buffer));
         Self {
             w: Box::into_raw(w),
         }
@@ -80,10 +76,9 @@ impl SyncWorker {
 
     fn init(&mut self, ctx: &Context, start_ts: u64) {
         let id = self.id;
-        self.txn.reset(start_ts);
         self.ckpt_cnt.store(0, Relaxed);
-        self.ckpt.store(ctx.meta.ckpt.load(Relaxed), Relaxed);
         self.tx_id.store(start_ts, Relaxed);
+        self.start_ts = start_ts;
         self.cc.global_wmk_tx.store(ctx.wmk_oldest(), Relaxed);
         self.cc.commit_tree.compact(ctx, id);
     }
@@ -100,41 +95,46 @@ impl SyncWorker {
     }
 
     pub(crate) fn commit(&self, ctx: &Context) {
-        let mut txn = self.txn;
-        let txid = txn.start_ts;
+        let mut ms = *self;
+        let w = ms.deref_mut();
+        let txid = w.tx_id.load(Relaxed);
 
-        if !self.txn.modified {
-            self.logging.record_commit(txid);
+        if !w.modified {
+            w.logging.record_commit(txid);
             return;
         }
 
-        let mut w = *self;
-        txn.commit_ts = ctx.alloc_oracle();
-        w.cc.commit_tree.append(txid, txn.commit_ts);
-        w.cc.latest_cts.store(txn.commit_ts, Relaxed);
+        let commit_ts = ctx.alloc_oracle();
+        w.cc.commit_tree.append(txid, commit_ts);
+        w.cc.latest_cts.store(commit_ts, Relaxed);
 
         w.tx_id.store(0, Release); // sync with cc
-        txn.max_fsn = w.logging.fsn();
-
-        // we have no remote dependency, since we are append-only
-        w.logging.append_txn(txn);
 
         w.logging.record_commit(txid);
         w.cc.collect_wmk(ctx);
-        w.logging.wait_commit(txn.commit_ts);
+        w.logging.stabilize();
     }
 
     pub(crate) fn rollback(&self, ctx: &Context, tree: &Tree) {
-        let txid = self.txn.start_ts;
-        if !self.txn.modified {
-            self.logging.record_abort(txid);
+        const SMALL_SIZE: usize = 256;
+        let mut ms = *self;
+        let w = ms.deref_mut();
+        let txid = w.tx_id.load(Relaxed);
+        if !w.modified {
+            w.logging.record_abort(txid);
             return;
         }
-        let mut w = *self;
-        w.logging.wait_flush();
-        let mut block = Block::alloc(1024);
+        w.logging.stabilize();
+        let mut block = Block::alloc(SMALL_SIZE);
         let reader = WalReader::new(ctx);
-        reader.rollback(&mut block, txid, w.logging.lsn.load(Relaxed), tree);
+        let (seq, off) = unpack_id(w.logging.lsn());
+        let location = Location {
+            wid: self.id as u32,
+            seq,
+            off,
+            len: 0,
+        };
+        reader.rollback(&mut block, txid, location, tree);
 
         // since we are append-only, we must update CommitTree to make the rollbacked data visible
         // for example: worker 1 set foo = bar then commit, worker 2 del foo, then rollback, if we
@@ -144,11 +144,9 @@ impl SyncWorker {
         w.tx_id.store(0, Release); // sync with cc
         w.cc.latest_cts.store(commit_ts, Relaxed);
         w.cc.collect_wmk(ctx);
+        w.logging.stabilize();
     }
 }
-
-unsafe impl Sync for SyncWorker {}
-unsafe impl Send for SyncWorker {}
 
 impl Deref for SyncWorker {
     type Target = Worker;

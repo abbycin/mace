@@ -44,7 +44,7 @@ impl<K, V> Default for Node<K, V> {
 }
 
 #[repr(align(64))]
-struct LruInner<K, V> {
+pub(crate) struct LruInner<K, V> {
     head: *mut Node<K, V>,
     map: Mutex<HashMap<K, *mut Node<K, V>>>,
 }
@@ -99,7 +99,7 @@ where
         }
     }
 
-    pub fn get(&self, k: &K) -> Option<&V> {
+    pub(crate) fn get(&self, k: &K) -> Option<&V> {
         let map = self.map.lock().unwrap();
         map.get(k).map(|x| {
             self.move_back(*x);
@@ -107,7 +107,7 @@ where
         })
     }
 
-    pub fn del(&self, k: &K) {
+    pub(crate) fn del(&self, k: &K) {
         let mut map = self.map.lock().unwrap();
         if let Some(node) = map.remove(k) {
             self.remove_node(node);
