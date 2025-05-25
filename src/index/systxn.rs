@@ -63,7 +63,7 @@ impl<'a> SysTxn<'a> {
     pub fn update(&mut self, pid: u64, old: u64, frame: &mut FrameRef) -> Result<(), u64> {
         let new = frame.addr();
         self.store.page.cas(pid, old, new).inspect_err(|_| {
-            // NOTE: if retry ok, it will be set to non-tombstone
+            // NOTE: if retry ok, it will be set to non-tombstone in Frame::set_pid
             frame.set_tombstone();
             self.junks.clear();
         })?;
@@ -114,7 +114,11 @@ impl IAlloc for SysTxn<'_> {
         self.alloc(size)
     }
 
-    fn page_size(&self) -> usize {
+    fn page_size(&self) -> u32 {
         self.store.opt.page_size
+    }
+
+    fn limit_size(&self) -> u32 {
+        self.store.opt.inline_size
     }
 }

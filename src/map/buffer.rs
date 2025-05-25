@@ -12,7 +12,10 @@ use crate::{
     OpCode,
     map::data::FrameFlag,
     static_assert,
-    utils::{INIT_ORACLE, INVALID_ID, NULL_ID, countblock::Countblock, data::Meta, raw_ptr_to_ref},
+    utils::{
+        INIT_ORACLE, INVALID_ID, MutRef, NULL_ID, countblock::Countblock, data::Meta,
+        options::ParsedOptions, raw_ptr_to_ref, traits::IDataLoader,
+    },
 };
 
 use super::{
@@ -22,7 +25,6 @@ use super::{
 };
 use crate::map::cache::Cache;
 use crate::utils::bytes::ByteArray;
-use crate::utils::options::Options;
 use crate::utils::{pack_id, unpack_id};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 
@@ -262,7 +264,7 @@ impl Pool {
     }
 
     fn new(
-        opt: Arc<Options>,
+        opt: Arc<ParsedOptions>,
         sem: Arc<Countblock>,
         mapping: Arc<Mapping>,
         meta: Arc<Meta>,
@@ -393,7 +395,7 @@ impl Pool {
         let next = (idx + 1) % self.buf.len();
         let id = self.gen_id()?;
 
-        log::debug!("swap arena {} => {}", idx, next);
+        log::info!("swap arena {} => {}", idx, next);
         while !p.balanced() || p.set_state(Arena::FLUSH, Arena::HOT) != Arena::FLUSH {
             self.try_flush();
         }
@@ -462,7 +464,7 @@ pub struct Buffers {
 
 impl Buffers {
     pub fn new(
-        opt: Arc<Options>,
+        opt: Arc<ParsedOptions>,
         sem: Arc<Countblock>,
         meta: Arc<Meta>,
         mapping: Mapping,
@@ -539,6 +541,33 @@ impl Buffers {
                 }
                 return f;
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Loader {
+    loader: *const Buffers,
+    holder: MutRef<Vec<FrameOwner>>,
+}
+
+impl Loader {
+    pub fn new(l: *const Buffers) -> Self {
+        Self {
+            loader: l,
+            holder: MutRef::new(Vec::new()),
+        }
+    }
+}
+
+impl IDataLoader for Loader {
+    type Out = FrameOwner;
+
+    fn load_data(&self, addr: u64) -> Self::Out {
+        unsafe {
+            let f = (*self.loader).load(addr);
+            self.holder.raw().push(f.clone());
+            f
         }
     }
 }

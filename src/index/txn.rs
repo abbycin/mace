@@ -118,7 +118,7 @@ impl<'a> TxnKV<'a> {
     }
 
     fn should_abort(&self) -> Result<(), OpCode> {
-        if self.g.w.ckpt_cnt.load(Relaxed) >= self.limit {
+        if self.is_end.get() || self.g.w.ckpt_cnt.load(Relaxed) >= self.limit {
             return Err(OpCode::AbortTx);
         }
         Ok(())
@@ -235,7 +235,7 @@ impl<'a> TxnKV<'a> {
             return Ok(None);
         }
 
-        assert!(!logged);
+        debug_assert!(!logged);
 
         self.update_impl(k, v, &mut logged).map(Some)
     }
@@ -286,23 +286,23 @@ impl<'a> TxnKV<'a> {
             .map(|x| x.unwrap())
     }
 
-    pub fn commit(self) -> Result<(), OpCode> {
+    pub fn commit(&self) -> Result<(), OpCode> {
         self.should_abort()?;
         self.g.w.commit(self.g.ctx);
+        self.g.destroy();
         self.is_end.set(true);
         Ok(())
     }
 
-    pub fn rollback(self) -> Result<(), OpCode> {
-        self.rollback_impl()
-    }
-
-    fn rollback_impl(&self) -> Result<(), OpCode> {
+    pub fn rollback(&self) -> Result<(), OpCode> {
         if !self.is_end.get() {
             self.g.w.rollback(self.g.ctx, self.tree);
+            self.g.destroy();
             self.is_end.set(true);
+            Ok(())
+        } else {
+            Err(OpCode::AbortTx)
         }
-        Ok(())
     }
 
     #[inline]
@@ -324,8 +324,7 @@ impl<'a> TxnKV<'a> {
 
 impl Drop for TxnKV<'_> {
     fn drop(&mut self) {
-        let _ = self.rollback_impl();
-        self.g.destroy();
+        let _ = self.rollback();
     }
 }
 
@@ -380,7 +379,7 @@ mod test {
     fn txnkv() -> Result<(), OpCode> {
         let path = RandomPath::tmp();
         let _ = std::fs::remove_dir_all(&*path);
-        let opt = Options::new(&*path);
+        let opt = Options::new(&*path).validate().unwrap();
         let db = Mace::new(opt)?;
         let (k1, k2) = ("beast".as_bytes(), "senpai".as_bytes());
         let (v1, v2) = ("114514".as_bytes(), "1919810".as_bytes());
@@ -390,12 +389,12 @@ mod test {
         kv.put(k2, v2).expect("can't put");
 
         let r = kv.get(k1).expect("can't get");
-        assert_eq!(r.data(), v1);
+        assert_eq!(r.slice(), v1);
         let r = kv.get(k2).expect("can't get");
-        assert_eq!(r.data(), v2);
+        assert_eq!(r.slice(), v2);
 
         let r = kv.del(k1).expect("can't del");
-        assert_eq!(r.data(), v1);
+        assert_eq!(r.slice(), v1);
         kv.commit()?;
 
         let kv = db.begin()?;
@@ -403,17 +402,17 @@ mod test {
         assert!(r.is_err());
 
         let r = kv.get(k2).expect("can't get");
-        assert_eq!(r.data(), v2);
+        assert_eq!(r.slice(), v2);
 
         let r = kv.del(k2).expect("can't del");
-        assert_eq!(r.data(), v2);
+        assert_eq!(r.slice(), v2);
         kv.rollback()?;
 
         let kv = db.begin()?;
         let r = kv.get(k1);
         assert!(r.is_err());
         let r = kv.del(k2).expect("can't del");
-        assert_eq!(r.data(), v2);
+        assert_eq!(r.slice(), v2);
         let r = kv.del(k2);
         assert!(r.is_err());
 
@@ -438,7 +437,7 @@ mod test {
 
             let view = db.view()?;
             let x = view.get("1").expect("can't get");
-            assert_eq!(x.data(), "10".as_bytes());
+            assert_eq!(x.slice(), "10".as_bytes());
         }
 
         {
@@ -446,7 +445,7 @@ mod test {
             kv.put("2", "20")?;
             kv.update("2", "21")?;
             let r = kv.get("2").unwrap();
-            assert_eq!(r.data(), "21".as_bytes());
+            assert_eq!(r.slice(), "21".as_bytes());
             kv.del("2")?;
             kv.rollback()?;
 
@@ -466,7 +465,7 @@ mod test {
 
             let view = db.view()?;
             let x = view.get("11").expect("can't get");
-            assert_eq!(x.data(), "10".as_bytes());
+            assert_eq!(x.slice(), "10".as_bytes());
         }
 
         {
@@ -474,7 +473,7 @@ mod test {
             kv.put("22", "20")?;
             kv.upsert("22", "21")?;
             let r = kv.get("22").unwrap();
-            assert_eq!(r.data(), "21".as_bytes());
+            assert_eq!(r.slice(), "21".as_bytes());
             kv.del("22")?;
             kv.rollback()?;
 

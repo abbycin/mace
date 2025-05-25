@@ -11,10 +11,13 @@ use std::{
 };
 
 use super::{cc::ConcurrencyControl, context::Context, log::Logging, wal::WalReader};
-use crate::cc::wal::Location;
-use crate::utils::data::{Meta, WalDescHandle};
 use crate::utils::unpack_id;
-use crate::{Options, index::tree::Tree, map::buffer::Buffers, utils::block::Block};
+use crate::utils::{
+    AMutRef,
+    data::{Meta, WalDescHandle},
+};
+use crate::{cc::wal::Location, utils::options::ParsedOptions};
+use crate::{index::tree::Tree, map::buffer::Buffers, utils::block::Block};
 
 pub struct Worker {
     pub cc: ConcurrencyControl,
@@ -28,7 +31,12 @@ pub struct Worker {
 }
 
 impl Worker {
-    fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<Options>, buffer: Arc<Buffers>) -> Self {
+    fn new(
+        desc: WalDescHandle,
+        meta: Arc<Meta>,
+        opt: Arc<ParsedOptions>,
+        buffer: AMutRef<Buffers>,
+    ) -> Self {
         let cnt = Arc::new(AtomicUsize::new(0));
         Self {
             cc: ConcurrencyControl::new(opt.workers),
@@ -60,8 +68,8 @@ impl SyncWorker {
     pub fn new(
         desc: WalDescHandle,
         meta: Arc<Meta>,
-        opt: Arc<Options>,
-        buffer: Arc<Buffers>,
+        opt: Arc<ParsedOptions>,
+        buffer: AMutRef<Buffers>,
     ) -> Self {
         let w = Box::new(Worker::new(desc, meta, opt, buffer));
         Self {

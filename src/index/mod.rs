@@ -10,8 +10,10 @@ pub(crate) mod txn;
 
 use crate::{OpCode, map::data::FrameRef};
 
-trait IAlloc {
+pub trait IAlloc {
     fn allocate(&mut self, size: usize) -> Result<FrameRef, OpCode>;
 
-    fn page_size(&self) -> usize;
+    fn page_size(&self) -> u32;
+
+    fn limit_size(&self) -> u32;
 }

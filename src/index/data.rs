@@ -3,7 +3,7 @@ use std::ops::Deref;
 
 use crate::cc::data::Ver;
 use crate::utils::traits::{ICodec, IKey, IVal, IValCodec};
-use crate::utils::varint::Varint32;
+use crate::utils::varint::{Varint32, Varint64};
 use crate::{number_to_slice, slice_to_number, utils::bytes::ByteArray};
 
 fn to_str(x: &[u8]) -> &str {
@@ -113,6 +113,7 @@ impl IKey for Ver {
     }
 }
 
+// TODO: varint encode/decode, space-time trade-off
 impl ICodec for Ver {
     fn packed_size(&self) -> usize {
         Self::len()
@@ -450,6 +451,75 @@ impl IValCodec for &[u8] {
 
     fn data(&self) -> &[u8] {
         self
+    }
+}
+
+pub(crate) struct Slot {
+    meta: u64,
+}
+
+impl Slot {
+    const INDIRECT_BIT: u64 = 1 << 63;
+    const MASK: u8 = 0x80; // highest byte mask
+    pub const REMOTE_LEN: usize = size_of::<Self>();
+    pub const LOCAL_LEN: usize = 1;
+
+    pub(crate) fn from_remote(addr: u64) -> Self {
+        Self {
+            meta: addr | Self::INDIRECT_BIT,
+        }
+    }
+
+    pub(crate) fn inline() -> Self {
+        Self { meta: 0 }
+    }
+
+    pub(crate) fn is_inline(&self) -> bool {
+        self.meta & Self::INDIRECT_BIT == 0
+    }
+
+    pub(crate) fn addr(&self) -> u64 {
+        debug_assert!(!self.is_inline());
+        self.meta & !Self::INDIRECT_BIT
+    }
+}
+
+impl ICodec for Slot {
+    fn packed_size(&self) -> usize {
+        if self.is_inline() {
+            let n = Varint64::size(self.meta);
+            debug_assert_eq!(n, Self::LOCAL_LEN);
+            n
+        } else {
+            Self::REMOTE_LEN
+        }
+    }
+
+    fn encode_to(&self, to: &mut [u8]) {
+        if self.is_inline() {
+            Varint64::encode(to, self.meta);
+        } else {
+            debug_assert!(to.len() == Self::REMOTE_LEN);
+            let be = self.meta.to_be_bytes();
+            to.copy_from_slice(&be);
+        }
+    }
+
+    fn decode_from(raw: ByteArray) -> Self {
+        // TODO: more robust
+        if raw.len() < Self::REMOTE_LEN {
+            return Self::inline();
+        }
+
+        let s = raw.as_slice(0, Self::REMOTE_LEN);
+        let meta: u8 = s[0];
+        if meta & Self::MASK != 0 {
+            Self {
+                meta: <u64>::from_be_bytes(s.try_into().unwrap()),
+            }
+        } else {
+            Self::inline()
+        }
     }
 }
 

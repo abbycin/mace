@@ -3,7 +3,7 @@ use mace::{Mace, OpCode, Options};
 fn main() -> Result<(), OpCode> {
     let path = std::env::temp_dir().join("mace");
     let _ = std::fs::remove_dir_all(&path);
-    let opt = Options::new(path);
+    let opt = Options::new(path).validate().unwrap();
     let db = Mace::new(opt)?;
 
     // start a read-write Txn
@@ -18,10 +18,10 @@ fn main() -> Result<(), OpCode> {
 
     // use `update` for exist key or use `upsert` when unsure
     let r = kv.update("foolish", "114514").unwrap();
-    assert_eq!(r.data(), "elder".as_bytes());
+    assert_eq!(r.slice(), "elder".as_bytes());
 
     let r = kv.get("foo")?;
-    assert_eq!(r.data(), "bar".as_bytes());
+    assert_eq!(r.slice(), "bar".as_bytes());
     kv.del("foolish")?;
     kv.commit()?;
 
@@ -33,7 +33,7 @@ fn main() -> Result<(), OpCode> {
     // start a read-only Txn
     let view = db.view()?;
     let r = view.get("foo")?;
-    assert_eq!(r.data(), "bar".as_bytes());
+    assert_eq!(r.slice(), "bar".as_bytes());
     let r = view.get("mo");
     assert_eq!(r.err().unwrap(), OpCode::NotFound);
 

@@ -402,7 +402,7 @@ impl Executor {
 
         opt.tmp_store = tmp;
         opt.workers = workers.len();
-        let db = Arc::new(Mace::new(opt).unwrap());
+        let db = Arc::new(Mace::new(opt.validate().unwrap()).unwrap());
 
         let mut map = HashMap::new();
         let mut handle = Vec::new();
@@ -600,7 +600,7 @@ impl Session {
         let mut rv = None;
         self.cond.set_fn(Closure::new(|| {
             let view = self.db.view().unwrap();
-            rv = Some(view.get(k.as_ref()).map(|x| x.data().to_vec()));
+            rv = Some(view.get(k.as_ref()).map(|x| x.slice().to_vec()));
         }));
         self.sync();
         rv.unwrap()
@@ -639,7 +639,7 @@ impl Session {
         let mut rv = None;
         self.cond.set_fn(Closure::new(|| {
             let r = kv.update(k.data(), v.data());
-            rv = Some(r.map(|x| x.data().to_vec()));
+            rv = Some(r.map(|x| x.slice().to_vec()));
         }));
         self.sync();
         rv.unwrap()
@@ -666,7 +666,7 @@ impl Session {
             } else {
                 kv.get(k.data())
             };
-            v = Some(r.map(|x| x.data().to_vec()));
+            v = Some(r.map(|x| x.slice().to_vec()));
         }));
         self.sync();
         v.unwrap()

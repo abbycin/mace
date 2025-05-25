@@ -1,4 +1,10 @@
-use std::{cell::RefCell, cmp::max, collections::BTreeMap, fmt::Debug, rc::Rc};
+use std::{
+    cell::RefCell,
+    cmp::max,
+    collections::{BTreeMap, btree_map::Entry},
+    fmt::Debug,
+    rc::Rc,
+};
 
 use io::{File, GatherIO};
 
@@ -403,7 +409,7 @@ impl<'a> WalReader<'a> {
         while map.len() > MAX_OPEN_FILES {
             map.pop_first();
         }
-        if let std::collections::btree_map::Entry::Vacant(e) = map.entry(seq) {
+        if let Entry::Vacant(e) = map.entry(seq) {
             let path = self.ctx.opt.wal_file(id as u16, seq);
             if !path.exists() {
                 return None;

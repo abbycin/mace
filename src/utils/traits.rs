@@ -33,3 +33,13 @@ pub trait IValCodec: Copy {
 
     fn data(&self) -> &[u8];
 }
+
+pub trait IInfer {
+    fn infer(&self) -> ByteArray;
+}
+
+pub trait IDataLoader: Clone {
+    type Out: Clone + IInfer;
+
+    fn load_data(&self, addr: u64) -> Self::Out;
+}

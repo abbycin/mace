@@ -4,9 +4,8 @@ use super::{
         IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate, ptr_to,
     },
 };
-use crate::utils::data::WalDescHandle;
+use crate::utils::{AMutRef, data::WalDescHandle, options::ParsedOptions};
 use crate::{
-    Options,
     cc::wal::{EntryType, WalPadding, WalSpan},
     map::buffer::Buffers,
     utils::{
@@ -125,9 +124,9 @@ pub struct Logging {
     lsn: u64,
     ops: usize,
     last_data: u32,
-    buffer: Arc<Buffers>,
+    buffer: AMutRef<Buffers>,
     writer: GatherWriter,
-    opt: Arc<Options>,
+    opt: Arc<ParsedOptions>,
     pub desc: WalDescHandle,
     meta: Arc<Meta>,
     #[cfg(feature = "extra_check")]
@@ -144,8 +143,8 @@ impl Logging {
         ckpt_cnt: Arc<AtomicUsize>,
         desc: WalDescHandle,
         meta: Arc<Meta>,
-        opt: Arc<Options>,
-        buffer: Arc<Buffers>,
+        opt: Arc<ParsedOptions>,
+        buffer: AMutRef<Buffers>,
     ) -> Self {
         let writer = GatherWriter::new(&opt.wal_file(desc.worker, desc.wal_id));
         Self {
@@ -220,11 +219,31 @@ impl Logging {
         self.lsn
     }
 
+    #[cold]
+    fn record_large(
+        &mut self,
+        u: &WalUpdate,
+        k: &[u8],
+        w: &[u8],
+        ov: &[u8],
+        nv: &[u8],
+        size: usize,
+    ) {
+        self.writer.queue(u.to_slice());
+        self.writer.queue(k);
+        self.writer.queue(w);
+        self.writer.queue(ov);
+        self.writer.queue(nv);
+        self.writer.flush();
+        self.advance(size);
+    }
+
     pub fn record_update<T>(&mut self, ver: Ver, w: T, k: &[u8], ov: &[u8], nv: &[u8])
     where
         T: IWalCodec + IWalPayload,
     {
         let payload_size = w.encoded_len() + k.len() + ov.len() + nv.len();
+
         let u = WalUpdate {
             wal_type: EntryType::Update,
             sub_type: w.sub_type(),
@@ -235,9 +254,14 @@ impl Logging {
             txid: ver.txid,
             prev_addr: self.lsn,
         };
-        let a = self.alloc(u.encoded_len() + payload_size);
-        let mut b = LogBuilder::new(a);
-        b.add(u).add(k).add(w).add(ov).add(nv).build(self);
+        let total_sz = payload_size + u.encoded_len();
+        if total_sz >= self.ring.len() {
+            self.record_large(&u, k, w.to_slice(), ov, nv, total_sz);
+        } else {
+            let a = self.alloc(total_sz);
+            let mut b = LogBuilder::new(a);
+            b.add(u).add(k).add(w).add(ov).add(nv).build(self);
+        }
     }
 
     fn add_entry<T: IWalCodec>(&mut self, w: T) {

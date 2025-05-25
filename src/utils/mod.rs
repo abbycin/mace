@@ -1,8 +1,8 @@
 use std::{
     cell::RefCell,
-    ops::{Deref, Range},
+    ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicI64, Ordering::Relaxed},
+    sync::atomic::{AtomicI64, AtomicU32, Ordering::Relaxed},
 };
 
 use rand::{Rng, rngs::ThreadRng};
@@ -63,14 +63,6 @@ pub(crate) const fn align_down(n: usize, align: usize) -> usize {
 
 pub(crate) const fn is_power_of_2(x: usize) -> bool {
     if x == 0 { false } else { x & (x - 1) == 0 }
-}
-
-pub(crate) fn next_power_of_2(x: usize) -> usize {
-    let mut r = 1;
-    while r < x {
-        r <<= 1;
-    }
-    r
 }
 
 pub(crate) fn raw_ptr_to_ref<'a, T>(x: *mut T) -> &'a T {
@@ -200,9 +192,143 @@ impl Drop for RandomPath {
     }
 }
 
+struct AMutRefInner<T: Send + Sync> {
+    raw: T,
+    refcnt: AtomicU32,
+}
+
+/// it's user's responsibility to make sure there's no reference cycle
+pub struct AMutRef<T: Send + Sync> {
+    inner: *mut AMutRefInner<T>,
+}
+
+unsafe impl<T: Send + Sync> Send for AMutRef<T> {}
+unsafe impl<T: Send + Sync> Sync for AMutRef<T> {}
+
+impl<T: Send + Sync> AMutRef<T> {
+    pub fn new(x: T) -> Self {
+        Self {
+            inner: Box::into_raw(Box::new(AMutRefInner {
+                raw: x,
+                refcnt: AtomicU32::new(1),
+            })),
+        }
+    }
+
+    pub fn raw(&self) -> *mut T {
+        unsafe { &mut (*self.inner).raw }
+    }
+
+    fn inc(&self) {
+        unsafe { (*self.inner).refcnt.fetch_add(1, Relaxed) };
+    }
+
+    fn dec(&self) -> u32 {
+        unsafe { (*self.inner).refcnt.fetch_sub(1, Relaxed) }
+    }
+}
+
+impl<T> Clone for AMutRef<T>
+where
+    T: Send + Sync,
+{
+    fn clone(&self) -> Self {
+        self.inc();
+        Self { inner: self.inner }
+    }
+}
+
+impl<T> Drop for AMutRef<T>
+where
+    T: Send + Sync,
+{
+    fn drop(&mut self) {
+        if self.dec() == 1 {
+            unsafe { drop(Box::from_raw(self.inner)) };
+        }
+    }
+}
+
+impl<T> Deref for AMutRef<T>
+where
+    T: Send + Sync,
+{
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &(*self.inner).raw }
+    }
+}
+
+impl<T> DerefMut for AMutRef<T>
+where
+    T: Send + Sync,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut (*self.inner).raw }
+    }
+}
+
+struct MutRefInner<T> {
+    raw: T,
+    refcnt: u32,
+}
+
+impl<T> MutRefInner<T> {
+    fn new(x: T) -> Self {
+        Self { raw: x, refcnt: 1 }
+    }
+}
+
+pub struct MutRef<T> {
+    inner: *mut MutRefInner<T>,
+}
+
+impl<T> MutRef<T> {
+    pub fn new(x: T) -> Self {
+        Self {
+            inner: Box::into_raw(Box::new(MutRefInner::new(x))),
+        }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    pub fn raw(&self) -> &mut T {
+        unsafe { &mut (*self.inner).raw }
+    }
+
+    fn inc(&self) {
+        unsafe { (*self.inner).refcnt += 1 };
+    }
+
+    fn dec(&self) -> u32 {
+        unsafe {
+            let old = (*self.inner).refcnt;
+            (*self.inner).refcnt -= 1;
+            old
+        }
+    }
+}
+
+impl<T> Clone for MutRef<T> {
+    fn clone(&self) -> Self {
+        self.inc();
+        Self { inner: self.inner }
+    }
+}
+
+impl<T> Drop for MutRef<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let old = self.dec();
+            if old == 1 {
+                drop(Box::from_raw(self.inner));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use crate::utils::{align_up, is_power_of_2, next_power_of_2};
+    use crate::utils::align_up;
 
     #[test]
     fn test_free_functions() {
@@ -210,17 +336,6 @@ mod test {
         assert_eq!(align_up(16, 8), 16);
         assert_eq!(align_up(23, 8), 24);
         assert_eq!(align_up(56, 8), 56);
-        assert!(is_power_of_2(1));
-        assert!(is_power_of_2(2));
-        assert!(is_power_of_2(1 << 10));
-        assert!(!is_power_of_2(0));
-        assert!(!is_power_of_2(3));
-        assert!(!is_power_of_2((1 << 10) - 1));
-
-        assert_eq!(next_power_of_2(0), 1);
-        assert_eq!(next_power_of_2(1), 1);
-        assert_eq!(next_power_of_2(2), 2);
-        assert_eq!(next_power_of_2(3), 4);
 
         static_assert!(true);
         static_assert!(true, "damn");

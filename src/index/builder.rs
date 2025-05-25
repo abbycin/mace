@@ -1,21 +1,96 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, marker::PhantomData};
 
 use crate::{
     OpCode,
     cc::data::Ver,
     index::data::SLOT_LEN,
-    utils::traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
+    utils::{
+        bytes::ByteArray,
+        traits::{ICodec, IKey, IPageIter, IVal, IValCodec},
+    },
 };
 
 use super::{
     FrameRef, IAlloc, Key,
-    data::{Sibling, Value},
+    data::{Sibling, Slot, Value},
     iter::{ItemIter, SliceIter},
     page::{
         self, DeltaType, LeafMergeIter, MainPage, MainPageHdr, Meta, NodeType, SIBPG_HDR_LEN,
         SibPage, SibPageHdr,
     },
 };
+
+pub(crate) struct PageBuilder<H> {
+    payload: ByteArray,
+    slots: ByteArray,
+    index: usize,
+    offset: u32,
+    _marker: PhantomData<H>,
+}
+
+impl<H> PageBuilder<H> {
+    const HDR_LEN: usize = size_of::<H>();
+
+    pub(crate) fn from(b: ByteArray, elems: usize) -> Self {
+        let slot_size = elems * SLOT_LEN + Self::HDR_LEN;
+        Self {
+            slots: b.sub_array(Self::HDR_LEN, slot_size - Self::HDR_LEN),
+            payload: b,
+            index: 0,
+            offset: slot_size as u32,
+            _marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn add<K, V, A: IAlloc>(&mut self, k: &K, v: &V, limit: usize, a: &mut A)
+    where
+        K: IKey,
+        V: IVal,
+    {
+        let (ksz, vsz) = (k.packed_size(), v.packed_size());
+        let mut total_sz = ksz + vsz;
+
+        if total_sz > limit {
+            let mut x = a.allocate(total_sz).unwrap();
+            x.set_normal();
+            let s = Slot::from_remote(x.addr());
+            let slot_sz = s.packed_size();
+            let hdr = self
+                .payload
+                .as_mut_slice::<u8>(self.offset as usize, slot_sz);
+            s.encode_to(hdr);
+            let b = x.payload();
+
+            let (kdst, vdst) = b.as_mut_slice::<u8>(0, b.len()).split_at_mut(ksz);
+            k.encode_to(kdst);
+            v.encode_to(vdst);
+
+            total_sz = slot_sz;
+        } else {
+            let s = Slot::inline();
+            let slot_sz = s.packed_size();
+            let hdr = self
+                .payload
+                .as_mut_slice::<u8>(self.offset as usize, slot_sz);
+            s.encode_to(hdr);
+
+            // we allocated slot_sz in builder, and we are not plus slot_sz into total_sz, so the
+            // count is total_sz
+            let (kdst, vdst) = self
+                .payload
+                .as_mut_slice::<u8>(self.offset as usize + slot_sz, total_sz)
+                .split_at_mut(ksz);
+            k.encode_to(kdst);
+            v.encode_to(vdst);
+
+            total_sz += slot_sz;
+        }
+
+        self.slots.write::<u32>(self.index * SLOT_LEN, self.offset);
+        self.index += 1;
+        self.offset += total_sz as u32;
+    }
+}
 
 pub(crate) struct Delta<T> {
     kind: DeltaType,
@@ -41,10 +116,15 @@ where
         }
     }
 
-    pub(crate) fn from(mut self, mut iter: T) -> Self {
+    pub(crate) fn from(mut self, mut iter: T, limit_sz: u32) -> Self {
         for (k, v) in &mut iter {
             self.elems += 1;
-            self.size += (k.packed_size() + v.packed_size()) as u32;
+            let kv_sz = (k.packed_size() + v.packed_size()) as u32;
+            if kv_sz > limit_sz {
+                self.size += Slot::REMOTE_LEN as u32;
+            } else {
+                self.size += kv_sz + Slot::LOCAL_LEN as u32;
+            }
         }
         self.size += self.elems as u32 * SLOT_LEN as u32;
         self.iter = Some(iter);
@@ -63,16 +143,22 @@ where
         h.elems = self.elems as u32;
     }
 
-    pub(crate) fn build(&mut self, page: &mut MainPage<K, V>) {
-        self.build_header(page.header_mut());
+    pub(crate) fn build<A>(&mut self, page: ByteArray, a: &mut A) -> &mut MainPageHdr
+    where
+        A: IAlloc,
+    {
+        let limit = a.limit_size() as usize;
+        let h = unsafe { &mut *page.data().cast::<MainPageHdr>() };
+        self.build_header(h);
 
         if let Some(iter) = self.iter.as_mut() {
-            let mut buf = page::PageBuilder::<MainPageHdr>::from(page.raw(), self.elems as usize);
+            let mut buf = PageBuilder::<MainPageHdr>::from(page, self.elems as usize);
             iter.rewind();
             for (k, v) in iter {
-                buf.add(&k, &v);
+                buf.add(&k, &v, limit, a);
             }
         }
+        h
     }
 }
 
@@ -81,8 +167,8 @@ where
     K: IKey,
     V: IVal,
 {
-    pub fn with_item(self, item: (K, V)) -> Self {
-        self.from(ItemIter::new(item))
+    pub fn with_item(self, pg_sz: u32, item: (K, V)) -> Self {
+        self.from(ItemIter::new(item), pg_sz)
     }
 }
 
@@ -91,8 +177,8 @@ where
     K: IKey,
     V: IVal,
 {
-    pub fn with_slice(self, s: &'a [(K, V)]) -> Self {
-        self.from(SliceIter::new(s))
+    pub fn with_slice(self, pg_sz: u32, s: &'a [(K, V)]) -> Self {
+        self.from(SliceIter::new(s), pg_sz)
     }
 }
 
@@ -120,11 +206,12 @@ where
         }
     }
 
-    pub(crate) fn prepare(&mut self, mut iter: LeafMergeIter<'a, T>) {
+    pub(crate) fn prepare<A: IAlloc>(&mut self, mut iter: LeafMergeIter<'a, T>, a: &A) {
         let mut fixed = false;
         self.hints.reserve(iter.len() * 3 / 5);
         let mut last_raw = None;
         let mut pos = 0;
+        let limit = a.limit_size();
 
         for (k, v) in &mut iter {
             if let Some(raw) = last_raw {
@@ -141,10 +228,16 @@ where
                 }
             }
 
+            let kv_sz = (k.packed_size() + v.packed_size()) as u32;
             pos += 1;
             last_raw = Some(k.raw);
             fixed = false;
-            self.header.len += (k.packed_size() + v.packed_size()) as u32;
+            if kv_sz > limit {
+                self.header.len += Slot::REMOTE_LEN as u32;
+            } else {
+                self.header.len += Slot::LOCAL_LEN as u32;
+                self.header.len += kv_sz;
+            }
             self.header.elems += 1;
         }
 
@@ -153,15 +246,18 @@ where
         self.iter = Some(iter);
     }
 
-    pub(crate) fn build<A: IAlloc>(&mut self, a: &mut A) -> Result<FrameRef, OpCode> {
+    pub(crate) fn build<A: IAlloc>(
+        &mut self,
+        a: &mut A,
+    ) -> Result<(MainPage<Key, Value<T>>, FrameRef), OpCode> {
         let b = a.allocate(self.header.len as usize)?;
         let mut page = MainPage::<Key, Value<T>>::from(b.payload());
         *page.header_mut() = self.header;
-        let mut builder =
-            page::PageBuilder::<MainPageHdr>::from(page.raw(), self.header.elems as usize);
+        let mut builder = PageBuilder::<MainPageHdr>::from(page.raw(), self.header.elems as usize);
 
         let mut iter = self.iter.take().unwrap();
         let mut pos = 0;
+        let limit = a.limit_size() as usize;
 
         loop {
             let Some((k, v)) = iter.next() else {
@@ -169,7 +265,7 @@ where
             };
 
             let Some((idx, _)) = self.hints.front() else {
-                builder.add(k, v);
+                builder.add(k, v, limit, a);
                 pos += 1;
                 continue;
             };
@@ -178,14 +274,14 @@ where
                 let (_, cnt) = self.hints.pop_front().unwrap();
                 let addr = self.save_versions(a, cnt as usize, &mut pos, &mut iter)?;
 
-                builder.add(k, &Value::Sib(Sibling::from(addr, v)));
+                builder.add(k, &Value::Sib(Sibling::from(addr, v)), limit, a);
             } else {
-                builder.add(k, v);
+                builder.add(k, v, limit, a);
             }
             pos += 1;
         }
 
-        Ok(b)
+        Ok((page.clone(), b))
     }
 
     fn save_versions<A: IAlloc>(
@@ -198,7 +294,8 @@ where
     where
         T: IValCodec,
     {
-        let pg_sz = a.page_size();
+        let pg_sz = a.page_size() as usize;
+        let limit = a.limit_size() as usize;
         let mut head = None;
         let mut tail: Option<page::SibPage<Ver, Value<T>>> = None;
         let mut beg = iter.curr_pos();
@@ -208,7 +305,13 @@ where
             let mut len = SIBPG_HDR_LEN;
             while cnt > 0 {
                 let (_, v) = iter.next().expect("it's always valid here");
-                let tmp = len + (Ver::len() + v.packed_size()) + SLOT_LEN;
+                let vz = v.packed_size();
+                let vlen = if vz > limit {
+                    Slot::REMOTE_LEN
+                } else {
+                    vz + Slot::LOCAL_LEN
+                };
+                let tmp = len + (Ver::len() + vlen) + SLOT_LEN;
                 if tmp > pg_sz {
                     break;
                 }
@@ -219,7 +322,7 @@ where
             iter.seek_to(saved);
 
             let mut b = a.allocate(len)?;
-            b.set_slotted();
+            b.set_normal();
 
             let addr = b.addr();
             let mut pg = SibPage::<Ver, Value<T>>::from(b.payload());
@@ -231,7 +334,7 @@ where
             let hdr = pg.header_mut();
             hdr.init(b.payload().len() as u32, (beg - saved) as u32);
 
-            let mut builder = page::PageBuilder::<SibPageHdr>::from(b.payload(), beg - saved);
+            let mut builder = PageBuilder::<SibPageHdr>::from(b.payload(), beg - saved);
 
             if let Some(mut last) = tail {
                 last.header_mut().link = addr;
@@ -240,7 +343,7 @@ where
 
             for _ in saved..beg {
                 let (k, v) = iter.next().expect("it's always valid here");
-                builder.add(k.ver(), v);
+                builder.add(k.ver(), v, limit, a);
                 *pos += 1;
             }
         }
@@ -259,17 +362,18 @@ mod test {
             page::{DeltaType, LeafMergeIter, NodeType},
         },
         map::data::FrameOwner,
+        utils::traits::IDataLoader,
     };
 
     use super::{FuseBuilder, page::MainPage};
 
     struct Arena {
         map: HashMap<u64, FrameOwner>,
-        page_size: usize,
+        page_size: u32,
     }
 
     impl Arena {
-        fn new(page_size: usize) -> Self {
+        fn new(page_size: u32) -> Self {
             Self {
                 map: HashMap::new(),
                 page_size,
@@ -290,8 +394,22 @@ mod test {
             Ok(self.alloc(size))
         }
 
-        fn page_size(&self) -> usize {
+        fn page_size(&self) -> u32 {
             self.page_size
+        }
+
+        fn limit_size(&self) -> u32 {
+            self.page_size / 2
+        }
+    }
+
+    #[derive(Clone)]
+    struct DummyLoader;
+
+    impl IDataLoader for DummyLoader {
+        type Out = FrameOwner;
+        fn load_data(&self, _addr: u64) -> Self::Out {
+            unimplemented!()
         }
     }
 
@@ -316,11 +434,12 @@ mod test {
 
         iter.sort();
 
-        b.prepare(iter);
+        b.prepare(iter, &arena);
+        let l = DummyLoader;
 
-        let f = b.build(&mut arena).unwrap();
+        let (_, f) = b.build(&mut arena).unwrap();
 
         let (addr, page) = (f.addr(), MainPage::<Key, Value<&[u8]>>::from(f.payload()));
-        page.show(addr);
+        page.show(&l, addr);
     }
 }

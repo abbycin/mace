@@ -11,7 +11,7 @@ fn intact_meta() {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut saved = opt.clone();
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
     let nr_kv = 10;
     let mut pair = Vec::with_capacity(nr_kv);
 
@@ -24,6 +24,7 @@ fn intact_meta() {
         kv.put(k, v).expect("can't insert kv");
     }
     kv.commit().unwrap();
+    drop(kv);
 
     let kv = db.begin().unwrap();
     for (i, (k, _)) in pair.iter().enumerate() {
@@ -32,11 +33,12 @@ fn intact_meta() {
         }
     }
     kv.commit().unwrap();
+    drop(kv);
 
     drop(db);
 
     saved.tmp_store = true;
-    let db = Mace::new(saved).unwrap();
+    let db = Mace::new(saved.validate().unwrap()).unwrap();
     let view = db.view().unwrap();
     for (i, (k, v)) in pair.iter().enumerate() {
         if i % 2 == 0 {
@@ -44,7 +46,7 @@ fn intact_meta() {
             assert!(r.is_err());
         } else {
             let r = view.get(k).expect("can't get key");
-            assert_eq!(r.data(), v.as_bytes());
+            assert_eq!(r.slice(), v.as_bytes());
         }
     }
 }
@@ -63,27 +65,29 @@ fn bad_meta() {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let kv = db.begin().unwrap();
     kv.put("114514", "1919810").unwrap();
     kv.commit().unwrap();
+    drop(kv);
 
     let kv = db.begin().unwrap();
     kv.put("mo", "ha").unwrap();
     kv.rollback().unwrap();
+    drop(kv);
 
     drop(db);
 
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::new(save).unwrap();
+    let db = Mace::new(save.validate().unwrap()).unwrap();
 
     let view = db.view().unwrap();
     view.show();
     let x = view.get("114514").expect("not found");
-    assert_eq!(x.data(), "1919810".as_bytes());
+    assert_eq!(x.slice(), "1919810".as_bytes());
     let x = view.get("mo");
     assert!(x.is_err());
 }
@@ -95,7 +99,7 @@ fn crash_again() {
     let mut save = opt.clone();
 
     {
-        let db = Mace::new(opt).unwrap();
+        let db = Mace::new(opt.validate().unwrap()).unwrap();
         let kv = db.begin().unwrap();
         kv.put("foo", "bar").unwrap();
         kv.commit().unwrap();
@@ -108,11 +112,11 @@ fn crash_again() {
     break_meta(save.meta_file());
 
     {
-        let db = Mace::new(save.clone()).unwrap();
+        let db = Mace::new(save.clone().validate().unwrap()).unwrap();
 
         let kv = db.begin().unwrap();
         let x = kv.get("foo").expect("not found");
-        assert_eq!(x.data(), "bar".as_bytes());
+        assert_eq!(x.slice(), "bar".as_bytes());
         let x = kv.get("mo");
         assert!(x.is_err());
 
@@ -124,11 +128,11 @@ fn crash_again() {
 
     {
         save.tmp_store = true;
-        let db = Mace::new(save.clone()).unwrap();
+        let db = Mace::new(save.validate().unwrap()).unwrap();
 
         let view = db.view().unwrap();
         let r = view.get("foo").expect("not found");
-        assert_eq!(r.data(), "bar".as_bytes());
+        assert_eq!(r.slice(), "bar".as_bytes());
         let r = view.get("mo");
         assert!(r.is_err());
         let r = view.get("114");
@@ -143,23 +147,25 @@ where
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let kv = db.begin().unwrap();
     kv.put("114514", "1919810").unwrap();
     kv.commit().unwrap();
+    drop(kv);
 
-    let _ = db.begin().unwrap();
+    let kv = db.begin().unwrap();
+    drop(kv);
 
     drop(db);
 
     f(&save, 1);
 
     save.tmp_store = true;
-    let db = Mace::new(save).unwrap();
+    let db = Mace::new(save.validate().unwrap()).unwrap();
     let view = db.view().unwrap();
     let x = view.get("114514").expect("not found");
-    assert_eq!(x.data(), "1919810".as_bytes());
+    assert_eq!(x.slice(), "1919810".as_bytes());
 }
 
 #[test]
@@ -183,7 +189,7 @@ fn recover_after_insert() {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut pairs = Vec::new();
 
     for i in 0..1000 {
@@ -196,17 +202,18 @@ fn recover_after_insert() {
     }
 
     kv.commit().unwrap();
+    drop(kv);
 
     drop(db);
 
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::new(save).unwrap();
+    let db = Mace::new(save.validate().unwrap()).unwrap();
     let view = db.view().unwrap();
     for (k, v) in &pairs {
         let r = view.get(k).unwrap();
-        assert_eq!(r.data(), v.as_bytes());
+        assert_eq!(r.slice(), v.as_bytes());
     }
 }
 
@@ -219,7 +226,7 @@ fn put_update(remove_data: bool) {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut pairs = Vec::new();
     let mut new_pairs = Vec::new();
 
@@ -245,7 +252,7 @@ fn put_update(remove_data: bool) {
     let view = db.view().unwrap();
     for (k, v) in &new_pairs {
         let r = view.get(k).expect("not found");
-        assert_eq!(r.data(), v.as_bytes());
+        assert_eq!(r.slice(), v.as_bytes());
     }
 
     drop(view);
@@ -266,12 +273,12 @@ fn put_update(remove_data: bool) {
     }
 
     save.tmp_store = true;
-    let db = Mace::new(save).unwrap();
+    let db = Mace::new(save.validate().unwrap()).unwrap();
 
     let view = db.view().unwrap();
     for (k, v) in &new_pairs {
         let r = view.get(k).expect("not found");
-        assert_eq!(r.data(), v.as_bytes());
+        assert_eq!(r.slice(), v.as_bytes());
     }
 }
 
@@ -280,7 +287,7 @@ fn recover_after_remove() {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut pairs = Vec::new();
 
     for i in 0..1000 {
@@ -303,7 +310,7 @@ fn recover_after_remove() {
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::new(save).unwrap();
+    let db = Mace::new(save.validate().unwrap()).unwrap();
     let view = db.view().unwrap();
     for (k, _) in &pairs {
         let r = view.get(k);
@@ -319,7 +326,7 @@ fn ckpt_wal(keys: usize, wal_len: u32) {
     opt.buffer_size = 512 << 10;
     opt.wal_file_size = wal_len;
     let mut save = opt.clone();
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut data = Vec::new();
 
     for i in 0..keys {
@@ -338,16 +345,17 @@ fn ckpt_wal(keys: usize, wal_len: u32) {
         kv.commit().unwrap();
     }
 
+    drop(kv);
     drop(db);
 
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::new(save).unwrap();
+    let db = Mace::new(save.validate().unwrap()).unwrap();
     let view = db.view().unwrap();
     for (k, v) in &data {
         let r = view.get(k).expect("not found");
-        assert_eq!(r.data(), v.as_bytes());
+        assert_eq!(r.slice(), v.as_bytes());
     }
 }
 
@@ -366,7 +374,7 @@ fn long_txn_impl(before: bool) {
     let mut opt = Options::new(&*path);
     opt.wal_file_size = 1024;
     let mut save = opt.clone();
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
     let b = Arc::new(Barrier::new(2));
     let mut pair = Vec::new();
 
@@ -405,15 +413,15 @@ fn long_txn_impl(before: bool) {
     break_meta(save.meta_file());
 
     save.tmp_store = true;
-    let db = Mace::new(save).unwrap();
+    let db = Mace::new(save.validate().unwrap()).unwrap();
     let view = db.view().unwrap();
     for (k, v) in &pair {
         let r = view.get(k).expect("not found");
-        assert_eq!(r.data(), v.as_bytes());
+        assert_eq!(r.slice(), v.as_bytes());
     }
 
     let r = view.get("foo").expect("not found");
-    assert_eq!(r.data(), "bar".as_bytes());
+    assert_eq!(r.slice(), "bar".as_bytes());
     let r = view.get("mo");
     assert!(r.is_err() && r.err().unwrap() == OpCode::NotFound);
 }

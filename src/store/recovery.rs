@@ -21,6 +21,7 @@ use crate::map::data::DataFooter;
 use crate::utils::block::Block;
 use crate::utils::data::{MapEntry, MetaInner, WalDescHandle};
 use crate::utils::lru::LruInner;
+use crate::utils::options::ParsedOptions;
 use crate::utils::{NULL_CMD, NULL_ORACLE, pack_id, raw_ptr_to_ref, unpack_id};
 use crate::{
     Options,
@@ -37,7 +38,7 @@ enum State {
 }
 
 pub(crate) struct Recovery {
-    opt: Arc<Options>,
+    opt: Arc<ParsedOptions>,
     buf: Block,
     state: State,
     dirty_table: BTreeMap<Ver, Location>,
@@ -46,7 +47,7 @@ pub(crate) struct Recovery {
 }
 
 impl Recovery {
-    pub(crate) fn new(opt: Arc<Options>) -> Self {
+    pub(crate) fn new(opt: Arc<ParsedOptions>) -> Self {
         if !opt.db_root.exists() {
             log::info!("create db_root {:?}", opt.db_root);
             std::fs::create_dir_all(&opt.db_root).expect("can't create db_root");

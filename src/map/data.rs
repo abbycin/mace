@@ -5,6 +5,7 @@ use crate::OpCode;
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
 use crate::utils::data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, PageTable, Reloc};
+use crate::utils::traits::IInfer;
 use crate::utils::{align_up, unpack_id};
 use crate::utils::{bytes::ByteArray, raw_ptr_to_ref, raw_ptr_to_ref_mut};
 use std::alloc::alloc_zeroed;
@@ -99,14 +100,13 @@ impl Drop for StatHandle {
 pub enum FrameFlag {
     Normal = 1,
     TombStone = 3,
-    Slotted = 5,
     /// a frame contains addrs point to other arena
     Junk = 11,
     Unknown = 13,
 }
 
 #[derive(Debug)]
-pub(crate) struct Frame {
+pub struct Frame {
     /// the pid and addr is runtime info used to build mapping table during flush, it's useless when
     /// load from file
     pid: u64,
@@ -179,9 +179,9 @@ impl Frame {
         self.flag = FrameFlag::TombStone;
     }
 
-    pub fn set_slotted(&mut self) {
+    pub fn set_normal(&mut self) {
         debug_assert_eq!(self.flag, FrameFlag::Unknown);
-        self.flag = FrameFlag::Slotted;
+        self.flag = FrameFlag::Normal;
     }
 
     pub fn fill_junk(&mut self, junks: &[u64]) {
@@ -216,12 +216,18 @@ impl DeepCopy for FrameOwner {
     }
 }
 
-pub(crate) struct FrameOwner {
+pub struct FrameOwner {
     raw: *mut Frame,
 }
 
 unsafe impl Send for FrameOwner {}
 unsafe impl Sync for FrameOwner {}
+
+impl IInfer for FrameOwner {
+    fn infer(&self) -> ByteArray {
+        self.payload()
+    }
+}
 
 impl Deref for FrameOwner {
     type Target = Frame;
@@ -266,7 +272,7 @@ impl FrameOwner {
         ByteArray::new(self.raw as *mut u8, self.size() as usize)
     }
 
-    pub(crate) fn payload(&self) -> ByteArray {
+    pub fn payload(&self) -> ByteArray {
         let ptr = unsafe { self.raw.add(1).cast::<u8>() };
         ByteArray::new(ptr, self.payload_size() as usize)
     }
@@ -542,7 +548,7 @@ impl DataBuilder {
 
     pub(crate) fn add(&mut self, f: FrameRef) {
         match f.flag() {
-            FrameFlag::Normal | FrameFlag::Slotted => {
+            FrameFlag::Normal => {
                 self.add_impl(f);
             }
             FrameFlag::Junk => {

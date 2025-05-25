@@ -1,14 +1,16 @@
+use crate::OpCode;
 use crate::map::buffer::Buffers;
+use crate::utils::AMutRef;
 use crate::utils::data::{Meta, WalDescHandle};
+use crate::utils::options::ParsedOptions;
 use crate::utils::queue::Queue;
-use crate::{OpCode, Options};
 
 use super::worker::SyncWorker;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::{Relaxed, Release};
 
 pub struct Context {
-    pub(crate) opt: Arc<Options>,
+    pub(crate) opt: Arc<ParsedOptions>,
     /// maybe a bottleneck
     /// contains oldest, txid less than or equal to it can be purged
     pub(crate) meta: Arc<Meta>,
@@ -18,8 +20,8 @@ pub struct Context {
 
 impl Context {
     pub fn new(
-        opt: Arc<Options>,
-        buffer: Arc<Buffers>,
+        opt: Arc<ParsedOptions>,
+        buffer: AMutRef<Buffers>,
         meta: Arc<Meta>,
         desc: &[WalDescHandle],
     ) -> Arc<Self> {

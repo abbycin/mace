@@ -12,7 +12,7 @@ fn gc_data() -> Result<(), OpCode> {
     opt.gc_ratio = 10;
     opt.buffer_size = 512 << 10;
     opt.gc_compacted_size = opt.buffer_size;
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let cap = 20000;
     let mut pair = Vec::with_capacity(cap);
@@ -41,7 +41,7 @@ fn gc_data() -> Result<(), OpCode> {
 
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     for k in &pair {
         let view = db.view().unwrap();
@@ -72,7 +72,7 @@ fn abort_txn() {
     let mut opt = Options::new(&*path);
     opt.max_ckpt_per_txn = 1;
     opt.buffer_size = 50 << 10; // make sure checkpoint was taken
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let kv = db.begin().unwrap();
     for i in 0..1000 {
@@ -92,7 +92,7 @@ fn gc_wal() {
     opt.gc_timeout = 2;
     opt.workers = 1;
     opt.buffer_size = 100 << 10; // make sure checkpoint was taken
-    let db = Mace::new(opt).unwrap();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut data = Vec::new();
 
     for i in 0..1000 {
@@ -108,7 +108,7 @@ fn gc_wal() {
     for i in &data {
         let view = db.view().unwrap();
         let r = view.get(i).expect("not found");
-        assert_eq!(r.data(), i.as_bytes());
+        assert_eq!(r.slice(), i.as_bytes());
     }
 
     let backup = db.options().wal_backup(0, 1);

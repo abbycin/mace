@@ -1,5 +1,4 @@
 use crate::OpCode;
-use crate::utils::next_power_of_2;
 use crate::utils::options::Options;
 use crate::utils::queue::Queue;
 use dashmap::DashMap;
@@ -100,7 +99,7 @@ where
         let this = Self {
             slots: unsafe { alloc_zeroed(Layout::array::<u64>(cap).unwrap()) as *mut u64 },
             map: DashMap::new(),
-            freelist: Queue::new(next_power_of_2(cap) as u32, None),
+            freelist: Queue::new(cap.next_power_of_two() as u32, None),
             cap,
             pct,
         };

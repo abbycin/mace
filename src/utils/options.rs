@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ops::Deref,
+    path::{Path, PathBuf},
+};
+
+use super::OpCode;
 
 #[derive(Clone)]
 pub struct Options {
@@ -31,7 +36,7 @@ pub struct Options {
     /// buffer pool element count, must > 2
     pub buffer_count: u32,
     /// B+ Tree node size, mut less than half of [`Self::buffer_size`]
-    pub page_size: usize,
+    pub page_size: u32,
     /// when should we consolidate delta chain, the best value is 16
     pub consolidate_threshold: u8,
     /// WAL ring buffer size, must greater than [`Self::page_size`] and must be power of 2
@@ -42,6 +47,13 @@ pub struct Options {
     pub max_ckpt_per_txn: usize,
     /// WAL file size limit which will trigger switch to new WAL file, at most 2GB
     pub wal_file_size: u32,
+
+    // private to crate
+    /// max kv size that can store directly into page
+    pub(crate) inline_size: u32,
+    pub(crate) intl_split_size: u32,
+    pub(crate) max_kv_size: u32,
+    pub(crate) intl_consolidate_threshold: u8,
 }
 
 impl Options {
@@ -71,12 +83,38 @@ impl Options {
             wal_buffer_size: 4 << 20,    // 4MB
             max_ckpt_per_txn: 1_000_000, // 1 million
             wal_file_size: 100 << 20,    // 100MB
+            // private to
+            inline_size: 0,
+            intl_split_size: 0,
+            max_kv_size: 0,
+            intl_consolidate_threshold: 0,
         }
     }
 
     /// the length of the kv plus the length of the metadata must be less than this value for now
-    pub fn max_data_size(&self) -> usize {
-        self.wal_buffer_size
+    #[inline(always)]
+    pub(crate) fn max_data_size(&self) -> usize {
+        self.max_kv_size as usize
+    }
+
+    pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
+        self.inline_size = self.page_size / 2;
+        self.intl_split_size = self.page_size / 2;
+        self.max_kv_size = self.buffer_size / 2;
+        self.intl_consolidate_threshold = self.consolidate_threshold / 2;
+        Ok(ParsedOptions { inner: self })
+    }
+}
+
+#[derive(Clone)]
+pub struct ParsedOptions {
+    pub(crate) inner: Options,
+}
+
+impl Deref for ParsedOptions {
+    type Target = Options;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 

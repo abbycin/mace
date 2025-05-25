@@ -9,8 +9,10 @@ use io::{File, GatherIO};
 
 use super::data::{DataMetaReader, FileStat, FrameOwner, StatHandle};
 use crate::{
-    OpCode, Options,
-    utils::{bitmap::BitMap, block::Block, data::Reloc, lru::Lru, unpack_id},
+    OpCode,
+    utils::{
+        bitmap::BitMap, block::Block, data::Reloc, lru::Lru, options::ParsedOptions, unpack_id,
+    },
 };
 
 pub(crate) struct FileReader {
@@ -48,12 +50,12 @@ pub struct Mapping {
     pub(crate) map: RwLock<HashMap<u32, u32>>,
     pub(crate) stats: DashMap<u32, StatHandle>,
     pub(crate) cache: Lru<FileReader>,
-    pub(crate) opt: Arc<Options>,
+    pub(crate) opt: Arc<ParsedOptions>,
     lk: Mutex<()>,
 }
 
 impl Mapping {
-    pub(crate) fn new(opt: Arc<Options>) -> Self {
+    pub(crate) fn new(opt: Arc<ParsedOptions>) -> Self {
         Self {
             map: RwLock::new(HashMap::new()),
             stats: DashMap::new(),

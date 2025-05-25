@@ -10,7 +10,7 @@ use store::{
     recovery::Recovery,
 };
 pub use utils::{OpCode, RandomPath, options::Options};
-use utils::{ROOT_PID, data::Meta};
+use utils::{ROOT_PID, data::Meta, options::ParsedOptions};
 
 mod cc;
 mod index;
@@ -24,7 +24,7 @@ struct Inner {
     meta: Arc<Meta>,
     gc: Handle,
     tree: Tree,
-    opt: Arc<Options>,
+    opt: Arc<ParsedOptions>,
 }
 
 impl Drop for Inner {
@@ -50,7 +50,7 @@ impl Mace {
             Tree::load(store, ROOT_PID)
         }
     }
-    pub fn new(opt: Options) -> Result<Self, OpCode> {
+    pub fn new(opt: ParsedOptions) -> Result<Self, OpCode> {
         let opt = Arc::new(opt);
         let mut recover = Recovery::new(opt.clone());
         let (meta, table, mapping, desc) = recover.phase1();

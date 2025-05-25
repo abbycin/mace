@@ -1,5 +1,7 @@
 use mace::{Mace, OpCode, Options, RandomPath};
 use rand::{seq::SliceRandom, thread_rng};
+use std::fs::File;
+use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
 use std::{
@@ -12,7 +14,7 @@ fn put_get() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.buffer_count = 5;
-    let db = Mace::new(opt)?;
+    let db = Mace::new(opt.validate().unwrap())?;
 
     let n = 1000;
     let mut container = Vec::with_capacity(n);
@@ -39,8 +41,8 @@ fn put_get() -> Result<(), OpCode> {
             for i in &elems {
                 let kv = db.begin().unwrap();
                 if let Ok(x) = kv.del(*i) {
-                    assert_eq!(x.data(), *i);
-                    del1.write().unwrap().insert(x.data().to_vec());
+                    assert_eq!(x.slice(), *i);
+                    del1.write().unwrap().insert(x.slice().to_vec());
                 }
                 kv.commit().unwrap();
             }
@@ -51,8 +53,8 @@ fn put_get() -> Result<(), OpCode> {
             for i in &elems {
                 let kv = db.begin().unwrap();
                 if let Ok(x) = kv.del(*i) {
-                    assert_eq!(x.data(), *i);
-                    del2.write().unwrap().insert(x.data().to_vec());
+                    assert_eq!(x.slice(), *i);
+                    del2.write().unwrap().insert(x.slice().to_vec());
                 }
                 kv.commit().unwrap();
             }
@@ -83,9 +85,9 @@ fn check(
             continue;
         }
         let r = view.get(*i).expect("must exist");
-        if r.data() != *i {
-            assert!(!lk1.contains(r.data()));
-            assert_eq!(r.data(), *i);
+        if r.slice() != *i {
+            assert!(!lk1.contains(r.slice()));
+            assert_eq!(r.slice(), *i);
         }
     }
 
@@ -104,7 +106,7 @@ fn check(
 fn get_del() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
-    let db = Mace::new(opt)?;
+    let db = Mace::new(opt.validate().unwrap())?;
 
     let n = 1000;
     let mut v = Vec::with_capacity(n);
@@ -153,7 +155,7 @@ fn get_del() -> Result<(), OpCode> {
 fn range_simple() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
-    let db = Mace::new(opts).unwrap();
+    let db = Mace::new(opts.validate().unwrap()).unwrap();
 
     let kv = db.begin().unwrap();
     kv.put("foo", "1")?;
@@ -190,7 +192,7 @@ fn range_simple() -> Result<(), OpCode> {
         let mut opts = Options::new(&*RandomPath::new());
         opts.consolidate_threshold = 10;
         opts.tmp_store = true;
-        let db = Mace::new(opts).unwrap();
+        let db = Mace::new(opts.validate().unwrap()).unwrap();
 
         let kv = db.begin().unwrap();
         kv.put([0], "bar")?;
@@ -212,7 +214,7 @@ fn range_in_one_node() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.consolidate_threshold = 10;
     opts.tmp_store = true;
-    let db = Mace::new(opts).unwrap();
+    let db = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10;
 
     let check_app = || {
@@ -284,7 +286,7 @@ fn range_cross_node() -> Result<(), OpCode> {
     opts.page_size = 1024; // force split
     opts.sync_on_write = false;
     opts.tmp_store = true;
-    let db = Mace::new(opts).unwrap();
+    let db = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 500;
     let mut h = HashSet::with_capacity(N);
 
@@ -340,25 +342,96 @@ fn to_str(x: &[u8]) -> &str {
 fn big_kv() {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.tmp_store = true;
     opt.consolidate_threshold = 3;
-    let db = Mace::new(opt).unwrap();
+    let mut saved = opt.clone();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
     const N: usize = 200;
     let kv = db.begin().unwrap();
     let val = vec![233; 56 << 10];
+    let keys: Vec<String> = (0..N).map(|x| format!("key_{}", x)).collect();
 
-    log::set_max_level(log::LevelFilter::Info);
-
-    for i in 0..N {
-        kv.put(format!("key_{}", i), &val).unwrap();
+    for k in &keys {
+        kv.put(k, &val).unwrap();
     }
     kv.commit().unwrap();
+    drop(kv);
 
     let kv = db.begin().unwrap();
-    for i in 0..N {
-        let x = kv.get(format!("key_{}", i));
+    for k in &keys {
+        let x = kv.get(k);
         assert!(x.is_ok());
-        assert_eq!(x.unwrap().data(), val.as_slice());
+        assert_eq!(x.unwrap().slice(), val.as_slice());
     }
     kv.commit().unwrap();
+    drop(kv);
+
+    drop(db);
+
+    // test recover from bad meta
+
+    let mut f = File::options()
+        .truncate(false)
+        .append(true)
+        .open(saved.meta_file())
+        .unwrap();
+    f.write_all(&[233]).unwrap();
+
+    saved.tmp_store = true;
+    let db = Mace::new(saved.validate().unwrap()).unwrap();
+    let view = db.view().unwrap();
+
+    for k in &keys {
+        let x = view.get(k);
+        assert!(x.is_ok());
+        assert_eq!(x.unwrap().slice(), val.as_slice());
+    }
+}
+
+#[test]
+fn big_kv2() {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.consolidate_threshold = 3;
+    opt.wal_buffer_size = 1024;
+    opt.buffer_size = 4096;
+    let mut saved = opt.clone();
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
+
+    let kv = db.begin().unwrap();
+
+    kv.put("key1", vec![233u8; 512]).unwrap();
+    kv.put("key2", vec![114u8; db.options().wal_buffer_size])
+        .unwrap();
+    let r = kv.put("key3", vec![114u8; db.options().buffer_size as usize]);
+    assert!(r.is_err() && r.err().unwrap() == OpCode::TooLarge);
+    kv.commit().unwrap();
+    drop(kv);
+
+    let view = db.view().unwrap();
+
+    let r = view.get("key1").unwrap();
+    assert_eq!(r.slice(), vec![233u8; 512]);
+
+    drop(r);
+    drop(view);
+    drop(db);
+
+    // test recover from bad meta
+
+    let mut f = File::options()
+        .truncate(false)
+        .append(true)
+        .open(saved.meta_file())
+        .unwrap();
+    f.write_all(&[233]).unwrap();
+
+    saved.tmp_store = true;
+    let db = Mace::new(saved.validate().unwrap()).unwrap();
+    let view = db.view().unwrap();
+
+    let r = view.get("key1").unwrap();
+    assert_eq!(r.slice(), vec![233u8; 512]);
+
+    let r = view.get("key2").unwrap();
+    assert_eq!(r.slice(), vec![114u8; db.options().wal_buffer_size]);
 }

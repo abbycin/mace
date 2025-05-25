@@ -6,8 +6,8 @@ use std::{
 };
 
 use libc::{
-    c_int, close, fstat, fsync, ftruncate, iovec, open, pread, stat, write, writev, EINTR,
-    O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    EINTR, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, c_int, close, fstat, fsync,
+    ftruncate, iovec, open, pread, stat, write, writev,
 };
 
 #[cfg(any(target_os = "freebsd", target_os = "macos"))]
@@ -124,7 +124,7 @@ impl GatherIO for File {
                     }
                     return Err(io::Error::from_raw_os_error(errno()));
                 }
-                assert_eq!(rc as usize, data.len());
+                debug_assert_eq!(rc as usize, data.len());
                 return Ok(rc as usize);
             }
         }
