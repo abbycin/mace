@@ -1,6 +1,5 @@
 use crc32c::Crc32cHasher;
 use io::{File, GatherIO};
-use std::ops::Deref;
 use std::{
     collections::HashSet,
     hash::Hasher,
@@ -16,20 +15,17 @@ use std::{
     time::Duration,
 };
 
-use crate::cc::worker::Worker;
 use crate::{
     Options, Store,
-    cc::wal::{WalCheckpoint, ptr_to},
     map::{
         Mapping,
         data::{DataFooter, DataMetaReader, FileStat},
     },
     utils::{
-        NEXT_ID,
         block::Block,
         countblock::Countblock,
         data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, Meta, PageTable},
-        pack_id, unpack_id,
+        unpack_id,
     },
 };
 
@@ -102,17 +98,16 @@ impl Handle {
 pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Arc<Mapping>) -> Handle {
     let (tx, rx) = channel();
     let sem = Arc::new(Countblock::new(0));
-    let mut last_ckpt = Vec::with_capacity(store.opt.workers);
-    store
-        .context
-        .workers()
-        .iter()
-        .for_each(|w| last_ckpt.push(w.logging.last_ckpt.load(Relaxed)));
+    let mut last_ckpt_seq = Vec::with_capacity(store.opt.workers);
+    store.context.workers().iter().for_each(|w| {
+        let (seq, _) = unpack_id(w.logging.last_ckpt.load(Relaxed));
+        last_ckpt_seq.push(seq);
+    });
     let gc = GarbageCollector {
         meta,
         map,
         store,
-        last_ckpt,
+        last_ckpt_seq,
     };
     gc_thread(gc, rx, sem.clone());
     Handle {
@@ -164,7 +159,7 @@ struct GarbageCollector {
     meta: Arc<Meta>,
     map: Arc<Mapping>,
     store: Arc<Store>,
-    last_ckpt: Vec<u64>,
+    last_ckpt_seq: Vec<u32>,
 }
 
 impl GarbageCollector {
@@ -185,6 +180,7 @@ impl GarbageCollector {
                 return;
             }
             let ratio = (total - active) * 100 / total;
+            log::debug!("total {} active {} ratio {}", total, active, ratio);
             if ratio < tgt_ratio {
                 return;
             }
@@ -238,58 +234,34 @@ impl GarbageCollector {
     fn process_wal(&mut self) {
         for w in self.store.context.workers().iter() {
             let id = w.id as usize;
-            let ckpt = w.logging.last_ckpt.load(Relaxed);
-            if self.last_ckpt[id] == ckpt {
+            let (ckpt_seq, _) = unpack_id(w.logging.last_ckpt.load(Relaxed));
+            if self.last_ckpt_seq[id] == ckpt_seq {
                 continue;
             }
-            self.last_ckpt[id] = ckpt;
-            Self::process_one_wal(&self.store.opt, w.deref());
+            Self::process_one_wal(&self.store.opt, w.id, self.last_ckpt_seq[id], ckpt_seq);
+            self.last_ckpt_seq[id] = ckpt_seq;
         }
     }
 
-    fn process_one_wal(opt: &Options, w: &Worker) {
-        let mut oldest_ckpt = w.logging.last_ckpt.load(Relaxed);
-
-        let mut buf = [0u8; size_of::<WalCheckpoint>()];
-        let (cur_id, _) = unpack_id(oldest_ckpt);
-        let mut end = None;
-        let mut beg = cur_id;
-
-        let null = pack_id(NEXT_ID, 0);
-        while oldest_ckpt != null {
-            let (seq, pos) = unpack_id(oldest_ckpt);
-            let path = opt.wal_file(w.id, seq);
-            if !path.exists() {
-                break;
+    fn process_one_wal(opt: &Options, id: u16, beg: u32, end: u32) {
+        // NOTE: not including `end`
+        for seq in beg..end {
+            let from = opt.wal_file(id, seq);
+            if !from.exists() {
+                continue;
             }
-            let f = File::options().read(true).open(&path).unwrap();
-
-            f.read(&mut buf, pos as u64).unwrap();
-            let c = ptr_to::<WalCheckpoint>(buf.as_ptr());
-            oldest_ckpt = c.prev_addr;
-
-            let (oldest_id, _) = unpack_id(oldest_ckpt);
-
-            if oldest_id != cur_id {
-                if end.is_none() {
-                    end = Some(oldest_id);
-                }
-                beg = oldest_id;
-            }
-        }
-
-        if end.is_some() {
-            let end = end.unwrap();
-            for i in beg..=end {
-                let from = opt.wal_file(w.id, i);
-                if !from.exists() {
-                    continue;
-                }
-                let to = opt.wal_backup(w.id, i);
+            let to = opt.wal_backup(id, seq);
+            if opt.keep_stable_wal_file {
+                log::info!("rename {:?} to {:?}", from, to);
                 std::fs::rename(&from, &to)
                     .inspect_err(|e| {
                         log::error!("can't rename {:?} to {:?}, error {:?}", from, to, e);
                     })
+                    .unwrap();
+            } else {
+                log::info!("unlink {:?}", from);
+                std::fs::remove_file(&from)
+                    .inspect_err(|e| log::error!("can't remove {:?}, error {:?}", from, e))
                     .unwrap();
             }
         }

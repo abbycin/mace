@@ -33,8 +33,9 @@ impl FileReader {
 
     fn read_at(&self, pos: u64) -> Option<FrameOwner> {
         let m = self.map.get(&pos)?;
-        let frame = FrameOwner::alloc(m.len as usize);
+        let mut frame = FrameOwner::alloc(m.len as usize);
 
+        frame.set_addr(pos); // used in gc
         let b = frame.payload();
         let dst = b.as_mut_slice(0, b.len());
         self.file.read(dst, m.off as u64).expect("can't read");

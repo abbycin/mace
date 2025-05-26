@@ -3,7 +3,7 @@ use std::{
     collections::BinaryHeap,
 };
 
-use crate::utils::traits::{IKey, IPageIter, IVal};
+use crate::utils::traits::{IInfer, IKey, IPageIter, IVal};
 
 pub struct ItemIter<T> {
     item: Option<T>,
@@ -122,27 +122,30 @@ where
     }
 }
 
-impl<I, K, V> Eq for SortedIter<I>
+impl<I, K, V, O> Eq for SortedIter<I>
 where
-    I: Iterator<Item = (K, V)>,
+    I: Iterator<Item = (K, V, Option<O>)>,
     K: Ord,
+    O: Clone + IInfer,
 {
 }
 
-impl<I, K, V> PartialEq for SortedIter<I>
+impl<I, K, V, O> PartialEq for SortedIter<I>
 where
-    I: Iterator<Item = (K, V)>,
+    I: Iterator<Item = (K, V, Option<O>)>,
     K: Ord,
+    O: Clone + IInfer,
 {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl<I, K, V> Ord for SortedIter<I>
+impl<I, K, V, O> Ord for SortedIter<I>
 where
-    I: Iterator<Item = (K, V)>,
+    I: Iterator<Item = (K, V, Option<O>)>,
     K: Ord,
+    O: Clone + IInfer,
 {
     fn cmp(&self, other: &Self) -> Ordering {
         let o = match (&self.next, &other.next) {
@@ -160,10 +163,11 @@ where
     }
 }
 
-impl<I, K, V> PartialOrd for SortedIter<I>
+impl<I, K, V, O> PartialOrd for SortedIter<I>
 where
-    I: Iterator<Item = (K, V)>,
+    I: Iterator<Item = (K, V, Option<O>)>,
     K: Ord,
+    O: Clone + IInfer,
 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -200,10 +204,11 @@ where
     iters: Vec<Reverse<SortedIter<I>>>,
 }
 
-impl<I, K, V> MergeIterBuilder<I>
+impl<I, K, V, O> MergeIterBuilder<I>
 where
-    I: Iterator<Item = (K, V)>,
+    I: Iterator<Item = (K, V, Option<O>)>,
     K: Ord,
+    O: Clone + IInfer,
 {
     pub fn new(cap: usize) -> Self {
         Self {

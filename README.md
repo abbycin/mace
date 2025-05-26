@@ -15,14 +15,15 @@ single-threaded read/write benchmarks see [bench.rs](tests/bench.rs)
 
 ```
 λ cargo test --test bench --release -- --nocapture
-    Finished `release` profile [optimized] target(s) in 0.02s
-     Running tests/bench.rs (target/release/deps/bench-02ae28ec6d08863b)
+   Compiling mace v0.0.7 (/home/workspace/gits/github/mace)
+    Finished `release` profile [optimized] target(s) in 9.09s
+     Running tests/bench.rs (target/release/deps/bench-e464b0deeba5a28d)
 
 running 1 test
-db_root "/tmp/mace_tmp_913320470031"
+db_root "/tmp/mace_tmp_100400117343"
 put       228ms
-hot get   24ms
-cold get  43ms
+hot get   29ms
+cold get  46ms
 test bench ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s

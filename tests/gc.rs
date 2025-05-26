@@ -8,6 +8,7 @@ fn gc_data() -> Result<(), OpCode> {
     let mut opt = Options::new(&*path);
     opt.tmp_store = false;
     opt.sync_on_write = false;
+    opt.gc_eager = true;
     opt.gc_timeout = 20;
     opt.gc_ratio = 10;
     opt.buffer_size = 512 << 10;
@@ -91,6 +92,7 @@ fn gc_wal() {
     opt.wal_file_size = 4096;
     opt.gc_timeout = 2;
     opt.workers = 1;
+    opt.keep_stable_wal_file = true;
     opt.buffer_size = 100 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut data = Vec::new();

@@ -11,7 +11,7 @@ use crate::{
     utils::{
         NULL_PID,
         bytes::ByteArray,
-        traits::{ICodec, IDataLoader, IInfer, IKey, IPageIter, IVal, IValCodec},
+        traits::{ICodec, ICollector, IDataLoader, IInfer, IKey, IPageIter, IVal, IValCodec},
         unpack_id,
     },
 };
@@ -290,7 +290,7 @@ where
         debug_assert!(self.raw.len() > off);
         let o = Slot::decode_from(self.raw.skip(off));
         if o.is_inline() {
-            K::decode_from(self.raw.skip(off + o.packed_size()))
+            K::decode_from(self.raw.skip(off + Slot::LOCAL_LEN))
         } else {
             let f = l.load_data(o.addr());
             K::decode_from(f.infer())
@@ -299,28 +299,43 @@ where
 
     #[allow(unused)]
     pub fn val_at<L: IDataLoader>(&self, l: &L, pos: usize) -> V {
-        let (_, v) = self.get(l, pos).unwrap();
+        let (_, v, _) = self.get_unchecked(l, pos);
         v
     }
 
-    pub fn get<L: IDataLoader>(&self, l: &L, pos: usize) -> Option<(K, V)> {
-        if pos >= self.header().elems() {
-            None
+    #[inline(always)]
+    pub fn get<L: IDataLoader>(
+        &self,
+        l: &L,
+        pos: usize,
+        elems: usize,
+    ) -> Option<(K, V, Option<L::Out>)> {
+        if pos < elems {
+            Some(self.get_unchecked(l, pos))
         } else {
-            let off = self.offset(pos);
-            let o = Slot::decode_from(self.raw.skip(off));
-            if o.is_inline() {
-                let oz = o.packed_size();
-                let k = K::decode_from(self.raw.skip(off + oz));
-                let v = V::decode_from(self.raw.skip(off + oz + k.packed_size()));
-                Some((k, v))
-            } else {
-                let f = l.load_data(o.addr());
-                let b = f.infer();
-                let k = K::decode_from(b);
-                let v = V::decode_from(b.skip(k.packed_size()));
-                Some((k, v))
-            }
+            None
+        }
+    }
+
+    #[cold]
+    fn get_remote<L: IDataLoader>(&self, l: &L, addr: u64) -> (K, V, Option<L::Out>) {
+        let f = l.load_data(addr);
+        let b = f.infer();
+        let k = K::decode_from(b);
+        let v = V::decode_from(b.skip(k.packed_size()));
+        (k, v, Some(f))
+    }
+
+    pub fn get_unchecked<L: IDataLoader>(&self, l: &L, pos: usize) -> (K, V, Option<L::Out>) {
+        let off = self.offset(pos);
+        let o = Slot::decode_from(self.raw.skip(off));
+        if o.is_inline() {
+            let oz = Slot::LOCAL_LEN;
+            let k = K::decode_from(self.raw.skip(off + oz));
+            let v = V::decode_from(self.raw.skip(off + oz + k.packed_size()));
+            (k, v, None)
+        } else {
+            self.get_remote(l, o.addr())
         }
     }
 
@@ -331,7 +346,7 @@ where
         let mut hi: usize = cnt;
 
         while lo < hi {
-            let mid = lo + (hi - lo) / 2;
+            let mid = lo + ((hi - lo) >> 1);
             match self.key_at(l, mid).cmp(key) {
                 Ordering::Less => lo = mid + 1,
                 _ => hi = mid,
@@ -351,7 +366,7 @@ where
         let mut hi = h.elems();
 
         while lo < hi {
-            let mid = lo + (hi - lo) / 2;
+            let mid = lo + ((hi - lo) >> 1);
             let k = self.key_at(l, mid);
             match f(&k, key) {
                 cmp::Ordering::Equal => return Ok(mid),
@@ -379,7 +394,7 @@ where
         let n = self.header().elems();
         log::debug!("------------- show page -----------",);
         for i in 0..n {
-            let (k, v) = self.get(l, i).unwrap();
+            let (k, v, _) = self.get_unchecked(l, i);
             log::debug!(
                 "{} => {}\t{}",
                 k.to_string(),
@@ -401,6 +416,15 @@ where
     l: L,
     range: Range<usize>,
     index: usize,
+}
+
+pub struct RangeIterAdaptor<K, V, L>
+where
+    K: IKey,
+    V: IVal,
+    L: IDataLoader,
+{
+    pub iter: RangeIter<K, V, L>,
 }
 
 impl<K, V, L> RangeIter<K, V, L>
@@ -426,13 +450,13 @@ where
     V: IVal,
     L: IDataLoader,
 {
-    type Item = (K, V);
+    type Item = (K, V, Option<L::Out>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.range.end {
-            let (k, v) = self.page.get(&self.l, self.index).unwrap();
+            let (k, v, o) = self.page.get_unchecked(&self.l, self.index);
             self.index += 1;
-            Some((k, v))
+            Some((k, v, o))
         } else {
             None
         }
@@ -447,6 +471,34 @@ where
 {
     fn rewind(&mut self) {
         self.index = self.range.start;
+    }
+}
+
+impl<K, V, L> Iterator for RangeIterAdaptor<K, V, L>
+where
+    K: IKey,
+    V: IVal,
+    L: IDataLoader,
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((k, v, _)) = self.iter.next() {
+            Some((k, v))
+        } else {
+            None
+        }
+    }
+}
+
+impl<K, V, L> IPageIter for RangeIterAdaptor<K, V, L>
+where
+    K: IKey,
+    V: IVal,
+    L: IDataLoader,
+{
+    fn rewind(&mut self) {
+        self.iter.rewind();
     }
 }
 
@@ -477,17 +529,17 @@ where
     V: IVal,
     L: IDataLoader,
 {
-    type Item = (K, V);
+    type Item = (K, V, Option<L::Out>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (k, v) = self.iter.next()?;
+        let (k, v, o) = self.iter.next()?;
 
         if let Some(split) = self.split {
             if k.raw() >= split {
                 return None;
             }
         }
-        Some((k, v))
+        Some((k, v, o))
     }
 }
 
@@ -649,31 +701,42 @@ impl<'a, T: IValCodec> LeafMergeIter<'a, T> {
     }
 }
 
-pub struct IntlMergeIter<'a, L>
+pub struct IntlMergeIter<'a, L, C, O>
 where
-    L: IDataLoader,
+    L: IDataLoader<Out = O>,
+    C: ICollector<Input = O>,
 {
     iter: PageMergeIter<'a, &'a [u8], Index, L>,
     last: Option<&'a [u8]>,
+    gc: &'a mut C,
 }
 
-impl<'a, L> IntlMergeIter<'a, L>
+impl<'a, L, C, O> IntlMergeIter<'a, L, C, O>
 where
-    L: IDataLoader,
+    L: IDataLoader<Out = O>,
+    C: ICollector<Input = O>,
 {
-    pub fn new(iter: PageMergeIter<'a, &'a [u8], Index, L>, _txid: u64) -> Self {
-        Self { iter, last: None }
+    pub fn new(iter: PageMergeIter<'a, &'a [u8], Index, L>, gc: &'a mut C, _txid: u64) -> Self {
+        Self {
+            iter,
+            last: None,
+            gc,
+        }
     }
 }
 
-impl<'a, L> Iterator for IntlMergeIter<'a, L>
+impl<'a, L, C, O> Iterator for IntlMergeIter<'a, L, C, O>
 where
-    L: IDataLoader,
+    L: IDataLoader<Out = O>,
+    C: ICollector<Input = O>,
 {
     type Item = (&'a [u8], Index);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for (k, i) in &mut self.iter {
+        for (k, i, o) in &mut self.iter {
+            if let Some(o) = o {
+                self.gc.collect(o);
+            }
             // skip range placeholder
             if i == NULL_INDEX {
                 continue;
@@ -693,9 +756,10 @@ where
     }
 }
 
-impl<L> IPageIter for IntlMergeIter<'_, L>
+impl<L, C, O> IPageIter for IntlMergeIter<'_, L, C, O>
 where
-    L: IDataLoader,
+    L: IDataLoader<Out = O>,
+    C: ICollector<Input = O>,
 {
     fn rewind(&mut self) {
         self.iter.rewind();
@@ -720,7 +784,7 @@ mod test {
     };
     use crate::map::data::{FrameOwner, FrameRef};
     use crate::utils::block::Block;
-    use crate::utils::traits::{ICodec, IDataLoader, IKey, IVal};
+    use crate::utils::traits::{ICodec, ICollector, IDataLoader, IKey, IVal};
     use crate::utils::{AMutRef, pack_id};
 
     use super::{IntlMergeIter, MainPageHdr, Meta, NULL_INDEX, RangeIter};
@@ -842,7 +906,7 @@ mod test {
         let k = page.key_at(&loader, 0);
         assert_eq!(k.raw, "key1".as_bytes());
 
-        let (k, v) = page.get(&loader, 0).unwrap();
+        let (k, v, _) = page.get_unchecked(&loader, 0);
         assert_eq!(k.raw, "key1".as_bytes());
         assert!(!v.is_del());
         assert_eq!(*v.as_ref(), "val1".as_bytes());
@@ -881,7 +945,7 @@ mod test {
 
         let page = MainPage::<Key, Value<&[u8]>>::from(a);
 
-        let (k, v) = page.get(&loader, 0).unwrap();
+        let (k, v, _) = page.get_unchecked(&loader, 0);
         assert_eq!(k.raw, kvec.as_slice());
         assert_eq!(*v.as_ref(), vvec.as_slice());
     }
@@ -959,7 +1023,8 @@ mod test {
             0..pg3.header().elems as usize,
         ));
 
-        let iter = IntlMergeIter::new(PageMergeIter::new(builder.build(), None), 0);
+        let mut coll = Coll;
+        let iter = IntlMergeIter::new(PageMergeIter::new(builder.build(), None), &mut coll, 0);
         let mut delta = Delta::new(DeltaType::Data, NodeType::Intl).from(iter, da.page_size());
         let x4 = Block::aligned_alloc(delta.size(), align_of::<MainPageHdr>());
         let b = x4.view(0, x4.len());
@@ -975,5 +1040,13 @@ mod test {
         ];
 
         must_match(expact.into_iter(), &loader, pg);
+    }
+
+    struct Coll;
+
+    impl ICollector for Coll {
+        type Input = FrameOwner;
+
+        fn collect(&mut self, _x: Self::Input) {}
     }
 }

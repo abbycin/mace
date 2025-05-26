@@ -1,10 +1,8 @@
 use super::{
     data::Ver,
-    wal::{
-        IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate, ptr_to,
-    },
+    wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate},
 };
-use crate::utils::{AMutRef, data::WalDescHandle, options::ParsedOptions};
+use crate::utils::{AMutRef, data::WalDescHandle, options::ParsedOptions, unpack_id};
 use crate::{
     cc::wal::{EntryType, WalPadding, WalSpan},
     map::buffer::Buffers,
@@ -12,7 +10,7 @@ use crate::{
         block::Block,
         bytes::ByteArray,
         data::{GatherWriter, Meta},
-        pack_id, unpack_id,
+        pack_id,
     },
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -114,6 +112,7 @@ impl LogBuilder {
 
 pub struct Logging {
     ring: Ring,
+    id: u16,
     enable_ckpt: AtomicBool,
     // save last checkpoint position, used by gc
     pub last_ckpt: AtomicU64,
@@ -140,6 +139,7 @@ impl Logging {
     const AUTO_STABLE: u32 = <usize>::trailing_zeros(32);
 
     pub(crate) fn new(
+        id: u16,
         ckpt_cnt: Arc<AtomicUsize>,
         desc: WalDescHandle,
         meta: Arc<Meta>,
@@ -149,8 +149,9 @@ impl Logging {
         let writer = GatherWriter::new(&opt.wal_file(desc.worker, desc.wal_id));
         Self {
             ring: Ring::new(opt.wal_buffer_size),
+            id,
             enable_ckpt: AtomicBool::new(false),
-            last_ckpt: AtomicU64::new(0),
+            last_ckpt: AtomicU64::new(desc.checkpoint),
             ckpt_cnt,
             log_id: desc.wal_id,
             log_off: writer.pos() as u32,
@@ -309,15 +310,16 @@ impl Logging {
         if cur == self.last_data {
             return;
         }
-        self.last_data = cur;
         let last_ckpt = self.last_ckpt.load(Relaxed);
 
         log::info!(
-            "checkpoint {:?} curr {} last {}",
+            "worker {} checkpoint {:?} curr {} last {}",
+            self.id,
             unpack_id(last_ckpt),
             cur,
             self.last_data
         );
+        self.last_data = cur;
 
         let ckpt = WalCheckpoint {
             wal_type: EntryType::CheckPoint,
@@ -378,51 +380,9 @@ impl Logging {
         true
     }
 
-    /// return true when checkpoint was taken
     pub fn stabilize(&mut self) {
         if self.flush() {
             self.checkpoint()
         }
-    }
-
-    #[allow(unused)]
-    pub fn parse_log_range(&self) {
-        let b = 0;
-        let e = self.log_off as usize;
-        let data = self.ring.data.data();
-
-        parse_log(data, b, e);
-        log::debug!("==> b {} e {} lsn {:?}", b, e, unpack_id(self.lsn()));
-    }
-}
-
-pub fn parse_log(data: *mut u8, mut b: usize, e: usize) {
-    while b < e {
-        let (p, h) = unsafe {
-            let p = data.add(b);
-            let h = p.read().into();
-            (p, h)
-        };
-
-        // the data is always valid, not need to check
-        let sz = match h {
-            EntryType::Abort | EntryType::Begin | EntryType::Commit => WalAbort::size(),
-            EntryType::Update => {
-                let u = ptr_to::<WalUpdate>(p);
-                log::debug!("{:?}", u);
-                u.size as usize + u.encoded_len()
-            }
-            EntryType::Padding => WalPadding::size(),
-            EntryType::Span => {
-                let x = ptr_to::<WalSpan>(p);
-                x.span as usize + x.encoded_len()
-            }
-            EntryType::CheckPoint => WalCheckpoint::size(),
-            _ => unreachable!("invalid type {}", h as u8),
-        };
-
-        log::debug!("=> {:?} pos {} new {}", h, b, b + sz);
-
-        b += sz;
     }
 }

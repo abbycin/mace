@@ -541,8 +541,7 @@ impl Recovery {
                 let d = &mut desc[idx];
                 // correct the initial value
                 d.wal_id = *x.last().unwrap();
-                d.checkpoint = pack_id(*x.first().unwrap(), 0);
-                self.load_wal_one(x, meta, &mut desc[idx]);
+                self.load_wal_one(x, meta, d);
             }
             self.load_data(&maps, meta, &table, mapping);
         }

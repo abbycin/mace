@@ -3,6 +3,7 @@ use crate::OpCode;
 use crate::Store;
 use crate::map::data::{FrameFlag, FrameOwner, FrameRef};
 use crate::utils::data::JUNK_LEN;
+use crate::utils::traits::ICollector;
 use std::sync::atomic::Ordering::Relaxed;
 
 pub struct SysTxn<'a> {
@@ -21,6 +22,10 @@ impl<'a> SysTxn<'a> {
             junks: Vec::new(),
             page_ids: Vec::new(),
         }
+    }
+
+    pub fn transmute<'b>(&mut self) -> &'b mut Self {
+        unsafe { &mut *(self as *mut _) }
     }
 
     fn commit(&mut self) {
@@ -120,5 +125,13 @@ impl IAlloc for SysTxn<'_> {
 
     fn limit_size(&self) -> u32 {
         self.store.opt.inline_size
+    }
+}
+
+impl ICollector for SysTxn<'_> {
+    type Input = FrameOwner;
+
+    fn collect(&mut self, x: Self::Input) {
+        self.gc(x);
     }
 }

@@ -464,21 +464,22 @@ impl Slot {
     pub const REMOTE_LEN: usize = size_of::<Self>();
     pub const LOCAL_LEN: usize = 1;
 
-    pub(crate) fn from_remote(addr: u64) -> Self {
+    pub(crate) const fn from_remote(addr: u64) -> Self {
         Self {
             meta: addr | Self::INDIRECT_BIT,
         }
     }
 
-    pub(crate) fn inline() -> Self {
+    pub(crate) const fn inline() -> Self {
         Self { meta: 0 }
     }
 
-    pub(crate) fn is_inline(&self) -> bool {
+    #[inline]
+    pub(crate) const fn is_inline(&self) -> bool {
         self.meta & Self::INDIRECT_BIT == 0
     }
 
-    pub(crate) fn addr(&self) -> u64 {
+    pub(crate) const fn addr(&self) -> u64 {
         debug_assert!(!self.is_inline());
         self.meta & !Self::INDIRECT_BIT
     }
@@ -506,19 +507,13 @@ impl ICodec for Slot {
     }
 
     fn decode_from(raw: ByteArray) -> Self {
-        // TODO: more robust
-        if raw.len() < Self::REMOTE_LEN {
-            return Self::inline();
-        }
-
-        let s = raw.as_slice(0, Self::REMOTE_LEN);
-        let meta: u8 = s[0];
-        if meta & Self::MASK != 0 {
-            Self {
-                meta: <u64>::from_be_bytes(s.try_into().unwrap()),
-            }
-        } else {
+        let meta = raw.read::<u8>(0);
+        if meta & Self::MASK == 0 {
             Self::inline()
+        } else {
+            Self {
+                meta: <u64>::from_be_bytes(raw.as_slice(0, Self::REMOTE_LEN).try_into().unwrap()),
+            }
         }
     }
 }

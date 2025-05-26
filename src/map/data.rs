@@ -155,7 +155,6 @@ impl Frame {
         self.size = size;
     }
 
-    #[cfg(test)]
     pub fn set_addr(&mut self, addr: u64) {
         self.addr = addr;
     }
@@ -203,7 +202,7 @@ impl DeepCopy for FrameOwner {
         if self.owned == 1 {
             return self;
         }
-        let other = FrameOwner::alloc(self.payload_size() as usize);
+        let mut other = FrameOwner::alloc(self.payload_size() as usize);
         debug_assert_eq!(self.size(), other.size());
         let src = self.payload();
         let dst = other.payload();
@@ -212,6 +211,8 @@ impl DeepCopy for FrameOwner {
             std::ptr::copy(src.data(), dst.data(), dst.len());
         }
         debug_assert!(other.borrowed.is_null());
+        // used in gc
+        other.set_addr(self.addr);
         other
     }
 }
@@ -233,6 +234,12 @@ impl Deref for FrameOwner {
     type Target = Frame;
     fn deref(&self) -> &Self::Target {
         raw_ptr_to_ref(self.raw)
+    }
+}
+
+impl DerefMut for FrameOwner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        raw_ptr_to_ref_mut(self.raw)
     }
 }
 

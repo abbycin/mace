@@ -47,6 +47,9 @@ pub struct Options {
     pub max_ckpt_per_txn: usize,
     /// WAL file size limit which will trigger switch to new WAL file, at most 2GB
     pub wal_file_size: u32,
+    /// if set to true, the unused stable wal file (never used in recovery) will be removed, default
+    /// value is `false`
+    pub keep_stable_wal_file: bool,
 
     // private to crate
     /// max kv size that can store directly into page
@@ -88,6 +91,7 @@ impl Options {
             intl_split_size: 0,
             max_kv_size: 0,
             intl_consolidate_threshold: 0,
+            keep_stable_wal_file: false,
         }
     }
 

@@ -35,7 +35,8 @@ fn flush_data(msg: FlushData, map: &Mapping) {
         let mut w = GatherWriter::new(&path);
         builder.build(&mut w, id);
         log::trace!(
-            "flush active {} frames, size {}",
+            "flush to {:?} active {} frames, size {}",
+            path,
             builder.active_frames(),
             size,
         );

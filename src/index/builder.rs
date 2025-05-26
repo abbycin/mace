@@ -42,6 +42,30 @@ impl<H> PageBuilder<H> {
         }
     }
 
+    #[cold]
+    fn add_remote<K, V, A: IAlloc>(&mut self, total: usize, k: &K, v: &V, a: &mut A) -> usize
+    where
+        K: IKey,
+        V: IVal,
+    {
+        let mut x = a.allocate(total).unwrap();
+        x.set_normal();
+        let s = Slot::from_remote(x.addr());
+        let slot_sz = s.packed_size();
+        let hdr = self
+            .payload
+            .as_mut_slice::<u8>(self.offset as usize, slot_sz);
+        s.encode_to(hdr);
+        let b = x.payload();
+
+        let (kdst, vdst) = b
+            .as_mut_slice::<u8>(0, b.len())
+            .split_at_mut(k.packed_size());
+        k.encode_to(kdst);
+        v.encode_to(vdst);
+        slot_sz
+    }
+
     pub(crate) fn add<K, V, A: IAlloc>(&mut self, k: &K, v: &V, limit: usize, a: &mut A)
     where
         K: IKey,
@@ -50,23 +74,7 @@ impl<H> PageBuilder<H> {
         let (ksz, vsz) = (k.packed_size(), v.packed_size());
         let mut total_sz = ksz + vsz;
 
-        if total_sz > limit {
-            let mut x = a.allocate(total_sz).unwrap();
-            x.set_normal();
-            let s = Slot::from_remote(x.addr());
-            let slot_sz = s.packed_size();
-            let hdr = self
-                .payload
-                .as_mut_slice::<u8>(self.offset as usize, slot_sz);
-            s.encode_to(hdr);
-            let b = x.payload();
-
-            let (kdst, vdst) = b.as_mut_slice::<u8>(0, b.len()).split_at_mut(ksz);
-            k.encode_to(kdst);
-            v.encode_to(vdst);
-
-            total_sz = slot_sz;
-        } else {
+        if total_sz < limit {
             let s = Slot::inline();
             let slot_sz = s.packed_size();
             let hdr = self
@@ -84,6 +92,8 @@ impl<H> PageBuilder<H> {
             v.encode_to(vdst);
 
             total_sz += slot_sz;
+        } else {
+            total_sz = self.add_remote(total_sz, k, v, a);
         }
 
         self.slots.write::<u32>(self.index * SLOT_LEN, self.offset);

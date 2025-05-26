@@ -43,3 +43,9 @@ pub trait IDataLoader: Clone {
 
     fn load_data(&self, addr: u64) -> Self::Out;
 }
+
+pub trait ICollector {
+    type Input: Clone + IInfer;
+
+    fn collect(&mut self, x: Self::Input);
+}
