@@ -1,6 +1,6 @@
 use crate::map::data::DataBuilder;
 use crate::utils::countblock::Countblock;
-use crate::utils::data::{GatherWriter, JUNK_LEN};
+use crate::utils::data::JUNK_LEN;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::RecvTimeoutError;
 use std::{
@@ -13,43 +13,58 @@ use std::{
     time::Duration,
 };
 
-use super::data::FlushData;
+use super::data::{FlushData, MapBuilder};
 use super::load::Mapping;
 
 fn flush_data(msg: FlushData, map: &Mapping) {
     let id = msg.id();
-    let mut builder = DataBuilder::new();
+    let mut data_builder = DataBuilder::new(id);
+    let mut map_builder = MapBuilder::new();
 
     let mut size = 0;
     for f in msg.iter {
         size += f.size();
-        builder.add(f);
+        data_builder.add(f);
+        map_builder.add(f);
     }
 
-    if !builder.is_empty() {
-        let path = map.opt.data_file(id);
-        if !map.opt.db_root.exists() {
-            log::error!("db_root {:?} not exist", path);
-            panic!("db_root {:?} not exist", path);
+    if !data_builder.is_empty() {
+        let opt = &map.opt;
+        if !opt.db_root.exists() {
+            log::error!("db_root {:?} not exist", opt.db_root);
+            panic!("db_root {:?} not exist", opt.db_root);
         }
-        let mut w = GatherWriter::new(&path);
-        builder.build(&mut w, id);
+        let mut state = io::File::options()
+            .create(true)
+            .trunc(true)
+            .write(true)
+            .open(&opt.state_file())
+            .unwrap();
+
+        data_builder.build(opt, &mut state);
         log::trace!(
             "flush to {:?} active {} frames, size {}",
-            path,
-            builder.active_frames(),
+            map.opt.data_file(id),
+            data_builder.active_frames(),
             size,
         );
+        map_builder.build(opt, &mut state);
+
+        drop(state);
+        let _ = std::fs::remove_file(opt.state_file());
 
         map.add(id, false).expect("never happen");
-        for f in builder.junks.iter() {
+        for f in data_builder.junks.iter() {
             let payload = f.payload();
             let junks = payload.as_slice::<u64>(0, payload.len() / JUNK_LEN);
             map.apply_junks(id, junks);
         }
+        // notify sender before map compaction
+        msg.mark_done();
+        map_builder.compact(opt);
+    } else {
+        msg.mark_done();
     }
-
-    msg.mark_done();
 }
 
 fn flush_thread(rx: Receiver<FlushData>, map: Arc<Mapping>, sync: Arc<Notifier>) -> JoinHandle<()> {

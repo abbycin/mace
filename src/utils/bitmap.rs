@@ -68,7 +68,7 @@ impl BitMap {
     }
 
     pub(crate) fn bits(&self) -> u32 {
-        self.cap * size_of::<BitmapElemType>() as u32
+        self.cap * BITS
     }
 }
 
@@ -124,5 +124,17 @@ mod test {
         for i in 0..64 {
             assert!(!m.test(i));
         }
+
+        let mut m = BitMap::new(12);
+        for i in 0..12 {
+            m.set(i);
+        }
+
+        for i in 0..12 {
+            assert!(m.test(i));
+        }
+
+        let cnt = m.iter().filter(|x| x.0).count();
+        assert_eq!(cnt, 12);
     }
 }

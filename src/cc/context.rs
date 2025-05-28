@@ -94,6 +94,9 @@ impl Context {
     }
 
     pub(crate) fn quit(&self) {
-        self.workers.iter().for_each(|x| x.reclaim());
+        self.workers.iter().for_each(|x| {
+            x.logging.sync_desc();
+            x.reclaim()
+        });
     }
 }

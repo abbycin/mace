@@ -124,8 +124,21 @@ impl Deref for ParsedOptions {
 
 impl Options {
     pub const DATA_PREFIX: &'static str = "data_";
+    pub const MAP_PREFIX: &'static str = "map_";
     pub const WAL_PREFIX: &'static str = "wal_";
-    pub const WAL_FREEZED: &'static str = "freezed_wal_";
+    pub const WAL_STABLE: &'static str = "stable_wal_";
+
+    pub fn state_file(&self) -> PathBuf {
+        self.db_root.join("state")
+    }
+
+    pub fn map_file_tmp(&self, id: u32) -> PathBuf {
+        self.db_root.join(format!("{}{}_tmp", Self::MAP_PREFIX, id))
+    }
+
+    pub fn map_file(&self, id: u32) -> PathBuf {
+        self.db_root.join(format!("{}{}", Self::MAP_PREFIX, id))
+    }
 
     pub fn data_file(&self, id: u32) -> PathBuf {
         self.db_root.join(format!("{}{}", Self::DATA_PREFIX, id))
@@ -142,7 +155,7 @@ impl Options {
 
     pub fn wal_backup(&self, wid: u16, seq: u32) -> PathBuf {
         self.wal_root()
-            .join(format!("{}{}_{}", Self::WAL_FREEZED, wid, seq))
+            .join(format!("{}{}_{}", Self::WAL_STABLE, wid, seq))
     }
 
     pub fn desc_file(&self, wid: u16) -> PathBuf {

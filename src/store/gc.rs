@@ -24,7 +24,7 @@ use crate::{
     utils::{
         block::Block,
         countblock::Countblock,
-        data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, Meta, PageTable},
+        data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, Meta},
         unpack_id,
     },
 };
@@ -305,14 +305,6 @@ impl GarbageCollector {
                     })
                     .collect();
 
-                // collect active pid-addr maps
-                let e: Vec<MapEntry> = hdr
-                    .entries()
-                    .iter()
-                    .filter(|e| active_addr.contains(&e.page_addr()))
-                    .copied()
-                    .collect();
-
                 // collect active junks
                 let mut junks = loader.get_junk().unwrap();
                 junks.sort_unstable();
@@ -327,7 +319,6 @@ impl GarbageCollector {
                 });
 
                 builder.add_frame(Item::new(x.id, x.up2, v));
-                builder.add_entry(e);
                 builder.add_junk(junks);
                 x.id
             })
@@ -378,7 +369,6 @@ impl GarbageCollector {
 }
 
 struct ReWriter<'a> {
-    table: PageTable,
     items: Vec<Item>,
     junks: Vec<u64>,
     sum_up2: u64,
@@ -389,7 +379,6 @@ struct ReWriter<'a> {
 impl<'a> ReWriter<'a> {
     fn new(opt: &'a Options, cap: usize) -> Self {
         Self {
-            table: PageTable::default(),
             items: Vec::with_capacity(cap),
             junks: Vec::new(),
             sum_up2: 0,
@@ -401,12 +390,6 @@ impl<'a> ReWriter<'a> {
     fn add_frame(&mut self, item: Item) {
         self.sum_up2 += item.up2 as u64;
         self.items.push(item);
-    }
-
-    fn add_entry(&mut self, e: Vec<MapEntry>) {
-        for i in e {
-            self.table.add(i.page_id(), i.page_addr());
-        }
     }
 
     fn add_junk(&mut self, junk: Vec<u64>) {
@@ -461,10 +444,6 @@ impl<'a> ReWriter<'a> {
         crc.write(s);
         writer.queue(s);
 
-        let s = self.table.collect();
-        crc.write(&s);
-        writer.queue(&s);
-
         let lids: Vec<u32> = lids.iter().cloned().collect();
 
         let slid =
@@ -475,7 +454,6 @@ impl<'a> ReWriter<'a> {
         let footer = DataFooter {
             up2,
             nr_lid: lids.len() as u32,
-            nr_entry: self.table.len() as u32,
             nr_reloc: seq,
             nr_junk: self.junks.len() as u32,
             nr_active: seq,

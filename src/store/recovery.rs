@@ -17,18 +17,19 @@ use crate::index::Key;
 use crate::index::data::Value;
 use crate::index::tree::Tree;
 use crate::map::Mapping;
-use crate::map::data::DataFooter;
+use crate::map::data::{DataState, MapReader, MapSate, StateType};
 use crate::utils::block::Block;
-use crate::utils::data::{MapEntry, MetaInner, WalDescHandle};
+use crate::utils::data::{MetaInner, WalDesc, WalDescHandle};
 use crate::utils::lru::LruInner;
 use crate::utils::options::ParsedOptions;
-use crate::utils::{NULL_CMD, NULL_ORACLE, pack_id, raw_ptr_to_ref, unpack_id};
+use crate::utils::traits::IAsSlice;
+use crate::utils::{NULL_CMD, NULL_ORACLE, pack_id, unpack_id};
+use crate::{OpCode, Record, static_assert};
 use crate::{
     Options,
     map::table::PageMap,
     utils::{NEXT_ID, data::Meta},
 };
-use crate::{Record, static_assert};
 
 #[derive(Debug, PartialEq, Eq)]
 enum State {
@@ -63,15 +64,22 @@ impl Recovery {
         }
     }
 
-    pub(crate) fn phase1(&mut self) -> (Arc<Meta>, PageMap, Mapping, Vec<WalDescHandle>) {
+    pub(crate) fn phase1(
+        &mut self,
+    ) -> Result<(Arc<Meta>, PageMap, Mapping, Vec<WalDescHandle>), OpCode> {
         let (meta, mut desc) = self.check();
         let mut mapping = Mapping::new(self.opt.clone());
-        let map = match self.state {
-            State::New => PageMap::default(),
+        if self.state == State::New {
+            return Ok((Arc::new(meta), PageMap::default(), mapping, desc));
+        }
+        // NOTE: we must load map before load data, since the data may be deleted during load map
+        let map = self.load_map()?;
+        match self.state {
             State::Damaged => self.enumerate(&meta, &mut desc, &mut mapping),
             State::Ok => self.load(&meta, &mut mapping),
+            _ => unreachable!(),
         };
-        (Arc::new(meta), map, mapping, desc)
+        Ok((Arc::new(meta), map, mapping, desc))
     }
 
     pub(crate) fn phase2(&mut self, meta: Arc<Meta>, desc: &[WalDescHandle], tree: &Tree) {
@@ -307,11 +315,11 @@ impl Recovery {
         }
     }
 
-    /// if either of WAL or meta file is not exist, we treat it as a new database
+    /// if meta file is not exist, we treat it as a new database
     fn check(&mut self) -> (Meta, Vec<WalDescHandle>) {
         let f = self.opt.meta_file();
         let mut desc = Vec::with_capacity(self.opt.workers);
-        (0..self.opt.workers as u16).for_each(|x| desc.push(WalDescHandle::new(x)));
+        (0..self.opt.workers as u16).for_each(|x| desc.push(WalDescHandle::new(WalDesc::new(x))));
 
         if !f.exists() {
             self.state = State::New;
@@ -371,8 +379,7 @@ impl Recovery {
         }
     }
 
-    fn load(&mut self, meta: &Meta, mapping: &mut Mapping) -> PageMap {
-        let table = PageMap::default();
+    fn load(&mut self, meta: &Meta, mapping: &mut Mapping) {
         let mut maps = Vec::new();
 
         Self::readdir(&self.opt.db_root, |name| {
@@ -385,9 +392,73 @@ impl Recovery {
 
         maps.sort_unstable();
 
-        self.load_data(&maps, meta, &table, mapping);
-        assert_eq!(self.state, State::Ok);
-        table
+        self.load_data(&maps, meta, mapping);
+    }
+
+    fn load_map(&mut self) -> Result<PageMap, OpCode> {
+        let table = PageMap::default();
+
+        let state = self.opt.state_file();
+        if state.exists() {
+            let f = File::options().read(true).open(&state).unwrap();
+            let mut pos = 0;
+            let end = f.size().unwrap();
+            let dlen = size_of::<DataState>();
+            let mlen = size_of::<MapSate>();
+            let mut buf = vec![0u8; dlen.max(mlen)];
+
+            while pos < end {
+                f.read(&mut buf[..1], pos).unwrap();
+                let kind = buf[0].into();
+                let n = match kind {
+                    StateType::Data => {
+                        f.read(&mut buf[..dlen], pos).unwrap();
+                        let data = DataState::from_slice(&buf[..dlen]);
+                        let data_file = self.opt.data_file(data.file_id);
+                        let _ = std::fs::remove_file(&data_file);
+                        log::info!("unlink {:?}", data_file);
+                        dlen
+                    }
+                    StateType::Map => {
+                        f.read(&mut buf[..mlen], pos).unwrap();
+                        let map = MapSate::from_slice(&buf[..mlen]);
+                        let map_path = self.opt.map_file(map.file_id);
+                        if map_path.exists() {
+                            let file = File::options().write(true).open(&map_path).unwrap();
+                            file.truncate(map.offset).unwrap();
+                            log::info!("truncate {:?}", map_path);
+                        }
+                        mlen
+                    }
+                };
+                pos += n as u64;
+            }
+
+            let _ = std::fs::remove_file(state);
+        }
+
+        let mut block = Block::alloc(MapReader::DEFAULT_BLOCK_SIZE);
+        for id in 0.. {
+            let map_path = self.opt.map_file(id);
+            if !map_path.exists() {
+                break;
+            }
+
+            let mut reader = MapReader::new(map_path);
+            loop {
+                let o = reader.next(&mut block)?;
+                if let Some(es) = o {
+                    es.iter().for_each(|e| {
+                        if table.get(e.page_id()) < e.page_addr() {
+                            table.index(e.page_id()).store(e.page_addr(), Relaxed);
+                        }
+                    });
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(table)
     }
 
     // NOTE: althrough id wrap around is not handled, it's enough for PB-level data storeage
@@ -472,14 +543,12 @@ impl Recovery {
         desc.checkpoint = ckpt;
     }
 
-    fn load_data(&self, maps: &[u32], meta: &Meta, table: &PageMap, mapping: &mut Mapping) {
+    fn load_data(&self, maps: &[u32], meta: &Meta, mapping: &mut Mapping) {
         let mut last_id = NEXT_ID;
         // old to new
         for i in maps.iter() {
             let i = *i;
-            if let Ok(data) = mapping.add(i, true) {
-                let d = raw_ptr_to_ref(data.data().cast::<DataFooter>());
-                self.build_table(d.entries(), table);
+            if mapping.add(i, true).is_ok() {
                 last_id = i;
             } else {
                 // either last data file or compacted data file, ignore them
@@ -492,13 +561,7 @@ impl Recovery {
         meta.next_data.store(last_id + 1, Relaxed);
     }
 
-    fn enumerate(
-        &mut self,
-        meta: &Meta,
-        desc: &mut [WalDescHandle],
-        mapping: &mut Mapping,
-    ) -> PageMap {
-        let table = PageMap::default();
+    fn enumerate(&mut self, meta: &Meta, desc: &mut [WalDescHandle], mapping: &mut Mapping) {
         let mut logs: Vec<Vec<u32>> = vec![Vec::new(); desc.len()];
         let mut maps = Vec::new();
 
@@ -543,17 +606,7 @@ impl Recovery {
                 d.wal_id = *x.last().unwrap();
                 self.load_wal_one(x, meta, d);
             }
-            self.load_data(&maps, meta, &table, mapping);
-        }
-
-        table
-    }
-
-    fn build_table(&self, map: &[MapEntry], table: &PageMap) {
-        for e in map {
-            if table.get(e.page_id()) < e.page_addr() {
-                table.index(e.page_id()).store(e.page_addr(), Relaxed);
-            }
+            self.load_data(&maps, meta, mapping);
         }
     }
 }

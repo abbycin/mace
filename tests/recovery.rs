@@ -180,6 +180,8 @@ fn lost_all() {
     lost_impl(|opt, id| {
         break_meta(opt.meta_file());
         std::fs::remove_file(opt.data_file(id)).unwrap();
+        // in current test the page id is always fall into slot 0
+        std::fs::remove_file(opt.map_file(0)).unwrap()
     });
     put_update(true);
 }
@@ -267,7 +269,11 @@ fn put_update(remove_data: bool) {
             let s = name.to_str().unwrap();
 
             if s.starts_with(Options::DATA_PREFIX) {
-                std::fs::remove_file(file).unwrap();
+                std::fs::remove_file(&file).unwrap();
+            }
+
+            if s.starts_with(Options::MAP_PREFIX) {
+                std::fs::remove_file(&file).unwrap();
             }
         }
     }

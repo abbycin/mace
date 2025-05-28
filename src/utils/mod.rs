@@ -326,6 +326,20 @@ impl<T> Drop for MutRef<T> {
     }
 }
 
+impl<T> Deref for MutRef<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &(*self.inner).raw }
+    }
+}
+
+impl<T> DerefMut for MutRef<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut (*self.inner).raw }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::utils::align_up;

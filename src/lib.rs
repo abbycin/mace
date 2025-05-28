@@ -53,7 +53,7 @@ impl Mace {
     pub fn new(opt: ParsedOptions) -> Result<Self, OpCode> {
         let opt = Arc::new(opt);
         let mut recover = Recovery::new(opt.clone());
-        let (meta, table, mapping, desc) = recover.phase1();
+        let (meta, table, mapping, desc) = recover.phase1()?;
         let store = Arc::new(Store::new(
             table,
             opt.clone(),

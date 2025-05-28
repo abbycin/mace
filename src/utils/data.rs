@@ -1,8 +1,8 @@
-use super::{INIT_ORACLE, NEXT_ID, OpCode, pack_id, rand_range};
+use super::{INIT_ORACLE, MutRef, NEXT_ID, OpCode, pack_id, rand_range};
 use crate::utils::bitmap::{BITMAP_ELEM_LEN, BitMap, BitmapElemType};
 use crc32c::Crc32cHasher;
 use io::{GatherIO, IoVec};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs::File;
 use std::hash::Hasher;
@@ -10,7 +10,7 @@ use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 use std::sync::{Mutex, RwLock};
 
 /// logical id and physical id are same length
@@ -82,7 +82,7 @@ impl MapEntry {
 #[derive(Default)]
 pub struct PageTable {
     // pid, addr, len(offset + len)
-    data: HashMap<u64, MapEntry>,
+    data: BTreeMap<u64, u64>,
 }
 
 impl PageTable {
@@ -91,32 +91,33 @@ impl PageTable {
     pub fn collect(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.data.iter().for_each(|x| {
-            buf.extend_from_slice(x.1.as_slice());
+            buf.extend_from_slice(
+                MapEntry {
+                    page_id: *x.0,
+                    page_addr: *x.1,
+                }
+                .as_slice(),
+            );
         });
         buf
     }
 
     pub fn add(&mut self, pid: u64, addr: u64) {
-        if let Some(e) = self.get_mut(&pid) {
-            // a delta chain in same arana, we use the latest mapping
-            // NOTE: it's incorrect when addr was wrapped, but it's almost never happen in our spec
-            if e.page_addr < addr {
-                e.page_addr = addr;
-            }
-        } else {
-            self.insert(
-                pid,
-                MapEntry {
-                    page_id: pid,
-                    page_addr: addr,
-                },
-            );
-        }
+        // a delta chain in same arana, we use the latest mapping
+        // NOTE: it's incorrect when addr was wrapped, but it's almost never happen in our spec
+        self.data
+            .entry(pid)
+            .and_modify(|x| {
+                if *x < addr {
+                    *x = addr;
+                }
+            })
+            .or_insert(addr);
     }
 }
 
 impl Deref for PageTable {
-    type Target = HashMap<u64, MapEntry>;
+    type Target = BTreeMap<u64, u64>;
     fn deref(&self) -> &Self::Target {
         &self.data
     }
@@ -216,8 +217,9 @@ impl Drop for GatherWriter {
 const META_COMPLETE: u16 = 114;
 const META_IMCOMPLETE: u16 = 514;
 
+#[derive(Debug)]
 #[repr(C)]
-pub struct WalDesc {
+pub(crate) struct WalDesc {
     // TODO: change to u128
     pub checkpoint: u64,
     // TODO: change to u64
@@ -228,7 +230,7 @@ pub struct WalDesc {
 }
 
 impl WalDesc {
-    fn new(wid: u16) -> Self {
+    pub(crate) fn new(wid: u16) -> Self {
         Self {
             checkpoint: pack_id(NEXT_ID, 0),
             wal_id: NEXT_ID,
@@ -286,56 +288,7 @@ impl WalDesc {
     }
 }
 
-pub struct WalDescHandle {
-    raw: *mut WalDesc,
-    refcnt: *mut AtomicUsize,
-}
-
-impl WalDescHandle {
-    pub fn new(wid: u16) -> Self {
-        Self {
-            raw: Box::into_raw(Box::new(WalDesc::new(wid))),
-            refcnt: Box::into_raw(Box::new(AtomicUsize::new(1))),
-        }
-    }
-}
-
-impl Deref for WalDescHandle {
-    type Target = WalDesc;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.raw }
-    }
-}
-
-impl DerefMut for WalDescHandle {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.raw }
-    }
-}
-
-impl Clone for WalDescHandle {
-    fn clone(&self) -> Self {
-        unsafe {
-            (*self.refcnt).fetch_add(1, Relaxed);
-        }
-        Self {
-            raw: self.raw,
-            refcnt: self.refcnt,
-        }
-    }
-}
-
-impl Drop for WalDescHandle {
-    fn drop(&mut self) {
-        unsafe {
-            let cnt = (*self.refcnt).fetch_sub(1, Relaxed);
-            if cnt == 1 {
-                drop(Box::from_raw(self.raw));
-                drop(Box::from_raw(self.refcnt));
-            }
-        }
-    }
-}
+pub(crate) type WalDescHandle = MutRef<WalDesc>;
 
 #[derive(Debug)]
 #[repr(C)]

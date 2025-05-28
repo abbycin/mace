@@ -10,9 +10,7 @@ use io::{File, GatherIO};
 use super::data::{DataMetaReader, FileStat, FrameOwner, StatHandle};
 use crate::{
     OpCode,
-    utils::{
-        bitmap::BitMap, block::Block, data::Reloc, lru::Lru, options::ParsedOptions, unpack_id,
-    },
+    utils::{bitmap::BitMap, data::Reloc, lru::Lru, options::ParsedOptions, unpack_id},
 };
 
 pub(crate) struct FileReader {
@@ -27,7 +25,7 @@ impl FileReader {
         let d = loader.get_meta().expect("never happen");
         d.relocs().iter().map(|x| map.insert(x.key, x.val)).count();
 
-        let (file, _) = loader.take();
+        let file = loader.take();
         Some(Self { file, map })
     }
 
@@ -76,7 +74,7 @@ impl Mapping {
         }
     }
 
-    pub(crate) fn add(&self, id: u32, validate: bool) -> Result<Block, OpCode> {
+    pub(crate) fn add(&self, id: u32, validate: bool) -> Result<(), OpCode> {
         let mut loader = DataMetaReader::new(self.opt.data_file(id), validate)?;
         let hdr = loader.get_meta()?;
         let mut map = HashMap::new();
@@ -106,10 +104,10 @@ impl Mapping {
         lk.insert(id, id);
         self.stats.insert(id, handle);
 
-        let (file, data) = loader.take();
+        let file = loader.take();
         let reader = FileReader { file, map };
         self.cache.add(id, reader);
-        Ok(data)
+        Ok(())
     }
 
     pub(crate) fn del(&self, id: u32) {

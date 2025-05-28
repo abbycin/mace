@@ -44,7 +44,7 @@ impl Worker {
             tx_id: AtomicU64::new(0),
             start_ts: 0,
             id: desc.worker,
-            logging: Logging::new(desc.worker, cnt, desc, meta, opt, buffer),
+            logging: Logging::new(cnt, desc, meta, opt, buffer),
             modified: false,
         }
     }

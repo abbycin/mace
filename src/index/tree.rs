@@ -1366,7 +1366,7 @@ mod test {
     fn new_tree(opt: Options) -> TreeRef {
         let _ = std::fs::remove_dir_all(&opt.db_root);
         let opt = Arc::new(opt.validate().unwrap());
-        let (meta, table, mapping, desc) = Recovery::new(opt.clone()).phase1();
+        let (meta, table, mapping, desc) = Recovery::new(opt.clone()).phase1().unwrap();
         let store = Arc::new(Store::new(table, opt, meta.clone(), mapping, &desc).unwrap());
         TreeRef {
             tree: Tree::new(store, ROOT_PID),

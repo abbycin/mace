@@ -49,3 +49,16 @@ pub trait ICollector {
 
     fn collect(&mut self, x: Self::Input);
 }
+
+/// NOTE: the type impl [`IAsSlice`] must be `packed(1)`
+pub trait IAsSlice: Sized {
+    fn as_slice(&self) -> &[u8] {
+        let p = self as *const Self;
+        unsafe { std::slice::from_raw_parts(p.cast(), size_of::<Self>()) }
+    }
+
+    fn from_slice(x: &[u8]) -> Self {
+        assert_eq!(x.len(), size_of::<Self>());
+        unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
+    }
+}

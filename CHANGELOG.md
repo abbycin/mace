@@ -1,3 +1,11 @@
+## [0.0.8] 2025-05-29
+### Changes
+- Separate `map` from `data` file
+- Support `map` file compaction
+
+### Bug fixes
+- Fix `BitMap` bits calculation
+
 ## [0.0.7] 2025-05-26
 ### Changes
 - `consolidation` will collect remote frames

@@ -1,18 +1,21 @@
 use crc32c::Crc32cHasher;
 use io::{File, GatherIO};
 
-use crate::OpCode;
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
 use crate::utils::data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, PageTable, Reloc};
-use crate::utils::traits::IInfer;
-use crate::utils::{align_up, unpack_id};
+use crate::utils::lru::LruInner;
+use crate::utils::traits::{IAsSlice, IInfer};
+use crate::utils::{MutRef, align_up, rand_range, unpack_id};
 use crate::utils::{bytes::ByteArray, raw_ptr_to_ref, raw_ptr_to_ref_mut};
+use crate::{OpCode, Options};
 use std::alloc::alloc_zeroed;
 use std::cmp::min;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::Hasher;
-use std::path::Path;
-use std::ptr::{null, null_mut};
+use std::path::{Path, PathBuf};
+use std::ptr::null;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{Relaxed, Release};
 use std::{
@@ -22,7 +25,7 @@ use std::{
 
 use super::cache::DeepCopy;
 
-/// NOTE: the field expect `file_id` will be changed, up1 and up2 change when new write, nr_active
+/// NOTE: the field except `file_id` will be changed, up1 and up2 change on new write, nr_active
 /// and active_size change when flush have new deallocate frame point to current file_id
 pub(crate) struct FileStat {
     pub(crate) file_id: u32,
@@ -388,16 +391,6 @@ impl ArenaIter {
     }
 }
 
-impl Default for ArenaIter {
-    fn default() -> Self {
-        Self {
-            raw: ByteArray::new(null_mut(), 0),
-            pos: 0,
-            end: 0,
-        }
-    }
-}
-
 impl Iterator for ArenaIter {
     type Item = FrameRef;
 
@@ -417,20 +410,19 @@ impl Iterator for ArenaIter {
 }
 /// the layout of a flushed arena is:
 /// ```text
-/// high                                                                            low
-/// +--------+-------+------+-------------+-------+---------------------------------+
-/// | footer | lids | map entries | relocations | junks |  frames (normal, slotted) |
-/// +--------+------+-------+-------------+-------+---------------------------------+
+/// high                                                     low
+/// +--------+------+---------------------+-------+----------+
+/// | footer | lids | relocations | junks |  frames (normal) |
+/// +--------+------+---------------------+-------+----------+
 ///
 /// ```
+/// write file from frames to footer while read file from footer to relocations
 #[repr(C, packed(1))]
 #[derive(Default, Debug)]
 pub(crate) struct DataFooter {
     pub(crate) up2: u32,
     /// logical id entries
     pub(crate) nr_lid: u32,
-    /// page table
-    pub(crate) nr_entry: u32,
     /// item's relocation table
     pub(crate) nr_reloc: u32,
     /// count of junks
@@ -456,16 +448,12 @@ impl DataFooter {
         Self::LEN
     }
 
-    fn entry_pos(&self) -> usize {
+    fn reloc_pos(&self) -> usize {
         Self::LEN + self.lid_len()
     }
 
-    fn reloc_pos(&self) -> usize {
-        self.entry_pos() + self.nr_entry as usize * PageTable::ITEM_LEN
-    }
-
     fn meta_len(&self) -> usize {
-        self.lid_len() + self.entry_len() + self.reloc_len()
+        self.lid_len() + self.reloc_len()
     }
 
     fn get<T>(&self, off: usize, n: usize) -> &[T] {
@@ -474,10 +462,6 @@ impl DataFooter {
             let p = p.cast::<u8>().add(off).cast::<T>();
             std::slice::from_raw_parts(p, n)
         }
-    }
-
-    fn entry_slice(&self) -> &[u8] {
-        self.get(self.entry_pos(), self.entry_len())
     }
 
     fn reloc_slice(&self) -> &[u8] {
@@ -492,10 +476,6 @@ impl DataFooter {
         self.nr_lid as usize * ID_LEN
     }
 
-    fn entry_len(&self) -> usize {
-        self.nr_entry as usize * PageTable::ITEM_LEN
-    }
-
     fn reloc_len(&self) -> usize {
         self.nr_reloc as usize * AddrMap::LEN
     }
@@ -508,46 +488,31 @@ impl DataFooter {
         self.get(self.lid_pos(), self.nr_lid as usize)
     }
 
-    pub(crate) fn entries(&self) -> &[MapEntry] {
-        self.get(self.entry_pos(), self.nr_entry as usize)
-    }
-
     pub(crate) fn relocs(&self) -> &[AddrMap] {
         self.get(self.reloc_pos(), self.nr_reloc as usize)
     }
 }
 
 pub(crate) struct DataBuilder {
+    id: u32,
     nr_rel: u32,
     nr_junk: u32,
     nr_active: u32,
     active_size: u32,
     pub(crate) junks: Vec<FrameRef>,
-    entry: PageTable,
     reloc: Vec<u8>,
     frames: Vec<FrameRef>,
 }
 
 impl DataBuilder {
-    fn add_impl(&mut self, f: FrameRef) {
-        if f.flag() == FrameFlag::Normal {
-            self.entry.add(f.page_id(), f.addr());
-        }
-        // including Slotted
-        self.nr_active += 1;
-        self.active_size += f.payload_size();
-        self.nr_rel += 1;
-        self.frames.push(f);
-    }
-
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(id: u32) -> Self {
         Self {
+            id,
             nr_rel: 0,
             nr_junk: 0,
             nr_active: 0,
             active_size: 0,
             junks: Vec::new(),
-            entry: PageTable::default(),
             reloc: Vec::new(),
             frames: Vec::new(),
         }
@@ -556,7 +521,10 @@ impl DataBuilder {
     pub(crate) fn add(&mut self, f: FrameRef) {
         match f.flag() {
             FrameFlag::Normal => {
-                self.add_impl(f);
+                self.nr_active += 1;
+                self.active_size += f.payload_size();
+                self.nr_rel += 1;
+                self.frames.push(f);
             }
             FrameFlag::Junk => {
                 self.nr_junk += f.payload_size() / JUNK_LEN as u32;
@@ -575,9 +543,21 @@ impl DataBuilder {
         self.frames.len()
     }
 
-    pub(crate) fn build(&mut self, w: &mut GatherWriter, up2: u32) {
+    pub(crate) fn build<T>(&mut self, opt: &Options, state: &mut T)
+    where
+        T: GatherIO,
+    {
         let mut pos = 0;
         let mut crc = Crc32cHasher::default();
+        let path = opt.data_file(self.id);
+        let mut w = GatherWriter::new(&path);
+
+        let ctx = DataState {
+            kind: StateType::Data,
+            file_id: self.id,
+        };
+        state.write(ctx.as_slice()).unwrap();
+        state.sync().unwrap();
 
         for (seq, f) in self.frames.iter().enumerate() {
             let reloc = AddrMap::new(f.addr(), pos, f.payload_size(), seq as u32);
@@ -598,14 +578,9 @@ impl DataBuilder {
         crc.write(s);
         w.queue(s);
 
-        let s = self.entry.collect();
-        crc.write(&s);
-        w.queue(&s);
-
         let hdr = DataFooter {
-            up2,
+            up2: self.id,
             nr_lid: 0,
-            nr_entry: self.entry.len() as u32,
             nr_reloc: self.nr_rel,
             nr_junk: self.nr_junk,
             nr_active: self.nr_active,
@@ -695,7 +670,6 @@ impl DataMetaReader {
         Self::get_footer(self)?;
         let f = raw_ptr_to_ref(self.buf.data().cast::<DataFooter>());
         self.get_lid(f)?;
-        self.get_entry(f)?;
         self.get_reloc(f)?;
         if self.validate {
             self.calc_crc(f)
@@ -731,17 +705,6 @@ impl DataMetaReader {
         Ok(())
     }
 
-    fn get_entry(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
-        if f.entry_len() > 0 {
-            self.off -= f.entry_len() as u64;
-            let s = self.buf.mut_slice(self.pos, f.entry_len());
-
-            self.file.read(s, self.off)?;
-            self.pos += f.entry_len();
-        }
-        Ok(())
-    }
-
     fn get_reloc(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
         if f.reloc_len() > 0 {
             self.off -= f.reloc_len() as u64;
@@ -769,59 +732,408 @@ impl DataMetaReader {
         }
 
         h.write(f.reloc_slice());
-        h.write(f.entry_slice());
         h.write(f.lid_slice());
 
         Ok(h.finish() as u32)
     }
 
-    pub(crate) fn take(self) -> (File, Block) {
-        (self.file, self.buf)
+    pub(crate) fn take(self) -> File {
+        self.file
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum StateType {
+    #[default]
+    Data,
+    Map,
+}
+
+impl From<u8> for StateType {
+    fn from(value: u8) -> Self {
+        assert!(value < 2);
+        unsafe { std::mem::transmute(value) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, packed(1))]
+pub(crate) struct DataState {
+    kind: StateType,
+    pub(crate) file_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, packed(1))]
+pub(crate) struct MapSate {
+    kind: StateType,
+    pub(crate) file_id: u32,
+    pub(crate) offset: u64,
+}
+
+impl IAsSlice for DataState {}
+impl IAsSlice for MapSate {}
+
+#[derive(Default, Debug)]
+#[repr(C, packed(1))]
+pub(crate) struct MapHeader {
+    len: u32,
+    crc32: u32,
+}
+
+impl IAsSlice for MapHeader {}
+
+pub(crate) struct MapBuilder {
+    tables: HashMap<u32, PageTable>,
+    size_map: HashMap<u32, usize>,
+    files: LruInner<u32, MutRef<io::File>>,
+}
+
+pub const MAX_MAP_FILE_SIZE: usize = 100 << 20;
+pub const PID_PER_MAP_FILE: usize = MAX_MAP_FILE_SIZE / PageTable::ITEM_LEN;
+pub const MAP_FILE_GC_SIZE: usize = MAX_MAP_FILE_SIZE + MAX_MAP_FILE_SIZE / 2;
+
+pub fn pid_to_fid(pid: u64) -> u32 {
+    (pid / PID_PER_MAP_FILE as u64) as u32
+}
+
+impl MapBuilder {
+    const CAP: usize = 32;
+    pub(crate) fn new() -> Self {
+        Self {
+            tables: HashMap::with_capacity(1),
+            size_map: HashMap::new(),
+            files: LruInner::new(),
+        }
+    }
+
+    pub(crate) fn add(&mut self, f: FrameRef) {
+        if f.flag() == FrameFlag::Normal {
+            let id = pid_to_fid(f.page_id());
+            match self.tables.entry(id) {
+                Entry::Occupied(ref mut x) => x.get_mut().add(f.page_id(), f.addr()),
+                Entry::Vacant(x) => {
+                    let mut table = PageTable::default();
+                    table.add(f.page_id(), f.addr());
+                    let _ = x.insert(table);
+                }
+            }
+        }
+    }
+
+    fn record(state: &mut io::File, id: u32, offset: u64) {
+        let ctx = MapSate {
+            kind: StateType::Map,
+            file_id: id,
+            offset,
+        };
+        state.write(ctx.as_slice()).unwrap();
+        state.sync().unwrap();
+    }
+
+    fn get_file(&self, opt: &Options, id: u32) -> MutRef<io::File> {
+        if let Some(x) = self.files.get(&id) {
+            x.clone()
+        } else {
+            let f = MutRef::new(
+                io::File::options()
+                    .append(true)
+                    .write(true)
+                    .create(true)
+                    .open(&opt.map_file(id))
+                    .unwrap(),
+            );
+            self.files.add(Self::CAP, id, f.clone());
+            f
+        }
+    }
+
+    pub(crate) fn build(&mut self, opt: &Options, state: &mut io::File) {
+        for (id, table) in self.tables.iter() {
+            let f = self.get_file(opt, *id);
+            Self::record(state, *id, f.size().unwrap());
+
+            let v = table.collect();
+            let mut h = Crc32cHasher::default();
+            h.write(&v);
+            let hdr = MapHeader {
+                len: v.len() as u32,
+                crc32: h.finish() as u32,
+            };
+
+            let raw = f.raw();
+            raw.write(hdr.as_slice()).unwrap();
+            f.raw().write(&v).unwrap();
+            f.raw().sync().unwrap();
+            self.size_map.insert(*id, f.size().unwrap() as usize);
+        }
+    }
+
+    pub(crate) fn compact(&mut self, opt: &Options) {
+        let mut v: Vec<(u32, usize)> = self
+            .size_map
+            .iter()
+            .filter(|x| {
+                if cfg!(debug_assertions) {
+                    x.1.cmp(&MAP_FILE_GC_SIZE).is_le()
+                } else {
+                    x.1.cmp(&MAP_FILE_GC_SIZE).is_ge()
+                }
+            })
+            .map(|(x, y)| (*x, *y))
+            .collect();
+
+        if !v.is_empty() {
+            v.sort_by(|x, y| x.1.cmp(&y.1));
+            let n = rand_range(0..v.len()).max(1); // at least choose one
+            let mut block = Block::alloc(MapReader::DEFAULT_BLOCK_SIZE);
+
+            for (id, _) in &v[..n] {
+                let id = *id;
+                if Self::do_compact(id, &mut block, opt).is_err() {
+                    log::error!("can't compact {:?}", opt.map_file(id));
+                    let _ = std::fs::remove_file(opt.map_file_tmp(id));
+                }
+            }
+        }
+    }
+
+    fn do_compact(id: u32, block: &mut Block, opt: &Options) -> Result<(), std::io::Error> {
+        let from = opt.map_file_tmp(id);
+        let to = opt.map_file(id);
+
+        {
+            let mut r = MapReader::new(&to);
+            let mut map = PageTable::default();
+
+            loop {
+                let x = r.next(block).unwrap();
+                if let Some(es) = x {
+                    es.iter().for_each(|e| {
+                        map.add(e.page_id(), e.page_addr());
+                    });
+                } else {
+                    break;
+                }
+            }
+
+            let mut f = File::options()
+                .write(true)
+                .trunc(true)
+                .create(true)
+                .open(&from)?;
+            let mut h = Crc32cHasher::default();
+            let v = map.collect();
+            h.write(&v);
+            let hdr = MapHeader {
+                len: v.len() as u32,
+                crc32: h.finish() as u32,
+            };
+
+            f.write(hdr.as_slice())?;
+            f.write(&v)?;
+            f.sync()?;
+        }
+
+        std::fs::rename(from, to)
+    }
+}
+
+pub(crate) struct MapReader {
+    path: PathBuf,
+    file: File,
+    offset: u64,
+    end: u64,
+}
+
+impl MapReader {
+    pub(crate) const DEFAULT_BLOCK_SIZE: usize = 4096;
+
+    pub(crate) fn new<P: AsRef<Path>>(path: P) -> Self {
+        let p = path.as_ref().to_path_buf();
+        let file = File::options().read(true).open(&p).unwrap();
+        let end = file.size().unwrap();
+        Self {
+            path: p,
+            file,
+            offset: 0,
+            end,
+        }
+    }
+
+    pub(crate) fn next(&mut self, block: &mut Block) -> Result<Option<&[MapEntry]>, OpCode> {
+        if self.offset >= self.end {
+            return Ok(None);
+        }
+
+        let mut hdr_buf = [0u8; size_of::<MapHeader>()];
+        self.file.read(&mut hdr_buf[..], self.offset).map_err(|x| {
+            log::error!("read file, error: {:?}", x);
+            OpCode::IoError
+        })?;
+        let hdr = MapHeader::from_slice(&hdr_buf[..]);
+        self.offset += hdr_buf.len() as u64;
+
+        // the size is limited to MAP_FILE_GC_SIZE
+        if block.len() < hdr.len as usize {
+            block.realloc(hdr.len as usize);
+        }
+
+        let mut hash = Crc32cHasher::default();
+        let data = block.mut_slice(0, hdr.len as usize);
+        self.file.read(data, self.offset).unwrap();
+
+        hash.write(data);
+        if hdr.crc32 != hash.finish() as u32 {
+            log::error!("corrupt map file: {:?}", self.path);
+            return Err(OpCode::BadData);
+        }
+        self.offset += hdr.len as u64;
+        let count = hdr.len as usize / PageTable::ITEM_LEN;
+
+        Ok(Some(unsafe {
+            std::slice::from_raw_parts(block.data().cast::<MapEntry>(), count)
+        }))
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::{cmp::Ordering, hash::Hasher};
+
+    use crc32c::Crc32cHasher;
+    use io::GatherIO;
+
     use crate::{
-        RandomPath,
-        utils::{NEXT_ID, data::GatherWriter},
+        Options, RandomPath,
+        utils::{NEXT_ID, block::Block, data::PageTable, traits::IAsSlice},
     };
 
-    use super::{DataBuilder, DataMetaReader, FrameOwner};
+    use super::{DataBuilder, DataMetaReader, FrameOwner, MapHeader, MapReader};
+
+    struct DummyState;
+
+    impl GatherIO for DummyState {
+        fn read(&self, _data: &mut [u8], _pos: u64) -> Result<usize, std::io::Error> {
+            unimplemented!()
+        }
+
+        fn sync(&mut self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
+            Ok(data.len())
+        }
+
+        fn size(&self) -> Result<u64, std::io::Error> {
+            unimplemented!()
+        }
+
+        fn truncate(&self, _to: u64) -> Result<(), std::io::Error> {
+            unimplemented!()
+        }
+
+        fn writev(&mut self, _data: &mut [io::IoVec]) -> Result<(), std::io::Error> {
+            unimplemented!()
+        }
+    }
 
     #[test]
-    fn dump_load() {
-        let path = RandomPath::tmp();
+    fn data_dump_load() {
+        let path = RandomPath::new();
         let f = FrameOwner::alloc(233);
         let (pid, addr) = (114514, 1919810);
         let mut view = f.as_ref();
+        let mut opt = Options::new(&*path);
+        opt.tmp_store = true;
 
         view.set_addr(addr);
         view.set_pid(pid);
 
-        let mut builder = DataBuilder::new();
+        let mut builder = DataBuilder::new(NEXT_ID);
 
         builder.add(view);
 
-        let mut file = GatherWriter::new(&path);
-        builder.build(&mut file, NEXT_ID);
+        std::fs::create_dir_all(&opt.db_root).unwrap();
+        let mut state = DummyState;
+        builder.build(&opt, &mut state);
 
-        let mut loader = DataMetaReader::new(&*path, true).unwrap();
+        let mut loader = DataMetaReader::new(opt.data_file(builder.id), true).unwrap();
 
         let d = loader.get_meta().unwrap();
-        let map = d.entries();
         let reloc = d.relocs();
 
-        assert_eq!(map.len(), 1);
         assert_eq!(reloc.len(), 1);
-
-        let m = &map[0];
-        assert_eq!(m.page_id(), pid);
-        assert_eq!(m.page_addr(), addr);
 
         let r = &reloc[0];
         assert_eq!({ r.key }, addr);
         assert_eq!({ r.val.off }, 0);
         assert_eq!({ r.val.len }, f.payload_size());
+    }
+
+    #[test]
+    fn map_dump_load() {
+        let path = RandomPath::new();
+        let mut opt = Options::new(&*path);
+        opt.tmp_store = true;
+        let map_id = 1;
+
+        std::fs::create_dir_all(&opt.db_root).unwrap();
+        let mut w = io::File::options()
+            .append(true)
+            .write(true)
+            .create(true)
+            .open(&opt.map_file(map_id))
+            .unwrap();
+        let mut input = Vec::new();
+        for _ in 0..10 {
+            let mut table = PageTable::default();
+
+            for i in 1..10 {
+                table.add(i, i * i);
+                input.push((i, i * i));
+            }
+
+            let v = table.collect();
+            let mut hash = Crc32cHasher::default();
+            hash.write(&v);
+            let h = MapHeader {
+                len: v.len() as u32,
+                crc32: hash.finish() as u32,
+            };
+
+            w.write(h.as_slice()).unwrap();
+            w.write(&v).unwrap();
+            w.sync().unwrap();
+        }
+
+        drop(w);
+
+        let mut block = Block::alloc(MapReader::DEFAULT_BLOCK_SIZE);
+        let mut r = MapReader::new(opt.map_file(map_id));
+        let mut output = Vec::new();
+
+        loop {
+            let x = r.next(&mut block).unwrap();
+            if let Some(es) = x {
+                for e in es {
+                    output.push((e.page_id(), e.page_addr()));
+                }
+            } else {
+                break;
+            }
+        }
+
+        input.sort_by(|x, y| match x.0.cmp(&y.0) {
+            Ordering::Equal => x.1.cmp(&y.1),
+            o => o,
+        });
+
+        output.sort_by(|x, y| match x.0.cmp(&y.0) {
+            Ordering::Equal => x.1.cmp(&y.1),
+            o => o,
+        });
+        assert_eq!(input, output);
     }
 }

@@ -112,7 +112,6 @@ impl LogBuilder {
 
 pub struct Logging {
     ring: Ring,
-    id: u16,
     enable_ckpt: AtomicBool,
     // save last checkpoint position, used by gc
     pub last_ckpt: AtomicU64,
@@ -139,7 +138,6 @@ impl Logging {
     const AUTO_STABLE: u32 = <usize>::trailing_zeros(32);
 
     pub(crate) fn new(
-        id: u16,
         ckpt_cnt: Arc<AtomicUsize>,
         desc: WalDescHandle,
         meta: Arc<Meta>,
@@ -149,7 +147,6 @@ impl Logging {
         let writer = GatherWriter::new(&opt.wal_file(desc.worker, desc.wal_id));
         Self {
             ring: Ring::new(opt.wal_buffer_size),
-            id,
             enable_ckpt: AtomicBool::new(false),
             last_ckpt: AtomicU64::new(desc.checkpoint),
             ckpt_cnt,
@@ -314,7 +311,7 @@ impl Logging {
 
         log::info!(
             "worker {} checkpoint {:?} curr {} last {}",
-            self.id,
+            self.desc.worker,
             unpack_id(last_ckpt),
             cur,
             self.last_data
@@ -337,21 +334,26 @@ impl Logging {
             .store(pack_id(self.log_id, self.log_off), Relaxed);
 
         self.log_off += ckpt.encoded_len() as u32;
-        self.desc.checkpoint = last_ckpt;
-        self.desc.wal_id = self.log_id;
-        let wid = self.desc.worker;
-        self.desc.sync(self.opt.desc_file(wid));
+        self.sync_desc();
+        let wid = self.desc.worker as u32;
 
         let lk = self.meta.mask.read().unwrap();
-        if !lk.test(wid as u32) {
+        if !lk.test(wid) {
             drop(lk);
             let mut lk = self.meta.mask.write().unwrap();
-            lk.set(wid as u32);
+            lk.set(wid);
             drop(lk);
             self.meta.sync(self.opt.meta_file(), false);
         }
 
         self.ckpt_cnt.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn sync_desc(&self) {
+        let mut desc = self.desc.clone();
+        desc.checkpoint = self.last_ckpt.load(Relaxed);
+        desc.wal_id = self.log_id;
+        desc.sync(self.opt.desc_file(self.desc.worker));
     }
 
     fn flush(&mut self) -> bool {
