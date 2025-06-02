@@ -36,7 +36,7 @@ pub struct Options {
     /// buffer pool element count, must > 2
     pub buffer_count: u32,
     /// B+ Tree node size, mut less than half of [`Self::buffer_size`]
-    pub page_size: u32,
+    pub page_size: u16,
     /// when should we consolidate delta chain, the best value is 16
     pub consolidate_threshold: u8,
     /// WAL ring buffer size, must greater than [`Self::page_size`] and must be power of 2
@@ -53,8 +53,8 @@ pub struct Options {
 
     // private to crate
     /// max kv size that can store directly into page
-    pub(crate) inline_size: u32,
-    pub(crate) intl_split_size: u32,
+    pub(crate) inline_size: u16,
+    pub(crate) intl_split_size: u16,
     pub(crate) max_kv_size: u32,
     pub(crate) intl_consolidate_threshold: u8,
 }
@@ -62,6 +62,7 @@ pub struct Options {
 impl Options {
     pub const DEFAULT_BUFFER_SIZE: u32 = 64 << 20; // 64MB
     pub const MAX_WORKERS: usize = 128;
+    pub const MAX_PAGE_SIZE: u16 = 16 << 10; // 16KB
 
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
@@ -102,6 +103,9 @@ impl Options {
     }
 
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
+        if self.page_size > Self::MAX_PAGE_SIZE {
+            return Err(OpCode::TooLarge);
+        }
         self.inline_size = self.page_size / 2;
         self.intl_split_size = self.page_size / 2;
         self.max_kv_size = self.buffer_size / 2;

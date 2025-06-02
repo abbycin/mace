@@ -120,11 +120,11 @@ impl IAlloc for SysTxn<'_> {
     }
 
     fn page_size(&self) -> u32 {
-        self.store.opt.page_size
+        self.store.opt.page_size as u32
     }
 
     fn limit_size(&self) -> u32 {
-        self.store.opt.inline_size
+        self.store.opt.inline_size as u32
     }
 }
 

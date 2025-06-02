@@ -861,10 +861,10 @@ impl MapBuilder {
                 crc32: h.finish() as u32,
             };
 
-            let raw = f.raw();
-            raw.write(hdr.as_slice()).unwrap();
-            f.raw().write(&v).unwrap();
-            f.raw().sync().unwrap();
+            let w = f.raw();
+            w.write(hdr.as_slice()).unwrap();
+            w.write(&v).unwrap();
+            w.sync().unwrap();
             self.size_map.insert(*id, f.size().unwrap() as usize);
         }
     }

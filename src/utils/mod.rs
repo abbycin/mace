@@ -65,12 +65,16 @@ pub(crate) const fn is_power_of_2(x: usize) -> bool {
     if x == 0 { false } else { x & (x - 1) == 0 }
 }
 
-pub(crate) fn raw_ptr_to_ref<'a, T>(x: *mut T) -> &'a T {
+pub(crate) const fn raw_ptr_to_ref<'a, T>(x: *mut T) -> &'a T {
     unsafe { &*x }
 }
 
-pub(crate) fn raw_ptr_to_ref_mut<'a, T>(x: *mut T) -> &'a mut T {
+pub(crate) const fn raw_ptr_to_ref_mut<'a, T>(x: *mut T) -> &'a mut T {
     unsafe { &mut *x }
+}
+
+pub(crate) const fn extend_slice_lifetime<T>(x: &[T]) -> &'static [T] {
+    unsafe { std::mem::transmute(x) }
 }
 
 #[macro_export]

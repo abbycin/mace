@@ -47,6 +47,10 @@ impl<T: Clone> IPageIter for ItemIter<T> {
     fn rewind(&mut self) {
         self.next = self.item.clone()
     }
+
+    fn first(&self) -> Option<Self::Item> {
+        self.next.clone()
+    }
 }
 
 pub struct SliceIter<'a, K, V>
@@ -94,6 +98,10 @@ where
     fn rewind(&mut self) {
         self.index = 0;
     }
+
+    fn first(&self) -> Option<Self::Item> {
+        self.data.first().copied()
+    }
 }
 
 pub struct SortedIter<I>
@@ -137,7 +145,7 @@ where
     O: Clone + IInfer,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
+        self.cmp(other).is_eq()
     }
 }
 
@@ -194,6 +202,10 @@ where
     fn rewind(&mut self) {
         self.iter.rewind();
         self.next = self.iter.next();
+    }
+
+    fn first(&self) -> Option<Self::Item> {
+        self.iter.first()
     }
 }
 
@@ -276,5 +288,13 @@ where
         }
         let mut h = BinaryHeap::from(v);
         std::mem::swap(&mut self.heap, &mut h);
+    }
+
+    fn first(&self) -> Option<Self::Item> {
+        if let Some(i) = self.heap.peek() {
+            i.0.first()
+        } else {
+            None
+        }
     }
 }

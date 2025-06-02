@@ -2,6 +2,8 @@ use crate::utils::bytes::ByteArray;
 
 pub trait IPageIter: Iterator {
     fn rewind(&mut self);
+
+    fn first(&self) -> Option<Self::Item>;
 }
 
 pub trait IKey: ICodec + Clone + Copy + Ord {

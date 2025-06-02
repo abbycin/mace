@@ -10,6 +10,15 @@ pub struct ByteArray {
 
 unsafe impl Send for ByteArray {}
 
+impl From<&mut [u8]> for ByteArray {
+    fn from(value: &mut [u8]) -> Self {
+        Self {
+            data: value.as_mut_ptr(),
+            size: value.len(),
+        }
+    }
+}
+
 impl ByteArray {
     pub fn alloc(size: usize) -> Self {
         let ptr = unsafe { alloc(Layout::from_size_align(size, size_of::<*const ()>()).unwrap()) };
@@ -37,6 +46,7 @@ impl ByteArray {
         self.data
     }
 
+    #[allow(unused)]
     pub fn write<T>(&self, pos: usize, val: T) {
         unsafe {
             self.data.add(pos).cast::<T>().write_unaligned(val);

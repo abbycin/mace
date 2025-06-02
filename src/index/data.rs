@@ -518,8 +518,6 @@ impl ICodec for Slot {
     }
 }
 
-pub(crate) const SLOT_LEN: usize = size_of::<u32>();
-
 #[cfg(test)]
 mod test {
     use crate::utils::{

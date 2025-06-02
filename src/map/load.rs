@@ -126,7 +126,10 @@ impl Mapping {
     pub(crate) fn load(&self, addr: u64) -> Option<FrameOwner> {
         let (id, _) = unpack_id(addr);
         let lk = self.map.read().unwrap();
-        let file_id = *lk.get(&id).unwrap();
+        let Some(&file_id) = lk.get(&id) else {
+            log::error!("can't load addr {} {:?}", addr, unpack_id(addr));
+            panic!("can't load addr {} {:?}", addr, unpack_id(addr));
+        };
 
         loop {
             if let Some(r) = self.cache.get(file_id) {

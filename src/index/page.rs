@@ -1,57 +1,29 @@
 use std::{
-    cmp::{self, Ordering},
+    cmp::Ordering,
     fmt::{Debug, Display},
     marker::PhantomData,
     ops::{Deref, DerefMut, Range},
 };
 
 use crate::{
+    cc::data::Ver,
     index::data::Key,
-    static_assert,
     utils::{
         NULL_PID,
         bytes::ByteArray,
+        raw_ptr_to_ref, raw_ptr_to_ref_mut,
         traits::{ICodec, ICollector, IDataLoader, IInfer, IKey, IPageIter, IVal, IValCodec},
         unpack_id,
     },
 };
 
 use super::{
-    data::{Index, SLOT_LEN, Slot, Value},
+    builder::{HINTS_CNT, key_to_hints},
+    data::{Index, Slot, Value},
     iter::MergeIter,
 };
 
 pub(crate) const NULL_INDEX: Index = Index::new(NULL_PID, 0);
-
-pub trait IPageHdr {
-    fn elems(&self) -> usize;
-}
-
-#[derive(Copy, Clone, Debug)]
-#[repr(C)]
-pub(crate) struct SibPageHdr {
-    pub(crate) link: u64,
-    pub(crate) elems: u32,
-    page_size: u32,
-}
-
-impl SibPageHdr {
-    pub fn init(&mut self, page_size: u32, elems: u32) {
-        self.link = 0;
-        self.elems = elems;
-        self.page_size = page_size;
-    }
-
-    pub fn link(&self) -> u64 {
-        self.link
-    }
-}
-
-impl IPageHdr for SibPageHdr {
-    fn elems(&self) -> usize {
-        self.elems as usize
-    }
-}
 
 /// - epoch , highest 48 bits
 /// - delta chain length, middle 8 bits
@@ -176,178 +148,478 @@ impl From<u8> for NodeType {
     }
 }
 
-#[repr(C)]
+#[cold]
+fn get_remote<K, V, L>(l: &L, addr: u64) -> (K, V, Option<L::Out>)
+where
+    K: IKey,
+    V: IVal,
+    L: IDataLoader,
+{
+    let f = l.load_data(addr);
+    let b = f.infer();
+    let k = K::decode_from(b);
+    let v = V::decode_from(b.skip(k.packed_size()));
+    (k, v, Some(f))
+}
+
+fn get_key<K, L>(src: *mut u8, off: usize, size: usize, l: &L) -> K
+where
+    K: IKey,
+    L: IDataLoader,
+{
+    let p = unsafe { std::slice::from_raw_parts_mut(src.add(off), size - off) };
+    let s = Slot::decode_from(p.into());
+    if s.is_inline() {
+        let tmp = &mut p[Slot::LOCAL_LEN..];
+        K::decode_from(tmp.into())
+    } else {
+        let f = l.load_data(s.addr());
+        K::decode_from(f.infer())
+    }
+}
+
+fn get_kv<F, T, K, V, L>(
+    src: *mut u8,
+    f: &F,
+    slots: &[T],
+    pos: usize,
+    size: usize,
+    l: &L,
+) -> (K, V, Option<L::Out>)
+where
+    F: Fn(&[T], usize) -> usize,
+    T: Sized,
+    K: IKey,
+    V: IVal,
+    L: IDataLoader,
+{
+    let off = f(slots, pos);
+    let p = unsafe { std::slice::from_raw_parts_mut(src.add(off), size - off) };
+    let s = Slot::decode_from(p.into());
+    if s.is_inline() {
+        let ks = &mut p[Slot::LOCAL_LEN..];
+        let k = K::decode_from(ks.into());
+        let vs = &mut p[Slot::LOCAL_LEN + k.packed_size()..];
+        let v = V::decode_from(vs.into());
+        (k, v, None)
+    } else {
+        get_remote(l, s.addr())
+    }
+}
+
+fn show_page<F, T, K, V, L>(
+    src: *mut u8,
+    f: F,
+    slots: &[T],
+    size: usize,
+    elems: usize,
+    l: &L,
+    addr: u64,
+) where
+    F: Fn(&[T], usize) -> usize,
+    T: Sized,
+    K: IKey,
+    V: IVal,
+    L: IDataLoader,
+{
+    log::debug!("------------- show page -----------",);
+    for i in 0..elems {
+        let (k, v, _) = get_kv::<F, T, K, V, L>(src, &f, slots, i, size, l);
+        log::debug!(
+            "{} => {}\t{}",
+            k.to_string(),
+            v.to_string(),
+            unpack_id(addr).1
+        );
+    }
+    log::debug!("--------------- end --------------");
+}
+
 #[derive(Clone, Copy, Default)]
-pub struct MainPageHdr {
-    pub meta: Meta,
-    /// logical link to delta or base page (file_id + offset)
-    link: u64,
-    /// NOTE: the page has same count of both key-value and key-index pair
-    pub elems: u32,
-    /// page size (including header)
-    pub len: u32,
+pub(crate) struct MainPageInner {
+    pub(crate) meta: Meta,
+    // link to delta page
+    pub(crate) link: u64,
+    pub(crate) elems: u32,
+    // total size
+    pub(crate) size: u32,
+    pub(crate) prefix_len: usize,
 }
 
-impl From<ByteArray> for MainPageHdr {
-    fn from(value: ByteArray) -> Self {
-        unsafe { *(value.data() as *const MainPageHdr) }
-    }
-}
-
-impl Debug for MainPageHdr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "PageHeader {{ {:?}, next: {} {:?}, elems: {}, len {} }}",
-            self.meta,
-            self.link,
-            unpack_id(self.link),
-            self.elems,
-            self.len,
-        ))
-    }
-}
-
-impl MainPageHdr {
-    pub fn set_link(&mut self, link: u64) -> &mut Self {
-        self.link = link;
-        self
-    }
-
-    pub fn link(&self) -> u64 {
-        self.link
-    }
-}
-
-impl IPageHdr for MainPageHdr {
-    fn elems(&self) -> usize {
-        self.elems as usize
-    }
-}
-
-impl Deref for MainPageHdr {
+impl Deref for MainPageInner {
     type Target = Meta;
     fn deref(&self) -> &Self::Target {
         &self.meta
     }
 }
 
-impl DerefMut for MainPageHdr {
+impl DerefMut for MainPageInner {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.meta
     }
 }
 
-pub const MAINPG_HDR_LEN: usize = size_of::<MainPageHdr>();
-static_assert!(MAINPG_HDR_LEN == 24);
-
-#[derive(Clone)]
-pub struct MainPage<K, V, H = MainPageHdr>
-where
-    H: IPageHdr,
-{
-    raw: ByteArray,
-    _marker: PhantomData<(K, V, H)>,
+impl From<ByteArray> for MainPageInner {
+    fn from(value: ByteArray) -> Self {
+        let p: *mut MainPageInner = value.data().cast();
+        unsafe { p.read_unaligned() }
+    }
 }
 
-pub type SibPage<K, V> = MainPage<K, V, SibPageHdr>;
+impl Debug for MainPageInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "MainPageInner {{ {:?}, next: {} {:?}, elems: {}, size: {}, prefix_len {}",
+            self.meta,
+            self.link,
+            unpack_id(self.link),
+            self.elems,
+            self.size,
+            self.prefix_len
+        ))
+    }
+}
 
-pub const SIBPG_HDR_LEN: usize = size_of::<SibPageHdr>();
+pub(crate) type MainSlotType = u64;
+pub(crate) const MAIN_SLOT_LEN: usize = size_of::<MainSlotType>();
+pub(crate) const MAIN_HDR_LEN: usize = size_of::<MainPageInner>();
+pub(crate) const MAX_PREFIX_LEN: usize = 256;
 
-impl<K, V, H> MainPage<K, V, H>
+/// the layout of main page is:
+/// ```text
+/// +---------+-------+-------------+--------+-----------+
+/// | header  | hints | index table | prefix | key-value |
+/// +---------+-------+-------------+--------+-----------+
+/// ```
+/// if the real prefix length exceed MAX_PREFIX_LEN, the prefix_len will be set to 0 to disbale the
+/// hints acceleration. additionally, for delta page the prefix_len is set to 0 too (it's elems is 1)
+#[derive(Clone, Copy)]
+pub(crate) struct MainPage<K, V> {
+    inner: *mut MainPageInner,
+    hints: &'static [u32],
+    slots: &'static [MainSlotType],
+    prefix: &'static [u8],
+    _marker: PhantomData<(K, V)>,
+}
+
+impl<K, V> Deref for MainPage<K, V> {
+    type Target = MainPageInner;
+
+    fn deref(&self) -> &Self::Target {
+        raw_ptr_to_ref(self.inner)
+    }
+}
+
+impl<K, V> DerefMut for MainPage<K, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        raw_ptr_to_ref_mut(self.inner)
+    }
+}
+
+impl<K, V> MainPage<K, V>
 where
     K: IKey,
     V: IVal,
-    H: IPageHdr,
 {
-    const HDR_LEN: usize = size_of::<H>();
-
-    pub fn from(b: ByteArray) -> Self {
-        Self {
-            raw: b,
-            _marker: PhantomData,
+    /// from a initialized address
+    pub(crate) fn from(b: ByteArray) -> Self {
+        let inner: *mut MainPageInner = b.data().cast();
+        use std::slice::from_raw_parts;
+        unsafe {
+            let hints = from_raw_parts(inner.add(1).cast::<u32>(), HINTS_CNT);
+            let slots = from_raw_parts(
+                hints.as_ptr().add(HINTS_CNT).cast::<u64>(),
+                (*inner).elems as usize,
+            );
+            let prefix = if (*inner).prefix_len == 0 {
+                [].as_slice()
+            } else {
+                from_raw_parts(
+                    slots.as_ptr().add((*inner).elems as usize).cast::<u8>(),
+                    (*inner).prefix_len,
+                )
+            };
+            Self {
+                inner,
+                hints,
+                slots,
+                prefix,
+                _marker: PhantomData,
+            }
         }
     }
 
-    pub fn raw(&self) -> ByteArray {
-        self.raw
+    /// initialize a page
+    pub(crate) fn new(b: ByteArray, hdr: MainPageInner) -> Self {
+        b.write(0, hdr);
+        Self::from(b)
     }
 
-    pub fn header(&self) -> &H {
-        unsafe { &*self.raw.data().cast::<H>() }
+    pub(crate) fn inner_mut<'a>(&mut self) -> &'a mut MainPageInner {
+        raw_ptr_to_ref_mut(self.inner)
     }
 
-    pub fn header_mut(&mut self) -> &mut H {
-        unsafe { &mut *self.raw.data().cast::<H>() }
+    fn offset(slots: &[u64], pos: usize) -> usize {
+        let (off, _) = unpack_id(slots[pos]);
+        off as usize
     }
 
-    #[inline]
-    fn offset(&self, pos: usize) -> usize {
-        self.raw.read::<u32>(Self::HDR_LEN + pos * SLOT_LEN) as usize
+    pub(crate) fn cast<K1, V1>(&self) -> MainPage<K1, V1>
+    where
+        K1: IKey,
+        V1: IVal,
+    {
+        MainPage::<K1, V1>::from(ByteArray::new(self.inner.cast(), self.size as usize))
     }
 
-    pub fn key_at<L: IDataLoader>(&self, l: &L, pos: usize) -> K {
-        let off = self.offset(pos);
-        debug_assert!(self.raw.len() > off);
-        let o = Slot::decode_from(self.raw.skip(off));
-        if o.is_inline() {
-            K::decode_from(self.raw.skip(off + Slot::LOCAL_LEN))
-        } else {
-            let f = l.load_data(o.addr());
-            K::decode_from(f.infer())
-        }
+    pub(crate) fn key_at<L: IDataLoader>(&self, l: &L, pos: usize) -> K {
+        get_key(
+            self.inner.cast(),
+            Self::offset(self.slots, pos),
+            self.size as usize,
+            l,
+        )
     }
 
     #[allow(unused)]
-    pub fn val_at<L: IDataLoader>(&self, l: &L, pos: usize) -> V {
+    pub(crate) fn val_at<L: IDataLoader>(&self, l: &L, pos: usize) -> V {
         let (_, v, _) = self.get_unchecked(l, pos);
         v
     }
 
-    #[inline(always)]
-    pub fn get<L: IDataLoader>(
-        &self,
-        l: &L,
-        pos: usize,
-        elems: usize,
-    ) -> Option<(K, V, Option<L::Out>)> {
-        if pos < elems {
+    pub(crate) fn get_unchecked<L>(&self, l: &L, pos: usize) -> (K, V, Option<L::Out>)
+    where
+        L: IDataLoader,
+    {
+        get_kv(
+            self.inner.cast(),
+            &Self::offset,
+            self.slots,
+            pos,
+            self.size as usize,
+            l,
+        )
+    }
+
+    pub(crate) fn get<L>(&self, l: &L, pos: usize) -> Option<(K, V, Option<L::Out>)>
+    where
+        L: IDataLoader,
+    {
+        if pos < self.elems as usize {
             Some(self.get_unchecked(l, pos))
         } else {
             None
         }
     }
 
-    #[cold]
-    fn get_remote<L: IDataLoader>(&self, l: &L, addr: u64) -> (K, V, Option<L::Out>) {
-        let f = l.load_data(addr);
-        let b = f.infer();
-        let k = K::decode_from(b);
-        let v = V::decode_from(b.skip(k.packed_size()));
-        (k, v, Some(f))
+    pub(crate) fn search_hints(&self, k: &[u8]) -> (usize, usize) {
+        let elems = self.elems as usize;
+        let step = elems / (HINTS_CNT + 1);
+        let mut l = 0;
+        let cnt = HINTS_CNT.min(elems);
+        let hint = key_to_hints(k.raw());
+
+        while l < cnt {
+            if self.hints[l] >= hint {
+                break;
+            }
+            l += 1;
+        }
+
+        let mut r = l;
+        while r < cnt {
+            if self.hints[r] != hint {
+                break;
+            }
+            r += 1;
+        }
+
+        (l * step, if r < cnt { (r + 1) * step } else { elems })
     }
 
-    pub fn get_unchecked<L: IDataLoader>(&self, l: &L, pos: usize) -> (K, V, Option<L::Out>) {
-        let off = self.offset(pos);
-        let o = Slot::decode_from(self.raw.skip(off));
-        if o.is_inline() {
-            let oz = Slot::LOCAL_LEN;
-            let k = K::decode_from(self.raw.skip(off + oz));
-            let v = V::decode_from(self.raw.skip(off + oz + k.packed_size()));
-            (k, v, None)
+    fn compare_prefix(lhs: &[u8], rhs: &[u8]) -> i32 {
+        let len = lhs.len().min(rhs.len());
+        let o = lhs[..len].cmp(&rhs[..len]) as i32;
+        let diff = lhs.len() as i32 - rhs.len() as i32;
+        if o != 0 { o } else { diff }
+    }
+
+    fn shrink_range(&self, raw: &[u8]) -> Result<(usize, usize), usize> {
+        let x = if self.prefix_len != 0 {
+            let prefix = &raw[..self.prefix_len.min(raw.len())];
+            let o = Self::compare_prefix(prefix, self.prefix);
+            if o < 0 {
+                return Err(0);
+            } else if o > 0 {
+                return Err(self.elems as usize);
+            }
+            self.search_hints(&raw[self.prefix_len..])
         } else {
-            self.get_remote(l, o.addr())
+            self.search_hints(raw)
+        };
+        Ok(x)
+    }
+
+    pub(crate) fn search_by<L, F>(&self, l: &L, key: &K, f: F) -> Result<usize, usize>
+    where
+        L: IDataLoader,
+        F: Fn(&K, &K) -> Ordering,
+    {
+        let (mut lo, mut hi) = self.shrink_range(key.raw())?;
+        // here we can shrink search range by using hints and then do binary search using key without
+        // prefix, but this will add more branch misses
+        while lo < hi {
+            let mid = lo + ((hi - lo) >> 1);
+            let k = self.key_at(l, mid);
+            match f(&k, key) {
+                Ordering::Equal => return Ok(mid),
+                Ordering::Greater => hi = mid,
+                Ordering::Less => lo = mid + 1,
+            }
+        }
+        Err(lo)
+    }
+
+    #[inline]
+    pub(crate) fn search<L>(&self, l: &L, k: &K) -> Result<usize, usize>
+    where
+        L: IDataLoader,
+    {
+        self.search_by(l, k, |x, y| x.cmp(y))
+    }
+
+    #[inline]
+    pub(crate) fn search_raw<L>(&self, l: &L, k: &K) -> Result<usize, usize>
+    where
+        L: IDataLoader,
+    {
+        self.search_by(l, k, |x, y| x.raw().cmp(y.raw()))
+    }
+
+    #[allow(unused)]
+    pub(crate) fn show<L>(&self, l: &L, addr: u64)
+    where
+        L: IDataLoader,
+    {
+        show_page::<_, _, K, V, L>(
+            self.inner.cast(),
+            &Self::offset,
+            self.slots,
+            self.size as usize,
+            self.elems as usize,
+            l,
+            addr,
+        );
+    }
+}
+
+pub(crate) struct VerPageInner {
+    pub(crate) link: u64,
+    pub(crate) elems: u32,
+    pub(crate) size: u32,
+}
+
+impl<T> Deref for VerPage<T>
+where
+    T: IValCodec,
+{
+    type Target = VerPageInner;
+
+    fn deref(&self) -> &Self::Target {
+        raw_ptr_to_ref(self.inner)
+    }
+}
+
+impl<T> DerefMut for VerPage<T>
+where
+    T: IValCodec,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        raw_ptr_to_ref_mut(self.inner)
+    }
+}
+
+pub(crate) type VerSlotType = u32;
+pub(crate) const VER_HDR_LEN: usize = size_of::<VerPageInner>();
+pub(crate) const VER_SLOT_LEN: usize = size_of::<VerSlotType>();
+
+/// the version page layout is:
+/// ```text
+/// +--------+--------------+---------------+
+/// | header | index table  | version-value |
+/// +--------+--------------+---------------+
+/// ```
+pub(crate) struct VerPage<T: IValCodec> {
+    inner: *mut VerPageInner,
+    slots: &'static [VerSlotType],
+    _marker: PhantomData<T>,
+}
+
+impl<T> VerPage<T>
+where
+    T: IValCodec,
+{
+    /// from a initialized address
+    pub(crate) fn from(b: ByteArray) -> Self {
+        let inner: *mut VerPageInner = b.data().cast();
+        let slots = unsafe {
+            let elems = (*inner).elems as usize;
+            std::slice::from_raw_parts(inner.add(1).cast::<u32>(), elems)
+        };
+        Self {
+            inner,
+            slots,
+            _marker: PhantomData,
         }
     }
 
-    /// NOTE: no duplication is allowed
-    pub(crate) fn lower_bound<L: IDataLoader>(&self, l: &L, key: &K) -> Result<usize, usize> {
-        let cnt = self.header().elems();
-        let mut lo: usize = 0;
-        let mut hi: usize = cnt;
+    /// initialize a page
+    pub(crate) fn new(b: ByteArray, hdr: VerPageInner) -> Self {
+        b.write(0, hdr);
+        Self::from(b)
+    }
+
+    fn offset(slots: &[u32], pos: usize) -> usize {
+        slots[pos] as usize
+    }
+
+    fn key_at<L>(&self, l: &L, pos: usize) -> Ver
+    where
+        L: IDataLoader,
+    {
+        get_key(
+            self.inner.cast(),
+            Self::offset(self.slots, pos),
+            self.size as usize,
+            l,
+        )
+    }
+
+    pub(crate) fn get_unchecked<L>(&self, l: &L, pos: usize) -> (Ver, Value<T>, Option<L::Out>)
+    where
+        L: IDataLoader,
+    {
+        get_kv(
+            self.inner.cast(),
+            &Self::offset,
+            self.slots,
+            pos,
+            self.size as usize,
+            l,
+        )
+    }
+
+    pub(crate) fn lower_bound<L>(&self, l: &L, k: &Ver) -> Result<usize, usize>
+    where
+        L: IDataLoader,
+    {
+        let cnt = self.elems as usize;
+        let mut lo = 0;
+        let mut hi = cnt;
 
         while lo < hi {
             let mid = lo + ((hi - lo) >> 1);
-            match self.key_at(l, mid).cmp(key) {
+            match self.key_at(l, mid).cmp(k) {
                 Ordering::Less => lo = mid + 1,
                 _ => hi = mid,
             }
@@ -356,53 +628,19 @@ where
         if lo == cnt { Err(lo) } else { Ok(lo) }
     }
 
-    fn search_by<L, F>(&self, l: &L, key: &K, f: F) -> Result<usize, usize>
+    pub(crate) fn show<L>(&self, l: &L, addr: u64)
     where
         L: IDataLoader,
-        F: Fn(&K, &K) -> Ordering,
     {
-        let h = self.header();
-        let mut lo = 0;
-        let mut hi = h.elems();
-
-        while lo < hi {
-            let mid = lo + ((hi - lo) >> 1);
-            let k = self.key_at(l, mid);
-            match f(&k, key) {
-                cmp::Ordering::Equal => return Ok(mid),
-                cmp::Ordering::Greater => {
-                    hi = mid;
-                }
-                cmp::Ordering::Less => {
-                    lo = mid + 1;
-                }
-            }
-        }
-        Err(lo)
-    }
-
-    pub fn search<L: IDataLoader>(&self, l: &L, key: &K) -> Result<usize, usize> {
-        self.search_by(l, key, |x, y| x.cmp(y))
-    }
-
-    pub fn search_raw<L: IDataLoader>(&self, l: &L, key: &K) -> Result<usize, usize> {
-        self.search_by(l, key, |x, y| x.raw().cmp(y.raw()))
-    }
-
-    #[allow(dead_code)]
-    pub fn show<L: IDataLoader>(&self, l: &L, addr: u64) {
-        let n = self.header().elems();
-        log::debug!("------------- show page -----------",);
-        for i in 0..n {
-            let (k, v, _) = self.get_unchecked(l, i);
-            log::debug!(
-                "{} => {}\t{}",
-                k.to_string(),
-                v.to_string(),
-                unpack_id(addr).1
-            );
-        }
-        log::debug!("--------------- end --------------");
+        show_page::<_, _, Ver, Value<T>, L>(
+            self.inner.cast(),
+            &Self::offset,
+            self.slots,
+            self.size as usize,
+            self.elems as usize,
+            l,
+            addr,
+        );
     }
 }
 
@@ -472,6 +710,10 @@ where
     fn rewind(&mut self) {
         self.index = self.range.start;
     }
+
+    fn first(&self) -> Option<Self::Item> {
+        self.page.get(&self.l, 0)
+    }
 }
 
 impl<K, V, L> Iterator for RangeIterAdaptor<K, V, L>
@@ -499,6 +741,10 @@ where
 {
     fn rewind(&mut self) {
         self.iter.rewind();
+    }
+
+    fn first(&self) -> Option<Self::Item> {
+        self.iter.first().map(|(k, v, _)| (k, v))
     }
 }
 
@@ -551,6 +797,10 @@ where
 {
     fn rewind(&mut self) {
         self.iter.rewind();
+    }
+
+    fn first(&self) -> Option<Self::Item> {
+        self.iter.first()
     }
 }
 
@@ -615,6 +865,10 @@ impl<'a, T: IValCodec> LeafMergeIter<'a, T> {
     pub fn sort(&mut self) {
         // stable sort for less cache/branch misses
         self.data.sort_by(|x, y| x.0.cmp(&y.0));
+    }
+
+    pub fn first(&self) -> Option<(Key, Value<T>)> {
+        self.data.first().copied()
     }
 
     pub fn retain<F>(&mut self, mut f: F)
@@ -765,29 +1019,32 @@ where
         self.iter.rewind();
         self.last = None;
     }
+
+    fn first(&self) -> Option<Self::Item> {
+        self.iter.first().map(|(k, v, _)| (k, v))
+    }
 }
 
 #[cfg(test)]
 mod test {
-
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering::Relaxed;
 
     use crate::OpCode;
     use crate::index::IAlloc;
-    use crate::index::builder::Delta;
+    use crate::index::builder::{Delta, HINTS_LEN};
     use crate::index::data::{Index, Key, Slot, Value};
     use crate::index::iter::MergeIterBuilder;
     use crate::index::page::{
-        DeltaType, MAINPG_HDR_LEN, MainPage, NodeType, PageMergeIter, SLOT_LEN,
+        DeltaType, MAIN_HDR_LEN, MAIN_SLOT_LEN, MainPage, MainPageInner, NodeType, PageMergeIter,
     };
     use crate::map::data::{FrameOwner, FrameRef};
     use crate::utils::block::Block;
     use crate::utils::traits::{ICodec, ICollector, IDataLoader, IKey, IVal};
     use crate::utils::{AMutRef, pack_id};
 
-    use super::{IntlMergeIter, MainPageHdr, Meta, NULL_INDEX, RangeIter};
+    use super::{IntlMergeIter, Meta, NULL_INDEX, RangeIter};
 
     #[test]
     fn test_meta() {
@@ -884,7 +1141,7 @@ mod test {
             .map(|(k, v)| (Key::new(k.as_bytes(), 0, 0), (Value::Put(v.as_bytes()))))
             .collect();
         let mut delta = Delta::new(DeltaType::Data, NodeType::Leaf).with_slice(da.page_size(), &kv);
-        let x = Block::aligned_alloc(delta.size(), align_of::<MainPageHdr>());
+        let x = Block::aligned_alloc(delta.size(), align_of::<MainPageInner>());
         let a = x.view(0, x.len());
 
         let h = delta.build(a, &mut da);
@@ -893,13 +1150,13 @@ mod test {
         assert!(h.meta.is_leaf());
         let k = Key::new("key1".as_bytes(), 0, 0);
         let v = Value::Put("val1".as_bytes());
-        let hdr_size = MAINPG_HDR_LEN;
-        let index_table_size = h.elems as usize * SLOT_LEN;
-        let slot_sz = Slot::inline().packed_size();
-        let expect_len = (k.packed_size() + v.packed_size() + slot_sz) * pairs.len()
-            + hdr_size
+        let hdr_size = MAIN_HDR_LEN;
+        let index_table_size = h.elems as usize * MAIN_SLOT_LEN;
+        let expect_len = (k.packed_size() + v.packed_size() + Slot::LOCAL_LEN) * pairs.len()
+            + hdr_size + "key".len() // prefix
+            + HINTS_LEN
             + index_table_size;
-        assert_eq!(h.len as usize, expect_len);
+        assert_eq!(h.size as usize, expect_len);
 
         let page = MainPage::<Key, Value<&[u8]>>::from(a);
 
@@ -938,7 +1195,7 @@ mod test {
         let kv = [(k, v)];
 
         let mut delta = Delta::new(DeltaType::Data, NodeType::Leaf).with_slice(da.page_size(), &kv);
-        let x = Block::aligned_alloc(delta.size(), align_of::<MainPageHdr>());
+        let x = Block::aligned_alloc(delta.size(), align_of::<MainPageInner>());
         let a = x.view(0, x.len());
 
         delta.build(a, &mut da);
@@ -986,51 +1243,40 @@ mod test {
         let mut delta3 =
             Delta::new(DeltaType::Data, NodeType::Intl).with_slice(da.page_size(), &s3);
 
-        let x1 = Block::aligned_alloc(delta1.size(), align_of::<MainPageHdr>());
-        let x2 = Block::aligned_alloc(delta1.size(), align_of::<MainPageHdr>());
-        let x3 = Block::aligned_alloc(delta1.size(), align_of::<MainPageHdr>());
+        let x1 = Block::aligned_alloc(delta1.size(), align_of::<MainPageInner>());
+        let x2 = Block::aligned_alloc(delta1.size(), align_of::<MainPageInner>());
+        let x3 = Block::aligned_alloc(delta1.size(), align_of::<MainPageInner>());
         let b1 = x1.view(0, x1.len());
         let b2 = x2.view(0, x2.len());
         let b3 = x3.view(0, x3.len());
-
-        let pg1 = MainPage::<&[u8], Index>::from(b1);
-        let pg2 = MainPage::<&[u8], Index>::from(b2);
-        let pg3 = MainPage::<&[u8], Index>::from(b3);
 
         delta1.build(b1, &mut da);
         delta2.build(b2, &mut da);
         delta3.build(b3, &mut da);
 
-        must_match(s1.into_iter(), &loader, pg1.clone());
-        must_match(s2.into_iter(), &loader, pg2.clone());
-        must_match(s3.into_iter(), &loader, pg3.clone());
+        let pg1 = MainPage::<&[u8], Index>::from(b1);
+        let pg2 = MainPage::<&[u8], Index>::from(b2);
+        let pg3 = MainPage::<&[u8], Index>::from(b3);
+
+        must_match(s1.into_iter(), &loader, pg1);
+        must_match(s2.into_iter(), &loader, pg2);
+        must_match(s3.into_iter(), &loader, pg3);
 
         let mut builder = MergeIterBuilder::new(3);
 
-        builder.add(RangeIter::new(
-            pg1.clone(),
-            loader.clone(),
-            0..pg1.header().elems as usize,
-        ));
-        builder.add(RangeIter::new(
-            pg2.clone(),
-            loader.clone(),
-            0..pg2.header().elems as usize,
-        ));
-        builder.add(RangeIter::new(
-            pg3.clone(),
-            loader.clone(),
-            0..pg3.header().elems as usize,
-        ));
+        builder.add(RangeIter::new(pg1, loader.clone(), 0..pg1.elems as usize));
+        builder.add(RangeIter::new(pg2, loader.clone(), 0..pg2.elems as usize));
+        builder.add(RangeIter::new(pg3, loader.clone(), 0..pg3.elems as usize));
 
         let mut coll = Coll;
         let iter = IntlMergeIter::new(PageMergeIter::new(builder.build(), None), &mut coll, 0);
         let mut delta = Delta::new(DeltaType::Data, NodeType::Intl).from(iter, da.page_size());
-        let x4 = Block::aligned_alloc(delta.size(), align_of::<MainPageHdr>());
+        let x4 = Block::aligned_alloc(delta.size(), align_of::<MainPageInner>());
         let b = x4.view(0, x4.len());
-        let pg = MainPage::<&[u8], Index>::from(b);
 
         delta.build(b, &mut da);
+
+        let pg = MainPage::<&[u8], Index>::from(b);
 
         let expact = [
             ([].as_slice(), Index::new(1, 0)),

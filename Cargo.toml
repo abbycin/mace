@@ -22,3 +22,5 @@ extra_check = []
 [profile.release]
 opt-level = 3
 lto = true
+debug = "line-tables-only"
+panic = "abort"

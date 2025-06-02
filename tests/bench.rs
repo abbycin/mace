@@ -12,7 +12,7 @@ fn bench() {
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let cap = 100000;
-    let mut pair = Vec::with_capacity(cap);
+    let mut pair: Vec<String> = Vec::with_capacity(cap);
 
     for i in 0..cap {
         pair.push(format!("{:08}", i));
