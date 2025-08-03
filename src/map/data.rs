@@ -1,41 +1,40 @@
 use crc32c::Crc32cHasher;
+use dashmap::DashMap;
 use io::{File, GatherIO};
 
+use crate::types::header::TagFlag;
+use crate::types::refbox::BoxRef;
+use crate::types::traits::IAsSlice;
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
 use crate::utils::data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, PageTable, Reloc};
 use crate::utils::lru::LruInner;
-use crate::utils::traits::{IAsSlice, IInfer};
-use crate::utils::{MutRef, align_up, rand_range, unpack_id};
-use crate::utils::{bytes::ByteArray, raw_ptr_to_ref, raw_ptr_to_ref_mut};
+use crate::utils::{Handle, INVALID_ID, NULL_PID, pack_id, raw_ptr_to_ref};
+use crate::utils::{MutRef, NULL_ADDR, rand_range};
 use crate::{OpCode, Options};
-use std::alloc::alloc_zeroed;
+use std::cell::Cell;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt::Debug;
 use std::hash::Hasher;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::ptr::null;
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering::{Relaxed, Release};
-use std::{
-    alloc::{Layout, dealloc},
-    ops::{Deref, DerefMut},
-};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64};
 
-use super::cache::DeepCopy;
-
-/// NOTE: the field except `file_id` will be changed, up1 and up2 change on new write, nr_active
+/// NOTE: the fields except `file_id` will be changed, up1 and up2 change on new write, nr_active
 /// and active_size change when flush have new deallocate frame point to current file_id
 pub(crate) struct FileStat {
     pub(crate) file_id: u32,
+    /// up1 and up2, see [Efficiently Reclaiming Space in a Log Structured Store](https://ieeexplore.ieee.org/document/9458684)
     pub(crate) up1: u32,
     pub(crate) up2: u32,
     pub(crate) nr_active: u32,
-    pub(crate) active_size: u32,
+    pub(crate) active_size: usize,
     // the following two field will never change
     pub(crate) total: u32,
-    pub(crate) total_size: u32,
+    pub(crate) total_size: usize,
     /// when an active frame was deallocated, mask it in the bitmap
     pub(crate) dealloc: BitMap,
     pub(crate) refcnt: AtomicU32,
@@ -44,7 +43,7 @@ pub(crate) struct FileStat {
 impl FileStat {
     pub(crate) fn update(&mut self, reloc: Reloc, now: u32) {
         self.nr_active -= 1;
-        self.active_size -= reloc.len;
+        self.active_size -= reloc.len as usize;
         self.dealloc.set(reloc.seq);
         // make sure monotonically increasing
         if self.up1 < now {
@@ -98,264 +97,6 @@ impl Drop for StatHandle {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum FrameFlag {
-    Normal = 1,
-    TombStone = 3,
-    /// a frame contains addrs point to other arena
-    Junk = 11,
-    Unknown = 13,
-}
-
-#[derive(Debug)]
-pub struct Frame {
-    /// the pid and addr is runtime info used to build mapping table during flush, it's useless when
-    /// load from file
-    pid: u64,
-    /// pack_id(file_id, offset)
-    addr: u64,
-    /// borrowed
-    borrowed: *const AtomicU32,
-    /// payload size
-    size: u32,
-    flag: FrameFlag,
-    owned: u8,
-    refcnt: AtomicU32,
-}
-
-impl Frame {
-    pub(crate) const FRAME_LEN: usize = size_of::<Self>();
-
-    pub fn alloc_size(request: u32) -> u32 {
-        align_up(Self::FRAME_LEN + request as usize, size_of::<usize>()) as u32
-    }
-
-    /// NOTE: the `size` is payload size
-    pub fn init(&mut self, cnt: *const AtomicU32, addr: u64, flag: FrameFlag) {
-        self.addr = addr;
-        self.flag = flag;
-        self.pid = 0;
-        self.owned = 0;
-        self.borrowed = cnt;
-        self.refcnt.store(0, Relaxed);
-    }
-
-    // only can be use when traverse arena and deallocate frame itself
-    pub fn size(&self) -> u32 {
-        Self::alloc_size(self.size)
-    }
-
-    pub fn addr(&self) -> u64 {
-        self.addr
-    }
-
-    pub fn payload_size(&self) -> u32 {
-        self.size
-    }
-
-    pub fn set_size(&mut self, size: u32) {
-        self.size = size;
-    }
-
-    pub fn set_addr(&mut self, addr: u64) {
-        self.addr = addr;
-    }
-
-    pub fn set_pid(&mut self, pid: u64) {
-        debug_assert_eq!(self.pid, 0);
-        debug_assert!(self.flag == FrameFlag::Unknown || self.flag == FrameFlag::TombStone);
-        self.pid = pid;
-        self.flag = FrameFlag::Normal;
-    }
-
-    pub fn page_id(&self) -> u64 {
-        self.pid
-    }
-
-    pub fn flag(&self) -> FrameFlag {
-        self.flag
-    }
-
-    pub fn set_tombstone(&mut self) {
-        self.flag = FrameFlag::TombStone;
-    }
-
-    pub fn set_normal(&mut self) {
-        debug_assert_eq!(self.flag, FrameFlag::Unknown);
-        self.flag = FrameFlag::Normal;
-    }
-
-    pub fn fill_junk(&mut self, junks: &[u64]) {
-        self.flag = FrameFlag::Junk;
-        let ptr = self as *mut Self;
-        let dst = unsafe {
-            std::slice::from_raw_parts_mut(
-                ptr.add(1).cast::<u64>(),
-                self.payload_size() as usize / JUNK_LEN,
-            )
-        };
-        dst.copy_from_slice(junks);
-    }
-}
-
-impl DeepCopy for FrameOwner {
-    // NOTE: excluding `borrowed`
-    fn deep_copy(self) -> Self {
-        if self.owned == 1 {
-            return self;
-        }
-        let mut other = FrameOwner::alloc(self.payload_size() as usize);
-        debug_assert_eq!(self.size(), other.size());
-        let src = self.payload();
-        let dst = other.payload();
-        assert_eq!(src.len(), dst.len());
-        unsafe {
-            std::ptr::copy(src.data(), dst.data(), dst.len());
-        }
-        debug_assert!(other.borrowed.is_null());
-        // used in gc
-        other.set_addr(self.addr);
-        other
-    }
-}
-
-pub struct FrameOwner {
-    raw: *mut Frame,
-}
-
-unsafe impl Send for FrameOwner {}
-unsafe impl Sync for FrameOwner {}
-
-impl IInfer for FrameOwner {
-    fn infer(&self) -> ByteArray {
-        self.payload()
-    }
-}
-
-impl Deref for FrameOwner {
-    type Target = Frame;
-    fn deref(&self) -> &Self::Target {
-        raw_ptr_to_ref(self.raw)
-    }
-}
-
-impl DerefMut for FrameOwner {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        raw_ptr_to_ref_mut(self.raw)
-    }
-}
-
-impl FrameOwner {
-    pub(crate) fn alloc(size: usize) -> Self {
-        let real_size = Frame::alloc_size(size as u32);
-        let raw = unsafe {
-            let f = alloc_zeroed(Layout::array::<*const ()>(real_size as usize).unwrap())
-                .cast::<Frame>();
-            &mut *f
-        };
-        raw.size = size as u32;
-        raw.flag = FrameFlag::Unknown;
-        raw.owned = 1;
-        raw.borrowed = null();
-        raw.refcnt.store(1, Relaxed);
-        Self { raw }
-    }
-
-    pub(crate) fn from(raw: *mut Frame) -> Self {
-        unsafe {
-            let b = (*raw).borrowed;
-            if !b.is_null() {
-                (*b).fetch_add(1, Relaxed);
-            }
-        }
-        Self { raw }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn as_ref(&self) -> FrameRef {
-        FrameRef::new(self.raw)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn data(&self) -> ByteArray {
-        ByteArray::new(self.raw as *mut u8, self.size() as usize)
-    }
-
-    pub fn payload(&self) -> ByteArray {
-        let ptr = unsafe { self.raw.add(1).cast::<u8>() };
-        ByteArray::new(ptr, self.payload_size() as usize)
-    }
-}
-
-impl Drop for FrameOwner {
-    fn drop(&mut self) {
-        if !self.borrowed.is_null() {
-            unsafe {
-                (*self.borrowed).fetch_sub(1, Relaxed);
-            }
-        }
-        if self.owned == 1 && self.refcnt.fetch_sub(1, Relaxed) == 1 {
-            unsafe {
-                dealloc(
-                    self.raw as *mut u8,
-                    Layout::array::<*const ()>(self.size() as usize).unwrap(),
-                );
-            }
-        }
-    }
-}
-
-impl Clone for FrameOwner {
-    fn clone(&self) -> Self {
-        if !self.borrowed.is_null() {
-            unsafe {
-                (*self.borrowed).fetch_add(1, Relaxed);
-            }
-        }
-        if self.owned == 1 {
-            self.refcnt.fetch_add(1, Relaxed);
-        }
-        Self { raw: self.raw }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct FrameRef {
-    raw: *mut Frame,
-}
-
-unsafe impl Send for FrameRef {}
-unsafe impl Sync for FrameRef {}
-
-impl Deref for FrameRef {
-    type Target = Frame;
-    fn deref(&self) -> &Self::Target {
-        raw_ptr_to_ref(self.raw)
-    }
-}
-
-impl DerefMut for FrameRef {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        raw_ptr_to_ref_mut(self.raw)
-    }
-}
-
-impl FrameRef {
-    pub(crate) fn new(ptr: *mut Frame) -> Self {
-        Self { raw: ptr }
-    }
-
-    pub(crate) fn payload(&self) -> ByteArray {
-        let ptr = unsafe { self.raw.add(1).cast::<u8>() };
-        ByteArray::new(ptr, self.payload_size() as usize)
-    }
-
-    fn payload_slice(&self) -> &[u8] {
-        self.payload().as_slice(0, self.payload_size() as usize)
-    }
-}
-
 pub(crate) struct FlushData {
     id: u32,
     pub(crate) iter: ArenaIter,
@@ -378,36 +119,237 @@ impl FlushData {
     }
 }
 
+// use C repr to fix the layout
+#[repr(C)]
+pub(crate) struct Arena {
+    items: DashMap<u64, BoxRef>,
+    id: Cell<u32>,
+    pub(crate) flsn: AtomicU32,
+    real_size: AtomicU64,
+    offset: AtomicU64,
+    mutref: AtomicU16,
+    refcnt: AtomicU16,
+    cap: u32,
+    pub(crate) idx: u16,
+    pub(crate) state: AtomicU8,
+    dirty: AtomicU8,
+}
+
+impl Deref for Arena {
+    type Target = DashMap<u64, BoxRef>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ArenaIter {
-    raw: ByteArray,
-    pos: u32,
-    end: u32,
+    arena: Handle<Arena>,
 }
 
 impl ArenaIter {
-    pub(crate) fn new(raw: ByteArray, end: u32) -> Self {
-        Self { raw, pos: 0, end }
-    }
-}
-
-impl Iterator for ArenaIter {
-    type Item = FrameRef;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos == self.end {
-            return None;
+    pub(crate) fn new(raw: *mut Arena) -> Self {
+        Self {
+            arena: Handle::from(raw),
         }
-        let f = unsafe {
-            let data = self.raw.data().add(self.pos as usize).cast::<Frame>();
-            FrameRef::new(data)
-        };
-
-        self.pos += f.size();
-
-        Some(f)
     }
 }
+
+impl Deref for ArenaIter {
+    type Target = DashMap<u64, BoxRef>;
+    fn deref(&self) -> &Self::Target {
+        &self.arena.items
+    }
+}
+
+impl Arena {
+    /// memory can be allocated
+    pub(crate) const HOT: u8 = 4;
+    /// memory no longer available for allocating
+    pub(crate) const WARM: u8 = 3;
+    /// waiting for flush
+    pub(crate) const COLD: u8 = 2;
+    /// flushed to disk
+    pub(crate) const FLUSH: u8 = 1;
+
+    const FRESH: u8 = 0;
+    const STALE: u8 = 1;
+    const DIRTY: u8 = 2;
+
+    pub(crate) fn new(cap: u32, idx: usize) -> Self {
+        Self {
+            items: DashMap::with_capacity(64 << 10),
+            flsn: AtomicU32::new(0),
+            id: Cell::new(INVALID_ID),
+            mutref: AtomicU16::new(0),
+            refcnt: AtomicU16::new(0),
+            offset: AtomicU64::new(0),
+            real_size: AtomicU64::new(0),
+            cap,
+            idx: idx as u16,
+            state: AtomicU8::new(Self::FLUSH),
+            dirty: AtomicU8::new(Self::FRESH),
+        }
+    }
+
+    pub(crate) fn reset(&self, id: u32, flsn: u32) {
+        self.id.set(id);
+        self.flsn.store(flsn, Relaxed);
+        self.dirty.store(Self::FRESH, Relaxed);
+        assert_eq!(self.state(), Self::HOT);
+        self.offset.store(0, Relaxed);
+        self.items.clear();
+        self.real_size.store(0, Relaxed);
+
+        #[cfg(feature = "extra_check")]
+        {
+            assert!(self.unref());
+            assert!(self.balanced());
+        }
+    }
+
+    fn alloc_size(&self, size: u32) -> Result<u32, OpCode> {
+        if size > self.cap {
+            return Err(OpCode::TooLarge);
+        }
+
+        let off = self.offset.fetch_add(size as u64, Relaxed);
+        if off >= u32::MAX as u64 {
+            return Err(OpCode::NeedMore);
+        }
+
+        let mut cur = self.real_size.load(Relaxed);
+        loop {
+            // it's possible that other thread change the state to WARM
+            if self.state() != Self::HOT {
+                return Err(OpCode::Again);
+            }
+
+            let new = cur + size as u64;
+            if new > self.cap as u64 {
+                return Err(OpCode::NeedMore);
+            }
+
+            match self.real_size.compare_exchange(cur, new, AcqRel, Acquire) {
+                Ok(_) => break,
+                Err(e) => cur = e,
+            }
+        }
+        Ok(off as u32)
+    }
+
+    fn alloc_at(&self, off: u32, size: u32) -> BoxRef {
+        let addr = pack_id(self.id.get(), off);
+        let p = BoxRef::alloc(size, addr);
+        self.items.insert(addr, p.clone());
+        p
+    }
+
+    pub fn alloc(&self, size: u32) -> Result<BoxRef, OpCode> {
+        let real_size = BoxRef::real_size(size);
+        self.inc_ref();
+        let offset = self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
+        Ok(self.alloc_at(offset, size))
+    }
+
+    pub(crate) fn used(&self) -> ArenaIter {
+        ArenaIter::new(self as *const Self as *mut _)
+    }
+
+    #[inline]
+    pub(crate) fn load(&self, off: u32) -> BoxRef {
+        let addr = pack_id(self.id(), off);
+        self.items.get(&addr).unwrap().value().clone()
+    }
+
+    pub(crate) fn set_state(&self, cur: u8, new: u8) -> u8 {
+        // we don't care if it's success, what we want is the `dirty` flag either be STALE or DIRTY
+        self.set_dirty(Self::FRESH, Self::STALE);
+        self.state
+            .compare_exchange(cur, new, AcqRel, Acquire)
+            .unwrap_or_else(|x| x)
+    }
+
+    pub(crate) fn state(&self) -> u8 {
+        self.state.load(Relaxed)
+    }
+
+    fn set_dirty(&self, cur: u8, new: u8) {
+        let _ = self.dirty.compare_exchange(cur, new, Relaxed, Relaxed);
+    }
+
+    pub(crate) fn mark_dirty(&self) {
+        self.set_dirty(Self::FRESH, Self::DIRTY);
+    }
+
+    /// we can't remove entry, althrough it has performance boostup, but it may cause further lookup
+    /// fail (because we allow load from WARM and COLD arena which is not flushed)
+    ///
+    /// if we backup the removed entry, the previous boostup will be lost and it will slow down front
+    /// thread
+    #[allow(unused)]
+    pub(crate) fn recycle(&self, addr: &u64) -> bool {
+        if let Some(mut x) = self.items.get_mut(addr) {
+            let h = x.value_mut().header_mut();
+            h.flag = TagFlag::TombStone;
+            let old = self.real_size.fetch_sub(h.total_size as u64, AcqRel);
+            debug_assert!(old >= h.total_size as u64);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty.load(Relaxed) == Self::DIRTY
+    }
+
+    pub(crate) fn inc_ref(&self) {
+        self.mutref.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn dec_ref(&self) {
+        self.mutref.fetch_sub(1, Relaxed);
+    }
+
+    pub(crate) fn unref(&self) -> bool {
+        self.mutref.load(Relaxed) == 0
+    }
+
+    pub(crate) fn acquire(&self) {
+        self.refcnt.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn release(&self) {
+        self.refcnt.fetch_sub(1, Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn balanced(&self) -> bool {
+        self.refcnt.load(Relaxed) == 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn id(&self) -> u32 {
+        self.id.get()
+    }
+}
+
+impl Debug for Arena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Arena")
+            .field("items ", &self.items.len())
+            .field("idx", &self.idx)
+            .field("state", &self.state)
+            .field("offset", &self.offset)
+            .field("flsn", &self.flsn.load(Relaxed))
+            .field("id", &self.id.get())
+            .field("refcnt", &self.refcnt)
+            .finish()
+    }
+}
+
 /// the layout of a flushed arena is:
 /// ```text
 /// high                                                     low
@@ -427,10 +369,12 @@ pub(crate) struct DataFooter {
     pub(crate) nr_reloc: u32,
     /// count of junks
     pub(crate) nr_junk: u32,
-    /// active frames, only calculate the Normal and Slotted
+    /// active frames
     pub(crate) nr_active: u32,
+    pub(crate) padding: u32,
     /// active frame size, also the initial total size
-    pub(crate) active_size: u32,
+    pub(crate) active_size: usize,
+    pub(crate) padding2: u32,
     pub(crate) crc: u32,
 }
 
@@ -498,10 +442,10 @@ pub(crate) struct DataBuilder {
     nr_rel: u32,
     nr_junk: u32,
     nr_active: u32,
-    active_size: u32,
-    pub(crate) junks: Vec<FrameRef>,
+    active_size: usize,
+    pub(crate) junks: Vec<BoxRef>,
     reloc: Vec<u8>,
-    frames: Vec<FrameRef>,
+    frames: Vec<BoxRef>,
 }
 
 impl DataBuilder {
@@ -518,20 +462,20 @@ impl DataBuilder {
         }
     }
 
-    pub(crate) fn add(&mut self, f: FrameRef) {
-        match f.flag() {
-            FrameFlag::Normal => {
+    pub(crate) fn add(&mut self, f: BoxRef) {
+        let h = f.header();
+        match h.flag {
+            TagFlag::Normal | TagFlag::Sibling => {
                 self.nr_active += 1;
-                self.active_size += f.payload_size();
+                self.active_size += f.total_size() as usize;
                 self.nr_rel += 1;
                 self.frames.push(f);
             }
-            FrameFlag::Junk => {
-                self.nr_junk += f.payload_size() / JUNK_LEN as u32;
+            TagFlag::Junk => {
+                self.nr_junk += h.payload_size / JUNK_LEN as u32;
                 self.junks.push(f);
             }
-            FrameFlag::TombStone => {}
-            FrameFlag::Unknown => unreachable!("invalid frame {:?}", unpack_id(f.addr())),
+            TagFlag::TombStone | TagFlag::Unmap => {}
         }
     }
 
@@ -547,10 +491,10 @@ impl DataBuilder {
     where
         T: GatherIO,
     {
-        let mut pos = 0;
+        let mut pos: usize = 0;
         let mut crc = Crc32cHasher::default();
         let path = opt.data_file(self.id);
-        let mut w = GatherWriter::new(&path);
+        let mut w = GatherWriter::new(&path, 64);
 
         let ctx = DataState {
             kind: StateType::Data,
@@ -560,16 +504,33 @@ impl DataBuilder {
         state.sync().unwrap();
 
         for (seq, f) in self.frames.iter().enumerate() {
-            let reloc = AddrMap::new(f.addr(), pos, f.payload_size(), seq as u32);
-            pos += f.payload_size();
+            let h = f.header();
+            // we dump the whole TagPtr into file, so use total_size, when load we must convert it
+            // back to the original size when it was allocated
+            let reloc = AddrMap::new(h.addr, pos, h.total_size, seq as u32);
             self.reloc.extend_from_slice(reloc.as_slice());
-            let s = f.payload_slice();
+            let s = f.dump_slice();
+            pos += s.len();
+
             crc.write(s);
             w.queue(s);
         }
 
+        #[cfg(feature = "extra_check")]
+        {
+            let mut cnt = 0;
+            for f in &self.junks {
+                let s = f.data_slice::<u8>();
+                cnt += s.len();
+                crc.write(s);
+                w.queue(s);
+            }
+            assert_eq!(self.nr_junk as usize, cnt / JUNK_LEN);
+        }
+
+        #[cfg(not(feature = "extra_check"))]
         for f in &self.junks {
-            let s = f.payload_slice();
+            let s = f.data_slice::<u8>();
             crc.write(s);
             w.queue(s);
         }
@@ -584,7 +545,9 @@ impl DataBuilder {
             nr_reloc: self.nr_rel,
             nr_junk: self.nr_junk,
             nr_active: self.nr_active,
+            padding: 0,
             active_size: self.active_size,
+            padding2: 0,
             crc: crc.finish() as u32,
         };
 
@@ -596,7 +559,9 @@ impl DataBuilder {
 
 pub(crate) struct DataMetaReader {
     file: File,
+    /// position of buffer, from begin to end
     pos: usize,
+    /// offset of file, from end to begin
     off: u64,
     buf: Block,
     validate: bool,
@@ -634,7 +599,7 @@ impl DataMetaReader {
 
     pub(crate) fn get_meta(&mut self) -> Result<&DataFooter, OpCode> {
         let crc = self.read_meta().map_err(|e| {
-            log::error!("io error {}", e);
+            log::error!("io error {e}");
             OpCode::IoError
         })?;
         let f = raw_ptr_to_ref(self.buf.data().cast::<DataFooter>());
@@ -652,14 +617,14 @@ impl DataMetaReader {
         if f.junk_len() == 0 {
             return Ok(Vec::new());
         }
-        let mut v: Vec<u64> = Vec::with_capacity(f.junk_len() / JUNK_LEN);
+        let mut v: Vec<u64> = vec![0; f.junk_len() / JUNK_LEN];
         let off = self.off - f.junk_len() as u64;
         let s = unsafe {
             let ptr = v.as_mut_ptr().cast::<u8>();
             std::slice::from_raw_parts_mut(ptr, f.junk_len())
         };
         self.file.read(s, off).map_err(|e| {
-            log::error!("read error {}", e);
+            log::error!("read error {e}");
             OpCode::IoError
         })?;
 
@@ -807,17 +772,29 @@ impl MapBuilder {
         }
     }
 
-    pub(crate) fn add(&mut self, f: FrameRef) {
-        if f.flag() == FrameFlag::Normal {
-            let id = pid_to_fid(f.page_id());
-            match self.tables.entry(id) {
-                Entry::Occupied(ref mut x) => x.get_mut().add(f.page_id(), f.addr()),
-                Entry::Vacant(x) => {
-                    let mut table = PageTable::default();
-                    table.add(f.page_id(), f.addr());
-                    let _ = x.insert(table);
+    pub(crate) fn add(&mut self, f: &BoxRef) {
+        let h = f.header();
+        match h.flag {
+            TagFlag::Normal => {
+                let id = pid_to_fid(h.pid);
+                match self.tables.entry(id) {
+                    Entry::Occupied(ref mut x) => x.get_mut().add(h.pid, h.addr),
+                    Entry::Vacant(x) => {
+                        let mut table = PageTable::default();
+                        table.add(h.pid, h.addr);
+                        let _ = x.insert(table);
+                    }
                 }
             }
+            TagFlag::Unmap => {
+                let id = pid_to_fid(h.pid);
+                let table = self.tables.get_mut(&id).expect("must exist");
+                table.add(h.pid, NULL_ADDR);
+            }
+            TagFlag::Sibling => {
+                assert_eq!(h.pid, NULL_PID);
+            }
+            _ => {}
         }
     }
 
@@ -968,7 +945,7 @@ impl MapReader {
 
         let mut hdr_buf = [0u8; size_of::<MapHeader>()];
         self.file.read(&mut hdr_buf[..], self.offset).map_err(|x| {
-            log::error!("read file, error: {:?}", x);
+            log::error!("read file, error: {x:?}");
             OpCode::IoError
         })?;
         let hdr = MapHeader::from_slice(&hdr_buf[..]);
@@ -1006,10 +983,11 @@ mod test {
 
     use crate::{
         Options, RandomPath,
-        utils::{NEXT_ID, block::Block, data::PageTable, traits::IAsSlice},
+        types::{refbox::BoxRef, traits::IAsSlice},
+        utils::{NEXT_ID, NULL_ADDR, block::Block, data::PageTable},
     };
 
-    use super::{DataBuilder, DataMetaReader, FrameOwner, MapHeader, MapReader};
+    use super::{DataBuilder, DataMetaReader, MapHeader, MapReader};
 
     struct DummyState;
 
@@ -1034,7 +1012,11 @@ mod test {
             unimplemented!()
         }
 
-        fn writev(&mut self, _data: &mut [io::IoVec]) -> Result<(), std::io::Error> {
+        fn writev(
+            &mut self,
+            _data: &mut [io::IoVec],
+            _total_len: usize,
+        ) -> Result<(), std::io::Error> {
             unimplemented!()
         }
     }
@@ -1042,18 +1024,16 @@ mod test {
     #[test]
     fn data_dump_load() {
         let path = RandomPath::new();
-        let f = FrameOwner::alloc(233);
-        let (pid, addr) = (114514, 1919810);
-        let mut view = f.as_ref();
         let mut opt = Options::new(&*path);
         opt.tmp_store = true;
 
-        view.set_addr(addr);
-        view.set_pid(pid);
+        let (pid, addr) = (114514, 1919810);
+        let mut p = BoxRef::alloc(233, addr);
+        p.header_mut().pid = pid;
 
         let mut builder = DataBuilder::new(NEXT_ID);
 
-        builder.add(view);
+        builder.add(p.clone());
 
         std::fs::create_dir_all(&opt.db_root).unwrap();
         let mut state = DummyState;
@@ -1066,10 +1046,11 @@ mod test {
 
         assert_eq!(reloc.len(), 1);
 
+        let h = p.header();
         let r = &reloc[0];
         assert_eq!({ r.key }, addr);
         assert_eq!({ r.val.off }, 0);
-        assert_eq!({ r.val.len }, f.payload_size());
+        assert_eq!({ r.val.len }, h.total_size);
     }
 
     #[test]
@@ -1135,5 +1116,61 @@ mod test {
             o => o,
         });
         assert_eq!(input, output);
+    }
+
+    #[test]
+    fn map_dump_load2() {
+        let path = RandomPath::new();
+        let mut opt = Options::new(&*path);
+        opt.tmp_store = true;
+        let map_id = 1;
+
+        std::fs::create_dir_all(&opt.db_root).unwrap();
+        let mut w = io::File::options()
+            .append(true)
+            .write(true)
+            .create(true)
+            .open(&opt.map_file(map_id))
+            .unwrap();
+        let mut table = PageTable::default();
+
+        table.add(1, 1);
+        table.add(1, NULL_ADDR);
+        table.add(2, 2);
+        table.add(2, NULL_ADDR);
+        table.add(2, 3);
+
+        let v = table.collect();
+        let mut hash = Crc32cHasher::default();
+        hash.write(&v);
+        let h = MapHeader {
+            len: v.len() as u32,
+            crc32: hash.finish() as u32,
+        };
+
+        w.write(h.as_slice()).unwrap();
+        w.write(&v).unwrap();
+        w.sync().unwrap();
+
+        drop(w);
+
+        let mut block = Block::alloc(MapReader::DEFAULT_BLOCK_SIZE);
+        let mut r = MapReader::new(opt.map_file(map_id));
+        let mut m = Vec::new();
+
+        loop {
+            let x = r.next(&mut block).unwrap();
+            if let Some(es) = x {
+                for e in es {
+                    m.push((e.page_id(), e.page_addr()));
+                }
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0], (1, NULL_ADDR));
+        assert_eq!(m[1], (2, 3));
     }
 }

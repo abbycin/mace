@@ -3,19 +3,24 @@ use std::{
     cmp::max,
     collections::{BTreeMap, btree_map::Entry},
     fmt::Debug,
+    path::PathBuf,
     rc::Rc,
 };
 
 use io::{File, GatherIO};
 
 use crate::{
-    Record,
-    index::{Key, data::Value, tree::Tree},
+    cc::worker::SyncWorker,
     static_assert,
+    types::{
+        data::{Key, Record, Value, Ver},
+        traits::ITree,
+    },
     utils::{INIT_CMD, NEXT_ID, block::Block, unpack_id},
 };
+use crossbeam_epoch::Guard;
 
-use super::{context::Context, data::Ver};
+use super::context::Context;
 
 pub(crate) trait IWalCodec {
     fn encoded_len(&self) -> usize;
@@ -71,13 +76,19 @@ pub(crate) struct WalPadding {
     dummy: EntryType,
 }
 
-static_assert!(size_of::<WalPadding>() == 1);
+static_assert!(size_of::<WalPadding>() == size_of::<u8>());
 
 impl Default for WalPadding {
     fn default() -> Self {
         Self {
             dummy: EntryType::Padding,
         }
+    }
+}
+
+impl From<WalPadding> for u8 {
+    fn from(val: WalPadding) -> Self {
+        val.dummy as u8
     }
 }
 
@@ -392,13 +403,15 @@ pub(crate) struct Location {
 pub(crate) struct WalReader<'a> {
     map: RefCell<BTreeMap<u32, (Rc<File>, u64)>>,
     ctx: &'a Context,
+    guard: &'a Guard,
 }
 
 impl<'a> WalReader<'a> {
-    pub(crate) fn new(ctx: &'a Context) -> Self {
+    pub(crate) fn new(ctx: &'a Context, guard: &'a Guard) -> Self {
         Self {
             map: RefCell::new(BTreeMap::new()),
             ctx,
+            guard,
         }
     }
 
@@ -422,7 +435,14 @@ impl<'a> WalReader<'a> {
     }
 
     // for rollback, the worker should be same to caller, but can be arbitrary for recovery
-    pub(crate) fn rollback(&self, block: &mut Block, txid: u64, addr: Location, tree: &Tree) {
+    pub(crate) fn rollback<T: ITree>(
+        &self,
+        block: &mut Block,
+        txid: u64,
+        addr: Location,
+        tree: &T,
+        worker: Option<SyncWorker>,
+    ) {
         let Location {
             wid, mut seq, off, ..
         } = addr;
@@ -457,7 +477,11 @@ impl<'a> WalReader<'a> {
                         // we use the same worker in the UPDATE record or else any worker is ok, so
                         // that we can make sure these records will be flushed with the same order
                         // as they were queued
-                        let mut w = self.ctx.worker(last_worker);
+                        let mut w = if let Some(w) = worker {
+                            w
+                        } else {
+                            self.ctx.worker(last_worker)
+                        };
                         w.logging.record_abort(txid);
                         break 'outer;
                     }
@@ -473,7 +497,8 @@ impl<'a> WalReader<'a> {
                         }
                         let s = block.mut_slice(sz, usz - sz);
                         f.read(s, pos + sz as u64).unwrap();
-                        let next = self.undo(ptr_to::<WalUpdate>(block.data()), &mut cmd, tree);
+                        let next =
+                            self.undo(ptr_to::<WalUpdate>(block.data()), &mut cmd, tree, worker);
                         let (prev_id, prev_pos) = unpack_id(next);
                         pos = prev_pos as u64;
                         if prev_id != seq {
@@ -488,7 +513,13 @@ impl<'a> WalReader<'a> {
         }
     }
 
-    fn undo(&self, c: &WalUpdate, cmd: &mut u32, tree: &Tree) -> u64 {
+    fn undo<T: ITree>(
+        &self,
+        c: &WalUpdate,
+        cmd: &mut u32,
+        tree: &T,
+        worker: Option<SyncWorker>,
+    ) -> u64 {
         let (tombstone, data) = match c.sub_type() {
             PayloadType::Insert => {
                 let i = c.put();
@@ -517,7 +548,11 @@ impl<'a> WalReader<'a> {
             Value::Put(Record::normal(c.worker_id, data))
         };
 
-        let mut w = self.ctx.worker(c.worker_id as usize);
+        let mut w = if let Some(w) = worker {
+            w
+        } else {
+            self.ctx.worker(c.worker_id as usize)
+        };
         w.logging.record_update(
             Ver::new(c.txid, *cmd),
             WalClr::new(tombstone, data.len(), c.prev_addr),
@@ -526,9 +561,46 @@ impl<'a> WalReader<'a> {
             data,
         );
 
-        tree.put(Key::new(raw, c.txid, *cmd), val)
-            .expect("can't go wrong");
+        tree.put(self.guard, Key::new(raw, c.txid, *cmd), val);
         c.prev_addr
+    }
+
+    #[allow(unused)]
+    fn check_wal(&self, path: &PathBuf) -> Result<(), u64> {
+        let f = io::File::options().read(true).open(path).unwrap();
+
+        let mut buf = vec![0u8; 8192];
+        let end = f.size().unwrap();
+        let mut pos = 0;
+        while pos < end {
+            let h = &mut buf[..1];
+            f.read(h, pos).unwrap();
+            if h[0] >= EntryType::Unknown as u8 {
+                return Err(pos);
+            }
+
+            let ty: EntryType = h[0].into();
+            let sz = wal_record_sz(ty);
+
+            assert!(pos + sz as u64 <= end);
+
+            f.read(&mut buf[0..sz], pos).unwrap();
+            let old = pos;
+            pos += sz as u64;
+            match ty {
+                EntryType::Span => {
+                    let p = ptr_to::<WalSpan>(buf.as_ptr());
+                    pos += p.span as u64;
+                }
+                EntryType::Update => {
+                    let u = ptr_to::<WalUpdate>(buf.as_ptr());
+                    pos += u.size as u64;
+                }
+                _ => {}
+            }
+            log::debug!("pos {old} {ty:?} data_len {}", pos - old);
+        }
+        Ok(())
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "mace"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 authors = ["abbytsing@gmail.com"]
 readme = "README.md"
@@ -11,6 +11,7 @@ dashmap = "6.1.0"
 rand = "0.8.5"
 log = "0.4.22"
 io = { path = "deps/io" }
+crossbeam-epoch = "0.9.18"
 
 [dev-dependencies]
 logger = { path = "deps/logger" }
@@ -18,7 +19,12 @@ logger = { path = "deps/logger" }
 [features]
 default = []
 extra_check = []
+test_disable_recycle = []
 
 [profile.release]
 opt-level = 3
 lto = true
+
+[profile.release-with-symbol]
+inherits = "release"
+debug = true

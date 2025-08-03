@@ -1,261 +1,40 @@
-use std::{
-    cell::Cell,
-    fmt::Debug,
-    ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicPtr, AtomicU32, AtomicUsize},
 };
 
 use crate::{
     OpCode,
-    map::data::FrameFlag,
-    static_assert,
+    map::{data::Arena, table::Swip},
+    types::{page::Page, traits::IInlineSize},
     utils::{
-        INIT_ORACLE, INVALID_ID, MutRef, NULL_ID, countblock::Countblock, data::Meta,
-        options::ParsedOptions, raw_ptr_to_ref, traits::IDataLoader,
+        Handle, INIT_ORACLE, INVALID_ID, NULL_ID, countblock::Countblock, data::Meta,
+        options::ParsedOptions,
     },
 };
+use crossbeam_epoch::Guard;
 
-use super::{
-    data::{ArenaIter, FlushData, Frame, FrameOwner, FrameRef},
-    flush::Flush,
-    load::Mapping,
-};
-use crate::map::cache::Cache;
-use crate::utils::bytes::ByteArray;
-use crate::utils::{pack_id, unpack_id};
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-
-// use C repr to fix the layout
-#[repr(C)]
-pub(crate) struct Arena {
-    raw: ByteArray,
-    idx: u16,
-    state: AtomicU8,
-    dirty: AtomicU8,
-    refcnt: AtomicU32,
-    offset: AtomicU32,
-    flsn: AtomicU64,
-    id: Cell<u32>,
-    borrow_cnt: AtomicU32,
-    padding: [u8; 16],
-}
-
-static_assert!(size_of::<Arena>() == 64);
-
-impl Arena {
-    /// memory can be allocated
-    const HOT: u8 = 4;
-    /// memory no longer available for allocating
-    const WARM: u8 = 3;
-    /// waiting for flush
-    const COLD: u8 = 2;
-    /// flushed to disk
-    const FLUSH: u8 = 1;
-
-    const FRESH: u8 = 0;
-    const STALE: u8 = 1;
-    const DIRTY: u8 = 2;
-
-    fn new(cap: u32, idx: usize) -> Self {
-        Self {
-            raw: ByteArray::alloc(cap as usize),
-            state: AtomicU8::new(Self::FLUSH),
-            dirty: AtomicU8::new(Self::FRESH),
-            refcnt: AtomicU32::new(0),
-            offset: AtomicU32::new(0),
-            flsn: AtomicU64::new(0),
-            idx: idx as u16,
-            id: Cell::new(INVALID_ID),
-            borrow_cnt: AtomicU32::new(0),
-            padding: const { [0u8; 16] },
-        }
-    }
-
-    fn reset(&self, id: u32, flsn: u64) {
-        self.id.set(id);
-        self.flsn.store(flsn, Relaxed);
-        self.dirty.store(Self::FRESH, Relaxed);
-        assert_eq!(self.state(), Self::HOT);
-        self.offset.store(0, Relaxed);
-    }
-
-    fn alloc_size(&self, size: u32) -> Result<u32, OpCode> {
-        let cap = self.raw.len() as u32;
-        if size > cap {
-            return Err(OpCode::TooLarge);
-        }
-
-        let mut cur = self.offset.load(Relaxed);
-        loop {
-            // it's possible that other thread change the state to WARM
-            if self.state() != Self::HOT {
-                return Err(OpCode::Again);
-            }
-
-            let new = cur + size;
-            if new > cap {
-                return Err(OpCode::NeedMore);
-            }
-
-            match self.offset.compare_exchange(cur, new, AcqRel, Acquire) {
-                Ok(_) => return Ok(cur),
-                Err(e) => cur = e,
-            }
-        }
-    }
-
-    fn alloc_at(&self, off: u32, size: u32) -> (usize, FrameRef) {
-        let frame = unsafe { &mut *self.load(off) };
-        let addr = pack_id(self.id.get(), off);
-
-        frame.init(&self.refcnt, addr, FrameFlag::Unknown);
-        frame.set_size(size);
-        (self.idx as usize, FrameRef::new(frame as *mut Frame))
-    }
-
-    // NOTE: it's possible that concurrent allocation may paritally fail, such as: a thread request
-    // a big chunk while the rest space is not enough but enough for othet threads, the failed one
-    // will request to switch arena while other threads are remain using it
-    // we increase the ref count before allocating, so that current arena won't be flushed
-    pub fn alloc(&self, size: u32) -> Result<(usize, FrameRef), OpCode> {
-        self.inc_ref(); // use release ordering
-        let real_size = Frame::alloc_size(size); // avoid UB in pointer type cast
-        let offset = self.alloc_size(real_size).inspect_err(|_| {
-            self.dec_ref();
-        })?;
-        Ok(self.alloc_at(offset, size))
-    }
-
-    fn used(&self) -> ArenaIter {
-        ArenaIter::new(self.raw, self.offset.load(Relaxed))
-    }
-
-    #[inline]
-    fn load(&self, off: u32) -> *mut Frame {
-        unsafe { self.raw.data().add(off as usize).cast::<Frame>() }
-    }
-
-    fn set_state(&self, cur: u8, new: u8) -> u8 {
-        // we don't care if it's success, what we want is the `dirty` flag either be STALE or DIRTY
-        self.set_dirty(Self::FRESH, Self::STALE);
-        self.state
-            .compare_exchange(cur, new, AcqRel, Acquire)
-            .unwrap_or_else(|x| x)
-    }
-
-    #[inline]
-    fn state(&self) -> u8 {
-        self.state.load(Relaxed)
-    }
-
-    #[inline(always)]
-    fn set_dirty(&self, cur: u8, new: u8) {
-        let _ = self.dirty.compare_exchange(cur, new, Relaxed, Relaxed);
-    }
-
-    fn mark_dirty(&self) {
-        self.set_dirty(Self::FRESH, Self::DIRTY);
-    }
-
-    #[inline]
-    fn is_dirty(&self) -> bool {
-        self.dirty.load(Relaxed) == Self::DIRTY
-    }
-
-    fn refs(&self) -> u32 {
-        self.refcnt.load(Relaxed)
-    }
-
-    #[inline]
-    fn inc_ref(&self) {
-        self.refcnt.fetch_add(1, Release);
-    }
-
-    #[inline]
-    fn dec_ref(&self) {
-        let x = self.refcnt.fetch_sub(1, Relaxed);
-        assert!(x > 0);
-    }
-
-    fn inc_borrow(&self) {
-        self.borrow_cnt.fetch_add(1, Relaxed);
-    }
-
-    fn dec_borrow(&self) {
-        self.borrow_cnt.fetch_sub(1, Relaxed);
-    }
-
-    #[inline]
-    fn balanced(&self) -> bool {
-        self.borrow_cnt.load(Relaxed) == 0
-    }
-
-    #[inline(always)]
-    fn id(&self) -> u32 {
-        self.id.get()
-    }
-}
-
-fn free_arena(a: *mut Arena) {
-    unsafe {
-        ByteArray::free((*a).raw);
-        drop(Box::from_raw(a));
-    }
-}
-
-impl Debug for Arena {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Arena")
-            .field("raw ", &self.raw.data())
-            .field("idx", &self.idx)
-            .field("state", &self.state)
-            .field("refcnt", &self.refcnt)
-            .field("offset", &self.offset)
-            .field("flsn", &unpack_id(self.flsn.load(Relaxed)))
-            .field("id", &self.id.get())
-            .field("borrow_cnt", &self.borrow_cnt)
-            .finish()
-    }
-}
+use super::{cache::CacheState, data::FlushData, flush::Flush, load::Mapping};
+use crate::map::cache::NodeCache;
+use crate::map::table::PageMap;
+use crate::types::refbox::{BoxRef, ILoader};
+use crate::utils::lru::Lru;
+use crate::utils::unpack_id;
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 struct Pool {
     flush: Flush,
     sem: Arc<Countblock>,
-    buf: Vec<Handle>,
+    buf: Vec<Handle<Arena>>,
     free: AtomicUsize,
     seal: AtomicUsize,
-    flsn: AtomicU64,
     cur: AtomicPtr<Arena>,
     meta: Arc<Meta>,
+    flsn: AtomicU32,
 }
 
 unsafe impl Sync for Pool {}
 unsafe impl Send for Pool {}
-
-#[derive(Clone, Copy)]
-struct Handle {
-    raw: *mut Arena,
-}
-
-unsafe impl Sync for Handle {}
-unsafe impl Send for Handle {}
-
-impl Deref for Handle {
-    type Target = Arena;
-
-    fn deref(&self) -> &Self::Target {
-        raw_ptr_to_ref(self.raw)
-    }
-}
-
-impl From<*mut Arena> for Handle {
-    fn from(value: *mut Arena) -> Self {
-        Self { raw: value }
-    }
-}
 
 impl Pool {
     fn new_arena(cap: u32, idx: usize) -> *mut Arena {
@@ -266,14 +45,14 @@ impl Pool {
     fn new(
         opt: Arc<ParsedOptions>,
         sem: Arc<Countblock>,
-        mapping: Arc<Mapping>,
+        mapping: Handle<Mapping>,
         meta: Arc<Meta>,
     ) -> Result<Self, OpCode> {
-        let cap = opt.buffer_count as usize;
-        let mut buf = Vec::with_capacity(cap);
+        let cap = opt.arena_count as usize;
+        let mut buf: Vec<Handle<Arena>> = Vec::with_capacity(cap);
 
         for i in 0..cap {
-            let a = Self::new_arena(opt.buffer_size, i);
+            let a = Self::new_arena(opt.arena_size, i);
             buf.push(a.into());
         }
         let h = buf[0];
@@ -285,8 +64,8 @@ impl Pool {
             buf,
             free,
             seal: AtomicUsize::new(0),
-            flsn: AtomicU64::new(INIT_ORACLE),
-            cur: AtomicPtr::new(h.raw),
+            flsn: AtomicU32::new(INIT_ORACLE as u32),
+            cur: AtomicPtr::new(h.inner()),
             meta,
         };
 
@@ -296,22 +75,13 @@ impl Pool {
         Ok(this)
     }
 
-    fn release(&self, idx: usize) {
-        let h = self.buf.get(idx).expect("index out of range");
-        assert!(matches!(h.state(), Arena::HOT | Arena::WARM));
-        h.dec_ref();
-        self.try_flush();
-    }
-
-    fn load_f<F>(&self, id: u32, off: u32, mut cb: F) -> Option<FrameOwner>
-    where
-        F: FnMut(FrameOwner) -> FrameOwner,
-    {
+    fn load(&self, addr: u64) -> Option<BoxRef> {
+        let (id, off) = unpack_id(addr);
         let cur = self.current();
         let cur_id = cur.id();
 
         if cur_id == id {
-            return Some(FrameOwner::from(cur.load(off)));
+            return Some(cur.load(off));
         }
 
         let idx = cur.idx as usize;
@@ -320,17 +90,16 @@ impl Pool {
         // NOTE: the logical id of arena may not be contiguous (because of GC)
         while i != idx {
             let h = self.buf[i];
-            h.inc_borrow();
+            h.acquire();
             if !matches!(h.state(), Arena::WARM | Arena::COLD) {
-                h.dec_borrow();
+                h.release();
                 break;
             }
             if h.id() == id {
-                let r = cb(FrameOwner::from(h.load(off)));
-                h.dec_borrow();
-                return Some(r);
+                h.release();
+                return Some(h.load(off));
             }
-            h.dec_borrow();
+            h.release();
             i = (n + i - 1) % n;
         }
         None
@@ -341,14 +110,16 @@ impl Pool {
         let h = self.buf[idx];
 
         let ready = if h.is_dirty() {
+            // there're write txns, we must wait until log flushed, namely pool's flsn > arena's
             let r = self.flsn.load(Relaxed);
             let l = h.flsn.load(Relaxed);
-            r > l
+            r.wrapping_sub(l) as i32 > 0
         } else {
+            // no write txns
             h.state() == Arena::WARM
         };
 
-        if ready && h.refs() == 0 && h.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
+        if ready && h.unref() && h.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
             let next = (idx + 1) % self.buf.len();
             self.seal.store(next, Relaxed);
             self.flush(h);
@@ -360,7 +131,7 @@ impl Pool {
         self.try_flush();
     }
 
-    fn flush(&self, h: Handle) {
+    fn flush(&self, h: Handle<Arena>) {
         assert_eq!(h.state(), Arena::COLD);
 
         let id = h.id();
@@ -378,24 +149,24 @@ impl Pool {
             .tx
             .send(FlushData::new(id, h.used(), Box::new(cb)))
             .inspect_err(|x| {
-                log::error!("can't send flush data {:?}", x);
+                log::error!("can't send flush data {x:?}");
                 std::process::abort();
             });
     }
 
-    fn current(&self) -> Handle {
+    fn current(&self) -> Handle<Arena> {
         self.cur.load(Relaxed).into()
     }
 
     // actually, concunrrent install will not happen, since only one thread can successfully change
     // state to WARM
-    fn install_new(&self, cur: Handle) -> Result<(), OpCode> {
+    fn install_new(&self, cur: Handle<Arena>) -> Result<(), OpCode> {
         let idx = self.free.load(Acquire);
         let p = self.buf[idx];
         let next = (idx + 1) % self.buf.len();
         let id = self.gen_id()?;
 
-        log::info!("swap arena {} => {}", idx, next);
+        log::trace!("swap arena {idx} => {next}");
         while !p.balanced() || p.set_state(Arena::FLUSH, Arena::HOT) != Arena::FLUSH {
             self.try_flush();
         }
@@ -403,7 +174,7 @@ impl Pool {
         self.free.store(next, Release); // release ordering is required
 
         self.cur
-            .compare_exchange(cur.raw, p.raw, Relaxed, Relaxed)
+            .compare_exchange(cur.inner(), p.inner(), Relaxed, Relaxed)
             .expect("never happen");
         Ok(())
     }
@@ -428,7 +199,6 @@ impl Pool {
             let h = self.buf[idx];
             if matches!(h.state(), Arena::HOT | Arena::WARM) {
                 h.state.store(Arena::COLD, Relaxed);
-                h.refcnt.store(0, Relaxed);
                 self.flush(h);
             }
             idx = (idx + 1) % n;
@@ -447,41 +217,51 @@ impl Pool {
     fn quit(&self) {
         self.flush_all();
         self.flush.quit();
-    }
-}
-
-impl Drop for Pool {
-    fn drop(&mut self) {
-        self.buf.iter().map(|x| free_arena(x.raw)).count();
+        self.buf
+            .iter()
+            .map(|h| {
+                h.clear();
+                unsafe { drop(Box::from_raw(h.inner())) };
+            })
+            .count();
     }
 }
 
 pub struct Buffers {
-    cache: Cache<FrameOwner>,
-    pool: Pool,
-    pub mapping: Arc<Mapping>,
+    max_inline_size: u32,
+    /// used for restrict in memory node count
+    cache: NodeCache,
+    table: Arc<PageMap>,
+    /// second level cache, provide data for NodeCache
+    remote: Handle<Lru<BoxRef>>,
+    pool: Handle<Pool>,
+    pub mapping: Handle<Mapping>,
 }
 
 impl Buffers {
     pub fn new(
+        pagemap: Arc<PageMap>,
         opt: Arc<ParsedOptions>,
         sem: Arc<Countblock>,
         meta: Arc<Meta>,
         mapping: Mapping,
     ) -> Result<Self, OpCode> {
-        let mapping = Arc::new(mapping);
+        let mapping = Handle::new(mapping);
         Ok(Self {
-            cache: Cache::new(&opt),
-            pool: Pool::new(opt, sem, mapping.clone(), meta)?,
+            max_inline_size: opt.max_inline_size,
+            cache: NodeCache::new(opt.cache_capacity, opt.cache_evict_pct),
+            table: pagemap,
+            remote: Handle::new(Lru::new(opt.cache_count)),
+            pool: Handle::new(Pool::new(opt.clone(), sem, mapping, meta)?),
             mapping,
         })
     }
 
-    pub fn alloc(&self, size: u32) -> Result<(usize, FrameRef), OpCode> {
+    pub fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
         loop {
             let a = self.pool.current();
             match a.alloc(size) {
-                Ok(x) => return Ok(x),
+                Ok(x) => return Ok((a, x)),
                 Err(e @ OpCode::TooLarge) => return Err(e),
                 Err(OpCode::Again) => continue,
                 Err(OpCode::NeedMore) => {
@@ -494,13 +274,49 @@ impl Buffers {
         }
     }
 
+    #[cfg(not(feature = "test_disable_recycle"))]
+    pub fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
+    where
+        F: FnMut(u64),
+    {
+        let a = self.pool.current();
+        a.inc_ref();
+        for i in addr {
+            if !a.recycle(i) {
+                gc(*i);
+            }
+        }
+        a.dec_ref();
+    }
+
+    #[cfg(feature = "test_disable_recycle")]
+    pub fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
+    where
+        F: FnMut(u64),
+    {
+        for i in addr {
+            gc(*i);
+        }
+    }
+
     pub fn quit(&self) {
-        self.pool.quit()
+        // make sure flush thread quit before we reclaim mapping
+        self.pool.quit();
+        self.mapping.reclaim();
+        self.remote.reclaim();
+        self.pool.reclaim();
+        self.cache.reclaim(|pid| {
+            let swip = Swip::new(self.table.get(pid));
+            if !swip.is_null() && !swip.is_tagged() {
+                let p = Page::<Loader>::from_swip(swip.raw());
+                p.reclaim();
+            }
+        });
     }
 
     #[inline]
-    pub fn release_buffer(&self, buffer_id: usize) {
-        self.pool.release(buffer_id);
+    pub fn flush_arena(&self) {
+        self.pool.try_flush();
     }
 
     #[inline]
@@ -514,32 +330,61 @@ impl Buffers {
         a.mark_dirty();
     }
 
-    #[inline]
-    fn cache(&self, src: FrameOwner) -> FrameOwner {
-        let addr = src.addr();
-        self.cache.put(addr, src).expect("can't is full")
+    pub fn loader(&self) -> Loader {
+        Loader {
+            max_inline_size: self.max_inline_size,
+            pool: self.pool,
+            mapping: self.mapping,
+            cache: self.remote,
+        }
     }
 
-    pub fn load(&self, addr: u64) -> FrameOwner {
-        let (id, off) = unpack_id(addr);
-
-        assert!(id > 0);
-
-        // lookup in current or sealed arena
-        if let Some(f) = self.pool.load_f(id, off, |f| self.cache(f)) {
-            return f;
-        }
-
-        if let Some(x) = self.cache.get(addr) {
-            return x;
-        }
-
-        loop {
-            if let Some(f) = self.mapping.load(addr) {
-                if let Err(e) = self.cache.put(addr, f.clone()) {
-                    log::warn!("cache is full, {:?}", e);
+    pub fn cache(&self, g: &Guard, p: Page<Loader>) {
+        if self.cache.full() {
+            let pids = self.cache.evict();
+            for pid in pids {
+                loop {
+                    let swip = Swip::new(self.table.get(pid));
+                    if swip.is_null() || swip.is_tagged() {
+                        continue;
+                    }
+                    let old = Page::<Loader>::from_swip(swip.untagged());
+                    if self
+                        .table
+                        .cas(pid, swip.raw(), Swip::tagged(old.latest_addr()))
+                        .is_ok()
+                    {
+                        g.defer(move || old.reclaim());
+                        break;
+                    }
                 }
-                return f;
+            }
+        }
+        let state = CacheState::Warm as u32 + p.is_intl() as u32;
+        self.cache.put(p.pid(), state, p.size() as isize);
+    }
+
+    pub fn evict(&self, pid: u64) {
+        self.cache.evict_one(pid);
+    }
+
+    pub fn load(&self, g: &Guard, pid: u64) -> Option<Page<Loader>> {
+        loop {
+            let swip = Swip::new(self.table.get(pid));
+            // never mapped or unmapped
+            if swip.is_null() {
+                return None;
+            }
+
+            if !swip.is_tagged() {
+                return Some(Page::<Loader>::from_swip(swip.raw()));
+            }
+            let new = Page::load(self.loader(), swip.untagged());
+            if self.table.cas(pid, swip.raw(), new.swip()).is_ok() {
+                self.cache(g, new);
+                return Some(new);
+            } else {
+                new.reclaim();
             }
         }
     }
@@ -547,27 +392,29 @@ impl Buffers {
 
 #[derive(Clone)]
 pub struct Loader {
-    loader: *const Buffers,
-    holder: MutRef<Vec<FrameOwner>>,
+    max_inline_size: u32,
+    pool: Handle<Pool>,
+    mapping: Handle<Mapping>,
+    cache: Handle<Lru<BoxRef>>,
 }
 
-impl Loader {
-    pub fn new(l: *const Buffers) -> Self {
-        Self {
-            loader: l,
-            holder: MutRef::new(Vec::new()),
+impl ILoader for Loader {
+    fn load(&self, addr: u64) -> BoxRef {
+        if let Some(x) = self.cache.get(addr) {
+            return x.clone();
         }
+        if let Some(x) = self.pool.load(addr) {
+            self.cache.add(addr, x.clone());
+            return x;
+        }
+        let x = self.mapping.load_impl(addr);
+        self.cache.add(addr, x.clone());
+        x
     }
 }
 
-impl IDataLoader for Loader {
-    type Out = FrameOwner;
-
-    fn load_data(&self, addr: u64) -> Self::Out {
-        unsafe {
-            let f = (*self.loader).load(addr);
-            self.holder.raw().push(f.clone());
-            f
-        }
+impl IInlineSize for Loader {
+    fn inline_size(&self) -> u32 {
+        self.max_inline_size
     }
 }

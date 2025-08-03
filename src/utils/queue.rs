@@ -145,6 +145,11 @@ impl<T> Queue<T> {
     }
 
     #[allow(unused)]
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+
+    #[allow(unused)]
     pub fn is_full(&self) -> bool {
         self.count() == self.cap
     }

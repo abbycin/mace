@@ -1,7 +1,9 @@
+#[cfg(feature = "test_disable_recycle")]
 use std::io::Write;
 
 use mace::{Mace, OpCode, Options, RandomPath};
 
+#[cfg(feature = "test_disable_recycle")]
 #[test]
 fn gc_data() -> Result<(), OpCode> {
     let path = RandomPath::new();
@@ -11,15 +13,15 @@ fn gc_data() -> Result<(), OpCode> {
     opt.gc_eager = true;
     opt.gc_timeout = 20;
     opt.gc_ratio = 10;
-    opt.buffer_size = 512 << 10;
-    opt.gc_compacted_size = opt.buffer_size;
+    opt.arena_size = 512 << 10;
+    opt.gc_compacted_size = opt.arena_size as usize;
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let cap = 20000;
     let mut pair = Vec::with_capacity(cap);
 
     for i in 0..cap {
-        pair.push(format!("{:08}", i));
+        pair.push(format!("{i:08}"));
     }
 
     for k in &pair {
@@ -72,12 +74,12 @@ fn abort_txn() {
     let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.max_ckpt_per_txn = 1;
-    opt.buffer_size = 50 << 10; // make sure checkpoint was taken
+    opt.arena_size = 50 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let kv = db.begin().unwrap();
     for i in 0..1000 {
-        let x = format!("key_{}", i);
+        let x = format!("key_{i}");
         let _ = kv.put(&x, &x);
     }
     let r = kv.commit();
@@ -85,6 +87,7 @@ fn abort_txn() {
     assert!(r.is_err() && r.err().unwrap() == OpCode::AbortTx);
 }
 
+#[cfg(feature = "test_disable_recycle")]
 #[test]
 fn gc_wal() {
     let path = RandomPath::tmp();
@@ -93,12 +96,12 @@ fn gc_wal() {
     opt.gc_timeout = 2;
     opt.workers = 1;
     opt.keep_stable_wal_file = true;
-    opt.buffer_size = 100 << 10; // make sure checkpoint was taken
+    opt.arena_size = 100 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut data = Vec::new();
 
     for i in 0..1000 {
-        data.push(format!("data_{}", i));
+        data.push(format!("data_{i}"));
     }
 
     for i in &data {

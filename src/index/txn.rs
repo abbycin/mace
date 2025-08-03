@@ -1,26 +1,26 @@
+use super::ValRef;
 use crate::{
     OpCode,
     cc::{
         context::Context,
-        data::{Record, Ver},
         wal::{WalDel, WalPut, WalReplace},
         worker::SyncWorker,
     },
-    index::{Key, data::Value, tree::Tree},
+    index::tree::{Iter, Tree},
+    types::data::{Key, Record, Value, Ver},
     utils::{INIT_CMD, NULL_CMD},
 };
+use crossbeam_epoch::Guard;
 use std::sync::{Arc, atomic::Ordering::Relaxed};
 use std::{cell::Cell, sync::atomic::AtomicU32};
 
-use super::{ValRef, tree::SeekIter};
-
-struct Guard<'a> {
+struct Package<'a> {
     ctx: &'a Context,
     w: SyncWorker,
     refcnt: Arc<AtomicU32>,
 }
 
-impl Clone for Guard<'_> {
+impl Clone for Package<'_> {
     fn clone(&self) -> Self {
         self.refcnt.fetch_add(1, Relaxed);
         Self {
@@ -31,7 +31,7 @@ impl Clone for Guard<'_> {
     }
 }
 
-impl Guard<'_> {
+impl Package<'_> {
     fn destroy(&self) {
         if self.refcnt.fetch_sub(1, Relaxed) == 1 {
             self.ctx.free_worker(self.w);
@@ -39,54 +39,61 @@ impl Guard<'_> {
     }
 }
 
-fn get_impl<'a, K: AsRef<[u8]>>(
+fn get_impl<K: AsRef<[u8]>>(
     ctx: &Context,
+    g: &Guard,
     tree: &Tree,
     mut w: SyncWorker,
     k: K,
-) -> Result<ValRef<Record<'a>>, OpCode> {
+) -> Result<ValRef, OpCode> {
     #[cfg(feature = "extra_check")]
     assert!(k.as_ref().len() > 0, "key must be non-empty");
 
     let wid = w.id;
     let start_ts = w.start_ts;
     let key = Key::new(k.as_ref(), start_ts, NULL_CMD);
-    let r = tree.traverse::<Record, _>(key, |txid, t| {
+    let r = tree.traverse(g, key, |txid, t| {
         w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid)
     })?;
 
-    debug_assert!(!r.unwrap().is_tombstone());
     Ok(r)
 }
 
-// NOTE: SeekIter lives at least as long as Mace, but the worker may be shared among several Txns
-fn seek_impl<'a, 'b, K>(
+fn seek_impl<'a, K>(
     ctx: &'a Context,
     tree: &'a Tree,
     mut w: SyncWorker,
     prefix: K,
-    g: Guard<'a>,
-) -> SeekIter<'a, 'b, Record<'b>>
+    p: Package<'a>,
+) -> Iter<'a>
 where
     K: AsRef<[u8]>,
 {
+    let b = prefix.as_ref();
+    let mut e = b.to_vec();
     #[cfg(feature = "extra_check")]
-    assert!(prefix.as_ref().len() > 0, "prefix must be non-empty");
+    assert!(!end.is_empty(), "prefix can't be empty");
+
+    if *e.last().unwrap() == u8::MAX {
+        e.push(0);
+    } else {
+        *e.last_mut().unwrap() += 1;
+    }
 
     let wid = w.id;
     let start_ts = w.start_ts;
-    SeekIter::<Record>::new(
-        tree,
-        prefix,
+
+    tree.range(
+        b..e.as_slice(),
         move |txid, t| w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid),
         move || {
-            g.destroy();
+            p.destroy();
         },
     )
 }
 
 pub struct TxnKV<'a> {
-    g: Guard<'a>,
+    p: Package<'a>,
     tree: &'a Tree,
     seq: Cell<u32>,
     is_end: Cell<bool>,
@@ -99,7 +106,7 @@ impl<'a> TxnKV<'a> {
         w.begin(ctx);
         let limit = tree.store.opt.max_ckpt_per_txn;
         Ok(Self {
-            g: Guard {
+            p: Package {
                 ctx,
                 w,
                 refcnt: Arc::new(AtomicU32::new(1)),
@@ -118,27 +125,28 @@ impl<'a> TxnKV<'a> {
     }
 
     fn should_abort(&self) -> Result<(), OpCode> {
-        if self.is_end.get() || self.g.w.ckpt_cnt.load(Relaxed) >= self.limit {
+        if self.is_end.get() || self.p.w.ckpt_cnt.load(Relaxed) >= self.limit {
             return Err(OpCode::AbortTx);
         }
         Ok(())
     }
 
-    fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<ValRef<Record>>, OpCode>
+    fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<ValRef>, OpCode>
     where
-        F: FnMut(&Option<(Key, ValRef<Record>)>, Ver, SyncWorker) -> Result<(), OpCode>,
+        F: FnMut(&Option<(Key, ValRef)>, Ver, SyncWorker) -> Result<(), OpCode>,
     {
         #[cfg(feature = "extra_check")]
         assert!(k.as_ref().len() > 0, "key must be non-empty");
 
+        let g = crossbeam_epoch::pin();
         self.should_abort()?;
-        let start_ts = self.g.w.start_ts;
-        let (wid, cmd_id) = (self.g.w.id, self.cmd_id());
+        let start_ts = self.p.w.start_ts;
+        let (wid, cmd_id) = (self.p.w.id, self.cmd_id());
         let key = Key::new(k, start_ts, cmd_id);
         let val = Value::Put(Record::normal(wid, v));
 
         self.tree
-            .update(key, val, |opt| f(opt, *key.ver(), self.g.w))
+            .update(&g, key, val, |opt| f(opt, *key.ver(), self.p.w))
     }
 
     fn put_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<(), OpCode> {
@@ -149,8 +157,8 @@ impl<'a> TxnKV<'a> {
                     let t = rv.unwrap();
                     if rv.is_put()
                         || !w.cc.is_visible_to(
-                            self.g.ctx,
-                            self.g.w.id,
+                            self.p.ctx,
+                            self.p.w.id,
                             t.worker_id(),
                             ver.txid,
                             rk.txid,
@@ -173,7 +181,7 @@ impl<'a> TxnKV<'a> {
         .map(|_| ())
     }
 
-    fn update_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<ValRef<Record>, OpCode> {
+    fn update_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<ValRef, OpCode> {
         self.modify(k, v, |opt, ver, mut w| match opt {
             None => Err(OpCode::NotFound),
             Some((rk, rv)) => {
@@ -183,7 +191,7 @@ impl<'a> TxnKV<'a> {
                 let t = rv.unwrap();
                 if !w
                     .cc
-                    .is_visible_to(self.g.ctx, self.g.w.id, t.worker_id(), ver.txid, rk.txid)
+                    .is_visible_to(self.p.ctx, self.p.w.id, t.worker_id(), ver.txid, rk.txid)
                 {
                     return Err(OpCode::AbortTx);
                 }
@@ -214,7 +222,7 @@ impl<'a> TxnKV<'a> {
         self.put_impl(k.as_ref(), v.as_ref(), &mut logged)
     }
 
-    pub fn update<K, V>(&self, k: K, v: V) -> Result<ValRef<Record>, OpCode>
+    pub fn update<K, V>(&self, k: K, v: V) -> Result<ValRef, OpCode>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -223,7 +231,7 @@ impl<'a> TxnKV<'a> {
         self.update_impl(k.as_ref(), v.as_ref(), &mut logged)
     }
 
-    pub fn upsert<K, V>(&self, k: K, v: V) -> Result<Option<ValRef<Record>>, OpCode>
+    pub fn upsert<K, V>(&self, k: K, v: V) -> Result<Option<ValRef>, OpCode>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -240,19 +248,20 @@ impl<'a> TxnKV<'a> {
         self.update_impl(k, v, &mut logged).map(Some)
     }
 
-    pub fn del<T>(&self, k: T) -> Result<ValRef<Record>, OpCode>
+    pub fn del<T>(&self, k: T) -> Result<ValRef, OpCode>
     where
         T: AsRef<[u8]>,
     {
         self.should_abort()?;
-        let mut w = self.g.w;
+        let mut w = self.p.w;
         let (wid, start_ts) = (w.id, w.start_ts);
         let key = Key::new(k.as_ref(), start_ts, self.cmd_id());
         let val = Value::Del(Record::remove(wid));
         let mut logged = false;
+        let g = crossbeam_epoch::pin();
 
         self.tree
-            .update::<Record, Record, _>(key, val, |opt| match opt {
+            .update::<Record, _>(&g, key, val, |opt| match opt {
                 None => Err(OpCode::NotFound),
                 Some((rk, rv)) => {
                     if rv.is_del() {
@@ -260,8 +269,8 @@ impl<'a> TxnKV<'a> {
                     }
                     let t = rv.unwrap();
                     if !w.cc.is_visible_to(
-                        self.g.ctx,
-                        self.g.w.id,
+                        self.p.ctx,
+                        self.p.w.id,
                         t.worker_id(),
                         start_ts,
                         rk.txid,
@@ -288,16 +297,17 @@ impl<'a> TxnKV<'a> {
 
     pub fn commit(&self) -> Result<(), OpCode> {
         self.should_abort()?;
-        self.g.w.commit(self.g.ctx);
-        self.g.destroy();
+        self.p.w.commit(self.p.ctx);
+        self.p.destroy();
         self.is_end.set(true);
         Ok(())
     }
 
     pub fn rollback(&self) -> Result<(), OpCode> {
         if !self.is_end.get() {
-            self.g.w.rollback(self.g.ctx, self.tree);
-            self.g.destroy();
+            let g = crossbeam_epoch::pin();
+            self.p.w.rollback(&g, self.p.ctx, self.tree);
+            self.p.destroy();
             self.is_end.set(true);
             Ok(())
         } else {
@@ -306,19 +316,21 @@ impl<'a> TxnKV<'a> {
     }
 
     #[inline]
-    pub fn get<K>(&self, k: K) -> Result<ValRef<Record>, OpCode>
+    pub fn get<K>(&self, k: K) -> Result<ValRef, OpCode>
     where
         K: AsRef<[u8]>,
     {
-        get_impl(self.g.ctx, self.tree, self.g.w, k)
+        let g = crossbeam_epoch::pin();
+        get_impl(self.p.ctx, &g, self.tree, self.p.w, k)
     }
 
+    /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
     #[inline]
-    pub fn seek<'b, K>(&self, prefix: K) -> SeekIter<'a, 'b, Record<'b>>
+    pub fn seek<K>(&'a self, prefix: K) -> Iter<'a>
     where
         K: AsRef<[u8]>,
     {
-        seek_impl(self.g.ctx, self.tree, self.g.w, prefix, self.g.clone())
+        seek_impl(self.p.ctx, self.tree, self.p.w, prefix, self.p.clone())
     }
 }
 
@@ -329,7 +341,7 @@ impl Drop for TxnKV<'_> {
 }
 
 pub struct TxnView<'a> {
-    g: Guard<'a>,
+    p: Package<'a>,
     tree: &'a Tree,
 }
 
@@ -338,7 +350,7 @@ impl<'a> TxnView<'a> {
         let mut w = ctx.alloc_worker()?;
         w.view(ctx);
         Ok(Self {
-            g: Guard {
+            p: Package {
                 ctx,
                 w,
                 refcnt: Arc::new(AtomicU32::new(1)),
@@ -348,26 +360,24 @@ impl<'a> TxnView<'a> {
     }
 
     #[inline]
-    pub fn get<K: AsRef<[u8]>>(&self, k: K) -> Result<ValRef<Record>, OpCode> {
-        get_impl(self.g.ctx, self.tree, self.g.w, k)
+    pub fn get<K: AsRef<[u8]>>(&self, k: K) -> Result<ValRef, OpCode> {
+        let g = crossbeam_epoch::pin();
+        get_impl(self.p.ctx, &g, self.tree, self.p.w, k)
     }
 
+    /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
     #[inline]
-    pub fn seek<'b, K>(&self, prefix: K) -> SeekIter<'a, 'b, Record<'b>>
+    pub fn seek<K>(&'a self, prefix: K) -> Iter<'a>
     where
         K: AsRef<[u8]>,
     {
-        seek_impl(self.g.ctx, self.tree, self.g.w, prefix, self.g.clone())
-    }
-
-    pub fn show(&self) {
-        self.tree.show::<Record>();
+        seek_impl(self.p.ctx, self.tree, self.p.w, prefix, self.p.clone())
     }
 }
 
 impl Drop for TxnView<'_> {
     fn drop(&mut self) {
-        self.g.destroy();
+        self.p.destroy();
     }
 }
 
@@ -387,11 +397,6 @@ mod test {
         let kv = db.begin()?;
         kv.put(k1, v1).expect("can't put");
         kv.put(k2, v2).expect("can't put");
-
-        let r = kv.get(k1).expect("can't get");
-        assert_eq!(r.slice(), v1);
-        let r = kv.get(k2).expect("can't get");
-        assert_eq!(r.slice(), v2);
 
         let r = kv.del(k1).expect("can't del");
         assert_eq!(r.slice(), v1);

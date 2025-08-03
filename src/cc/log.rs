@@ -1,14 +1,11 @@
-use super::{
-    data::Ver,
-    wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate},
-};
-use crate::utils::{AMutRef, data::WalDescHandle, options::ParsedOptions, unpack_id};
+use super::wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate};
+use crate::types::data::Ver;
+use crate::utils::{Handle, data::WalDescHandle, options::ParsedOptions, unpack_id};
 use crate::{
     cc::wal::{EntryType, WalPadding, WalSpan},
     map::buffer::Buffers,
     utils::{
         block::Block,
-        bytes::ByteArray,
         data::{GatherWriter, Meta},
         pack_id,
     },
@@ -37,68 +34,65 @@ impl Ring {
         }
     }
 
-    #[inline]
     fn avail(&self) -> usize {
         self.data.len() - (self.tail - self.head)
     }
 
     // NOTE: the request buffer never wraps around
-    fn prod(&mut self, size: usize) -> ByteArray {
+    fn prod(&mut self, size: usize) -> &mut [u8] {
         debug_assert!(self.avail() >= size);
         let mut b = self.tail;
         self.tail += size;
 
         b &= self.mask();
-        self.data.view(b, b + size)
+        self.data.mut_slice(b, size)
     }
 
-    #[inline]
     fn cons(&mut self, pos: usize) {
         self.head += pos;
     }
 
-    #[inline]
+    fn distance(&self) -> usize {
+        self.tail - self.head
+    }
+
     fn head(&self) -> usize {
         self.head & self.mask()
     }
 
-    #[inline]
     fn tail(&self) -> usize {
         self.tail & self.mask()
     }
 
-    #[inline]
     fn slice(&self, pos: usize, len: usize) -> &[u8] {
         self.data.slice(pos, len)
     }
 
-    #[inline]
     fn mask(&self) -> usize {
         self.data.len() - 1
     }
 
-    #[inline]
     fn len(&self) -> usize {
         self.data.len()
     }
 }
 
 pub struct LogBuilder {
-    buf: ByteArray,
     off: usize,
+    len: usize,
 }
 
 impl LogBuilder {
-    fn new(b: ByteArray) -> Self {
-        Self { buf: b, off: 0 }
+    fn new(len: usize) -> Self {
+        Self { off: 0, len }
     }
 
-    pub fn add<T>(&mut self, payload: T) -> &mut Self
+    pub fn add<T>(&mut self, buf: &mut [u8], payload: T) -> &mut Self
     where
         T: IWalCodec,
     {
         let src = payload.to_slice();
-        let dst = self.buf.as_mut_slice(self.off, src.len());
+        let dst = &mut buf[self.off..self.off + src.len()];
         dst.copy_from_slice(src);
         self.off += src.len();
 
@@ -106,7 +100,7 @@ impl LogBuilder {
     }
 
     pub fn build(&self, log: &mut Logging) {
-        log.advance(self.buf.len());
+        log.advance(self.len);
     }
 }
 
@@ -122,7 +116,7 @@ pub struct Logging {
     lsn: u64,
     ops: usize,
     last_data: u32,
-    buffer: AMutRef<Buffers>,
+    buffer: Handle<Buffers>,
     writer: GatherWriter,
     opt: Arc<ParsedOptions>,
     pub desc: WalDescHandle,
@@ -142,9 +136,9 @@ impl Logging {
         desc: WalDescHandle,
         meta: Arc<Meta>,
         opt: Arc<ParsedOptions>,
-        buffer: AMutRef<Buffers>,
+        buffer: Handle<Buffers>,
     ) -> Self {
-        let writer = GatherWriter::new(&opt.wal_file(desc.worker, desc.wal_id));
+        let writer = GatherWriter::new(&opt.wal_file(desc.worker, desc.wal_id), 32);
         Self {
             ring: Ring::new(opt.wal_buffer_size),
             enable_ckpt: AtomicBool::new(false),
@@ -165,20 +159,22 @@ impl Logging {
         }
     }
 
-    fn alloc(&mut self, size: usize) -> ByteArray {
+    fn alloc(&mut self, size: usize) -> &mut [u8] {
         let rest = self.ring.len() - self.ring.tail();
         if rest < size {
             let a = self.ring.prod(rest);
             if rest < WalSpan::size() {
-                a.as_mut_slice(0, a.len()).fill(WalPadding::default());
+                a.fill(WalPadding::default().into());
             } else {
                 let span = WalSpan {
                     wal_type: EntryType::Span,
                     span: (rest - WalSpan::size()) as u32,
                 };
-                let dst = a.as_mut_slice(0, span.encoded_len());
+                let dst = &mut a[0..span.encoded_len()];
                 dst.copy_from_slice(span.to_slice());
             }
+            // excluding Padding and Span
+            self.log_off += rest as u32;
             self.flush();
         }
         self.ring.prod(size)
@@ -253,20 +249,25 @@ impl Logging {
             prev_addr: self.lsn,
         };
         let total_sz = payload_size + u.encoded_len();
-        if total_sz >= self.ring.len() {
-            self.record_large(&u, k, w.to_slice(), ov, nv, total_sz);
-        } else {
+        if total_sz < self.ring.len() {
             let a = self.alloc(total_sz);
-            let mut b = LogBuilder::new(a);
-            b.add(u).add(k).add(w).add(ov).add(nv).build(self);
+            let mut b = LogBuilder::new(a.len());
+            b.add(a, u)
+                .add(a, k)
+                .add(a, w)
+                .add(a, ov)
+                .add(a, nv)
+                .build(self);
+        } else {
+            self.record_large(&u, k, w.to_slice(), ov, nv, total_sz);
         }
     }
 
     fn add_entry<T: IWalCodec>(&mut self, w: T) {
         let size = w.encoded_len();
         let a = self.alloc(size);
-        let mut b = LogBuilder::new(a);
-        b.add(w).build(self);
+        let mut b = LogBuilder::new(a.len());
+        b.add(a, w).build(self);
     }
 
     pub fn record_begin(&mut self, txid: u64) {
@@ -309,7 +310,7 @@ impl Logging {
         }
         let last_ckpt = self.last_ckpt.load(Relaxed);
 
-        log::info!(
+        log::trace!(
             "worker {} checkpoint {:?} curr {} last {}",
             self.desc.worker,
             unpack_id(last_ckpt),
@@ -357,17 +358,17 @@ impl Logging {
     }
 
     fn flush(&mut self) -> bool {
-        let head = self.ring.head();
-        let tail = self.ring.tail();
-
-        if head == tail {
+        if self.ring.distance() == 0 {
             return false;
         }
 
-        let len = if tail == 0 {
-            self.ring.len() - head
-        } else {
+        let head = self.ring.head();
+        let tail = self.ring.tail();
+
+        let len = if tail >= head {
             tail - head
+        } else {
+            self.ring.len() - head
         };
 
         self.writer.write(self.ring.slice(head, len));

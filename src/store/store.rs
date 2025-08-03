@@ -5,19 +5,18 @@ use crate::map::table::PageMap;
 use crate::utils::countblock::Countblock;
 use crate::utils::data::{Meta, WalDescHandle};
 use crate::utils::options::ParsedOptions;
-use crate::utils::{AMutRef, NULL_PID};
+use crate::utils::{Handle, NULL_PID};
 use crate::{OpCode, ROOT_PID};
 use std::sync::Arc;
 
 pub struct Store {
-    pub(crate) page: PageMap,
-    pub(crate) buffer: AMutRef<Buffers>,
-    pub(crate) context: Arc<Context>,
+    pub(crate) buffer: Handle<Buffers>,
+    pub(crate) context: Context,
+    pub(crate) page: Arc<PageMap>,
     pub(crate) opt: Arc<ParsedOptions>,
 }
 
 impl Store {
-    /// recover from exist database from given path or create a new instance
     pub fn new(
         page: PageMap,
         opt: Arc<ParsedOptions>,
@@ -27,16 +26,18 @@ impl Store {
     ) -> Result<Self, OpCode> {
         let cores = opt.workers;
         let sem = Arc::new(Countblock::new(cores));
-        let buffer = AMutRef::new(Buffers::new(
+        let page = Arc::new(page);
+        let buffer = Handle::new(Buffers::new(
+            page.clone(),
             opt.clone(),
             sem.clone(),
             meta.clone(),
             mapping,
         )?);
         Ok(Self {
-            page,
-            buffer: buffer.clone(),
+            buffer,
             context: Context::new(opt.clone(), buffer, meta, desc),
+            page,
             opt,
         })
     }
@@ -53,5 +54,6 @@ impl Store {
     pub(crate) fn quit(&self) {
         self.context.quit(); // flush log first
         self.buffer.quit();
+        self.buffer.reclaim();
     }
 }

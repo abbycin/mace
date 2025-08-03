@@ -130,7 +130,7 @@ impl GatherIO for File {
         }
     }
 
-    fn writev(&mut self, data: &mut [crate::IoVec]) -> Result<(), io::Error> {
+    fn writev(&mut self, data: &mut [crate::IoVec], total_len: usize) -> Result<(), io::Error> {
         let mut count = data.len() as c_int;
         let mut iov = data.as_mut_ptr().cast::<iovec>();
 
@@ -145,6 +145,9 @@ impl GatherIO for File {
                 }
 
                 let mut n = n as usize;
+                if n == total_len {
+                    break;
+                }
                 while count > 0 && n >= (*iov).iov_len {
                     n -= (*iov).iov_len;
                     iov = iov.add(1);

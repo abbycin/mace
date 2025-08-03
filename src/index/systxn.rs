@@ -1,137 +1,178 @@
-use super::IAlloc;
-use crate::OpCode;
-use crate::Store;
-use crate::map::data::{FrameFlag, FrameOwner, FrameRef};
+pub(crate) use crate::OpCode;
+use crate::index::Node;
+use crate::map::data::Arena;
+use crate::types::header::TagFlag;
+use crate::types::refbox::{BoxRef, BoxView};
+use crate::types::traits::{IAlloc, IInlineSize};
+use crate::utils::Handle;
 use crate::utils::data::JUNK_LEN;
-use crate::utils::traits::ICollector;
-use std::sync::atomic::Ordering::Relaxed;
+use crate::{Store, index::Page};
+use crossbeam_epoch::Guard;
 
 pub struct SysTxn<'a> {
     pub store: &'a Store,
-    /// arena list
-    buffers: Vec<(usize, FrameRef)>,
-    junks: Vec<FrameOwner>,
-    page_ids: Vec<(u64, u64)>,
+    g: &'a Guard,
+    pinned: Vec<Page>,
+    maps: Vec<(u64, u64)>,
+    /// garbage and allocs may overlap, garbage will be set to Junk on success, while allocs will be
+    /// set to TombStone on failure
+    garbage: Vec<u64>,
+    allocs: Vec<(Handle<Arena>, BoxView)>,
 }
 
 impl<'a> SysTxn<'a> {
-    pub fn new(store: &'a Store) -> Self {
+    pub fn new(store: &'a Store, g: &'a Guard) -> Self {
         Self {
             store,
-            buffers: Vec::new(),
-            junks: Vec::new(),
-            page_ids: Vec::new(),
+            g,
+            pinned: Vec::new(),
+            maps: Vec::new(),
+            garbage: Vec::new(),
+            allocs: Vec::new(),
         }
     }
 
-    pub fn transmute<'b>(&mut self) -> &'b mut Self {
-        unsafe { &mut *(self as *mut _) }
-    }
-
-    fn commit(&mut self) {
-        self.page_ids.clear();
-        // NOTE: some frames allocated but failed in cas are also cleand here, since they were
-        // marked as tombstone on cas failed (if we don't do that, we have to traverse buffers to
-        // determine which id should be delayed for releasing buffer and be marked tombstone here,
-        // it's a little bit more overhead and complicate)
-        for (id, _) in &self.buffers {
-            self.store.buffer.release_buffer(*id);
+    pub fn commit(&mut self) {
+        self.maps.clear();
+        while let Some((a, _)) = self.allocs.pop() {
+            a.dec_ref();
         }
-        self.buffers.clear();
-    }
-
-    pub fn gc(&mut self, f: FrameOwner) {
-        self.junks.push(f);
-    }
-
-    pub fn alloc(&mut self, size: usize) -> Result<FrameRef, OpCode> {
-        let (buff_id, frame) = self.store.buffer.alloc(size as u32).inspect_err(|e| {
-            log::error!("alloc memory fail, {:?}", e);
-        })?;
-
-        self.buffers.push((buff_id, frame));
-        Ok(frame)
-    }
-
-    pub fn map(&mut self, frame: &mut FrameRef) -> u64 {
-        if matches!(frame.flag(), FrameFlag::TombStone) {
-            panic!("bad insert");
+        if !self.garbage.is_empty() {
+            self.apply_junk();
         }
-        let addr = frame.addr();
+        self.pinned.clear();
+        self.store.buffer.flush_arena();
+    }
 
-        let pid = self.store.page.map(addr).expect("no page slot");
-        frame.set_pid(pid);
-        self.page_ids.push((pid, addr));
+    pub fn pin(&mut self, p: Page) {
+        self.pinned.push(p);
+    }
+
+    pub fn alloc(&mut self, size: usize) -> BoxRef {
+        let (h, t) = self.store.buffer.alloc(size as u32).expect("never happen");
+        self.allocs.push((h, t.view()));
+        t
+    }
+
+    /// map pid to page table and assign pid to page
+    pub fn map(&mut self, p: &mut Page) -> u64 {
+        let pid = self.store.page.map(p.swip()).expect("no page slot");
+        p.set_pid(pid);
+        self.maps.push((pid, p.swip()));
         pid
     }
 
-    pub fn update(&mut self, pid: u64, old: u64, frame: &mut FrameRef) -> Result<(), u64> {
-        let new = frame.addr();
-        self.store.page.cas(pid, old, new).inspect_err(|_| {
-            // NOTE: if retry ok, it will be set to non-tombstone in Frame::set_pid
-            frame.set_tombstone();
-            self.junks.clear();
-        })?;
+    /// unmap pid from page table then recycle space
+    pub fn unmap(&mut self, p: Page) -> Result<(), OpCode> {
+        // allocate only TagHeader
+        let mut unmap = self.alloc(0);
+        let h = unmap.header_mut();
+        let pid = p.pid();
+        h.flag = TagFlag::Unmap;
+        h.pid = pid;
 
-        Self::apply_junks(self);
-        frame.set_pid(pid);
-        self.commit();
-        Ok(())
+        self.store
+            .page
+            .unmap(pid, p.swip())
+            .map(|_| {
+                p.garbage_collect(self);
+                self.store.buffer.evict(pid);
+                self.g.defer(move || p.reclaim());
+            })
+            .inspect_err(|_| {
+                h.flag = TagFlag::TombStone;
+            })
     }
 
-    fn apply_junks(&mut self) {
-        // the junks maybe from multiple arenas
-        let junks: Vec<u64> = self.junks.iter().map(|x| x.addr()).collect();
-
-        if !junks.is_empty() {
-            let sz = junks.len() * JUNK_LEN;
-
-            let (id, mut junk) = self.store.buffer.alloc(sz as u32).expect("no memory");
-            junk.fill_junk(&junks);
-            self.store.buffer.release_buffer(id);
+    fn apply_junk(&mut self) {
+        #[cfg(feature = "extra_check")]
+        {
+            let old = self.garbage.len();
+            self.garbage.sort();
+            self.garbage.dedup();
+            assert_eq!(old, self.garbage.len());
         }
-        self.junks.clear();
+        let sz = self.garbage.len() * JUNK_LEN;
+        let (h, mut junk) = self.store.buffer.alloc(sz as u32).unwrap();
+        junk.header_mut().flag = TagFlag::Junk;
+        let dst = junk.data_slice_mut::<u64>();
+        dst.copy_from_slice(&self.garbage);
+        self.garbage.clear();
+        h.dec_ref();
     }
 
-    pub fn update_unchecked(&mut self, pid: u64, frame: &mut FrameRef) {
-        self.store.page.index(pid).store(frame.addr(), Relaxed);
-        frame.set_pid(pid);
-        self.commit();
+    /// return new page on success,the old page will be reclaimed
+    pub fn replace(&mut self, old: Page, node: Node) -> Result<Page, OpCode> {
+        let pid = old.pid();
+        let mut new = Page::new(node);
+        new.set_pid(pid);
+        self.store
+            .page
+            .cas(pid, old.swip(), new.swip())
+            .map(|_| {
+                old.garbage_collect(self);
+                self.g.defer(move || old.reclaim());
+                new
+            })
+            .map_err(|_| {
+                new.reclaim();
+                OpCode::Again
+            })
+    }
+
+    pub fn update(&mut self, old: Page, new: &mut Page) -> Result<(), OpCode> {
+        let pid = old.pid();
+        new.set_pid(pid);
+        self.store
+            .page
+            .cas(pid, old.swip(), new.swip())
+            .map(|_| self.g.defer(move || old.reclaim()))
+            .map_err(|_| OpCode::Again)
     }
 }
 
 impl Drop for SysTxn<'_> {
     fn drop(&mut self) {
-        for (pid, addr) in &self.page_ids {
-            self.store.page.unmap(*pid, *addr).expect("can't go wrong");
+        while let Some((pid, swip)) = self.maps.pop() {
+            // the pid is not publish yet, so the unmap here will always succeed
+            self.store.page.unmap(pid, swip).expect("never happen");
         }
-        self.junks.clear();
 
-        for (id, f) in self.buffers.iter_mut() {
-            f.set_tombstone();
-            self.store.buffer.release_buffer(*id);
+        while let Some((a, mut v)) = self.allocs.pop() {
+            v.flag = TagFlag::TombStone;
+            a.dec_ref();
+        }
+        self.store.buffer.flush_arena();
+
+        while let Some(p) = self.pinned.pop() {
+            p.reclaim();
         }
     }
 }
 
 impl IAlloc for SysTxn<'_> {
-    fn allocate(&mut self, size: usize) -> Result<FrameRef, OpCode> {
+    fn allocate(&mut self, size: usize) -> BoxRef {
         self.alloc(size)
     }
 
-    fn page_size(&self) -> u32 {
-        self.store.opt.page_size
+    /// a small optimization, when address is currently in an active arena, we can mark it as TombStone
+    /// so that it will NOT be flushed to data file, or else the address will be used by GC to reclaim
+    /// the unused space in old data file
+    ///
+    /// this can significantly reduce data file size
+    fn recycle(&mut self, addr: &[u64]) {
+        self.store.buffer.tombstone_active(addr, |addr| {
+            self.garbage.push(addr);
+        });
     }
 
-    fn limit_size(&self) -> u32 {
-        self.store.opt.inline_size
+    fn arena_size(&mut self) -> u32 {
+        self.store.opt.arena_size
     }
 }
 
-impl ICollector for SysTxn<'_> {
-    type Input = FrameOwner;
-
-    fn collect(&mut self, x: Self::Input) {
-        self.gc(x);
+impl IInlineSize for SysTxn<'_> {
+    fn inline_size(&self) -> u32 {
+        self.store.opt.max_inline_size
     }
 }

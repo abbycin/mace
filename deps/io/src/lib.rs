@@ -1,5 +1,6 @@
 use std::io;
 
+#[repr(C)]
 pub struct IoVec {
     pub data: *const u8,
     pub len: usize,
@@ -22,7 +23,7 @@ pub trait GatherIO {
 
     fn write(&mut self, data: &[u8]) -> Result<usize, io::Error>;
 
-    fn writev(&mut self, data: &mut [IoVec]) -> Result<(), io::Error>;
+    fn writev(&mut self, data: &mut [IoVec], total_len: usize) -> Result<(), io::Error>;
 
     fn sync(&mut self) -> Result<(), io::Error>;
 

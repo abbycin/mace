@@ -13,11 +13,12 @@ use std::{
 use super::{cc::ConcurrencyControl, context::Context, log::Logging, wal::WalReader};
 use crate::utils::unpack_id;
 use crate::utils::{
-    AMutRef,
+    Handle,
     data::{Meta, WalDescHandle},
 };
 use crate::{cc::wal::Location, utils::options::ParsedOptions};
 use crate::{index::tree::Tree, map::buffer::Buffers, utils::block::Block};
+use crossbeam_epoch::Guard;
 
 pub struct Worker {
     pub cc: ConcurrencyControl,
@@ -35,7 +36,7 @@ impl Worker {
         desc: WalDescHandle,
         meta: Arc<Meta>,
         opt: Arc<ParsedOptions>,
-        buffer: AMutRef<Buffers>,
+        buffer: Handle<Buffers>,
     ) -> Self {
         let cnt = Arc::new(AtomicUsize::new(0));
         Self {
@@ -69,7 +70,7 @@ impl SyncWorker {
         desc: WalDescHandle,
         meta: Arc<Meta>,
         opt: Arc<ParsedOptions>,
-        buffer: AMutRef<Buffers>,
+        buffer: Handle<Buffers>,
     ) -> Self {
         let w = Box::new(Worker::new(desc, meta, opt, buffer));
         Self {
@@ -78,8 +79,7 @@ impl SyncWorker {
     }
 
     pub fn reclaim(&self) {
-        let b = unsafe { Box::from_raw(self.w) };
-        drop(b);
+        unsafe { drop(Box::from_raw(self.w)) };
     }
 
     fn init(&mut self, ctx: &Context, start_ts: u64) {
@@ -123,7 +123,7 @@ impl SyncWorker {
         w.logging.stabilize();
     }
 
-    pub(crate) fn rollback(&self, ctx: &Context, tree: &Tree) {
+    pub(crate) fn rollback(&self, g: &Guard, ctx: &Context, tree: &Tree) {
         const SMALL_SIZE: usize = 256;
         let mut ms = *self;
         let w = ms.deref_mut();
@@ -134,7 +134,7 @@ impl SyncWorker {
         }
         w.logging.stabilize();
         let mut block = Block::alloc(SMALL_SIZE);
-        let reader = WalReader::new(ctx);
+        let reader = WalReader::new(ctx, g);
         let (seq, off) = unpack_id(w.logging.lsn());
         let location = Location {
             wid: self.id as u32,
@@ -142,7 +142,7 @@ impl SyncWorker {
             off,
             len: 0,
         };
-        reader.rollback(&mut block, txid, location, tree);
+        reader.rollback(&mut block, txid, location, tree, Some(*self));
 
         // since we are append-only, we must update CommitTree to make the rollbacked data visible
         // for example: worker 1 set foo = bar then commit, worker 2 del foo, then rollback, if we

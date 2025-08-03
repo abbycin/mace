@@ -1,6 +1,6 @@
 use crate::map::data::DataBuilder;
+use crate::utils::Handle;
 use crate::utils::countblock::Countblock;
-use crate::utils::data::JUNK_LEN;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::RecvTimeoutError;
 use std::{
@@ -16,16 +16,17 @@ use std::{
 use super::data::{FlushData, MapBuilder};
 use super::load::Mapping;
 
-fn flush_data(msg: FlushData, map: &Mapping) {
+fn flush_data(msg: FlushData, map: Handle<Mapping>) {
     let id = msg.id();
     let mut data_builder = DataBuilder::new(id);
     let mut map_builder = MapBuilder::new();
 
-    let mut size = 0;
-    for f in msg.iter {
-        size += f.size();
-        data_builder.add(f);
+    let mut size: usize = 0;
+    for x in msg.iter.iter() {
+        let f = x.value();
+        size += f.total_size() as usize;
         map_builder.add(f);
+        data_builder.add(f.clone());
     }
 
     if !data_builder.is_empty() {
@@ -55,8 +56,7 @@ fn flush_data(msg: FlushData, map: &Mapping) {
 
         map.add(id, false).expect("never happen");
         for f in data_builder.junks.iter() {
-            let payload = f.payload();
-            let junks = payload.as_slice::<u64>(0, payload.len() / JUNK_LEN);
+            let junks = f.data_slice::<u64>();
             map.apply_junks(id, junks);
         }
         // notify sender before map compaction
@@ -67,14 +67,18 @@ fn flush_data(msg: FlushData, map: &Mapping) {
     }
 }
 
-fn flush_thread(rx: Receiver<FlushData>, map: Arc<Mapping>, sync: Arc<Notifier>) -> JoinHandle<()> {
+fn flush_thread(
+    rx: Receiver<FlushData>,
+    map: Handle<Mapping>,
+    sync: Arc<Notifier>,
+) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("flush".into())
         .spawn(move || {
             log::debug!("start flush thread");
             while !sync.is_quit() {
                 match rx.recv_timeout(Duration::from_millis(1)) {
-                    Ok(x) => flush_data(x, &map),
+                    Ok(x) => flush_data(x, map),
                     Err(RecvTimeoutError::Disconnected) => break,
                     _ => {}
                 }
@@ -122,7 +126,7 @@ pub struct Flush {
 }
 
 impl Flush {
-    pub fn new(mapping: Arc<Mapping>) -> Self {
+    pub fn new(mapping: Handle<Mapping>) -> Self {
         let (tx, rx) = channel();
         let sync = Arc::new(Notifier::new());
         flush_thread(rx, mapping, sync.clone());

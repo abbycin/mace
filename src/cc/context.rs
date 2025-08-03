@@ -1,6 +1,6 @@
 use crate::OpCode;
 use crate::map::buffer::Buffers;
-use crate::utils::AMutRef;
+use crate::utils::Handle;
 use crate::utils::data::{Meta, WalDescHandle};
 use crate::utils::options::ParsedOptions;
 use crate::utils::queue::Queue;
@@ -21,17 +21,16 @@ pub struct Context {
 impl Context {
     pub fn new(
         opt: Arc<ParsedOptions>,
-        buffer: AMutRef<Buffers>,
+        buffer: Handle<Buffers>,
         meta: Arc<Meta>,
         desc: &[WalDescHandle],
-    ) -> Arc<Self> {
+    ) -> Self {
         let cores = opt.workers;
         // NOTE: the elements of desc were ordered by worker id
         assert_eq!(cores, desc.len());
         let mut w = Vec::with_capacity(cores);
         let active_workers = Queue::new(cores.next_power_of_two() as u32, None);
         for i in desc.iter() {
-            let buffer = buffer.clone();
             let x = SyncWorker::new(i.clone(), meta.clone(), opt.clone(), buffer);
             w.push(x);
         }
@@ -40,14 +39,12 @@ impl Context {
             active_workers.push(*x).unwrap();
         }
 
-        let this = Self {
+        Self {
             opt: opt.clone(),
             meta,
             workers: Arc::new(w),
             active_workers,
-        };
-
-        Arc::new(this)
+        }
     }
 
     pub fn alloc_worker(&self) -> Result<SyncWorker, OpCode> {

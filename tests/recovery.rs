@@ -85,7 +85,6 @@ fn bad_meta() {
     let db = Mace::new(save.validate().unwrap()).unwrap();
 
     let view = db.view().unwrap();
-    view.show();
     let x = view.get("114514").expect("not found");
     assert_eq!(x.slice(), "1919810".as_bytes());
     let x = view.get("mo");
@@ -195,7 +194,7 @@ fn recover_after_insert() {
     let mut pairs = Vec::new();
 
     for i in 0..1000 {
-        pairs.push((format!("key_{}", i), format!("val_{}", i)));
+        pairs.push((format!("key_{i}"), format!("val_{i}")));
     }
 
     let kv = db.begin().unwrap();
@@ -233,8 +232,8 @@ fn put_update(remove_data: bool) {
     let mut new_pairs = Vec::new();
 
     for i in 0..10000 {
-        pairs.push((format!("key_{}", i), format!("val_{}", i)));
-        new_pairs.push((format!("key_{}", i), format!("new_val_{}", i)));
+        pairs.push((format!("key_{i}"), format!("val_{i}")));
+        new_pairs.push((format!("key_{i}"), format!("new_val_{i}")));
     }
 
     for (k, v) in &pairs {
@@ -297,7 +296,7 @@ fn recover_after_remove() {
     let mut pairs = Vec::new();
 
     for i in 0..1000 {
-        pairs.push((format!("key_{}", i), format!("val_{}", i)));
+        pairs.push((format!("key_{i}"), format!("val_{i}")));
     }
 
     for (k, v) in &pairs {
@@ -328,15 +327,15 @@ fn recover_after_remove() {
 fn ckpt_wal(keys: usize, wal_len: u32) {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.buffer_count = 10;
-    opt.buffer_size = 512 << 10;
+    opt.arena_count = 10;
+    opt.arena_size = 512 << 10;
     opt.wal_file_size = wal_len;
     let mut save = opt.clone();
     let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut data = Vec::new();
 
     for i in 0..keys {
-        data.push((format!("key_{}", i), format!("val_{}", i)));
+        data.push((format!("key_{i}"), format!("val_{i}")));
     }
 
     let kv = db.begin().unwrap();
@@ -385,7 +384,7 @@ fn long_txn_impl(before: bool) {
     let mut pair = Vec::new();
 
     for i in 0..20 {
-        pair.push((format!("key_{}", i), format!("key_{}", i)));
+        pair.push((format!("key_{i}"), format!("key_{i}")));
     }
 
     let cb = b.clone();

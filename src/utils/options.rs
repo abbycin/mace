@@ -3,6 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::{types::imtree::NODE_SIZE, utils::lru::LRU_SHARD};
+
 use super::OpCode;
 
 #[derive(Clone)]
@@ -19,26 +21,26 @@ pub struct Options {
     /// perform compaction when [`Self::gc_ratio`] is reached
     pub gc_eager: bool,
     /// if [`Self::gc_eager`] is not set, the compaction will only be triggered when active data
-    /// size can be compacted into [`Self::gc_compacted_size`], the default setting is [`Self::buffer_size`]
-    pub gc_compacted_size: u32,
-    /// is temperary storage, if true, db_root will be unlinked when quit
+    /// size can be compacted into [`Self::gc_compacted_size`], the default setting is [`Self::arena_size`]
+    pub gc_compacted_size: usize,
+    /// is temperary storage, if true, db_root will be unlinked on exit
     pub tmp_store: bool,
     /// where to store database files
     pub db_root: PathBuf,
     /// number of file meta will be cached, it will be sharded into 32 slots
     pub file_cache: usize,
-    /// cache memory size, unit in element count, not element size
+    /// node cache memory size
     pub cache_capacity: usize,
-    /// percent of items will evict at once, default is 10%
+    /// percent of items will be evicted at once, default is 10%
     pub cache_evict_pct: usize,
-    /// buffer pool element size, also the flushed file size
-    pub buffer_size: u32,
-    /// buffer pool element count, must > 2
-    pub buffer_count: u32,
-    /// B+ Tree node size, mut less than half of [`Self::buffer_size`]
-    pub page_size: u32,
-    /// when should we consolidate delta chain, the best value is 16
-    pub consolidate_threshold: u8,
+    /// delta cache count, shard into 32 slots, which act as a secondary cache to node cache
+    pub cache_count: usize,
+    /// a size limit to trigger data file flush, which also control max key-value size
+    pub arena_size: u32,
+    /// must > 2
+    pub arena_count: u32,
+    /// when should we consolidate delta chain, must less than [`NODE_SIZE`] which is 64
+    pub consolidate_threshold: u32,
     /// WAL ring buffer size, must greater than [`Self::page_size`] and must be power of 2
     pub wal_buffer_size: usize,
     /// the count of checkpoints that a txn can span, ie, the length limit of a txn, if a txn length
@@ -50,18 +52,28 @@ pub struct Options {
     /// if set to true, the unused stable wal file (never used in recovery) will be removed, default
     /// value is `false`
     pub keep_stable_wal_file: bool,
-
-    // private to crate
-    /// max kv size that can store directly into page
-    pub(crate) inline_size: u32,
-    pub(crate) intl_split_size: u32,
-    pub(crate) max_kv_size: u32,
-    pub(crate) intl_consolidate_threshold: u8,
+    /// max key-value size support, it must less than 4GB (because we have to add extra headers or
+    /// something else), the default value is **half** of [`Self::arena_size`]
+    pub max_kv_size: u32,
+    /// max size that key-val can be save into sst (B+ Tree Node) rather than save as a pointer to
+    /// remote address the default value is 2048, the same must less than [`Self::max_kv_size`]
+    pub max_inline_size: u32,
+    /// control max elements in sst (B+ Tree Node), the default value is 512, the sst size which is
+    /// approximate [`Self::max_inline_size`] * [`Self::split_elem`] must less than [`Self::max_kv_size`]
+    pub split_elem: u16,
 }
 
 impl Options {
-    pub const DEFAULT_BUFFER_SIZE: u32 = 64 << 20; // 64MB
+    pub const ARENA_SIZE: usize = 64 << 20; // 64MB
     pub const MAX_WORKERS: usize = 128;
+    pub const CONSOLIDATE_THRESHOLD: u32 = NODE_SIZE as u32;
+    pub const CACHE_CAP: usize = 1 << 30; // 1GB
+    pub const CACHE_CNT: usize = 4096;
+    pub const FILE_CACHE: usize = 512;
+    pub const WAL_BUF_SZ: usize = 8 << 20; // 8MB
+    pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
+    pub const INLINE_SIZE: u32 = 2048;
+    pub const SPLIT_ELEM: u16 = 512;
 
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
@@ -71,41 +83,54 @@ impl Options {
                 .get()
                 .min(Self::MAX_WORKERS),
             tmp_store: false,
-            gc_timeout: 60 * 1000, // 60s
-            gc_ratio: 80,          // 80%
-            gc_eager: false,
-            gc_compacted_size: Self::DEFAULT_BUFFER_SIZE,
+            gc_timeout: 50, // 50ms
+            gc_ratio: 20,   // 20%
+            gc_eager: true,
+            gc_compacted_size: Self::ARENA_SIZE,
             db_root: db_root.as_ref().to_path_buf(),
-            file_cache: 512,      // each shard has 16 entries
-            cache_capacity: 2048, // 2048 items
-            cache_evict_pct: 10,  // 10%
-            buffer_size: Self::DEFAULT_BUFFER_SIZE,
-            buffer_count: 3,    // total 192MB
-            page_size: 8 << 10, // 8KB
-            consolidate_threshold: 24,
-            wal_buffer_size: 4 << 20,    // 4MB
+            file_cache: Self::FILE_CACHE, // each shard has 16 entries
+            cache_capacity: Self::CACHE_CAP,
+            cache_evict_pct: 10, // 10% evict 100MB every time
+            cache_count: Self::CACHE_CNT,
+            arena_size: Self::ARENA_SIZE as u32,
+            arena_count: 3, // total 192MB
+            consolidate_threshold: Self::CONSOLIDATE_THRESHOLD,
+            wal_buffer_size: Self::WAL_BUF_SZ,
             max_ckpt_per_txn: 1_000_000, // 1 million
-            wal_file_size: 100 << 20,    // 100MB
-            // private to
-            inline_size: 0,
-            intl_split_size: 0,
-            max_kv_size: 0,
-            intl_consolidate_threshold: 0,
+            wal_file_size: Self::WAL_FILE_SZ as u32,
+            max_kv_size: Self::ARENA_SIZE as u32 / 2,
             keep_stable_wal_file: false,
+            max_inline_size: Self::INLINE_SIZE,
+            split_elem: Self::SPLIT_ELEM,
         }
     }
 
-    /// the length of the kv plus the length of the metadata must be less than this value for now
-    #[inline(always)]
+    /// the length of the kv plus the length of the metadata must be less than this value
     pub(crate) fn max_data_size(&self) -> usize {
         self.max_kv_size as usize
     }
 
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
-        self.inline_size = self.page_size / 2;
-        self.intl_split_size = self.page_size / 2;
-        self.max_kv_size = self.buffer_size / 2;
-        self.intl_consolidate_threshold = self.consolidate_threshold / 2;
+        if self.consolidate_threshold > Self::CONSOLIDATE_THRESHOLD {
+            self.consolidate_threshold = Self::CONSOLIDATE_THRESHOLD;
+        }
+        if self.file_cache < LRU_SHARD {
+            self.file_cache = Self::FILE_CACHE;
+        }
+        if self.cache_count < LRU_SHARD {
+            self.cache_count = Self::CACHE_CNT;
+        }
+        if self.cache_capacity < self.arena_count as usize * self.arena_size as usize {
+            self.cache_capacity = Self::CACHE_CAP;
+        }
+        self.max_kv_size = self.arena_size / 2;
+        if self.max_inline_size > self.max_kv_size {
+            self.max_inline_size = Self::INLINE_SIZE;
+        }
+        if self.max_inline_size as usize * self.split_elem as usize > self.max_kv_size as usize {
+            self.max_inline_size = Self::INLINE_SIZE;
+            self.split_elem = Self::SPLIT_ELEM;
+        }
         Ok(ParsedOptions { inner: self })
     }
 }
@@ -162,7 +187,7 @@ impl Options {
         if wid == u16::MAX {
             self.db_root.join("meta")
         } else {
-            self.wal_root().join(format!("meta_{}", wid))
+            self.wal_root().join(format!("meta_{wid}"))
         }
     }
     pub fn meta_file(&self) -> PathBuf {

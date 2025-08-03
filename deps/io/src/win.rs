@@ -54,7 +54,7 @@ impl GatherIO for File {
         self.file.write_all(data).map(|_| data.len())
     }
 
-    fn writev(&mut self, iov: &mut [IoVec]) -> Result<(), io::Error> {
+    fn writev(&mut self, iov: &mut [IoVec], _total_len: usize) -> Result<(), io::Error> {
         for x in iov {
             let s = unsafe { std::slice::from_raw_parts(x.data, x.len) };
             self.file.write_all(s)?;

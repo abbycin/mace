@@ -8,28 +8,28 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use io::{File, GatherIO};
 
-use crate::cc::data::Ver;
 use crate::cc::wal::{
     EntryType, Location, PayloadType, WalAbort, WalBegin, WalReader, WalSpan, WalUpdate, ptr_to,
     wal_record_sz,
 };
-use crate::index::Key;
-use crate::index::data::Value;
 use crate::index::tree::Tree;
 use crate::map::Mapping;
 use crate::map::data::{DataState, MapReader, MapSate, StateType};
+use crate::map::table::Swip;
+use crate::types::data::{Key, Record, Value, Ver};
+use crate::types::traits::IAsSlice;
 use crate::utils::block::Block;
 use crate::utils::data::{MetaInner, WalDesc, WalDescHandle};
 use crate::utils::lru::LruInner;
 use crate::utils::options::ParsedOptions;
-use crate::utils::traits::IAsSlice;
-use crate::utils::{NULL_CMD, NULL_ORACLE, pack_id, unpack_id};
-use crate::{OpCode, Record, static_assert};
+use crate::utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE, pack_id, unpack_id};
+use crate::{OpCode, static_assert};
 use crate::{
     Options,
     map::table::PageMap,
     utils::{NEXT_ID, data::Meta},
 };
+use crossbeam_epoch::Guard;
 
 #[derive(Debug, PartialEq, Eq)]
 enum State {
@@ -72,7 +72,6 @@ impl Recovery {
         if self.state == State::New {
             return Ok((Arc::new(meta), PageMap::default(), mapping, desc));
         }
-        // NOTE: we must load map before load data, since the data may be deleted during load map
         let map = self.load_map()?;
         match self.state {
             State::Damaged => self.enumerate(&meta, &mut desc, &mut mapping),
@@ -82,26 +81,32 @@ impl Recovery {
         Ok((Arc::new(meta), map, mapping, desc))
     }
 
-    pub(crate) fn phase2(&mut self, meta: Arc<Meta>, desc: &[WalDescHandle], tree: &Tree) {
+    pub(crate) fn phase2(
+        &mut self,
+        g: &Guard,
+        meta: Arc<Meta>,
+        desc: &[WalDescHandle],
+        tree: &Tree,
+    ) {
         let mut oracle = meta.oracle.load(Relaxed);
         if self.state == State::Damaged {
             let mut block = Block::alloc(self.opt.max_data_size());
             for d in desc.iter() {
                 // analyze and redo starts from latest checkpoint
-                let cur_oracle = self.analyze(d.worker, d.checkpoint, &mut block, tree);
+                let cur_oracle = self.analyze(g, d.worker, d.checkpoint, &mut block, tree);
                 oracle = max(oracle, cur_oracle);
             }
 
             if !self.dirty_table.is_empty() {
-                self.redo(&mut block, tree);
+                self.redo(&mut block, g, tree);
             }
             if !self.undo_table.is_empty() {
-                self.undo(&mut block, tree);
+                self.undo(&mut block, g, tree);
             }
             // that's why we call it oracle, or else keep using the intact oracle in meta
             oracle += 1;
         }
-        log::trace!("oracle {}", oracle);
+        log::trace!("oracle {oracle}");
         meta.oracle.store(oracle, Relaxed);
         meta.wmk_oldest.store(oracle, Relaxed);
     }
@@ -111,7 +116,14 @@ impl Recovery {
         if len < sz { None } else { Some(sz) }
     }
 
-    fn handle_update(&mut self, f: &mut File, loc: &mut Location, buf: &mut [u8], tree: &Tree) {
+    fn handle_update(
+        &mut self,
+        g: &Guard,
+        f: &mut File,
+        loc: &mut Location,
+        buf: &mut [u8],
+        tree: &Tree,
+    ) {
         assert!((loc.len as usize) < buf.len());
         f.read(&mut buf[0..loc.len as usize], loc.off as u64)
             .unwrap();
@@ -123,7 +135,7 @@ impl Recovery {
 
         let raw = u.key();
         let r = tree
-            .get::<Key, Record>(Key::new(raw, NULL_ORACLE, NULL_CMD))
+            .get(g, Key::new(raw, NULL_ORACLE, NULL_CMD))
             .map(|(k, _)| *k.ver());
 
         // check whether the key is exits in data or is latest
@@ -133,7 +145,7 @@ impl Recovery {
         }
     }
 
-    fn analyze(&mut self, wid: u16, addr: u64, block: &mut Block, tree: &Tree) -> u64 {
+    fn analyze(&mut self, g: &Guard, wid: u16, addr: u64, block: &mut Block, tree: &Tree) -> u64 {
         let (seq, mut off) = unpack_id(addr);
         let mut pos;
         let mut oracle = 0;
@@ -162,7 +174,7 @@ impl Recovery {
             pos = off as u64;
             off = 0;
 
-            log::trace!("{:?} pos {} end {}", path, pos, end);
+            log::trace!("{path:?} pos {pos} end {end}");
             while pos < end {
                 let hdr = {
                     let hdr = &mut buf[0..1];
@@ -175,7 +187,7 @@ impl Recovery {
                     break;
                 };
 
-                log::trace!("pos {} sz {} {:?}", pos, sz, et);
+                log::trace!("pos {pos} sz {sz} {et:?}");
                 f.read(&mut buf[0..sz], pos).unwrap();
 
                 pos += sz as u64;
@@ -183,12 +195,12 @@ impl Recovery {
                 match et {
                     EntryType::Commit | EntryType::Abort => {
                         let a = ptr_to::<WalAbort>(ptr);
-                        log::trace!("{:?}", a);
+                        log::trace!("{a:?}");
                         self.undo_table.remove(&{ a.txid });
                     }
                     EntryType::Begin => {
                         let b = ptr_to::<WalBegin>(ptr);
-                        log::trace!("{:?}", b);
+                        log::trace!("{b:?}");
                         self.undo_table.insert(
                             b.txid,
                             Location {
@@ -213,7 +225,7 @@ impl Recovery {
                             break;
                         }
                         loc.len = (sz + u.payload_len()) as u32;
-                        log::trace!("{pos} => {:?}", u);
+                        log::trace!("{pos} => {u:?}");
                         loc.off = (pos - sz as u64) as u32;
 
                         if let Some(l) = self.undo_table.get_mut(&{ u.txid }) {
@@ -221,7 +233,7 @@ impl Recovery {
                             l.seq = seq;
                             l.off = loc.off;
                         }
-                        self.handle_update(&mut f, &mut loc, buf, tree);
+                        self.handle_update(g, &mut f, &mut loc, buf, tree);
                         pos += u.payload_len() as u64;
                     }
                     _ => {
@@ -232,7 +244,7 @@ impl Recovery {
 
             if pos < end {
                 // truncate the WAL if it's imcomplete
-                log::trace!("truncate {:?} from {} to {}", path, end, pos);
+                log::trace!("truncate {path:?} from {end} to {pos}");
                 f.truncate(pos).expect("can't truncate file");
             }
         }
@@ -261,7 +273,7 @@ impl Recovery {
         }
     }
 
-    fn redo(&mut self, block: &mut Block, tree: &Tree) {
+    fn redo(&mut self, block: &mut Block, g: &Guard, tree: &Tree) {
         let cache = LruInner::new();
         let cap = 32;
 
@@ -283,16 +295,16 @@ impl Recovery {
                 PayloadType::Insert => {
                     let i = c.put();
                     let val = Value::Put(Record::normal(c.worker_id, i.val()));
-                    tree.put(key, val)
+                    tree.put(g, key, val)
                 }
                 PayloadType::Update => {
                     let u = c.update();
                     let val = Value::Put(Record::normal(c.worker_id, u.new_val()));
-                    tree.put(key, val)
+                    tree.put(g, key, val)
                 }
                 PayloadType::Delete => {
                     let val = Value::Del(Record::remove(c.worker_id));
-                    tree.put(key, val)
+                    tree.put(g, key, val)
                 }
                 PayloadType::Clr => {
                     let r = c.clr();
@@ -301,17 +313,17 @@ impl Recovery {
                     } else {
                         Value::Put(Record::normal(c.worker_id, r.val()))
                     };
-                    tree.put(key, val)
+                    tree.put(g, key, val)
                 }
             };
             assert!(r.is_ok());
         }
     }
 
-    fn undo(&self, block: &mut Block, tree: &Tree) {
-        let reader = WalReader::new(&tree.store.context);
+    fn undo(&self, block: &mut Block, g: &Guard, tree: &Tree) {
+        let reader = WalReader::new(&tree.store.context, g);
         for (txid, addr) in &self.undo_table {
-            reader.rollback(block, *txid, *addr, tree);
+            reader.rollback(block, *txid, *addr, tree, None);
         }
     }
 
@@ -416,7 +428,7 @@ impl Recovery {
                         let data = DataState::from_slice(&buf[..dlen]);
                         let data_file = self.opt.data_file(data.file_id);
                         let _ = std::fs::remove_file(&data_file);
-                        log::info!("unlink {:?}", data_file);
+                        log::info!("unlink {data_file:?}");
                         dlen
                     }
                     StateType::Map => {
@@ -426,7 +438,7 @@ impl Recovery {
                         if map_path.exists() {
                             let file = File::options().write(true).open(&map_path).unwrap();
                             file.truncate(map.offset).unwrap();
-                            log::info!("truncate {:?}", map_path);
+                            log::info!("truncate {map_path:?}");
                         }
                         mlen
                     }
@@ -438,6 +450,7 @@ impl Recovery {
         }
 
         let mut block = Block::alloc(MapReader::DEFAULT_BLOCK_SIZE);
+        let mut next = 0;
         for id in 0.. {
             let map_path = self.opt.map_file(id);
             if !map_path.exists() {
@@ -449,8 +462,13 @@ impl Recovery {
                 let o = reader.next(&mut block)?;
                 if let Some(es) = o {
                     es.iter().for_each(|e| {
-                        if table.get(e.page_id()) < e.page_addr() {
-                            table.index(e.page_id()).store(e.page_addr(), Relaxed);
+                        next = next.max(e.page_id());
+                        if e.page_addr() == NULL_ADDR {
+                            table.insert_free(e.page_id());
+                        } else {
+                            table
+                                .index(e.page_id())
+                                .fetch_max(Swip::tagged(e.page_addr()), Relaxed);
                         }
                     });
                 } else {
@@ -458,6 +476,7 @@ impl Recovery {
                 }
             }
         }
+        table.set_next(next + 1);
         Ok(table)
     }
 
@@ -509,8 +528,6 @@ impl Recovery {
                 f.read(&mut buf[0..sz], pos).unwrap();
                 pos += sz as u64;
 
-                log::trace!("load wal {:?}", h);
-
                 match h {
                     EntryType::Begin => {
                         let b = ptr_to::<WalBegin>(buf.as_ptr());
@@ -553,7 +570,7 @@ impl Recovery {
             } else {
                 // either last data file or compacted data file, ignore them
                 let name = self.opt.data_file(i);
-                log::info!("unlink imcomplete file {:?}", name);
+                log::info!("unlink imcomplete file {name:?}");
                 std::fs::remove_file(name).expect("never happen");
             }
         }

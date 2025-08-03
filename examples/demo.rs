@@ -3,7 +3,7 @@ use mace::{Mace, OpCode, Options};
 fn main() -> Result<(), OpCode> {
     let path = std::env::temp_dir().join("mace");
     let _ = std::fs::remove_dir_all(&path);
-    let opt = Options::new(path).validate().unwrap();
+    let opt = Options::new(path).validate()?;
     let db = Mace::new(opt)?;
 
     // start a read-write Txn

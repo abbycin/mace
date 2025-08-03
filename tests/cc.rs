@@ -1,25 +1,24 @@
 use mace::{Mace, OpCode, Options, RandomPath};
 use rand::{seq::SliceRandom, thread_rng};
-use std::thread::sleep;
-use std::time::Duration;
 use std::{
     collections::HashSet,
-    sync::{Barrier, RwLock},
+    sync::{Arc, Barrier, RwLock},
+    thread::{JoinHandle, sleep},
+    time::Duration,
 };
 
 #[test]
 fn put_get() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
-    opt.buffer_count = 5;
+    opt.arena_count = 5;
     let db = Mace::new(opt.validate().unwrap())?;
 
     let n = 1000;
-    let mut container = Vec::with_capacity(n);
+    let mut elems = Vec::with_capacity(n);
     for i in 0..n {
-        container.push(format!("elem_{i}"));
+        elems.push(format!("elem_{i}"));
     }
-    let elems: Vec<&[u8]> = container.iter().map(|x| x.as_bytes()).collect();
     let del1: RwLock<HashSet<Vec<u8>>> = RwLock::new(HashSet::new());
     let del2: RwLock<HashSet<Vec<u8>>> = RwLock::new(HashSet::new());
     let barrier = Barrier::new(3);
@@ -29,7 +28,7 @@ fn put_get() -> Result<(), OpCode> {
             barrier.wait();
             for i in &elems {
                 let kv = db.begin().unwrap();
-                let _ = kv.put(*i, *i);
+                let _ = kv.put(i, i);
                 kv.commit().unwrap();
             }
         });
@@ -38,8 +37,8 @@ fn put_get() -> Result<(), OpCode> {
             barrier.wait();
             for i in &elems {
                 let kv = db.begin().unwrap();
-                if let Ok(x) = kv.del(*i) {
-                    assert_eq!(x.slice(), *i);
+                if let Ok(x) = kv.del(i) {
+                    assert_eq!(x.slice(), i.as_bytes());
                     del1.write().unwrap().insert(x.slice().to_vec());
                 }
                 kv.commit().unwrap();
@@ -50,8 +49,8 @@ fn put_get() -> Result<(), OpCode> {
             barrier.wait();
             for i in &elems {
                 let kv = db.begin().unwrap();
-                if let Ok(x) = kv.del(*i) {
-                    assert_eq!(x.slice(), *i);
+                if let Ok(x) = kv.del(i) {
+                    assert_eq!(x.slice(), i.as_bytes());
                     del2.write().unwrap().insert(x.slice().to_vec());
                 }
                 kv.commit().unwrap();
@@ -70,7 +69,7 @@ fn put_get() -> Result<(), OpCode> {
 
 fn check(
     db: &Mace,
-    elems: &Vec<&[u8]>,
+    elems: &[String],
     del1: &RwLock<HashSet<Vec<u8>>>,
     del2: &RwLock<HashSet<Vec<u8>>>,
 ) {
@@ -78,14 +77,14 @@ fn check(
     let lk2 = del2.read().unwrap();
     let view = db.view().unwrap();
     for i in elems.iter() {
-        let tmp = i.to_vec();
+        let tmp = i.as_bytes().to_vec();
         if lk1.contains(&tmp) || lk2.contains(&tmp) {
             continue;
         }
-        let r = view.get(*i).expect("must exist");
-        if r.slice() != *i {
+        let r = view.get(i).expect("must exist");
+        if r.slice() != i.as_bytes() {
             assert!(!lk1.contains(r.slice()));
-            assert_eq!(r.slice(), *i);
+            assert_eq!(r.slice(), i.as_bytes());
         }
     }
 
@@ -136,7 +135,7 @@ fn get_del() -> Result<(), OpCode> {
         }
         removed.push(k.clone());
         let kv = db.begin().unwrap();
-        kv.del(v[i].as_bytes()).expect("can't del");
+        kv.del(k.as_bytes()).expect("can't del");
         kv.commit().unwrap();
     }
 
@@ -147,6 +146,62 @@ fn get_del() -> Result<(), OpCode> {
     }
 
     Ok(())
+}
+
+#[test]
+fn rollback() {
+    let workers = 12;
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    opts.arena_count = workers;
+    opts.workers = workers as usize;
+    let db = Mace::new(opts.validate().unwrap()).unwrap();
+    const N: usize = 10000;
+
+    // multiple threads trying to update the same key, some of them will pass the visibility check and
+    // start update the key, but only one of them may success, those failure threads will check the
+    // visibility again and find the new key is invisible to them, they will abort the transaction
+    // and rollback what they have wrote to the log
+    fn update(db: &Mace, pairs: &Vec<Vec<u8>>) {
+        for x in pairs {
+            let kv = db.begin().unwrap();
+            if kv.update(x, x).is_ok() {
+                kv.commit().unwrap();
+            }
+            // automatically rollback
+        }
+    }
+
+    for t in [2, 6, workers] {
+        for len in [16, 64, 256] {
+            let pairs: Vec<Vec<u8>> = (0..N)
+                .map(|i| {
+                    let mut tmp = vec![0; len];
+                    let k = format!("{i}");
+                    tmp[..k.len()].copy_from_slice(k.as_bytes());
+                    tmp
+                })
+                .collect();
+            let pairs = Arc::new(pairs);
+
+            for x in pairs.iter() {
+                let kv = db.begin().unwrap();
+                kv.upsert(x, x).unwrap();
+                kv.commit().unwrap();
+            }
+            let h: Vec<JoinHandle<()>> = (0..t)
+                .map(|_| {
+                    let db = db.clone();
+                    let pairs = pairs.clone();
+                    std::thread::spawn(move || update(&db, &pairs))
+                })
+                .collect();
+
+            for x in h {
+                x.join().unwrap();
+            }
+        }
+    }
 }
 
 #[test]
@@ -231,7 +286,7 @@ fn range_in_one_node() -> Result<(), OpCode> {
     let db2 = db.clone();
     let t = std::thread::spawn(move || {
         for i in 0..N {
-            let k = format!("key_{}", i);
+            let k = format!("key_{i}");
             let kv = db2.begin().unwrap();
             kv.put(&k, &k).unwrap();
             kv.commit().unwrap();
@@ -258,7 +313,7 @@ fn range_in_one_node() -> Result<(), OpCode> {
 
     let mut keys = HashSet::with_capacity(N);
     for i in 0..N {
-        let x = format!("key_{}", i);
+        let x = format!("key_{i}");
         keys.insert(x);
     }
 
@@ -281,7 +336,7 @@ fn range_in_one_node() -> Result<(), OpCode> {
 fn range_cross_node() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.consolidate_threshold = 8;
-    opts.page_size = 1024; // force split
+    opts.split_elem = 128; // force split
     opts.sync_on_write = false;
     opts.tmp_store = true;
     let db = Mace::new(opts.validate().unwrap()).unwrap();
@@ -289,7 +344,7 @@ fn range_cross_node() -> Result<(), OpCode> {
     let mut h = HashSet::with_capacity(N);
 
     for i in 0..N {
-        let x = format!("key_{}", i);
+        let x = format!("key_{i}");
         let kv = db.begin().unwrap();
         kv.put(&x, &x)?;
         kv.commit()?;
@@ -311,7 +366,7 @@ fn range_cross_node() -> Result<(), OpCode> {
 
     let kv = db.begin().unwrap();
     for i in 0..40 {
-        let a = format!("aa_{}", i);
+        let a = format!("aa_{i}");
         kv.put(&a, "bar")?;
     }
     kv.commit()?;
@@ -321,7 +376,7 @@ fn range_cross_node() -> Result<(), OpCode> {
 
     let kv = db.begin().unwrap();
     for i in 0..40 {
-        let z = format!("zz_{}", i);
+        let z = format!("zz_{i}");
         kv.put(&z, "bar")?;
     }
     kv.commit()?;
@@ -332,6 +387,54 @@ fn range_cross_node() -> Result<(), OpCode> {
     Ok(())
 }
 
+#[test]
+fn cross_txn() {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.workers = 3;
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
+
+    let tx1 = db.begin().unwrap();
+    let tx2 = db.begin().unwrap();
+
+    let _ = tx1.put("foo", "1");
+    let _ = tx1.put("fool", "2");
+
+    let iter = tx2.seek("fo");
+    assert_eq!(iter.count(), 0);
+
+    let _ = tx1.commit();
+
+    let iter = tx2.seek("fo");
+    assert_eq!(iter.count(), 0);
+    let _ = tx2.commit();
+
+    let tx2 = db.view().unwrap();
+    let iter = tx2.seek("fo");
+    assert_eq!(iter.count(), 2);
+
+    let tx1 = db.begin().unwrap();
+    tx1.del("foo").unwrap();
+
+    let iter = tx1.seek("fo");
+    assert_eq!(iter.count(), 1);
+
+    let view = db.view().unwrap();
+    let iter = view.seek("fo");
+    assert_eq!(iter.count(), 2);
+
+    let _ = tx1.commit();
+    let iter = view.seek("fo");
+    assert_eq!(iter.count(), 2);
+
+    let view = db.view().unwrap();
+    let iter = view.seek("fo");
+    assert_eq!(iter.count(), 1);
+    let r = view.get("fool").unwrap();
+    assert_eq!(r.slice(), "2".as_bytes());
+}
+
 fn to_str(x: &[u8]) -> &str {
-    std::str::from_utf8(x).unwrap()
+    unsafe { std::str::from_utf8_unchecked(x) }
 }

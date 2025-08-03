@@ -1,4 +1,4 @@
-use super::{INIT_ORACLE, MutRef, NEXT_ID, OpCode, pack_id, rand_range};
+use super::{INIT_ORACLE, MutRef, NEXT_ID, NULL_ADDR, OpCode, pack_id, rand_range};
 use crate::utils::bitmap::{BITMAP_ELEM_LEN, BitMap, BitmapElemType};
 use crc32c::Crc32cHasher;
 use io::{GatherIO, IoVec};
@@ -22,7 +22,7 @@ pub(crate) const JUNK_LEN: usize = size_of::<u64>();
 #[repr(C, packed(1))]
 pub struct Reloc {
     /// frame offset in page file
-    pub(crate) off: u32,
+    pub(crate) off: usize,
     /// frame's payload length
     pub(crate) len: u32,
     /// index in reclocation table
@@ -39,7 +39,7 @@ pub struct AddrMap {
 
 impl AddrMap {
     pub const LEN: usize = size_of::<Self>();
-    pub fn new(key: u64, off: u32, len: u32, seq: u32) -> Self {
+    pub fn new(key: u64, off: usize, len: u32, seq: u32) -> Self {
         Self {
             key,
             val: Reloc { off, len, seq },
@@ -82,6 +82,7 @@ impl MapEntry {
 #[derive(Default)]
 pub struct PageTable {
     // pid, addr, len(offset + len)
+    // NULL_ADDR for delete mark
     data: BTreeMap<u64, u64>,
 }
 
@@ -103,12 +104,11 @@ impl PageTable {
     }
 
     pub fn add(&mut self, pid: u64, addr: u64) {
-        // a delta chain in same arana, we use the latest mapping
-        // NOTE: it's incorrect when addr was wrapped, but it's almost never happen in our spec
         self.data
             .entry(pid)
             .and_modify(|x| {
-                if *x < addr {
+                // when current is normal addr, or it's a tombstone and reused
+                if *x < addr || *x == NULL_ADDR {
                     *x = addr;
                 }
             })
@@ -133,12 +133,16 @@ pub struct GatherWriter {
     path: PathBuf,
     file: io::File,
     queue: Vec<IoVec>,
+    queued_len: usize,
+    max_iovcnt: usize,
 }
 
 unsafe impl Send for GatherWriter {}
 
 impl GatherWriter {
-    const MAX_IOVCNT: usize = 64;
+    /// max iovec count is limited to 1024 in Linux
+    pub(crate) const MAX_IOVCNT: usize = 1024;
+    pub(crate) const DEFAULT_IOVCNT: usize = 64;
 
     fn open(path: &PathBuf) -> io::File {
         io::File::options()
@@ -147,16 +151,22 @@ impl GatherWriter {
             .create(true)
             .open(path)
             .inspect_err(|x| {
-                log::error!("can't open {:?}, {}", path, x);
+                log::error!("can't open {path:?}, {x}");
             })
             .unwrap()
     }
 
-    pub fn new(path: &PathBuf) -> Self {
+    pub fn new(path: &PathBuf, max_iovcnt: usize) -> Self {
         Self {
             path: path.clone(),
             file: Self::open(path),
             queue: Vec::new(),
+            queued_len: 0,
+            max_iovcnt: if max_iovcnt >= Self::MAX_IOVCNT {
+                Self::DEFAULT_IOVCNT
+            } else {
+                max_iovcnt
+            },
         }
     }
 
@@ -167,10 +177,11 @@ impl GatherWriter {
     }
 
     pub fn queue(&mut self, data: &[u8]) {
-        if self.queue.len() == Self::MAX_IOVCNT {
+        if self.queue.len() >= self.max_iovcnt {
             self.flush();
         }
         self.queue.push(data.into());
+        self.queued_len += data.len();
     }
 
     #[allow(unused)]
@@ -194,9 +205,10 @@ impl GatherWriter {
     pub fn flush(&mut self) {
         let iov = self.queue.as_mut_slice();
         self.file
-            .writev(iov)
-            .inspect_err(|x| log::error!("can't write iov, {}", x))
+            .writev(iov, self.queued_len)
+            .inspect_err(|x| log::error!("can't write iov, {x}"))
             .unwrap();
+        self.queued_len = 0;
         self.queue.clear();
     }
 
@@ -326,6 +338,10 @@ impl MetaInner {
         }
     }
 
+    pub fn safe_tixd(&self) -> u64 {
+        self.wmk_oldest.load(Relaxed)
+    }
+
     pub fn checksum(&self) -> u32 {
         self.checksum.load(Relaxed)
     }
@@ -394,8 +410,6 @@ impl Meta {
             std::slice::from_raw_parts(p, n)
         };
 
-        // TODO: we can provide a `shrink` or `enlarge` function to resize worker dynamically when
-        //  it's initialized and before performing any modification
         if inner.nr_worker.load(Relaxed) != workers as u16 {
             log::error!(
                 "incorrect number of workers, expect {} real {}",

@@ -1,10 +1,20 @@
-use crate::utils::bytes::ByteArray;
+use crossbeam_epoch::Guard;
 
-pub trait IPageIter: Iterator {
-    fn rewind(&mut self);
+use crate::types::refbox::BoxRef;
+
+pub trait IInlineSize {
+    fn inline_size(&self) -> u32;
 }
 
-pub trait IKey: ICodec + Clone + Copy + Ord {
+pub trait IAlloc: IInlineSize {
+    fn allocate(&mut self, size: usize) -> BoxRef;
+
+    fn recycle(&mut self, addr: &[u64]);
+
+    fn arena_size(&mut self) -> u32;
+}
+
+pub trait IKey: Default + ICodec + Clone + Copy + Ord {
     fn raw(&self) -> &[u8];
 
     fn to_string(&self) -> String;
@@ -15,11 +25,13 @@ pub trait ICodec {
 
     fn encode_to(&self, to: &mut [u8]);
 
-    fn decode_from(raw: ByteArray) -> Self;
+    fn decode_from(raw: &[u8]) -> Self;
 }
 
-pub trait IVal: ICodec + Copy + Clone {
+pub trait IVal: ICodec + Copy + Clone + Default {
     fn to_string(&self) -> String;
+
+    fn is_tombstone(&self) -> bool;
 }
 
 pub trait IValCodec: Copy {
@@ -34,20 +46,11 @@ pub trait IValCodec: Copy {
     fn data(&self) -> &[u8];
 }
 
-pub trait IInfer {
-    fn infer(&self) -> ByteArray;
-}
-
-pub trait IDataLoader: Clone {
-    type Out: Clone + IInfer;
-
-    fn load_data(&self, addr: u64) -> Self::Out;
-}
-
-pub trait ICollector {
-    type Input: Clone + IInfer;
-
-    fn collect(&mut self, x: Self::Input);
+pub trait ITree {
+    fn put<K, V>(&self, g: &Guard, k: K, v: V)
+    where
+        K: IKey,
+        V: IVal;
 }
 
 /// NOTE: the type impl [`IAsSlice`] must be `packed(1)`
@@ -61,4 +64,8 @@ pub trait IAsSlice: Sized {
         assert_eq!(x.len(), size_of::<Self>());
         unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
     }
+}
+
+pub trait IHolder: Iterator {
+    fn take_holder(&mut self) -> BoxRef;
 }

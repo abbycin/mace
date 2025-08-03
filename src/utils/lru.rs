@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
     hash::Hash,
+    ops::Deref,
     ptr::{self},
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
 };
 
 use super::spooky::spooky_hash;
@@ -40,6 +41,18 @@ impl<K, V> Default for Node<K, V> {
             prev: ptr::null_mut(),
             next: ptr::null_mut(),
         }
+    }
+}
+pub(crate) struct LruGuard<'a, K, V> {
+    data: &'a V,
+    _guard: MutexGuard<'a, HashMap<K, *mut Node<K, V>>>,
+}
+
+impl<K, V> Deref for LruGuard<'_, K, V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        self.data
     }
 }
 
@@ -99,12 +112,17 @@ where
         }
     }
 
-    pub(crate) fn get(&self, k: &K) -> Option<&V> {
+    pub(crate) fn get<'a>(&'a self, k: &K) -> Option<LruGuard<'a, K, V>> {
         let map = self.map.lock().unwrap();
-        map.get(k).map(|x| {
+        if let Some(x) = map.get(k) {
             self.move_back(*x);
-            unsafe { (*(*x)).val.as_ref().unwrap() }
-        })
+            Some(LruGuard {
+                data: unsafe { (*(*x)).val.as_ref().unwrap() },
+                _guard: map,
+            })
+        } else {
+            None
+        }
     }
 
     pub(crate) fn del(&self, k: &K) {
@@ -163,7 +181,7 @@ pub const LRU_SHARD: usize = 32;
 const LRU_SHARD_MASK: usize = LRU_SHARD - 1;
 
 pub(crate) struct Lru<V> {
-    shard: [LruInner<u32, V>; LRU_SHARD],
+    shard: [LruInner<u64, V>; LRU_SHARD],
     cap: usize,
 }
 
@@ -177,25 +195,27 @@ impl<V> Lru<V> {
     }
 
     #[inline(always)]
-    fn get_shard(k: u32) -> usize {
-        spooky_hash(k as u64) as usize & LRU_SHARD_MASK
+    fn get_shard(k: u64) -> usize {
+        spooky_hash(k) as usize & LRU_SHARD_MASK
     }
 
-    pub(crate) fn add(&self, k: u32, v: V) {
+    pub(crate) fn add(&self, k: u64, v: V) {
         self.shard[Self::get_shard(k)].add(self.cap, k, v);
     }
 
-    pub(crate) fn get(&self, k: u32) -> Option<&V> {
+    pub(crate) fn get<'a>(&'a self, k: u64) -> Option<LruGuard<'a, u64, V>> {
         self.shard[Self::get_shard(k)].get(&k)
     }
 
-    pub(crate) fn del(&self, k: u32) {
+    pub(crate) fn del(&self, k: u64) {
         self.shard[Self::get_shard(k)].del(&k);
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::ops::Deref;
+
     use crate::utils::lru::LruInner;
 
     #[test]
@@ -206,15 +226,15 @@ mod test {
         m.add(cap, 1, 1);
         m.add(cap, 1, 2);
 
-        assert_eq!(m.get(&1).unwrap(), &2);
+        assert_eq!(m.get(&1).unwrap().deref(), &2);
 
         m.add(cap, 2, 2);
         m.add(cap, 3, 3);
         m.add(cap, 4, 4);
 
-        assert_eq!(m.get(&1), None);
-        assert_eq!(m.get(&2).unwrap(), &2);
-        assert_eq!(m.get(&3).unwrap(), &3);
-        assert_eq!(m.get(&4).unwrap(), &4);
+        assert!(m.get(&1).is_none());
+        assert_eq!(m.get(&2).unwrap().deref(), &2);
+        assert_eq!(m.get(&3).unwrap().deref(), &3);
+        assert_eq!(m.get(&4).unwrap().deref(), &4);
     }
 }

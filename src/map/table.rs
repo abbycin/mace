@@ -1,19 +1,20 @@
-use std::cmp::min;
+use std::collections::BTreeSet;
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::OpCode;
-use crate::utils::{NULL_PID, ROOT_PID};
+use crate::utils::{INIT_ADDR, NULL_PID, ROOT_PID};
 
 const SLOT_SIZE: u64 = 1u64 << 16;
 
-/// NOTE: zero addr indicate empty
 pub struct PageMap {
     l1: Box<Layer1>,
     l2: Box<Layer2>,
     l3: Box<Layer3>,
     next: AtomicU64,
+    free: Mutex<BTreeSet<u64>>,
 }
 
 // currently in stable rust we can't create large object directly using Box, since it will create the
@@ -35,20 +36,29 @@ impl Default for PageMap {
             l2: box_new(),
             l3: box_new(),
             next: AtomicU64::new(ROOT_PID),
+            free: Mutex::new(BTreeSet::new()),
         }
     }
 }
 
 impl PageMap {
-    /// alloc a pid with value euqal to pid
-    pub fn alloc(&self) -> Option<u64> {
-        let mut pid = self.next.load(Ordering::Relaxed);
+    pub fn map(&self, data: u64) -> Option<u64> {
+        let mut lk = self.free.lock().unwrap();
+        if let Some(pid) = lk.pop_first() {
+            self.index(pid)
+                .compare_exchange(NULL_PID, data, Ordering::AcqRel, Ordering::Relaxed)
+                .expect("impossible");
+            return Some(pid);
+        }
+        drop(lk);
+
+        let mut pid = self.next.fetch_add(1, Ordering::Relaxed);
         let mut cnt = 0;
 
         while cnt < MAX_ID {
             match self.index(pid).compare_exchange(
                 NULL_PID,
-                pid,
+                data,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
@@ -60,51 +70,29 @@ impl PageMap {
         None
     }
 
-    pub fn map(&self, addr: u64) -> Option<u64> {
-        let mut pid = self.next.fetch_add(1, Ordering::Release);
-        let mut cnt = 0;
-
-        while cnt < MAX_ID {
-            match self.index(pid).compare_exchange(
-                NULL_PID,
-                addr,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(x) => {
-                    assert_eq!(x, NULL_PID);
-                    break;
-                }
-                Err(_) => {
-                    pid = self.next.fetch_add(1, Ordering::Release);
-                }
-            }
-            cnt += 1;
-        }
-
-        if cnt == MAX_ID { None } else { Some(pid) }
-    }
-
     pub fn unmap(&self, pid: u64, addr: u64) -> Result<(), OpCode> {
         self.index(pid)
             .compare_exchange(addr, NULL_PID, Ordering::AcqRel, Ordering::Relaxed)
             .map_err(|_| OpCode::Again)?;
-        let mut curr = self.next.load(Ordering::Relaxed);
-        loop {
-            let smaller = min(pid, curr);
-            match self
-                .next
-                .compare_exchange(curr, smaller, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(x) => curr = x,
-            }
-        }
+
+        let mut lk = self.free.lock().unwrap();
+        assert!(!lk.contains(&pid));
+        lk.insert(pid);
         Ok(())
+    }
+
+    pub fn set_next(&self, pid: u64) {
+        self.next.store(pid, Ordering::Relaxed);
     }
 
     pub fn get(&self, pid: u64) -> u64 {
         self.index(pid).load(Ordering::Relaxed)
+    }
+
+    pub fn insert_free(&self, pid: u64) {
+        let mut lk = self.free.lock().unwrap();
+        assert!(!lk.contains(&pid));
+        lk.insert(pid);
     }
 
     pub fn index(&self, pid: u64) -> &AtomicU64 {
@@ -144,8 +132,7 @@ impl Layer3 {
 
 macro_rules! build_layer {
     ($layer:ident, $indirect:ty, $fanout:expr) => {
-        /// NOTE: `SLOT_SIZE - 1` since we extract one as standalone layer in `PageMap`
-        struct $layer([AtomicPtr<$indirect>; SLOT_SIZE as usize - 1]);
+        struct $layer([AtomicPtr<$indirect>; SLOT_SIZE as usize]);
 
         impl Default for $layer {
             fn default() -> Self {
@@ -200,12 +187,44 @@ const L1_FANOUT: u64 = L2_FANOUT * SLOT_SIZE;
 
 const MAX_ID: u64 = L1_FANOUT - 1;
 
-build_layer!(Layer2, Layer3, L2_FANOUT);
-build_layer!(Layer1, Layer2, L1_FANOUT);
+build_layer!(Layer2, Layer3, L3_FANOUT);
+build_layer!(Layer1, Layer2, L2_FANOUT);
+
+pub(crate) struct Swip(u64);
+
+impl Swip {
+    pub(crate) const TAG: u64 = 1 << 63;
+    pub(crate) fn new(x: u64) -> Self {
+        Self(x)
+    }
+
+    pub(crate) fn is_null(&self) -> bool {
+        self.0 == INIT_ADDR
+    }
+
+    pub(crate) fn is_tagged(&self) -> bool {
+        self.0 & Self::TAG != 0
+    }
+
+    pub(crate) fn untagged(&self) -> u64 {
+        self.0 & !Self::TAG
+    }
+
+    pub(crate) fn raw(&self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn tagged(x: u64) -> u64 {
+        x | Self::TAG
+    }
+}
 
 #[cfg(test)]
 mod test {
-    use crate::map::table::{L1_FANOUT, L2_FANOUT, L3_FANOUT, NULL_PID, PageMap};
+    use crate::{
+        map::table::{L1_FANOUT, L2_FANOUT, L3_FANOUT, PageMap},
+        utils::INIT_ADDR,
+    };
 
     fn addr(a: u64) -> u64 {
         a * 2
@@ -224,20 +243,20 @@ mod test {
             L2_FANOUT,
             L2_FANOUT + 1,
             L1_FANOUT - 1,
-            L1_FANOUT,
-            L1_FANOUT + 1,
         ];
         let mut mapped_pid = vec![];
 
-        for i in &pids {
-            let pid = table.map(addr(*i)).unwrap();
-            mapped_pid.push(pid);
-            assert_eq!(table.get(pid), addr(*i));
+        for &i in &pids {
+            table
+                .index(i)
+                .store(addr(i), std::sync::atomic::Ordering::Relaxed);
+            mapped_pid.push(i);
+            assert_eq!(table.get(i), addr(i));
         }
 
         for (idx, pid) in mapped_pid.iter().enumerate() {
             table.unmap(*pid, addr(pids[idx])).unwrap();
-            assert_eq!(table.get(*pid), NULL_PID);
+            assert_eq!(table.get(*pid), INIT_ADDR);
         }
 
         assert_eq!(pids.len(), mapped_pid.len());

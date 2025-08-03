@@ -1,6 +1,6 @@
 use std::alloc::{Layout, alloc, dealloc, realloc};
 
-use super::{align_up, bytes::ByteArray};
+use super::align_up;
 
 pub(crate) struct Block {
     data: *mut u8,
@@ -58,12 +58,6 @@ impl Block {
 
     pub(crate) fn aligned_len(&self) -> usize {
         align_up(self.len as usize, self.align as usize)
-    }
-
-    pub(crate) fn view(&self, from: usize, to: usize) -> ByteArray {
-        debug_assert!(from <= to);
-        debug_assert!(to <= self.len as usize);
-        ByteArray::new(unsafe { self.data.add(from) }, to - from)
     }
 
     pub(crate) fn mut_slice<'a>(&self, off: usize, len: usize) -> &'a mut [u8] {

@@ -1,3 +1,14 @@
+## [0.0.9] 2025-08-03
+### Changes
+- Replace delta-chain implementation to ImTree
+- Abstract `Node` implementation
+- Save remote addresses directly into sst for quickly recycle
+- Reduce garbage creation
+
+### Bug fixes
+- Fix `LruInner::get` data race
+- Fix `log.rs` rollback lsn point to junk data and subtraction overflow
+
 ## [0.0.8] 2025-05-29
 ### Changes
 - Separate `map` from `data` file

@@ -98,7 +98,7 @@ impl Debug for BitMap {
                 bits[i as usize] = 1;
             }
         }
-        f.write_fmt(format_args!("{:?}", bits))
+        f.write_fmt(format_args!("{bits:?}"))
     }
 }
 

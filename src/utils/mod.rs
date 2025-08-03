@@ -1,25 +1,25 @@
 use std::{
-    cell::RefCell,
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicI64, AtomicU32, Ordering::Relaxed},
+    sync::atomic::{AtomicI64, Ordering::Relaxed},
 };
 
-use rand::{Rng, rngs::ThreadRng};
+use rand::Rng;
 
 pub(crate) mod bitmap;
 pub(crate) mod block;
-pub(crate) mod bytes;
 pub(crate) mod countblock;
 pub(crate) mod data;
 pub(crate) mod lru;
 pub(crate) mod options;
 pub(crate) mod queue;
-mod spooky;
-pub(crate) mod traits;
+pub(crate) mod spooky;
 pub(crate) mod varint;
 
 pub(crate) const NULL_PID: u64 = 0;
+pub(crate) const NULL_ADDR: u64 = u64::MAX;
+pub(crate) const INIT_ADDR: u64 = 0;
+pub const ADDR_LEN: usize = size_of::<u64>();
 pub(crate) const ROOT_PID: u64 = 1;
 pub(crate) const NEXT_ID: u32 = 1;
 pub(crate) const INVALID_ID: u32 = 0;
@@ -27,7 +27,7 @@ pub(crate) const NULL_ID: u32 = u32::MAX;
 pub(crate) const INIT_CMD: u32 = 1;
 pub(crate) const NULL_CMD: u32 = u32::MAX;
 /// NOTE: must larger than wmk_oldest_tx(which is 0 by default)
-pub(crate) const INIT_ORACLE: u64 = 2;
+pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
 
 #[derive(Debug, PartialEq)]
@@ -48,7 +48,7 @@ pub enum OpCode {
 
 impl std::fmt::Display for OpCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:?}", self))
+        f.write_fmt(format_args!("{self:?}"))
     }
 }
 
@@ -71,6 +71,11 @@ pub(crate) fn raw_ptr_to_ref<'a, T>(x: *mut T) -> &'a T {
 
 pub(crate) fn raw_ptr_to_ref_mut<'a, T>(x: *mut T) -> &'a mut T {
     unsafe { &mut *x }
+}
+
+#[allow(unused)]
+pub(crate) const fn to_str(x: &[u8]) -> &str {
+    unsafe { std::str::from_utf8_unchecked(x) }
 }
 
 #[macro_export]
@@ -108,12 +113,8 @@ pub(crate) const fn unpack_id(x: u64) -> (u32, u32) {
     )
 }
 
-thread_local! {
-    pub static G_RAND: RefCell<ThreadRng> = RefCell::new(rand::thread_rng());
-}
-
 pub fn rand_range(range: Range<usize>) -> usize {
-    G_RAND.with_borrow_mut(|x| x.gen_range(range))
+    rand::thread_rng().gen_range(range)
 }
 
 static_assert!(size_of::<usize>() == 8, "exepct 64 bits pointer width");
@@ -192,82 +193,6 @@ impl Drop for RandomPath {
     }
 }
 
-struct AMutRefInner<T: Send + Sync> {
-    raw: T,
-    refcnt: AtomicU32,
-}
-
-/// it's user's responsibility to make sure there's no reference cycle
-pub struct AMutRef<T: Send + Sync> {
-    inner: *mut AMutRefInner<T>,
-}
-
-unsafe impl<T: Send + Sync> Send for AMutRef<T> {}
-unsafe impl<T: Send + Sync> Sync for AMutRef<T> {}
-
-impl<T: Send + Sync> AMutRef<T> {
-    pub fn new(x: T) -> Self {
-        Self {
-            inner: Box::into_raw(Box::new(AMutRefInner {
-                raw: x,
-                refcnt: AtomicU32::new(1),
-            })),
-        }
-    }
-
-    pub fn raw(&self) -> *mut T {
-        unsafe { &mut (*self.inner).raw }
-    }
-
-    fn inc(&self) {
-        unsafe { (*self.inner).refcnt.fetch_add(1, Relaxed) };
-    }
-
-    fn dec(&self) -> u32 {
-        unsafe { (*self.inner).refcnt.fetch_sub(1, Relaxed) }
-    }
-}
-
-impl<T> Clone for AMutRef<T>
-where
-    T: Send + Sync,
-{
-    fn clone(&self) -> Self {
-        self.inc();
-        Self { inner: self.inner }
-    }
-}
-
-impl<T> Drop for AMutRef<T>
-where
-    T: Send + Sync,
-{
-    fn drop(&mut self) {
-        if self.dec() == 1 {
-            unsafe { drop(Box::from_raw(self.inner)) };
-        }
-    }
-}
-
-impl<T> Deref for AMutRef<T>
-where
-    T: Send + Sync,
-{
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &(*self.inner).raw }
-    }
-}
-
-impl<T> DerefMut for AMutRef<T>
-where
-    T: Send + Sync,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut (*self.inner).raw }
-    }
-}
-
 struct MutRefInner<T> {
     raw: T,
     refcnt: u32,
@@ -339,6 +264,59 @@ impl<T> DerefMut for MutRef<T> {
         unsafe { &mut (*self.inner).raw }
     }
 }
+
+pub(crate) struct Handle<T: Sized> {
+    raw: *mut T,
+}
+
+impl<T> Handle<T> {
+    pub(crate) fn new(x: T) -> Self {
+        Self {
+            raw: Box::into_raw(Box::new(x)),
+        }
+    }
+
+    pub(crate) fn inner(&self) -> *mut T {
+        self.raw
+    }
+
+    pub(crate) fn reclaim(&self) {
+        if !self.raw.is_null() {
+            unsafe { drop(Box::from_raw(self.raw)) };
+        }
+    }
+}
+
+impl<T> Deref for Handle<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        raw_ptr_to_ref(self.raw)
+    }
+}
+
+impl<T> DerefMut for Handle<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        raw_ptr_to_ref_mut(self.raw)
+    }
+}
+
+impl<T> From<*mut T> for Handle<T> {
+    fn from(value: *mut T) -> Self {
+        Self { raw: value }
+    }
+}
+
+// NOTE: have to manually impl Clone/Copy instead of derive
+impl<T> Copy for Handle<T> {}
+impl<T> Clone for Handle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+unsafe impl<T> Send for Handle<T> {}
+unsafe impl<T> Sync for Handle<T> {}
 
 #[cfg(test)]
 mod test {

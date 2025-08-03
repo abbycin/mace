@@ -22,6 +22,7 @@ use crate::{
         data::{DataFooter, DataMetaReader, FileStat},
     },
     utils::{
+        Handle,
         block::Block,
         countblock::Countblock,
         data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, Meta},
@@ -61,7 +62,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                         }
                     }
                     Err(e) => {
-                        log::error!("gc receive error {}", e);
+                        log::error!("gc receive error {e}");
                         break;
                     }
                 }
@@ -73,12 +74,12 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
 }
 
 #[derive(Clone)]
-pub(crate) struct Handle {
+pub(crate) struct GCHandle {
     tx: Arc<Sender<i32>>,
     sem: Arc<Countblock>,
 }
 
-impl Handle {
+impl GCHandle {
     pub(crate) fn quit(&self) {
         self.tx.send(GC_QUIT).unwrap();
         self.sem.wait();
@@ -95,7 +96,7 @@ impl Handle {
     }
 }
 
-pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Arc<Mapping>) -> Handle {
+pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Handle<Mapping>) -> GCHandle {
     let (tx, rx) = channel();
     let sem = Arc::new(Countblock::new(0));
     let mut last_ckpt_seq = Vec::with_capacity(store.opt.workers);
@@ -110,7 +111,7 @@ pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Arc<Mapping>) ->
         last_ckpt_seq,
     };
     gc_thread(gc, rx, sem.clone());
-    Handle {
+    GCHandle {
         tx: Arc::new(tx),
         sem,
     }
@@ -119,9 +120,9 @@ pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Arc<Mapping>) ->
 struct Score {
     id: u32,
     logical_id: u32,
-    up2: u32,
-    size: u32,
+    size: usize,
     rate: f64,
+    up2: u32,
 }
 
 impl Score {
@@ -129,9 +130,9 @@ impl Score {
         Self {
             logical_id,
             id: stat.file_id,
-            up2: stat.up2,
             size: stat.active_size,
             rate: Self::calc_decline_rate(stat, now),
+            up2: stat.up2,
         }
     }
 
@@ -146,18 +147,9 @@ impl Score {
     }
 }
 
-/// almost all garbages are produced by consolidation, on the other hand, consolidation makes arena
-/// more denser and will move the old delta from old arena to the recent one
-///
-/// BTW, we can significantly reduce the flush size by mark frames to `TombStone` on successfully
-/// conslidated
-/// but this will face the race condition: one thread successfully consolidated while other threads
-/// still perform lookup or consolidate on the same node, they will trying to load frame from file
-/// with the old offset already be marked as `TombStone` that not flushed to file
-/// this problem can be solved, but it's very complicated or inefficient, we will solve it later
 struct GarbageCollector {
     meta: Arc<Meta>,
-    map: Arc<Mapping>,
+    map: Handle<Mapping>,
     store: Arc<Store>,
     last_ckpt_seq: Vec<u32>,
 }
@@ -180,7 +172,7 @@ impl GarbageCollector {
                 return;
             }
             let ratio = (total - active) * 100 / total;
-            log::debug!("total {} active {} ratio {}", total, active, ratio);
+            log::trace!("ratio {ratio} tgt_ratio {tgt_ratio} total {total} active {active}");
             if ratio < tgt_ratio {
                 return;
             }
@@ -252,16 +244,16 @@ impl GarbageCollector {
             }
             let to = opt.wal_backup(id, seq);
             if opt.keep_stable_wal_file {
-                log::info!("rename {:?} to {:?}", from, to);
+                log::info!("rename {from:?} to {to:?}");
                 std::fs::rename(&from, &to)
                     .inspect_err(|e| {
-                        log::error!("can't rename {:?} to {:?}, error {:?}", from, to, e);
+                        log::error!("can't rename {from:?} to {to:?}, error {e:?}");
                     })
                     .unwrap();
             } else {
-                log::info!("unlink {:?}", from);
+                log::info!("unlink {from:?}");
                 std::fs::remove_file(&from)
-                    .inspect_err(|e| log::error!("can't remove {:?}, error {:?}", from, e))
+                    .inspect_err(|e| log::error!("can't remove {from:?}, error {e:?}"))
                     .unwrap();
             }
         }
@@ -300,7 +292,7 @@ impl GarbageCollector {
                         Entry {
                             key: x.key,
                             off: x.val.off,
-                            len: x.val.len,
+                            len: x.val.len, // NOTE: it's frame len not payload len of the frame
                         }
                     })
                     .collect();
@@ -332,7 +324,7 @@ impl GarbageCollector {
         builder
             .build(lids, id)
             .inspect_err(|e| {
-                log::error!("error {}", e);
+                log::error!("error {e}");
             })
             .unwrap();
 
@@ -345,9 +337,9 @@ impl GarbageCollector {
 
         unlinked.extend(tmp.iter());
         unlinked.iter().for_each(|x| {
-            self.map.cache.del(*x);
+            self.map.evict(*x);
             let name = opt.data_file(*x);
-            log::info!("unlink {:?}", name);
+            log::info!("unlink {name:?}");
             let _ = std::fs::remove_file(name);
         });
 
@@ -363,7 +355,7 @@ impl GarbageCollector {
             self.map.del(*x);
         });
 
-        // remove those physical id have already been unlinked
+        // remove those physical ids have been unlinked
         self.map.retain(&unlinked);
     }
 }
@@ -402,7 +394,7 @@ impl<'a> ReWriter<'a> {
         let mut seq = 0;
         let mut off = 0;
         let path = self.opt.data_file(id);
-        let mut writer = GatherWriter::new(&path);
+        let mut writer = GatherWriter::new(&path, 128);
         let mut crc = Crc32cHasher::default();
         let mut reloc: Vec<u8> = Vec::new();
 
@@ -426,7 +418,7 @@ impl<'a> ReWriter<'a> {
 
                 let m = AddrMap::new(e.key, off, e.len, seq);
                 reloc.extend_from_slice(m.as_slice());
-                off += e.len;
+                off += e.len as usize;
                 seq += 1;
             }
         }
@@ -457,7 +449,9 @@ impl<'a> ReWriter<'a> {
             nr_reloc: seq,
             nr_junk: self.junks.len() as u32,
             nr_active: seq,
+            padding: 0,
             active_size: off,
+            padding2: 0,
             crc: crc.finish() as u32,
         };
 
@@ -465,7 +459,7 @@ impl<'a> ReWriter<'a> {
 
         writer.flush();
         writer.sync();
-        log::info!("compacted to {:?} {:?}", path, footer);
+        log::info!("compacted to {path:?} {footer:?}");
         Ok(())
     }
 }
@@ -484,6 +478,6 @@ impl Item {
 
 struct Entry {
     key: u64,
-    off: u32,
+    off: usize,
     len: u32,
 }

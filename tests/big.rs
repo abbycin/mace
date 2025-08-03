@@ -7,7 +7,8 @@ use rand::Rng;
 fn upsert_delete() {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.tmp_store = true;
+    let mut saved = opt.clone();
+    opt.tmp_store = false;
     opt.gc_eager = true;
     opt.gc_timeout = 1000;
     opt.gc_ratio = 10;
@@ -47,21 +48,14 @@ fn upsert_delete() {
         }
     }
 
-    let mut count = 0;
-    let mut max_id = 0;
-    let dir = std::fs::read_dir(&db.options().db_root).unwrap();
-    for d in dir {
-        let x = d.unwrap();
-        let f = x.file_name();
-        let name = f.to_str().unwrap();
-        if name.starts_with(Options::DATA_PREFIX) {
-            let v: Vec<&str> = name.split(Options::DATA_PREFIX).collect();
-            let id = v[1].parse::<u32>().expect("invalid number");
-            count += 1;
-            max_id = max_id.max(id);
-        }
+    drop(db);
+    saved.tmp_store = true;
+    let db = Mace::new(saved.validate().unwrap()).unwrap();
+
+    for (k, _) in &kvs {
+        let view = db.view().unwrap();
+        assert!(view.get(k).is_err());
     }
-    assert!(count < max_id);
 }
 
 #[test]
@@ -74,7 +68,7 @@ fn big_kv() {
     const N: usize = 200;
     let kv = db.begin().unwrap();
     let val = vec![233; 56 << 10];
-    let keys: Vec<String> = (0..N).map(|x| format!("key_{}", x)).collect();
+    let keys: Vec<String> = (0..N).map(|x| format!("key_{x}")).collect();
 
     for k in &keys {
         kv.put(k, &val).unwrap();
@@ -119,7 +113,7 @@ fn big_kv2() {
     let mut opt = Options::new(&*path);
     opt.consolidate_threshold = 3;
     opt.wal_buffer_size = 1024;
-    opt.buffer_size = 4096;
+    opt.arena_size = 4096;
     let mut saved = opt.clone();
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
@@ -128,7 +122,7 @@ fn big_kv2() {
     kv.put("key1", vec![233u8; 512]).unwrap();
     kv.put("key2", vec![114u8; db.options().wal_buffer_size])
         .unwrap();
-    let r = kv.put("key3", vec![114u8; db.options().buffer_size as usize]);
+    let r = kv.put("key3", vec![114u8; db.options().arena_size as usize]);
     assert!(r.is_err() && r.err().unwrap() == OpCode::TooLarge);
     kv.commit().unwrap();
     drop(kv);
@@ -160,4 +154,23 @@ fn big_kv2() {
 
     let r = view.get("key2").unwrap();
     assert_eq!(r.slice(), vec![114u8; db.options().wal_buffer_size]);
+}
+
+#[test]
+fn big_kv3() {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let val = vec![b'0'; 10240];
+    let ksz = 1024;
+    let count = 10000;
+
+    for i in 0..count {
+        let mut tmp = format!("key_{i}").into_bytes();
+        tmp.resize(ksz, b'x');
+        let tx = db.begin().unwrap();
+        tx.put(&tmp, &val).unwrap();
+        tx.commit().unwrap();
+    }
 }

@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
-pub use cc::data::Record;
-pub use index::tree::SeekIter;
 use index::tree::Tree;
 pub use index::txn::{TxnKV, TxnView};
 pub(crate) use store::store::Store;
 use store::{
-    gc::{Handle, start_gc},
+    gc::{GCHandle, start_gc},
     recovery::Recovery,
 };
 pub use utils::{OpCode, RandomPath, options::Options};
@@ -17,12 +15,14 @@ mod index;
 mod map;
 mod store;
 mod utils;
+
+mod types;
 pub use index::ValRef;
 
 struct Inner {
     store: Arc<Store>,
     meta: Arc<Meta>,
-    gc: Handle,
+    gc: GCHandle,
     tree: Tree,
     opt: Arc<ParsedOptions>,
 }
@@ -43,8 +43,6 @@ pub struct Mace {
 impl Mace {
     fn open(store: Arc<Store>) -> Tree {
         if store.is_fresh() {
-            let pid = store.page.alloc().expect("no space");
-            assert_eq!(pid, ROOT_PID);
             Tree::new(store, ROOT_PID)
         } else {
             Tree::load(store, ROOT_PID)
@@ -63,10 +61,11 @@ impl Mace {
         )?);
         let tree = Self::open(store.clone());
 
-        recover.phase2(meta.clone(), &desc, &tree);
+        let g = crossbeam_epoch::pin();
+        recover.phase2(&g, meta.clone(), &desc, &tree);
         meta.sync(opt.meta_file(), false);
         store.start();
-        let handle = start_gc(store.clone(), meta.clone(), store.buffer.mapping.clone());
+        let handle = start_gc(store.clone(), meta.clone(), store.buffer.mapping);
 
         Ok(Self {
             inner: Arc::new(Inner {

@@ -7,7 +7,8 @@ use std::{
 use dashmap::DashMap;
 use io::{File, GatherIO};
 
-use super::data::{DataMetaReader, FileStat, FrameOwner, StatHandle};
+use super::data::{DataMetaReader, FileStat, StatHandle};
+use crate::types::refbox::BoxRef;
 use crate::{
     OpCode,
     utils::{bitmap::BitMap, data::Reloc, lru::Lru, options::ParsedOptions, unpack_id},
@@ -29,16 +30,16 @@ impl FileReader {
         Some(Self { file, map })
     }
 
-    fn read_at(&self, pos: u64) -> Option<FrameOwner> {
-        let m = self.map.get(&pos)?;
-        let mut frame = FrameOwner::alloc(m.len as usize);
+    fn read_at(&self, pos: u64) -> BoxRef {
+        let m = self.map.get(&pos).expect("never happen");
+        let mut p = BoxRef::alloc(m.len - BoxRef::HDR_LEN as u32, pos);
 
-        frame.set_addr(pos); // used in gc
-        let b = frame.payload();
-        let dst = b.as_mut_slice(0, b.len());
+        let dst = p.load_slice();
         self.file.read(dst, m.off as u64).expect("can't read");
+        debug_assert_eq!(p.view().refcnt(), 1);
+        debug_assert!(p.header().payload_size <= (m.len - BoxRef::HDR_LEN as u32));
 
-        Some(frame)
+        p
     }
 }
 
@@ -65,10 +66,10 @@ impl Mapping {
     }
 
     pub(crate) fn apply_junks(&self, now: u32, junks: &[u64]) {
-        for pos in junks {
-            let (logical_id, _) = unpack_id(*pos);
+        for &pos in junks {
+            let (logical_id, _) = unpack_id(pos);
             if let Some(mut stat) = self.stats.get_mut(&logical_id) {
-                let reloc = self.get_reloc(stat.file_id, *pos);
+                let reloc = self.get_reloc(stat.file_id, pos);
                 stat.update(reloc, now);
             }
         }
@@ -106,7 +107,7 @@ impl Mapping {
 
         let file = loader.take();
         let reader = FileReader { file, map };
-        self.cache.add(id, reader);
+        self.cache.add(id as u64, reader);
         Ok(())
     }
 
@@ -123,28 +124,38 @@ impl Mapping {
         lk.retain(|_, file_id| !set.contains(file_id));
     }
 
-    pub(crate) fn load(&self, addr: u64) -> Option<FrameOwner> {
+    pub(crate) fn load_impl(&self, addr: u64) -> BoxRef {
         let (id, _) = unpack_id(addr);
         let lk = self.map.read().unwrap();
         let file_id = *lk.get(&id).unwrap();
 
         loop {
-            if let Some(r) = self.cache.get(file_id) {
+            if let Some(r) = self.cache.get(file_id as u64) {
                 return r.read_at(addr);
             }
 
-            self.fill_cache(file_id)?;
+            self.fill_cache(file_id);
         }
+    }
+
+    pub(crate) fn evict(&self, file_id: u32) {
+        self.cache.del(file_id as u64);
     }
 
     fn get_reloc(&self, file_id: u32, key: u64) -> Reloc {
         loop {
-            if let Some(x) = self.cache.get(file_id) {
+            if let Some(x) = self.cache.get(file_id as u64) {
                 return *x.map.get(&key).unwrap();
             }
 
+            let mut cnt: usize = 0;
             while self.fill_cache(file_id).is_none() {
                 std::hint::spin_loop();
+                cnt += 1;
+                if cnt > 1000000 {
+                    cnt = 0;
+                    log::warn!("spin too long");
+                }
             }
         }
     }
@@ -152,7 +163,7 @@ impl Mapping {
     fn fill_cache(&self, file_id: u32) -> Option<()> {
         let _lk = self.lk.try_lock().ok()?;
         let r = FileReader::open(self.opt.data_file(file_id))?;
-        self.cache.add(file_id, r);
+        self.cache.add(file_id as u64, r);
         Some(())
     }
 }
