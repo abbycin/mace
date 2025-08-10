@@ -35,10 +35,9 @@ pub struct Options {
     pub cache_evict_pct: usize,
     /// delta cache count, shard into 32 slots, which act as a secondary cache to node cache
     pub cache_count: usize,
-    /// a size limit to trigger data file flush, which also control max key-value size
-    pub arena_size: u32,
-    /// must > 2
-    pub arena_count: u32,
+    /// a size limit to trigger data file flush, which also control max key-value size, NOTE: too
+    /// large a file size will cause the flushing to be slow
+    pub data_file_size: u32,
     /// when should we consolidate delta chain, must less than [`NODE_SIZE`] which is 64
     pub consolidate_threshold: u32,
     /// WAL ring buffer size, must greater than [`Self::page_size`] and must be power of 2
@@ -64,11 +63,12 @@ pub struct Options {
 }
 
 impl Options {
-    pub const ARENA_SIZE: usize = 64 << 20; // 64MB
+    pub const DATA_FILE_SIZE: usize = 64 << 20; // 64MB
     pub const MAX_WORKERS: usize = 128;
     pub const CONSOLIDATE_THRESHOLD: u32 = NODE_SIZE as u32;
+    pub const MIN_CACHE_CAP: usize = Self::DATA_FILE_SIZE;
     pub const CACHE_CAP: usize = 1 << 30; // 1GB
-    pub const CACHE_CNT: usize = 4096;
+    pub const CACHE_CNT: usize = 16384;
     pub const FILE_CACHE: usize = 512;
     pub const WAL_BUF_SZ: usize = 8 << 20; // 8MB
     pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
@@ -86,19 +86,18 @@ impl Options {
             gc_timeout: 50, // 50ms
             gc_ratio: 20,   // 20%
             gc_eager: true,
-            gc_compacted_size: Self::ARENA_SIZE,
+            gc_compacted_size: Self::DATA_FILE_SIZE,
             db_root: db_root.as_ref().to_path_buf(),
             file_cache: Self::FILE_CACHE, // each shard has 16 entries
             cache_capacity: Self::CACHE_CAP,
             cache_evict_pct: 10, // 10% evict 100MB every time
             cache_count: Self::CACHE_CNT,
-            arena_size: Self::ARENA_SIZE as u32,
-            arena_count: 3, // total 192MB
+            data_file_size: Self::DATA_FILE_SIZE as u32,
             consolidate_threshold: Self::CONSOLIDATE_THRESHOLD,
             wal_buffer_size: Self::WAL_BUF_SZ,
             max_ckpt_per_txn: 1_000_000, // 1 million
             wal_file_size: Self::WAL_FILE_SZ as u32,
-            max_kv_size: Self::ARENA_SIZE as u32 / 2,
+            max_kv_size: Self::DATA_FILE_SIZE as u32 / 2,
             keep_stable_wal_file: false,
             max_inline_size: Self::INLINE_SIZE,
             split_elem: Self::SPLIT_ELEM,
@@ -120,10 +119,10 @@ impl Options {
         if self.cache_count < LRU_SHARD {
             self.cache_count = Self::CACHE_CNT;
         }
-        if self.cache_capacity < self.arena_count as usize * self.arena_size as usize {
+        if self.cache_capacity < Self::MIN_CACHE_CAP {
             self.cache_capacity = Self::CACHE_CAP;
         }
-        self.max_kv_size = self.arena_size / 2;
+        self.max_kv_size = self.data_file_size / 2;
         if self.max_inline_size > self.max_kv_size {
             self.max_inline_size = Self::INLINE_SIZE;
         }

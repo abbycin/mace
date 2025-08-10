@@ -1,9 +1,36 @@
 use crossbeam_epoch::Guard;
 
-use crate::types::refbox::BoxRef;
+use crate::types::{
+    header::BoxHeader,
+    refbox::{BoxRef, BoxView},
+};
 
 pub trait IInlineSize {
     fn inline_size(&self) -> u32;
+}
+
+pub trait ILoader: IInlineSize + Clone {
+    fn shallow_copy(&self) -> Self;
+
+    fn pin(&self, data: BoxRef);
+
+    fn pin_load(&self, addr: u64) -> BoxView;
+}
+
+pub trait IAsBoxRef {
+    fn as_box(&self) -> BoxRef;
+}
+
+pub trait IBoxHeader {
+    fn box_header(&self) -> &BoxHeader;
+
+    fn box_header_mut(&mut self) -> &mut BoxHeader;
+}
+
+pub trait IHeader<T> {
+    fn header(&self) -> &T;
+
+    fn header_mut(&mut self) -> &mut T;
 }
 
 pub trait IAlloc: IInlineSize {
@@ -21,6 +48,8 @@ pub trait IKey: Default + ICodec + Clone + Copy + Ord {
 }
 
 pub trait ICodec {
+    fn remove_prefix(&self, prefix_len: usize) -> Self;
+
     fn packed_size(&self) -> usize;
 
     fn encode_to(&self, to: &mut [u8]);
@@ -64,8 +93,4 @@ pub trait IAsSlice: Sized {
         assert_eq!(x.len(), size_of::<Self>());
         unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
     }
-}
-
-pub trait IHolder: Iterator {
-    fn take_holder(&mut self) -> BoxRef;
 }

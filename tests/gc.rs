@@ -13,8 +13,8 @@ fn gc_data() -> Result<(), OpCode> {
     opt.gc_eager = true;
     opt.gc_timeout = 20;
     opt.gc_ratio = 10;
-    opt.arena_size = 512 << 10;
-    opt.gc_compacted_size = opt.arena_size as usize;
+    opt.data_file_size = 512 << 10;
+    opt.gc_compacted_size = opt.data_file_size as usize;
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let cap = 20000;
@@ -74,7 +74,7 @@ fn abort_txn() {
     let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.max_ckpt_per_txn = 1;
-    opt.arena_size = 50 << 10; // make sure checkpoint was taken
+    opt.data_file_size = 50 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let kv = db.begin().unwrap();
@@ -96,7 +96,7 @@ fn gc_wal() {
     opt.gc_timeout = 2;
     opt.workers = 1;
     opt.keep_stable_wal_file = true;
-    opt.arena_size = 100 << 10; // make sure checkpoint was taken
+    opt.data_file_size = 100 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut data = Vec::new();
 

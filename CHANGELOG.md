@@ -1,3 +1,13 @@
+## [0.0.10] 2025-08-10
+### New Features
+- Support prefix encoding
+
+### Changes
+- Removed all xxRef except BoxRef
+- Unified BoxRef management, which greatly reduces the occurrence of cloning, especially in ImTree
+- Disabled cc compact for read-only txn
+- Replaced the `Queue` implementation to improve concurrency 
+
 ## [0.0.9] 2025-08-03
 ### Changes
 - Replace delta-chain implementation to ImTree

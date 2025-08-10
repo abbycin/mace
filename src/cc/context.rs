@@ -29,7 +29,8 @@ impl Context {
         // NOTE: the elements of desc were ordered by worker id
         assert_eq!(cores, desc.len());
         let mut w = Vec::with_capacity(cores);
-        let active_workers = Queue::new(cores.next_power_of_two() as u32, None);
+        // queue elems must > 1, when worker is 1, the next_power_of_two is 1 too, so we plus 1 here
+        let active_workers = Queue::new((cores + 1).next_power_of_two());
         for i in desc.iter() {
             let x = SyncWorker::new(i.clone(), meta.clone(), opt.clone(), buffer);
             w.push(x);
@@ -48,7 +49,7 @@ impl Context {
     }
 
     pub fn alloc_worker(&self) -> Result<SyncWorker, OpCode> {
-        self.active_workers.pop()
+        self.active_workers.pop().ok_or(OpCode::Again)
     }
 
     pub fn free_worker(&self, w: SyncWorker) {

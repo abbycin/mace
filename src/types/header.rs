@@ -37,9 +37,9 @@ pub(crate) struct BoxHeader {
     pub(crate) total_size: u32,
     pub(crate) payload_size: u32,
     pub(crate) pid: u64,
-    /// current TagPtr's logical address
+    /// current BoxRef's logical address
     pub(crate) addr: u64,
-    /// logical address link to next TagPtr
+    /// logical address link to next BoxRef
     pub(crate) link: u64,
 }
 
@@ -57,7 +57,7 @@ pub(crate) struct BaseHeader {
     pub(crate) elems: u16,
     /// elems to trigger merge when necessary, set when split happen
     pub(crate) split_elems: u16,
-    /// total size (including header)
+    /// total size (including header, remote address)
     pub(crate) size: u32,
     /// pid of right sibling, when it the right most node, it should be 0
     pub(crate) right_sibling: u64,
@@ -65,6 +65,7 @@ pub(crate) struct BaseHeader {
     pub(crate) merging_child: u64,
     pub(crate) lo_len: u32,
     pub(crate) hi_len: u32,
+    pub(crate) prefix_len: u32,
     /// indirect addr count, including big key-val in sst, sibling itself and big ver-val in sibling
     pub(crate) nr_remote: u16,
     pub(crate) merging: bool,
@@ -125,6 +126,10 @@ impl ICodec for Slot {
         } else {
             Self::REMOTE_LEN
         }
+    }
+
+    fn remove_prefix(&self, _prefix_len: usize) -> Self {
+        unimplemented!()
     }
 
     fn encode_to(&self, to: &mut [u8]) {

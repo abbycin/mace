@@ -135,7 +135,7 @@ impl Recovery {
 
         let raw = u.key();
         let r = tree
-            .get(g, Key::new(raw, NULL_ORACLE, NULL_CMD))
+            .get(g, Key::new(raw, Ver::new(NULL_ORACLE, NULL_CMD)))
             .map(|(k, _)| *k.ver());
 
         // check whether the key is exits in data or is latest
@@ -288,7 +288,7 @@ impl Recovery {
                 .unwrap();
             let c = ptr_to::<WalUpdate>(block.data());
             let ok = c.key();
-            let key = Key::new(ok, c.txid, c.cmd_id);
+            let key = Key::new(ok, Ver::new(c.txid, c.cmd_id));
             // redo never write log, so we manually make arena flush work
             tree.store.buffer.update_flsn();
             let r = match c.sub_type() {

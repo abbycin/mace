@@ -1,6 +1,9 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::{types::refbox::ILoader, utils::Handle};
+use crate::{
+    types::traits::{IHeader, ILoader},
+    utils::Handle,
+};
 
 use super::node::Node;
 

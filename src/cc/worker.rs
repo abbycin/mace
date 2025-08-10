@@ -1,4 +1,5 @@
 use std::{
+    fmt::Debug,
     ops::{Deref, DerefMut},
     ptr::null_mut,
     sync::{
@@ -56,6 +57,12 @@ pub struct SyncWorker {
     w: *mut Worker,
 }
 
+impl Debug for SyncWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{:p}", self.w))
+    }
+}
+
 unsafe impl Send for SyncWorker {}
 unsafe impl Sync for SyncWorker {}
 
@@ -82,22 +89,24 @@ impl SyncWorker {
         unsafe { drop(Box::from_raw(self.w)) };
     }
 
-    fn init(&mut self, ctx: &Context, start_ts: u64) {
+    fn init(&mut self, ctx: &Context, start_ts: u64, read_only: bool) {
         let id = self.id;
         self.ckpt_cnt.store(0, Relaxed);
         self.tx_id.store(start_ts, Relaxed);
         self.start_ts = start_ts;
         self.cc.global_wmk_tx.store(ctx.wmk_oldest(), Relaxed);
-        self.cc.commit_tree.compact(ctx, id);
+        if !read_only {
+            self.cc.commit_tree.compact(ctx, id);
+        }
     }
 
     pub(crate) fn view(&mut self, ctx: &Context) {
-        self.init(ctx, ctx.load_oracle());
+        self.init(ctx, ctx.load_oracle(), true);
     }
 
     pub(crate) fn begin(&mut self, ctx: &Context) -> u64 {
         let start_ts = ctx.alloc_oracle();
-        self.init(ctx, start_ts);
+        self.init(ctx, start_ts, false);
         self.logging.record_begin(start_ts);
         start_ts
     }

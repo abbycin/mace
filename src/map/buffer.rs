@@ -1,78 +1,98 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicPtr, AtomicU32, AtomicUsize},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicPtr, AtomicU32},
+    },
 };
 
 use crate::{
     OpCode,
     map::{data::Arena, table::Swip},
-    types::{page::Page, traits::IInlineSize},
+    types::{
+        page::Page,
+        refbox::BoxView,
+        traits::{IHeader, IInlineSize, ILoader},
+    },
     utils::{
-        Handle, INIT_ORACLE, INVALID_ID, NULL_ID, countblock::Countblock, data::Meta,
-        options::ParsedOptions,
+        Handle, INIT_ORACLE, INVALID_ID, MutRef, NULL_ID, data::Meta, options::ParsedOptions,
+        queue::Queue,
     },
 };
 use crossbeam_epoch::Guard;
+use dashmap::{DashMap, Entry};
 
 use super::{cache::CacheState, data::FlushData, flush::Flush, load::Mapping};
 use crate::map::cache::NodeCache;
 use crate::map::table::PageMap;
-use crate::types::refbox::{BoxRef, ILoader};
+use crate::types::refbox::BoxRef;
 use crate::utils::lru::Lru;
 use crate::utils::unpack_id;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{Relaxed, Release};
 
 struct Pool {
     flush: Flush,
-    sem: Arc<Countblock>,
-    buf: Vec<Handle<Arena>>,
-    free: AtomicUsize,
-    seal: AtomicUsize,
+    /// contains all flushed arena
+    free: Arc<Queue<Handle<Arena>>>,
+    /// contains all non-HOT arena
+    wait: Arc<DashMap<u32, Handle<Arena>>>,
+    /// queue of arena ordered by id, for flush only
+    que: Mutex<VecDeque<Handle<Arena>>>,
+    /// currently HOT arena
     cur: AtomicPtr<Arena>,
     meta: Arc<Meta>,
     flsn: AtomicU32,
 }
 
-unsafe impl Sync for Pool {}
-unsafe impl Send for Pool {}
-
 impl Pool {
-    fn new_arena(cap: u32, idx: usize) -> *mut Arena {
-        let x = Box::new(Arena::new(cap, idx));
-        Box::into_raw(x)
-    }
+    const NR_MAX_ARENA: u32 = 32; // must be power of 2
 
     fn new(
         opt: Arc<ParsedOptions>,
-        sem: Arc<Countblock>,
         mapping: Handle<Mapping>,
         meta: Arc<Meta>,
-    ) -> Result<Self, OpCode> {
-        let cap = opt.arena_count as usize;
-        let mut buf: Vec<Handle<Arena>> = Vec::with_capacity(cap);
-
-        for i in 0..cap {
-            let a = Self::new_arena(opt.arena_size, i);
-            buf.push(a.into());
+    ) -> Result<Pool, OpCode> {
+        let id = Self::get_id(&meta)?;
+        let q = Queue::new(Self::NR_MAX_ARENA as usize);
+        for _ in 0..Self::NR_MAX_ARENA {
+            let h = Handle::new(Arena::new(opt.data_file_size));
+            q.push(h).unwrap();
         }
-        let h = buf[0];
-        let free = AtomicUsize::new(1);
+
+        let h = q.pop().unwrap();
 
         let this = Self {
             flush: Flush::new(mapping),
-            sem,
-            buf,
-            free,
-            seal: AtomicUsize::new(0),
-            flsn: AtomicU32::new(INIT_ORACLE as u32),
+            free: Arc::new(q),
+            wait: Arc::new(DashMap::new()),
+            que: Mutex::new(VecDeque::new()),
             cur: AtomicPtr::new(h.inner()),
             meta,
+            flsn: AtomicU32::new(INIT_ORACLE as u32),
         };
 
-        let id = this.gen_id()?;
         h.set_state(Arena::FLUSH, Arena::HOT);
         h.reset(id, this.flsn.load(Relaxed));
         Ok(this)
+    }
+
+    fn get_id(meta: &Meta) -> Result<u32, OpCode> {
+        let id = meta.next_data.fetch_add(1, Relaxed);
+
+        // TODO: deal with id exhaustion
+        if id == NULL_ID {
+            return Err(OpCode::DbFull);
+        }
+        Ok(id)
+    }
+
+    fn update_flsn(&self) {
+        self.flsn.fetch_add(1, Release);
+        self.try_flush();
+    }
+
+    fn current(&self) -> Handle<Arena> {
+        self.cur.load(Relaxed).into()
     }
 
     fn load(&self, addr: u64) -> Option<BoxRef> {
@@ -84,51 +104,66 @@ impl Pool {
             return Some(cur.load(off));
         }
 
-        let idx = cur.idx as usize;
-        let n = self.buf.len();
-        let mut i = (n + idx - 1) % n;
-        // NOTE: the logical id of arena may not be contiguous (because of GC)
-        while i != idx {
-            let h = self.buf[i];
-            h.acquire();
+        if let Some(h) = self.wait.get(&id) {
             if !matches!(h.state(), Arena::WARM | Arena::COLD) {
-                h.release();
-                break;
+                return None;
             }
             if h.id() == id {
-                h.release();
                 return Some(h.load(off));
             }
-            h.release();
-            i = (n + i - 1) % n;
         }
         None
     }
 
-    fn try_flush(&self) {
-        let idx = self.seal.load(Relaxed);
-        let h = self.buf[idx];
-
-        let ready = if h.is_dirty() {
-            // there're write txns, we must wait until log flushed, namely pool's flsn > arena's
-            let r = self.flsn.load(Relaxed);
-            let l = h.flsn.load(Relaxed);
-            r.wrapping_sub(l) as i32 > 0
-        } else {
-            // no write txns
-            h.state() == Arena::WARM
-        };
-
-        if ready && h.unref() && h.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
-            let next = (idx + 1) % self.buf.len();
-            self.seal.store(next, Relaxed);
-            self.flush(h);
+    /// only one thread can process `install_new` at same time
+    fn install_new(&self, cur: Handle<Arena>) -> Result<(), OpCode> {
+        let id = Self::get_id(&self.meta)?;
+        self.wait.insert(cur.id(), cur);
+        {
+            let mut lk = self.que.lock().unwrap();
+            lk.push_back(cur); // keep the allocattion order
+            drop(lk);
+            self.try_flush();
         }
+
+        let p = if let Some(p) = self.free.pop() {
+            p
+        } else {
+            Handle::new(Arena::new(cur.cap()))
+        };
+        p.set_state(Arena::FLUSH, Arena::HOT);
+        p.reset(id, self.flsn.load(Relaxed));
+
+        self.cur
+            .compare_exchange(cur.inner(), p.inner(), Relaxed, Relaxed)
+            .expect("never happen");
+        Ok(())
     }
 
-    fn update_flsn(&self) {
-        self.flsn.fetch_add(1, Release);
-        self.try_flush();
+    fn try_flush(&self) -> bool {
+        let Ok(mut que) = self.que.try_lock() else {
+            return false;
+        };
+        let lsn = self.flsn.load(Relaxed);
+
+        while let Some(h) = que.pop_front() {
+            let ready = if h.is_dirty() {
+                // there're write txns, we must wait until log flushed, namely pool's flsn >
+                // arena's
+                lsn.wrapping_sub(h.flsn.load(Relaxed)) as i32 > 0
+            } else {
+                // no write happens
+                h.state() == Arena::WARM
+            };
+
+            if ready && h.unref() && h.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
+                self.flush(h);
+            } else {
+                que.push_front(h);
+                break;
+            }
+        }
+        true
     }
 
     fn flush(&self, h: Handle<Arena>) {
@@ -136,12 +171,16 @@ impl Pool {
 
         let id = h.id();
         assert!(id > INVALID_ID);
-        let sem = self.sem.clone();
+        let wait = self.wait.clone();
+        let free = self.free.clone();
 
         let cb = move || {
             let x = h.set_state(Arena::COLD, Arena::FLUSH);
             assert_eq!(x, Arena::COLD);
-            sem.post();
+            wait.remove(&h.id());
+            if free.push(h).is_err() {
+                h.reclaim();
+            }
         };
 
         let _ = self
@@ -154,59 +193,27 @@ impl Pool {
             });
     }
 
-    fn current(&self) -> Handle<Arena> {
-        self.cur.load(Relaxed).into()
-    }
-
-    // actually, concunrrent install will not happen, since only one thread can successfully change
-    // state to WARM
-    fn install_new(&self, cur: Handle<Arena>) -> Result<(), OpCode> {
-        let idx = self.free.load(Acquire);
-        let p = self.buf[idx];
-        let next = (idx + 1) % self.buf.len();
-        let id = self.gen_id()?;
-
-        log::trace!("swap arena {idx} => {next}");
-        while !p.balanced() || p.set_state(Arena::FLUSH, Arena::HOT) != Arena::FLUSH {
-            self.try_flush();
-        }
-        p.reset(id, self.flsn.load(Relaxed));
-        self.free.store(next, Release); // release ordering is required
-
-        self.cur
-            .compare_exchange(cur.inner(), p.inner(), Relaxed, Relaxed)
-            .expect("never happen");
-        Ok(())
-    }
-
-    fn gen_id(&self) -> Result<u32, OpCode> {
-        let id = self.meta.next_data.fetch_add(1, Relaxed);
-
-        // TODO: deal with id exhaustion
-        if id == NULL_ID {
-            return Err(OpCode::DbFull);
-        }
-        Ok(id)
-    }
-
     fn flush_all(&self) {
         let mut cnt = 0;
-        let mut idx = self.seal.load(Relaxed);
-        let n = self.buf.len();
-        let end = (n + idx - 1) % n;
-
-        while idx != end {
-            let h = self.buf[idx];
+        let cur = self.current();
+        self.wait.insert(cur.id(), cur);
+        let mut q: Vec<Handle<Arena>> = Vec::new();
+        self.wait.iter().for_each(|h| {
             if matches!(h.state(), Arena::HOT | Arena::WARM) {
                 h.state.store(Arena::COLD, Relaxed);
-                self.flush(h);
+                q.push(*h);
             }
-            idx = (idx + 1) % n;
+        });
+
+        q.sort_unstable_by_key(|x| x.id());
+        for h in q.iter() {
+            self.flush(*h);
         }
 
+        let n = q.len();
         while cnt != n {
             cnt = 0;
-            for h in &self.buf {
+            for h in q.iter() {
                 if matches!(h.state(), Arena::FLUSH) {
                     cnt += 1;
                 }
@@ -217,18 +224,19 @@ impl Pool {
     fn quit(&self) {
         self.flush_all();
         self.flush.quit();
-        self.buf
-            .iter()
-            .map(|h| {
-                h.clear();
-                unsafe { drop(Box::from_raw(h.inner())) };
-            })
-            .count();
+        // arena in `free` has invalid id, so clean them individually
+        while let Some(h) = self.free.pop() {
+            h.reclaim();
+        }
+        self.wait.iter().for_each(|h| {
+            h.reclaim();
+        });
     }
 }
 
 pub struct Buffers {
     max_inline_size: u32,
+    split_elems: u32,
     /// used for restrict in memory node count
     cache: NodeCache,
     table: Arc<PageMap>,
@@ -242,17 +250,17 @@ impl Buffers {
     pub fn new(
         pagemap: Arc<PageMap>,
         opt: Arc<ParsedOptions>,
-        sem: Arc<Countblock>,
         meta: Arc<Meta>,
         mapping: Mapping,
     ) -> Result<Self, OpCode> {
         let mapping = Handle::new(mapping);
         Ok(Self {
             max_inline_size: opt.max_inline_size,
+            split_elems: opt.split_elem as u32,
             cache: NodeCache::new(opt.cache_capacity, opt.cache_evict_pct),
             table: pagemap,
             remote: Handle::new(Lru::new(opt.cache_count)),
-            pool: Handle::new(Pool::new(opt.clone(), sem, mapping, meta)?),
+            pool: Handle::new(Pool::new(opt.clone(), mapping, meta)?),
             mapping,
         })
     }
@@ -333,9 +341,11 @@ impl Buffers {
     pub fn loader(&self) -> Loader {
         Loader {
             max_inline_size: self.max_inline_size,
+            split_elems: self.split_elems,
             pool: self.pool,
             mapping: self.mapping,
             cache: self.remote,
+            pinned: MutRef::new(DashMap::with_capacity(self.split_elems as usize)),
         }
     }
 
@@ -390,15 +400,17 @@ impl Buffers {
     }
 }
 
-#[derive(Clone)]
 pub struct Loader {
     max_inline_size: u32,
+    split_elems: u32,
     pool: Handle<Pool>,
     mapping: Handle<Mapping>,
     cache: Handle<Lru<BoxRef>>,
+    /// it's per-node context
+    pinned: MutRef<DashMap<u64, BoxRef>>,
 }
 
-impl ILoader for Loader {
+impl Loader {
     fn load(&self, addr: u64) -> BoxRef {
         if let Some(x) = self.cache.get(addr) {
             return x.clone();
@@ -410,6 +422,57 @@ impl ILoader for Loader {
         let x = self.mapping.load_impl(addr);
         self.cache.add(addr, x.clone());
         x
+    }
+}
+
+// clone happens where node is going to be replace, be careful this may hurt cold fetch performance
+impl Clone for Loader {
+    fn clone(&self) -> Self {
+        Self {
+            max_inline_size: self.max_inline_size,
+            split_elems: self.split_elems,
+            pool: self.pool,
+            mapping: self.mapping,
+            cache: self.cache,
+            pinned: MutRef::new(DashMap::with_capacity(self.split_elems as usize)),
+        }
+    }
+}
+
+impl ILoader for Loader {
+    fn shallow_copy(&self) -> Self {
+        Self {
+            max_inline_size: self.max_inline_size,
+            split_elems: self.split_elems,
+            pool: self.pool,
+            mapping: self.mapping,
+            cache: self.cache,
+            pinned: self.pinned.clone(),
+        }
+    }
+
+    fn pin(&self, data: BoxRef) {
+        let r = self.pinned.insert(data.header().addr, data);
+        debug_assert!(r.is_none());
+    }
+
+    fn pin_load(&self, addr: u64) -> BoxView {
+        if let Some(p) = self.pinned.get(&addr) {
+            let v = p.view();
+            return v;
+        }
+        let x = self.load(addr);
+
+        // concurrent load may happen, we have to make sure that all the load get the same view
+        let e = self.pinned.entry(addr);
+        match e {
+            Entry::Occupied(o) => o.get().view(),
+            Entry::Vacant(v) => {
+                let r = x.view();
+                v.insert(x);
+                r
+            }
+        }
     }
 }
 

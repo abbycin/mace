@@ -561,7 +561,7 @@ impl<'a> WalReader<'a> {
             data,
         );
 
-        tree.put(self.guard, Key::new(raw, c.txid, *cmd), val);
+        tree.put(self.guard, Key::new(raw, Ver::new(c.txid, *cmd)), val);
         c.prev_addr
     }
 

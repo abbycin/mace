@@ -21,7 +21,7 @@ pub(crate) struct ImTree<K> {
 
 impl<K> ImTree<K>
 where
-    K: Clone,
+    K: Copy,
 {
     fn insert(&mut self, k: K) -> Option<K> {
         let root = self.root.get_or_insert_with(Node::default);
@@ -95,7 +95,7 @@ struct Intl<K> {
 }
 
 struct Leaf<K> {
-    keys: Chunk<K, NODE_SIZE>,
+    keys: PodChunk<K, NODE_SIZE>,
 }
 
 enum Children<K> {
@@ -108,7 +108,7 @@ enum Children<K> {
     },
 }
 
-impl<K: Clone> Intl<K> {
+impl<K: Copy> Intl<K> {
     fn put<F>(&mut self, k: K, cmp: F) -> Update<K>
     where
         F: Fn(&K, &K) -> Ordering,
@@ -275,7 +275,7 @@ impl<K> Children<K> {
 
 impl<K> Node<K>
 where
-    K: Clone,
+    K: Copy,
 {
     fn put(&mut self, k: K, c: Comparator<K>) -> Update<K> {
         match self {
@@ -441,6 +441,91 @@ impl<T, const N: usize> Chunk<T, N> {
     }
 }
 
+/// TODO: remove when stable rust support `specialization`
+struct PodChunk<T, const N: usize> {
+    data: MaybeUninit<[T; N]>,
+    size: usize,
+}
+
+impl<T, const N: usize> PodChunk<T, N> {
+    fn new() -> Self {
+        Self {
+            data: MaybeUninit::uninit(),
+            size: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.size
+    }
+
+    fn insert(&mut self, pos: usize, data: T) {
+        assert!(!self.is_full());
+        assert!(pos <= self.len());
+        self.move_to(pos, pos + 1, self.len() - pos);
+        unsafe { self.ptr_at_mut(pos).write(data) };
+        self.size += 1;
+    }
+
+    fn split_at(&mut self, pos: usize) -> Self {
+        assert!(pos <= self.len());
+
+        let mut tmp = Self::new();
+        if pos == self.len() {
+            return tmp;
+        }
+        let len = self.len() - pos;
+        self.copy_to(pos, 0, len, &mut tmp);
+        tmp.size = len;
+        self.size = pos;
+        tmp
+    }
+
+    fn ptr_at(&self, pos: usize) -> *const T {
+        unsafe { (&self.data as *const _ as *const T).add(pos) }
+    }
+
+    fn ptr_at_mut(&mut self, pos: usize) -> *mut T {
+        unsafe { (&mut self.data as *mut _ as *mut T).add(pos) }
+    }
+
+    fn copy_to(&self, from: usize, to: usize, count: usize, dst: &mut Self) {
+        if count > 0 {
+            unsafe { std::ptr::copy_nonoverlapping(self.ptr_at(from), dst.ptr_at_mut(to), count) };
+        }
+    }
+
+    fn move_to(&mut self, from: usize, to: usize, count: usize) {
+        if count > 0 {
+            let src = self.ptr_at_mut(from);
+            let dst = self.ptr_at_mut(to);
+            unsafe { std::ptr::copy(src, dst, count) };
+        }
+    }
+
+    fn as_slice(&self) -> &[T] {
+        unsafe {
+            std::slice::from_raw_parts(
+                &self.data as *const MaybeUninit<[T; N]> as *const T,
+                self.len(),
+            )
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                &mut self.data as *mut MaybeUninit<[T; N]> as *mut T,
+                self.len(),
+            )
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.size == N
+    }
+}
+
 pub(crate) struct Iter<'a, K> {
     cursor: Cursor<'a, K>,
     runout: bool,
@@ -596,7 +681,7 @@ impl<'a, K> Cursor<'a, K> {
 
 // traits implementations
 
-impl<K: Clone> Clone for ImTree<K> {
+impl<K: Copy> Clone for ImTree<K> {
     fn clone(&self) -> Self {
         Self {
             root: self.root.clone(),
@@ -622,7 +707,19 @@ impl<T, const N: usize> Drop for Chunk<T, N> {
     }
 }
 
-impl<K: Clone> Clone for Intl<K> {
+impl<T: Copy, const N: usize> Clone for PodChunk<T, N> {
+    fn clone(&self) -> Self {
+        let mut tmp = Self::new();
+        unsafe {
+            tmp.ptr_at_mut(0)
+                .copy_from_nonoverlapping(self.ptr_at(0), self.size);
+        }
+        tmp.size = self.size;
+        tmp
+    }
+}
+
+impl<K: Copy> Clone for Intl<K> {
     fn clone(&self) -> Self {
         Self {
             keys: self.keys.clone(),
@@ -631,7 +728,7 @@ impl<K: Clone> Clone for Intl<K> {
     }
 }
 
-impl<K: Clone> Clone for Leaf<K> {
+impl<K: Copy> Clone for Leaf<K> {
     fn clone(&self) -> Self {
         Self {
             keys: self.keys.clone(),
@@ -639,7 +736,7 @@ impl<K: Clone> Clone for Leaf<K> {
     }
 }
 
-impl<K: Clone> Clone for Children<K> {
+impl<K: Copy> Clone for Children<K> {
     fn clone(&self) -> Self {
         match self {
             Children::Intl { intl, level } => Children::Intl {
@@ -651,7 +748,7 @@ impl<K: Clone> Clone for Children<K> {
     }
 }
 
-impl<K: Clone> Clone for Node<K> {
+impl<K: Copy> Clone for Node<K> {
     fn clone(&self) -> Self {
         match self {
             Node::Intl(intl) => Node::Intl(intl.clone()),
@@ -662,7 +759,9 @@ impl<K: Clone> Clone for Node<K> {
 
 impl<K> Default for Node<K> {
     fn default() -> Self {
-        Node::Leaf(Arc::new(Leaf { keys: Chunk::new() }))
+        Node::Leaf(Arc::new(Leaf {
+            keys: PodChunk::new(),
+        }))
     }
 }
 
@@ -695,6 +794,40 @@ impl<T, const N: usize> Deref for Chunk<T, N> {
 }
 
 impl<T, const N: usize> DerefMut for Chunk<T, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+impl<T, I, const N: usize> Index<I> for PodChunk<T, N>
+where
+    I: SliceIndex<[T]>,
+{
+    type Output = I::Output;
+
+    fn index(&self, index: I) -> &Self::Output {
+        self.as_slice().index(index)
+    }
+}
+
+impl<T, I, const N: usize> IndexMut<I> for PodChunk<T, N>
+where
+    I: SliceIndex<[T]>,
+{
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        self.as_mut_slice().index_mut(index)
+    }
+}
+
+impl<T, const N: usize> Deref for PodChunk<T, N> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<T, const N: usize> DerefMut for PodChunk<T, N> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }
@@ -752,9 +885,9 @@ mod test {
 
     use rand::seq::SliceRandom;
 
-    use crate::types::data::{Key, Record, Value};
+    use crate::types::data::{Key, Record, Value, Ver};
     use crate::types::imtree::{ImTree, NODE_SIZE};
-    use crate::types::refbox::{BoxRef, DeltaRef};
+    use crate::types::refbox::{BoxRef, DeltaView};
     use crate::types::traits::{IAlloc, IInlineSize};
 
     static G_VER: AtomicUsize = AtomicUsize::new(1);
@@ -783,7 +916,7 @@ mod test {
         }
     }
 
-    #[derive(Clone, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     struct Data {
         key: &'static [u8],
         val: &'static [u8],
@@ -895,15 +1028,15 @@ mod test {
 
     #[test]
     fn leak() {
-        let mut im = ImTree::<DeltaRef>::new(|x, y| x.key().cmp(y.key()));
+        let mut im = ImTree::<DeltaView>::new(|x, y| x.key().cmp(y.key()));
         let mut a = Allocator;
 
-        let delta = DeltaRef::new(
+        let delta = DeltaView::from_key_val(
             &mut a,
-            Key::new("foo".as_bytes(), 1, 0),
+            Key::new("foo".as_bytes(), Ver::new(1, 0)),
             Value::Put(Record::normal(1, "bar".as_bytes())),
         );
-        im = im.update(delta);
+        im = im.update(delta.view().as_delta());
 
         assert_eq!(im.len(), 1);
     }

@@ -10,8 +10,7 @@ use std::{
 #[test]
 fn put_get() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
-    let mut opt = Options::new(&*path);
-    opt.arena_count = 5;
+    let opt = Options::new(&*path);
     let db = Mace::new(opt.validate().unwrap())?;
 
     let n = 1000;
@@ -153,7 +152,6 @@ fn rollback() {
     let workers = 12;
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
-    opts.arena_count = workers;
     opts.workers = workers as usize;
     let db = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10000;

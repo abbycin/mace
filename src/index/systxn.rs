@@ -3,7 +3,7 @@ use crate::index::Node;
 use crate::map::data::Arena;
 use crate::types::header::TagFlag;
 use crate::types::refbox::{BoxRef, BoxView};
-use crate::types::traits::{IAlloc, IInlineSize};
+use crate::types::traits::{IAlloc, IHeader, IInlineSize};
 use crate::utils::Handle;
 use crate::utils::data::JUNK_LEN;
 use crate::{Store, index::Page};
@@ -167,7 +167,7 @@ impl IAlloc for SysTxn<'_> {
     }
 
     fn arena_size(&mut self) -> u32 {
-        self.store.opt.arena_size
+        self.store.opt.data_file_size
     }
 }
 

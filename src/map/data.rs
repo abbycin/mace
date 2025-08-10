@@ -4,7 +4,7 @@ use io::{File, GatherIO};
 
 use crate::types::header::TagFlag;
 use crate::types::refbox::BoxRef;
-use crate::types::traits::IAsSlice;
+use crate::types::traits::{IAsSlice, IHeader};
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
 use crate::utils::data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, PageTable, Reloc};
@@ -128,9 +128,7 @@ pub(crate) struct Arena {
     real_size: AtomicU64,
     offset: AtomicU64,
     mutref: AtomicU16,
-    refcnt: AtomicU16,
     cap: u32,
-    pub(crate) idx: u16,
     pub(crate) state: AtomicU8,
     dirty: AtomicU8,
 }
@@ -177,17 +175,15 @@ impl Arena {
     const STALE: u8 = 1;
     const DIRTY: u8 = 2;
 
-    pub(crate) fn new(cap: u32, idx: usize) -> Self {
+    pub(crate) fn new(cap: u32) -> Self {
         Self {
-            items: DashMap::with_capacity(64 << 10),
+            items: DashMap::with_capacity(16 << 10),
             flsn: AtomicU32::new(0),
             id: Cell::new(INVALID_ID),
             mutref: AtomicU16::new(0),
-            refcnt: AtomicU16::new(0),
             offset: AtomicU64::new(0),
             real_size: AtomicU64::new(0),
             cap,
-            idx: idx as u16,
             state: AtomicU8::new(Self::FLUSH),
             dirty: AtomicU8::new(Self::FRESH),
         }
@@ -209,14 +205,13 @@ impl Arena {
         }
     }
 
+    pub(crate) fn cap(&self) -> u32 {
+        self.cap
+    }
+
     fn alloc_size(&self, size: u32) -> Result<u32, OpCode> {
         if size > self.cap {
             return Err(OpCode::TooLarge);
-        }
-
-        let off = self.offset.fetch_add(size as u64, Relaxed);
-        if off >= u32::MAX as u64 {
-            return Err(OpCode::NeedMore);
         }
 
         let mut cur = self.real_size.load(Relaxed);
@@ -232,11 +227,16 @@ impl Arena {
             }
 
             match self.real_size.compare_exchange(cur, new, AcqRel, Acquire) {
-                Ok(_) => break,
+                Ok(_) => {
+                    let off = self.offset.fetch_add(size as u64, Relaxed);
+                    if off >= u32::MAX as u64 {
+                        return Err(OpCode::NeedMore);
+                    }
+                    return Ok(off as u32);
+                }
                 Err(e) => cur = e,
             }
         }
-        Ok(off as u32)
     }
 
     fn alloc_at(&self, off: u32, size: u32) -> BoxRef {
@@ -317,19 +317,6 @@ impl Arena {
         self.mutref.load(Relaxed) == 0
     }
 
-    pub(crate) fn acquire(&self) {
-        self.refcnt.fetch_add(1, Relaxed);
-    }
-
-    pub(crate) fn release(&self) {
-        self.refcnt.fetch_sub(1, Relaxed);
-    }
-
-    #[inline]
-    pub(crate) fn balanced(&self) -> bool {
-        self.refcnt.load(Relaxed) == 0
-    }
-
     #[inline(always)]
     pub(crate) fn id(&self) -> u32 {
         self.id.get()
@@ -340,12 +327,10 @@ impl Debug for Arena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Arena")
             .field("items ", &self.items.len())
-            .field("idx", &self.idx)
             .field("state", &self.state)
             .field("offset", &self.offset)
             .field("flsn", &self.flsn.load(Relaxed))
             .field("id", &self.id.get())
-            .field("refcnt", &self.refcnt)
             .finish()
     }
 }
@@ -505,7 +490,7 @@ impl DataBuilder {
 
         for (seq, f) in self.frames.iter().enumerate() {
             let h = f.header();
-            // we dump the whole TagPtr into file, so use total_size, when load we must convert it
+            // we dump the whole BoxRef into file, so use total_size, when load we must convert it
             // back to the original size when it was allocated
             let reloc = AddrMap::new(h.addr, pos, h.total_size, seq as u32);
             self.reloc.extend_from_slice(reloc.as_slice());
@@ -983,7 +968,10 @@ mod test {
 
     use crate::{
         Options, RandomPath,
-        types::{refbox::BoxRef, traits::IAsSlice},
+        types::{
+            refbox::BoxRef,
+            traits::{IAsSlice, IHeader},
+        },
         utils::{NEXT_ID, NULL_ADDR, block::Block, data::PageTable},
     };
 

@@ -40,14 +40,20 @@ impl IKey for IntlKey<'_> {
 }
 
 impl ICodec for IntlKey<'_> {
-    // raw_len + raw + ver
     fn packed_size(&self) -> usize {
         Varint32::size(self.raw.len() as u32) + self.raw.len()
     }
 
+    fn remove_prefix(&self, prefix_len: usize) -> Self {
+        debug_assert!(self.raw.len() >= prefix_len);
+        Self {
+            raw: &self.raw[prefix_len..],
+        }
+    }
+
     fn encode_to(&self, to: &mut [u8]) {
         debug_assert_eq!(to.len(), self.packed_size());
-        let (l, r) = to.split_at_mut(Varint32::size(self.raw.len() as u32));
+        let (l, r) = to.split_at_mut(Varint32::size(to.len() as u32));
         Varint32::encode(l, self.raw.len() as u32);
         r.copy_from_slice(self.raw);
     }
@@ -68,14 +74,11 @@ pub struct Key<'a> {
 }
 
 impl<'a> Key<'a> {
-    pub fn new(raw: &'a [u8], txid: u64, cmd: u32) -> Self {
-        Self {
-            raw,
-            ver: Ver::new(txid, cmd),
-        }
+    pub fn new(raw: &'a [u8], ver: Ver) -> Self {
+        Self { raw, ver }
     }
 
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.raw.len() + Ver::len()
     }
 
@@ -112,6 +115,14 @@ impl Ord for Key<'_> {
 impl ICodec for Key<'_> {
     fn packed_size(&self) -> usize {
         self.len() + Varint32::size(self.len() as u32)
+    }
+
+    fn remove_prefix(&self, prefix_len: usize) -> Self {
+        debug_assert!(self.raw.len() >= prefix_len);
+        Self {
+            raw: &self.raw[prefix_len..],
+            ver: self.ver,
+        }
     }
 
     fn encode_to(&self, to: &mut [u8]) {
@@ -169,6 +180,10 @@ impl ICodec for Ver {
         Self::len()
     }
 
+    fn remove_prefix(&self, _prefix_len: usize) -> Self {
+        *self
+    }
+
     fn encode_to(&self, to: &mut [u8]) {
         debug_assert_eq!(to.len(), Self::len());
         let (x, y) = to.split_at_mut(size_of::<u64>());
@@ -184,6 +199,136 @@ impl ICodec for Ver {
                 u32
             ),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IntlSeg<'a> {
+    prefix: &'a [u8],
+    base: &'a [u8],
+}
+
+impl<'a> IntlSeg<'a> {
+    pub(crate) fn new(prefix: &'a [u8], base: &'a [u8]) -> Self {
+        Self { prefix, base }
+    }
+
+    /// compare in same node, they share same prefix
+    pub(crate) fn raw_cmp(&self, other: &Self) -> Ordering {
+        self.base.cmp(other.base)
+    }
+
+    fn len(&self) -> usize {
+        self.prefix.len() + self.base.len()
+    }
+}
+
+impl ICodec for IntlSeg<'_> {
+    fn packed_size(&self) -> usize {
+        self.len() + Varint32::size(self.len() as u32)
+    }
+
+    fn remove_prefix(&self, prefix_len: usize) -> Self {
+        debug_assert!(self.len() >= prefix_len);
+        if prefix_len >= self.prefix.len() {
+            let rest = prefix_len - self.prefix.len();
+            Self {
+                prefix: &[],
+                base: &self.base[rest..],
+            }
+        } else {
+            Self {
+                prefix: &self.prefix[prefix_len..],
+                base: self.base,
+            }
+        }
+    }
+
+    fn decode_from(_raw: &[u8]) -> Self {
+        unimplemented!()
+    }
+
+    fn encode_to(&self, to: &mut [u8]) {
+        let (len, data) = to.split_at_mut(Varint32::size(self.len() as u32));
+        let (p, b) = data.split_at_mut(self.prefix.len());
+        Varint32::encode(len, self.len() as u32);
+        p.copy_from_slice(self.prefix);
+        b.copy_from_slice(self.base);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct LeafSeg<'a> {
+    prefix: &'a [u8],
+    base: &'a [u8],
+    pub(crate) ver: Ver,
+}
+
+impl<'a> LeafSeg<'a> {
+    pub(crate) fn new(prefix: &'a [u8], base: &'a [u8], ver: Ver) -> Self {
+        Self { prefix, base, ver }
+    }
+
+    /// compare in same node, they share same prefix
+    pub(crate) fn raw_cmp(&self, other: &Self) -> Ordering {
+        self.base.cmp(other.base)
+    }
+
+    pub(crate) fn cmp(&self, other: &Self) -> Ordering {
+        match self.raw_cmp(other) {
+            Ordering::Equal => self.ver.cmp(&other.ver),
+            o => o,
+        }
+    }
+
+    pub(crate) fn raw(&self) -> &'a [u8] {
+        self.base
+    }
+
+    pub(crate) fn txid(&self) -> u64 {
+        self.ver.txid
+    }
+
+    fn len(&self) -> usize {
+        self.prefix.len() + self.base.len() + Ver::len()
+    }
+}
+
+impl ICodec for LeafSeg<'_> {
+    fn packed_size(&self) -> usize {
+        self.len() + Varint32::size(self.len() as u32)
+    }
+
+    fn decode_from(_raw: &[u8]) -> Self {
+        unimplemented!()
+    }
+
+    fn remove_prefix(&self, prefix_len: usize) -> Self {
+        debug_assert!(self.len() - Ver::len() >= prefix_len);
+        if prefix_len >= self.prefix.len() {
+            let rest = prefix_len - self.prefix.len();
+            Self {
+                prefix: &[],
+                base: &self.base[rest..],
+                ver: self.ver,
+            }
+        } else {
+            Self {
+                prefix: &self.prefix[prefix_len..],
+                base: self.base,
+                ver: self.ver,
+            }
+        }
+    }
+
+    fn encode_to(&self, to: &mut [u8]) {
+        let (len, data) = to.split_at_mut(Varint32::size(to.len() as u32));
+        Varint32::encode(len, self.len() as u32);
+        let (ver, k) = data.split_at_mut(Ver::len());
+        self.ver.encode_to(ver);
+        let (p, b) = k.split_at_mut(self.prefix.len());
+        p.copy_from_slice(self.prefix);
+        b.copy_from_slice(self.base);
     }
 }
 
@@ -344,6 +489,10 @@ where
         Varint32::size(len as u32) + len
     }
 
+    fn remove_prefix(&self, _prefix_len: usize) -> Self {
+        unimplemented!()
+    }
+
     fn encode_to(&self, to: &mut [u8]) {
         debug_assert_eq!(to.len(), self.packed_size());
         let (len, payload) = to.split_at_mut(Varint32::size(to.len() as u32));
@@ -433,6 +582,10 @@ impl IVal for Index {
 impl ICodec for Index {
     fn packed_size(&self) -> usize {
         Self::len()
+    }
+
+    fn remove_prefix(&self, _prefix_len: usize) -> Self {
+        unimplemented!()
     }
 
     fn encode_to(&self, to: &mut [u8]) {
@@ -561,7 +714,7 @@ impl Ord for Ver {
 #[cfg(test)]
 mod test {
     use crate::types::{
-        data::{IntlKey, Record},
+        data::{IntlKey, Record, Ver},
         traits::ICodec,
     };
 
@@ -569,7 +722,7 @@ mod test {
 
     #[test]
     fn test_key_codec() {
-        let key = Key::new("moha".as_bytes(), 114514, 0);
+        let key = Key::new("moha".as_bytes(), Ver::new(114514, 0));
         let mut buf = vec![0u8; key.packed_size()];
 
         key.encode_to(&mut buf);

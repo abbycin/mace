@@ -3,14 +3,15 @@ use super::{Node, Page, systxn::SysTxn};
 use crate::map::buffer::Loader;
 use crate::types::data::Record;
 use crate::types::node::RawLeafIter;
-use crate::types::refbox::KeyRef;
+use crate::types::refbox::{DeltaView, KeyRef};
+use crate::types::traits::{IAsBoxRef, IBoxHeader, IHeader, ILoader};
 use crate::utils::ROOT_PID;
 use crate::{
     OpCode, Store,
     types::{
         data::{Index, IntlKey, Key, Value, Ver},
         node::MergeOp,
-        refbox::{BoxRef, DeltaRef, IBoxHeader, IBoxRef, ILoader},
+        refbox::BoxRef,
         traits::{ICodec, IKey, ITree, IVal, IValCodec},
     },
     utils::{NULL_CMD, NULL_PID},
@@ -175,9 +176,8 @@ impl Tree {
                 // retry merge
                 continue;
             }
-            let hi_opt = cursor_ptr.hi();
-            let hi = hi_opt.as_ref().map(|x: &(BoxRef, &[u8])| x.1);
-            let (_x, lo) = child_ptr.lo();
+            let hi = cursor_ptr.hi();
+            let lo = child_ptr.lo();
             if hi >= Some(lo) {
                 // another thread has installed the merged node after we get the cursor
                 break;
@@ -295,7 +295,7 @@ impl Tree {
         // publish rpage to global
         txn.commit();
 
-        let (_tmp, lo) = rpage.lo();
+        let lo = rpage.lo();
         if let Some(parent) = parent_opt {
             // 4.
             let new_node = parent.insert_index(&mut txn, lo, rpid, safe_txid);
@@ -325,7 +325,7 @@ impl Tree {
         let mut txn = self.begin(g);
 
         // compact is required, since other thread may already insert new data after step 3
-        let mut lnode = root.compact(&mut txn, safe_txid);
+        let mut lnode = root.compact(&mut txn, safe_txid, false);
         lnode.header_mut().right_sibling = rpid;
         let mut lpage = Page::new(lnode);
 
@@ -380,7 +380,7 @@ impl Tree {
             }
 
             // the node it self may be obsoleted by smo, we must make sure key is in [lo, hi)
-            let (_x, lo) = node_ptr.lo();
+            let lo = node_ptr.lo();
             if key < lo {
                 return Err(OpCode::Again);
             }
@@ -392,8 +392,7 @@ impl Tree {
 
             // another thread replace the old node which the cursor pointed to with a new node just
             // splitted
-            let hi_opt = node_ptr.hi();
-            let hi = hi_opt.as_ref().map(|x| x.1);
+            let hi = node_ptr.hi();
             let is_splitting = if let Some(hi) = hi { key >= hi } else { false };
 
             if is_splitting {
@@ -468,8 +467,8 @@ impl Tree {
         F: FnMut(Page, &K) -> Result<(), OpCode>,
     {
         let mut txn = self.begin(g);
-        let delta = DeltaRef::new(&mut txn, *k, *v);
-        let mut new = Page::new(old.insert(delta));
+        let b = DeltaView::from_key_val(&mut txn, *k, *v);
+        let mut new = Page::new(old.insert(b.view().as_delta()));
 
         txn.pin(new);
 
@@ -484,10 +483,11 @@ impl Tree {
         }
 
         txn.commit();
+        new.save(b); // save the delta itself until page was reclaimed
 
         if new.delta_len() >= self.store.opt.consolidate_threshold {
             // consolidation never retry
-            let new_node = new.compact(&mut txn, self.txid());
+            let new_node = new.compact(&mut txn, self.txid(), true);
             if txn.replace(new, new_node).is_ok() {
                 txn.commit();
             }
@@ -537,7 +537,8 @@ impl Tree {
 
         self.link(g, page, key, val, |pg, k| {
             let tmp = pg.find_latest(k, |x, y| x.raw.cmp(y.raw));
-            r = tmp.map(|(x, y, t)| (x, ValRef::new(y, t)));
+            // use the full key from input argument and the version from the exists latest one
+            r = tmp.map(|(x, y, t)| (Key::new(k.raw, x.ver), ValRef::new(y, t)));
             visible(&r)
         })?;
 
@@ -630,21 +631,27 @@ impl Tree {
         let ver = Ver::new(start_ts, NULL_CMD);
 
         while addr != NULL_PID {
-            let ptr = l.load(addr);
-            let node = ptr.as_base();
-            let sst = node.sst::<Ver, Value<Record>>();
+            let ptr = l.pin_load(addr).as_base();
+            let sst = ptr.sst::<Ver, Value<Record>>();
             let pos = sst.lower_bound(l, &ver).unwrap_or_else(|pos| pos);
-            if pos < node.header().elems as usize {
+            if pos < sst.header().elems as usize {
                 let (k, v, p) = sst.get_unchecked(l, pos);
 
                 if visible(k.txid, v.as_ref()) {
                     if v.is_del() {
                         return Err(OpCode::NotFound);
                     }
-                    return Ok(ValRef::new(v, p.as_box()));
+                    return Ok(ValRef::new(
+                        v,
+                        if p.is_null() {
+                            ptr.as_box()
+                        } else {
+                            p.as_box()
+                        },
+                    ));
                 }
             }
-            addr = node.box_header().link;
+            addr = ptr.box_header().link;
         }
         Err(OpCode::NotFound)
     }
@@ -731,7 +738,7 @@ impl Iter<'_> {
     }
 
     fn is_lt_upper(&self, node: &Node) -> bool {
-        if let Some((_x, hi)) = node.hi() {
+        if let Some(hi) = node.hi() {
             match self.lo.as_ref() {
                 Bound::Excluded(b) if hi >= b.key() => true,
                 Bound::Included(b) if hi > b.key() => true,
@@ -743,7 +750,7 @@ impl Iter<'_> {
     }
 
     fn is_gt_lower(&self, node: &Node) -> bool {
-        let (_x, lo) = node.lo();
+        let lo = node.lo();
         match self.lo.as_ref() {
             Bound::Excluded(b) | Bound::Included(b) if lo <= b.key() => true,
             _ => lo.is_empty(),
@@ -797,7 +804,7 @@ impl Iter<'_> {
                 continue;
             } else if !self.is_gt_lower(node) {
                 // split or exhuasted
-                let (_, lo) = node.lo();
+                let lo = node.lo();
                 let next = self.predecessor(lo)?;
                 let p = self.tree.find_leaf(&g, &next).unwrap();
                 self.cache = Some(p.clone_node());
@@ -840,9 +847,7 @@ impl Iter<'_> {
                 }
             } else {
                 self.iter.take();
-                let tmp = node.hi();
-                let hi = tmp.map(|x| x.1);
-                if let Some(hi) = hi {
+                if let Some(hi) = node.hi() {
                     self.lo = Bound::Included(KeyRef::copy(hi));
                     continue;
                 }
@@ -868,12 +873,12 @@ struct Filter<'a> {
 
 impl<'a> Filter<'a> {
     fn check(&mut self, k: &'a [u8], is_del: bool, r: KeyRef) -> bool {
-        self.holder = Some(r);
         if let Some(last) = self.last {
             if last == k {
                 return false;
             }
         }
+        self.holder = Some(r);
         self.last = Some(k);
         !is_del
     }

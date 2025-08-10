@@ -51,7 +51,7 @@ fn get_impl<K: AsRef<[u8]>>(
 
     let wid = w.id;
     let start_ts = w.start_ts;
-    let key = Key::new(k.as_ref(), start_ts, NULL_CMD);
+    let key = Key::new(k.as_ref(), Ver::new(start_ts, NULL_CMD));
     let r = tree.traverse(g, key, |txid, t| {
         w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid)
     })?;
@@ -142,7 +142,7 @@ impl<'a> TxnKV<'a> {
         self.should_abort()?;
         let start_ts = self.p.w.start_ts;
         let (wid, cmd_id) = (self.p.w.id, self.cmd_id());
-        let key = Key::new(k, start_ts, cmd_id);
+        let key = Key::new(k, Ver::new(start_ts, cmd_id));
         let val = Value::Put(Record::normal(wid, v));
 
         self.tree
@@ -238,14 +238,42 @@ impl<'a> TxnKV<'a> {
     {
         let mut logged = false;
         let (k, v) = (k.as_ref(), v.as_ref());
+        self.modify(k, v, |opt, ver, mut w| match opt {
+            None => {
+                if !logged {
+                    w.modified = true;
+                    logged = true;
+                    w.logging
+                        .record_update(ver, WalPut::new(v.len()), k, &[], v);
+                }
+                Ok(())
+            }
+            Some((rk, rv)) => {
+                if rv.is_del() {
+                    return Err(OpCode::NotFound);
+                }
+                let t = rv.unwrap();
+                if !w
+                    .cc
+                    .is_visible_to(self.p.ctx, self.p.w.id, t.worker_id(), ver.txid, rk.txid)
+                {
+                    return Err(OpCode::AbortTx);
+                }
 
-        if self.put_impl(k, v, &mut logged).is_ok() {
-            return Ok(None);
-        }
-
-        debug_assert!(!logged);
-
-        self.update_impl(k, v, &mut logged).map(Some)
+                if !logged {
+                    w.modified = true;
+                    logged = true;
+                    w.logging.record_update(
+                        ver,
+                        WalReplace::new(t.data().len(), v.len()),
+                        rk.raw,
+                        t.data(),
+                        v,
+                    );
+                }
+                Ok(())
+            }
+        })
     }
 
     pub fn del<T>(&self, k: T) -> Result<ValRef, OpCode>
@@ -255,7 +283,7 @@ impl<'a> TxnKV<'a> {
         self.should_abort()?;
         let mut w = self.p.w;
         let (wid, start_ts) = (w.id, w.start_ts);
-        let key = Key::new(k.as_ref(), start_ts, self.cmd_id());
+        let key = Key::new(k.as_ref(), Ver::new(start_ts, self.cmd_id()));
         let val = Value::Del(Record::remove(wid));
         let mut logged = false;
         let g = crossbeam_epoch::pin();

@@ -2,7 +2,6 @@ use crate::cc::context::Context;
 use crate::map::Mapping;
 use crate::map::buffer::Buffers;
 use crate::map::table::PageMap;
-use crate::utils::countblock::Countblock;
 use crate::utils::data::{Meta, WalDescHandle};
 use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, NULL_PID};
@@ -24,13 +23,10 @@ impl Store {
         mapping: Mapping,
         desc: &[WalDescHandle],
     ) -> Result<Self, OpCode> {
-        let cores = opt.workers;
-        let sem = Arc::new(Countblock::new(cores));
         let page = Arc::new(page);
         let buffer = Handle::new(Buffers::new(
             page.clone(),
             opt.clone(),
-            sem.clone(),
             meta.clone(),
             mapping,
         )?);

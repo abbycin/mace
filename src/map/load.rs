@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use io::{File, GatherIO};
 
 use super::data::{DataMetaReader, FileStat, StatHandle};
-use crate::types::refbox::BoxRef;
+use crate::types::{refbox::BoxRef, traits::IHeader};
 use crate::{
     OpCode,
     utils::{bitmap::BitMap, data::Reloc, lru::Lru, options::ParsedOptions, unpack_id},
@@ -127,7 +127,11 @@ impl Mapping {
     pub(crate) fn load_impl(&self, addr: u64) -> BoxRef {
         let (id, _) = unpack_id(addr);
         let lk = self.map.read().unwrap();
-        let file_id = *lk.get(&id).unwrap();
+        let Some(&file_id) = lk.get(&id) else {
+            log::error!("==>> {:?}", unpack_id(addr));
+            panic!("xxx");
+        };
+        // let file_id = *lk.get(&id).unwrap();
 
         loop {
             if let Some(r) = self.cache.get(file_id as u64) {

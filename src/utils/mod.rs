@@ -1,7 +1,7 @@
 use std::{
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicI64, Ordering::Relaxed},
+    sync::atomic::{AtomicI64, AtomicU32, Ordering::Relaxed},
 };
 
 use rand::Rng;
@@ -59,10 +59,6 @@ pub(crate) const fn align_up(n: usize, align: usize) -> usize {
 #[allow(unused)]
 pub(crate) const fn align_down(n: usize, align: usize) -> usize {
     n & !(align - 1)
-}
-
-pub(crate) const fn is_power_of_2(x: usize) -> bool {
-    if x == 0 { false } else { x & (x - 1) == 0 }
 }
 
 pub(crate) fn raw_ptr_to_ref<'a, T>(x: *mut T) -> &'a T {
@@ -195,12 +191,15 @@ impl Drop for RandomPath {
 
 struct MutRefInner<T> {
     raw: T,
-    refcnt: u32,
+    refcnt: AtomicU32,
 }
 
 impl<T> MutRefInner<T> {
     fn new(x: T) -> Self {
-        Self { raw: x, refcnt: 1 }
+        Self {
+            raw: x,
+            refcnt: AtomicU32::new(1),
+        }
     }
 }
 
@@ -221,15 +220,11 @@ impl<T> MutRef<T> {
     }
 
     fn inc(&self) {
-        unsafe { (*self.inner).refcnt += 1 };
+        unsafe { (*self.inner).refcnt.fetch_add(1, Relaxed) };
     }
 
     fn dec(&self) -> u32 {
-        unsafe {
-            let old = (*self.inner).refcnt;
-            (*self.inner).refcnt -= 1;
-            old
-        }
+        unsafe { (*self.inner).refcnt.fetch_sub(1, Relaxed) }
     }
 }
 
@@ -265,6 +260,7 @@ impl<T> DerefMut for MutRef<T> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct Handle<T: Sized> {
     raw: *mut T,
 }

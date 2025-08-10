@@ -3,13 +3,13 @@ use std::{cmp::Ordering, marker::PhantomData};
 use crate::{
     types::{
         header::{Slot, SlotType},
-        refbox::ILoader,
-        traits::{ICodec, IKey, IVal},
+        refbox::RemoteView,
+        traits::{ICodec, IKey, ILoader, IVal},
     },
     utils::{ADDR_LEN, raw_ptr_to_ref, unpack_id},
 };
 
-use super::{header::BaseHeader, refbox::RemoteRef};
+use super::header::BaseHeader;
 
 /// the layout of sst:
 /// ```text
@@ -55,21 +55,21 @@ impl<K, V> Sst<K, V> {
 
 impl<K, V> Sst<K, V>
 where
-    K: IKey,
-    V: IVal,
+    K: Ord + ICodec,
+    V: ICodec,
 {
-    fn get_remote<L>(l: &L, addr: u64) -> (K, V, RemoteRef)
+    fn get_remote<L>(l: &L, addr: u64) -> (K, V, RemoteView)
     where
         L: ILoader,
     {
-        let mut p = l.load(addr).as_remote();
+        let mut p = l.pin_load(addr).as_remote();
         let data = p.raw_mut();
         let k = K::decode_from(data);
         let v = V::decode_from(&data[k.packed_size()..]);
         (k, v, p)
     }
 
-    pub(crate) fn key_at<L>(&self, l: &L, pos: usize) -> (K, RemoteRef)
+    pub(crate) fn key_at<L>(&self, l: &L, pos: usize) -> K
     where
         L: ILoader,
     {
@@ -77,14 +77,14 @@ where
         let s = Slot::decode_from(raw);
 
         if s.is_inline() {
-            (K::decode_from(&raw[Slot::LOCAL_LEN..]), RemoteRef::null())
+            K::decode_from(&raw[Slot::LOCAL_LEN..])
         } else {
-            let mut p = l.load(s.addr()).as_remote();
-            (K::decode_from(p.raw_mut()), p)
+            let mut p = l.pin_load(s.addr()).as_remote();
+            K::decode_from(p.raw_mut())
         }
     }
 
-    pub(crate) fn get_unchecked<L>(&self, l: &L, pos: usize) -> (K, V, RemoteRef)
+    pub(crate) fn get_unchecked<L>(&self, l: &L, pos: usize) -> (K, V, RemoteView)
     where
         L: ILoader,
     {
@@ -94,7 +94,7 @@ where
         if s.is_inline() {
             let k = K::decode_from(&raw[Slot::LOCAL_LEN..]);
             let v = V::decode_from(&raw[Slot::LOCAL_LEN + k.packed_size()..]);
-            (k, v, RemoteRef::null())
+            (k, v, RemoteView::null())
         } else {
             Self::get_remote(l, s.addr())
         }
@@ -105,12 +105,14 @@ where
         L: ILoader,
         F: Fn(&K, &K) -> Ordering,
     {
-        let (mut lo, mut hi) = (0, self.header().elems as usize);
+        let h = self.header();
+        let rk = key.remove_prefix(h.prefix_len as usize);
+        let (mut lo, mut hi) = (0, h.elems as usize);
 
         while lo < hi {
             let mid = lo + ((hi - lo) >> 1);
-            let (k, _r) = self.key_at(l, mid);
-            match f(&k, key) {
+            let k = self.key_at(l, mid);
+            match f(&k, &rk) {
                 Ordering::Equal => return Ok(mid),
                 Ordering::Greater => hi = mid,
                 Ordering::Less => lo = mid + 1,
@@ -124,13 +126,15 @@ where
     where
         L: ILoader,
     {
-        let elems = self.header().elems as usize;
+        let h = self.header();
+        let elems = h.elems as usize;
+        let rk = k.remove_prefix(h.prefix_len as usize);
         let (mut lo, mut hi) = (0, elems);
 
         while lo < hi {
             let mid = lo + ((hi - lo) >> 1);
-            let (key, _r) = self.key_at(l, mid);
-            match key.cmp(k) {
+            let key = self.key_at(l, mid);
+            match key.cmp(&rk) {
                 Ordering::Less => lo = mid + 1,
                 _ => hi = mid,
             }
@@ -138,7 +142,13 @@ where
 
         if lo == elems { Err(lo) } else { Ok(lo) }
     }
+}
 
+impl<K, V> Sst<K, V>
+where
+    K: IKey,
+    V: IVal,
+{
     pub(crate) fn show<L>(&self, l: &L, pid: u64, addr: u64)
     where
         L: ILoader,

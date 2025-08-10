@@ -113,7 +113,7 @@ fn big_kv2() {
     let mut opt = Options::new(&*path);
     opt.consolidate_threshold = 3;
     opt.wal_buffer_size = 1024;
-    opt.arena_size = 4096;
+    opt.data_file_size = 4096;
     let mut saved = opt.clone();
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
@@ -122,7 +122,7 @@ fn big_kv2() {
     kv.put("key1", vec![233u8; 512]).unwrap();
     kv.put("key2", vec![114u8; db.options().wal_buffer_size])
         .unwrap();
-    let r = kv.put("key3", vec![114u8; db.options().arena_size as usize]);
+    let r = kv.put("key3", vec![114u8; db.options().data_file_size as usize]);
     assert!(r.is_err() && r.err().unwrap() == OpCode::TooLarge);
     kv.commit().unwrap();
     drop(kv);
