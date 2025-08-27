@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, ptr::null_mut};
 
 use crate::{
-    Options, number_to_slice,
+    Options, number_to_slice, slice_to_number,
     types::{
         data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Sibling, Value, Ver},
         header::{BaseHeader, NodeType, SLOT_LEN, Slot, SlotType, TagFlag, TagKind},
@@ -62,7 +62,7 @@ impl BaseView {
         let mut remote_cnt = 0;
         let prefix_len = Self::calc_prefix(lo, &hi);
         #[cfg(feature = "extra_check")]
-        let mut last_k = None;
+        let mut last_k: Option<LeafSeg> = None;
 
         let iter = f();
         for (ks, v) in iter {
@@ -76,22 +76,22 @@ impl BaseView {
 
             let k = ks.remove_prefix(prefix_len);
             seekable.add(k, v);
-            if let Some(ref raw) = last_raw {
-                if raw.raw_cmp(&k).is_eq() {
-                    if !fixed {
-                        fixed = true;
-                        payload_sz += ADDR_LEN; // plus extra addr size
-                        remote_cnt += 1; // sibling itself
-                        hints.push_back((pos - 1, 0));
-                    }
-                    let (_, cnt) = hints.back_mut().unwrap();
-                    *cnt += 1;
-                    pos += 1;
-                    if v.packed_size() + Ver::len() > inline_size {
-                        remote_cnt += 1; // (ver, value) in sibling
-                    }
-                    continue;
+            if let Some(ref raw) = last_raw
+                && raw.raw_cmp(&k).is_eq()
+            {
+                if !fixed {
+                    fixed = true;
+                    payload_sz += ADDR_LEN; // plus extra addr size
+                    remote_cnt += 1; // sibling itself
+                    hints.push_back((pos - 1, 0));
                 }
+                let (_, cnt) = hints.back_mut().unwrap();
+                *cnt += 1;
+                pos += 1;
+                if v.packed_size() + Ver::len() > inline_size {
+                    remote_cnt += 1; // (ver, value) in sibling
+                }
+                continue;
             }
 
             let kv_sz = k.packed_size() + v.packed_size();
@@ -363,8 +363,8 @@ impl BaseView {
         unsafe { std::slice::from_raw_parts_mut(self.0.add(1).cast::<u64>(), h.nr_remote as usize) }
     }
 
-    /// the date means slot + hi/lo + key-value
-    pub(crate) fn data_mut(&mut self) -> &mut [u8] {
+    /// the data means slot + hi/lo + key-value, excluding header and remotes
+    fn data_mut(&mut self) -> &mut [u8] {
         let h = self.header();
         let remote_len = h.nr_remote as usize * ADDR_LEN;
         unsafe {
@@ -375,7 +375,7 @@ impl BaseView {
         }
     }
 
-    pub(crate) fn data(&self) -> &[u8] {
+    fn data(&self) -> &[u8] {
         let h = self.header();
         let remote_len = h.nr_remote as usize * ADDR_LEN;
         unsafe {
@@ -396,8 +396,8 @@ impl BaseView {
         if sz <= l.inline_size() {
             &self.data()[off..off + h.lo_len as usize]
         } else {
-            let s = Slot::decode_from(&self.data()[off..off + Slot::REMOTE_LEN]);
-            self.load_remote(l, s.addr(), 0, h.lo_len as usize)
+            let addr = slice_to_number!(&self.data()[off..off + Slot::REMOTE_LEN], u64);
+            self.load_remote(l, addr, 0, h.lo_len as usize)
         }
     }
 
@@ -418,8 +418,8 @@ impl BaseView {
         if sz <= l.inline_size() {
             Some(&self.data()[off + h.lo_len as usize..off + sz as usize])
         } else {
-            let s = Slot::decode_from(&self.data()[off..off + Slot::REMOTE_LEN]);
-            Some(self.load_remote(l, s.addr(), h.lo_len as usize, h.hi_len as usize))
+            let addr = slice_to_number!(&self.data()[off..off + Slot::REMOTE_LEN], u64);
+            Some(self.load_remote(l, addr, h.lo_len as usize, h.hi_len as usize))
         }
     }
 
@@ -689,6 +689,8 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// NOTE: because the lo/hi_len are saved in header, neither varint nor fixed size encode is
+    /// applied here
     fn setup_range<A: IAlloc>(&mut self, a: &mut A, lo: &[u8], hi: Option<&[u8]>) {
         let hi_len = hi.map_or(0, |x| x.len());
         let boundary_len = lo.len() + hi_len;
@@ -707,6 +709,7 @@ impl<'a> Builder<'a> {
                 let dst = r.raw_mut();
                 dst[0..lo.len()].copy_from_slice(lo);
                 dst[lo.len()..].copy_from_slice(hi.map_or(&[], |x| x));
+                // record remote addr in where lo/hi belong in sst
                 number_to_slice!(
                     p.header().addr,
                     self.payload[self.offset..self.offset + Slot::REMOTE_LEN]
@@ -721,7 +724,6 @@ impl<'a> Builder<'a> {
         K: ICodec,
         V: ICodec,
     {
-        // TODO: we can reuse the RemotePtr
         let p = RemoteView::alloc(a, total);
         let s = Slot::from_remote(p.header().addr);
         self.save_remote(s.addr());
@@ -777,7 +779,7 @@ struct SeekableIter<'a> {
 impl<'a> SeekableIter<'a> {
     fn new() -> Self {
         Self {
-            data: Vec::with_capacity(Options::SPLIT_ELEM as usize * 4),
+            data: Vec::with_capacity(Options::SPLIT_ELEMS as usize * 4),
             index: 0,
         }
     }
@@ -850,9 +852,7 @@ mod test {
             b
         }
 
-        fn recycle(&mut self, _p: &[u64]) {
-            unimplemented!()
-        }
+        fn collect(&mut self, _addr: &[u64]) {}
 
         fn arena_size(&mut self) -> u32 {
             1 << 20
@@ -913,8 +913,6 @@ mod test {
         let b = BaseView::new_leaf(&mut a, [].as_slice(), None, NULL_PID, || empty);
         let th = b.header();
         assert_eq!(th.kind, TagKind::Base);
-
-        log::debug!("{th:?}");
     }
 
     #[test]
@@ -929,15 +927,16 @@ mod test {
             };
         }
 
+        // NOTE: the kv should be ordered
         let kv = LeafData {
             data: &[
                 (
-                    LeafSeg::new(&[], "foo".as_bytes(), Ver::new(1, 1)),
-                    Value::Put(Record::normal(1, "foo".as_bytes())),
-                ),
-                (
                     LeafSeg::new(&[], "foo".as_bytes(), Ver::new(2, 1)),
                     Value::Put(Record::normal(1, "bar".as_bytes())),
+                ),
+                (
+                    LeafSeg::new(&[], "foo".as_bytes(), Ver::new(1, 1)),
+                    Value::Put(Record::normal(1, "foo".as_bytes())),
                 ),
                 (
                     LeafSeg::new(&[], "mo".as_bytes(), Ver::new(3, 1)),
@@ -956,7 +955,7 @@ mod test {
 
         let (k, v) = iter.next().unwrap();
 
-        test!(k, v, "foo", 1, 1, "foo", 1);
+        test!(k, v, "foo", 2, 1, "bar", 1);
 
         assert!(v.sibling().is_none());
 

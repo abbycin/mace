@@ -88,18 +88,15 @@ where
     pub(crate) fn add(&self, cap: usize, k: K, v: V) {
         let mut map = self.map.lock().unwrap();
         let e = map.get(&k);
-        if e.is_none() {
+        if let Some(e) = e {
+            unsafe { (*(*e)).set_val(v) };
+            self.move_back(*e);
+        } else {
             let node = Box::new(Node::new(k.clone(), v));
             let p = Box::into_raw(node);
             map.insert(k, p);
             self.push_back(p);
-        } else {
-            let e = e.unwrap();
-            unsafe {
-                (*(*e)).set_val(v);
-            }
-            self.move_back(*e);
-        };
+        }
 
         if map.len() > cap {
             let node = self.front();

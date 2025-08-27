@@ -289,8 +289,7 @@ impl Recovery {
             let c = ptr_to::<WalUpdate>(block.data());
             let ok = c.key();
             let key = Key::new(ok, Ver::new(c.txid, c.cmd_id));
-            // redo never write log, so we manually make arena flush work
-            tree.store.buffer.update_flsn();
+
             let r = match c.sub_type() {
                 PayloadType::Insert => {
                     let i = c.put();

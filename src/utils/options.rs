@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{types::imtree::NODE_SIZE, utils::lru::LRU_SHARD};
+use crate::utils::lru::LRU_SHARD;
 
 use super::OpCode;
 
@@ -13,6 +13,8 @@ pub struct Options {
     /// result in data loss, while turning it on may result in performance degradation
     pub sync_on_write: bool,
     /// hardware concurrency count, range in [1, cores]
+    ///
+    /// **Once set, it cannot be modified**
     pub workers: usize,
     /// garbage collection cycle (milliseconds)
     pub gc_timeout: u64,
@@ -38,8 +40,10 @@ pub struct Options {
     /// a size limit to trigger data file flush, which also control max key-value size, NOTE: too
     /// large a file size will cause the flushing to be slow
     pub data_file_size: u32,
-    /// when should we consolidate delta chain, must less than [`NODE_SIZE`] which is 64
-    pub consolidate_threshold: u32,
+    /// when should we consolidate delta chain, the default value is set to half [`Self::split_elems`]
+    /// and it also the maximum value, shrink this value may get better query performance (especially
+    /// in large key-value workload)
+    pub consolidate_threshold: u16,
     /// WAL ring buffer size, must greater than [`Self::page_size`] and must be power of 2
     pub wal_buffer_size: usize,
     /// the count of checkpoints that a txn can span, ie, the length limit of a txn, if a txn length
@@ -53,27 +57,32 @@ pub struct Options {
     pub keep_stable_wal_file: bool,
     /// max key-value size support, it must less than 4GB (because we have to add extra headers or
     /// something else), the default value is **half** of [`Self::arena_size`]
+    ///
+    /// **Once set, it cannot be modified**
     pub max_kv_size: u32,
     /// max size that key-val can be save into sst (B+ Tree Node) rather than save as a pointer to
     /// remote address the default value is 2048, the same must less than [`Self::max_kv_size`]
+    ///
+    /// **Once set, it cannot be modified**
     pub max_inline_size: u32,
     /// control max elements in sst (B+ Tree Node), the default value is 512, the sst size which is
     /// approximate [`Self::max_inline_size`] * [`Self::split_elem`] must less than [`Self::max_kv_size`]
-    pub split_elem: u16,
+    ///
+    /// **Once set, it cannot be modified**
+    pub split_elems: u16,
 }
 
 impl Options {
     pub const DATA_FILE_SIZE: usize = 64 << 20; // 64MB
     pub const MAX_WORKERS: usize = 128;
-    pub const CONSOLIDATE_THRESHOLD: u32 = NODE_SIZE as u32;
     pub const MIN_CACHE_CAP: usize = Self::DATA_FILE_SIZE;
     pub const CACHE_CAP: usize = 1 << 30; // 1GB
     pub const CACHE_CNT: usize = 16384;
     pub const FILE_CACHE: usize = 512;
     pub const WAL_BUF_SZ: usize = 8 << 20; // 8MB
     pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
-    pub const INLINE_SIZE: u32 = 2048;
-    pub const SPLIT_ELEM: u16 = 512;
+    pub const INLINE_SIZE: u32 = 4096;
+    pub const SPLIT_ELEMS: u16 = 512;
 
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
@@ -93,14 +102,14 @@ impl Options {
             cache_evict_pct: 10, // 10% evict 100MB every time
             cache_count: Self::CACHE_CNT,
             data_file_size: Self::DATA_FILE_SIZE as u32,
-            consolidate_threshold: Self::CONSOLIDATE_THRESHOLD,
+            consolidate_threshold: Self::SPLIT_ELEMS / 2,
             wal_buffer_size: Self::WAL_BUF_SZ,
             max_ckpt_per_txn: 1_000_000, // 1 million
             wal_file_size: Self::WAL_FILE_SZ as u32,
             max_kv_size: Self::DATA_FILE_SIZE as u32 / 2,
             keep_stable_wal_file: false,
             max_inline_size: Self::INLINE_SIZE,
-            split_elem: Self::SPLIT_ELEM,
+            split_elems: Self::SPLIT_ELEMS,
         }
     }
 
@@ -110,8 +119,13 @@ impl Options {
     }
 
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
-        if self.consolidate_threshold > Self::CONSOLIDATE_THRESHOLD {
-            self.consolidate_threshold = Self::CONSOLIDATE_THRESHOLD;
+        // make sure base page smaller than arena size
+        if self.max_inline_size as usize * self.split_elems as usize > self.max_kv_size as usize {
+            self.max_inline_size = Self::INLINE_SIZE;
+            self.split_elems = Self::SPLIT_ELEMS;
+        }
+        if self.consolidate_threshold > self.split_elems / 2 {
+            self.consolidate_threshold = self.split_elems / 2;
         }
         if self.file_cache < LRU_SHARD {
             self.file_cache = Self::FILE_CACHE;
@@ -125,10 +139,6 @@ impl Options {
         self.max_kv_size = self.data_file_size / 2;
         if self.max_inline_size > self.max_kv_size {
             self.max_inline_size = Self::INLINE_SIZE;
-        }
-        if self.max_inline_size as usize * self.split_elem as usize > self.max_kv_size as usize {
-            self.max_inline_size = Self::INLINE_SIZE;
-            self.split_elem = Self::SPLIT_ELEM;
         }
         Ok(ParsedOptions { inner: self })
     }

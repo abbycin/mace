@@ -59,7 +59,7 @@ impl BitMap {
         self.data.fill(0);
     }
 
-    pub(crate) fn iter(&self) -> BitMapIter {
+    pub(crate) fn iter(&'_ self) -> BitMapIter<'_> {
         BitMapIter {
             m: self,
             idx: 0,

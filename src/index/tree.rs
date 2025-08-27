@@ -19,7 +19,21 @@ use crate::{
 use crossbeam_epoch::Guard;
 use std::cmp::Ordering::Equal;
 use std::ops::{Bound, RangeBounds};
+#[cfg(feature = "metric")]
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::{borrow::Cow, sync::Arc};
+
+#[cfg(feature = "metric")]
+macro_rules! inc_cas {
+    ($field: ident) => {
+        G_CAS.$field.fetch_add(1, Relaxed)
+    };
+}
+
+#[cfg(not(feature = "metric"))]
+macro_rules! inc_cas {
+    ($filed: ident) => {};
+}
 
 #[derive(Clone)]
 pub struct ValRef {
@@ -86,7 +100,7 @@ impl Tree {
         let node = Node::new_leaf(&mut txn, self.store.buffer.loader());
         let mut new_page = Page::new(node);
         let root_pid = txn.map(&mut new_page);
-        self.store.buffer.cache(&g, new_page);
+        self.store.buffer.cache(new_page);
         assert_eq!(root_pid, self.root_index.pid);
         txn.commit();
     }
@@ -105,7 +119,7 @@ impl Tree {
         g: &Guard,
         pid: u64,
     ) -> Result<Option<Page>, OpCode> {
-        if let Some(p) = store.buffer.load(g, pid) {
+        if let Some(p) = store.buffer.load(pid) {
             let child_pid = p.header().merging_child;
             if child_pid != 0 {
                 self.merge_node(&p, child_pid, g)?;
@@ -122,6 +136,11 @@ impl Tree {
     // 4. remove index to child from it's parent
     // 5. unmap child pid from page table
     fn merge_node(&self, parent_ptr: &Page, child_pid: u64, g: &Guard) -> Result<(), OpCode> {
+        // NOTE: a large lock is necessary because the merge process must be exclusive
+        let Ok(_lk) = parent_ptr.try_lock() else {
+            // retrun Ok let cooperative threads not retry
+            return Ok(());
+        };
         let safe_txid = self.txid();
         assert_ne!(child_pid, NULL_PID);
         // 1.
@@ -169,10 +188,13 @@ impl Tree {
             // further check if it's really the left sibling of child
             if next_pid == child_pid {
                 let new_node = cursor_ptr.merge_node(&mut txn, &child_ptr, safe_txid);
+                inc_cas!(merge);
                 if txn.replace(cursor_ptr, new_node).is_ok() {
+                    child_ptr.garbage_collect(&mut txn);
                     txn.commit();
                     break;
                 }
+                inc_cas!(merge_fail);
                 // retry merge
                 continue;
             }
@@ -217,10 +239,12 @@ impl Tree {
         loop {
             let mut txn = self.begin(g);
             let new_ptr = parent_ptr.process_merge(&mut txn, MergeOp::Merged, safe_txid);
+            inc_cas!(remove_node);
             if txn.replace(*parent, new_ptr).is_ok() {
                 txn.commit();
                 return Ok(true);
             }
+            inc_cas!(remove_node_fail);
             let new_ptr =
                 if let Some(x) = self.load_node(&self.store, g, parent_ptr.box_header().pid)? {
                     x
@@ -257,10 +281,12 @@ impl Tree {
 
             let mut txn = self.begin(g);
             let new_node = page.process_merge(&mut txn, MergeOp::MarkChild, safe_txid);
+            inc_cas!(mark_merge);
             if let Ok(new_page) = txn.replace(page, new_node) {
                 txn.commit();
                 return Ok(Some(new_page));
             }
+            inc_cas!(mark_merge_fail);
         }
     }
 
@@ -277,6 +303,9 @@ impl Tree {
     ///    - replace root with new node
     ///
     fn split_node(&self, node: Page, parent_opt: Option<Page>, g: &Guard) -> Result<(), OpCode> {
+        let Ok(node_lock) = node.try_lock() else {
+            return Err(OpCode::Again);
+        };
         let safe_txid = self.store.context.meta.safe_tixd();
         let mut txn = self.begin(g);
         // 1.
@@ -290,20 +319,34 @@ impl Tree {
         lnode.header_mut().right_sibling = rpid;
 
         // 3.
-        let lpage = txn.replace(node, lnode)?;
-        self.store.buffer.cache(g, rpage);
+        inc_cas!(split1);
+        let lpage = txn.replace(node, lnode).inspect_err(|_| {
+            inc_cas!(split_fail1);
+        })?;
+        self.store.buffer.cache(rpage);
+        // drop lock early let cooperative threads have chance to make progress
+        drop(node_lock);
         // publish rpage to global
         txn.commit();
 
         let lo = rpage.lo();
         if let Some(parent) = parent_opt {
+            // multiple threads (cooperative) may concurrently update parent
+            let _lk = parent.lock();
+            if self.store.page.get(parent.pid()) != parent.swip() {
+                // other thread has finished same job
+                return Ok(());
+            }
             // 4.
             let new_node = parent.insert_index(&mut txn, lo, rpid, safe_txid);
             if new_node.is_none() {
                 // may conflict with other thread
                 return Ok(());
             }
-            txn.replace(parent, new_node.unwrap())?;
+            inc_cas!(split2);
+            txn.replace(parent, new_node.unwrap()).inspect_err(|_| {
+                inc_cas!(split_fail2);
+            })?;
             // publish new parent to global
             txn.commit();
         } else {
@@ -322,6 +365,10 @@ impl Tree {
         lo: &[u8],
         safe_txid: u64,
     ) -> Result<(), OpCode> {
+        let _lk = root.lock();
+        if self.store.page.get(root.pid()) != root.swip() {
+            return Err(OpCode::Again);
+        };
         let mut txn = self.begin(g);
 
         // compact is required, since other thread may already insert new data after step 3
@@ -342,31 +389,32 @@ impl Tree {
             ],
         );
 
-        let n = txn.replace(root, new_root_node)?;
+        inc_cas!(split_root);
+        let n = txn.replace(root, new_root_node).inspect_err(|_| {
+            inc_cas!(split_root_fail);
+        })?;
         assert_eq!(n.box_header().pid, ROOT_PID);
         // publish new root to global
         txn.commit();
-        self.store.buffer.cache(g, lpage);
+        self.store.buffer.cache(lpage);
         Ok(())
     }
 
     fn find_leaf(&self, g: &Guard, k: &[u8]) -> Result<Page, OpCode> {
-        let mut smo_cnt = 3;
         loop {
-            match self.try_find_leaf(smo_cnt, g, k) {
-                Err(OpCode::Again) => smo_cnt = smo_cnt.saturating_sub(1),
+            match self.try_find_leaf(g, k) {
+                Err(OpCode::Again) => continue,
                 Err(e) => unreachable!("invalid opcode {:?}", e),
                 o => return o,
             }
         }
     }
 
-    fn try_find_leaf(&self, smo_cnt: usize, g: &Guard, key: &[u8]) -> Result<Page, OpCode> {
+    fn try_find_leaf(&self, g: &Guard, key: &[u8]) -> Result<Page, OpCode> {
         let mut cursor = self.root_index.pid;
         let mut parent_opt: Option<Page> = None;
         let mut unsplit_parent_opt: Option<Page> = None;
         let mut leftmost = false;
-        let mut txn = self.begin(g);
 
         loop {
             let node_ptr = if let Some(x) = self.load_node(&self.store, g, cursor)? {
@@ -385,7 +433,7 @@ impl Tree {
                 return Err(OpCode::Again);
             }
 
-            if smo_cnt > 0 && node_ptr.should_split(self.store.opt.split_elem) {
+            if node_ptr.should_split(self.store.opt.split_elems) {
                 self.split_node(node_ptr, parent_opt, g)?;
                 return Err(OpCode::Again);
             }
@@ -418,6 +466,13 @@ impl Tree {
 
             // cooperative the split
             if let Some(unsplit) = unsplit_parent_opt.take() {
+                let mut txn = self.begin(g);
+                let _lk = unsplit.lock();
+                if self.store.page.get(unsplit.pid()) != unsplit.swip() {
+                    // other thread has finished same job
+                    return Err(OpCode::Again);
+                }
+
                 // create a new index in intl node
                 let split_node = unsplit.insert_index(&mut txn, lo, cursor, self.txid());
 
@@ -425,10 +480,14 @@ impl Tree {
                     return Err(OpCode::Again);
                 }
 
-                txn.replace(unsplit, split_node.unwrap())?;
+                inc_cas!(coop);
+                txn.replace(unsplit, split_node.unwrap()).inspect_err(|_| {
+                    inc_cas!(coop_fail);
+                })?;
+                txn.commit();
             }
 
-            if smo_cnt > 0 && !leftmost && parent_opt.is_some() && node_ptr.should_merge() {
+            if !leftmost && parent_opt.is_some() && node_ptr.should_merge() {
                 self.try_merge(g, parent_opt.unwrap(), node_ptr)?;
                 return Err(OpCode::Again);
             }
@@ -439,22 +498,49 @@ impl Tree {
                 parent_opt = Some(node_ptr);
                 cursor = pid;
             } else {
-                txn.commit();
+                if node_ptr.delta_len() >= self.store.opt.consolidate_threshold as usize {
+                    self.try_compact(g, node_ptr);
+                    // it may need split
+                    continue;
+                }
                 return Ok(node_ptr);
             }
         }
     }
 
+    fn try_compact(&self, g: &Guard, page: Page) {
+        let _lk = page.lock();
+        if self.store.page.get(page.pid()) != page.swip() {
+            return;
+        };
+
+        // consolidation never retry
+        let mut txn = self.begin(g);
+        let new_node = page.compact(&mut txn, self.txid(), true);
+        inc_cas!(compact);
+        if txn.replace(page, new_node).is_ok() {
+            txn.commit();
+        } else {
+            inc_cas!(compact_fail);
+        }
+    }
+
     fn try_merge(&self, g: &Guard, parent: Page, cur: Page) -> Result<(), OpCode> {
+        let Ok(lk) = parent.try_lock() else {
+            return Err(OpCode::Again);
+        };
         assert_eq!(parent.header().merging_child, NULL_PID);
         let mut txn = self.begin(g);
         let pid = cur.pid();
 
         if parent.can_merge_child(pid) {
             let new_parent = parent.process_merge(&mut txn, MergeOp::MarkParent(pid), self.txid());
-            let new_page = txn.replace(parent, new_parent)?;
-
+            inc_cas!(try_merge);
+            let new_page = txn.replace(parent, new_parent).inspect_err(|_| {
+                inc_cas!(try_merge_fail);
+            })?;
             txn.commit();
+            drop(lk);
             self.merge_node(&new_page, pid, g)?;
         }
         Ok(())
@@ -466,32 +552,27 @@ impl Tree {
         V: IVal,
         F: FnMut(Page, &K) -> Result<(), OpCode>,
     {
+        check(old, k)?;
+
         let mut txn = self.begin(g);
         let b = DeltaView::from_key_val(&mut txn, *k, *v);
         let mut new = Page::new(old.insert(b.view().as_delta()));
 
         txn.pin(new);
 
-        check(old, k)?;
-
         // because each thread contains their private data, we have to load the current page by pid
         // and retry (insert delta to the loaded page) on failure caused by both insert/compaction,
         // meanwhile, smo may also cause update fail, we simply restart the whole insert procedure
         // TODO: potentail decline in performance
+        inc_cas!(link);
         if txn.update(old, &mut new).is_err() {
+            inc_cas!(link_fail);
             return Err(OpCode::Again);
         }
 
         txn.commit();
         new.save(b); // save the delta itself until page was reclaimed
 
-        if new.delta_len() >= self.store.opt.consolidate_threshold {
-            // consolidation never retry
-            let new_node = new.compact(&mut txn, self.txid(), true);
-            if txn.replace(new, new_node).is_ok() {
-                txn.commit();
-            }
-        }
         Ok(())
     }
 
@@ -515,7 +596,10 @@ impl Tree {
         loop {
             match self.try_put::<K, V>(g, &key, &val) {
                 Ok(_) => return Ok(()),
-                Err(OpCode::Again) => continue,
+                Err(OpCode::Again) => {
+                    g.flush();
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -564,7 +648,10 @@ impl Tree {
         loop {
             match self.try_update(g, &key, &val, &mut visible) {
                 Ok(x) => return Ok(x),
-                Err(OpCode::Again) => continue,
+                Err(OpCode::Again) => {
+                    g.flush();
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -635,7 +722,7 @@ impl Tree {
             let sst = ptr.sst::<Ver, Value<Record>>();
             let pos = sst.lower_bound(l, &ver).unwrap_or_else(|pos| pos);
             if pos < sst.header().elems as usize {
-                let (k, v, p) = sst.get_unchecked(l, pos);
+                let (k, v, r) = sst.get_unchecked(l, pos);
 
                 if visible(k.txid, v.as_ref()) {
                     if v.is_del() {
@@ -643,11 +730,7 @@ impl Tree {
                     }
                     return Ok(ValRef::new(
                         v,
-                        if p.is_null() {
-                            ptr.as_box()
-                        } else {
-                            p.as_box()
-                        },
+                        r.map_or_else(|| ptr.as_box(), |x| x.as_box()),
                     ));
                 }
             }
@@ -873,13 +956,67 @@ struct Filter<'a> {
 
 impl<'a> Filter<'a> {
     fn check(&mut self, k: &'a [u8], is_del: bool, r: KeyRef) -> bool {
-        if let Some(last) = self.last {
-            if last == k {
-                return false;
-            }
+        if let Some(last) = self.last
+            && last == k
+        {
+            return false;
         }
         self.holder = Some(r);
         self.last = Some(k);
         !is_del
     }
+}
+
+#[cfg(feature = "metric")]
+#[derive(Debug)]
+pub struct CASstatus {
+    merge: AtomicUsize,
+    merge_fail: AtomicUsize,
+    remove_node: AtomicUsize,
+    remove_node_fail: AtomicUsize,
+    mark_merge: AtomicUsize,
+    mark_merge_fail: AtomicUsize,
+    split1: AtomicUsize,
+    split_fail1: AtomicUsize,
+    split2: AtomicUsize,
+    split_fail2: AtomicUsize,
+    split_root: AtomicUsize,
+    split_root_fail: AtomicUsize,
+    coop: AtomicUsize,
+    coop_fail: AtomicUsize,
+    try_merge: AtomicUsize,
+    try_merge_fail: AtomicUsize,
+    link: AtomicUsize,
+    link_fail: AtomicUsize,
+    compact: AtomicUsize,
+    compact_fail: AtomicUsize,
+}
+
+#[cfg(feature = "metric")]
+static G_CAS: CASstatus = CASstatus {
+    merge: AtomicUsize::new(0),
+    merge_fail: AtomicUsize::new(0),
+    remove_node: AtomicUsize::new(0),
+    remove_node_fail: AtomicUsize::new(0),
+    mark_merge: AtomicUsize::new(0),
+    mark_merge_fail: AtomicUsize::new(0),
+    split1: AtomicUsize::new(0),
+    split_fail1: AtomicUsize::new(0),
+    split2: AtomicUsize::new(0),
+    split_fail2: AtomicUsize::new(0),
+    split_root: AtomicUsize::new(0),
+    split_root_fail: AtomicUsize::new(0),
+    coop: AtomicUsize::new(0),
+    coop_fail: AtomicUsize::new(0),
+    try_merge: AtomicUsize::new(0),
+    try_merge_fail: AtomicUsize::new(0),
+    link: AtomicUsize::new(0),
+    link_fail: AtomicUsize::new(0),
+    compact: AtomicUsize::new(0),
+    compact_fail: AtomicUsize::new(0),
+};
+
+#[cfg(feature = "metric")]
+pub fn g_cas_status() -> &'static CASstatus {
+    &G_CAS
 }

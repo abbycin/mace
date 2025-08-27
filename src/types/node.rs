@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering::{self, Equal, Greater, Less},
     ops::{Bound, Deref, DerefMut},
+    sync::{Arc, Mutex, MutexGuard, TryLockResult},
 };
 
 use crate::{
@@ -12,7 +13,7 @@ use crate::{
         refbox::{BaseView, BoxView, DeltaView, KeyRef},
         traits::{IAlloc, IAsBoxRef, IBoxHeader, ICodec, IHeader, IKey, ILoader, IVal},
     },
-    utils::{NULL_CMD, NULL_ORACLE, NULL_PID, ROOT_PID, unpack_id},
+    utils::{NULL_CMD, NULL_ORACLE, NULL_PID, unpack_id},
 };
 
 use super::{header::TagKind, refbox::BoxRef};
@@ -24,6 +25,7 @@ pub(crate) struct Node<L: ILoader> {
     total_size: usize,
     /// the loader is remote/sibling loader, not node loader
     loader: L,
+    mtx: Arc<Mutex<()>>,
     delta: ImTree<DeltaView>,
     inner: BaseView,
 }
@@ -57,6 +59,10 @@ where
     L: ILoader,
 {
     fn new(loader: L, b: BoxRef) -> Self {
+        Self::new_with_mtx(loader, b, Arc::new(Mutex::new(())))
+    }
+
+    fn new_with_mtx(loader: L, b: BoxRef, mtx: Arc<Mutex<()>>) -> Self {
         let h = b.header();
         let (addr, total_size) = (h.addr, h.total_size as usize);
         let base = b.view().as_base();
@@ -65,6 +71,7 @@ where
             addr,
             total_size,
             loader,
+            mtx,
             delta: ImTree::new(if base.header().is_index {
                 intl_cmp
             } else {
@@ -80,6 +87,14 @@ where
 
     pub(crate) fn save(&self, b: BoxRef) {
         self.loader.pin(b);
+    }
+
+    pub(crate) fn pid(&self) -> u64 {
+        self.inner.box_header().pid
+    }
+
+    pub(crate) fn set_pid(&mut self, pid: u64) {
+        self.inner.box_header_mut().pid = pid;
     }
 
     pub(crate) fn new_leaf<A: IAlloc>(a: &mut A, loader: L) -> Node<L> {
@@ -101,22 +116,24 @@ where
         self.total_size
     }
 
+    pub(crate) fn base_addr(&self) -> u64 {
+        self.inner.box_header().addr
+    }
+
     pub(crate) fn garbage_collect<A: IAlloc>(&self, a: &mut A) {
-        let iter = self.delta.iter();
+        self.delta
+            .iter()
+            .for_each(|x| a.collect(&[x.box_header().addr]));
 
-        for d in iter {
-            let x = d.box_header().addr;
-            a.recycle(&[x]);
-        }
-
-        a.recycle(self.inner.remote());
-        a.recycle(&[self.inner.box_header().addr]);
+        a.collect(self.inner.remote());
+        a.collect(&[self.base_addr()]);
     }
 
     pub(crate) fn load(addr: u64, loader: L) -> Self {
         let d = loader.pin_load(addr);
         let mut l = Self {
             loader,
+            mtx: Arc::new(Mutex::new(())),
             delta: ImTree::new(null_cmp),
             inner: BaseView::null(),
             total_size: 0,
@@ -145,6 +162,7 @@ where
 
     pub(crate) fn should_merge(&self) -> bool {
         let h = self.header();
+        // current elems is less or equal than original elems
         let size_limited = h.split_elems >= h.elems * 4;
         let no_conflict = !h.merging && h.merging_child == NULL_PID;
         size_limited && no_conflict
@@ -165,13 +183,9 @@ where
         other: &Node<L>,
         safe_txid: u64,
     ) -> Node<L> {
-        // TODO: these delta/sst should not allocate in arena which create too many garbage
         let lb = self.merge_to_base(a, safe_txid);
         let rb = other.merge_to_base(a, safe_txid);
         let (lhs, rhs) = (lb.view().as_base(), rb.view().as_base());
-        a.recycle(lhs.remote());
-        a.recycle(rhs.remote());
-        a.recycle(&[lhs.box_header().addr, rhs.box_header().addr]);
 
         let mut node = Self::new(self.loader.clone(), lhs.merge(a, &self.loader, rhs));
         node.header_mut().split_elems = self.header().split_elems;
@@ -193,9 +207,9 @@ where
             // it's always compacted after node split, so the `map` is empty
             assert_eq!(self.delta.len(), 0);
             // make sure k is in current node
-            assert!(k >= self.lo().1);
+            assert!(k >= self.lo());
             if let Some(hi) = self.hi() {
-                assert!(hi.1 > k);
+                assert!(hi > k);
             }
         }
         let sst = self.sst::<IntlKey, Index>();
@@ -216,14 +230,6 @@ where
         pid: u64,
         safe_txid: u64,
     ) -> Option<Node<L>> {
-        if self
-            .find_latest::<IntlKey, Index, _>(&IntlKey::new(key), |x, y| x.raw().cmp(y.raw()))
-            .is_some()
-        {
-            // already inserted by other thread
-            return None;
-        }
-
         #[cfg(feature = "extra_check")]
         if key < self.lo()
             || if let Some(hi) = self.hi() {
@@ -237,7 +243,7 @@ where
 
         let b = DeltaView::from_key_val(a, IntlKey::new(key), Index::new(pid));
         let view = b.view().as_delta();
-        let node = self.insert(view).compact(a, safe_txid, false);
+        let node = self.insert(view).compact(a, safe_txid, false); // 1/SPLIT_ELEMS chance to run
         node.loader.pin(b); // pin to new loader (the cloned one)
         Some(node)
     }
@@ -326,7 +332,7 @@ where
     }
 
     #[allow(clippy::iter_skip_zero)]
-    pub(crate) fn intl_iter(&self) -> IntlIter<L> {
+    pub(crate) fn intl_iter(&'_ self) -> IntlIter<'_, L> {
         debug_assert_eq!(self.box_header().node_type, NodeType::Intl);
         let len = self.header().prefix_len as usize;
         let lo = self.lo();
@@ -342,7 +348,7 @@ where
     }
 
     #[allow(clippy::iter_skip_zero)]
-    pub(crate) fn leaf_iter(&self, safe_tixd: u64) -> LeafIter<L> {
+    pub(crate) fn leaf_iter(&'_ self, safe_txid: u64) -> LeafIter<'_, L> {
         debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
         let len = self.header().prefix_len as usize;
         let lo = self.lo();
@@ -355,7 +361,7 @@ where
                 .range_iter(&self.loader, 0, self.inner.header().elems as usize),
             delta_iter: IterAdaptor::Iter(self.delta.iter().skip(0)),
             filter: LeafFilter {
-                txid: safe_tixd,
+                txid: safe_txid,
                 last: None,
                 skip_dup: false,
             },
@@ -374,12 +380,11 @@ where
         let new_h = base.header_mut();
         new_h.merging = old_h.merging;
         new_h.merging_child = old_h.merging_child;
-        let loader = if share_pinned {
-            self.loader.shallow_copy()
+        if share_pinned {
+            Self::new_with_mtx(self.loader.shallow_copy(), b, self.mtx.clone())
         } else {
-            self.loader.clone()
-        };
-        Self::new(loader, b)
+            Self::new(self.loader.clone(), b)
+        }
     }
 
     fn merge_to_base<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> BoxRef {
@@ -445,11 +450,24 @@ where
 
         Node {
             loader: self.loader.shallow_copy(),
+            mtx: self.mtx.clone(),
             addr: h.addr, // save the new address
             total_size: self.total_size + h.total_size as usize,
             delta: self.delta.update(k),
             inner: self.inner,
         }
+    }
+
+    pub(crate) fn lock(&'_ self) -> MutexGuard<'_, ()> {
+        self.mtx.lock().expect("never happen")
+    }
+
+    pub(crate) fn try_lock(&'_ self) -> TryLockResult<MutexGuard<'_, ()>> {
+        self.mtx.try_lock()
+    }
+
+    pub(crate) fn latest_addr(&self) -> u64 {
+        self.addr
     }
 
     pub(crate) fn find_latest<K, V, F>(&self, key: &K, f: F) -> Option<(K, V, BoxRef)>
@@ -473,32 +491,26 @@ where
         K: IKey,
         V: IVal,
     {
-        if self.inner.header().elems == 0 {
-            debug_assert_eq!(self.inner.box_header().pid, ROOT_PID);
-            return None;
+        if self.header().elems > 0 {
+            let sst = self.inner.sst::<K, V>();
+            let pos = sst
+                .search_by(&self.loader, key, |x, y| x.raw().cmp(y.raw()))
+                .ok()?;
+            let (k, v, r) = sst.get_unchecked(&self.loader, pos);
+            Some((k, v, r.map_or_else(|| self.inner.as_box(), |x| x.as_box())))
+        } else {
+            // it not just ROOT_PID may have empty elems, it's same to those nodes have been compacted
+            // with all elems were filtered out
+            None
         }
-        let sst = self.inner.sst::<K, V>();
-        let pos = sst
-            .search_by(&self.loader, key, |x, y| x.raw().cmp(y.raw()))
-            .ok()?;
-        let (k, v, p) = sst.get_unchecked(&self.loader, pos);
-        Some((
-            k,
-            v,
-            if p.is_null() {
-                self.inner.as_box()
-            } else {
-                p.as_box()
-            },
-        ))
     }
 
     pub(crate) fn range_from<K>(
-        &self,
+        &'_ self,
         key: K,
         cmp: fn(&DeltaView, &K) -> Ordering,
         equal: fn(&DeltaView, &K) -> bool,
-    ) -> RangeIter<DeltaView, K>
+    ) -> RangeIter<'_, DeltaView, K>
     where
         K: IKey,
     {
@@ -539,12 +551,8 @@ where
         self.inner.box_header()
     }
 
-    pub(crate) fn box_header_mut(&mut self) -> &mut BoxHeader {
-        self.inner.box_header_mut()
-    }
-
-    pub(crate) fn delta_len(&self) -> u32 {
-        self.delta.len() as u32
+    pub(crate) fn delta_len(&self) -> usize {
+        self.delta.len()
     }
 
     fn load_inner(l: &mut Node<L>, mut d: BoxView) {
@@ -731,34 +739,38 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.next_l.is_none() {
-                if let Some(x) = self.delta_iter.next() {
-                    let k = IntlKey::decode_from(x.key());
-                    // NOTE: split raw into two parts which simplify comparation
-                    self.next_l = Some((
-                        IntlSeg::new(self.prefix, &k.raw[self.prefix.len()..]),
-                        Index::decode_from(x.val()),
-                    ));
-                }
+            if self.next_l.is_none()
+                && let Some(x) = self.delta_iter.next()
+            {
+                let k = IntlKey::decode_from(x.key());
+                // NOTE: split raw into two parts which simplify comparation
+                self.next_l = Some((
+                    IntlSeg::new(self.prefix, &k.raw[self.prefix.len()..]),
+                    Index::decode_from(x.val()),
+                ));
             }
 
-            if self.next_r.is_none() {
-                if let Some((k, v)) = self.sst_iter.next() {
-                    self.next_r = Some((IntlSeg::new(self.prefix, k.raw), v));
-                }
+            if self.next_r.is_none()
+                && let Some((k, v)) = self.sst_iter.next()
+            {
+                self.next_r = Some((IntlSeg::new(self.prefix, k.raw), v));
             }
 
-            match (self.next_l.take(), self.next_r.take()) {
+            match (self.next_l, self.next_r) {
                 (None, None) => return None,
                 (None, Some(x)) => {
+                    self.next_r = None;
                     return Some(x);
                 }
                 (Some(x), None) => {
+                    self.next_l = None;
                     debug_assert!(!x.1.is_tombstone());
                     return Some(x);
                 }
                 (Some(l), Some(r)) => match l.0.raw_cmp(&r.0) {
                     Equal => {
+                        self.next_l = None;
+                        self.next_r = None;
                         // when the latest one is marked as tombstone, skip all same `raw`s
                         // NOTE: there are at most same `raw` one in delta another in sst
                         if l.1.is_tombstone() {
@@ -767,11 +779,11 @@ where
                         return Some(l);
                     }
                     Greater => {
-                        self.next_l = Some(l);
+                        self.next_r = None;
                         return Some(r);
                     }
                     Less => {
-                        self.next_r = Some(r);
+                        self.next_l = None;
                         return Some(l);
                     }
                 },
@@ -786,47 +798,51 @@ where
 {
     type Item = (LeafSeg<'a>, Value<Record>);
 
+    // TODO: `self.next_l/r = Some(xx)` cause too many l1d-load-misses, maybe we can return Key
+    // instead, and apply prefix then remove new prefix in `Base::new_leaf`
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.next_r.is_none() {
-                if let Some((k, v)) = self.sst_iter.next() {
-                    debug_assert!(v.sibling().is_none());
-                    self.next_r = Some((LeafSeg::new(self.prefix, k.raw, k.ver), v));
-                }
+            if self.next_r.is_none()
+                && let Some((k, v)) = self.sst_iter.next()
+            {
+                debug_assert!(v.sibling().is_none());
+                self.next_r = Some((LeafSeg::new(self.prefix, k.raw, k.ver), v));
             }
 
-            if self.next_l.is_none() {
-                if let Some(x) = self.delta_iter.next() {
-                    let k = Key::decode_from(x.key());
-                    let v = Value::<Record>::decode_from(x.val());
-                    self.next_l = Some((
-                        LeafSeg::new(self.prefix, &k.raw[self.prefix.len()..], k.ver),
-                        v,
-                    ));
-                }
+            if self.next_l.is_none()
+                && let Some(x) = self.delta_iter.next()
+            {
+                let k = Key::decode_from(x.key());
+                let v = Value::<Record>::decode_from(x.val());
+                self.next_l = Some((
+                    LeafSeg::new(self.prefix, &k.raw[self.prefix.len()..], k.ver),
+                    v,
+                ));
             }
 
-            match (self.next_l.take(), self.next_r.take()) {
+            match (self.next_l, self.next_r) {
                 (None, None) => return None,
                 (None, Some(r)) => {
+                    self.next_r = None;
                     if self.filter.check(&(r.0, r.1)) {
                         return Some(r);
                     }
                 }
                 (Some(l), None) => {
+                    self.next_l = None;
                     if self.filter.check(&(l.0, l.1)) {
                         return Some(l);
                     }
                 }
                 (Some(l), Some(r)) => match l.0.cmp(&r.0) {
                     Less => {
-                        self.next_r = Some(r);
+                        self.next_l = None;
                         if self.filter.check(&(l.0, l.1)) {
                             return Some(l);
                         }
                     }
                     Greater => {
-                        self.next_l = Some(l);
+                        self.next_r = None;
                         if self.filter.check(&(r.0, r.1)) {
                             return Some(r);
                         }
@@ -845,19 +861,19 @@ where
     type Item = (Key<'a>, Value<Record>, KeyRef);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_l.is_none() {
-            if let Some(x) = self.delta_iter.next() {
-                let k = Key::decode_from(x.key());
-                let v = Value::<Record>::decode_from(x.val());
-                self.next_l = Some((k, v, KeyRef::new(k.raw, x.as_box())));
-            }
+        if self.next_l.is_none()
+            && let Some(x) = self.delta_iter.next()
+        {
+            let k = Key::decode_from(x.key());
+            let v = Value::<Record>::decode_from(x.val());
+            self.next_l = Some((k, v, KeyRef::new(k.raw, x.as_box())));
         }
 
-        if self.next_r.is_none() {
-            if let Some((k, v)) = self.sst_iter.next() {
-                let kr = KeyRef::build(self.prefix, k.raw);
-                self.next_r = Some((Key::new(kr.key(), k.ver), v, kr));
-            }
+        if self.next_r.is_none()
+            && let Some((k, v)) = self.sst_iter.next()
+        {
+            let kr = KeyRef::build(self.prefix, k.raw);
+            self.next_r = Some((Key::new(kr.key(), k.ver), v, kr));
         }
 
         return match (self.next_l.take(), self.next_r.take()) {
@@ -888,23 +904,23 @@ struct LeafFilter<'a> {
 impl<'a> LeafFilter<'a> {
     fn check(&mut self, x: &(LeafSeg<'a>, Value<Record>)) -> bool {
         let (k, v) = x;
-        if let Some(last) = self.last {
-            if last == k.raw() {
-                if self.skip_dup {
-                    return false;
-                }
+        if let Some(last) = self.last
+            && last == k.raw()
+        {
+            if self.skip_dup {
+                return false;
+            }
 
-                if k.txid() > self.txid {
-                    return true;
-                }
+            if k.txid() > self.txid {
+                return true;
+            }
 
-                // it's the oldest version, the rest versions will never be accessed by any txn
-                self.skip_dup = true;
-                match v {
-                    // skip only when removed and is safe
-                    Value::Del(_) => return false,
-                    _ => return true,
-                }
+            // it's the oldest version, the rest versions will never be accessed by any txn
+            self.skip_dup = true;
+            match v {
+                // skip only when removed and is safe
+                Value::Del(_) => return false,
+                _ => return true,
             }
         }
 
@@ -929,14 +945,11 @@ mod test {
         },
     };
 
-    use crate::{
-        Options,
-        types::{
-            data::{Key, Record, Value, Ver},
-            node::Node,
-            refbox::{BoxRef, BoxView, DeltaView},
-            traits::{IAlloc, IHeader, IInlineSize, ILoader},
-        },
+    use crate::types::{
+        data::{Key, Record, Value, Ver},
+        node::Node,
+        refbox::{BoxRef, BoxView, DeltaView},
+        traits::{IAlloc, IHeader, IInlineSize, ILoader},
     };
 
     struct AInner {
@@ -981,7 +994,7 @@ mod test {
             64 << 20
         }
 
-        fn recycle(&mut self, _p: &[u64]) {}
+        fn collect(&mut self, _addr: &[u64]) {}
     }
 
     impl IInlineSize for A {
@@ -1009,6 +1022,7 @@ mod test {
     fn leaf_iter() {
         let mut a = A::new();
         let txid = AtomicU64::new(1);
+        const CONSOLIDATE_THRESHOLD: usize = 64;
 
         {
             let l = a.clone();
@@ -1057,7 +1071,7 @@ mod test {
             node = node.insert(delta.view().as_delta());
             node.save(delta);
 
-            if node.delta_len() >= Options::CONSOLIDATE_THRESHOLD {
+            if node.delta_len() >= CONSOLIDATE_THRESHOLD {
                 node = node.compact(&mut a, 3, true);
             }
         }
@@ -1071,7 +1085,7 @@ mod test {
             node = node.insert(delta.view().as_delta());
             node.save(delta);
 
-            if node.delta_len() >= Options::CONSOLIDATE_THRESHOLD {
+            if node.delta_len() >= CONSOLIDATE_THRESHOLD {
                 node = node.compact(&mut a, 3, true);
             }
         }
@@ -1085,7 +1099,7 @@ mod test {
             node = node.insert(delta.view().as_delta());
             node.save(delta);
 
-            if node.delta_len() >= Options::CONSOLIDATE_THRESHOLD {
+            if node.delta_len() >= CONSOLIDATE_THRESHOLD {
                 node = node.compact(&mut a, 3, true);
             }
         }

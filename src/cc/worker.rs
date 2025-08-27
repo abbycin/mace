@@ -5,25 +5,27 @@ use std::{
     sync::{
         Arc,
         atomic::{
-            AtomicU64, AtomicUsize,
+            AtomicU64,
             Ordering::{Relaxed, Release},
         },
     },
 };
 
-use super::{cc::ConcurrencyControl, context::Context, log::Logging, wal::WalReader};
-use crate::utils::unpack_id;
-use crate::utils::{
-    Handle,
-    data::{Meta, WalDescHandle},
+use super::{cc::ConcurrencyControl, context::Context, log::Logging};
+use crate::{
+    cc::wal::Location,
+    utils::{NEXT_ID, options::ParsedOptions, pack_id, unpack_id},
 };
-use crate::{cc::wal::Location, utils::options::ParsedOptions};
-use crate::{index::tree::Tree, map::buffer::Buffers, utils::block::Block};
+use crate::{
+    cc::wal::WalReader,
+    utils::data::{Meta, WalDescHandle},
+};
+use crate::{index::tree::Tree, utils::block::Block};
 use crossbeam_epoch::Guard;
 
 pub struct Worker {
     pub cc: ConcurrencyControl,
-    pub ckpt_cnt: Arc<AtomicUsize>,
+    pub start_ckpt: AtomicU64,
     pub tx_id: AtomicU64,
     // a copy of tx_id not shared among threads
     pub start_ts: u64,
@@ -33,20 +35,14 @@ pub struct Worker {
 }
 
 impl Worker {
-    fn new(
-        desc: WalDescHandle,
-        meta: Arc<Meta>,
-        opt: Arc<ParsedOptions>,
-        buffer: Handle<Buffers>,
-    ) -> Self {
-        let cnt = Arc::new(AtomicUsize::new(0));
+    fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<ParsedOptions>) -> Self {
         Self {
             cc: ConcurrencyControl::new(opt.workers),
-            ckpt_cnt: cnt.clone(),
+            start_ckpt: AtomicU64::new(pack_id(NEXT_ID, 0)),
             tx_id: AtomicU64::new(0),
             start_ts: 0,
             id: desc.worker,
-            logging: Logging::new(cnt, desc, meta, opt, buffer),
+            logging: Logging::new(desc, meta, opt),
             modified: false,
         }
     }
@@ -73,13 +69,8 @@ impl Default for SyncWorker {
 }
 
 impl SyncWorker {
-    pub fn new(
-        desc: WalDescHandle,
-        meta: Arc<Meta>,
-        opt: Arc<ParsedOptions>,
-        buffer: Handle<Buffers>,
-    ) -> Self {
-        let w = Box::new(Worker::new(desc, meta, opt, buffer));
+    pub fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<ParsedOptions>) -> Self {
+        let w = Box::new(Worker::new(desc, meta, opt));
         Self {
             w: Box::into_raw(w),
         }
@@ -91,9 +82,11 @@ impl SyncWorker {
 
     fn init(&mut self, ctx: &Context, start_ts: u64, read_only: bool) {
         let id = self.id;
-        self.ckpt_cnt.store(0, Relaxed);
+        self.start_ckpt.store(0, Relaxed);
         self.tx_id.store(start_ts, Relaxed);
         self.start_ts = start_ts;
+        self.logging.reset_ckpt_cnt();
+        self.start_ckpt.store(self.logging.last_ckpt(), Relaxed);
         self.cc.global_wmk_tx.store(ctx.wmk_oldest(), Relaxed);
         if !read_only {
             self.cc.commit_tree.compact(ctx, id);
@@ -115,6 +108,7 @@ impl SyncWorker {
         let mut ms = *self;
         let w = ms.deref_mut();
         let txid = w.tx_id.load(Relaxed);
+        w.tx_id.store(0, Release); // sync with cc
 
         if !w.modified {
             w.logging.record_commit(txid);
@@ -124,8 +118,6 @@ impl SyncWorker {
         let commit_ts = ctx.alloc_oracle();
         w.cc.commit_tree.append(txid, commit_ts);
         w.cc.latest_cts.store(commit_ts, Relaxed);
-
-        w.tx_id.store(0, Release); // sync with cc
 
         w.logging.record_commit(txid);
         w.cc.collect_wmk(ctx);
@@ -137,6 +129,7 @@ impl SyncWorker {
         let mut ms = *self;
         let w = ms.deref_mut();
         let txid = w.tx_id.load(Relaxed);
+        w.tx_id.store(0, Release); // sync with cc
         if !w.modified {
             w.logging.record_abort(txid);
             return;
@@ -158,7 +151,6 @@ impl SyncWorker {
         // don't update CommitTree, then foo is not visible to any other worker except worker 2
         let commit_ts = ctx.alloc_oracle();
         w.cc.commit_tree.append(txid, commit_ts);
-        w.tx_id.store(0, Release); // sync with cc
         w.cc.latest_cts.store(commit_ts, Relaxed);
         w.cc.collect_wmk(ctx);
         w.logging.stabilize();

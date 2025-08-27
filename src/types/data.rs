@@ -409,10 +409,6 @@ where
             self.data.to_string()
         )
     }
-
-    fn data(&self) -> &[u8] {
-        self.data.data()
-    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -672,10 +668,6 @@ impl IValCodec for Record {
             self.worker_id(),
             to_str(self.data)
         )
-    }
-
-    fn data(&self) -> &[u8] {
-        self.data
     }
 }
 

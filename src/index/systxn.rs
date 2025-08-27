@@ -8,6 +8,8 @@ use crate::utils::Handle;
 use crate::utils::data::JUNK_LEN;
 use crate::{Store, index::Page};
 use crossbeam_epoch::Guard;
+#[cfg(feature = "metric")]
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 pub struct SysTxn<'a> {
     pub store: &'a Store,
@@ -37,11 +39,15 @@ impl<'a> SysTxn<'a> {
         while let Some((a, _)) = self.allocs.pop() {
             a.dec_ref();
         }
+
+        let mut garbage: Vec<u64> = Vec::new();
+        std::mem::swap(&mut garbage, &mut self.garbage);
+        self.recycle(&garbage);
         if !self.garbage.is_empty() {
             self.apply_junk();
         }
+
         self.pinned.clear();
-        self.store.buffer.flush_arena();
     }
 
     pub fn pin(&mut self, p: Page) {
@@ -49,6 +55,11 @@ impl<'a> SysTxn<'a> {
     }
 
     pub fn alloc(&mut self, size: usize) -> BoxRef {
+        #[cfg(feature = "metric")]
+        {
+            G_ALLOC_STATUS.total_alloc_size.fetch_add(size, Relaxed);
+            G_ALLOC_STATUS.total_allocs.fetch_add(1, Relaxed);
+        }
         let (h, t) = self.store.buffer.alloc(size as u32).expect("never happen");
         self.allocs.push((h, t.view()));
         t
@@ -71,17 +82,11 @@ impl<'a> SysTxn<'a> {
         h.flag = TagFlag::Unmap;
         h.pid = pid;
 
-        self.store
-            .page
-            .unmap(pid, p.swip())
-            .map(|_| {
-                p.garbage_collect(self);
-                self.store.buffer.evict(pid);
-                self.g.defer(move || p.reclaim());
-            })
-            .inspect_err(|_| {
-                h.flag = TagFlag::TombStone;
-            })
+        self.store.page.unmap(pid, p.swip()).map(|_| {
+            p.garbage_collect(self);
+            self.store.buffer.evict(pid);
+            self.g.defer(move || p.reclaim());
+        })
     }
 
     fn apply_junk(&mut self) {
@@ -129,31 +134,6 @@ impl<'a> SysTxn<'a> {
             .map(|_| self.g.defer(move || old.reclaim()))
             .map_err(|_| OpCode::Again)
     }
-}
-
-impl Drop for SysTxn<'_> {
-    fn drop(&mut self) {
-        while let Some((pid, swip)) = self.maps.pop() {
-            // the pid is not publish yet, so the unmap here will always succeed
-            self.store.page.unmap(pid, swip).expect("never happen");
-        }
-
-        while let Some((a, mut v)) = self.allocs.pop() {
-            v.flag = TagFlag::TombStone;
-            a.dec_ref();
-        }
-        self.store.buffer.flush_arena();
-
-        while let Some(p) = self.pinned.pop() {
-            p.reclaim();
-        }
-    }
-}
-
-impl IAlloc for SysTxn<'_> {
-    fn allocate(&mut self, size: usize) -> BoxRef {
-        self.alloc(size)
-    }
 
     /// a small optimization, when address is currently in an active arena, we can mark it as TombStone
     /// so that it will NOT be flushed to data file, or else the address will be used by GC to reclaim
@@ -165,6 +145,41 @@ impl IAlloc for SysTxn<'_> {
             self.garbage.push(addr);
         });
     }
+}
+
+impl Drop for SysTxn<'_> {
+    fn drop(&mut self) {
+        while let Some((pid, swip)) = self.maps.pop() {
+            // the pid is not publish yet, so the unmap here will always succeed
+            self.store.page.unmap(pid, swip).expect("never happen");
+        }
+
+        while let Some((a, b)) = self.allocs.pop() {
+            let h = b.header();
+            #[cfg(feature = "metric")]
+            {
+                G_ALLOC_STATUS
+                    .dealloc_size
+                    .fetch_add(h.total_size as usize, Relaxed);
+                G_ALLOC_STATUS.deallocs.fetch_add(1, Relaxed);
+            }
+            a.dealloc(h.addr, h.total_size as usize);
+            a.dec_ref();
+        }
+        while let Some(p) = self.pinned.pop() {
+            p.reclaim();
+        }
+    }
+}
+
+impl IAlloc for SysTxn<'_> {
+    fn allocate(&mut self, size: usize) -> BoxRef {
+        self.alloc(size)
+    }
+
+    fn collect(&mut self, addr: &[u64]) {
+        self.garbage.extend_from_slice(addr);
+    }
 
     fn arena_size(&mut self) -> u32 {
         self.store.opt.data_file_size
@@ -175,4 +190,26 @@ impl IInlineSize for SysTxn<'_> {
     fn inline_size(&self) -> u32 {
         self.store.opt.max_inline_size
     }
+}
+
+#[cfg(feature = "metric")]
+#[derive(Debug)]
+pub struct AllocStatus {
+    total_alloc_size: AtomicUsize,
+    total_allocs: AtomicUsize,
+    dealloc_size: AtomicUsize,
+    deallocs: AtomicUsize,
+}
+
+#[cfg(feature = "metric")]
+static G_ALLOC_STATUS: AllocStatus = AllocStatus {
+    total_alloc_size: AtomicUsize::new(0),
+    total_allocs: AtomicUsize::new(0),
+    dealloc_size: AtomicUsize::new(0),
+    deallocs: AtomicUsize::new(0),
+};
+
+#[cfg(feature = "metric")]
+pub fn g_alloc_status() -> &'static AllocStatus {
+    &G_ALLOC_STATUS
 }

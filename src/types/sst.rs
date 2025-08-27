@@ -58,7 +58,7 @@ where
     K: Ord + ICodec,
     V: ICodec,
 {
-    fn get_remote<L>(l: &L, addr: u64) -> (K, V, RemoteView)
+    fn get_remote<L>(l: &L, addr: u64) -> (K, V, Option<RemoteView>)
     where
         L: ILoader,
     {
@@ -66,7 +66,7 @@ where
         let data = p.raw_mut();
         let k = K::decode_from(data);
         let v = V::decode_from(&data[k.packed_size()..]);
-        (k, v, p)
+        (k, v, Some(p))
     }
 
     pub(crate) fn key_at<L>(&self, l: &L, pos: usize) -> K
@@ -84,7 +84,7 @@ where
         }
     }
 
-    pub(crate) fn get_unchecked<L>(&self, l: &L, pos: usize) -> (K, V, RemoteView)
+    pub(crate) fn get_unchecked<L>(&self, l: &L, pos: usize) -> (K, V, Option<RemoteView>)
     where
         L: ILoader,
     {
@@ -94,7 +94,7 @@ where
         if s.is_inline() {
             let k = K::decode_from(&raw[Slot::LOCAL_LEN..]);
             let v = V::decode_from(&raw[Slot::LOCAL_LEN + k.packed_size()..]);
-            (k, v, RemoteView::null())
+            (k, v, None)
         } else {
             Self::get_remote(l, s.addr())
         }
@@ -106,6 +106,7 @@ where
         F: Fn(&K, &K) -> Ordering,
     {
         let h = self.header();
+        debug_assert!(h.elems > 0);
         let rk = key.remove_prefix(h.prefix_len as usize);
         let (mut lo, mut hi) = (0, h.elems as usize);
 

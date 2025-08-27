@@ -128,10 +128,9 @@ impl Mapping {
         let (id, _) = unpack_id(addr);
         let lk = self.map.read().unwrap();
         let Some(&file_id) = lk.get(&id) else {
-            log::error!("==>> {:?}", unpack_id(addr));
-            panic!("xxx");
+            log::error!("can't get physical id by {:?}", unpack_id(addr));
+            panic!("can't get physical id by logical id {id}");
         };
-        // let file_id = *lk.get(&id).unwrap();
 
         loop {
             if let Some(r) = self.cache.get(file_id as u64) {
@@ -149,7 +148,7 @@ impl Mapping {
     fn get_reloc(&self, file_id: u32, key: u64) -> Reloc {
         loop {
             if let Some(x) = self.cache.get(file_id as u64) {
-                return *x.map.get(&key).unwrap();
+                return *x.map.get(&key).expect("never happen");
             }
 
             let mut cnt: usize = 0;

@@ -98,24 +98,31 @@ impl Drop for StatHandle {
 }
 
 pub(crate) struct FlushData {
-    id: u32,
-    pub(crate) iter: ArenaIter,
+    arena: Handle<Arena>,
     cb: Box<dyn FnOnce()>,
 }
 
 unsafe impl Send for FlushData {}
 
 impl FlushData {
-    pub fn new(id: u32, iter: ArenaIter, cb: Box<dyn FnOnce()>) -> Self {
-        Self { id, iter, cb }
+    pub fn new(arena: Handle<Arena>, cb: Box<dyn FnOnce()>) -> Self {
+        Self { arena, cb }
     }
 
     pub fn id(&self) -> u32 {
-        self.id
+        self.arena.id()
     }
 
     pub fn mark_done(self) {
         (self.cb)()
+    }
+}
+
+impl Deref for FlushData {
+    type Target = Arena;
+
+    fn deref(&self) -> &Self::Target {
+        &self.arena
     }
 }
 
@@ -126,11 +133,11 @@ pub(crate) struct Arena {
     id: Cell<u32>,
     pub(crate) flsn: AtomicU32,
     real_size: AtomicU64,
+    // pack file_id and seq
     offset: AtomicU64,
-    mutref: AtomicU16,
     cap: u32,
+    refs: AtomicU16,
     pub(crate) state: AtomicU8,
-    dirty: AtomicU8,
 }
 
 impl Deref for Arena {
@@ -138,26 +145,6 @@ impl Deref for Arena {
 
     fn deref(&self) -> &Self::Target {
         &self.items
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ArenaIter {
-    arena: Handle<Arena>,
-}
-
-impl ArenaIter {
-    pub(crate) fn new(raw: *mut Arena) -> Self {
-        Self {
-            arena: Handle::from(raw),
-        }
-    }
-}
-
-impl Deref for ArenaIter {
-    type Target = DashMap<u64, BoxRef>;
-    fn deref(&self) -> &Self::Target {
-        &self.arena.items
     }
 }
 
@@ -171,42 +158,37 @@ impl Arena {
     /// flushed to disk
     pub(crate) const FLUSH: u8 = 1;
 
-    const FRESH: u8 = 0;
-    const STALE: u8 = 1;
-    const DIRTY: u8 = 2;
-
     pub(crate) fn new(cap: u32) -> Self {
         Self {
             items: DashMap::with_capacity(16 << 10),
             flsn: AtomicU32::new(0),
             id: Cell::new(INVALID_ID),
-            mutref: AtomicU16::new(0),
+            refs: AtomicU16::new(0),
             offset: AtomicU64::new(0),
             real_size: AtomicU64::new(0),
             cap,
             state: AtomicU8::new(Self::FLUSH),
-            dirty: AtomicU8::new(Self::FRESH),
         }
     }
 
-    pub(crate) fn reset(&self, id: u32, flsn: u32) {
+    pub(crate) fn reset(&self, id: u32) {
         self.id.set(id);
-        self.flsn.store(flsn, Relaxed);
-        self.dirty.store(Self::FRESH, Relaxed);
-        assert_eq!(self.state(), Self::HOT);
+        assert_eq!(self.state(), Self::FLUSH);
+        self.set_state(Arena::FLUSH, Arena::HOT);
         self.offset.store(0, Relaxed);
         self.items.clear();
         self.real_size.store(0, Relaxed);
-
-        #[cfg(feature = "extra_check")]
-        {
-            assert!(self.unref());
-            assert!(self.balanced());
-        }
+        assert!(self.unref());
     }
 
     pub(crate) fn cap(&self) -> u32 {
         self.cap
+    }
+
+    pub(crate) fn sizes(&self) -> (u64, u64) {
+        let x = self.real_size.load(Relaxed);
+        let y = self.offset.load(Relaxed);
+        (x, y)
     }
 
     fn alloc_size(&self, size: u32) -> Result<u32, OpCode> {
@@ -228,7 +210,7 @@ impl Arena {
 
             match self.real_size.compare_exchange(cur, new, AcqRel, Acquire) {
                 Ok(_) => {
-                    let off = self.offset.fetch_add(size as u64, Relaxed);
+                    let off = self.offset.fetch_add(1_u64, Relaxed);
                     if off >= u32::MAX as u64 {
                         return Err(OpCode::NeedMore);
                     }
@@ -253,8 +235,10 @@ impl Arena {
         Ok(self.alloc_at(offset, size))
     }
 
-    pub(crate) fn used(&self) -> ArenaIter {
-        ArenaIter::new(self as *const Self as *mut _)
+    pub(crate) fn dealloc(&self, addr: u64, len: usize) {
+        if self.items.remove(&addr).is_some() {
+            self.real_size.fetch_sub(len as u64, AcqRel);
+        }
     }
 
     #[inline]
@@ -264,8 +248,6 @@ impl Arena {
     }
 
     pub(crate) fn set_state(&self, cur: u8, new: u8) -> u8 {
-        // we don't care if it's success, what we want is the `dirty` flag either be STALE or DIRTY
-        self.set_dirty(Self::FRESH, Self::STALE);
         self.state
             .compare_exchange(cur, new, AcqRel, Acquire)
             .unwrap_or_else(|x| x)
@@ -273,14 +255,6 @@ impl Arena {
 
     pub(crate) fn state(&self) -> u8 {
         self.state.load(Relaxed)
-    }
-
-    fn set_dirty(&self, cur: u8, new: u8) {
-        let _ = self.dirty.compare_exchange(cur, new, Relaxed, Relaxed);
-    }
-
-    pub(crate) fn mark_dirty(&self) {
-        self.set_dirty(Self::FRESH, Self::DIRTY);
     }
 
     /// we can't remove entry, althrough it has performance boostup, but it may cause further lookup
@@ -294,30 +268,26 @@ impl Arena {
             let h = x.value_mut().header_mut();
             h.flag = TagFlag::TombStone;
             let old = self.real_size.fetch_sub(h.total_size as u64, AcqRel);
-            debug_assert!(old >= h.total_size as u64);
+            #[cfg(feature = "extra_check")]
+            assert!(old >= h.total_size as u64);
             true
         } else {
             false
         }
     }
 
-    pub(crate) fn is_dirty(&self) -> bool {
-        self.dirty.load(Relaxed) == Self::DIRTY
-    }
-
     pub(crate) fn inc_ref(&self) {
-        self.mutref.fetch_add(1, Relaxed);
+        self.refs.fetch_add(1, Relaxed);
     }
 
     pub(crate) fn dec_ref(&self) {
-        self.mutref.fetch_sub(1, Relaxed);
+        self.refs.fetch_sub(1, Relaxed);
     }
 
     pub(crate) fn unref(&self) -> bool {
-        self.mutref.load(Relaxed) == 0
+        self.refs.load(Relaxed) == 0
     }
 
-    #[inline(always)]
     pub(crate) fn id(&self) -> u32 {
         self.id.get()
     }
@@ -757,24 +727,26 @@ impl MapBuilder {
         }
     }
 
+    fn add_impl(&mut self, pid: u64, addr: u64, is_unmap: bool) {
+        let id = pid_to_fid(pid);
+        match self.tables.entry(id) {
+            Entry::Occupied(ref mut x) => x.get_mut().add(pid, addr),
+            Entry::Vacant(x) => {
+                let mut table = PageTable::default();
+                table.add(pid, if is_unmap { NULL_ADDR } else { addr });
+                let _ = x.insert(table);
+            }
+        }
+    }
+
     pub(crate) fn add(&mut self, f: &BoxRef) {
         let h = f.header();
         match h.flag {
             TagFlag::Normal => {
-                let id = pid_to_fid(h.pid);
-                match self.tables.entry(id) {
-                    Entry::Occupied(ref mut x) => x.get_mut().add(h.pid, h.addr),
-                    Entry::Vacant(x) => {
-                        let mut table = PageTable::default();
-                        table.add(h.pid, h.addr);
-                        let _ = x.insert(table);
-                    }
-                }
+                self.add_impl(h.pid, h.addr, false);
             }
             TagFlag::Unmap => {
-                let id = pid_to_fid(h.pid);
-                let table = self.tables.get_mut(&id).expect("must exist");
-                table.add(h.pid, NULL_ADDR);
+                self.add_impl(h.pid, h.addr, true);
             }
             TagFlag::Sibling => {
                 assert_eq!(h.pid, NULL_PID);

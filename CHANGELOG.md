@@ -1,12 +1,36 @@
+## [0.0.11] 2025-08-27
+### Changes
+- Add new evictor thread compact node on cache evict and randomly pick active node for compaction
+- Change `consolidate_threshold`'s maximum value to `split_elems`
+- Create `SysTxn` when it's necessary
+- Add `Mutex` to each node which 
+   - mitigate multi-threaded contention in both compaction and SMO
+   - reduce wasted memory allocation 
+   - remove check in `Node::insert_index` which is unnecessary now
+- Move node compact in `Tree::link` to `Tree::try_find_leaf` which mitigate multi-threaded contention
+
+### Bug fixes
+- Fix `upsert`
+- Enable missing node cache warm up when cache hits
+- Fix GC remove WALs that still in use
+- Fix duplicated garbage collection in `merge_node`
+- Fix `MapBuilder:add`'s assert which is possible in some case
+- Fix `Node::search_sst`'s assert which is possible in some case
+
+
 ## [0.0.10] 2025-08-10
 ### New Features
 - Support prefix encoding
 
 ### Changes
+- Dynamic arena allocation
 - Removed all xxRef except BoxRef
 - Unified BoxRef management, which greatly reduces the occurrence of cloning, especially in ImTree
 - Disabled cc compact for read-only txn
 - Replaced the `Queue` implementation to improve concurrency 
+
+### Bug fixes
+- Atomic `upsert`
 
 ## [0.0.9] 2025-08-03
 ### Changes

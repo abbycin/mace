@@ -13,7 +13,6 @@ fn upsert_delete() {
     opt.gc_timeout = 1000;
     opt.gc_ratio = 10;
     opt.wal_file_size = 32 << 20;
-    opt.consolidate_threshold = 16;
 
     let db = Mace::new(opt.validate().unwrap()).unwrap();
     let mut rng = rand::thread_rng();
@@ -61,8 +60,7 @@ fn upsert_delete() {
 #[test]
 fn big_kv() {
     let path = RandomPath::new();
-    let mut opt = Options::new(&*path);
-    opt.consolidate_threshold = 3;
+    let opt = Options::new(&*path);
     let mut saved = opt.clone();
     let db = Mace::new(opt.validate().unwrap()).unwrap();
     const N: usize = 200;
@@ -111,7 +109,6 @@ fn big_kv() {
 fn big_kv2() {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.consolidate_threshold = 3;
     opt.wal_buffer_size = 1024;
     opt.data_file_size = 4096;
     let mut saved = opt.clone();

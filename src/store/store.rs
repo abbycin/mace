@@ -1,7 +1,7 @@
 use crate::cc::context::Context;
-use crate::map::Mapping;
 use crate::map::buffer::Buffers;
 use crate::map::table::PageMap;
+use crate::map::{Mapping, create_buffer};
 use crate::utils::data::{Meta, WalDescHandle};
 use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, NULL_PID};
@@ -24,15 +24,9 @@ impl Store {
         desc: &[WalDescHandle],
     ) -> Result<Self, OpCode> {
         let page = Arc::new(page);
-        let buffer = Handle::new(Buffers::new(
-            page.clone(),
-            opt.clone(),
-            meta.clone(),
-            mapping,
-        )?);
         Ok(Self {
-            buffer,
-            context: Context::new(opt.clone(), buffer, meta, desc),
+            buffer: create_buffer(page.clone(), opt.clone(), meta.clone(), mapping)?,
+            context: Context::new(opt.clone(), meta, desc),
             page,
             opt,
         })

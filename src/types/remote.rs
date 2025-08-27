@@ -1,5 +1,3 @@
-use std::ptr::null_mut;
-
 use crate::types::{
     header::{RemoteHeader, TagKind},
     refbox::{BoxRef, RemoteView},
@@ -12,15 +10,6 @@ impl RemoteView {
         p.header_mut().kind = TagKind::Remote;
         p.view().as_remote().header_mut().size = size;
         p
-    }
-
-    pub fn null() -> Self {
-        Self(null_mut())
-    }
-
-    /// in case deref to remoteview cause null pointer dereference
-    pub fn is_null(&self) -> bool {
-        self.0.is_null()
     }
 
     pub fn raw<'a>(&self) -> &'a [u8] {

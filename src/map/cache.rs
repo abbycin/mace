@@ -1,6 +1,6 @@
 use dashmap::{DashMap, Entry};
-use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+use std::sync::atomic::{AtomicIsize, AtomicU32};
 
 use crate::utils::rand_range;
 
@@ -18,20 +18,32 @@ impl From<u32> for CacheState {
     }
 }
 
-#[derive(Clone, Copy)]
 struct CacheItem {
-    state: u32,
+    state: AtomicU32,
     size: isize,
 }
 
 impl CacheItem {
-    fn warm(&mut self) {
-        self.state = (self.state + 1).max(CacheState::Hot as u32);
+    fn warm(&self) {
+        let cur = self.state.load(Relaxed);
+        let _ = self.state.compare_exchange(
+            cur,
+            (cur + 1).min(CacheState::Hot as u32),
+            Relaxed,
+            Relaxed,
+        );
     }
 
     fn cool(&mut self) -> CacheState {
-        self.state = self.state.saturating_sub(1);
-        self.state.into()
+        let cur = self.state.load(Relaxed);
+        self.state
+            .compare_exchange(cur, cur.saturating_sub(1), Relaxed, Relaxed)
+            .unwrap_or_else(|x| x)
+            .into()
+    }
+
+    fn status(&self) -> CacheState {
+        self.state.load(Relaxed).into()
     }
 }
 
@@ -56,6 +68,10 @@ impl NodeCache {
         self.used.load(Relaxed) >= self.cap
     }
 
+    pub(crate) fn almost_full(&self) -> bool {
+        self.used.load(Relaxed) >= self.cap * 100 / 80
+    }
+
     pub(crate) fn put(&self, pid: u64, state: u32, size: isize) {
         let e = self.map.entry(pid);
         match e {
@@ -67,8 +83,17 @@ impl NodeCache {
             }
             Entry::Vacant(v) => {
                 self.used.fetch_add(size, AcqRel);
-                v.insert(CacheItem { state, size });
+                v.insert(CacheItem {
+                    state: AtomicU32::new(state),
+                    size,
+                });
             }
+        }
+    }
+
+    pub(crate) fn warm(&self, pid: u64) {
+        if let Some(v) = self.map.get(&pid) {
+            v.warm();
         }
     }
 
@@ -95,9 +120,25 @@ impl NodeCache {
         pids
     }
 
-    pub(crate) fn reclaim<F>(&self, f: F)
+    pub(crate) fn compact(&self) -> Vec<u64> {
+        let mut pids = Vec::new();
+        let mut count = self.pct * self.cap / 100;
+
+        for i in self.map.iter() {
+            if count == 0 {
+                break;
+            }
+            count -= 1;
+            if rand_range(0..100) > self.pct as usize && i.status() > CacheState::Cool {
+                pids.push(*i.key());
+            }
+        }
+        pids
+    }
+
+    pub(crate) fn reclaim<F>(&self, mut f: F)
     where
-        F: Fn(u64),
+        F: FnMut(u64),
     {
         self.map.iter().for_each(|x| f(*x.key()));
     }

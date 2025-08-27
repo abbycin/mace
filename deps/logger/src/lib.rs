@@ -217,7 +217,7 @@ impl Logger {
         self.abort_on_error.load(Relaxed)
     }
 
-    fn lock(&self) -> MutexGuard<()> {
+    fn lock(&'_ self) -> MutexGuard<'_, ()> {
         self.mtx_shard[get_tid() as usize & (self.mtx_shard.len() - 1)]
             .lock()
             .unwrap()

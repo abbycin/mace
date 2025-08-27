@@ -152,6 +152,7 @@ fn rollback() {
     let workers = 12;
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
+    opts.sync_on_write = false;
     opts.workers = workers as usize;
     let db = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10000;
@@ -241,7 +242,6 @@ fn range_simple() -> Result<(), OpCode> {
 
     {
         let mut opts = Options::new(&*RandomPath::new());
-        opts.consolidate_threshold = 10;
         opts.tmp_store = true;
         let db = Mace::new(opts.validate().unwrap()).unwrap();
 
@@ -263,7 +263,6 @@ fn range_simple() -> Result<(), OpCode> {
 #[test]
 fn range_in_one_node() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
-    opts.consolidate_threshold = 10;
     opts.tmp_store = true;
     let db = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10;
@@ -333,8 +332,7 @@ fn range_in_one_node() -> Result<(), OpCode> {
 #[test]
 fn range_cross_node() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
-    opts.consolidate_threshold = 8;
-    opts.split_elem = 128; // force split
+    opts.split_elems = 128; // force split
     opts.sync_on_write = false;
     opts.tmp_store = true;
     let db = Mace::new(opts.validate().unwrap()).unwrap();

@@ -19,6 +19,9 @@ mod utils;
 mod types;
 pub use index::ValRef;
 
+#[cfg(feature = "metric")]
+use crate::index::{g_alloc_status, g_cas_status};
+
 struct Inner {
     store: Arc<Store>,
     meta: Arc<Meta>,
@@ -29,6 +32,10 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        #[cfg(feature = "metric")]
+        log::info!("\n{:#?}", g_alloc_status());
+        #[cfg(feature = "metric")]
+        log::info!("\n{:#?}", g_cas_status());
         self.gc.quit();
         self.store.quit();
         self.meta.sync(self.store.opt.meta_file(), true);
@@ -78,11 +85,11 @@ impl Mace {
         })
     }
 
-    pub fn begin(&self) -> Result<TxnKV, OpCode> {
+    pub fn begin(&'_ self) -> Result<TxnKV<'_>, OpCode> {
         TxnKV::new(&self.inner.store.context, &self.inner.tree)
     }
 
-    pub fn view(&self) -> Result<TxnView, OpCode> {
+    pub fn view(&'_ self) -> Result<TxnView<'_>, OpCode> {
         TxnView::new(&self.inner.store.context, &self.inner.tree)
     }
 

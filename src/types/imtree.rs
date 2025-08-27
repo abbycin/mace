@@ -865,11 +865,11 @@ impl<'a, K, T> Iterator for RangeIter<'a, K, T> {
             self.cursor.peek()
         };
 
-        if let Some(x) = next.as_ref() {
-            if !(self.equal)(x, &self.key) {
-                self.runout = true;
-                return None;
-            }
+        if let Some(x) = next.as_ref()
+            && !(self.equal)(x, &self.key)
+        {
+            self.runout = true;
+            return None;
         }
 
         next
@@ -902,9 +902,7 @@ mod test {
             BoxRef::alloc(size as u32, addr)
         }
 
-        fn recycle(&mut self, _p: &[u64]) {
-            unimplemented!()
-        }
+        fn collect(&mut self, _addr: &[u64]) {}
 
         fn arena_size(&mut self) -> u32 {
             1 << 20

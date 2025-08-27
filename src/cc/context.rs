@@ -1,6 +1,4 @@
 use crate::OpCode;
-use crate::map::buffer::Buffers;
-use crate::utils::Handle;
 use crate::utils::data::{Meta, WalDescHandle};
 use crate::utils::options::ParsedOptions;
 use crate::utils::queue::Queue;
@@ -19,12 +17,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(
-        opt: Arc<ParsedOptions>,
-        buffer: Handle<Buffers>,
-        meta: Arc<Meta>,
-        desc: &[WalDescHandle],
-    ) -> Self {
+    pub fn new(opt: Arc<ParsedOptions>, meta: Arc<Meta>, desc: &[WalDescHandle]) -> Self {
         let cores = opt.workers;
         // NOTE: the elements of desc were ordered by worker id
         assert_eq!(cores, desc.len());
@@ -32,7 +25,7 @@ impl Context {
         // queue elems must > 1, when worker is 1, the next_power_of_two is 1 too, so we plus 1 here
         let active_workers = Queue::new((cores + 1).next_power_of_two());
         for i in desc.iter() {
-            let x = SyncWorker::new(i.clone(), meta.clone(), opt.clone(), buffer);
+            let x = SyncWorker::new(i.clone(), meta.clone(), opt.clone());
             w.push(x);
         }
 

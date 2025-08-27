@@ -15,7 +15,10 @@ fn bench() {
     let mut pair = Vec::with_capacity(cap);
 
     for i in 0..cap {
-        pair.push(format!("{i:08}"));
+        // let mut tmp = format!("key_{i}").into_bytes();
+        // tmp.resize(1024, b'x');
+        let tmp = format!("{i:08}");
+        pair.push(tmp);
     }
 
     let b = Instant::now();

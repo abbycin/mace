@@ -1,25 +1,21 @@
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicPtr, AtomicU32},
-    },
+use std::sync::{
+    Arc,
+    atomic::AtomicPtr,
+    mpsc::{Receiver, Sender},
 };
 
 use crate::{
     OpCode,
-    map::{data::Arena, table::Swip},
+    map::{SharedState, data::Arena, table::Swip},
     types::{
         page::Page,
         refbox::BoxView,
         traits::{IHeader, IInlineSize, ILoader},
     },
     utils::{
-        Handle, INIT_ORACLE, INVALID_ID, MutRef, NULL_ID, data::Meta, options::ParsedOptions,
-        queue::Queue,
+        Handle, INVALID_ID, MutRef, NULL_ID, data::Meta, options::ParsedOptions, queue::Queue,
     },
 };
-use crossbeam_epoch::Guard;
 use dashmap::{DashMap, Entry};
 
 use super::{cache::CacheState, data::FlushData, flush::Flush, load::Mapping};
@@ -28,7 +24,7 @@ use crate::map::table::PageMap;
 use crate::types::refbox::BoxRef;
 use crate::utils::lru::Lru;
 use crate::utils::unpack_id;
-use std::sync::atomic::Ordering::{Relaxed, Release};
+use std::sync::atomic::Ordering::Relaxed;
 
 struct Pool {
     flush: Flush,
@@ -36,16 +32,13 @@ struct Pool {
     free: Arc<Queue<Handle<Arena>>>,
     /// contains all non-HOT arena
     wait: Arc<DashMap<u32, Handle<Arena>>>,
-    /// queue of arena ordered by id, for flush only
-    que: Mutex<VecDeque<Handle<Arena>>>,
     /// currently HOT arena
     cur: AtomicPtr<Arena>,
     meta: Arc<Meta>,
-    flsn: AtomicU32,
 }
 
 impl Pool {
-    const NR_MAX_ARENA: u32 = 32; // must be power of 2
+    const INIT_ARENA: u32 = 16; // must be power of 2
 
     fn new(
         opt: Arc<ParsedOptions>,
@@ -53,8 +46,8 @@ impl Pool {
         meta: Arc<Meta>,
     ) -> Result<Pool, OpCode> {
         let id = Self::get_id(&meta)?;
-        let q = Queue::new(Self::NR_MAX_ARENA as usize);
-        for _ in 0..Self::NR_MAX_ARENA {
+        let q = Queue::new(Self::INIT_ARENA as usize);
+        for _ in 0..Self::INIT_ARENA {
             let h = Handle::new(Arena::new(opt.data_file_size));
             q.push(h).unwrap();
         }
@@ -62,17 +55,14 @@ impl Pool {
         let h = q.pop().unwrap();
 
         let this = Self {
-            flush: Flush::new(mapping),
+            flush: Flush::new(mapping, meta.clone()),
             free: Arc::new(q),
             wait: Arc::new(DashMap::new()),
-            que: Mutex::new(VecDeque::new()),
             cur: AtomicPtr::new(h.inner()),
             meta,
-            flsn: AtomicU32::new(INIT_ORACLE as u32),
         };
 
-        h.set_state(Arena::FLUSH, Arena::HOT);
-        h.reset(id, this.flsn.load(Relaxed));
+        h.reset(id);
         Ok(this)
     }
 
@@ -84,11 +74,6 @@ impl Pool {
             return Err(OpCode::DbFull);
         }
         Ok(id)
-    }
-
-    fn update_flsn(&self) {
-        self.flsn.fetch_add(1, Release);
-        self.try_flush();
     }
 
     fn current(&self) -> Handle<Arena> {
@@ -119,20 +104,14 @@ impl Pool {
     fn install_new(&self, cur: Handle<Arena>) -> Result<(), OpCode> {
         let id = Self::get_id(&self.meta)?;
         self.wait.insert(cur.id(), cur);
-        {
-            let mut lk = self.que.lock().unwrap();
-            lk.push_back(cur); // keep the allocattion order
-            drop(lk);
-            self.try_flush();
-        }
+        self.flush(cur);
 
         let p = if let Some(p) = self.free.pop() {
             p
         } else {
             Handle::new(Arena::new(cur.cap()))
         };
-        p.set_state(Arena::FLUSH, Arena::HOT);
-        p.reset(id, self.flsn.load(Relaxed));
+        p.reset(id);
 
         self.cur
             .compare_exchange(cur.inner(), p.inner(), Relaxed, Relaxed)
@@ -140,37 +119,8 @@ impl Pool {
         Ok(())
     }
 
-    fn try_flush(&self) -> bool {
-        let Ok(mut que) = self.que.try_lock() else {
-            return false;
-        };
-        let lsn = self.flsn.load(Relaxed);
-
-        while let Some(h) = que.pop_front() {
-            let ready = if h.is_dirty() {
-                // there're write txns, we must wait until log flushed, namely pool's flsn >
-                // arena's
-                lsn.wrapping_sub(h.flsn.load(Relaxed)) as i32 > 0
-            } else {
-                // no write happens
-                h.state() == Arena::WARM
-            };
-
-            if ready && h.unref() && h.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
-                self.flush(h);
-            } else {
-                que.push_front(h);
-                break;
-            }
-        }
-        true
-    }
-
     fn flush(&self, h: Handle<Arena>) {
-        assert_eq!(h.state(), Arena::COLD);
-
-        let id = h.id();
-        assert!(id > INVALID_ID);
+        assert!(h.id() > INVALID_ID);
         let wait = self.wait.clone();
         let free = self.free.clone();
 
@@ -186,43 +136,19 @@ impl Pool {
         let _ = self
             .flush
             .tx
-            .send(FlushData::new(id, h.used(), Box::new(cb)))
+            .send(FlushData::new(h, Box::new(cb)))
             .inspect_err(|x| {
                 log::error!("can't send flush data {x:?}");
                 std::process::abort();
             });
     }
 
-    fn flush_all(&self) {
-        let mut cnt = 0;
+    fn quit(&self) {
         let cur = self.current();
         self.wait.insert(cur.id(), cur);
-        let mut q: Vec<Handle<Arena>> = Vec::new();
-        self.wait.iter().for_each(|h| {
-            if matches!(h.state(), Arena::HOT | Arena::WARM) {
-                h.state.store(Arena::COLD, Relaxed);
-                q.push(*h);
-            }
-        });
-
-        q.sort_unstable_by_key(|x| x.id());
-        for h in q.iter() {
-            self.flush(*h);
-        }
-
-        let n = q.len();
-        while cnt != n {
-            cnt = 0;
-            for h in q.iter() {
-                if matches!(h.state(), Arena::FLUSH) {
-                    cnt += 1;
-                }
-            }
-        }
-    }
-
-    fn quit(&self) {
-        self.flush_all();
+        // cur may still hot
+        cur.set_state(Arena::HOT, Arena::WARM);
+        self.flush(cur);
         self.flush.quit();
         // arena in `free` has invalid id, so clean them individually
         while let Some(h) = self.free.pop() {
@@ -234,38 +160,45 @@ impl Pool {
     }
 }
 
-pub struct Buffers {
+pub(crate) struct Buffers {
     max_inline_size: u32,
     split_elems: u32,
     /// used for restrict in memory node count
-    cache: NodeCache,
+    cache: Arc<NodeCache>,
     table: Arc<PageMap>,
     /// second level cache, provide data for NodeCache
     remote: Handle<Lru<BoxRef>>,
     pool: Handle<Pool>,
     pub mapping: Handle<Mapping>,
+    tx: Sender<SharedState>,
+    rx: Receiver<()>,
 }
 
 impl Buffers {
-    pub fn new(
+    pub(crate) fn new(
         pagemap: Arc<PageMap>,
         opt: Arc<ParsedOptions>,
         meta: Arc<Meta>,
+        cache: Arc<NodeCache>,
         mapping: Mapping,
+        tx: Sender<SharedState>,
+        rx: Receiver<()>,
     ) -> Result<Self, OpCode> {
         let mapping = Handle::new(mapping);
         Ok(Self {
             max_inline_size: opt.max_inline_size,
-            split_elems: opt.split_elem as u32,
-            cache: NodeCache::new(opt.cache_capacity, opt.cache_evict_pct),
+            split_elems: opt.split_elems as u32,
+            cache,
             table: pagemap,
             remote: Handle::new(Lru::new(opt.cache_count)),
             pool: Handle::new(Pool::new(opt.clone(), mapping, meta)?),
             mapping,
+            tx,
+            rx,
         })
     }
 
-    pub fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
+    pub(crate) fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
         loop {
             let a = self.pool.current();
             match a.alloc(size) {
@@ -283,7 +216,7 @@ impl Buffers {
     }
 
     #[cfg(not(feature = "test_disable_recycle"))]
-    pub fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
+    pub(crate) fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
     where
         F: FnMut(u64),
     {
@@ -298,7 +231,7 @@ impl Buffers {
     }
 
     #[cfg(feature = "test_disable_recycle")]
-    pub fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
+    pub(crate) fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
     where
         F: FnMut(u64),
     {
@@ -307,38 +240,17 @@ impl Buffers {
         }
     }
 
-    pub fn quit(&self) {
+    pub(crate) fn quit(&self) {
+        let _ = self.tx.send(SharedState::Quit);
+        let _ = self.rx.recv();
         // make sure flush thread quit before we reclaim mapping
         self.pool.quit();
         self.mapping.reclaim();
         self.remote.reclaim();
         self.pool.reclaim();
-        self.cache.reclaim(|pid| {
-            let swip = Swip::new(self.table.get(pid));
-            if !swip.is_null() && !swip.is_tagged() {
-                let p = Page::<Loader>::from_swip(swip.raw());
-                p.reclaim();
-            }
-        });
     }
 
-    #[inline]
-    pub fn flush_arena(&self) {
-        self.pool.try_flush();
-    }
-
-    #[inline]
-    pub fn update_flsn(&self) {
-        self.pool.update_flsn();
-    }
-
-    #[inline]
-    pub fn mark_dirty(&self) {
-        let a = self.pool.current();
-        a.mark_dirty();
-    }
-
-    pub fn loader(&self) -> Loader {
+    pub(crate) fn loader(&self) -> Loader {
         Loader {
             max_inline_size: self.max_inline_size,
             split_elems: self.split_elems,
@@ -349,36 +261,20 @@ impl Buffers {
         }
     }
 
-    pub fn cache(&self, g: &Guard, p: Page<Loader>) {
-        if self.cache.full() {
-            let pids = self.cache.evict();
-            for pid in pids {
-                loop {
-                    let swip = Swip::new(self.table.get(pid));
-                    if swip.is_null() || swip.is_tagged() {
-                        continue;
-                    }
-                    let old = Page::<Loader>::from_swip(swip.untagged());
-                    if self
-                        .table
-                        .cas(pid, swip.raw(), Swip::tagged(old.latest_addr()))
-                        .is_ok()
-                    {
-                        g.defer(move || old.reclaim());
-                        break;
-                    }
-                }
-            }
-        }
+    pub(crate) fn cache(&self, p: Page<Loader>) {
         let state = CacheState::Warm as u32 + p.is_intl() as u32;
         self.cache.put(p.pid(), state, p.size() as isize);
+
+        if self.cache.full() {
+            self.tx.send(SharedState::Evict).expect("never happen");
+        }
     }
 
-    pub fn evict(&self, pid: u64) {
+    pub(crate) fn evict(&self, pid: u64) {
         self.cache.evict_one(pid);
     }
 
-    pub fn load(&self, g: &Guard, pid: u64) -> Option<Page<Loader>> {
+    pub(crate) fn load(&self, pid: u64) -> Option<Page<Loader>> {
         loop {
             let swip = Swip::new(self.table.get(pid));
             // never mapped or unmapped
@@ -387,11 +283,12 @@ impl Buffers {
             }
 
             if !swip.is_tagged() {
+                self.cache.warm(pid);
                 return Some(Page::<Loader>::from_swip(swip.raw()));
             }
             let new = Page::load(self.loader(), swip.untagged());
             if self.table.cas(pid, swip.raw(), new.swip()).is_ok() {
-                self.cache(g, new);
+                self.cache(new);
                 return Some(new);
             } else {
                 new.reclaim();

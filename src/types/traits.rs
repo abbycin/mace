@@ -36,7 +36,7 @@ pub trait IHeader<T> {
 pub trait IAlloc: IInlineSize {
     fn allocate(&mut self, size: usize) -> BoxRef;
 
-    fn recycle(&mut self, addr: &[u64]);
+    fn collect(&mut self, addr: &[u64]);
 
     fn arena_size(&mut self) -> u32;
 }
@@ -71,8 +71,6 @@ pub trait IValCodec: Copy {
     fn decode(from: &[u8]) -> Self;
 
     fn to_string(&self) -> String;
-
-    fn data(&self) -> &[u8];
 }
 
 pub trait ITree {

@@ -44,24 +44,8 @@ where
         self.inner.inner() as u64
     }
 
-    pub(crate) fn pid(&self) -> u64 {
-        self.inner.box_header().pid
-    }
-
     pub(crate) fn clone_node(&self) -> Node<L> {
         self.inner.deref().clone()
-    }
-
-    pub(crate) fn set_pid(&mut self, pid: u64) {
-        self.inner.box_header_mut().pid = pid;
-    }
-
-    pub(crate) fn size(&self) -> usize {
-        self.inner.size()
-    }
-
-    pub(crate) fn latest_addr(&self) -> u64 {
-        self.inner.addr
     }
 
     pub(crate) fn is_intl(&self) -> bool {

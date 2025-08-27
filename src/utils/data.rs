@@ -1,4 +1,5 @@
 use super::{INIT_ORACLE, MutRef, NEXT_ID, NULL_ADDR, OpCode, pack_id, rand_range};
+use crate::utils::INVALID_ID;
 use crate::utils::bitmap::{BITMAP_ELEM_LEN, BitMap, BitmapElemType};
 use crc32c::Crc32cHasher;
 use io::{GatherIO, IoVec};
@@ -310,6 +311,8 @@ pub struct MetaInner {
     pub wmk_oldest: AtomicU64,
     /// the latest data file id
     pub next_data: AtomicU32,
+    /// indicate data has been flushed
+    pub flush_data: AtomicU32,
     state: AtomicU32,
     nr_worker: AtomicU16,
     padding: u16,
@@ -325,6 +328,7 @@ impl MetaInner {
             wmk_oldest: AtomicU64::new(0),
             next_data: AtomicU32::new(NEXT_ID),
             state: AtomicU32::new(META_IMCOMPLETE as u32),
+            flush_data: AtomicU32::new(INVALID_ID),
             nr_worker: AtomicU16::new(workers as u16),
             padding: 0,
             checksum: AtomicU32::new(0),
@@ -379,8 +383,9 @@ impl Meta {
         // ------------ footer -----------------
 
         h.write_u64(self.inner.oracle.load(Relaxed));
-        // not calc wmk_oldest on purpose
+        // no calc wmk_oldest on purpose
         h.write_u32(self.inner.next_data.load(Relaxed));
+        // no flush_data on purpose
         h.write_u32(self.inner.state.load(Relaxed));
         h.write_u16(self.inner.nr_worker.load(Relaxed));
         h.write_u16(m.len() as u16);

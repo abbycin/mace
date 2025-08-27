@@ -1,20 +1,16 @@
 use super::wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate};
 use crate::types::data::Ver;
-use crate::utils::{Handle, data::WalDescHandle, options::ParsedOptions, unpack_id};
+use crate::utils::{data::WalDescHandle, options::ParsedOptions, unpack_id};
 use crate::{
     cc::wal::{EntryType, WalPadding, WalSpan},
-    map::buffer::Buffers,
     utils::{
         block::Block,
         data::{GatherWriter, Meta},
         pack_id,
     },
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering::Relaxed},
-};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, atomic::Ordering::Relaxed};
 
 struct Ring {
     data: Block,
@@ -108,15 +104,14 @@ pub struct Logging {
     ring: Ring,
     enable_ckpt: AtomicBool,
     // save last checkpoint position, used by gc
-    pub last_ckpt: AtomicU64,
-    ckpt_cnt: Arc<AtomicUsize>,
+    last_ckpt: u64,
+    ckpt_cnt: usize,
     // used for building traverse chain (lsn)
     log_id: u32,
     log_off: u32,
     lsn: u64,
     ops: usize,
     last_data: u32,
-    buffer: Handle<Buffers>,
     writer: GatherWriter,
     opt: Arc<ParsedOptions>,
     pub desc: WalDescHandle,
@@ -131,25 +126,18 @@ unsafe impl Send for Logging {}
 impl Logging {
     const AUTO_STABLE: u32 = <usize>::trailing_zeros(32);
 
-    pub(crate) fn new(
-        ckpt_cnt: Arc<AtomicUsize>,
-        desc: WalDescHandle,
-        meta: Arc<Meta>,
-        opt: Arc<ParsedOptions>,
-        buffer: Handle<Buffers>,
-    ) -> Self {
+    pub(crate) fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<ParsedOptions>) -> Self {
         let writer = GatherWriter::new(&opt.wal_file(desc.worker, desc.wal_id), 32);
         Self {
             ring: Ring::new(opt.wal_buffer_size),
             enable_ckpt: AtomicBool::new(false),
-            last_ckpt: AtomicU64::new(desc.checkpoint),
-            ckpt_cnt,
+            last_ckpt: desc.checkpoint,
+            ckpt_cnt: 0,
             log_id: desc.wal_id,
             log_off: writer.pos() as u32,
             lsn: pack_id(desc.wal_id, writer.pos() as u32),
             ops: 0,
-            last_data: meta.next_data.load(Relaxed),
-            buffer,
+            last_data: meta.flush_data.load(Relaxed),
             writer,
             opt,
             desc,
@@ -194,12 +182,13 @@ impl Logging {
                 .reset(&self.opt.wal_file(self.desc.worker, self.log_id));
         }
 
-        // notify that we are going to write data to arena
-        self.buffer.mark_dirty();
-
-        self.ops = self.ops.wrapping_add(1);
-        if self.ops.trailing_zeros() >= Self::AUTO_STABLE {
+        if self.opt.sync_on_write {
             self.flush();
+        } else {
+            self.ops = self.ops.wrapping_add(1);
+            if self.ops.trailing_zeros() >= Self::AUTO_STABLE {
+                self.flush();
+            }
         }
 
         self.checkpoint();
@@ -213,6 +202,18 @@ impl Logging {
         self.lsn
     }
 
+    pub fn ckpt_cnt(&self) -> usize {
+        self.ckpt_cnt
+    }
+
+    pub fn reset_ckpt_cnt(&mut self) {
+        self.ckpt_cnt = 0;
+    }
+
+    pub fn last_ckpt(&self) -> u64 {
+        self.last_ckpt
+    }
+
     #[cold]
     fn record_large(
         &mut self,
@@ -223,6 +224,7 @@ impl Logging {
         nv: &[u8],
         size: usize,
     ) {
+        self.flush(); // flush queued first, make sure log record is sequentail
         self.writer.queue(u.to_slice());
         self.writer.queue(k);
         self.writer.queue(w);
@@ -303,12 +305,12 @@ impl Logging {
         if !self.enable_ckpt.load(Relaxed) {
             return;
         }
-        let cur = self.meta.next_data.load(Relaxed);
+        let cur = self.meta.flush_data.load(Relaxed);
 
         if cur == self.last_data {
             return;
         }
-        let last_ckpt = self.last_ckpt.load(Relaxed);
+        let last_ckpt = self.last_ckpt;
 
         log::trace!(
             "worker {} checkpoint {:?} curr {} last {}",
@@ -331,8 +333,7 @@ impl Logging {
             self.writer.sync();
         }
 
-        self.last_ckpt
-            .store(pack_id(self.log_id, self.log_off), Relaxed);
+        self.last_ckpt = pack_id(self.log_id, self.log_off);
 
         self.log_off += ckpt.encoded_len() as u32;
         self.sync_desc();
@@ -347,12 +348,12 @@ impl Logging {
             self.meta.sync(self.opt.meta_file(), false);
         }
 
-        self.ckpt_cnt.fetch_add(1, Relaxed);
+        self.ckpt_cnt += 1;
     }
 
     pub(crate) fn sync_desc(&self) {
         let mut desc = self.desc.clone();
-        desc.checkpoint = self.last_ckpt.load(Relaxed);
+        desc.checkpoint = self.last_ckpt;
         desc.wal_id = self.log_id;
         desc.sync(self.opt.desc_file(self.desc.worker));
     }
@@ -378,8 +379,6 @@ impl Logging {
             self.writer.sync();
         }
 
-        // NOTE: the flsn is shared among all workers
-        self.buffer.update_flsn();
         true
     }
 

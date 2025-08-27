@@ -47,7 +47,7 @@ fn get_impl<K: AsRef<[u8]>>(
     k: K,
 ) -> Result<ValRef, OpCode> {
     #[cfg(feature = "extra_check")]
-    assert!(k.as_ref().len() > 0, "key must be non-empty");
+    assert!(!k.as_ref().is_empty(), "key must be non-empty");
 
     let wid = w.id;
     let start_ts = w.start_ts;
@@ -72,7 +72,7 @@ where
     let b = prefix.as_ref();
     let mut e = b.to_vec();
     #[cfg(feature = "extra_check")]
-    assert!(!end.is_empty(), "prefix can't be empty");
+    assert!(!e.is_empty(), "prefix can't be empty");
 
     if *e.last().unwrap() == u8::MAX {
         e.push(0);
@@ -125,7 +125,7 @@ impl<'a> TxnKV<'a> {
     }
 
     fn should_abort(&self) -> Result<(), OpCode> {
-        if self.is_end.get() || self.p.w.ckpt_cnt.load(Relaxed) >= self.limit {
+        if self.is_end.get() || self.p.w.logging.ckpt_cnt() >= self.limit {
             return Err(OpCode::AbortTx);
         }
         Ok(())
@@ -136,7 +136,7 @@ impl<'a> TxnKV<'a> {
         F: FnMut(&Option<(Key, ValRef)>, Ver, SyncWorker) -> Result<(), OpCode>,
     {
         #[cfg(feature = "extra_check")]
-        assert!(k.as_ref().len() > 0, "key must be non-empty");
+        assert!(!k.as_ref().is_empty(), "key must be non-empty");
 
         let g = crossbeam_epoch::pin();
         self.should_abort()?;
@@ -249,9 +249,6 @@ impl<'a> TxnKV<'a> {
                 Ok(())
             }
             Some((rk, rv)) => {
-                if rv.is_del() {
-                    return Err(OpCode::NotFound);
-                }
                 let t = rv.unwrap();
                 if !w
                     .cc
@@ -513,6 +510,22 @@ mod test {
             let view = db.view()?;
             let x = view.get("22");
             assert!(x.is_err());
+        }
+
+        {
+            let kv = db.begin()?;
+            kv.put("elder", "+1s")?;
+            kv.del("elder")?;
+            kv.commit()?;
+            let kv = db.begin()?;
+            let r = kv.update("elder", "mo");
+            // a remove key can't be update again
+            assert!(r.is_err());
+            // but can be upsert
+            kv.upsert("elder", "mo")?;
+            kv.commit()?;
+            let view = db.view()?;
+            assert_eq!(view.get("elder").unwrap().slice(), "mo".as_bytes());
         }
         Ok(())
     }

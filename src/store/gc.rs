@@ -101,7 +101,7 @@ pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Handle<Mapping>)
     let sem = Arc::new(Countblock::new(0));
     let mut last_ckpt_seq = Vec::with_capacity(store.opt.workers);
     store.context.workers().iter().for_each(|w| {
-        let (seq, _) = unpack_id(w.logging.last_ckpt.load(Relaxed));
+        let (seq, _) = unpack_id(w.logging.last_ckpt());
         last_ckpt_seq.push(seq);
     });
     let gc = GarbageCollector {
@@ -226,7 +226,7 @@ impl GarbageCollector {
     fn process_wal(&mut self) {
         for w in self.store.context.workers().iter() {
             let id = w.id as usize;
-            let (ckpt_seq, _) = unpack_id(w.logging.last_ckpt.load(Relaxed));
+            let (ckpt_seq, _) = unpack_id(w.start_ckpt.load(Relaxed));
             if self.last_ckpt_seq[id] == ckpt_seq {
                 continue;
             }
