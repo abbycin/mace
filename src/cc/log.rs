@@ -1,15 +1,16 @@
 use super::wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate};
 use crate::types::data::Ver;
-use crate::utils::{data::WalDescHandle, options::ParsedOptions, unpack_id};
+use crate::utils::data::Position;
+use crate::utils::{data::WalDescHandle, options::ParsedOptions};
 use crate::{
-    cc::wal::{EntryType, WalPadding, WalSpan},
+    cc::wal::EntryType,
     utils::{
         block::Block,
         data::{GatherWriter, Meta},
-        pack_id,
     },
 };
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, atomic::Ordering::Relaxed};
 
 struct Ring {
@@ -31,11 +32,11 @@ impl Ring {
     }
 
     fn avail(&self) -> usize {
-        self.data.len() - (self.tail - self.head)
+        self.data.len() - self.distance()
     }
 
     // NOTE: the request buffer never wraps around
-    fn prod(&mut self, size: usize) -> &mut [u8] {
+    fn prod<'a>(&mut self, size: usize) -> &'a mut [u8] {
         debug_assert!(self.avail() >= size);
         let mut b = self.tail;
         self.tail += size;
@@ -49,6 +50,8 @@ impl Ring {
     }
 
     fn distance(&self) -> usize {
+        #[cfg(feature = "extra_check")]
+        assert!(self.tail >= self.head);
         self.tail - self.head
     }
 
@@ -73,22 +76,22 @@ impl Ring {
     }
 }
 
-pub struct LogBuilder {
+pub struct LogBuilder<'a> {
     off: usize,
-    len: usize,
+    buf: &'a mut [u8],
 }
 
-impl LogBuilder {
-    fn new(len: usize) -> Self {
-        Self { off: 0, len }
+impl<'a> LogBuilder<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { off: 0, buf }
     }
 
-    pub fn add<T>(&mut self, buf: &mut [u8], payload: T) -> &mut Self
+    pub fn add<T>(&mut self, payload: T) -> &mut Self
     where
         T: IWalCodec,
     {
         let src = payload.to_slice();
-        let dst = &mut buf[self.off..self.off + src.len()];
+        let dst = &mut self.buf[self.off..self.off + src.len()];
         dst.copy_from_slice(src);
         self.off += src.len();
 
@@ -96,20 +99,23 @@ impl LogBuilder {
     }
 
     pub fn build(&self, log: &mut Logging) {
-        log.advance(self.len);
+        log.advance(self.buf.len());
     }
 }
 
 pub struct Logging {
     ring: Ring,
     enable_ckpt: AtomicBool,
-    // save last checkpoint position, used by gc
-    last_ckpt: u64,
+    /// save last checkpoint position, used by gc
+    last_ckpt: Position,
     ckpt_cnt: usize,
-    // used for building traverse chain (lsn)
-    log_id: u32,
-    log_off: u32,
-    lsn: u64,
+    /// used for building traverse chain (lsn)
+    log_pos: Position,
+    lsn: Position,
+    /// what we want is happen before sequentail
+    seq: u64,
+    /// so use a number rather than real Position
+    flushed_lsn: AtomicU64,
     ops: usize,
     last_data: u32,
     writer: GatherWriter,
@@ -124,18 +130,24 @@ unsafe impl Sync for Logging {}
 unsafe impl Send for Logging {}
 
 impl Logging {
-    const AUTO_STABLE: u32 = <usize>::trailing_zeros(32);
+    const AUTO_STABLE_SIZE: usize = 4 << 20;
+    const AUTO_STABLE_OPS: u32 = <usize>::trailing_zeros(32);
 
     pub(crate) fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<ParsedOptions>) -> Self {
-        let writer = GatherWriter::new(&opt.wal_file(desc.worker, desc.wal_id), 32);
+        let writer = GatherWriter::new(&opt.wal_file(desc.worker, desc.wal_id), 16);
+        let pos = Position {
+            file_id: desc.wal_id,
+            offset: writer.pos(),
+        };
         Self {
             ring: Ring::new(opt.wal_buffer_size),
             enable_ckpt: AtomicBool::new(false),
             last_ckpt: desc.checkpoint,
             ckpt_cnt: 0,
-            log_id: desc.wal_id,
-            log_off: writer.pos() as u32,
-            lsn: pack_id(desc.wal_id, writer.pos() as u32),
+            log_pos: pos,
+            lsn: pos,
+            seq: 0,
+            flushed_lsn: AtomicU64::new(0),
             ops: 0,
             last_data: meta.flush_data.load(Relaxed),
             writer,
@@ -147,48 +159,38 @@ impl Logging {
         }
     }
 
-    fn alloc(&mut self, size: usize) -> &mut [u8] {
+    fn alloc<'a>(&mut self, size: usize) -> &'a mut [u8] {
         let rest = self.ring.len() - self.ring.tail();
         if rest < size {
-            let a = self.ring.prod(rest);
-            if rest < WalSpan::size() {
-                a.fill(WalPadding::default().into());
-            } else {
-                let span = WalSpan {
-                    wal_type: EntryType::Span,
-                    span: (rest - WalSpan::size()) as u32,
-                };
-                let dst = &mut a[0..span.encoded_len()];
-                dst.copy_from_slice(span.to_slice());
-            }
-            // excluding Padding and Span
-            self.log_off += rest as u32;
             self.flush();
+            // skip the rest data, and restart from the begining
+            self.ring.prod(rest);
+            self.ring.cons(rest);
         }
         self.ring.prod(size)
     }
 
     fn advance(&mut self, data_len: usize) {
-        self.lsn = pack_id(self.log_id, self.log_off);
+        self.lsn = self.log_pos;
+        self.seq += 1;
 
         // maybe switch wal file
-        self.log_off += data_len as u32;
-        if self.log_off >= self.opt.wal_file_size {
-            self.log_id += 1;
-            self.log_off = 0;
+        self.log_pos.offset += data_len as u64;
+        if self.log_pos.offset >= self.opt.wal_file_size as u64 {
+            self.log_pos.file_id += 1;
+            self.log_pos.offset = 0;
 
             self.flush();
             self.writer
-                .reset(&self.opt.wal_file(self.desc.worker, self.log_id));
+                .reset(&self.opt.wal_file(self.desc.worker, self.log_pos.file_id));
+            self.sync_desc();
         }
 
-        if self.opt.sync_on_write {
+        self.ops = self.ops.wrapping_add(1);
+        if self.ops.trailing_zeros() >= Self::AUTO_STABLE_OPS
+            || self.ring.distance() >= Self::AUTO_STABLE_SIZE
+        {
             self.flush();
-        } else {
-            self.ops = self.ops.wrapping_add(1);
-            if self.ops.trailing_zeros() >= Self::AUTO_STABLE {
-                self.flush();
-            }
         }
 
         self.checkpoint();
@@ -198,8 +200,16 @@ impl Logging {
         self.enable_ckpt.store(true, Relaxed);
     }
 
-    pub fn lsn(&self) -> u64 {
+    pub fn lsn(&self) -> Position {
         self.lsn
+    }
+
+    pub fn flsn(&self) -> u64 {
+        self.flushed_lsn.load(Relaxed)
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     pub fn ckpt_cnt(&self) -> usize {
@@ -210,7 +220,7 @@ impl Logging {
         self.ckpt_cnt = 0;
     }
 
-    pub fn last_ckpt(&self) -> u64 {
+    pub fn last_ckpt(&self) -> Position {
         self.last_ckpt
     }
 
@@ -225,12 +235,14 @@ impl Logging {
         size: usize,
     ) {
         self.flush(); // flush queued first, make sure log record is sequentail
-        self.writer.queue(u.to_slice());
-        self.writer.queue(k);
-        self.writer.queue(w);
-        self.writer.queue(ov);
-        self.writer.queue(nv);
-        self.writer.flush();
+        {
+            self.writer.queue(u.to_slice());
+            self.writer.queue(k);
+            self.writer.queue(w);
+            self.writer.queue(ov);
+            self.writer.queue(nv);
+            self.writer.flush();
+        }
         self.advance(size);
     }
 
@@ -239,6 +251,7 @@ impl Logging {
         T: IWalCodec + IWalPayload,
     {
         let payload_size = w.encoded_len() + k.len() + ov.len() + nv.len();
+        let Position { file_id, offset } = self.lsn();
 
         let u = WalUpdate {
             wal_type: EntryType::Update,
@@ -248,18 +261,14 @@ impl Logging {
             cmd_id: ver.cmd,
             klen: k.len() as u32,
             txid: ver.txid,
-            prev_addr: self.lsn,
+            prev_id: file_id,
+            prev_off: offset,
         };
         let total_sz = payload_size + u.encoded_len();
         if total_sz < self.ring.len() {
             let a = self.alloc(total_sz);
-            let mut b = LogBuilder::new(a.len());
-            b.add(a, u)
-                .add(a, k)
-                .add(a, w)
-                .add(a, ov)
-                .add(a, nv)
-                .build(self);
+            let mut b = LogBuilder::new(a);
+            b.add(u).add(k).add(w).add(ov).add(nv).build(self);
         } else {
             self.record_large(&u, k, w.to_slice(), ov, nv, total_sz);
         }
@@ -268,8 +277,8 @@ impl Logging {
     fn add_entry<T: IWalCodec>(&mut self, w: T) {
         let size = w.encoded_len();
         let a = self.alloc(size);
-        let mut b = LogBuilder::new(a.len());
-        b.add(a, w).build(self);
+        let mut b = LogBuilder::new(a);
+        b.add(w).build(self);
     }
 
     pub fn record_begin(&mut self, txid: u64) {
@@ -315,7 +324,7 @@ impl Logging {
         log::trace!(
             "worker {} checkpoint {:?} curr {} last {}",
             self.desc.worker,
-            unpack_id(last_ckpt),
+            last_ckpt,
             cur,
             self.last_data
         );
@@ -323,7 +332,6 @@ impl Logging {
 
         let ckpt = WalCheckpoint {
             wal_type: EntryType::CheckPoint,
-            prev_addr: last_ckpt,
         };
 
         // we must flush buffer in ring to make sure they are stabilized before flush checkpoint
@@ -333,9 +341,9 @@ impl Logging {
             self.writer.sync();
         }
 
-        self.last_ckpt = pack_id(self.log_id, self.log_off);
+        self.last_ckpt = self.log_pos;
 
-        self.log_off += ckpt.encoded_len() as u32;
+        self.log_pos.offset += ckpt.encoded_len() as u64;
         self.sync_desc();
         let wid = self.desc.worker as u32;
 
@@ -351,40 +359,29 @@ impl Logging {
         self.ckpt_cnt += 1;
     }
 
-    pub(crate) fn sync_desc(&self) {
+    fn sync_desc(&self) {
         let mut desc = self.desc.clone();
         desc.checkpoint = self.last_ckpt;
-        desc.wal_id = self.log_id;
+        desc.wal_id = self.log_pos.file_id;
         desc.sync(self.opt.desc_file(self.desc.worker));
     }
 
-    fn flush(&mut self) -> bool {
-        if self.ring.distance() == 0 {
-            return false;
+    fn flush(&mut self) {
+        let len = self.ring.distance();
+        if len != 0 {
+            self.writer.write(self.ring.slice(self.ring.head(), len));
+            self.ring.cons(len);
+
+            if self.opt.sync_on_write {
+                self.writer.sync();
+            }
+
+            self.flushed_lsn.store(self.seq, Relaxed);
         }
-
-        let head = self.ring.head();
-        let tail = self.ring.tail();
-
-        let len = if tail >= head {
-            tail - head
-        } else {
-            self.ring.len() - head
-        };
-
-        self.writer.write(self.ring.slice(head, len));
-        self.ring.cons(len);
-
-        if self.opt.sync_on_write {
-            self.writer.sync();
-        }
-
-        true
     }
 
     pub fn stabilize(&mut self) {
-        if self.flush() {
-            self.checkpoint()
-        }
+        self.flush();
+        self.checkpoint()
     }
 }

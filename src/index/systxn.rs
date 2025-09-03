@@ -34,6 +34,11 @@ impl<'a> SysTxn<'a> {
         }
     }
 
+    pub fn record_and_commit(&mut self, worker_id: usize, seq: u64) {
+        self.store.buffer.record_lsn(worker_id, seq);
+        self.commit();
+    }
+
     pub fn commit(&mut self) {
         self.maps.clear();
         while let Some((a, _)) = self.allocs.pop() {
@@ -117,6 +122,7 @@ impl<'a> SysTxn<'a> {
             .map(|_| {
                 old.garbage_collect(self);
                 self.g.defer(move || old.reclaim());
+                self.store.buffer.warm(pid, new.size());
                 new
             })
             .map_err(|_| {
@@ -131,7 +137,10 @@ impl<'a> SysTxn<'a> {
         self.store
             .page
             .cas(pid, old.swip(), new.swip())
-            .map(|_| self.g.defer(move || old.reclaim()))
+            .map(|_| {
+                self.store.buffer.warm(pid, new.size());
+                self.g.defer(move || old.reclaim())
+            })
             .map_err(|_| OpCode::Again)
     }
 

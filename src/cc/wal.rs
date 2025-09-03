@@ -16,7 +16,7 @@ use crate::{
         data::{Key, Record, Value, Ver},
         traits::ITree,
     },
-    utils::{INIT_CMD, NEXT_ID, block::Block, unpack_id},
+    utils::{INIT_CMD, block::Block, data::Position},
 };
 use crossbeam_epoch::Guard;
 
@@ -37,8 +37,6 @@ pub(crate) trait IWalPayload {
 #[repr(u8)]
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub(crate) enum EntryType {
-    Padding,
-    Span,
     Update,
     Begin,
     Commit,
@@ -71,35 +69,6 @@ impl From<u8> for PayloadType {
 }
 
 #[repr(C, packed(1))]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct WalPadding {
-    dummy: EntryType,
-}
-
-static_assert!(size_of::<WalPadding>() == size_of::<u8>());
-
-impl Default for WalPadding {
-    fn default() -> Self {
-        Self {
-            dummy: EntryType::Padding,
-        }
-    }
-}
-
-impl From<WalPadding> for u8 {
-    fn from(val: WalPadding) -> Self {
-        val.dummy as u8
-    }
-}
-
-#[repr(C, packed(1))]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct WalSpan {
-    pub(crate) wal_type: EntryType,
-    pub(crate) span: u32,
-}
-
-#[repr(C, packed(1))]
 pub(crate) struct WalUpdate {
     pub(crate) wal_type: EntryType,
     pub(crate) sub_type: PayloadType,
@@ -110,7 +79,8 @@ pub(crate) struct WalUpdate {
     pub(crate) cmd_id: u32,
     pub(crate) klen: u32,
     pub(crate) txid: u64,
-    pub(crate) prev_addr: u64,
+    pub(crate) prev_id: u64,
+    pub(crate) prev_off: u64,
 }
 
 impl Debug for WalUpdate {
@@ -123,7 +93,8 @@ impl Debug for WalUpdate {
             .field("cmd_id", &{ self.cmd_id })
             .field("klen", &{ self.klen })
             .field("txid", &{ self.txid })
-            .field("prev_addr", &unpack_id(self.prev_addr))
+            .field("prev_addr", &{ self.prev_id })
+            .field("prev_off", &{ self.prev_off })
             .finish()
     }
 }
@@ -158,8 +129,6 @@ static_assert!(size_of::<WalCommit>() == size_of::<WalBegin>());
 #[derive(Debug)]
 pub(crate) struct WalCheckpoint {
     pub(crate) wal_type: EntryType,
-    /// previous checkpoint's file + offset
-    pub(crate) prev_addr: u64,
 }
 
 impl WalUpdate {
@@ -219,8 +188,6 @@ macro_rules! impl_codec {
     };
 }
 
-impl_codec!(WalPadding);
-impl_codec!(WalSpan);
 impl_codec!(WalUpdate);
 impl_codec!(WalBegin);
 impl_codec!(WalCommit);
@@ -318,15 +285,17 @@ impl_codec!(WalDel);
 pub(crate) struct WalClr {
     tombstone: bool,
     vlen: u32,
-    pub(crate) undo_next: u64,
+    pub(crate) undo_id: u64,
+    pub(crate) undo_off: u64,
 }
 
 impl WalClr {
-    pub(crate) fn new(tombstone: bool, vlen: usize, undo_next: u64) -> Self {
+    pub(crate) fn new(tombstone: bool, vlen: usize, undo_id: u64, undo_off: u64) -> Self {
         Self {
             tombstone,
             vlen: vlen as u32,
-            undo_next,
+            undo_id,
+            undo_off,
         }
     }
 
@@ -384,8 +353,6 @@ pub(crate) fn wal_record_sz(e: EntryType) -> usize {
     match e {
         EntryType::Abort | EntryType::Begin | EntryType::Commit => WalAbort::size(),
         EntryType::Update => WalUpdate::size(),
-        EntryType::Padding => WalPadding::size(),
-        EntryType::Span => WalSpan::size(),
         EntryType::CheckPoint => WalCheckpoint::size(),
         _ => unreachable!("invalid type {}", e as u8),
     }
@@ -394,14 +361,12 @@ pub(crate) fn wal_record_sz(e: EntryType) -> usize {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Location {
     pub(crate) wid: u32,
-    pub(crate) seq: u32,
-    /// wal file must not bigger than 4GB
-    pub(crate) off: u32,
+    pub(crate) pos: Position,
     pub(crate) len: u32,
 }
 
 pub(crate) struct WalReader<'a> {
-    map: RefCell<BTreeMap<u32, (Rc<File>, u64)>>,
+    map: RefCell<BTreeMap<u64, (Rc<File>, u64)>>,
     ctx: &'a Context,
     guard: &'a Guard,
 }
@@ -415,8 +380,7 @@ impl<'a> WalReader<'a> {
         }
     }
 
-    fn get_file(&self, id: u32, seq: u32) -> Option<(Rc<File>, u64)> {
-        assert!(seq >= NEXT_ID);
+    fn get_file(&self, id: u32, seq: u64) -> Option<(Rc<File>, u64)> {
         const MAX_OPEN_FILES: usize = 10;
         let mut map = self.map.borrow_mut();
         while map.len() > MAX_OPEN_FILES {
@@ -439,19 +403,17 @@ impl<'a> WalReader<'a> {
         &self,
         block: &mut Block,
         txid: u64,
-        addr: Location,
+        mut addr: Location,
         tree: &T,
         worker: Option<SyncWorker>,
     ) {
-        let Location {
-            wid, mut seq, off, ..
-        } = addr;
+        let wid = addr.wid;
         let mut cmd = INIT_CMD;
         let mut last_worker = 0;
-        let mut pos = off as u64;
+        let mut pos = addr.pos.offset;
 
         'outer: loop {
-            let (f, end) = match self.get_file(wid, seq) {
+            let (f, end) = match self.get_file(wid, addr.pos.file_id) {
                 None => break, // for rollback, this will not happen, but may happen in recovery
                 Some(f) => {
                     if f.1 == 0 {
@@ -497,16 +459,14 @@ impl<'a> WalReader<'a> {
                         }
                         let s = block.mut_slice(sz, usz - sz);
                         f.read(s, pos + sz as u64).unwrap();
-                        let next =
+                        let (prev_id, prev_off) =
                             self.undo(ptr_to::<WalUpdate>(block.data()), &mut cmd, tree, worker);
-                        let (prev_id, prev_pos) = unpack_id(next);
-                        pos = prev_pos as u64;
-                        if prev_id != seq {
-                            seq = prev_id;
+                        pos = prev_off;
+                        if prev_id != addr.pos.file_id {
+                            addr.pos.file_id = prev_id;
                             break;
                         }
                     }
-                    EntryType::Padding => unreachable!("we've excluded padding from the chain"),
                     _ => unreachable!("the chain will never point to {:?}", h),
                 }
             }
@@ -519,7 +479,7 @@ impl<'a> WalReader<'a> {
         cmd: &mut u32,
         tree: &T,
         worker: Option<SyncWorker>,
-    ) -> u64 {
+    ) -> (u64, u64) {
         let (tombstone, data) = match c.sub_type() {
             PayloadType::Insert => {
                 let i = c.put();
@@ -535,7 +495,7 @@ impl<'a> WalReader<'a> {
             }
             PayloadType::Clr => {
                 let x = c.clr();
-                return x.undo_next;
+                return (x.undo_id, x.undo_off);
             }
         };
 
@@ -555,14 +515,14 @@ impl<'a> WalReader<'a> {
         };
         w.logging.record_update(
             Ver::new(c.txid, *cmd),
-            WalClr::new(tombstone, data.len(), c.prev_addr),
+            WalClr::new(tombstone, data.len(), c.prev_id, c.prev_off),
             raw,
             [].as_slice(),
             data,
         );
 
         tree.put(self.guard, Key::new(raw, Ver::new(c.txid, *cmd)), val);
-        c.prev_addr
+        (c.prev_id, c.prev_off)
     }
 
     #[allow(unused)]
@@ -587,16 +547,9 @@ impl<'a> WalReader<'a> {
             f.read(&mut buf[0..sz], pos).unwrap();
             let old = pos;
             pos += sz as u64;
-            match ty {
-                EntryType::Span => {
-                    let p = ptr_to::<WalSpan>(buf.as_ptr());
-                    pos += p.span as u64;
-                }
-                EntryType::Update => {
-                    let u = ptr_to::<WalUpdate>(buf.as_ptr());
-                    pos += u.size as u64;
-                }
-                _ => {}
+            if ty == EntryType::Update {
+                let u = ptr_to::<WalUpdate>(buf.as_ptr());
+                pos += u.size as u64;
             }
             log::debug!("pos {old} {ty:?} data_len {}", pos - old);
         }
@@ -627,7 +580,8 @@ mod test {
             txid: 26,
             size: len as u32,
             klen: KEY.len() as u32,
-            prev_addr: 0,
+            prev_id: 0,
+            prev_off: 0,
         };
         let total_len = c.encoded_len() + len;
         let mut buf = vec![0u8; total_len * 2];

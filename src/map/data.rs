@@ -7,11 +7,14 @@ use crate::types::refbox::BoxRef;
 use crate::types::traits::{IAsSlice, IHeader};
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
-use crate::utils::data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, PageTable, Reloc};
+use crate::utils::data::{
+    AddrPair, GatherWriter, ID_LEN, JUNK_LEN, MapEntry, Meta, PageTable, Position, Reloc,
+};
 use crate::utils::lru::LruInner;
-use crate::utils::{Handle, INVALID_ID, NULL_PID, pack_id, raw_ptr_to_ref};
+use crate::utils::{CachePad, Handle, INIT_ID, NULL_PID, pack_id, raw_ptr_to_ref};
 use crate::utils::{MutRef, NULL_ADDR, rand_range};
-use crate::{OpCode, Options};
+use crate::{OpCode, Options, static_assert};
+use std::alloc::{Layout, alloc_zeroed};
 use std::cell::Cell;
 use std::cmp::min;
 use std::collections::HashMap;
@@ -28,8 +31,8 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64};
 pub(crate) struct FileStat {
     pub(crate) file_id: u32,
     /// up1 and up2, see [Efficiently Reclaiming Space in a Log Structured Store](https://ieeexplore.ieee.org/document/9458684)
-    pub(crate) up1: u32,
-    pub(crate) up2: u32,
+    pub(crate) up1: u64,
+    pub(crate) up2: u64,
     pub(crate) nr_active: u32,
     pub(crate) active_size: usize,
     // the following two field will never change
@@ -41,14 +44,14 @@ pub(crate) struct FileStat {
 }
 
 impl FileStat {
-    pub(crate) fn update(&mut self, reloc: Reloc, now: u32) {
+    pub(crate) fn update(&mut self, reloc: Reloc, tick: u64) {
         self.nr_active -= 1;
         self.active_size -= reloc.len as usize;
         self.dealloc.set(reloc.seq);
         // make sure monotonically increasing
-        if self.up1 < now {
+        if self.up1 < tick {
             self.up1 = self.up2;
-            self.up2 = now;
+            self.up2 = tick;
         }
     }
 }
@@ -131,7 +134,8 @@ impl Deref for FlushData {
 pub(crate) struct Arena {
     items: DashMap<u64, BoxRef>,
     id: Cell<u32>,
-    pub(crate) flsn: AtomicU32,
+    /// flush LSN
+    pub(crate) flsn: Box<[CachePad<AtomicU64>]>,
     real_size: AtomicU64,
     // pack file_id and seq
     offset: AtomicU64,
@@ -158,11 +162,24 @@ impl Arena {
     /// flushed to disk
     pub(crate) const FLUSH: u8 = 1;
 
-    pub(crate) fn new(cap: u32) -> Self {
+    fn alloc_flsn(n: usize) -> Box<[CachePad<AtomicU64>]> {
+        static_assert!(size_of::<CachePad<Position>>() == 64);
+        static_assert!(align_of::<CachePad<Position>>() == 64);
+        let layout = Layout::from_size_align(64 * n, 64).unwrap();
+        unsafe {
+            let p = alloc_zeroed(layout);
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                p.cast::<CachePad<AtomicU64>>(),
+                n,
+            ))
+        }
+    }
+
+    pub(crate) fn new(cap: u32, workers: usize) -> Self {
         Self {
             items: DashMap::with_capacity(16 << 10),
-            flsn: AtomicU32::new(0),
-            id: Cell::new(INVALID_ID),
+            flsn: Self::alloc_flsn(workers),
+            id: Cell::new(INIT_ID),
             refs: AtomicU16::new(0),
             offset: AtomicU64::new(0),
             real_size: AtomicU64::new(0),
@@ -221,18 +238,18 @@ impl Arena {
         }
     }
 
-    fn alloc_at(&self, off: u32, size: u32) -> BoxRef {
+    fn alloc_at(&self, meta: &Meta, off: u32, size: u32) -> BoxRef {
         let addr = pack_id(self.id.get(), off);
-        let p = BoxRef::alloc(size, addr);
+        let p = BoxRef::alloc(size, addr, meta.epoch.fetch_add(1, Relaxed));
         self.items.insert(addr, p.clone());
         p
     }
 
-    pub fn alloc(&self, size: u32) -> Result<BoxRef, OpCode> {
+    pub fn alloc(&self, meta: &Meta, size: u32) -> Result<BoxRef, OpCode> {
         let real_size = BoxRef::real_size(size);
         self.inc_ref();
         let offset = self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
-        Ok(self.alloc_at(offset, size))
+        Ok(self.alloc_at(meta, offset, size))
     }
 
     pub(crate) fn dealloc(&self, addr: u64, len: usize) {
@@ -257,10 +274,10 @@ impl Arena {
         self.state.load(Relaxed)
     }
 
-    /// we can't remove entry, althrough it has performance boostup, but it may cause further lookup
+    /// we can't remove entry, although it has performance boost, but it may cause further lookup
     /// fail (because we allow load from WARM and COLD arena which is not flushed)
     ///
-    /// if we backup the removed entry, the previous boostup will be lost and it will slow down front
+    /// if we back up the removed entry, the previous boost will be lost, and it will slow down front
     /// thread
     #[allow(unused)]
     pub(crate) fn recycle(&self, addr: &u64) -> bool {
@@ -276,16 +293,20 @@ impl Arena {
         }
     }
 
+    pub(crate) fn record_lsn(&mut self, worker_id: usize, seq: u64) {
+        self.flsn[worker_id].store(seq, Relaxed);
+    }
+
     pub(crate) fn inc_ref(&self) {
         self.refs.fetch_add(1, Relaxed);
     }
 
     pub(crate) fn dec_ref(&self) {
-        self.refs.fetch_sub(1, Relaxed);
+        self.refs.fetch_sub(1, Release);
     }
 
-    pub(crate) fn unref(&self) -> bool {
-        self.refs.load(Relaxed) == 0
+    fn unref(&self) -> bool {
+        self.refs.load(Acquire) == 0
     }
 
     pub(crate) fn id(&self) -> u32 {
@@ -299,7 +320,6 @@ impl Debug for Arena {
             .field("items ", &self.items.len())
             .field("state", &self.state)
             .field("offset", &self.offset)
-            .field("flsn", &self.flsn.load(Relaxed))
             .field("id", &self.id.get())
             .finish()
     }
@@ -317,7 +337,8 @@ impl Debug for Arena {
 #[repr(C, packed(1))]
 #[derive(Default, Debug)]
 pub(crate) struct DataFooter {
-    pub(crate) up2: u32,
+    /// monotonically increasing
+    pub(crate) up2: u64,
     /// logical id entries
     pub(crate) nr_lid: u32,
     /// item's relocation table
@@ -376,7 +397,7 @@ impl DataFooter {
     }
 
     fn reloc_len(&self) -> usize {
-        self.nr_reloc as usize * AddrMap::LEN
+        self.nr_reloc as usize * AddrPair::LEN
     }
 
     fn junk_len(&self) -> usize {
@@ -387,13 +408,14 @@ impl DataFooter {
         self.get(self.lid_pos(), self.nr_lid as usize)
     }
 
-    pub(crate) fn relocs(&self) -> &[AddrMap] {
+    pub(crate) fn relocs(&self) -> &[AddrPair] {
         self.get(self.reloc_pos(), self.nr_reloc as usize)
     }
 }
 
 pub(crate) struct DataBuilder {
-    id: u32,
+    tick: u64,
+    file_id: u32,
     nr_rel: u32,
     nr_junk: u32,
     nr_active: u32,
@@ -404,9 +426,10 @@ pub(crate) struct DataBuilder {
 }
 
 impl DataBuilder {
-    pub(crate) fn new(id: u32) -> Self {
+    pub(crate) fn new(tick: u64, file_id: u32) -> Self {
         Self {
-            id,
+            tick,
+            file_id,
             nr_rel: 0,
             nr_junk: 0,
             nr_active: 0,
@@ -448,21 +471,23 @@ impl DataBuilder {
     {
         let mut pos: usize = 0;
         let mut crc = Crc32cHasher::default();
-        let path = opt.data_file(self.id);
-        let mut w = GatherWriter::new(&path, 64);
-
+        let path = opt.data_file(self.file_id);
         let ctx = DataState {
             kind: StateType::Data,
-            file_id: self.id,
+            file_id: self.file_id,
         };
+
         state.write(ctx.as_slice()).unwrap();
         state.sync().unwrap();
+
+        // must create after state is stabilized
+        let mut w = GatherWriter::new(&path, 64);
 
         for (seq, f) in self.frames.iter().enumerate() {
             let h = f.header();
             // we dump the whole BoxRef into file, so use total_size, when load we must convert it
             // back to the original size when it was allocated
-            let reloc = AddrMap::new(h.addr, pos, h.total_size, seq as u32);
+            let reloc = AddrPair::new(h.addr, pos, h.total_size, seq as u32);
             self.reloc.extend_from_slice(reloc.as_slice());
             let s = f.dump_slice();
             pos += s.len();
@@ -495,7 +520,7 @@ impl DataBuilder {
         w.queue(s);
 
         let hdr = DataFooter {
-            up2: self.id,
+            up2: self.tick,
             nr_lid: 0,
             nr_reloc: self.nr_rel,
             nr_junk: self.nr_junk,
@@ -727,13 +752,13 @@ impl MapBuilder {
         }
     }
 
-    fn add_impl(&mut self, pid: u64, addr: u64, is_unmap: bool) {
+    fn add_impl(&mut self, pid: u64, addr: u64, epoch: u64, is_unmap: bool) {
         let id = pid_to_fid(pid);
         match self.tables.entry(id) {
-            Entry::Occupied(ref mut x) => x.get_mut().add(pid, addr),
+            Entry::Occupied(ref mut x) => x.get_mut().add(pid, addr, epoch),
             Entry::Vacant(x) => {
                 let mut table = PageTable::default();
-                table.add(pid, if is_unmap { NULL_ADDR } else { addr });
+                table.add(pid, if is_unmap { NULL_ADDR } else { addr }, epoch);
                 let _ = x.insert(table);
             }
         }
@@ -743,10 +768,10 @@ impl MapBuilder {
         let h = f.header();
         match h.flag {
             TagFlag::Normal => {
-                self.add_impl(h.pid, h.addr, false);
+                self.add_impl(h.pid, h.addr, h.epoch, false);
             }
             TagFlag::Unmap => {
-                self.add_impl(h.pid, h.addr, true);
+                self.add_impl(h.pid, h.addr, h.epoch, true);
             }
             TagFlag::Sibling => {
                 assert_eq!(h.pid, NULL_PID);
@@ -844,7 +869,7 @@ impl MapBuilder {
                 let x = r.next(block).unwrap();
                 if let Some(es) = x {
                     es.iter().for_each(|e| {
-                        map.add(e.page_id(), e.page_addr());
+                        map.add(e.page_id, e.page_addr, e.epoch);
                     });
                 } else {
                     break;
@@ -933,10 +958,11 @@ impl MapReader {
 
 #[cfg(test)]
 mod test {
-    use std::{cmp::Ordering, hash::Hasher};
-
     use crc32c::Crc32cHasher;
     use io::GatherIO;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::{cmp::Ordering, hash::Hasher};
 
     use crate::{
         Options, RandomPath,
@@ -944,7 +970,7 @@ mod test {
             refbox::BoxRef,
             traits::{IAsSlice, IHeader},
         },
-        utils::{NEXT_ID, NULL_ADDR, block::Block, data::PageTable},
+        utils::{INIT_ID, NULL_ADDR, block::Block, data::PageTable},
     };
 
     use super::{DataBuilder, DataMetaReader, MapHeader, MapReader};
@@ -988,10 +1014,10 @@ mod test {
         opt.tmp_store = true;
 
         let (pid, addr) = (114514, 1919810);
-        let mut p = BoxRef::alloc(233, addr);
+        let mut p = BoxRef::alloc(233, addr, 0);
         p.header_mut().pid = pid;
 
-        let mut builder = DataBuilder::new(NEXT_ID);
+        let mut builder = DataBuilder::new(INIT_ID as u64, INIT_ID);
 
         builder.add(p.clone());
 
@@ -999,7 +1025,7 @@ mod test {
         let mut state = DummyState;
         builder.build(&opt, &mut state);
 
-        let mut loader = DataMetaReader::new(opt.data_file(builder.id), true).unwrap();
+        let mut loader = DataMetaReader::new(opt.data_file(builder.file_id), true).unwrap();
 
         let d = loader.get_meta().unwrap();
         let reloc = d.relocs();
@@ -1028,12 +1054,14 @@ mod test {
             .open(&opt.map_file(map_id))
             .unwrap();
         let mut input = Vec::new();
+        let mut epoch = 0;
         for _ in 0..10 {
             let mut table = PageTable::default();
 
             for i in 1..10 {
-                table.add(i, i * i);
+                table.add(i, i * i, epoch);
                 input.push((i, i * i));
+                epoch += 1;
             }
 
             let v = table.collect();
@@ -1059,7 +1087,7 @@ mod test {
             let x = r.next(&mut block).unwrap();
             if let Some(es) = x {
                 for e in es {
-                    output.push((e.page_id(), e.page_addr()));
+                    output.push((e.page_id, e.page_addr));
                 }
             } else {
                 break;
@@ -1093,12 +1121,13 @@ mod test {
             .open(&opt.map_file(map_id))
             .unwrap();
         let mut table = PageTable::default();
+        let epoch = AtomicU64::new(0);
 
-        table.add(1, 1);
-        table.add(1, NULL_ADDR);
-        table.add(2, 2);
-        table.add(2, NULL_ADDR);
-        table.add(2, 3);
+        table.add(1, 1, epoch.fetch_add(1, Relaxed));
+        table.add(1, NULL_ADDR, epoch.fetch_add(1, Relaxed));
+        table.add(2, 2, epoch.fetch_add(1, Relaxed));
+        table.add(2, NULL_ADDR, epoch.fetch_add(1, Relaxed));
+        table.add(2, 3, epoch.fetch_add(1, Relaxed));
 
         let v = table.collect();
         let mut hash = Crc32cHasher::default();
@@ -1122,7 +1151,7 @@ mod test {
             let x = r.next(&mut block).unwrap();
             if let Some(es) = x {
                 for e in es {
-                    m.push((e.page_id(), e.page_addr()));
+                    m.push((e.page_id, e.page_addr, e.epoch));
                 }
             } else {
                 break;
@@ -1130,7 +1159,7 @@ mod test {
         }
 
         assert_eq!(m.len(), 2);
-        assert_eq!(m[0], (1, NULL_ADDR));
-        assert_eq!(m[1], (2, 3));
+        assert_eq!((m[0].0, m[0].1), (1, NULL_ADDR));
+        assert_eq!((m[1].0, m[1].1), (2, 3));
     }
 }

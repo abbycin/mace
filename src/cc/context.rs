@@ -32,11 +32,12 @@ impl Context {
         for x in w.iter().rev() {
             active_workers.push(*x).unwrap();
         }
+        let workers = Arc::new(w);
 
         Self {
             opt: opt.clone(),
             meta,
-            workers: Arc::new(w),
+            workers,
             active_workers,
         }
     }
@@ -86,7 +87,9 @@ impl Context {
 
     pub(crate) fn quit(&self) {
         self.workers.iter().for_each(|x| {
-            x.logging.sync_desc();
+            // we are the last one, so use mutable copy is ok
+            let mut h = *x;
+            h.logging.stabilize();
             x.reclaim()
         });
     }

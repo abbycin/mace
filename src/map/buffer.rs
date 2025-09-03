@@ -6,15 +6,14 @@ use std::sync::{
 
 use crate::{
     OpCode,
+    cc::context::Context,
     map::{SharedState, data::Arena, table::Swip},
     types::{
         page::Page,
         refbox::BoxView,
         traits::{IHeader, IInlineSize, ILoader},
     },
-    utils::{
-        Handle, INVALID_ID, MutRef, NULL_ID, data::Meta, options::ParsedOptions, queue::Queue,
-    },
+    utils::{Handle, MutRef, data::Meta, options::ParsedOptions, queue::Queue},
 };
 use dashmap::{DashMap, Entry};
 
@@ -24,9 +23,10 @@ use crate::map::table::PageMap;
 use crate::types::refbox::BoxRef;
 use crate::utils::lru::Lru;
 use crate::utils::unpack_id;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{Acquire, Relaxed};
 
 struct Pool {
+    workers: usize,
     flush: Flush,
     /// contains all flushed arena
     free: Arc<Queue<Handle<Arena>>>,
@@ -43,19 +43,22 @@ impl Pool {
     fn new(
         opt: Arc<ParsedOptions>,
         mapping: Handle<Mapping>,
+        ctx: Handle<Context>,
         meta: Arc<Meta>,
     ) -> Result<Pool, OpCode> {
+        let workers = opt.workers;
         let id = Self::get_id(&meta)?;
         let q = Queue::new(Self::INIT_ARENA as usize);
         for _ in 0..Self::INIT_ARENA {
-            let h = Handle::new(Arena::new(opt.data_file_size));
+            let h = Handle::new(Arena::new(opt.data_file_size, workers));
             q.push(h).unwrap();
         }
 
         let h = q.pop().unwrap();
 
         let this = Self {
-            flush: Flush::new(mapping, meta.clone()),
+            workers,
+            flush: Flush::new(mapping, ctx),
             free: Arc::new(q),
             wait: Arc::new(DashMap::new()),
             cur: AtomicPtr::new(h.inner()),
@@ -69,8 +72,8 @@ impl Pool {
     fn get_id(meta: &Meta) -> Result<u32, OpCode> {
         let id = meta.next_data.fetch_add(1, Relaxed);
 
-        // TODO: deal with id exhaustion
-        if id == NULL_ID {
+        // next id is equal to the oldest, which means there's no space left
+        if id + 1 == meta.oldest_data.load(Acquire) {
             return Err(OpCode::DbFull);
         }
         Ok(id)
@@ -109,7 +112,7 @@ impl Pool {
         let p = if let Some(p) = self.free.pop() {
             p
         } else {
-            Handle::new(Arena::new(cur.cap()))
+            Handle::new(Arena::new(cur.cap(), self.workers))
         };
         p.reset(id);
 
@@ -120,7 +123,6 @@ impl Pool {
     }
 
     fn flush(&self, h: Handle<Arena>) {
-        assert!(h.id() > INVALID_ID);
         let wait = self.wait.clone();
         let free = self.free.clone();
 
@@ -161,8 +163,7 @@ impl Pool {
 }
 
 pub(crate) struct Buffers {
-    max_inline_size: u32,
-    split_elems: u32,
+    ctx: Handle<Context>,
     /// used for restrict in memory node count
     cache: Arc<NodeCache>,
     table: Arc<PageMap>,
@@ -177,21 +178,21 @@ pub(crate) struct Buffers {
 impl Buffers {
     pub(crate) fn new(
         pagemap: Arc<PageMap>,
-        opt: Arc<ParsedOptions>,
-        meta: Arc<Meta>,
+        ctx: Handle<Context>,
         cache: Arc<NodeCache>,
         mapping: Mapping,
         tx: Sender<SharedState>,
         rx: Receiver<()>,
     ) -> Result<Self, OpCode> {
         let mapping = Handle::new(mapping);
+        let opt = ctx.opt.clone();
+        let meta = ctx.meta.clone();
         Ok(Self {
-            max_inline_size: opt.max_inline_size,
-            split_elems: opt.split_elems as u32,
+            ctx,
             cache,
             table: pagemap,
             remote: Handle::new(Lru::new(opt.cache_count)),
-            pool: Handle::new(Pool::new(opt.clone(), mapping, meta)?),
+            pool: Handle::new(Pool::new(opt.clone(), mapping, ctx, meta)?),
             mapping,
             tx,
             rx,
@@ -201,7 +202,7 @@ impl Buffers {
     pub(crate) fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
         loop {
             let a = self.pool.current();
-            match a.alloc(size) {
+            match a.alloc(&self.pool.meta, size) {
                 Ok(x) => return Ok((a, x)),
                 Err(e @ OpCode::TooLarge) => return Err(e),
                 Err(OpCode::Again) => continue,
@@ -213,6 +214,10 @@ impl Buffers {
                 _ => unreachable!("invalid opcode"),
             }
         }
+    }
+
+    pub(crate) fn record_lsn(&self, worker_id: usize, seq: u64) {
+        self.pool.current().record_lsn(worker_id, seq);
     }
 
     #[cfg(not(feature = "test_disable_recycle"))]
@@ -251,17 +256,21 @@ impl Buffers {
     }
 
     pub(crate) fn loader(&self) -> Loader {
+        let split_elems = self.ctx.opt.split_elems as u32;
         Loader {
-            max_inline_size: self.max_inline_size,
-            split_elems: self.split_elems,
+            max_inline_size: self.ctx.opt.max_inline_size,
+            split_elems,
             pool: self.pool,
             mapping: self.mapping,
             cache: self.remote,
-            pinned: MutRef::new(DashMap::with_capacity(self.split_elems as usize)),
+            pinned: MutRef::new(DashMap::with_capacity(split_elems as usize)),
         }
     }
 
     pub(crate) fn cache(&self, p: Page<Loader>) {
+        if p.size() > self.cache.cap() {
+            log::warn!("cache_capacity too small: {}", self.cache.cap());
+        }
         let state = CacheState::Warm as u32 + p.is_intl() as u32;
         self.cache.put(p.pid(), state, p.size() as isize);
 
@@ -274,6 +283,10 @@ impl Buffers {
         self.cache.evict_one(pid);
     }
 
+    pub(crate) fn warm(&self, pid: u64, size: usize) {
+        self.cache.warm(pid, size);
+    }
+
     pub(crate) fn load(&self, pid: u64) -> Option<Page<Loader>> {
         loop {
             let swip = Swip::new(self.table.get(pid));
@@ -283,7 +296,7 @@ impl Buffers {
             }
 
             if !swip.is_tagged() {
-                self.cache.warm(pid);
+                // we delay cache warm up when the value of page map entry was updated
                 return Some(Page::<Loader>::from_swip(swip.raw()));
             }
             let new = Page::load(self.loader(), swip.untagged());

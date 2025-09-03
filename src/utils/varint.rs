@@ -1,43 +1,53 @@
 pub struct Varint32;
+#[cfg(test)]
 pub struct Varint64;
 
 macro_rules! impl_varint {
-    ($name: ty, $e: ty) => {
+    ($name: ty, $bits: expr, $max_bytes: expr, $e: ty) => {
+
         impl $name {
-            /// return bytes required to encode `x`
             #[allow(unused)]
-            pub fn size(mut x: $e) -> usize {
-                let mut i = 0;
-                while x >= 128 {
-                    x >>= 7;
-                    i += 1;
+            pub fn size(x: usize) -> usize {
+                if x < (1 << 7) {
+                    1
+                } else if x < (1 << 14) {
+                    2
+                } else if x < (1 << 21) {
+                    3
+                } else if x < (1 << 28) {
+                    4
+                } else if x < (1 << 35) {
+                    5
+                } else if x < (1 << 42) {
+                    6
+                } else if x < (1 << 49) {
+                    7
+                } else if x < (1 << 56) {
+                    8
+                } else if x < (1 << 63) {
+                    9
+                } else {
+                    $max_bytes
                 }
-                i + 1
             }
 
-            /// encode `x` into `data` and return bytes consumed in data
-            /// assume the `data` is zeroed
-            #[allow(unused)]
             pub fn encode(data: &mut [u8], mut x: $e) -> usize {
                 let mut i = 0;
-                while x >= 128 {
+                while x >= 128 && i < $max_bytes - 1 {
                     data[i] = (x as u8) | 128;
                     x >>= 7;
                     i += 1;
                 }
                 data[i] = x as u8;
-                // expect the highest 1 bit is zero
-                assert_eq!(data[i] >> 7, 0);
+                debug_assert!(data[i] < 128);
                 i + 1
             }
 
-            /// decode `data` into `$e` and return `$e` and the bytes consumed in data
-            /// return None on error or overflow
             #[allow(unused)]
             pub fn decode(data: &[u8]) -> Option<($e, usize)> {
                 let mut n: $e = 0;
                 let mut shift = 0;
-                for (i, &x) in data.iter().enumerate() {
+                for (i, &x) in data.iter().enumerate().take($max_bytes) {
                     if x < 128 {
                         return (<$e>::from(x)).checked_shl(shift).map(|x| (n | x, (i+1) as usize));
                     }
@@ -55,8 +65,9 @@ macro_rules! impl_varint {
     };
 }
 
-impl_varint!(Varint32, u32);
-impl_varint!(Varint64, u64);
+impl_varint!(Varint32, 32, 5, u32);
+#[cfg(test)]
+impl_varint!(Varint64, 64, 10, u64);
 
 #[cfg(test)]
 mod test {

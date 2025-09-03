@@ -25,7 +25,7 @@ use crate::{
         Handle,
         block::Block,
         countblock::Countblock,
-        data::{AddrMap, GatherWriter, ID_LEN, JUNK_LEN, Meta},
+        data::{AddrPair, GatherWriter, ID_LEN, JUNK_LEN, Meta},
         unpack_id,
     },
 };
@@ -33,10 +33,11 @@ use crate::{
 const GC_QUIT: i32 = -1;
 const GC_PAUSE: i32 = 3;
 const GC_RESUME: i32 = 5;
+const GC_START: i32 = 7;
 
 fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) -> JoinHandle<()> {
     std::thread::Builder::new()
-        .name("garbage_collector".into())
+        .name("garbage-collector".into())
         .spawn(move || {
             let timeout = Duration::from_millis(gc.store.opt.gc_timeout);
             let mut pause = false;
@@ -46,10 +47,13 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                     Ok(x) => match x {
                         GC_PAUSE => {
                             pause = true;
-                            sem.post();
                         }
                         GC_RESUME => {
                             pause = false;
+                        }
+                        GC_START => {
+                            gc.process_data();
+                            gc.process_wal();
                             sem.post();
                         }
                         GC_QUIT => break,
@@ -69,6 +73,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
             }
 
             sem.post();
+            log::debug!("garbage-collector thread exit");
         })
         .unwrap()
 }
@@ -87,21 +92,24 @@ impl GCHandle {
 
     pub(crate) fn pause(&self) {
         self.tx.send(GC_PAUSE).unwrap();
-        self.sem.wait();
     }
 
     pub(crate) fn resume(&self) {
         self.tx.send(GC_RESUME).unwrap();
+    }
+
+    pub(crate) fn start(&self) {
+        self.tx.send(GC_START).unwrap();
         self.sem.wait();
     }
 }
 
 pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Handle<Mapping>) -> GCHandle {
     let (tx, rx) = channel();
-    let sem = Arc::new(Countblock::new(0));
+    let sem = Arc::new(Countblock::new(1));
     let mut last_ckpt_seq = Vec::with_capacity(store.opt.workers);
     store.context.workers().iter().for_each(|w| {
-        let (seq, _) = unpack_id(w.logging.last_ckpt());
+        let seq = w.logging.last_ckpt().file_id;
         last_ckpt_seq.push(seq);
     });
     let gc = GarbageCollector {
@@ -109,6 +117,8 @@ pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Handle<Mapping>)
         map,
         store,
         last_ckpt_seq,
+        last_raio: 0,
+        last_total: 0,
     };
     gc_thread(gc, rx, sem.clone());
     GCHandle {
@@ -122,11 +132,11 @@ struct Score {
     logical_id: u32,
     size: usize,
     rate: f64,
-    up2: u32,
+    up2: u64,
 }
 
 impl Score {
-    fn from(logical_id: u32, stat: &FileStat, now: u32) -> Self {
+    fn from(logical_id: u32, stat: &FileStat, now: u64) -> Self {
         Self {
             logical_id,
             id: stat.file_id,
@@ -136,10 +146,10 @@ impl Score {
         }
     }
 
-    fn calc_decline_rate(stat: &FileStat, now: u32) -> f64 {
+    fn calc_decline_rate(stat: &FileStat, now: u64) -> f64 {
         let free = stat.total_size.saturating_sub(stat.active_size);
         if free == 0 || stat.up2 == now {
-            return f64::MIN; // skip new born
+            return f64::MIN; // skip newborn
         }
 
         -(stat.active_size as f64 / free as f64).powi(2)
@@ -151,7 +161,9 @@ struct GarbageCollector {
     meta: Arc<Meta>,
     map: Handle<Mapping>,
     store: Arc<Store>,
-    last_ckpt_seq: Vec<u32>,
+    last_ckpt_seq: Vec<u64>,
+    last_raio: u64,
+    last_total: u64,
 }
 
 impl GarbageCollector {
@@ -172,12 +184,21 @@ impl GarbageCollector {
                 return;
             }
             let ratio = (total - active) * 100 / total;
-            log::trace!("ratio {ratio} tgt_ratio {tgt_ratio} total {total} active {active}");
+            // log::trace!("ratio {ratio} tgt_ratio {tgt_ratio} total {total} active {active}");
             if ratio < tgt_ratio {
                 return;
             }
 
-            let now = self.meta.next_data.load(Relaxed);
+            // we have cleaned some segments, but the total size and ratio remain unchanged, no need
+            // to clean
+            if self.last_raio == ratio && self.last_total == total {
+                return;
+            }
+
+            self.last_raio = ratio;
+            self.last_total = total;
+
+            let tick = self.meta.tick.load(Relaxed);
             let mut q = Vec::new();
             let mut unmapped = HashSet::new();
             let mut unlinked = HashSet::new();
@@ -185,7 +206,7 @@ impl GarbageCollector {
                 let s = x.value();
                 // NOTE: file may have no active frames, but the junks may still active, they will
                 // be filtered in `compact`
-                q.push(Score::from(*x.key(), s, now));
+                q.push(Score::from(*x.key(), s, tick));
                 if s.nr_active == 0 {
                     unmapped.insert(*x.key());
                     unlinked.insert(s.file_id);
@@ -226,7 +247,9 @@ impl GarbageCollector {
     fn process_wal(&mut self) {
         for w in self.store.context.workers().iter() {
             let id = w.id as usize;
-            let (ckpt_seq, _) = unpack_id(w.start_ckpt.load(Relaxed));
+            let lk = w.start_ckpt.read().unwrap();
+            let ckpt_seq = lk.file_id;
+            drop(lk);
             if self.last_ckpt_seq[id] == ckpt_seq {
                 continue;
             }
@@ -235,7 +258,7 @@ impl GarbageCollector {
         }
     }
 
-    fn process_one_wal(opt: &Options, id: u16, beg: u32, end: u32) {
+    fn process_one_wal(opt: &Options, id: u16, beg: u64, end: u64) {
         // NOTE: not including `end`
         for seq in beg..end {
             let from = opt.wal_file(id, seq);
@@ -380,7 +403,7 @@ impl<'a> ReWriter<'a> {
     }
 
     fn add_frame(&mut self, item: Item) {
-        self.sum_up2 += item.up2 as u64;
+        self.sum_up2 += item.up2;
         self.items.push(item);
     }
 
@@ -389,7 +412,7 @@ impl<'a> ReWriter<'a> {
     }
 
     fn build(&mut self, lids: HashSet<u32>, id: u32) -> Result<(), std::io::Error> {
-        let up2 = (self.sum_up2 / self.total) as u32;
+        let up2 = self.sum_up2 / self.total;
         let mut block = Block::alloc(1 << 20);
         let mut seq = 0;
         let mut off = 0;
@@ -416,7 +439,7 @@ impl<'a> ReWriter<'a> {
                 // the data will be reused next time, so we write data to file instead of queue it
                 writer.write(data);
 
-                let m = AddrMap::new(e.key, off, e.len, seq);
+                let m = AddrPair::new(e.key, off, e.len, seq);
                 reloc.extend_from_slice(m.as_slice());
                 off += e.len as usize;
                 seq += 1;
@@ -466,12 +489,12 @@ impl<'a> ReWriter<'a> {
 
 struct Item {
     id: u32,
-    up2: u32,
+    up2: u64,
     pos: Vec<Entry>,
 }
 
 impl Item {
-    fn new(id: u32, up2: u32, pos: Vec<Entry>) -> Self {
+    fn new(id: u32, up2: u64, pos: Vec<Entry>) -> Self {
         Self { id, up2, pos }
     }
 }

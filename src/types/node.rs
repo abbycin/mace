@@ -13,7 +13,7 @@ use crate::{
         refbox::{BaseView, BoxView, DeltaView, KeyRef},
         traits::{IAlloc, IAsBoxRef, IBoxHeader, ICodec, IHeader, IKey, ILoader, IVal},
     },
-    utils::{NULL_CMD, NULL_ORACLE, NULL_PID, unpack_id},
+    utils::{MAX_NODE_SIZE, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, unpack_id},
 };
 
 use super::{header::TagKind, refbox::BoxRef};
@@ -151,10 +151,9 @@ where
         }
     }
 
-    /// we are not rely on node size for smo, but the max node size is close to INLINE_SIZE * SPLIT_ELEM
     pub(crate) fn should_split(&self, split_elem: u16) -> bool {
         let h = self.header();
-        let size_limited = h.elems >= split_elem;
+        let size_limited = h.elems >= split_elem || self.size() >= MAX_NODE_SIZE;
         let no_conflict = !h.merging && h.merging_child == NULL_PID && h.elems >= 2;
 
         size_limited && no_conflict
@@ -580,11 +579,12 @@ where
                 }
                 _ => unreachable!("bad kind {:?}", h.kind),
             }
-            if h.link == 0 {
+            if h.link == NULL_ADDR {
                 break;
             }
             d = l.loader.pin_load(h.link);
         }
+        assert!(!l.inner.is_null());
     }
 
     #[allow(clippy::iter_skip_zero)]
@@ -951,6 +951,7 @@ mod test {
         refbox::{BoxRef, BoxView, DeltaView},
         traits::{IAlloc, IHeader, IInlineSize, ILoader},
     };
+    use crate::utils::INIT_EPOCH;
 
     struct AInner {
         map: Mutex<HashMap<u64, BoxRef>>,
@@ -960,6 +961,7 @@ mod test {
     #[derive(Clone)]
     struct A {
         inner: Rc<AInner>,
+        epoch: u64,
     }
 
     impl A {
@@ -969,6 +971,7 @@ mod test {
                     map: Mutex::new(HashMap::new()),
                     off: AtomicU64::new(0),
                 }),
+                epoch: INIT_EPOCH,
             }
         }
 
@@ -984,7 +987,8 @@ mod test {
                 .inner
                 .off
                 .fetch_add(BoxRef::real_size(size as u32) as u64, Relaxed);
-            let p = BoxRef::alloc(size as u32, addr);
+            let p = BoxRef::alloc(size as u32, addr, self.epoch);
+            self.epoch += 1;
             let mut lk = self.inner.map.lock().unwrap();
             lk.insert(addr, p.clone());
             p

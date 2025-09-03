@@ -9,6 +9,7 @@ use io::{File, GatherIO};
 
 use super::data::{DataMetaReader, FileStat, StatHandle};
 use crate::types::{refbox::BoxRef, traits::IHeader};
+use crate::utils::NULL_EPOCH;
 use crate::{
     OpCode,
     utils::{bitmap::BitMap, data::Reloc, lru::Lru, options::ParsedOptions, unpack_id},
@@ -32,7 +33,7 @@ impl FileReader {
 
     fn read_at(&self, pos: u64) -> BoxRef {
         let m = self.map.get(&pos).expect("never happen");
-        let mut p = BoxRef::alloc(m.len - BoxRef::HDR_LEN as u32, pos);
+        let mut p = BoxRef::alloc(m.len - BoxRef::HDR_LEN as u32, pos, NULL_EPOCH);
 
         let dst = p.load_slice();
         self.file.read(dst, m.off as u64).expect("can't read");
@@ -65,12 +66,12 @@ impl Mapping {
         }
     }
 
-    pub(crate) fn apply_junks(&self, now: u32, junks: &[u64]) {
+    pub(crate) fn apply_junks(&self, tick: u64, junks: &[u64]) {
         for &pos in junks {
             let (logical_id, _) = unpack_id(pos);
             if let Some(mut stat) = self.stats.get_mut(&logical_id) {
                 let reloc = self.get_reloc(stat.file_id, pos);
-                stat.update(reloc, now);
+                stat.update(reloc, tick);
             }
         }
     }
@@ -148,7 +149,7 @@ impl Mapping {
     fn get_reloc(&self, file_id: u32, key: u64) -> Reloc {
         loop {
             if let Some(x) = self.cache.get(file_id as u64) {
-                return *x.map.get(&key).expect("never happen");
+                return *x.map.get(&key).expect("addr in Junk frame but not flushed");
             }
 
             let mut cnt: usize = 0;

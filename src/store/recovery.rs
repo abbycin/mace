@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use io::{File, GatherIO};
 
 use crate::cc::wal::{
-    EntryType, Location, PayloadType, WalAbort, WalBegin, WalReader, WalSpan, WalUpdate, ptr_to,
+    EntryType, Location, PayloadType, WalAbort, WalBegin, WalReader, WalUpdate, ptr_to,
     wal_record_sz,
 };
 use crate::index::tree::Tree;
@@ -19,15 +19,15 @@ use crate::map::table::Swip;
 use crate::types::data::{Key, Record, Value, Ver};
 use crate::types::traits::IAsSlice;
 use crate::utils::block::Block;
-use crate::utils::data::{MetaInner, WalDesc, WalDescHandle};
+use crate::utils::data::{MetaInner, PageTable, Position, WalDesc, WalDescHandle};
 use crate::utils::lru::LruInner;
 use crate::utils::options::ParsedOptions;
-use crate::utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE, pack_id, unpack_id};
+use crate::utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE};
 use crate::{OpCode, static_assert};
 use crate::{
     Options,
     map::table::PageMap,
-    utils::{NEXT_ID, data::Meta},
+    utils::{INIT_ID, data::Meta},
 };
 use crossbeam_epoch::Guard;
 
@@ -81,27 +81,23 @@ impl Recovery {
         Ok((Arc::new(meta), map, mapping, desc))
     }
 
-    pub(crate) fn phase2(
-        &mut self,
-        g: &Guard,
-        meta: Arc<Meta>,
-        desc: &[WalDescHandle],
-        tree: &Tree,
-    ) {
+    pub(crate) fn phase2(&mut self, meta: Arc<Meta>, desc: &[WalDescHandle], tree: &Tree) {
+        let g = crossbeam_epoch::pin();
         let mut oracle = meta.oracle.load(Relaxed);
         if self.state == State::Damaged {
             let mut block = Block::alloc(self.opt.max_data_size());
             for d in desc.iter() {
                 // analyze and redo starts from latest checkpoint
-                let cur_oracle = self.analyze(g, d.worker, d.checkpoint, &mut block, tree);
+                let cur_oracle = self.analyze(&g, d.worker, d.checkpoint, &mut block, tree);
                 oracle = max(oracle, cur_oracle);
+                g.flush();
             }
 
             if !self.dirty_table.is_empty() {
-                self.redo(&mut block, g, tree);
+                self.redo(&mut block, &g, tree);
             }
             if !self.undo_table.is_empty() {
-                self.undo(&mut block, g, tree);
+                self.undo(&mut block, &g, tree);
             }
             // that's why we call it oracle, or else keep using the intact oracle in meta
             oracle += 1;
@@ -125,7 +121,7 @@ impl Recovery {
         tree: &Tree,
     ) {
         assert!((loc.len as usize) < buf.len());
-        f.read(&mut buf[0..loc.len as usize], loc.off as u64)
+        f.read(&mut buf[0..loc.len as usize], loc.pos.offset)
             .unwrap();
 
         let u = ptr_to::<WalUpdate>(buf.as_ptr());
@@ -145,19 +141,27 @@ impl Recovery {
         }
     }
 
-    fn analyze(&mut self, g: &Guard, wid: u16, addr: u64, block: &mut Block, tree: &Tree) -> u64 {
-        let (seq, mut off) = unpack_id(addr);
+    fn analyze(
+        &mut self,
+        g: &Guard,
+        wid: u16,
+        addr: Position,
+        block: &mut Block,
+        tree: &Tree,
+    ) -> u64 {
+        let Position {
+            file_id,
+            mut offset,
+        } = addr;
         let mut pos;
         let mut oracle = 0;
         let mut loc = Location {
             wid: wid as u32,
-            seq: 0,
-            off: 0,
+            pos: Position::default(),
             len: 0,
         };
 
-        // TODO: handle wal seq wrapping
-        for i in seq..=u32::MAX {
+        for i in file_id.. {
             let path = self.opt.wal_file(wid, i);
             if !path.exists() {
                 break; // no more wal file
@@ -170,9 +174,9 @@ impl Recovery {
             let buf = block.mut_slice(0, block.len());
             static_assert!(size_of::<EntryType>() == 1);
 
-            loc.seq = seq;
-            pos = off as u64;
-            off = 0;
+            loc.pos.file_id = i;
+            pos = offset;
+            offset = 0;
 
             log::trace!("{path:?} pos {pos} end {end}");
             while pos < end {
@@ -205,19 +209,17 @@ impl Recovery {
                             b.txid,
                             Location {
                                 wid: wid as u32,
-                                seq,
-                                off: pos as u32 - sz as u32,
+                                pos: Position {
+                                    file_id: i,
+                                    offset: pos - sz as u64,
+                                },
                                 len: 0,
                             },
                         );
                         oracle = max(b.txid, oracle);
                     }
-                    EntryType::CheckPoint | EntryType::Padding => {
+                    EntryType::CheckPoint => {
                         // do nothing
-                    }
-                    EntryType::Span => {
-                        let p = ptr_to::<WalSpan>(ptr);
-                        pos += p.span as u64;
                     }
                     EntryType::Update => {
                         let u = ptr_to::<WalUpdate>(ptr);
@@ -226,12 +228,12 @@ impl Recovery {
                         }
                         loc.len = (sz + u.payload_len()) as u32;
                         log::trace!("{pos} => {u:?}");
-                        loc.off = (pos - sz as u64) as u32;
+                        loc.pos.offset = pos - sz as u64;
 
                         if let Some(l) = self.undo_table.get_mut(&{ u.txid }) {
                             // update to latest record position
-                            l.seq = seq;
-                            l.off = loc.off;
+                            l.pos.file_id = i;
+                            l.pos.offset = loc.pos.offset;
                         }
                         self.handle_update(g, &mut f, &mut loc, buf, tree);
                         pos += u.payload_len() as u64;
@@ -253,13 +255,13 @@ impl Recovery {
     }
 
     fn get_file(
-        cache: &LruInner<u64, Rc<File>>,
+        cache: &LruInner<(u32, u64), Rc<File>>,
         cap: usize,
         opt: &Options,
         wid: u32,
-        seq: u32,
+        seq: u64,
     ) -> Option<Rc<File>> {
-        let id = pack_id(wid, seq);
+        let id = (wid, seq);
         if let Some(f) = cache.get(&id) {
             Some(f.clone())
         } else {
@@ -280,11 +282,11 @@ impl Recovery {
         // NOTE: because the `Ver` is descending ordered by txid first, we call `rev` here to make
         //  smaller txid to apply first
         for (_, table) in self.dirty_table.iter().rev() {
-            let Location { wid, seq, off, len } = *table;
-            let Some(f) = Self::get_file(&cache, cap, &self.opt, wid, seq) else {
+            let Location { wid, pos, len } = *table;
+            let Some(f) = Self::get_file(&cache, cap, &self.opt, wid, pos.file_id) else {
                 break;
             };
-            f.read(block.mut_slice(0, len as usize), off as u64)
+            f.read(block.mut_slice(0, len as usize), pos.offset)
                 .unwrap();
             let c = ptr_to::<WalUpdate>(block.data());
             let ok = c.key();
@@ -407,7 +409,7 @@ impl Recovery {
     }
 
     fn load_map(&mut self) -> Result<PageMap, OpCode> {
-        let table = PageMap::default();
+        let map = PageMap::default();
 
         let state = self.opt.state_file();
         if state.exists() {
@@ -449,7 +451,7 @@ impl Recovery {
         }
 
         let mut block = Block::alloc(MapReader::DEFAULT_BLOCK_SIZE);
-        let mut next = 0;
+        let mut table = PageTable::default();
         for id in 0.. {
             let map_path = self.opt.map_file(id);
             if !map_path.exists() {
@@ -457,29 +459,27 @@ impl Recovery {
             }
 
             let mut reader = MapReader::new(map_path);
-            loop {
-                let o = reader.next(&mut block)?;
-                if let Some(es) = o {
-                    es.iter().for_each(|e| {
-                        next = next.max(e.page_id());
-                        if e.page_addr() == NULL_ADDR {
-                            table.insert_free(e.page_id());
-                        } else {
-                            table
-                                .index(e.page_id())
-                                .fetch_max(Swip::tagged(e.page_addr()), Relaxed);
-                        }
-                    });
-                } else {
-                    break;
-                }
+            while let Some(es) = reader.next(&mut block)? {
+                es.iter().for_each(|e| {
+                    table.add(e.page_id, e.page_addr, e.epoch);
+                });
             }
         }
-        table.set_next(next + 1);
-        Ok(table)
+
+        let mut next = 0;
+        for (&pid, m) in table.iter() {
+            next = next.max(pid);
+
+            if m.addr == NULL_ADDR {
+                map.insert_free(pid);
+            } else {
+                map.index(pid).fetch_max(Swip::tagged(m.addr), Relaxed);
+            }
+        }
+        map.set_next(next + 1);
+        Ok(map)
     }
 
-    // NOTE: althrough id wrap around is not handled, it's enough for PB-level data storeage
     fn readdir<F>(path: &PathBuf, mut f: F)
     where
         F: FnMut(&str),
@@ -496,9 +496,9 @@ impl Recovery {
         }
     }
 
-    fn load_wal_one(&self, logs: &[u32], meta: &Meta, desc: &mut WalDescHandle) {
+    fn load_wal_one(&self, logs: &[u64], meta: &Meta, desc: &mut WalDescHandle) {
         let mut oracle = meta.oracle.load(Relaxed);
-        let mut ckpt = 0;
+        let mut ckpt = Position::default();
         // assume WAL header is less than it
         let mut buf = [0u8; 128];
         // we prefer to use the latest file's last checkpoint
@@ -532,20 +532,14 @@ impl Recovery {
                         let b = ptr_to::<WalBegin>(buf.as_ptr());
                         oracle = max(oracle, b.txid);
                     }
-                    EntryType::Padding => {
-                        // do nothing
-                    }
-                    EntryType::Span => {
-                        let p = ptr_to::<WalSpan>(buf.as_ptr());
-                        pos += p.span as u64;
-                    }
                     EntryType::Update => {
                         let u = ptr_to::<WalUpdate>(buf.as_ptr());
                         pos += u.size as u64
                     }
                     EntryType::CheckPoint => {
                         // we will keep looking for the next checkpoint (the latest one)
-                        ckpt = pack_id(*i, (pos - sz as u64) as u32);
+                        ckpt.file_id = *i;
+                        ckpt.offset = pos - sz as u64;
                         find_ckpt = true;
                     }
                     _ => {}
@@ -560,7 +554,7 @@ impl Recovery {
     }
 
     fn load_data(&self, maps: &[u32], meta: &Meta, mapping: &mut Mapping) {
-        let mut last_id = NEXT_ID;
+        let mut last_id = INIT_ID;
         // old to new
         for i in maps.iter() {
             let i = *i;
@@ -578,7 +572,7 @@ impl Recovery {
     }
 
     fn enumerate(&mut self, meta: &Meta, desc: &mut [WalDescHandle], mapping: &mut Mapping) {
-        let mut logs: Vec<Vec<u32>> = vec![Vec::new(); desc.len()];
+        let mut logs: Vec<Vec<u64>> = vec![Vec::new(); desc.len()];
         let mut maps = Vec::new();
 
         Self::readdir(&self.opt.db_root, |name| {
@@ -594,7 +588,7 @@ impl Recovery {
                 let v: Vec<&str> = name.split("_").collect();
                 assert_eq!(v.len(), 3);
                 let wid = v[1].parse::<u16>().expect("invalid number");
-                let seq = v[2].parse::<u32>().expect("invalid number");
+                let seq = v[2].parse::<u64>().expect("invalid number");
                 logs[wid as usize].push(seq);
             }
         });

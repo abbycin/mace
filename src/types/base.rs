@@ -9,7 +9,7 @@ use crate::{
         sst::Sst,
         traits::{IAlloc, IBoxHeader, ICodec, IHeader, IKey, ILoader, IVal},
     },
-    utils::{ADDR_LEN, INIT_ADDR, NULL_PID},
+    utils::{ADDR_LEN, NULL_ADDR, NULL_PID},
 };
 
 impl BaseView {
@@ -298,7 +298,7 @@ impl BaseView {
         let mut p = a.allocate(size);
         let h = p.header_mut();
         h.kind = TagKind::Base;
-        h.link = 0;
+        h.link = NULL_ADDR;
         h.node_type = if IS_INDEX {
             NodeType::Intl
         } else {
@@ -498,7 +498,7 @@ where
             } else {
                 let link = p.box_header().link;
                 self.sibling_pos = 0;
-                if link != INIT_ADDR {
+                if link != NULL_ADDR {
                     self.sibling = Some(self.loader.pin_load(link).as_base());
                     continue;
                 }
@@ -809,8 +809,7 @@ impl<'a> SeekableIter<'a> {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::Cell, collections::HashMap};
-
+    use crate::utils::INIT_EPOCH;
     use crate::{
         types::{
             data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Value, Ver},
@@ -820,6 +819,7 @@ mod test {
         },
         utils::{MutRef, NULL_PID},
     };
+    use std::{cell::Cell, collections::HashMap};
 
     struct Inner {
         off: Cell<u64>,
@@ -829,6 +829,7 @@ mod test {
     #[derive(Clone)]
     struct Allocator {
         inner: MutRef<Inner>,
+        epoch: u64,
     }
 
     impl Allocator {
@@ -838,6 +839,7 @@ mod test {
                     off: Cell::new(0),
                     map: HashMap::new(),
                 }),
+                epoch: INIT_EPOCH,
             }
         }
     }
@@ -847,7 +849,8 @@ mod test {
             let r = &mut self.inner;
             let old = r.off.get();
             r.off.set(old + size as u64);
-            let b = BoxRef::alloc(size as u32, old);
+            let b = BoxRef::alloc(size as u32, old, self.epoch);
+            self.epoch += 1;
             r.map.insert(old, b.clone());
             b
         }

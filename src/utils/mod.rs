@@ -1,10 +1,12 @@
 use std::{
+    fmt::Debug,
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicI64, AtomicU32, Ordering::Relaxed},
+    sync::atomic::{
+        AtomicI64, AtomicU32,
+        Ordering::{Relaxed, Release},
+    },
 };
-
-use rand::Rng;
 
 pub(crate) mod bitmap;
 pub(crate) mod block;
@@ -17,18 +19,19 @@ pub(crate) mod spooky;
 pub(crate) mod varint;
 
 pub(crate) const NULL_PID: u64 = 0;
+pub(crate) const ROOT_PID: u64 = 1;
 pub(crate) const NULL_ADDR: u64 = u64::MAX;
 pub(crate) const INIT_ADDR: u64 = 0;
 pub const ADDR_LEN: usize = size_of::<u64>();
-pub(crate) const ROOT_PID: u64 = 1;
-pub(crate) const NEXT_ID: u32 = 1;
-pub(crate) const INVALID_ID: u32 = 0;
-pub(crate) const NULL_ID: u32 = u32::MAX;
+pub(crate) const INIT_ID: u32 = 0;
 pub(crate) const INIT_CMD: u32 = 1;
 pub(crate) const NULL_CMD: u32 = u32::MAX;
 /// NOTE: must larger than wmk_oldest_tx(which is 0 by default)
 pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
+pub(crate) const INIT_EPOCH: u64 = 0;
+pub(crate) const NULL_EPOCH: u64 = u64::MAX;
+pub(crate) const MAX_NODE_SIZE: usize = 16 << 20;
 
 #[derive(Debug, PartialEq)]
 pub enum OpCode {
@@ -110,7 +113,7 @@ pub(crate) const fn unpack_id(x: u64) -> (u32, u32) {
 }
 
 pub fn rand_range(range: Range<usize>) -> usize {
-    rand::thread_rng().gen_range(range)
+    rand::random_range(range)
 }
 
 static_assert!(size_of::<usize>() == 8, "exepct 64 bits pointer width");
@@ -224,7 +227,7 @@ impl<T> MutRef<T> {
     }
 
     fn dec(&self) -> u32 {
-        unsafe { (*self.inner).refcnt.fetch_sub(1, Relaxed) }
+        unsafe { (*self.inner).refcnt.fetch_sub(1, Release) }
     }
 }
 
@@ -313,6 +316,85 @@ impl<T> Clone for Handle<T> {
 
 unsafe impl<T> Send for Handle<T> {}
 unsafe impl<T> Sync for Handle<T> {}
+
+#[repr(align(64))]
+pub(crate) struct CachePad<T> {
+    data: T,
+}
+
+impl<T> Deref for CachePad<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl<T> DerefMut for CachePad<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
+impl<T> Default for CachePad<T>
+where
+    T: Default,
+{
+    fn default() -> Self {
+        Self { data: T::default() }
+    }
+}
+
+impl<T> Clone for CachePad<T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+        }
+    }
+}
+
+impl<T> Copy for CachePad<T> where T: Copy {}
+
+impl<T> Debug for CachePad<T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{:?}", self.data))
+    }
+}
+
+impl<T> Ord for CachePad<T>
+where
+    T: Ord,
+{
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.data.cmp(&other.data)
+    }
+}
+
+impl<T> PartialOrd for CachePad<T>
+where
+    T: PartialOrd,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.data.partial_cmp(&other.data)
+    }
+}
+
+impl<T> PartialEq for CachePad<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.data.eq(&other.data)
+    }
+}
+
+impl<T> Eq for CachePad<T> where T: Eq {}
 
 #[cfg(test)]
 mod test {

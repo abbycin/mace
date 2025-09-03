@@ -3,7 +3,7 @@ use std::{
     ops::{Deref, DerefMut},
     ptr::null_mut,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{
             AtomicU64,
             Ordering::{Relaxed, Release},
@@ -14,7 +14,7 @@ use std::{
 use super::{cc::ConcurrencyControl, context::Context, log::Logging};
 use crate::{
     cc::wal::Location,
-    utils::{NEXT_ID, options::ParsedOptions, pack_id, unpack_id},
+    utils::{data::Position, options::ParsedOptions},
 };
 use crate::{
     cc::wal::WalReader,
@@ -25,7 +25,7 @@ use crossbeam_epoch::Guard;
 
 pub struct Worker {
     pub cc: ConcurrencyControl,
-    pub start_ckpt: AtomicU64,
+    pub start_ckpt: RwLock<Position>,
     pub tx_id: AtomicU64,
     // a copy of tx_id not shared among threads
     pub start_ts: u64,
@@ -38,7 +38,7 @@ impl Worker {
     fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<ParsedOptions>) -> Self {
         Self {
             cc: ConcurrencyControl::new(opt.workers),
-            start_ckpt: AtomicU64::new(pack_id(NEXT_ID, 0)),
+            start_ckpt: RwLock::new(Position::default()),
             tx_id: AtomicU64::new(0),
             start_ts: 0,
             id: desc.worker,
@@ -82,11 +82,12 @@ impl SyncWorker {
 
     fn init(&mut self, ctx: &Context, start_ts: u64, read_only: bool) {
         let id = self.id;
-        self.start_ckpt.store(0, Relaxed);
         self.tx_id.store(start_ts, Relaxed);
         self.start_ts = start_ts;
         self.logging.reset_ckpt_cnt();
-        self.start_ckpt.store(self.logging.last_ckpt(), Relaxed);
+        let mut lk = self.start_ckpt.write().unwrap();
+        *lk = self.logging.last_ckpt();
+        drop(lk);
         self.cc.global_wmk_tx.store(ctx.wmk_oldest(), Relaxed);
         if !read_only {
             self.cc.commit_tree.compact(ctx, id);
@@ -137,11 +138,9 @@ impl SyncWorker {
         w.logging.stabilize();
         let mut block = Block::alloc(SMALL_SIZE);
         let reader = WalReader::new(ctx, g);
-        let (seq, off) = unpack_id(w.logging.lsn());
         let location = Location {
             wid: self.id as u32,
-            seq,
-            off,
+            pos: w.logging.lsn(),
             len: 0,
         };
         reader.rollback(&mut block, txid, location, tree, Some(*self));

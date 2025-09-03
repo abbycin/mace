@@ -15,7 +15,7 @@ fn upsert_delete() {
     opt.wal_file_size = 32 << 20;
 
     let db = Mace::new(opt.validate().unwrap()).unwrap();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     const N: usize = 1200;
     let mut kvs = Vec::with_capacity(N);
@@ -23,9 +23,9 @@ fn upsert_delete() {
         kvs.push((
             format!(
                 "{}{}{}_{:06}",
-                rng.gen_range(48..112),
-                rng.gen_range(48..112),
-                rng.gen_range(48..120),
+                rng.random_range(48..112),
+                rng.random_range(48..112),
+                rng.random_range(48..120),
                 i,
             ),
             vec![233u8; 16384],

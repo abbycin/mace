@@ -12,6 +12,9 @@ pub struct Options {
     /// force sync data to disk for every log write, the default value is `true`, turning it off may
     /// result in data loss, while turning it on may result in performance degradation
     pub sync_on_write: bool,
+    /// compact all cached node on exit. default value is false, it only compact cached nodes that
+    /// must be compacted
+    pub compact_on_exit: bool,
     /// hardware concurrency count, range in [1, cores]
     ///
     /// **Once set, it cannot be modified**
@@ -23,12 +26,14 @@ pub struct Options {
     /// perform compaction when [`Self::gc_ratio`] is reached
     pub gc_eager: bool,
     /// if [`Self::gc_eager`] is not set, the compaction will only be triggered when active data
-    /// size can be compacted into [`Self::gc_compacted_size`], the default setting is [`Self::arena_size`]
+    /// size can be compacted into [`Self::gc_compacted_size`], the default setting is [`Self::data_file_size`]
     pub gc_compacted_size: usize,
     /// is temperary storage, if true, db_root will be unlinked on exit
     pub tmp_store: bool,
     /// where to store database files
-    pub db_root: PathBuf,
+    pub(crate) db_root: PathBuf,
+    /// where to store wal files, the default value is `db_root/wal`
+    pub wal_root: PathBuf,
     /// number of file meta will be cached, it will be sharded into 32 slots
     pub file_cache: usize,
     /// node cache memory size
@@ -87,6 +92,7 @@ impl Options {
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
             sync_on_write: true,
+            compact_on_exit: false,
             workers: std::thread::available_parallelism()
                 .unwrap()
                 .get()
@@ -97,6 +103,7 @@ impl Options {
             gc_eager: true,
             gc_compacted_size: Self::DATA_FILE_SIZE,
             db_root: db_root.as_ref().to_path_buf(),
+            wal_root: db_root.as_ref().to_path_buf(),
             file_cache: Self::FILE_CACHE, // each shard has 16 entries
             cache_capacity: Self::CACHE_CAP,
             cache_evict_pct: 10, // 10% evict 100MB every time
@@ -179,15 +186,19 @@ impl Options {
     }
 
     pub fn wal_root(&self) -> PathBuf {
-        self.db_root.join("wal")
+        if self.wal_root == self.db_root {
+            self.db_root.join("wal")
+        } else {
+            self.wal_root.clone()
+        }
     }
 
-    pub fn wal_file(&self, wid: u16, seq: u32) -> PathBuf {
+    pub fn wal_file(&self, wid: u16, seq: u64) -> PathBuf {
         self.wal_root()
             .join(format!("{}{}_{}", Self::WAL_PREFIX, wid, seq))
     }
 
-    pub fn wal_backup(&self, wid: u16, seq: u32) -> PathBuf {
+    pub fn wal_backup(&self, wid: u16, seq: u64) -> PathBuf {
         self.wal_root()
             .join(format!("{}{}_{}", Self::WAL_STABLE, wid, seq))
     }

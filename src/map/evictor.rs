@@ -71,7 +71,10 @@ impl Evictor {
 
         for &pid in &pids {
             let swip = Swip::new(self.table.get(pid));
-            assert!(!swip.is_null());
+            // it's passible when a node was unmapped, but not removed from cache yet (concurrently)
+            if swip.is_null() {
+                continue;
+            }
             assert!(!swip.is_tagged());
 
             let old = Page::<Loader>::from_swip(swip.untagged());
@@ -98,7 +101,7 @@ impl Evictor {
         }
     }
 
-    fn evict_all(&mut self, safe_txid: u64) {
+    fn evict_all(&mut self, safe_txid: u64, limit: usize) {
         let mut pids = Vec::new();
         self.cache.reclaim(|x| pids.push(x));
 
@@ -108,17 +111,22 @@ impl Evictor {
                 continue;
             }
             let old = Page::<Loader>::from_swip(swip.untagged());
-            let mut node = old.compact(self, safe_txid, true);
-            node.set_pid(old.pid());
+            if self.opt.compact_on_exit || old.delta_len() >= limit {
+                let mut node = old.compact(self, safe_txid, true);
+                node.set_pid(old.pid());
+                self.commit();
+            }
             old.reclaim();
-            self.commit();
         }
     }
 
     fn compact(&mut self, pids: &[u64], g: &Guard, limit: usize, safe_txid: u64) {
         for &pid in pids {
             let swip = Swip::new(self.table.get(pid));
-            assert!(!swip.is_null());
+            // it's passible when a node was unmapped, but not removed from cache yet (concurrently)
+            if swip.is_null() {
+                continue;
+            }
             assert!(!swip.is_tagged());
             let old = Page::<Loader>::from_swip(swip.untagged());
             if old.delta_len() > limit {
@@ -228,7 +236,7 @@ fn evictor_loop(mut e: Evictor) {
         match r {
             Ok(s) => match s {
                 SharedState::Quit => {
-                    e.evict_all(safe_txid);
+                    e.evict_all(safe_txid, limit);
                     break;
                 }
                 SharedState::Evict => {

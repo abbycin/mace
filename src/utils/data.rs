@@ -1,5 +1,4 @@
-use super::{INIT_ORACLE, MutRef, NEXT_ID, NULL_ADDR, OpCode, pack_id, rand_range};
-use crate::utils::INVALID_ID;
+use super::{INIT_EPOCH, INIT_ID, INIT_ORACLE, MutRef, OpCode, rand_range};
 use crate::utils::bitmap::{BITMAP_ELEM_LEN, BitMap, BitmapElemType};
 use crc32c::Crc32cHasher;
 use io::{GatherIO, IoVec};
@@ -32,13 +31,13 @@ pub struct Reloc {
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed(1))]
-pub struct AddrMap {
+pub struct AddrPair {
     /// pack_id(lid, off)
     pub(crate) key: u64,
     pub(crate) val: Reloc,
 }
 
-impl AddrMap {
+impl AddrPair {
     pub const LEN: usize = size_of::<Self>();
     pub fn new(key: u64, off: usize, len: u32, seq: u32) -> Self {
         Self {
@@ -56,11 +55,19 @@ impl AddrMap {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct AddrMap {
+    pub epoch: u64,
+    /// pack_id(file_id, offset)
+    pub addr: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 #[repr(C, packed(1))]
 pub struct MapEntry {
-    page_id: u64,
-    /// (file_id << 32) | arena_offset
-    page_addr: u64,
+    pub page_id: u64,
+    // NULL_ADDR for delete mark
+    pub page_addr: u64,
+    pub epoch: u64,
 }
 
 impl MapEntry {
@@ -70,21 +77,12 @@ impl MapEntry {
             std::slice::from_raw_parts(p, size_of::<Self>())
         }
     }
-
-    pub fn page_id(&self) -> u64 {
-        self.page_id
-    }
-
-    pub fn page_addr(&self) -> u64 {
-        self.page_addr
-    }
 }
 
 #[derive(Default)]
 pub struct PageTable {
     // pid, addr, len(offset + len)
-    // NULL_ADDR for delete mark
-    data: BTreeMap<u64, u64>,
+    data: BTreeMap<u64, AddrMap>,
 }
 
 impl PageTable {
@@ -92,11 +90,12 @@ impl PageTable {
 
     pub fn collect(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        self.data.iter().for_each(|x| {
+        self.data.iter().for_each(|(&pid, m)| {
             buf.extend_from_slice(
                 MapEntry {
-                    page_id: *x.0,
-                    page_addr: *x.1,
+                    page_id: pid,
+                    page_addr: m.addr,
+                    epoch: m.epoch,
                 }
                 .as_slice(),
             );
@@ -104,21 +103,21 @@ impl PageTable {
         buf
     }
 
-    pub fn add(&mut self, pid: u64, addr: u64) {
+    pub fn add(&mut self, pid: u64, addr: u64, epoch: u64) {
         self.data
             .entry(pid)
             .and_modify(|x| {
-                // when current is normal addr, or it's a tombstone and reused
-                if *x < addr || *x == NULL_ADDR {
-                    *x = addr;
+                if x.epoch < epoch {
+                    x.epoch = epoch;
+                    x.addr = addr;
                 }
             })
-            .or_insert(addr);
+            .or_insert(AddrMap { epoch, addr });
     }
 }
 
 impl Deref for PageTable {
-    type Target = BTreeMap<u64, u64>;
+    type Target = BTreeMap<u64, AddrMap>;
     fn deref(&self) -> &Self::Target {
         &self.data
     }
@@ -161,7 +160,7 @@ impl GatherWriter {
         Self {
             path: path.clone(),
             file: Self::open(path),
-            queue: Vec::new(),
+            queue: Vec::with_capacity(max_iovcnt),
             queued_len: 0,
             max_iovcnt: if max_iovcnt >= Self::MAX_IOVCNT {
                 Self::DEFAULT_IOVCNT
@@ -230,13 +229,41 @@ impl Drop for GatherWriter {
 const META_COMPLETE: u16 = 114;
 const META_IMCOMPLETE: u16 = 514;
 
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct Position {
+    pub file_id: u64,
+    pub offset: u64,
+}
+
+impl Ord for Position {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self.file_id.cmp(&other.file_id) {
+            std::cmp::Ordering::Equal => self.offset.cmp(&other.offset),
+            o => o,
+        }
+    }
+}
+
+impl PartialOrd for Position {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Position {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Position {}
+
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct WalDesc {
-    // TODO: change to u128
-    pub checkpoint: u64,
-    // TODO: change to u64
-    pub wal_id: u32,
+    pub checkpoint: Position,
+    pub wal_id: u64,
     pub worker: u16,
     padding: u16,
     pub checksum: u32,
@@ -245,8 +272,8 @@ pub(crate) struct WalDesc {
 impl WalDesc {
     pub(crate) fn new(wid: u16) -> Self {
         Self {
-            checkpoint: pack_id(NEXT_ID, 0),
-            wal_id: NEXT_ID,
+            checkpoint: Position::default(),
+            wal_id: INIT_ID as u64,
             worker: wid,
             padding: 0,
             checksum: 0,
@@ -307,15 +334,15 @@ pub(crate) type WalDescHandle = MutRef<WalDesc>;
 #[repr(C)]
 pub struct MetaInner {
     pub oracle: AtomicU64,
-    /// oldest flushed txid
-    pub wmk_oldest: AtomicU64,
+    /// monotonically  increasing epoch
+    pub epoch: AtomicU64,
+    /// monotonically increasing on flush
+    pub tick: AtomicU64,
     /// the latest data file id
     pub next_data: AtomicU32,
-    /// indicate data has been flushed
-    pub flush_data: AtomicU32,
-    state: AtomicU32,
+    pub oldest_data: AtomicU32,
+    state: AtomicU16,
     nr_worker: AtomicU16,
-    padding: u16,
     checksum: AtomicU32,
 }
 
@@ -325,12 +352,12 @@ impl MetaInner {
     fn new(workers: usize) -> Self {
         Self {
             oracle: AtomicU64::new(INIT_ORACLE),
-            wmk_oldest: AtomicU64::new(0),
-            next_data: AtomicU32::new(NEXT_ID),
-            state: AtomicU32::new(META_IMCOMPLETE as u32),
-            flush_data: AtomicU32::new(INVALID_ID),
+            epoch: AtomicU64::new(INIT_EPOCH),
+            tick: AtomicU64::new(0),
+            next_data: AtomicU32::new(INIT_ID),
+            oldest_data: AtomicU32::new(INIT_ID),
+            state: AtomicU16::new(META_IMCOMPLETE),
             nr_worker: AtomicU16::new(workers as u16),
-            padding: 0,
             checksum: AtomicU32::new(0),
         }
     }
@@ -342,10 +369,6 @@ impl MetaInner {
         }
     }
 
-    pub fn safe_tixd(&self) -> u64 {
-        self.wmk_oldest.load(Relaxed)
-    }
-
     pub fn checksum(&self) -> u32 {
         self.checksum.load(Relaxed)
     }
@@ -353,6 +376,10 @@ impl MetaInner {
 
 #[repr(C)]
 pub struct Meta {
+    /// indicate data has been flushed
+    pub flush_data: AtomicU32,
+    /// oldest flushed txid
+    pub wmk_oldest: AtomicU64,
     pub inner: MetaInner,
     pub mask: RwLock<BitMap>,
     pub mtx: Mutex<()>,
@@ -368,10 +395,16 @@ impl Deref for Meta {
 impl Meta {
     pub fn new(workers: usize) -> Self {
         Self {
+            flush_data: AtomicU32::new(INIT_ID),
+            wmk_oldest: AtomicU64::new(0),
             inner: MetaInner::new(workers),
             mask: RwLock::new(BitMap::new(workers as u32)),
             mtx: Mutex::new(()),
         }
+    }
+
+    pub fn safe_tixd(&self) -> u64 {
+        self.wmk_oldest.load(Relaxed)
     }
 
     fn crc32_inner(&self, m: &BitMap) -> u32 {
@@ -385,8 +418,10 @@ impl Meta {
         h.write_u64(self.inner.oracle.load(Relaxed));
         // no calc wmk_oldest on purpose
         h.write_u32(self.inner.next_data.load(Relaxed));
-        // no flush_data on purpose
-        h.write_u32(self.inner.state.load(Relaxed));
+        h.write_u32(self.inner.oldest_data.load(Relaxed));
+        h.write_u64(self.inner.epoch.load(Relaxed));
+        h.write_u64(self.inner.tick.load(Relaxed));
+        h.write_u16(self.inner.state.load(Relaxed));
         h.write_u16(self.inner.nr_worker.load(Relaxed));
         h.write_u16(m.len() as u16);
         h.finish() as u32
@@ -425,6 +460,8 @@ impl Meta {
         }
 
         let tmp = Self {
+            flush_data: AtomicU32::new(INIT_ID),
+            wmk_oldest: AtomicU64::new(0),
             inner,
             mask: RwLock::new(BitMap::from(s)),
             mtx: Mutex::new(()),
@@ -436,7 +473,7 @@ impl Meta {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.inner.state.load(Relaxed) == META_COMPLETE as u32
+        self.inner.state.load(Relaxed) == META_COMPLETE
     }
 
     fn serialize(&self, m: &BitMap) -> Vec<u8> {
@@ -476,7 +513,7 @@ impl Meta {
         } else {
             META_IMCOMPLETE
         };
-        self.inner.state.store(state as u32, Relaxed);
+        self.inner.state.store(state, Relaxed);
         let lk = self.mask.read().unwrap();
         f.write_all(self.serialize(&lk).as_slice())
             .expect("can't write meta file");
@@ -507,7 +544,7 @@ mod test {
 
         std::fs::create_dir_all(&root).unwrap();
 
-        meta.state.store(META_COMPLETE as u32, Relaxed);
+        meta.state.store(META_COMPLETE, Relaxed);
         meta.next_data.store(1, Relaxed);
         meta.oracle.store(5, Relaxed);
         meta.mask.write().unwrap().set(0);

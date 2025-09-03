@@ -80,7 +80,6 @@ pub trait ITree {
         V: IVal;
 }
 
-/// NOTE: the type impl [`IAsSlice`] must be `packed(1)`
 pub trait IAsSlice: Sized {
     fn as_slice(&self) -> &[u8] {
         let p = self as *const Self;

@@ -19,9 +19,6 @@ mod utils;
 mod types;
 pub use index::ValRef;
 
-#[cfg(feature = "metric")]
-use crate::index::{g_alloc_status, g_cas_status};
-
 struct Inner {
     store: Arc<Store>,
     meta: Arc<Meta>,
@@ -33,9 +30,14 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         #[cfg(feature = "metric")]
-        log::info!("\n{:#?}", g_alloc_status());
-        #[cfg(feature = "metric")]
-        log::info!("\n{:#?}", g_cas_status());
+        {
+            use crate::index::{g_alloc_status, g_cas_status};
+            use crate::map::g_flush_status;
+
+            log::info!("\n{:#?}", g_alloc_status());
+            log::info!("\n{:#?}", g_cas_status());
+            log::info!("\n{:#?}", g_flush_status());
+        }
         self.gc.quit();
         self.store.quit();
         self.meta.sync(self.store.opt.meta_file(), true);
@@ -68,8 +70,7 @@ impl Mace {
         )?);
         let tree = Self::open(store.clone());
 
-        let g = crossbeam_epoch::pin();
-        recover.phase2(&g, meta.clone(), &desc, &tree);
+        recover.phase2(meta.clone(), &desc, &tree);
         meta.sync(opt.meta_file(), false);
         store.start();
         let handle = start_gc(store.clone(), meta.clone(), store.buffer.mapping);
@@ -97,11 +98,18 @@ impl Mace {
         &self.inner.opt
     }
 
-    pub fn pause_gc(&self) {
+    /// notify gc has been disabled, gc will not start when timeout
+    pub fn disable_gc(&self) {
         self.inner.gc.pause();
     }
 
-    pub fn resume_gc(&self) {
+    /// notify gc has been enabled, gc will start when timeout
+    pub fn enable_gc(&self) {
         self.inner.gc.resume();
+    }
+
+    /// notify gc to work even when gc was disabled, block until gc has been finished
+    pub fn start_gc(&self) {
+        self.inner.gc.start();
     }
 }

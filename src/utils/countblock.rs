@@ -25,13 +25,13 @@ impl Countblock {
 
     pub fn wait(&self) {
         let mut c = self.lock.lock().expect("can't lock");
-        while *c <= 0 {
+        *c -= 1;
+        while *c == 0 {
             c = self
                 .cond
                 .wait_timeout(c, Duration::from_millis(1))
                 .expect("can't wait")
                 .0;
         }
-        *c -= 1;
     }
 }

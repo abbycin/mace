@@ -11,7 +11,10 @@ use crate::{
     utils::{INIT_CMD, NULL_CMD},
 };
 use crossbeam_epoch::Guard;
-use std::sync::{Arc, atomic::Ordering::Relaxed};
+use std::sync::{
+    Arc,
+    atomic::Ordering::{Relaxed, Release},
+};
 use std::{cell::Cell, sync::atomic::AtomicU32};
 
 struct Package<'a> {
@@ -33,7 +36,7 @@ impl Clone for Package<'_> {
 
 impl Package<'_> {
     fn destroy(&self) {
-        if self.refcnt.fetch_sub(1, Relaxed) == 1 {
+        if self.refcnt.fetch_sub(1, Release) == 1 {
             self.ctx.free_worker(self.w);
         }
     }
@@ -133,7 +136,7 @@ impl<'a> TxnKV<'a> {
 
     fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<ValRef>, OpCode>
     where
-        F: FnMut(&Option<(Key, ValRef)>, Ver, SyncWorker) -> Result<(), OpCode>,
+        F: FnMut(&Option<(Key, ValRef)>, Ver, SyncWorker) -> Result<(u16, u64), OpCode>,
     {
         #[cfg(feature = "extra_check")]
         assert!(!k.as_ref().is_empty(), "key must be non-empty");
@@ -176,7 +179,7 @@ impl<'a> TxnKV<'a> {
                 w.logging
                     .record_update(ver, WalPut::new(v.len()), k, [].as_slice(), v);
             }
-            r
+            r.map(|_| (w.id, w.logging.seq()))
         })
         .map(|_| ())
     }
@@ -207,7 +210,7 @@ impl<'a> TxnKV<'a> {
                         v,
                     );
                 }
-                Ok(())
+                Ok((w.id, w.logging.seq()))
             }
         })
         .map(|x| x.unwrap())
@@ -246,7 +249,7 @@ impl<'a> TxnKV<'a> {
                     w.logging
                         .record_update(ver, WalPut::new(v.len()), k, &[], v);
                 }
-                Ok(())
+                Ok((w.id, w.logging.seq()))
             }
             Some((rk, rv)) => {
                 let t = rv.unwrap();
@@ -268,7 +271,7 @@ impl<'a> TxnKV<'a> {
                         v,
                     );
                 }
-                Ok(())
+                Ok((w.id, w.logging.seq()))
             }
         })
     }
@@ -314,7 +317,7 @@ impl<'a> TxnKV<'a> {
                             [].as_slice(),
                         );
                     }
-                    Ok(())
+                    Ok((w.id, w.logging.seq()))
                 }
             })
             .map(|x| x.unwrap())

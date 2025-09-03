@@ -158,7 +158,7 @@ where
 
     drop(db);
 
-    f(&save, 1);
+    f(&save, 0);
 
     save.tmp_store = true;
     let db = Mace::new(save.validate().unwrap()).unwrap();
@@ -260,7 +260,7 @@ fn put_update(remove_data: bool) {
     drop(db);
     break_meta(save.meta_file());
     if remove_data {
-        let entries = std::fs::read_dir(&save.db_root).unwrap();
+        let entries = std::fs::read_dir(&*path).unwrap();
         for e in entries {
             let e = e.unwrap();
             let file = e.path();

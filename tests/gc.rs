@@ -53,7 +53,7 @@ fn gc_data() -> Result<(), OpCode> {
 
     let mut count = 0;
     let mut max_id = 0;
-    let dir = std::fs::read_dir(&db.options().db_root).unwrap();
+    let dir = std::fs::read_dir(&*path).unwrap();
     for d in dir {
         let x = d.unwrap();
         let f = x.file_name();
@@ -78,7 +78,7 @@ fn abort_txn() {
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let kv = db.begin().unwrap();
-    for i in 0..1000 {
+    for i in 0..5000 {
         let x = format!("key_{i}");
         let _ = kv.put(&x, &x);
     }

@@ -1,5 +1,5 @@
 use mace::{Mace, OpCode, Options, RandomPath};
-use rand::{seq::SliceRandom, thread_rng};
+use rand::seq::SliceRandom;
 use std::{
     collections::HashSet,
     sync::{Arc, Barrier, RwLock},
@@ -124,7 +124,7 @@ fn get_del() -> Result<(), OpCode> {
 
     let cnt = n / 3;
     let mut removed = Vec::with_capacity(cnt);
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
 
     v.shuffle(&mut rng);
 

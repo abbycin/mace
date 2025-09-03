@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::OpCode;
-use crate::utils::{INIT_ADDR, NULL_PID, ROOT_PID};
+use crate::utils::{INIT_ADDR, ROOT_PID};
 
 const SLOT_SIZE: u64 = 1u64 << 16;
 
@@ -46,7 +46,7 @@ impl PageMap {
         let mut lk = self.free.lock().unwrap();
         if let Some(pid) = lk.pop_first() {
             self.index(pid)
-                .compare_exchange(NULL_PID, data, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(INIT_ADDR, data, Ordering::AcqRel, Ordering::Relaxed)
                 .expect("impossible");
             return Some(pid);
         }
@@ -57,7 +57,7 @@ impl PageMap {
 
         while cnt < MAX_ID {
             match self.index(pid).compare_exchange(
-                NULL_PID,
+                INIT_ADDR,
                 data,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
@@ -72,7 +72,7 @@ impl PageMap {
 
     pub fn unmap(&self, pid: u64, addr: u64) -> Result<(), OpCode> {
         self.index(pid)
-            .compare_exchange(addr, NULL_PID, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(addr, INIT_ADDR, Ordering::AcqRel, Ordering::Relaxed)
             .map_err(|_| OpCode::Again)?;
 
         let mut lk = self.free.lock().unwrap();

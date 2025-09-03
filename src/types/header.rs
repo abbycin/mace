@@ -1,6 +1,6 @@
 use std::sync::atomic::AtomicU32;
 
-use crate::{static_assert, types::traits::ICodec, utils::varint::Varint64};
+use crate::{static_assert, types::traits::ICodec};
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[repr(u8)]
@@ -30,7 +30,7 @@ pub(crate) enum TagFlag {
 #[derive(Debug)]
 #[repr(C, align(8))]
 pub(crate) struct BoxHeader {
-    pub(super) refcnt: AtomicU32,
+    pub(super) refs: AtomicU32,
     pub(crate) kind: TagKind,
     pub(crate) node_type: NodeType,
     pub(crate) flag: TagFlag,
@@ -39,6 +39,7 @@ pub(crate) struct BoxHeader {
     pub(crate) pid: u64,
     /// current BoxRef's logical address
     pub(crate) addr: u64,
+    pub(crate) epoch: u64,
     /// logical address link to next BoxRef
     pub(crate) link: u64,
 }
@@ -121,7 +122,6 @@ impl Slot {
 impl ICodec for Slot {
     fn packed_size(&self) -> usize {
         if self.is_inline() {
-            debug_assert_eq!(Varint64::size(self.meta), Self::LOCAL_LEN);
             Self::LOCAL_LEN
         } else {
             Self::REMOTE_LEN
@@ -134,7 +134,7 @@ impl ICodec for Slot {
 
     fn encode_to(&self, to: &mut [u8]) {
         if self.is_inline() {
-            Varint64::encode(to, self.meta);
+            to[0] = self.meta as u8;
         } else {
             debug_assert!(to.len() == Self::REMOTE_LEN);
             let be = self.meta.to_be_bytes();

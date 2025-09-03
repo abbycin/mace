@@ -113,13 +113,8 @@ impl Tree {
         SysTxn::new(&self.store, g)
     }
 
-    pub(crate) fn load_node(
-        &self,
-        store: &Store,
-        g: &Guard,
-        pid: u64,
-    ) -> Result<Option<Page>, OpCode> {
-        if let Some(p) = store.buffer.load(pid) {
+    pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
+        if let Some(p) = self.store.buffer.load(pid) {
             let child_pid = p.header().merging_child;
             if child_pid != 0 {
                 self.merge_node(&p, child_pid, g)?;
@@ -165,7 +160,7 @@ impl Tree {
             .unwrap();
 
         loop {
-            let cursor_ptr = if let Some(x) = self.load_node(&self.store, g, cursor_pid)? {
+            let cursor_ptr = if let Some(x) = self.load_node(g, cursor_pid)? {
                 x
             } else {
                 // the pid has been merged
@@ -245,12 +240,11 @@ impl Tree {
                 return Ok(true);
             }
             inc_cas!(remove_node_fail);
-            let new_ptr =
-                if let Some(x) = self.load_node(&self.store, g, parent_ptr.box_header().pid)? {
-                    x
-                } else {
-                    return Ok(false);
-                };
+            let new_ptr = if let Some(x) = self.load_node(g, parent_ptr.box_header().pid)? {
+                x
+            } else {
+                return Ok(false);
+            };
             if new_ptr.header().merging_child != child_pid {
                 return Ok(false);
             }
@@ -269,7 +263,7 @@ impl Tree {
         safe_txid: u64,
     ) -> Result<Option<Page>, OpCode> {
         loop {
-            let page = if let Some(x) = self.load_node(&self.store, g, child_pid)? {
+            let page = if let Some(x) = self.load_node(g, child_pid)? {
                 x
             } else {
                 return Ok(None);
@@ -417,7 +411,7 @@ impl Tree {
         let mut leftmost = false;
 
         loop {
-            let node_ptr = if let Some(x) = self.load_node(&self.store, g, cursor)? {
+            let node_ptr = if let Some(x) = self.load_node(g, cursor)? {
                 x
             } else {
                 return Err(OpCode::Again);
@@ -550,9 +544,9 @@ impl Tree {
     where
         K: IKey,
         V: IVal,
-        F: FnMut(Page, &K) -> Result<(), OpCode>,
+        F: FnMut(Page, &K) -> Result<(u16, u64), OpCode>,
     {
-        check(old, k)?;
+        let (wid, seq) = check(old, k)?;
 
         let mut txn = self.begin(g);
         let b = DeltaView::from_key_val(&mut txn, *k, *v);
@@ -570,7 +564,7 @@ impl Tree {
             return Err(OpCode::Again);
         }
 
-        txn.commit();
+        txn.record_and_commit(wid as usize, seq);
         new.save(b); // save the delta itself until page was reclaimed
 
         Ok(())
@@ -583,7 +577,8 @@ impl Tree {
     {
         let page = self.find_leaf(g, key.raw())?;
 
-        self.link(g, page, key, val, |_, _| Ok(()))?;
+        // it never write log, so use default value is always OK
+        self.link(g, page, key, val, |_, _| Ok((0, 0)))?;
         Ok(())
     }
 
@@ -614,7 +609,7 @@ impl Tree {
     ) -> Result<Option<ValRef>, OpCode>
     where
         T: IValCodec,
-        F: FnMut(&Option<(Key, ValRef)>) -> Result<(), OpCode>,
+        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u16, u64), OpCode>,
     {
         let page = self.find_leaf(g, key.raw)?;
         let mut r = None;
@@ -639,7 +634,7 @@ impl Tree {
     ) -> Result<Option<ValRef>, OpCode>
     where
         T: IValCodec,
-        V: FnMut(&Option<(Key, ValRef)>) -> Result<(), OpCode>,
+        V: FnMut(&Option<(Key, ValRef)>) -> Result<(u16, u64), OpCode>,
     {
         let size = key.packed_size() + val.packed_size();
         if size > self.store.opt.max_data_size() {

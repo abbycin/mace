@@ -11,6 +11,7 @@ pub use load::Mapping;
 
 use crate::{
     OpCode,
+    cc::context::Context,
     map::{buffer::Buffers, cache::NodeCache, evictor::Evictor, table::PageMap},
     utils::{Handle, data::Meta, options::ParsedOptions},
 };
@@ -22,6 +23,7 @@ pub(crate) enum SharedState {
 
 pub(crate) fn create_buffer(
     page: Arc<PageMap>,
+    ctx: Handle<Context>,
     opt: Arc<ParsedOptions>,
     meta: Arc<Meta>,
     mapping: Mapping,
@@ -31,8 +33,7 @@ pub(crate) fn create_buffer(
     let node_cache = Arc::new(NodeCache::new(opt.cache_capacity, opt.cache_evict_pct));
     let buffer = Handle::new(Buffers::new(
         page.clone(),
-        opt.clone(),
-        meta.clone(),
+        ctx,
         node_cache.clone(),
         mapping,
         tx,
@@ -42,3 +43,6 @@ pub(crate) fn create_buffer(
     evictor.start();
     Ok(buffer)
 }
+
+#[cfg(feature = "metric")]
+pub use flush::g_flush_status;

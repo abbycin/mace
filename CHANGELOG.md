@@ -1,3 +1,19 @@
+## [0.0.12] 2025-09-03
+### Changes
+- Remove some unused wal record type, and unused fields in WalCheckpoint
+- Bring back log flush before data
+- Extend wal id and checkpoint position to 64 bits
+- Partially support data file id wrapping (use an extra `tick` to generate `up2`, an extra `epoch` to keep `MapEntry` ordered)
+- Allow to store wal file in separate directory
+- Limit maximum node size
+
+### Bug fixes
+- Fix `warm_up` not change cache size
+- Fix possible assert in evictor (when pid unmap happens)
+- Fix possible infinite loop in `NodeCache::evict` and `GarbageCollector::process_data`
+- Fix `fetch_sub` memory order
+
+
 ## [0.0.11] 2025-08-27
 ### Changes
 - Add new evictor thread compact node on cache evict and randomly pick active node for compaction

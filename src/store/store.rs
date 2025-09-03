@@ -9,8 +9,8 @@ use crate::{OpCode, ROOT_PID};
 use std::sync::Arc;
 
 pub struct Store {
+    pub(crate) context: Handle<Context>,
     pub(crate) buffer: Handle<Buffers>,
-    pub(crate) context: Context,
     pub(crate) page: Arc<PageMap>,
     pub(crate) opt: Arc<ParsedOptions>,
 }
@@ -24,9 +24,10 @@ impl Store {
         desc: &[WalDescHandle],
     ) -> Result<Self, OpCode> {
         let page = Arc::new(page);
+        let ctx = Handle::new(Context::new(opt.clone(), meta.clone(), desc));
         Ok(Self {
-            buffer: create_buffer(page.clone(), opt.clone(), meta.clone(), mapping)?,
-            context: Context::new(opt.clone(), meta, desc),
+            buffer: create_buffer(page.clone(), ctx, opt.clone(), meta.clone(), mapping)?,
+            context: ctx,
             page,
             opt,
         })
@@ -42,8 +43,9 @@ impl Store {
     }
 
     pub(crate) fn quit(&self) {
-        self.context.quit(); // flush log first
         self.buffer.quit();
+        self.context.quit();
         self.buffer.reclaim();
+        self.context.reclaim();
     }
 }

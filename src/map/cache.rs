@@ -1,8 +1,8 @@
 use dashmap::{DashMap, Entry};
-use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicIsize, AtomicU32};
 
-use crate::utils::rand_range;
+use crate::utils::{ROOT_PID, rand_range};
 
 #[derive(PartialEq, Eq, Copy, Clone, PartialOrd, Ord, Debug)]
 #[repr(u32)]
@@ -65,11 +65,15 @@ impl NodeCache {
     }
 
     pub(crate) fn full(&self) -> bool {
-        self.used.load(Relaxed) >= self.cap
+        self.used.load(Acquire) >= self.cap
     }
 
     pub(crate) fn almost_full(&self) -> bool {
-        self.used.load(Relaxed) >= self.cap * 100 / 80
+        self.used.load(Acquire) >= self.cap * 100 / 80
+    }
+
+    pub(crate) fn cap(&self) -> usize {
+        self.cap as usize
     }
 
     pub(crate) fn put(&self, pid: u64, state: u32, size: isize) {
@@ -91,8 +95,9 @@ impl NodeCache {
         }
     }
 
-    pub(crate) fn warm(&self, pid: u64) {
+    pub(crate) fn warm(&self, pid: u64, size: usize) {
         if let Some(v) = self.map.get(&pid) {
+            self.used.fetch_add(size as isize - v.size, Relaxed);
             v.warm();
         }
     }
@@ -105,30 +110,35 @@ impl NodeCache {
 
     pub(crate) fn evict(&self) -> Vec<u64> {
         let tgt = self.pct * self.cap / 100;
+        let mut cnt = self.pct as usize * self.map.len() / 100;
         let mut pids = Vec::new();
 
-        while self.cap - self.used.load(Relaxed) < tgt {
+        while self.cap - self.used.load(Acquire) < tgt && cnt > 0 {
             self.map.retain(|&pid, v| {
-                if rand_range(0..100) > self.pct as usize || v.cool() > CacheState::Cool {
+                if pid == ROOT_PID
+                    || rand_range(0..100) > self.pct as usize
+                    || v.cool() > CacheState::Cool
+                {
                     return true;
                 }
-                self.used.fetch_sub(v.size, Relaxed);
+                self.used.fetch_sub(v.size, Release);
                 pids.push(pid);
                 false
             });
+            cnt -= 1;
         }
         pids
     }
 
     pub(crate) fn compact(&self) -> Vec<u64> {
         let mut pids = Vec::new();
-        let mut count = self.pct * self.cap / 100;
+        let mut cnt = self.pct as usize * self.map.len() / 100;
 
         for i in self.map.iter() {
-            if count == 0 {
+            if cnt == 0 {
                 break;
             }
-            count -= 1;
+            cnt -= 1;
             if rand_range(0..100) > self.pct as usize && i.status() > CacheState::Cool {
                 pids.push(*i.key());
             }
