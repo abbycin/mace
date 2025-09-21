@@ -5,7 +5,7 @@ use crate::types::data::Record;
 use crate::types::node::RawLeafIter;
 use crate::types::refbox::{DeltaView, KeyRef};
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IHeader, ILoader};
-use crate::utils::ROOT_PID;
+use crate::utils::{MutRef, ROOT_PID};
 use crate::{
     OpCode, Store,
     types::{
@@ -17,11 +17,11 @@ use crate::{
     utils::{NULL_CMD, NULL_PID},
 };
 use crossbeam_epoch::Guard;
+use std::borrow::Cow;
 use std::cmp::Ordering::Equal;
 use std::ops::{Bound, RangeBounds};
 #[cfg(feature = "metric")]
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::{borrow::Cow, sync::Arc};
 
 #[cfg(feature = "metric")]
 macro_rules! inc_cas {
@@ -75,19 +75,19 @@ impl Drop for ValRef {
 
 #[derive(Clone)]
 pub struct Tree {
-    pub(crate) store: Arc<Store>,
+    pub(crate) store: MutRef<Store>,
     root_index: Index,
 }
 
 impl Tree {
-    pub fn load(store: Arc<Store>, root_pid: u64) -> Self {
+    pub fn load(store: MutRef<Store>, root_pid: u64) -> Self {
         Self {
             store: store.clone(),
             root_index: Index::new(root_pid),
         }
     }
 
-    pub fn new(store: Arc<Store>, root_pid: u64) -> Self {
+    pub fn new(store: MutRef<Store>, root_pid: u64) -> Self {
         let this = Self::load(store, root_pid);
         this.init();
 
@@ -106,7 +106,7 @@ impl Tree {
     }
 
     fn txid(&self) -> u64 {
-        self.store.context.meta.safe_tixd()
+        self.store.context.numerics.safe_tixd()
     }
 
     pub(crate) fn begin<'a>(&'a self, g: &'a Guard) -> SysTxn<'a> {
@@ -114,7 +114,7 @@ impl Tree {
     }
 
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
-        if let Some(p) = self.store.buffer.load(pid) {
+        if let Some(p) = self.store.buffer.load(pid)? {
             let child_pid = p.header().merging_child;
             if child_pid != 0 {
                 self.merge_node(&p, child_pid, g)?;
@@ -300,7 +300,7 @@ impl Tree {
         let Ok(node_lock) = node.try_lock() else {
             return Err(OpCode::Again);
         };
-        let safe_txid = self.store.context.meta.safe_tixd();
+        let safe_txid = self.store.context.numerics.safe_tixd();
         let mut txn = self.begin(g);
         // 1.
         let (mut lnode, rnode) = node.split(&mut txn);
@@ -398,6 +398,7 @@ impl Tree {
         loop {
             match self.try_find_leaf(g, k) {
                 Err(OpCode::Again) => continue,
+                Err(OpCode::NotFound) => return Err(OpCode::NotFound),
                 Err(e) => unreachable!("invalid opcode {:?}", e),
                 o => return o,
             }
@@ -449,7 +450,7 @@ impl Tree {
                     // into two parts and the lhs part is current node_ptr but not install the new
                     // root yet, here we complete the new root install phase
                     assert_eq!(cursor, self.root_index.pid);
-                    let safe_txid = self.store.context.meta.safe_tixd();
+                    let safe_txid = self.store.context.numerics.safe_tixd();
                     let _ = self.split_root(g, node_ptr, rpid, hi.unwrap(), safe_txid);
                     return Err(OpCode::Again);
                 }
@@ -713,7 +714,7 @@ impl Tree {
         let ver = Ver::new(start_ts, NULL_CMD);
 
         while addr != NULL_PID {
-            let ptr = l.pin_load(addr).as_base();
+            let ptr = l.pin_load(addr).ok_or(OpCode::NotFound)?.as_base();
             let sst = ptr.sst::<Ver, Value<Record>>();
             let pos = sst.lower_bound(l, &ver).unwrap_or_else(|pos| pos);
             if pos < sst.header().elems as usize {

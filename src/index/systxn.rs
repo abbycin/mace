@@ -121,8 +121,8 @@ impl<'a> SysTxn<'a> {
             .cas(pid, old.swip(), new.swip())
             .map(|_| {
                 old.garbage_collect(self);
-                self.g.defer(move || old.reclaim());
                 self.store.buffer.warm(pid, new.size());
+                self.g.defer(move || old.reclaim());
                 new
             })
             .map_err(|_| {

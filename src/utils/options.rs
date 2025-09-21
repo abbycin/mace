@@ -34,8 +34,6 @@ pub struct Options {
     pub(crate) db_root: PathBuf,
     /// where to store wal files, the default value is `db_root/wal`
     pub wal_root: PathBuf,
-    /// number of file meta will be cached, it will be sharded into 32 slots
-    pub file_cache: usize,
     /// node cache memory size
     pub cache_capacity: usize,
     /// percent of items will be evicted at once, default is 10%
@@ -104,7 +102,6 @@ impl Options {
             gc_compacted_size: Self::DATA_FILE_SIZE,
             db_root: db_root.as_ref().to_path_buf(),
             wal_root: db_root.as_ref().to_path_buf(),
-            file_cache: Self::FILE_CACHE, // each shard has 16 entries
             cache_capacity: Self::CACHE_CAP,
             cache_evict_pct: 10, // 10% evict 100MB every time
             cache_count: Self::CACHE_CNT,
@@ -134,9 +131,6 @@ impl Options {
         if self.consolidate_threshold > self.split_elems / 2 {
             self.consolidate_threshold = self.split_elems / 2;
         }
-        if self.file_cache < LRU_SHARD {
-            self.file_cache = Self::FILE_CACHE;
-        }
         if self.cache_count < LRU_SHARD {
             self.cache_count = Self::CACHE_CNT;
         }
@@ -147,7 +141,23 @@ impl Options {
         if self.max_inline_size > self.max_kv_size {
             self.max_inline_size = Self::INLINE_SIZE;
         }
+
+        self.create_dir();
         Ok(ParsedOptions { inner: self })
+    }
+
+    pub fn create_dir(&self) {
+        let (db_root, data_root, wal_root) = (self.db_root(), self.data_root(), self.wal_root());
+
+        if !db_root.exists() {
+            std::fs::create_dir_all(db_root).expect("cant' create db root");
+        }
+        if !data_root.exists() {
+            std::fs::create_dir_all(data_root).expect("can't create data root");
+        }
+        if !wal_root.exists() {
+            std::fs::create_dir_all(wal_root).expect("can't create wal root");
+        }
     }
 }
 
@@ -164,25 +174,19 @@ impl Deref for ParsedOptions {
 }
 
 impl Options {
-    pub const DATA_PREFIX: &'static str = "data_";
-    pub const MAP_PREFIX: &'static str = "map_";
-    pub const WAL_PREFIX: &'static str = "wal_";
-    pub const WAL_STABLE: &'static str = "stable_wal_";
+    pub const SEP: &'static str = "_";
+    pub const DATA_PREFIX: &'static str = "data";
+    pub const WAL_PREFIX: &'static str = "wal";
+    pub const WAL_STABLE: &'static str = "stable-wal";
+    pub const MANIFEST_PREFIX: &'static str = "manifest";
 
-    pub fn state_file(&self) -> PathBuf {
-        self.db_root.join("state")
-    }
-
-    pub fn map_file_tmp(&self, id: u32) -> PathBuf {
-        self.db_root.join(format!("{}{}_tmp", Self::MAP_PREFIX, id))
-    }
-
-    pub fn map_file(&self, id: u32) -> PathBuf {
-        self.db_root.join(format!("{}{}", Self::MAP_PREFIX, id))
+    pub fn data_root(&self) -> PathBuf {
+        self.db_root().join("data")
     }
 
     pub fn data_file(&self, id: u32) -> PathBuf {
-        self.db_root.join(format!("{}{}", Self::DATA_PREFIX, id))
+        self.data_root()
+            .join(format!("{}{}{}", Self::DATA_PREFIX, Self::SEP, id))
     }
 
     pub fn wal_root(&self) -> PathBuf {
@@ -193,25 +197,48 @@ impl Options {
         }
     }
 
+    pub fn db_root(&self) -> PathBuf {
+        self.db_root.clone()
+    }
+
     pub fn wal_file(&self, wid: u16, seq: u64) -> PathBuf {
-        self.wal_root()
-            .join(format!("{}{}_{}", Self::WAL_PREFIX, wid, seq))
+        self.wal_root().join(format!(
+            "{}{}{}{}{}",
+            Self::WAL_PREFIX,
+            Self::SEP,
+            wid,
+            Self::SEP,
+            seq
+        ))
     }
 
     pub fn wal_backup(&self, wid: u16, seq: u64) -> PathBuf {
-        self.wal_root()
-            .join(format!("{}{}_{}", Self::WAL_STABLE, wid, seq))
+        self.wal_root().join(format!(
+            "{}{}{}{}{}",
+            Self::WAL_STABLE,
+            Self::SEP,
+            wid,
+            Self::SEP,
+            seq
+        ))
     }
 
     pub fn desc_file(&self, wid: u16) -> PathBuf {
-        if wid == u16::MAX {
-            self.db_root.join("meta")
-        } else {
-            self.wal_root().join(format!("meta_{wid}"))
-        }
+        self.wal_root().join(format!("meta_{wid}"))
     }
-    pub fn meta_file(&self) -> PathBuf {
-        self.desc_file(u16::MAX)
+
+    pub fn manifest(&self, seq: u64) -> PathBuf {
+        self.db_root
+            .join(format!("{}{}{}", Self::MANIFEST_PREFIX, Self::SEP, seq))
+    }
+
+    pub fn snapshot(&self, seq: u64) -> PathBuf {
+        self.db_root.join(format!(
+            "{}{}{}.snapshot",
+            Self::MANIFEST_PREFIX,
+            Self::SEP,
+            seq
+        ))
     }
 }
 

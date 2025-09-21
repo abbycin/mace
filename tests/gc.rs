@@ -1,9 +1,11 @@
-#[cfg(feature = "test_disable_recycle")]
+#[cfg(feature = "disable_recycle")]
+use std::fs::File;
+#[cfg(feature = "disable_recycle")]
 use std::io::Write;
 
 use mace::{Mace, OpCode, Options, RandomPath};
 
-#[cfg(feature = "test_disable_recycle")]
+#[cfg(feature = "disable_recycle")]
 #[test]
 fn gc_data() -> Result<(), OpCode> {
     let path = RandomPath::new();
@@ -12,9 +14,10 @@ fn gc_data() -> Result<(), OpCode> {
     opt.sync_on_write = false;
     opt.gc_eager = true;
     opt.gc_timeout = 20;
-    opt.gc_ratio = 10;
+    opt.gc_ratio = 5;
     opt.data_file_size = 512 << 10;
     opt.gc_compacted_size = opt.data_file_size as usize;
+    let saved = opt.clone();
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let cap = 20000;
@@ -30,17 +33,9 @@ fn gc_data() -> Result<(), OpCode> {
         kv.commit()?;
     }
 
-    let meta = db.options().meta_file();
-
     drop(db);
 
-    // break the meta file
-    let mut f = std::fs::File::options()
-        .truncate(false)
-        .append(true)
-        .open(meta)
-        .unwrap();
-    f.write_all(&[233]).unwrap();
+    break_meta(&saved);
 
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
@@ -53,13 +48,13 @@ fn gc_data() -> Result<(), OpCode> {
 
     let mut count = 0;
     let mut max_id = 0;
-    let dir = std::fs::read_dir(&*path).unwrap();
+    let dir = std::fs::read_dir(db.options().data_root()).unwrap();
     for d in dir {
         let x = d.unwrap();
         let f = x.file_name();
         let name = f.to_str().unwrap();
         if name.starts_with(Options::DATA_PREFIX) {
-            let v: Vec<&str> = name.split(Options::DATA_PREFIX).collect();
+            let v: Vec<&str> = name.split(Options::SEP).collect();
             let id = v[1].parse::<u32>().expect("invalid number");
             count += 1;
             max_id = max_id.max(id);
@@ -87,7 +82,7 @@ fn abort_txn() {
     assert!(r.is_err() && r.err().unwrap() == OpCode::AbortTx);
 }
 
-#[cfg(feature = "test_disable_recycle")]
+#[cfg(feature = "disable_recycle")]
 #[test]
 fn gc_wal() {
     let path = RandomPath::tmp();
@@ -118,4 +113,26 @@ fn gc_wal() {
 
     let backup = db.options().wal_backup(0, 1);
     assert!(backup.exists());
+}
+
+#[cfg(feature = "disable_recycle")]
+fn break_meta(opt: &Options) {
+    let d = std::fs::read_dir(opt.db_root()).unwrap();
+    let mut last = 0;
+    for f in d.flatten() {
+        let tmp = f.file_name();
+        let name = tmp.to_str().unwrap();
+        if name.starts_with(Options::MANIFEST_PREFIX) {
+            let v: Vec<&str> = name.split(Options::SEP).collect();
+            let seq = v[1].parse::<u64>().unwrap();
+            last = last.max(seq);
+        }
+    }
+    let mut f = File::options()
+        .truncate(false)
+        .append(true)
+        .open(opt.manifest(last))
+        .unwrap();
+    // append a Begin
+    f.write_all(&[1]).unwrap();
 }

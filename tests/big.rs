@@ -85,14 +85,15 @@ fn big_kv() {
 
     drop(db);
 
-    // test recover from bad meta
+    // test recover from imcomplete manifest
 
     let mut f = File::options()
         .truncate(false)
         .append(true)
-        .open(saved.meta_file())
+        .open(saved.manifest(0))
         .unwrap();
-    f.write_all(&[233]).unwrap();
+    // append a Begin
+    f.write_all(&[1]).unwrap();
 
     saved.tmp_store = true;
     let db = Mace::new(saved.validate().unwrap()).unwrap();
@@ -133,14 +134,15 @@ fn big_kv2() {
     drop(view);
     drop(db);
 
-    // test recover from bad meta
+    // test recover from imcomplete manifest
 
     let mut f = File::options()
         .truncate(false)
         .append(true)
-        .open(saved.meta_file())
+        .open(saved.manifest(0))
         .unwrap();
-    f.write_all(&[233]).unwrap();
+    // append a Begin
+    f.write_all(&[1]).unwrap();
 
     saved.tmp_store = true;
     let db = Mace::new(saved.validate().unwrap()).unwrap();

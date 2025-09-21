@@ -14,7 +14,11 @@ pub trait ILoader: IInlineSize + Clone {
 
     fn pin(&self, data: BoxRef);
 
-    fn pin_load(&self, addr: u64) -> BoxView;
+    fn pin_load(&self, addr: u64) -> Option<BoxView>;
+
+    fn pin_load_unchecked(&self, addr: u64) -> BoxView {
+        self.pin_load(addr).expect("must exist")
+    }
 }
 
 pub trait IAsBoxRef {
@@ -87,7 +91,7 @@ pub trait IAsSlice: Sized {
     }
 
     fn from_slice(x: &[u8]) -> Self {
-        assert_eq!(x.len(), size_of::<Self>());
+        assert!(x.len() >= size_of::<Self>());
         unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
     }
 }

@@ -5,10 +5,7 @@ use std::{
     hash::Hasher,
     sync::{
         Arc,
-        atomic::{
-            Ordering::{Acquire, Relaxed, Release},
-            fence,
-        },
+        atomic::Ordering::Relaxed,
         mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     },
     thread::JoinHandle,
@@ -17,15 +14,15 @@ use std::{
 
 use crate::{
     Options, Store,
-    map::{
-        Mapping,
-        data::{DataFooter, DataMetaReader, FileStat},
-    },
+    cc::context::Context,
+    map::data::{DataFooter, DataMetaReader},
+    meta::{Delete, FileStat, Lid, Numerics, StatInner},
     utils::{
-        Handle,
+        Handle, MutRef,
+        bitmap::BitMap,
         block::Block,
         countblock::Countblock,
-        data::{AddrPair, GatherWriter, ID_LEN, JUNK_LEN, Meta},
+        data::{AddrPair, GatherWriter},
         unpack_id,
     },
 };
@@ -52,6 +49,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                             pause = false;
                         }
                         GC_START => {
+                            gc.process_manifest();
                             gc.process_data();
                             gc.process_wal();
                             sem.post();
@@ -61,6 +59,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                     },
                     Err(RecvTimeoutError::Timeout) => {
                         if !pause {
+                            gc.process_manifest();
                             gc.process_data();
                             gc.process_wal();
                         }
@@ -73,7 +72,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
             }
 
             sem.post();
-            log::debug!("garbage-collector thread exit");
+            log::info!("garbage-collector thread exit");
         })
         .unwrap()
 }
@@ -104,7 +103,7 @@ impl GCHandle {
     }
 }
 
-pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Handle<Mapping>) -> GCHandle {
+pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
     let (tx, rx) = channel();
     let sem = Arc::new(Countblock::new(1));
     let mut last_ckpt_seq = Vec::with_capacity(store.opt.workers);
@@ -113,8 +112,8 @@ pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Handle<Mapping>)
         last_ckpt_seq.push(seq);
     });
     let gc = GarbageCollector {
-        meta,
-        map,
+        numerics: ctx.numerics.clone(),
+        ctx,
         store,
         last_ckpt_seq,
         last_raio: 0,
@@ -127,6 +126,7 @@ pub(crate) fn start_gc(store: Arc<Store>, meta: Arc<Meta>, map: Handle<Mapping>)
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 struct Score {
     id: u32,
     logical_id: u32,
@@ -153,20 +153,25 @@ impl Score {
         }
 
         -(stat.active_size as f64 / free as f64).powi(2)
-            / (stat.total as f64 * (now - stat.up2) as f64)
+            / (stat.total_elems as f64 * (now - stat.up2) as f64)
     }
 }
 
 struct GarbageCollector {
-    meta: Arc<Meta>,
-    map: Handle<Mapping>,
-    store: Arc<Store>,
+    numerics: Arc<Numerics>,
+    ctx: Handle<Context>,
+    store: MutRef<Store>,
     last_ckpt_seq: Vec<u64>,
     last_raio: u64,
     last_total: u64,
 }
 
 impl GarbageCollector {
+    /// with SSD support, for TB level data directly write manifest snapshot is acceptable
+    fn process_manifest(&mut self) {
+        self.ctx.manifest.try_clean();
+    }
+
     fn process_data(&mut self) {
         let tgt_ratio = self.store.opt.gc_ratio as u64;
         let tgt_size = self.store.opt.gc_compacted_size;
@@ -175,7 +180,7 @@ impl GarbageCollector {
         'again: loop {
             let mut total = 0u64;
             let mut active = 0u64;
-            self.map.stats.iter().for_each(|x| {
+            self.ctx.manifest.file_stat.iter().for_each(|x| {
                 total += x.total_size as u64;
                 active += x.active_size as u64;
             });
@@ -198,18 +203,16 @@ impl GarbageCollector {
             self.last_raio = ratio;
             self.last_total = total;
 
-            let tick = self.meta.tick.load(Relaxed);
+            let tick = self.numerics.tick.load(Relaxed);
             let mut q = Vec::new();
-            let mut unmapped = HashSet::new();
             let mut unlinked = HashSet::new();
-            self.map.stats.iter().for_each(|x| {
+            self.ctx.manifest.file_stat.iter().for_each(|x| {
                 let s = x.value();
-                // NOTE: file may have no active frames, but the junks may still active, they will
-                // be filtered in `compact`
-                q.push(Score::from(*x.key(), s, tick));
-                if s.nr_active == 0 {
-                    unmapped.insert(*x.key());
+                // a data file has no active frame will be unlinked directly
+                if s.active_elems == 0 {
                     unlinked.insert(s.file_id);
+                } else {
+                    q.push(Score::from(*x.key(), s, tick));
                 }
             });
 
@@ -233,12 +236,12 @@ impl GarbageCollector {
                 victims.push(x);
 
                 if sum >= tgt_size {
-                    self.compact(victims, unmapped, unlinked);
+                    self.compact(victims, unlinked);
                     continue 'again;
                 }
             }
             if eager {
-                self.compact(victims, unmapped, unlinked);
+                self.compact(victims, unlinked);
             }
             break;
         }
@@ -282,110 +285,126 @@ impl GarbageCollector {
         }
     }
 
-    fn compact(&mut self, victims: Vec<Score>, unmapped: HashSet<u32>, mut unlinked: HashSet<u32>) {
+    fn compact(&mut self, victims: Vec<Score>, unlinked: HashSet<u32>) {
         let opt = &self.store.opt;
         let mut builder = ReWriter::new(opt, victims.len());
-        let mut lids = HashSet::new();
-        let mut dealloc = HashSet::new();
+        // including victims' logical id which are going to be mapped to new physical id
+        let mut active_lids = HashSet::new();
+        let mut inactive_lids = HashSet::new();
+        // including logical_id mapped to victims phyiscal_id and victims themselves' mapping
+        let mut unmapped_lids = Vec::with_capacity(victims.len());
+        let mut del = Delete::default();
+        let mut obsoleted = Vec::with_capacity(victims.len());
 
-        let tmp: Vec<u32> = victims
-            .iter()
-            .map(|x| {
-                let mut loader = DataMetaReader::new(opt.data_file(x.id), false).unwrap();
-                let hdr = loader.get_meta().unwrap();
-                let mut active_addr = HashSet::new();
-
-                // collect active frames
-                let v: Vec<Entry> = hdr
-                    .relocs()
-                    .iter()
-                    .filter(|m| {
-                        let stat = self.map.stats.get(&x.logical_id).unwrap();
-                        // collect total logical id
-                        dealloc.insert(unpack_id(m.key).0);
-                        // filter-out deallocated frames
-                        !stat.dealloc.test(m.val.seq)
-                    })
-                    .map(|x| {
-                        let (lid, _) = unpack_id(x.key);
-                        // the real active logical id is which still has reloc
-                        lids.insert(lid);
-                        // the real active pid -> addr entry
-                        active_addr.insert(x.key);
-                        Entry {
-                            key: x.key,
-                            off: x.val.off,
-                            len: x.val.len, // NOTE: it's frame len not payload len of the frame
-                        }
-                    })
-                    .collect();
-
-                // collect active junks
-                let mut junks = loader.get_junk().unwrap();
-                junks.sort_unstable();
-                junks.dedup();
-                // remove entries that are about to be unmapped or do not exist
-                junks.retain(|addr| {
-                    let (logical_id, _) = unpack_id(*addr);
-                    if logical_id == x.logical_id {
-                        return false;
-                    }
-                    !unmapped.contains(&logical_id) && self.map.stats.contains_key(&logical_id)
-                });
-
-                builder.add_frame(Item::new(x.id, x.up2, v));
-                builder.add_junk(junks);
-                x.id
-            })
-            .collect();
-
-        // filter-out active logical id, then the reset is about to removed from mapping
-        lids.iter().for_each(|x| {
-            dealloc.remove(x);
+        unlinked.iter().for_each(|x| {
+            del.push(*x);
         });
-        let id = self.meta.next_data.fetch_add(1, Relaxed);
+
+        victims.iter().for_each(|x| {
+            let mut loader = DataMetaReader::new(opt.data_file(x.id), false).unwrap();
+            let hdr = loader.get_meta().unwrap();
+            let mut lid = Lid::new(x.id);
+            let mut set = HashSet::new();
+
+            // collect active frames
+            let v: Vec<Entry> = hdr
+                .relocs()
+                .iter()
+                .filter(|m| {
+                    let stat = self.ctx.manifest.file_stat.get(&x.logical_id).unwrap();
+                    let (lid, _) = unpack_id(m.key);
+                    set.insert(lid);
+                    // the frames may come from other data file when current file was created
+                    // by compaction, we must move them to new location too
+                    if !stat.deleted_elems.test(m.val.seq) {
+                        active_lids.insert(lid);
+                        true
+                    } else {
+                        // excluding victims' id which is going to be mapped to new data file
+                        if lid != x.id {
+                            inactive_lids.insert(lid);
+                        }
+                        false
+                    }
+                })
+                .map(|x| Entry {
+                    key: x.key,
+                    off: x.val.off,
+                    len: x.val.len,
+                })
+                .collect();
+
+            // they are going to be unmapped or remapped
+            for id in set.iter() {
+                lid.del(*id);
+            }
+            unmapped_lids.push(lid);
+            builder.add_frame(Item::new(x.id, x.up2, v));
+            del.push(x.id);
+            obsoleted.push(x.id);
+        });
+
+        let id = self.numerics.next_file_id.fetch_add(1, Relaxed);
+        let fstat = builder.stat(id);
+        let stat = fstat.copy();
+        let mut remap_lid = Lid::new(id);
+        // remap to new id
+        for id in active_lids.iter() {
+            remap_lid.add(*id);
+        }
+
+        let mut txn = self.ctx.manifest.begin(id);
+
+        // new entry same as flush, stat must flush before lid
+        txn.record(&stat);
+        // 1. record delete first
+        for lid in &unmapped_lids {
+            txn.record(lid);
+        }
+        // 2. then record remapping
+        txn.record(&remap_lid);
+        // in case crah happens before/during deleting files
+        txn.record(&del);
+
+        // flush before commit, simplify recover process
+        txn.flush();
         builder
-            .build(lids, id)
+            .build(id)
             .inspect_err(|e| {
                 log::error!("error {e}");
             })
             .unwrap();
 
-        fence(Acquire);
+        txn.commit();
 
-        // create a new indirection
-        // NOTE: it's unnecessary to set file_id map to id individually, since `add` will replace
-        // the whole stat rather than a single file_id
-        self.map.add(id, false).expect("never happen");
-
-        unlinked.extend(tmp.iter());
-        unlinked.iter().for_each(|x| {
-            self.map.evict(*x);
-            let name = opt.data_file(*x);
-            log::info!("unlink {name:?}");
-            let _ = std::fs::remove_file(name);
+        // 1.
+        // excluding victims, because they will be remapping to fstat later, we can't remove the old
+        // mapping and then remap, which is not atomic and may cause mapping not found
+        (0..victims.len()).for_each(|_| {
+            del.pop();
         });
-
-        fence(Release);
-
-        // remove those have no reloc
-        dealloc.iter().for_each(|x| {
-            self.map.del(*x);
+        // including those logical_id in data file have no active frames, their source files were
+        // removed in previous compaction
+        inactive_lids.iter().for_each(|&id| {
+            del.push(id);
         });
+        self.ctx.manifest.retain(&del);
+        self.ctx.manifest.save_obsolete_files(&obsoleted);
 
-        // remove those have no active frames
-        unmapped.iter().for_each(|x| {
-            self.map.del(*x);
-        });
+        // 2.
+        // update in-memory mapping
+        let lids: Vec<u32> = active_lids.iter().copied().collect();
+        self.ctx.manifest.update_stat(&lids, fstat);
 
-        // remove those physical ids have been unlinked
-        self.map.retain(&unlinked);
+        // 3. it's safe to clean obsolete files, becuase no reader is reference to them
+        self.ctx.manifest.delete_files();
     }
 }
 
 struct ReWriter<'a> {
     items: Vec<Item>,
-    junks: Vec<u64>,
+    active_elems: u32,
+    active_size: usize,
     sum_up2: u64,
     total: u64,
     opt: &'a Options,
@@ -395,7 +414,8 @@ impl<'a> ReWriter<'a> {
     fn new(opt: &'a Options, cap: usize) -> Self {
         Self {
             items: Vec::with_capacity(cap),
-            junks: Vec::new(),
+            active_elems: 0,
+            active_size: 0,
             sum_up2: 0,
             total: cap as u64,
             opt,
@@ -404,20 +424,35 @@ impl<'a> ReWriter<'a> {
 
     fn add_frame(&mut self, item: Item) {
         self.sum_up2 += item.up2;
+        self.active_elems += item.pos.len() as u32;
+        self.active_size += item.pos.iter().map(|x| x.len).sum::<u32>() as usize;
         self.items.push(item);
     }
 
-    fn add_junk(&mut self, junk: Vec<u64>) {
-        self.junks.extend_from_slice(&junk);
+    fn stat(&self, id: u32) -> FileStat {
+        let up2 = self.sum_up2 / self.total;
+        FileStat {
+            inner: StatInner {
+                file_id: id,
+                _padding: 0,
+                up1: up2,
+                up2,
+                active_elems: self.active_elems,
+                total_elems: self.active_elems,
+                active_size: self.active_size,
+                total_size: self.active_size,
+            },
+            deleted_elems: BitMap::new(self.active_elems),
+        }
     }
 
-    fn build(&mut self, lids: HashSet<u32>, id: u32) -> Result<(), std::io::Error> {
+    fn build(&mut self, id: u32) -> Result<(), std::io::Error> {
         let up2 = self.sum_up2 / self.total;
         let mut block = Block::alloc(1 << 20);
         let mut seq = 0;
         let mut off = 0;
         let path = self.opt.data_file(id);
-        let mut writer = GatherWriter::new(&path, 128);
+        let mut writer = GatherWriter::append(&path, 128);
         let mut crc = Crc32cHasher::default();
         let mut reloc: Vec<u8> = Vec::new();
 
@@ -446,35 +481,16 @@ impl<'a> ReWriter<'a> {
             }
         }
 
-        let junks = unsafe {
-            std::slice::from_raw_parts(
-                self.junks.as_ptr().cast::<u8>(),
-                self.junks.len() * JUNK_LEN,
-            )
-        };
-        crc.write(junks);
-        writer.queue(junks);
-
         let s = reloc.as_slice();
         crc.write(s);
         writer.queue(s);
 
-        let lids: Vec<u32> = lids.iter().cloned().collect();
-
-        let slid =
-            unsafe { std::slice::from_raw_parts(lids.as_ptr().cast::<u8>(), lids.len() * ID_LEN) };
-        crc.write(slid);
-        writer.queue(slid);
-
         let footer = DataFooter {
             up2,
-            nr_lid: lids.len() as u32,
             nr_reloc: seq,
-            nr_junk: self.junks.len() as u32,
             nr_active: seq,
-            padding: 0,
             active_size: off,
-            padding2: 0,
+            padding: 0,
             crc: crc.finish() as u32,
         };
 

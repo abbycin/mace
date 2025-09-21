@@ -16,24 +16,21 @@ use crate::{
         data::Arena,
         table::{PageMap, Swip},
     },
+    meta::Numerics,
     types::{
         header::TagFlag,
         page::Page,
         refbox::{BoxRef, BoxView},
         traits::{IAlloc, IHeader, IInlineSize},
     },
-    utils::{
-        Handle,
-        data::{JUNK_LEN, Meta},
-        options::ParsedOptions,
-    },
+    utils::{Handle, data::JUNK_LEN, options::ParsedOptions},
 };
 
 pub(crate) struct Evictor {
     opt: Arc<ParsedOptions>,
     cache: Arc<NodeCache>,
     table: Arc<PageMap>,
-    meta: Arc<Meta>,
+    numerics: Arc<Numerics>,
     rx: Receiver<SharedState>,
     tx: Sender<()>,
     buffer: Handle<Buffers>,
@@ -48,7 +45,7 @@ impl Evictor {
         opt: Arc<ParsedOptions>,
         cache: Arc<NodeCache>,
         table: Arc<PageMap>,
-        meta: Arc<Meta>,
+        numerics: Arc<Numerics>,
         buffer: Handle<Buffers>,
         rx: Receiver<SharedState>,
         tx: Sender<()>,
@@ -57,7 +54,7 @@ impl Evictor {
             opt,
             cache,
             table,
-            meta,
+            numerics,
             rx,
             tx,
             buffer,
@@ -84,6 +81,7 @@ impl Evictor {
                 let addr = node.latest_addr();
                 assert_eq!(addr, node.base_addr());
 
+                // NOTE: other threads may perform cas in the same time
                 match self.table.cas(pid, old.swip(), Swip::tagged(addr)) {
                     Ok(_) => {
                         old.garbage_collect(self);
@@ -92,8 +90,8 @@ impl Evictor {
                         self.commit();
                     }
                     Err(_) => {
-                        // it has been load from disk just after being evict from cache, in this case
-                        // we do NOT retry, it will be compacted next time either here or somewhere
+                        // it has been replaced by other thread, in this case, we do NOT retry, it
+                        // will be compacted next time either here or somewhere
                         self.rollback();
                     }
                 }
@@ -138,6 +136,7 @@ impl Evictor {
                 let new = Page::new(node);
                 // never retry
                 // probability of successful CAS > 70%
+                // NOTE: other threads may perform cas in the same time
                 match self.table.cas(pid, old.swip(), new.swip()) {
                     Ok(_) => {
                         old.garbage_collect(self);
@@ -225,13 +224,14 @@ impl IInlineSize for Evictor {
 }
 
 fn evictor_loop(mut e: Evictor) {
+    const TMO_MS: u64 = 200;
+    const COMPACT_TMO: u64 = 5 * TMO_MS;
+    let mut compact_cnt = 0;
     loop {
         let r = e.rx.recv_timeout(Duration::from_millis(200));
         let g = crossbeam_epoch::pin();
         let limit = e.opt.split_elems as usize / 4;
-        let safe_txid = e.meta.safe_tixd();
-
-        {}
+        let safe_txid = e.numerics.safe_tixd();
 
         match r {
             Ok(s) => match s {
@@ -244,9 +244,10 @@ fn evictor_loop(mut e: Evictor) {
                 }
             },
             Err(RecvTimeoutError::Timeout) => {
+                compact_cnt += TMO_MS;
                 if e.cache.almost_full() {
                     e.evict(&g, limit, safe_txid);
-                } else {
+                } else if compact_cnt >= COMPACT_TMO {
                     let pids = e.cache.compact();
                     e.compact(&pids, &g, limit, safe_txid);
                 }

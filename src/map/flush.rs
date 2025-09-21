@@ -1,8 +1,7 @@
 use crate::cc::context::Context;
 use crate::map::data::{Arena, DataBuilder};
-use crate::utils::Handle;
 use crate::utils::countblock::Countblock;
-use crate::utils::data::Meta;
+use crate::utils::{Handle, unpack_id};
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "metric")]
@@ -19,7 +18,6 @@ use std::{
 };
 
 use super::data::{FlushData, MapBuilder};
-use super::load::Mapping;
 
 #[cfg(feature = "metric")]
 macro_rules! record {
@@ -33,10 +31,9 @@ macro_rules! record {
     ($x: ident) => {};
 }
 
-fn flush_data(msg: FlushData, map: Handle<Mapping>, meta: &Meta) {
+fn flush_data(msg: FlushData, mut ctx: Handle<Context>) {
     let id = msg.id();
-    let tick = meta.tick.load(Relaxed);
-    let mut data_builder = DataBuilder::new(tick, id);
+    let mut data_builder = DataBuilder::new();
     let mut map_builder = MapBuilder::new();
 
     let mut size: usize = 0;
@@ -48,45 +45,50 @@ fn flush_data(msg: FlushData, map: Handle<Mapping>, meta: &Meta) {
     }
 
     if !data_builder.is_empty() {
-        let opt = &map.opt;
-        if !opt.db_root.exists() {
-            log::error!("db_root {:?} not exist", opt.db_root);
-            panic!("db_root {:?} not exist", opt.db_root);
+        let path = ctx.opt.data_file(id);
+        if !ctx.opt.db_root.exists() {
+            log::error!("db_root {:?} not exist", ctx.opt.db_root);
+            panic!("db_root {:?} not exist", ctx.opt.db_root);
         }
-        let mut state = io::File::options()
-            .create(true)
-            .trunc(true)
-            .write(true)
-            .open(&opt.state_file())
-            .unwrap();
 
-        data_builder.build(opt, &mut state);
+        let tick = ctx.manifest.numerics.tick.load(Relaxed);
+        let fstat = data_builder.stat(id, tick);
+        let stat = fstat.copy();
+        let mut junks = Vec::with_capacity(data_builder.junks.len());
+        for f in data_builder.junks.iter() {
+            junks.extend_from_slice(f.data_slice::<u64>());
+        }
+        junks.sort_unstable_by(|x, y| unpack_id(*x).0.cmp(&unpack_id(*y).0));
+        let stats = ctx.manifest.apply_junks(tick, &junks);
+
+        let mut txn = ctx.manifest.begin(id);
+
+        txn.record(&stat); // new entry
+        txn.record(&map_builder.table());
+
+        stats.iter().for_each(|x| txn.record(x));
+
+        // flush before commit
+        txn.flush();
+        data_builder.build(tick, path);
+
+        let nbytes = txn.commit();
+
         log::debug!(
-            "flush to {:?} active {} frames, size {} sizes {:?}",
-            map.opt.data_file(id),
+            "flush to {:?} active {} frames, size {} sizes {:?} manifest {}",
+            ctx.opt.data_file(id),
             data_builder.active_frames(),
             size,
             msg.sizes(),
+            nbytes
         );
-        map_builder.build(opt, &mut state);
 
-        drop(state);
-        let _ = std::fs::remove_file(opt.state_file());
-
-        // must after state stabilized
-        meta.flush_data.fetch_add(1, Relaxed);
-
-        map.add(id, false).expect("never happen");
-        for f in data_builder.junks.iter() {
-            let junks = f.data_slice::<u64>();
-            map.apply_junks(tick, junks);
-        }
-        // notify sender before map compaction
-        msg.mark_done();
-        map_builder.compact(opt);
-    } else {
-        msg.mark_done();
+        // create a new mapping must after data has been flushed, so that GC can read fully flushed
+        // data file
+        ctx.manifest.add_stat(fstat);
+        ctx.manifest.numerics.tick.fetch_add(1, Relaxed);
     }
+    msg.mark_done();
 }
 
 fn safe_to_flush(data: &FlushData, ctx: Handle<Context>) -> bool {
@@ -101,11 +103,11 @@ fn safe_to_flush(data: &FlushData, ctx: Handle<Context>) -> bool {
     true
 }
 
-fn try_flush(q: &mut VecDeque<FlushData>, map: Handle<Mapping>, ctx: Handle<Context>) -> bool {
+fn try_flush(q: &mut VecDeque<FlushData>, ctx: Handle<Context>) -> bool {
     while let Some(data) = q.pop_front() {
         record!(total);
         if safe_to_flush(&data, ctx) && data.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
-            flush_data(data, map, &ctx.meta)
+            flush_data(data, ctx)
         } else {
             q.push_front(data);
             record!(retry);
@@ -117,7 +119,6 @@ fn try_flush(q: &mut VecDeque<FlushData>, map: Handle<Mapping>, ctx: Handle<Cont
 
 fn flush_thread(
     rx: Receiver<FlushData>,
-    map: Handle<Mapping>,
     ctx: Handle<Context>,
     sync: Arc<Notifier>,
 ) -> JoinHandle<()> {
@@ -133,19 +134,19 @@ fn flush_thread(
                     Err(RecvTimeoutError::Disconnected) => break,
                     _ => {}
                 }
-                try_flush(&mut q, map, ctx);
+                try_flush(&mut q, ctx);
             }
 
             while let Ok(data) = rx.try_recv() {
                 q.push_back(data);
             }
 
-            while !try_flush(&mut q, map, ctx) {
+            while !try_flush(&mut q, ctx) {
                 std::hint::spin_loop();
             }
             drop(rx);
             sync.notify_done();
-            log::debug!("flusher thread eixt");
+            log::info!("flusher thread eixt");
         })
         .expect("can't build flush thread")
 }
@@ -186,10 +187,10 @@ pub struct Flush {
 }
 
 impl Flush {
-    pub fn new(mapping: Handle<Mapping>, ctx: Handle<Context>) -> Self {
+    pub fn new(ctx: Handle<Context>) -> Self {
         let (tx, rx) = channel();
         let sync = Arc::new(Notifier::new());
-        flush_thread(rx, mapping, ctx, sync.clone());
+        flush_thread(rx, ctx, sync.clone());
         Self { tx, sync }
     }
 

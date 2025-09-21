@@ -1,80 +1,13 @@
 use super::wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate};
+use crate::meta::Numerics;
 use crate::types::data::Ver;
+use crate::utils::block::Ring;
 use crate::utils::data::Position;
 use crate::utils::{data::WalDescHandle, options::ParsedOptions};
-use crate::{
-    cc::wal::EntryType,
-    utils::{
-        block::Block,
-        data::{GatherWriter, Meta},
-    },
-};
+use crate::{cc::wal::EntryType, utils::data::GatherWriter};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, atomic::Ordering::Relaxed};
-
-struct Ring {
-    data: Block,
-    head: usize,
-    tail: usize,
-}
-
-impl Ring {
-    fn new(cap: usize) -> Self {
-        let data = Block::aligned_alloc(cap, 1);
-        data.zero();
-        assert!(data.len().is_power_of_two());
-        Self {
-            data,
-            head: 0,
-            tail: 0,
-        }
-    }
-
-    fn avail(&self) -> usize {
-        self.data.len() - self.distance()
-    }
-
-    // NOTE: the request buffer never wraps around
-    fn prod<'a>(&mut self, size: usize) -> &'a mut [u8] {
-        debug_assert!(self.avail() >= size);
-        let mut b = self.tail;
-        self.tail += size;
-
-        b &= self.mask();
-        self.data.mut_slice(b, size)
-    }
-
-    fn cons(&mut self, pos: usize) {
-        self.head += pos;
-    }
-
-    fn distance(&self) -> usize {
-        #[cfg(feature = "extra_check")]
-        assert!(self.tail >= self.head);
-        self.tail - self.head
-    }
-
-    fn head(&self) -> usize {
-        self.head & self.mask()
-    }
-
-    fn tail(&self) -> usize {
-        self.tail & self.mask()
-    }
-
-    fn slice(&self, pos: usize, len: usize) -> &[u8] {
-        self.data.slice(pos, len)
-    }
-
-    fn mask(&self) -> usize {
-        self.data.len() - 1
-    }
-
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-}
 
 pub struct LogBuilder<'a> {
     off: usize,
@@ -117,11 +50,11 @@ pub struct Logging {
     /// so use a number rather than real Position
     flushed_lsn: AtomicU64,
     ops: usize,
-    last_data: u32,
+    last_data: u64,
     writer: GatherWriter,
     opt: Arc<ParsedOptions>,
     pub desc: WalDescHandle,
-    meta: Arc<Meta>,
+    numerics: Arc<Numerics>,
     #[cfg(feature = "extra_check")]
     last_id: u64,
 }
@@ -133,8 +66,12 @@ impl Logging {
     const AUTO_STABLE_SIZE: usize = 4 << 20;
     const AUTO_STABLE_OPS: u32 = <usize>::trailing_zeros(32);
 
-    pub(crate) fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<ParsedOptions>) -> Self {
-        let writer = GatherWriter::new(&opt.wal_file(desc.worker, desc.wal_id), 16);
+    pub(crate) fn new(
+        desc: WalDescHandle,
+        numerics: Arc<Numerics>,
+        opt: Arc<ParsedOptions>,
+    ) -> Self {
+        let writer = GatherWriter::append(&opt.wal_file(desc.worker, desc.wal_id), 16);
         let pos = Position {
             file_id: desc.wal_id,
             offset: writer.pos(),
@@ -149,11 +86,11 @@ impl Logging {
             seq: 0,
             flushed_lsn: AtomicU64::new(0),
             ops: 0,
-            last_data: meta.flush_data.load(Relaxed),
+            last_data: numerics.tick.load(Relaxed),
             writer,
             opt,
             desc,
-            meta,
+            numerics,
             #[cfg(feature = "extra_check")]
             last_id: 0,
         }
@@ -314,7 +251,7 @@ impl Logging {
         if !self.enable_ckpt.load(Relaxed) {
             return;
         }
-        let cur = self.meta.flush_data.load(Relaxed);
+        let cur = self.numerics.tick.load(Relaxed);
 
         if cur == self.last_data {
             return;
@@ -344,19 +281,8 @@ impl Logging {
         self.last_ckpt = self.log_pos;
 
         self.log_pos.offset += ckpt.encoded_len() as u64;
-        self.sync_desc();
-        let wid = self.desc.worker as u32;
-
-        let lk = self.meta.mask.read().unwrap();
-        if !lk.test(wid) {
-            drop(lk);
-            let mut lk = self.meta.mask.write().unwrap();
-            lk.set(wid);
-            drop(lk);
-            self.meta.sync(self.opt.meta_file(), false);
-        }
-
         self.ckpt_cnt += 1;
+        self.sync_desc();
     }
 
     fn sync_desc(&self) {

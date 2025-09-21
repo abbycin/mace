@@ -33,11 +33,11 @@ where
         }
     }
 
-    pub(crate) fn load(l: L, addr: u64) -> Self {
-        let node = Node::<L>::load(addr, l);
-        Self {
+    pub(crate) fn load(l: L, addr: u64) -> Option<Self> {
+        let node = Node::<L>::load(addr, l)?;
+        Some(Self {
             inner: Handle::new(node),
-        }
+        })
     }
 
     pub(crate) fn swip(&self) -> u64 {

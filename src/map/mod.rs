@@ -3,17 +3,15 @@ pub(crate) mod cache;
 pub(crate) mod data;
 mod evictor;
 mod flush;
-mod load;
 pub mod table;
 use std::sync::{Arc, mpsc::channel};
-
-pub use load::Mapping;
 
 use crate::{
     OpCode,
     cc::context::Context,
     map::{buffer::Buffers, cache::NodeCache, evictor::Evictor, table::PageMap},
-    utils::{Handle, data::Meta, options::ParsedOptions},
+    meta::Numerics,
+    utils::{Handle, options::ParsedOptions},
 };
 
 pub(crate) enum SharedState {
@@ -25,8 +23,7 @@ pub(crate) fn create_buffer(
     page: Arc<PageMap>,
     ctx: Handle<Context>,
     opt: Arc<ParsedOptions>,
-    meta: Arc<Meta>,
-    mapping: Mapping,
+    numerics: Arc<Numerics>,
 ) -> Result<Handle<Buffers>, OpCode> {
     let (tx, rx) = channel();
     let (qtx, qrx) = channel();
@@ -35,11 +32,10 @@ pub(crate) fn create_buffer(
         page.clone(),
         ctx,
         node_cache.clone(),
-        mapping,
         tx,
         qrx,
     )?);
-    let evictor = Evictor::new(opt, node_cache, page, meta, buffer, rx, qtx);
+    let evictor = Evictor::new(opt, node_cache, page, numerics, buffer, rx, qtx);
     evictor.start();
     Ok(buffer)
 }

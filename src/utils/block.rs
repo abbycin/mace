@@ -121,3 +121,66 @@ impl Drop for Block {
         }
     }
 }
+
+pub(crate) struct Ring {
+    data: Block,
+    head: usize,
+    tail: usize,
+}
+
+impl Ring {
+    pub(crate) fn new(cap: usize) -> Self {
+        let data = Block::aligned_alloc(cap, 1);
+        data.zero();
+        assert!(data.len().is_power_of_two());
+        Self {
+            data,
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    pub(crate) fn avail(&self) -> usize {
+        self.data.len() - self.distance()
+    }
+
+    // NOTE: the request buffer never wraps around
+    pub(crate) fn prod<'a>(&mut self, size: usize) -> &'a mut [u8] {
+        debug_assert!(self.avail() >= size);
+        let mut b = self.tail;
+        self.tail += size;
+
+        b &= self.mask();
+        self.data.mut_slice(b, size)
+    }
+
+    pub(crate) fn cons(&mut self, pos: usize) {
+        self.head += pos;
+    }
+
+    pub(crate) fn distance(&self) -> usize {
+        #[cfg(feature = "extra_check")]
+        assert!(self.tail >= self.head);
+        self.tail - self.head
+    }
+
+    pub(crate) fn head(&self) -> usize {
+        self.head & self.mask()
+    }
+
+    pub(crate) fn tail(&self) -> usize {
+        self.tail & self.mask()
+    }
+
+    pub(crate) fn slice(&self, pos: usize, len: usize) -> &[u8] {
+        self.data.slice(pos, len)
+    }
+
+    pub(crate) fn mask(&self) -> usize {
+        self.data.len() - 1
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.data.len()
+    }
+}

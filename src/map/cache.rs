@@ -1,6 +1,6 @@
 use dashmap::{DashMap, Entry};
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicIsize, AtomicU32};
+use std::sync::atomic::AtomicIsize;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 
 use crate::utils::{ROOT_PID, rand_range};
 
@@ -19,31 +19,24 @@ impl From<u32> for CacheState {
 }
 
 struct CacheItem {
-    state: AtomicU32,
+    /// it's always guarded by mutex (DashMap)
+    state: u32,
     size: isize,
 }
 
 impl CacheItem {
-    fn warm(&self) {
-        let cur = self.state.load(Relaxed);
-        let _ = self.state.compare_exchange(
-            cur,
-            (cur + 1).min(CacheState::Hot as u32),
-            Relaxed,
-            Relaxed,
-        );
+    fn warm(&mut self) {
+        self.state = (self.state + 1).min(CacheState::Hot as u32);
     }
 
     fn cool(&mut self) -> CacheState {
-        let cur = self.state.load(Relaxed);
-        self.state
-            .compare_exchange(cur, cur.saturating_sub(1), Relaxed, Relaxed)
-            .unwrap_or_else(|x| x)
-            .into()
+        let cur = self.state;
+        self.state = cur.saturating_sub(1);
+        cur.into()
     }
 
     fn status(&self) -> CacheState {
-        self.state.load(Relaxed).into()
+        self.state.into()
     }
 }
 
@@ -87,19 +80,16 @@ impl NodeCache {
             }
             Entry::Vacant(v) => {
                 self.used.fetch_add(size, AcqRel);
-                v.insert(CacheItem {
-                    state: AtomicU32::new(state),
-                    size,
-                });
+                v.insert(CacheItem { state, size });
             }
         }
     }
 
+    /// it's possible that evictor has removed the pid from cache, but not replace page table yet
+    /// and other threads finished replace that cause eviction fail, so we add it back to cache with
+    /// Cool state
     pub(crate) fn warm(&self, pid: u64, size: usize) {
-        if let Some(v) = self.map.get(&pid) {
-            self.used.fetch_add(size as isize - v.size, Relaxed);
-            v.warm();
-        }
+        self.put(pid, CacheState::Cool as u32, size as isize);
     }
 
     pub(crate) fn evict_one(&self, pid: u64) {

@@ -14,12 +14,10 @@ use std::{
 use super::{cc::ConcurrencyControl, context::Context, log::Logging};
 use crate::{
     cc::wal::Location,
+    meta::Numerics,
     utils::{data::Position, options::ParsedOptions},
 };
-use crate::{
-    cc::wal::WalReader,
-    utils::data::{Meta, WalDescHandle},
-};
+use crate::{cc::wal::WalReader, utils::data::WalDescHandle};
 use crate::{index::tree::Tree, utils::block::Block};
 use crossbeam_epoch::Guard;
 
@@ -35,14 +33,14 @@ pub struct Worker {
 }
 
 impl Worker {
-    fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<ParsedOptions>) -> Self {
+    fn new(desc: WalDescHandle, numerics: Arc<Numerics>, opt: Arc<ParsedOptions>) -> Self {
         Self {
             cc: ConcurrencyControl::new(opt.workers),
             start_ckpt: RwLock::new(Position::default()),
             tx_id: AtomicU64::new(0),
             start_ts: 0,
             id: desc.worker,
-            logging: Logging::new(desc, meta, opt),
+            logging: Logging::new(desc, numerics, opt),
             modified: false,
         }
     }
@@ -69,8 +67,8 @@ impl Default for SyncWorker {
 }
 
 impl SyncWorker {
-    pub fn new(desc: WalDescHandle, meta: Arc<Meta>, opt: Arc<ParsedOptions>) -> Self {
-        let w = Box::new(Worker::new(desc, meta, opt));
+    pub fn new(desc: WalDescHandle, numerics: Arc<Numerics>, opt: Arc<ParsedOptions>) -> Self {
+        let w = Box::new(Worker::new(desc, numerics, opt));
         Self {
             w: Box::into_raw(w),
         }

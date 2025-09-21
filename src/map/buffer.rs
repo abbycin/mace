@@ -8,16 +8,17 @@ use crate::{
     OpCode,
     cc::context::Context,
     map::{SharedState, data::Arena, table::Swip},
+    meta::Numerics,
     types::{
         page::Page,
         refbox::BoxView,
         traits::{IHeader, IInlineSize, ILoader},
     },
-    utils::{Handle, MutRef, data::Meta, options::ParsedOptions, queue::Queue},
+    utils::{Handle, MutRef, options::ParsedOptions, queue::Queue},
 };
 use dashmap::{DashMap, Entry};
 
-use super::{cache::CacheState, data::FlushData, flush::Flush, load::Mapping};
+use super::{cache::CacheState, data::FlushData, flush::Flush};
 use crate::map::cache::NodeCache;
 use crate::map::table::PageMap;
 use crate::types::refbox::BoxRef;
@@ -34,7 +35,7 @@ struct Pool {
     wait: Arc<DashMap<u32, Handle<Arena>>>,
     /// currently HOT arena
     cur: AtomicPtr<Arena>,
-    meta: Arc<Meta>,
+    numerics: Arc<Numerics>,
 }
 
 impl Pool {
@@ -42,12 +43,11 @@ impl Pool {
 
     fn new(
         opt: Arc<ParsedOptions>,
-        mapping: Handle<Mapping>,
         ctx: Handle<Context>,
-        meta: Arc<Meta>,
+        numerics: Arc<Numerics>,
     ) -> Result<Pool, OpCode> {
         let workers = opt.workers;
-        let id = Self::get_id(&meta)?;
+        let id = Self::get_id(&numerics)?;
         let q = Queue::new(Self::INIT_ARENA as usize);
         for _ in 0..Self::INIT_ARENA {
             let h = Handle::new(Arena::new(opt.data_file_size, workers));
@@ -58,22 +58,22 @@ impl Pool {
 
         let this = Self {
             workers,
-            flush: Flush::new(mapping, ctx),
+            flush: Flush::new(ctx),
             free: Arc::new(q),
             wait: Arc::new(DashMap::new()),
             cur: AtomicPtr::new(h.inner()),
-            meta,
+            numerics,
         };
 
         h.reset(id);
         Ok(this)
     }
 
-    fn get_id(meta: &Meta) -> Result<u32, OpCode> {
-        let id = meta.next_data.fetch_add(1, Relaxed);
+    fn get_id(numerics: &Numerics) -> Result<u32, OpCode> {
+        let id = numerics.next_file_id.fetch_add(1, Relaxed);
 
         // next id is equal to the oldest, which means there's no space left
-        if id + 1 == meta.oldest_data.load(Acquire) {
+        if id + 1 == numerics.oldest_file_id.load(Acquire) {
             return Err(OpCode::DbFull);
         }
         Ok(id)
@@ -105,7 +105,7 @@ impl Pool {
 
     /// only one thread can process `install_new` at same time
     fn install_new(&self, cur: Handle<Arena>) -> Result<(), OpCode> {
-        let id = Self::get_id(&self.meta)?;
+        let id = Self::get_id(&self.numerics)?;
         self.wait.insert(cur.id(), cur);
         self.flush(cur);
 
@@ -170,7 +170,6 @@ pub(crate) struct Buffers {
     /// second level cache, provide data for NodeCache
     remote: Handle<Lru<BoxRef>>,
     pool: Handle<Pool>,
-    pub mapping: Handle<Mapping>,
     tx: Sender<SharedState>,
     rx: Receiver<()>,
 }
@@ -180,20 +179,17 @@ impl Buffers {
         pagemap: Arc<PageMap>,
         ctx: Handle<Context>,
         cache: Arc<NodeCache>,
-        mapping: Mapping,
         tx: Sender<SharedState>,
         rx: Receiver<()>,
     ) -> Result<Self, OpCode> {
-        let mapping = Handle::new(mapping);
         let opt = ctx.opt.clone();
-        let meta = ctx.meta.clone();
+        let numerics = ctx.numerics.clone();
         Ok(Self {
             ctx,
             cache,
             table: pagemap,
             remote: Handle::new(Lru::new(opt.cache_count)),
-            pool: Handle::new(Pool::new(opt.clone(), mapping, ctx, meta)?),
-            mapping,
+            pool: Handle::new(Pool::new(opt.clone(), ctx, numerics)?),
             tx,
             rx,
         })
@@ -202,7 +198,7 @@ impl Buffers {
     pub(crate) fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
         loop {
             let a = self.pool.current();
-            match a.alloc(&self.pool.meta, size) {
+            match a.alloc(&self.pool.numerics, size) {
                 Ok(x) => return Ok((a, x)),
                 Err(e @ OpCode::TooLarge) => return Err(e),
                 Err(OpCode::Again) => continue,
@@ -220,7 +216,7 @@ impl Buffers {
         self.pool.current().record_lsn(worker_id, seq);
     }
 
-    #[cfg(not(feature = "test_disable_recycle"))]
+    #[cfg(not(feature = "disable_recycle"))]
     pub(crate) fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
     where
         F: FnMut(u64),
@@ -235,7 +231,7 @@ impl Buffers {
         a.dec_ref();
     }
 
-    #[cfg(feature = "test_disable_recycle")]
+    #[cfg(feature = "disable_recycle")]
     pub(crate) fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
     where
         F: FnMut(u64),
@@ -250,7 +246,6 @@ impl Buffers {
         let _ = self.rx.recv();
         // make sure flush thread quit before we reclaim mapping
         self.pool.quit();
-        self.mapping.reclaim();
         self.remote.reclaim();
         self.pool.reclaim();
     }
@@ -261,7 +256,7 @@ impl Buffers {
             max_inline_size: self.ctx.opt.max_inline_size,
             split_elems,
             pool: self.pool,
-            mapping: self.mapping,
+            ctx: self.ctx,
             cache: self.remote,
             pinned: MutRef::new(DashMap::with_capacity(split_elems as usize)),
         }
@@ -287,22 +282,22 @@ impl Buffers {
         self.cache.warm(pid, size);
     }
 
-    pub(crate) fn load(&self, pid: u64) -> Option<Page<Loader>> {
+    pub(crate) fn load(&self, pid: u64) -> Result<Option<Page<Loader>>, OpCode> {
         loop {
             let swip = Swip::new(self.table.get(pid));
             // never mapped or unmapped
             if swip.is_null() {
-                return None;
+                return Ok(None);
             }
 
             if !swip.is_tagged() {
                 // we delay cache warm up when the value of page map entry was updated
-                return Some(Page::<Loader>::from_swip(swip.raw()));
+                return Ok(Some(Page::<Loader>::from_swip(swip.raw())));
             }
-            let new = Page::load(self.loader(), swip.untagged());
+            let new = Page::load(self.loader(), swip.untagged()).ok_or(OpCode::NotFound)?;
             if self.table.cas(pid, swip.raw(), new.swip()).is_ok() {
                 self.cache(new);
-                return Some(new);
+                return Ok(Some(new));
             } else {
                 new.reclaim();
             }
@@ -314,24 +309,24 @@ pub struct Loader {
     max_inline_size: u32,
     split_elems: u32,
     pool: Handle<Pool>,
-    mapping: Handle<Mapping>,
+    ctx: Handle<Context>,
     cache: Handle<Lru<BoxRef>>,
     /// it's per-node context
     pinned: MutRef<DashMap<u64, BoxRef>>,
 }
 
 impl Loader {
-    fn load(&self, addr: u64) -> BoxRef {
+    fn load(&self, addr: u64) -> Option<BoxRef> {
         if let Some(x) = self.cache.get(addr) {
-            return x.clone();
+            return Some(x.clone());
         }
         if let Some(x) = self.pool.load(addr) {
             self.cache.add(addr, x.clone());
-            return x;
+            return Some(x);
         }
-        let x = self.mapping.load_impl(addr);
+        let x = self.ctx.manifest.load_impl(addr)?;
         self.cache.add(addr, x.clone());
-        x
+        Some(x)
     }
 }
 
@@ -342,7 +337,7 @@ impl Clone for Loader {
             max_inline_size: self.max_inline_size,
             split_elems: self.split_elems,
             pool: self.pool,
-            mapping: self.mapping,
+            ctx: self.ctx,
             cache: self.cache,
             pinned: MutRef::new(DashMap::with_capacity(self.split_elems as usize)),
         }
@@ -355,7 +350,7 @@ impl ILoader for Loader {
             max_inline_size: self.max_inline_size,
             split_elems: self.split_elems,
             pool: self.pool,
-            mapping: self.mapping,
+            ctx: self.ctx,
             cache: self.cache,
             pinned: self.pinned.clone(),
         }
@@ -366,21 +361,21 @@ impl ILoader for Loader {
         debug_assert!(r.is_none());
     }
 
-    fn pin_load(&self, addr: u64) -> BoxView {
+    fn pin_load(&self, addr: u64) -> Option<BoxView> {
         if let Some(p) = self.pinned.get(&addr) {
             let v = p.view();
-            return v;
+            return Some(v);
         }
-        let x = self.load(addr);
+        let x = self.load(addr)?;
 
         // concurrent load may happen, we have to make sure that all the load get the same view
         let e = self.pinned.entry(addr);
         match e {
-            Entry::Occupied(o) => o.get().view(),
+            Entry::Occupied(o) => Some(o.get().view()),
             Entry::Vacant(v) => {
                 let r = x.view();
                 v.insert(x);
-                r
+                Some(r)
             }
         }
     }

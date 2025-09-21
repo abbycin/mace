@@ -8,20 +8,22 @@ use store::{
     recovery::Recovery,
 };
 pub use utils::{OpCode, RandomPath, options::Options};
-use utils::{ROOT_PID, data::Meta, options::ParsedOptions};
+use utils::{ROOT_PID, options::ParsedOptions};
 
 mod cc;
 mod index;
 mod map;
+mod meta;
 mod store;
 mod utils;
 
 mod types;
 pub use index::ValRef;
 
+use crate::utils::MutRef;
+
 struct Inner {
-    store: Arc<Store>,
-    meta: Arc<Meta>,
+    store: MutRef<Store>,
     gc: GCHandle,
     tree: Tree,
     opt: Arc<ParsedOptions>,
@@ -40,7 +42,6 @@ impl Drop for Inner {
         }
         self.gc.quit();
         self.store.quit();
-        self.meta.sync(self.store.opt.meta_file(), true);
     }
 }
 
@@ -50,7 +51,7 @@ pub struct Mace {
 }
 
 impl Mace {
-    fn open(store: Arc<Store>) -> Tree {
+    fn open(store: MutRef<Store>) -> Tree {
         if store.is_fresh() {
             Tree::new(store, ROOT_PID)
         } else {
@@ -60,25 +61,17 @@ impl Mace {
     pub fn new(opt: ParsedOptions) -> Result<Self, OpCode> {
         let opt = Arc::new(opt);
         let mut recover = Recovery::new(opt.clone());
-        let (meta, table, mapping, desc) = recover.phase1()?;
-        let store = Arc::new(Store::new(
-            table,
-            opt.clone(),
-            meta.clone(),
-            mapping,
-            &desc,
-        )?);
+        let (table, desc, ctx) = recover.phase1()?;
+        let store = MutRef::new(Store::new(table, opt.clone(), ctx)?);
         let tree = Self::open(store.clone());
 
-        recover.phase2(meta.clone(), &desc, &tree);
-        meta.sync(opt.meta_file(), false);
+        recover.phase2(ctx, &desc, &tree);
         store.start();
-        let handle = start_gc(store.clone(), meta.clone(), store.buffer.mapping);
+        let handle = start_gc(store.clone(), store.context);
 
         Ok(Self {
             inner: Arc::new(Inner {
                 store,
-                meta,
                 gc: handle,
                 tree,
                 opt,

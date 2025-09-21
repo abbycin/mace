@@ -62,7 +62,7 @@ where
     where
         L: ILoader,
     {
-        let mut p = l.pin_load(addr).as_remote();
+        let mut p = l.pin_load_unchecked(addr).as_remote();
         let data = p.raw_mut();
         let k = K::decode_from(data);
         let v = V::decode_from(&data[k.packed_size()..]);
@@ -79,7 +79,7 @@ where
         if s.is_inline() {
             K::decode_from(&raw[Slot::LOCAL_LEN..])
         } else {
-            let mut p = l.pin_load(s.addr()).as_remote();
+            let mut p = l.pin_load_unchecked(s.addr()).as_remote();
             K::decode_from(p.raw_mut())
         }
     }

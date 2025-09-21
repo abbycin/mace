@@ -35,7 +35,9 @@ impl OpenOptions {
 
         if self.trunc {
             flag |= O_TRUNC;
-        } else if self.append {
+        }
+
+        if self.append {
             flag |= O_APPEND;
         }
 

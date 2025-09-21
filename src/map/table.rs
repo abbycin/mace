@@ -114,6 +114,10 @@ impl PageMap {
         self.index(pid)
             .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
     }
+
+    pub fn len(&self) -> u64 {
+        self.next.load(Ordering::Acquire)
+    }
 }
 
 struct Layer3([AtomicU64; SLOT_SIZE as usize]);
@@ -190,6 +194,7 @@ const MAX_ID: u64 = L1_FANOUT - 1;
 build_layer!(Layer2, Layer3, L3_FANOUT);
 build_layer!(Layer1, Layer2, L2_FANOUT);
 
+#[derive(Clone, Copy)]
 pub(crate) struct Swip(u64);
 
 impl Swip {

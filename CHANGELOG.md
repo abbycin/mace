@@ -1,3 +1,11 @@
+## [0.0.13] 2025-09-21
+### Changes
+- Simplify data file layout, move meta fields into a manifest file
+  actually, it's not the best solution, we should use something like BoltDB, so that we don't need to load all the mappings into memory
+
+### Bug fixes
+- Fix leak in cache evict
+
 ## [0.0.12] 2025-09-03
 ### Changes
 - Remove some unused wal record type, and unused fields in WalCheckpoint

@@ -402,7 +402,7 @@ impl BaseView {
     }
 
     fn load_remote<L: ILoader>(&self, l: &L, addr: u64, off: usize, len: usize) -> &[u8] {
-        let p = l.pin_load(addr);
+        let p = l.pin_load_unchecked(addr);
         let r = p.as_remote();
         let s = r.raw();
         &s[off..off + len]
@@ -499,7 +499,7 @@ where
                 let link = p.box_header().link;
                 self.sibling_pos = 0;
                 if link != NULL_ADDR {
-                    self.sibling = Some(self.loader.pin_load(link).as_base());
+                    self.sibling = Some(self.loader.pin_load_unchecked(link).as_base());
                     continue;
                 }
                 self.sibling.take();
@@ -510,7 +510,7 @@ where
             self.beg += 1;
             if let Some(s) = v.sibling() {
                 self.sib_key = k.raw;
-                self.sibling = Some(self.loader.pin_load(s.addr()).as_base());
+                self.sibling = Some(self.loader.pin_load_unchecked(s.addr()).as_base());
                 self.sibling_pos = 0;
                 Some((k, v.unpack_sibling()))
             } else {
@@ -603,7 +603,7 @@ where
                 self.sibling_pos = 0;
                 let link = p.box_header().link;
                 if link != 0 {
-                    self.sibling = Some(self.loader.pin_load(link).as_base());
+                    self.sibling = Some(self.loader.pin_load_unchecked(link).as_base());
                     continue;
                 }
                 self.sibling = None;
@@ -629,7 +629,7 @@ where
         if let Some(s) = v.sibling() {
             self.sib_key = k.raw;
             self.sibling_pos = 0;
-            self.sibling = Some(self.loader.pin_load(s.addr()).as_base());
+            self.sibling = Some(self.loader.pin_load_unchecked(s.addr()).as_base());
             return Some((
                 LeafSeg::new(self.prefix(), k.raw, k.ver),
                 v.unpack_sibling(),
@@ -863,8 +863,8 @@ mod test {
     }
 
     impl ILoader for Allocator {
-        fn pin_load(&self, addr: u64) -> BoxView {
-            self.inner.map.get(&addr).unwrap().view()
+        fn pin_load(&self, addr: u64) -> Option<BoxView> {
+            Some(self.inner.map.get(&addr).unwrap().view())
         }
 
         fn pin(&self, data: BoxRef) {

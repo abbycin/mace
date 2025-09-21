@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Formatter};
 
+#[derive(Clone)]
 pub(crate) struct BitMap {
     cap: u32,
     data: Vec<u64>,
@@ -8,9 +9,6 @@ pub(crate) struct BitMap {
 const POWER: u32 = 6;
 const BITS: u32 = 64;
 const MASK: u32 = BITS - 1;
-
-pub type BitmapElemType = u64;
-pub const BITMAP_ELEM_LEN: usize = size_of::<BitmapElemType>();
 
 impl BitMap {
     /// cap is the target count
@@ -26,13 +24,6 @@ impl BitMap {
         }
     }
 
-    pub(crate) fn from(data: &[BitmapElemType]) -> Self {
-        let cap = data.len() as u32;
-        let v = data.to_vec();
-
-        Self { cap, data: v }
-    }
-
     pub(crate) fn set(&mut self, bit: u32) {
         self.data[(bit >> POWER) as usize] |= 1 << (bit & MASK);
     }
@@ -46,10 +37,7 @@ impl BitMap {
         self.data[(bit >> POWER) as usize] & (1 << (bit & MASK)) != 0
     }
 
-    pub(crate) fn slice(&self) -> &[u64] {
-        self.data.as_slice()
-    }
-
+    #[allow(unused)]
     pub(crate) fn len(&self) -> usize {
         self.data.len()
     }
@@ -59,6 +47,7 @@ impl BitMap {
         self.data.fill(0);
     }
 
+    #[cfg(test)]
     pub(crate) fn iter(&'_ self) -> BitMapIter<'_> {
         BitMapIter {
             m: self,
@@ -72,12 +61,14 @@ impl BitMap {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct BitMapIter<'a> {
     m: &'a BitMap,
     idx: u32,
     end: u32,
 }
 
+#[cfg(test)]
 impl Iterator for BitMapIter<'_> {
     type Item = (bool, u32);
     fn next(&mut self) -> Option<Self::Item> {

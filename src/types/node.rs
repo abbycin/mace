@@ -13,7 +13,7 @@ use crate::{
         refbox::{BaseView, BoxView, DeltaView, KeyRef},
         traits::{IAlloc, IAsBoxRef, IBoxHeader, ICodec, IHeader, IKey, ILoader, IVal},
     },
-    utils::{MAX_NODE_SIZE, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, unpack_id},
+    utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, unpack_id},
 };
 
 use super::{header::TagKind, refbox::BoxRef};
@@ -129,18 +129,18 @@ where
         a.collect(&[self.base_addr()]);
     }
 
-    pub(crate) fn load(addr: u64, loader: L) -> Self {
-        let d = loader.pin_load(addr);
+    pub(crate) fn load(addr: u64, loader: L) -> Option<Self> {
+        let d = loader.pin_load(addr)?;
         let mut l = Self {
             loader,
             mtx: Arc::new(Mutex::new(())),
             delta: ImTree::new(null_cmp),
             inner: BaseView::null(),
             total_size: 0,
-            addr,
+            addr: d.addr,
         };
-        Self::load_inner(&mut l, d);
-        l
+        Self::load_inner(&mut l, d)?;
+        Some(l)
     }
 
     fn set_comparator(&mut self, nt: NodeType) {
@@ -153,7 +153,7 @@ where
 
     pub(crate) fn should_split(&self, split_elem: u16) -> bool {
         let h = self.header();
-        let size_limited = h.elems >= split_elem || self.size() >= MAX_NODE_SIZE;
+        let size_limited = h.elems >= split_elem;
         let no_conflict = !h.merging && h.merging_child == NULL_PID && h.elems >= 2;
 
         size_limited && no_conflict
@@ -554,7 +554,7 @@ where
         self.delta.len()
     }
 
-    fn load_inner(l: &mut Node<L>, mut d: BoxView) {
+    fn load_inner(l: &mut Node<L>, mut d: BoxView) -> Option<()> {
         let mut one_base = true;
         let mut last_type = None;
 
@@ -582,9 +582,10 @@ where
             if h.link == NULL_ADDR {
                 break;
             }
-            d = l.loader.pin_load(h.link);
+            d = l.loader.pin_load(h.link)?;
         }
         assert!(!l.inner.is_null());
+        Some(())
     }
 
     #[allow(clippy::iter_skip_zero)]
@@ -1008,8 +1009,8 @@ mod test {
     }
 
     impl ILoader for A {
-        fn pin_load(&self, addr: u64) -> BoxView {
-            self.load(addr).view()
+        fn pin_load(&self, addr: u64) -> Option<BoxView> {
+            Some(self.load(addr).view())
         }
 
         fn pin(&self, data: BoxRef) {

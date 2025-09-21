@@ -8,40 +8,35 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use io::{File, GatherIO};
 
+use crate::cc::context::Context;
 use crate::cc::wal::{
-    EntryType, Location, PayloadType, WalAbort, WalBegin, WalReader, WalUpdate, ptr_to,
+    EntryType, Location, PayloadType, WalAbort, WalBegin, WalCommit, WalReader, WalUpdate, ptr_to,
     wal_record_sz,
 };
 use crate::index::tree::Tree;
-use crate::map::Mapping;
-use crate::map::data::{DataState, MapReader, MapSate, StateType};
-use crate::map::table::Swip;
+use crate::meta::Manifest;
+use crate::meta::builder::ManifestBuilder;
 use crate::types::data::{Key, Record, Value, Ver};
-use crate::types::traits::IAsSlice;
 use crate::utils::block::Block;
-use crate::utils::data::{MetaInner, PageTable, Position, WalDesc, WalDescHandle};
+use crate::utils::data::{Position, WalDesc, WalDescHandle};
 use crate::utils::lru::LruInner;
 use crate::utils::options::ParsedOptions;
-use crate::utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE};
+use crate::utils::{Handle, NULL_CMD, NULL_ORACLE};
 use crate::{OpCode, static_assert};
-use crate::{
-    Options,
-    map::table::PageMap,
-    utils::{INIT_ID, data::Meta},
-};
+use crate::{Options, map::table::PageMap};
 use crossbeam_epoch::Guard;
 
-#[derive(Debug, PartialEq, Eq)]
-enum State {
-    New,
-    Damaged,
-    Ok,
-}
-
+/// there are some cases can't recover:
+/// 1. manifest file checksum mismatch
+/// 2. log desc file checksum mismatch
+/// 3. data file lost (if wal file is complete, manual recovery is possible)
+///
+/// and there is only one case can recover:
+/// - abnormal shutdown happened before transaction commit
+///
+/// in this case we can parse the log and perform necessary redo/undo to bring data back to consistent
 pub(crate) struct Recovery {
     opt: Arc<ParsedOptions>,
-    buf: Block,
-    state: State,
     dirty_table: BTreeMap<Ver, Location>,
     /// txid, last lsn
     undo_table: BTreeMap<u64, Location>,
@@ -49,16 +44,8 @@ pub(crate) struct Recovery {
 
 impl Recovery {
     pub(crate) fn new(opt: Arc<ParsedOptions>) -> Self {
-        if !opt.db_root.exists() {
-            log::info!("create db_root {:?}", opt.db_root);
-            std::fs::create_dir_all(&opt.db_root).expect("can't create db_root");
-            std::fs::create_dir_all(opt.wal_root()).expect("can't create wal root");
-        }
-
         Self {
             opt,
-            buf: Block::alloc(512),
-            state: State::New,
             dirty_table: BTreeMap::new(),
             undo_table: BTreeMap::new(),
         }
@@ -66,45 +53,39 @@ impl Recovery {
 
     pub(crate) fn phase1(
         &mut self,
-    ) -> Result<(Arc<Meta>, PageMap, Mapping, Vec<WalDescHandle>), OpCode> {
-        let (meta, mut desc) = self.check();
-        let mut mapping = Mapping::new(self.opt.clone());
-        if self.state == State::New {
-            return Ok((Arc::new(meta), PageMap::default(), mapping, desc));
-        }
-        let map = self.load_map()?;
-        match self.state {
-            State::Damaged => self.enumerate(&meta, &mut desc, &mut mapping),
-            State::Ok => self.load(&meta, &mut mapping),
-            _ => unreachable!(),
-        };
-        Ok((Arc::new(meta), map, mapping, desc))
+    ) -> Result<(Arc<PageMap>, Vec<WalDescHandle>, Handle<Context>), OpCode> {
+        let desc = self.load_desc()?;
+        let manifest = self.load_manifest()?;
+
+        let ctx = Handle::new(Context::new(self.opt.clone(), manifest, &desc));
+        Ok((ctx.manifest.map.clone(), desc, ctx))
     }
 
-    pub(crate) fn phase2(&mut self, meta: Arc<Meta>, desc: &[WalDescHandle], tree: &Tree) {
+    /// we must perform phase2, in case crash happened before data flush and log checkpoint
+    pub(crate) fn phase2(&mut self, ctx: Handle<Context>, desc: &[WalDescHandle], tree: &Tree) {
         let g = crossbeam_epoch::pin();
-        let mut oracle = meta.oracle.load(Relaxed);
-        if self.state == State::Damaged {
-            let mut block = Block::alloc(self.opt.max_data_size());
-            for d in desc.iter() {
-                // analyze and redo starts from latest checkpoint
-                let cur_oracle = self.analyze(&g, d.worker, d.checkpoint, &mut block, tree);
-                oracle = max(oracle, cur_oracle);
-                g.flush();
-            }
+        let numerics = &ctx.manifest.numerics;
+        let mut oracle = numerics.oracle.load(Relaxed);
+        let mut block = Block::alloc(self.opt.max_data_size());
 
-            if !self.dirty_table.is_empty() {
-                self.redo(&mut block, &g, tree);
-            }
-            if !self.undo_table.is_empty() {
-                self.undo(&mut block, &g, tree);
-            }
-            // that's why we call it oracle, or else keep using the intact oracle in meta
-            oracle += 1;
+        for d in desc.iter() {
+            // analyze and redo starts from latest checkpoint
+            let cur_oracle = self.analyze(&g, d.worker, d.checkpoint, &mut block, tree);
+            oracle = max(oracle, cur_oracle);
+            g.flush();
         }
+
+        if !self.dirty_table.is_empty() {
+            self.redo(&mut block, &g, tree);
+        }
+        if !self.undo_table.is_empty() {
+            self.undo(&mut block, &g, tree);
+        }
+        // that's why we call it oracle, or else keep using the intact oracle in numerics
+        oracle += 1;
         log::trace!("oracle {oracle}");
-        meta.oracle.store(oracle, Relaxed);
-        meta.wmk_oldest.store(oracle, Relaxed);
+        numerics.oracle.store(oracle, Relaxed);
+        numerics.wmk_oldest.store(oracle, Relaxed);
     }
 
     fn get_size(e: EntryType, len: usize) -> Option<usize> {
@@ -197,7 +178,12 @@ impl Recovery {
                 pos += sz as u64;
                 let ptr = buf.as_ptr();
                 match et {
-                    EntryType::Commit | EntryType::Abort => {
+                    EntryType::Commit => {
+                        let a = ptr_to::<WalCommit>(ptr);
+                        log::trace!("{a:?}");
+                        self.undo_table.remove(&{ a.txid });
+                    }
+                    EntryType::Abort => {
                         let a = ptr_to::<WalAbort>(ptr);
                         log::trace!("{a:?}");
                         self.undo_table.remove(&{ a.txid });
@@ -328,295 +314,108 @@ impl Recovery {
         }
     }
 
-    /// if meta file is not exist, we treat it as a new database
-    fn check(&mut self) -> (Meta, Vec<WalDescHandle>) {
-        let f = self.opt.meta_file();
-        let mut desc = Vec::with_capacity(self.opt.workers);
-        (0..self.opt.workers as u16).for_each(|x| desc.push(WalDescHandle::new(WalDesc::new(x))));
+    fn load_desc(&self) -> Result<Vec<WalDescHandle>, OpCode> {
+        let mut desc: Vec<WalDescHandle> = (0..self.opt.workers as u16)
+            .map(|x| WalDescHandle::new(WalDesc::new(x)))
+            .collect();
 
-        if !f.exists() {
-            self.state = State::New;
-            return (Meta::new(self.opt.workers), desc);
-        }
-
-        let file_sz = f.metadata().expect("can't get metadata of meta file").len() as usize;
-        if file_sz < size_of::<MetaInner>() {
-            self.state = State::Damaged;
-            log::warn!("corrupted meta file, ignore it");
-            return (Meta::new(self.opt.workers), desc);
-        }
-
-        if file_sz > self.buf.len() {
-            self.buf.realloc(file_sz);
-        }
-
-        let f = File::options()
-            .read(true)
-            .open(&f)
-            .expect("can't open meta file");
-        let nbytes = f
-            .read(self.buf.mut_slice(0, self.buf.len()), 0)
-            .expect("can't read meata file");
-
-        let Ok(meta) = Meta::deserialize(self.buf.slice(0, nbytes), self.opt.workers) else {
-            self.state = State::Damaged;
-            return (Meta::new(self.opt.workers), desc);
-        };
-
-        if !meta.is_complete() {
-            self.state = State::Damaged;
-            return (Meta::new(self.opt.workers), desc);
-        }
-
-        self.load_desc(&meta, &mut desc);
-
-        self.state = State::Ok;
-        (meta, desc)
-    }
-
-    // because we sync `desc` before `meta`, to simplify the recover procedure, we assume that when
-    // `meta` is intact the `desc` is also intact
-    fn load_desc(&self, meta: &Meta, desc: &mut [WalDescHandle]) {
-        let lk = meta.mask.read().unwrap();
-        for (ok, i) in lk.iter() {
-            if !ok {
+        for x in &mut desc {
+            let path = self.opt.desc_file(x.worker);
+            if !path.exists() {
+                log::trace!("no log record for worker {}", x.worker);
                 continue;
             }
-            let path = self.opt.desc_file(i as u16);
             let f = File::options()
                 .read(true)
                 .open(&path)
                 .unwrap_or_else(|_| panic!("{:?} must exist", path));
-            let dst = desc[i as usize].as_mut_slice();
+            let dst = x.as_mut_slice();
             f.read(dst, 0).unwrap();
+            if !x.is_valid() {
+                log::error!("{path:?} was corrupted");
+                return Err(OpCode::BadData);
+            }
         }
+
+        Ok(desc)
     }
 
-    fn load(&mut self, meta: &Meta, mapping: &mut Mapping) {
-        let mut maps = Vec::new();
-
-        Self::readdir(&self.opt.db_root, |name| {
-            if name.starts_with(Options::DATA_PREFIX) {
-                let v: Vec<&str> = name.split(Options::DATA_PREFIX).collect();
-                let id = v[1].parse::<u32>().expect("invalid number");
-                maps.push(id);
+    /// there are a few number of manifest files, we can iterate them to build latest manifest
+    fn load_manifest(&self) -> Result<Manifest, OpCode> {
+        let mut nums = Vec::new();
+        let mut snap = None; // latest snapshot
+        Self::readdir(&self.opt.db_root, |path, name| {
+            if name.ends_with("tmp") {
+                // remove imcomplete dump
+                let _ = std::fs::remove_file(path);
+                return;
+            }
+            if name.starts_with(Options::MANIFEST_PREFIX) {
+                let v: Vec<&str> = name.split(Options::SEP).collect();
+                assert_eq!(v.len(), 2);
+                let num = v[1].parse::<u64>().expect("bad manifest file name");
+                if name.ends_with("snap") {
+                    if let Some(x) = snap.as_mut() {
+                        if *x < num {
+                            *x = num;
+                        }
+                    } else {
+                        snap = Some(num);
+                    }
+                }
+                nums.push(num);
             }
         });
 
-        maps.sort_unstable();
-
-        self.load_data(&maps, meta, mapping);
-    }
-
-    fn load_map(&mut self) -> Result<PageMap, OpCode> {
-        let map = PageMap::default();
-
-        let state = self.opt.state_file();
-        if state.exists() {
-            let f = File::options().read(true).open(&state).unwrap();
-            let mut pos = 0;
-            let end = f.size().unwrap();
-            let dlen = size_of::<DataState>();
-            let mlen = size_of::<MapSate>();
-            let mut buf = vec![0u8; dlen.max(mlen)];
-
-            while pos < end {
-                f.read(&mut buf[..1], pos).unwrap();
-                let kind = buf[0].into();
-                let n = match kind {
-                    StateType::Data => {
-                        f.read(&mut buf[..dlen], pos).unwrap();
-                        let data = DataState::from_slice(&buf[..dlen]);
-                        let data_file = self.opt.data_file(data.file_id);
-                        let _ = std::fs::remove_file(&data_file);
-                        log::info!("unlink {data_file:?}");
-                        dlen
-                    }
-                    StateType::Map => {
-                        f.read(&mut buf[..mlen], pos).unwrap();
-                        let map = MapSate::from_slice(&buf[..mlen]);
-                        let map_path = self.opt.map_file(map.file_id);
-                        if map_path.exists() {
-                            let file = File::options().write(true).open(&map_path).unwrap();
-                            file.truncate(map.offset).unwrap();
-                            log::info!("truncate {map_path:?}");
-                        }
-                        mlen
-                    }
-                };
-                pos += n as u64;
-            }
-
-            let _ = std::fs::remove_file(state);
-        }
-
-        let mut block = Block::alloc(MapReader::DEFAULT_BLOCK_SIZE);
-        let mut table = PageTable::default();
-        for id in 0.. {
-            let map_path = self.opt.map_file(id);
-            if !map_path.exists() {
-                break;
-            }
-
-            let mut reader = MapReader::new(map_path);
-            while let Some(es) = reader.next(&mut block)? {
-                es.iter().for_each(|e| {
-                    table.add(e.page_id, e.page_addr, e.epoch);
-                });
-            }
-        }
-
-        let mut next = 0;
-        for (&pid, m) in table.iter() {
-            next = next.max(pid);
-
-            if m.addr == NULL_ADDR {
-                map.insert_free(pid);
+        // if has snapshot, keep latest snapshot and later manifest
+        nums.retain(|x| {
+            if let Some(s) = snap.as_ref() {
+                *x >= *s
             } else {
-                map.index(pid).fetch_max(Swip::tagged(m.addr), Relaxed);
+                true
+            }
+        });
+
+        let mut b = ManifestBuilder::new(self.opt.clone());
+        nums.sort_unstable();
+        for (idx, i) in nums.iter().enumerate() {
+            let is_last = idx == nums.len() - 1;
+            let path = if let Some(snap_id) = snap.as_ref()
+                && snap_id == i
+            {
+                assert_eq!(idx, 0);
+                self.opt.snapshot(*snap_id)
+            } else {
+                self.opt.manifest(*i)
+            };
+            let e = b.add(path, is_last);
+            match e {
+                Ok(()) => {}
+                Err(OpCode::BadData) => return Err(OpCode::BadData),
+                Err(e) => {
+                    log::error!("parse manifest fail: {e:?}");
+                    return Err(e);
+                }
             }
         }
-        map.set_next(next + 1);
-        Ok(map)
+
+        // log desc is complete (we checked in the very beginning), but data file is not, in this case
+        // the wal must has records after checkpoint in log desc, so we can recover data from wal records
+        Ok(b.finish(snap))
     }
 
     fn readdir<F>(path: &PathBuf, mut f: F)
     where
-        F: FnMut(&str),
+        F: FnMut(PathBuf, &str),
     {
         let dir = std::fs::read_dir(path).expect("can't readdir");
-        for i in dir {
-            let tmp = i.expect("can't get dir entry");
-            if !tmp.file_type().unwrap().is_file() {
+        for i in dir.flatten() {
+            if !i.file_type().unwrap().is_file() {
                 continue;
             }
-            let p = tmp.file_name();
+            let p = i.file_name();
             let name = p.to_str().expect("can't filename");
-            f(name);
-        }
-    }
-
-    fn load_wal_one(&self, logs: &[u64], meta: &Meta, desc: &mut WalDescHandle) {
-        let mut oracle = meta.oracle.load(Relaxed);
-        let mut ckpt = Position::default();
-        // assume WAL header is less than it
-        let mut buf = [0u8; 128];
-        // we prefer to use the latest file's last checkpoint
-        let mut find_ckpt = false;
-
-        // new to old
-        for i in logs.iter().rev() {
-            let path = self.opt.wal_file(desc.worker, *i);
-            if !path.exists() {
-                panic!("lost wal file {:?}", path);
-            }
-            let f = File::options()
-                .read(true)
-                .write(true) // for truncate
-                .open(&path)
-                .unwrap();
-            let end = f.size().unwrap();
-            let mut pos = 0;
-            while pos < end {
-                f.read(&mut buf[0..1], pos).unwrap();
-                let h = buf[0].into();
-                let Some(sz) = Self::get_size(h, (end - pos) as usize) else {
-                    break;
-                };
-
-                f.read(&mut buf[0..sz], pos).unwrap();
-                pos += sz as u64;
-
-                match h {
-                    EntryType::Begin => {
-                        let b = ptr_to::<WalBegin>(buf.as_ptr());
-                        oracle = max(oracle, b.txid);
-                    }
-                    EntryType::Update => {
-                        let u = ptr_to::<WalUpdate>(buf.as_ptr());
-                        pos += u.size as u64
-                    }
-                    EntryType::CheckPoint => {
-                        // we will keep looking for the next checkpoint (the latest one)
-                        ckpt.file_id = *i;
-                        ckpt.offset = pos - sz as u64;
-                        find_ckpt = true;
-                    }
-                    _ => {}
-                }
-            }
-            if find_ckpt {
-                break;
-            }
-        }
-        meta.oracle.store(oracle, Relaxed);
-        desc.checkpoint = ckpt;
-    }
-
-    fn load_data(&self, maps: &[u32], meta: &Meta, mapping: &mut Mapping) {
-        let mut last_id = INIT_ID;
-        // old to new
-        for i in maps.iter() {
-            let i = *i;
-            if mapping.add(i, true).is_ok() {
-                last_id = i;
-            } else {
-                // either last data file or compacted data file, ignore them
-                let name = self.opt.data_file(i);
-                log::info!("unlink imcomplete file {name:?}");
-                std::fs::remove_file(name).expect("never happen");
-            }
-        }
-
-        meta.next_data.store(last_id + 1, Relaxed);
-    }
-
-    fn enumerate(&mut self, meta: &Meta, desc: &mut [WalDescHandle], mapping: &mut Mapping) {
-        let mut logs: Vec<Vec<u64>> = vec![Vec::new(); desc.len()];
-        let mut maps = Vec::new();
-
-        Self::readdir(&self.opt.db_root, |name| {
-            if name.starts_with(Options::DATA_PREFIX) {
-                let v: Vec<&str> = name.split(Options::DATA_PREFIX).collect();
-                let id = v[1].parse::<u32>().expect("invalid number");
-                maps.push(id);
-            }
-        });
-
-        Self::readdir(&self.opt.wal_root(), |name| {
-            if name.starts_with(Options::WAL_PREFIX) {
-                let v: Vec<&str> = name.split("_").collect();
-                assert_eq!(v.len(), 3);
-                let wid = v[1].parse::<u16>().expect("invalid number");
-                let seq = v[2].parse::<u64>().expect("invalid number");
-                logs[wid as usize].push(seq);
-            }
-        });
-
-        // sort by modified time, the latest wal is the last element in ids
-        // NOTE: the order of log files is important, while it's not for data files, but we sort
-        // them anyway (in GC, the compacted data file may get a bigger id than the flushed one, for
-        // example: flush get id 13 while gc get id 14, in this case, file data_13 contains newer
-        // data than compacted file data_14)
-        logs.iter_mut().for_each(|x| {
-            x.sort_unstable();
-        });
-        maps.sort_unstable();
-
-        // if there's no data file we have to traverse all wal (if wal is not cleaned) in phase2, or
-        // else we traverse from the last checkpoint here
-        if !maps.is_empty() {
-            for (idx, x) in logs.iter().enumerate() {
-                if x.is_empty() {
-                    // this worker has no wal record
-                    continue;
-                }
-                let d = &mut desc[idx];
-                // correct the initial value
-                d.wal_id = *x.last().unwrap();
-                self.load_wal_one(x, meta, d);
-            }
-            self.load_data(&maps, meta, mapping);
+            f(i.path(), name);
         }
     }
 }

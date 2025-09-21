@@ -31,7 +31,6 @@ pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
 pub(crate) const INIT_EPOCH: u64 = 0;
 pub(crate) const NULL_EPOCH: u64 = u64::MAX;
-pub(crate) const MAX_NODE_SIZE: usize = 16 << 20;
 
 #[derive(Debug, PartialEq)]
 pub enum OpCode {
@@ -210,6 +209,9 @@ pub struct MutRef<T> {
     inner: *mut MutRefInner<T>,
 }
 
+unsafe impl<T> Send for MutRef<T> {}
+unsafe impl<T> Sync for MutRef<T> {}
+
 impl<T> MutRef<T> {
     pub fn new(x: T) -> Self {
         Self {
@@ -217,6 +219,7 @@ impl<T> MutRef<T> {
         }
     }
 
+    #[allow(unused)]
     #[allow(clippy::mut_from_ref)]
     pub fn raw(&self) -> &mut T {
         unsafe { &mut (*self.inner).raw }

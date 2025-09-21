@@ -75,6 +75,9 @@ impl OpenOptions {
     }
 
     pub fn trunc(&mut self, on: bool) -> &mut Self {
+        if on {
+            self.append = false;
+        }
         self.trunc = on;
         self
     }
