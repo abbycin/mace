@@ -1,5 +1,6 @@
 use super::{Node, Page, systxn::SysTxn};
 
+use crate::cc::context::Context;
 use crate::map::buffer::Loader;
 use crate::types::data::Record;
 use crate::types::node::RawLeafIter;
@@ -671,7 +672,7 @@ impl Tree {
     where
         K: AsRef<[u8]>,
         R: RangeBounds<K>,
-        F: FnMut(u64, &Record) -> bool + 'a,
+        F: FnMut(&Context, u64, &Record) -> bool + 'a,
         D: Fn() + 'a,
     {
         let lo = match range.start_bound() {
@@ -797,7 +798,7 @@ pub struct Iter<'a> {
     hi: Bound<Vec<u8>>,
     iter: Option<RawLeafIter<'a, Loader>>,
     cache: Option<Node>,
-    checker: Box<dyn FnMut(u64, &Record) -> bool + 'a>,
+    checker: Box<dyn FnMut(&Context, u64, &Record) -> bool + 'a>,
     dtor: Box<dyn Fn() + 'a>,
     filter: Filter<'a>,
 }
@@ -906,7 +907,7 @@ impl Iter<'_> {
                     Bound::Included(b) => k.raw >= b.key(),
                     Bound::Excluded(b) => k.raw > b.key(),
                 };
-                if ok && (self.checker)(k.txid, v.as_ref()) {
+                if ok && (self.checker)(&self.tree.store.context, k.txid, v.as_ref()) {
                     self.filter.check(k.raw, v.is_del(), r.clone())
                 } else {
                     false

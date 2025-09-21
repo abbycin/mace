@@ -62,15 +62,9 @@ fn get_impl<K: AsRef<[u8]>>(
     Ok(r)
 }
 
-fn seek_impl<'a, K>(
-    ctx: &'a Context,
-    tree: &'a Tree,
-    mut w: SyncWorker,
-    prefix: K,
-    p: Package<'a>,
-) -> Iter<'a>
+fn seek_impl<'a, 'b, K>(tree: &'b Tree, mut w: SyncWorker, prefix: K, p: Package<'b>) -> Iter<'b>
 where
-    K: AsRef<[u8]>,
+    K: AsRef<[u8]> + 'a,
 {
     let b = prefix.as_ref();
     let mut e = b.to_vec();
@@ -88,7 +82,7 @@ where
 
     tree.range(
         b..e.as_slice(),
-        move |txid, t| w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid),
+        move |ctx, txid, t| w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid),
         move || {
             p.destroy();
         },
@@ -354,11 +348,12 @@ impl<'a> TxnKV<'a> {
 
     /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
     #[inline]
-    pub fn seek<K>(&'a self, prefix: K) -> Iter<'a>
+    pub fn seek<'b, K>(&self, prefix: K) -> Iter<'b>
     where
         K: AsRef<[u8]>,
+        'a: 'b,
     {
-        seek_impl(self.p.ctx, self.tree, self.p.w, prefix, self.p.clone())
+        seek_impl(self.tree, self.p.w, prefix, self.p.clone())
     }
 }
 
@@ -395,11 +390,12 @@ impl<'a> TxnView<'a> {
 
     /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
     #[inline]
-    pub fn seek<K>(&'a self, prefix: K) -> Iter<'a>
+    pub fn seek<'b, K>(&self, prefix: K) -> Iter<'b>
     where
         K: AsRef<[u8]>,
+        'a: 'b,
     {
-        seek_impl(self.p.ctx, self.tree, self.p.w, prefix, self.p.clone())
+        seek_impl(self.tree, self.p.w, prefix, self.p.clone())
     }
 }
 

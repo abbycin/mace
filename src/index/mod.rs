@@ -1,6 +1,6 @@
 mod systxn;
 pub(crate) mod tree;
-pub use tree::ValRef;
+pub use tree::{Iter, ValRef};
 pub(crate) mod txn;
 
 use crate::map::buffer::Loader;

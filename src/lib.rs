@@ -18,7 +18,7 @@ mod store;
 mod utils;
 
 mod types;
-pub use index::ValRef;
+pub use index::{Iter, ValRef};
 
 use crate::utils::MutRef;
 
