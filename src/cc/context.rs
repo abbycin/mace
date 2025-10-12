@@ -20,7 +20,7 @@ pub struct Context {
 
 impl Context {
     pub fn new(opt: Arc<ParsedOptions>, manifest: Manifest, desc: &[WalDescHandle]) -> Self {
-        let cores = opt.workers;
+        let cores = opt.workers as usize;
         // NOTE: the elements of desc were ordered by worker id
         assert_eq!(cores, desc.len());
         let mut w = Vec::with_capacity(cores);

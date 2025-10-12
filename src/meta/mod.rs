@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     ptr::null_mut,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, RwLock,
         atomic::{
             AtomicBool, AtomicU64,
             Ordering::{Relaxed, Release},
@@ -14,7 +14,7 @@ use std::{
 };
 
 use crc32c::Crc32cHasher;
-use dashmap::{DashMap, Entry};
+use dashmap::DashMap;
 use io::{File, GatherIO};
 
 use crate::{
@@ -27,18 +27,20 @@ use crate::{
     meta::entry::{Begin, Commit},
     types::{page::Page, refbox::BoxRef, traits::IHeader},
     utils::{
-        Handle, MutRef, NULL_EPOCH, ROOT_PID,
+        Handle, ROOT_PID,
         block::{Block, Ring},
         data::{GatherWriter, Reloc},
+        interval::IntervalMap,
         lru::Lru,
         options::ParsedOptions,
-        unpack_id,
     },
 };
 
 pub(crate) mod builder;
 mod entry;
-pub use entry::{Delete, FileStat, Lid, Numerics, PageTable, Stat, StatInner};
+pub use entry::{
+    Delete, FileStat, IntervalPair, IntervalStart, Numerics, PageTable, Stat, StatInner,
+};
 
 const LOG_BUF_SZ: usize = 64 << 20;
 
@@ -53,28 +55,34 @@ pub(crate) trait IMetaCodec {
 pub(crate) struct Manifest {
     pub(crate) numerics: Arc<Numerics>,
     pub(crate) map: Arc<PageMap>,
-    pub(crate) file_stat: DashMap<u32, MutRef<FileStat>>,
+    /// interval to file_id map, multiple intervals may point to same file_id after compaction
+    pub(crate) interval: RwLock<IntervalMap>,
+    /// file_id to stat map
+    pub(crate) file_stat: DashMap<u64, FileStat>,
     pub(crate) is_cleaning: AtomicBool,
     txid: AtomicU64,
-    obsolete_files: Mutex<Vec<u32>>,
+    obsolete_files: Mutex<Vec<u64>>,
     cache: Lru<FileReader>,
     opt: Arc<ParsedOptions>,
     writer: Handle<GatherWriter>,
-    ring: Ring,
-    mtx: Mutex<()>,
+    ring: Handle<Ring>,
+    txn_lock: Mutex<()>,
+    /// when multiple thread are trying to load data from a file, only one can successfully lock
+    non_dup_lock: Mutex<()>,
 }
 
 impl Drop for Manifest {
     fn drop(&mut self) {
         self.writer.reclaim();
+        self.ring.reclaim();
     }
 }
 
 pub(crate) struct Txn<'a> {
     _guard: MutexGuard<'a, ()>,
     txid: u64,
-    ring: &'a mut Ring,
-    writer: &'a mut GatherWriter,
+    ring: Handle<Ring>,
+    writer: Handle<GatherWriter>,
     h: Crc32cHasher,
     nbytes: u64,
 }
@@ -161,7 +169,7 @@ impl FileReader {
 
     fn read_at(&self, pos: u64) -> BoxRef {
         let m = self.map.get(&pos).expect("never happen");
-        let mut p = BoxRef::alloc(m.len - BoxRef::HDR_LEN as u32, pos, NULL_EPOCH);
+        let mut p = BoxRef::alloc(m.len - BoxRef::HDR_LEN as u32, pos);
 
         let dst = p.load_slice();
         self.file.read(dst, m.off as u64).expect("can't read");
@@ -179,6 +187,7 @@ impl Manifest {
         Self {
             numerics: Arc::new(Numerics::default()),
             map: Arc::new(PageMap::default()),
+            interval: RwLock::new(IntervalMap::new()),
             file_stat: DashMap::new(),
             is_cleaning: AtomicBool::new(false),
             txid: AtomicU64::new(0),
@@ -186,40 +195,58 @@ impl Manifest {
             cache: Lru::new(256),
             opt,
             writer: null_mut::<GatherWriter>().into(),
-            ring: Ring::new(LOG_BUF_SZ),
-            mtx: Mutex::new(()),
+            ring: Handle::new(Ring::new(LOG_BUF_SZ)),
+            txn_lock: Mutex::new(()),
+            non_dup_lock: Mutex::new(()),
         }
     }
 
-    pub(crate) fn add_stat(&mut self, stat: FileStat) {
-        self.file_stat.insert(stat.file_id, MutRef::new(stat));
+    pub(crate) fn add_stat_interval(&mut self, stat: FileStat, ivl: IntervalPair) {
+        // this lock guard protect both interval and file_stat in Manifest so that partail lookup
+        // will not happen
+        let mut lk = self.interval.write().expect("can't lock write");
+        lk.insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
+        self.file_stat.insert(stat.file_id, stat);
     }
 
-    pub(crate) fn update_stat(&mut self, lids: &[u32], stat: FileStat) {
-        let shared = MutRef::new(stat);
-        for &id in lids {
-            let e = self.file_stat.entry(id);
-            // if we update first, the reader will read from new mapped file
-            // or else the new reader will read from new mapped file, the old reader will still get
-            // a copy from old file (but correct data), and it's cache will be removed by us, so we
-            // don't need a mechanism such as version reference
-            match e {
-                Entry::Occupied(mut o) => {
-                    self.cache.del(id as u64);
-                    o.insert(shared.clone());
-                }
-                Entry::Vacant(v) => {
-                    v.insert(shared.clone());
-                }
-            }
+    pub(crate) fn update_stat_interval(
+        &self,
+        stat: FileStat,
+        obsoleted: &[u64],
+        del: &[u64],
+        ivls: &[IntervalPair],
+    ) {
+        // this lock guard protect both interval and file_stat in Manifest so that partail lookup
+        // will not happen
+        let mut lk = self.interval.write().expect("can't lock write");
+        for &lo in del {
+            let r = lk.remove(lo);
+            assert!(r.is_some());
         }
+        for i in ivls {
+            lk.update(i.lo_addr, i.hi_addr, i.file_id);
+        }
+
+        for &id in obsoleted {
+            self.file_stat.remove(&id);
+            self.cache.del(id);
+        }
+
+        let r = self.file_stat.insert(stat.file_id, stat);
+        assert!(r.is_none());
     }
 
-    pub(crate) fn apply_junks(&mut self, tick: u64, junks: &[u64]) -> Vec<Stat> {
-        let mut h: HashMap<u32, Stat> = HashMap::with_capacity(junks.len());
+    pub(crate) fn apply_junks(&self, tick: u64, junks: &[u64]) -> Vec<Stat> {
+        let mut h: HashMap<u64, Stat> = HashMap::with_capacity(junks.len());
+        // this lock guard protect both interval and file_stat in Manifest so that partail lookup
+        // will not happen
+        let lk = self.interval.read().expect("can't lock read");
         for &pos in junks {
-            let (lid, _) = unpack_id(pos);
-            if let Some(mut stat) = self.file_stat.get_mut(&lid) {
+            // the junk addr may belong to non-flushed arena (when disable_recycle feature enable)
+            let Some(file_id) = lk.find(pos) else {
+                continue;
+            };
+            if let Some(mut stat) = self.file_stat.get_mut(&file_id) {
                 let reloc = self.get_reloc(stat.file_id, pos);
                 stat.update(tick, reloc);
                 let e = h.entry(stat.file_id);
@@ -229,15 +256,15 @@ impl Manifest {
                 })
                 .or_insert(Stat {
                     inner: stat.inner,
-                    deleted_elems: MutRef::new(vec![reloc.seq]),
+                    deleted_elems: vec![reloc.seq],
                 });
             }
         }
         h.values().cloned().collect()
     }
 
-    pub(crate) fn begin(&'_ mut self, file_id: u32) -> Txn<'_> {
-        let guard = self.mtx.lock().unwrap();
+    pub(crate) fn begin(&'_ self, file_id: u64) -> Txn<'_> {
+        let guard = self.txn_lock.lock().unwrap();
         let mut numerics = self.numerics.deref().clone();
         let txid = self.txid.fetch_add(1, Relaxed);
         numerics.flushed_id = file_id;
@@ -245,8 +272,8 @@ impl Manifest {
         let mut txn = Txn {
             _guard: guard,
             txid,
-            ring: &mut self.ring,
-            writer: &mut self.writer,
+            ring: self.ring,
+            writer: self.writer,
             h: Crc32cHasher::default(),
             nbytes: 0,
         };
@@ -257,7 +284,7 @@ impl Manifest {
     }
 
     pub(crate) fn try_clean(&mut self) {
-        let Ok(_lk) = self.mtx.try_lock() else {
+        let Ok(_lk) = self.txn_lock.try_lock() else {
             return;
         };
         if self.writer.pos() < Self::CLEAN_SIZE {
@@ -279,8 +306,8 @@ impl Manifest {
         let last_pid = self.map.len();
         let mut table = PageTable::default();
         const LIMIT: usize = 8192; // estimate 128KB
-        let mut w = GatherWriter::append(&tmp_path, 32);
-        let mut ring = Ring::new(LOG_BUF_SZ);
+        let w = Handle::new(GatherWriter::append(&tmp_path, 32));
+        let ring = Handle::new(Ring::new(LOG_BUF_SZ));
         let mtx = Mutex::new(());
 
         let txid = self.txid.fetch_add(1, Relaxed);
@@ -290,16 +317,16 @@ impl Manifest {
             txid,
             _guard: mtx.lock().unwrap(),
             h: Crc32cHasher::default(),
-            ring: &mut ring,
-            writer: &mut w,
+            ring,
+            writer: w,
             nbytes: 0,
         };
 
         txn.record(&numerics);
 
         let g = crossbeam_epoch::pin(); // guard page
-        for i in ROOT_PID..last_pid {
-            let swip = Swip::new(self.map.get(i));
+        for pid in ROOT_PID..last_pid {
+            let swip = Swip::new(self.map.get(pid));
             if swip.is_null() {
                 continue;
             }
@@ -309,7 +336,7 @@ impl Manifest {
                 let p = Page::<Loader>::from_swip(swip.raw());
                 p.latest_addr()
             };
-            table.add(i, addr, 0);
+            table.add(pid, addr);
             if table.len() == LIMIT {
                 txn.record(&table);
                 table.clear();
@@ -317,24 +344,22 @@ impl Manifest {
         }
         drop(g);
 
-        let mut group: HashMap<u32, Vec<u32>> = HashMap::new();
-        for item in self.file_stat.iter() {
-            group.entry(item.file_id).or_default().push(*item.key());
+        for fstat in self.file_stat.iter() {
+            let stat = fstat.copy();
+            txn.record(&stat);
         }
 
-        let mut lid = Lid::empty();
-        for (k, v) in group.iter() {
-            // it's possible that stat has been removed
-            if let Some(fstat) = self.file_stat.get(k) {
-                let stat = fstat.copy();
-                // stat must flush before lid
-                txn.record(&stat);
-            }
-
-            lid.reset(*k);
-            lid.add_multiple(v);
-            txn.record(&lid);
+        let lk = self.interval.read().expect("can't lock read");
+        for (&lo, &(hi, id)) in lk.iter() {
+            let ivl = IntervalPair::new(lo, hi, id);
+            txn.record(&ivl);
         }
+        drop(lk);
+
+        let nbytes = txn.commit();
+        log::info!("write manifest snapshot: {nbytes} bytes");
+        ring.reclaim();
+        w.reclaim();
 
         std::fs::rename(tmp_path, self.opt.snapshot(snap_id)).expect("can't fail");
 
@@ -362,45 +387,39 @@ impl Manifest {
     }
 
     fn bump_id(&mut self) -> u64 {
-        let _lk = self.mtx.lock().unwrap();
+        let _lk = self.txn_lock.lock().unwrap();
         let old = self.numerics.next_manifest_id.fetch_add(2, Release);
         self.writer.reset(&self.opt.manifest(old + 2));
         old
     }
 
     pub(crate) fn load_impl(&self, addr: u64) -> Option<BoxRef> {
-        let (id, _) = unpack_id(addr);
-        // a read lock guard the whole function, it's necessary
-        let Some(stat) = self.file_stat.get(&id) else {
-            log::error!("can't get physical id by {:?}", unpack_id(addr));
-            for item in self.file_stat.iter() {
-                log::debug!("=> {} => {:?}", item.key(), item.value().inner);
-            }
-            panic!("can't get physical id by logical id {id}");
+        let file_id = {
+            // this lock guard protect both interval and file_stat in Manifest, so that partial lookup
+            // will not happen
+            let lk = self.interval.read().expect("can't lock read");
+            let lid = lk.find(addr).expect("must exist");
+            // a read lock guard the whole function, it's necessary
+            let Some(stat) = self.file_stat.get(&lid) else {
+                log::error!("can't get physical id by {addr}");
+                panic!("can't get physical id by logical id {lid}");
+            };
+            stat.file_id
         };
-        let file_id = stat.file_id;
 
         loop {
             if let Some(r) = self.cache.get(file_id as u64) {
                 return Some(r.read_at(addr));
             }
 
-            let Ok(_lk) = self.mtx.try_lock() else {
+            let Ok(_lk) = self.non_dup_lock.try_lock() else {
                 continue;
             };
             self.load_cache(file_id)?;
         }
     }
 
-    pub(crate) fn retain(&mut self, set: &[u32]) {
-        for &id in set {
-            self.file_stat.remove(&id);
-            self.cache.del(id as u64);
-        }
-        self.save_obsolete_files(set);
-    }
-
-    pub(crate) fn save_obsolete_files(&self, id: &[u32]) {
+    pub(crate) fn save_obsolete_files(&self, id: &[u64]) {
         if !id.is_empty() {
             let mut lk = self.obsolete_files.lock().unwrap();
             lk.extend_from_slice(id);
@@ -419,22 +438,22 @@ impl Manifest {
         }
     }
 
-    fn get_reloc(&self, file_id: u32, pos: u64) -> Reloc {
+    fn get_reloc(&self, file_id: u64, pos: u64) -> Reloc {
         loop {
-            if let Some(x) = self.cache.get(file_id as u64) {
+            if let Some(x) = self.cache.get(file_id) {
                 return *x.map.get(&pos).expect("addr in Junk but not flushed");
             }
 
-            let Ok(_lk) = self.mtx.try_lock() else {
+            let Ok(_lk) = self.non_dup_lock.try_lock() else {
                 continue;
             };
             self.load_cache(file_id).expect("file must exist");
         }
     }
 
-    fn load_cache(&self, file_id: u32) -> Option<()> {
+    fn load_cache(&self, file_id: u64) -> Option<()> {
         let f = FileReader::open(self.opt.data_file(file_id))?;
-        self.cache.add(file_id as u64, f);
+        self.cache.add(file_id, f);
         Some(())
     }
 }

@@ -889,24 +889,22 @@ mod test {
     use crate::types::imtree::{ImTree, NODE_SIZE};
     use crate::types::refbox::{BoxRef, DeltaView};
     use crate::types::traits::{IAlloc, IInlineSize};
-    use crate::utils::INIT_EPOCH;
 
     static G_VER: AtomicUsize = AtomicUsize::new(1);
 
     struct Allocator;
 
     static G_OFF: AtomicU64 = AtomicU64::new(0);
-    static G_EPOCH: AtomicU64 = AtomicU64::new(INIT_EPOCH);
 
     impl IAlloc for Allocator {
         fn allocate(&mut self, size: usize) -> BoxRef {
             let addr = G_OFF.fetch_add(size as u64, Relaxed);
-            BoxRef::alloc(size as u32, addr, G_EPOCH.fetch_add(1, Relaxed))
+            BoxRef::alloc(size as u32, addr)
         }
 
         fn collect(&mut self, _addr: &[u64]) {}
 
-        fn arena_size(&mut self) -> u32 {
+        fn arena_size(&mut self) -> usize {
             1 << 20
         }
     }

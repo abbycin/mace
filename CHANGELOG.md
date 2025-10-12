@@ -1,3 +1,18 @@
+## [0.0.14] 2025-10-12
+### Changes
+- Add a layer of indirection allows the data file ID to be represented using 64 bits
+- Force checkpoint when WAL file too large
+- Reduce memory consumption
+    - always `clone` loader when a node was compacted
+    - remove unnecessary `pin` in `SysTxn`
+    - clear arena when it was flushed
+- Remove `rollback`, if the txn is not committed, it will be implicitly rolled back
+
+### Bug fixes
+- Fixed `NodeCache` not being able to limit memory usage
+- Fix arena being flushed while still being mutably referenced
+- Fix `Layout` in `Block`
+
 ## [0.0.13] 2025-09-21
 ### Changes
 - Simplify data file layout, move meta fields into a manifest file

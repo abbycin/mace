@@ -153,7 +153,7 @@ fn rollback() {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     opts.sync_on_write = false;
-    opts.workers = workers as usize;
+    opts.workers = workers;
     let db = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10000;
 
@@ -238,7 +238,7 @@ fn range_simple() -> Result<(), OpCode> {
     let mut iter = kv.seek("foo");
     assert_eq!(iter.next(), Some(("fool".as_bytes(), "1".as_bytes())));
     assert_eq!(iter.next(), None);
-    kv.rollback()?;
+    drop(kv);
 
     {
         let mut opts = Options::new(&*RandomPath::new());

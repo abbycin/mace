@@ -1,5 +1,6 @@
 use super::{Node, Page, systxn::SysTxn};
 
+use crate::cc::context::Context;
 use crate::map::buffer::Loader;
 use crate::types::data::Record;
 use crate::types::node::RawLeafIter;
@@ -80,15 +81,15 @@ pub struct Tree {
 }
 
 impl Tree {
-    pub fn load(store: MutRef<Store>, root_pid: u64) -> Self {
+    pub fn load(store: MutRef<Store>) -> Self {
         Self {
             store: store.clone(),
-            root_index: Index::new(root_pid),
+            root_index: Index::new(ROOT_PID),
         }
     }
 
-    pub fn new(store: MutRef<Store>, root_pid: u64) -> Self {
-        let this = Self::load(store, root_pid);
+    pub fn new(store: MutRef<Store>) -> Self {
+        let this = Self::load(store);
         this.init();
 
         this
@@ -306,8 +307,6 @@ impl Tree {
         let (mut lnode, rnode) = node.split(&mut txn);
         let mut rpage = Page::new(rnode);
 
-        txn.pin(rpage);
-
         // 2.
         let rpid = txn.map(&mut rpage);
         lnode.header_mut().right_sibling = rpid;
@@ -366,11 +365,9 @@ impl Tree {
         let mut txn = self.begin(g);
 
         // compact is required, since other thread may already insert new data after step 3
-        let mut lnode = root.compact(&mut txn, safe_txid, false);
+        let mut lnode = root.compact(&mut txn, safe_txid);
         lnode.header_mut().right_sibling = rpid;
         let mut lpage = Page::new(lnode);
-
-        txn.pin(lpage);
 
         let lpid = txn.map(&mut lpage);
 
@@ -511,7 +508,7 @@ impl Tree {
 
         // consolidation never retry
         let mut txn = self.begin(g);
-        let new_node = page.compact(&mut txn, self.txid(), true);
+        let new_node = page.compact(&mut txn, self.txid());
         inc_cas!(compact);
         if txn.replace(page, new_node).is_ok() {
             txn.commit();
@@ -553,8 +550,6 @@ impl Tree {
         let b = DeltaView::from_key_val(&mut txn, *k, *v);
         let mut new = Page::new(old.insert(b.view().as_delta()));
 
-        txn.pin(new);
-
         // because each thread contains their private data, we have to load the current page by pid
         // and retry (insert delta to the loaded page) on failure caused by both insert/compaction,
         // meanwhile, smo may also cause update fail, we simply restart the whole insert procedure
@@ -562,6 +557,7 @@ impl Tree {
         inc_cas!(link);
         if txn.update(old, &mut new).is_err() {
             inc_cas!(link_fail);
+            new.reclaim();
             return Err(OpCode::Again);
         }
 
@@ -671,7 +667,7 @@ impl Tree {
     where
         K: AsRef<[u8]>,
         R: RangeBounds<K>,
-        F: FnMut(u64, &Record) -> bool + 'a,
+        F: FnMut(&Context, u64, &Record) -> bool + 'a,
         D: Fn() + 'a,
     {
         let lo = match range.start_bound() {
@@ -714,7 +710,7 @@ impl Tree {
         let ver = Ver::new(start_ts, NULL_CMD);
 
         while addr != NULL_PID {
-            let ptr = l.pin_load(addr).ok_or(OpCode::NotFound)?.as_base();
+            let ptr = l.load(addr).ok_or(OpCode::NotFound)?.as_base();
             let sst = ptr.sst::<Ver, Value<Record>>();
             let pos = sst.lower_bound(l, &ver).unwrap_or_else(|pos| pos);
             if pos < sst.header().elems as usize {
@@ -797,7 +793,7 @@ pub struct Iter<'a> {
     hi: Bound<Vec<u8>>,
     iter: Option<RawLeafIter<'a, Loader>>,
     cache: Option<Node>,
-    checker: Box<dyn FnMut(u64, &Record) -> bool + 'a>,
+    checker: Box<dyn FnMut(&Context, u64, &Record) -> bool + 'a>,
     dtor: Box<dyn Fn() + 'a>,
     filter: Filter<'a>,
 }
@@ -906,7 +902,7 @@ impl Iter<'_> {
                     Bound::Included(b) => k.raw >= b.key(),
                     Bound::Excluded(b) => k.raw > b.key(),
                 };
-                if ok && (self.checker)(k.txid, v.as_ref()) {
+                if ok && (self.checker)(&self.tree.store.context, k.txid, v.as_ref()) {
                     self.filter.check(k.raw, v.is_del(), r.clone())
                 } else {
                     false

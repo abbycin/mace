@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{
         AtomicI64, AtomicU32,
-        Ordering::{Relaxed, Release},
+        Ordering::{AcqRel, Relaxed},
     },
 };
 
@@ -12,6 +12,7 @@ pub(crate) mod bitmap;
 pub(crate) mod block;
 pub(crate) mod countblock;
 pub(crate) mod data;
+pub(crate) mod interval;
 pub(crate) mod lru;
 pub(crate) mod options;
 pub(crate) mod queue;
@@ -20,17 +21,16 @@ pub(crate) mod varint;
 
 pub(crate) const NULL_PID: u64 = 0;
 pub(crate) const ROOT_PID: u64 = 1;
-pub(crate) const NULL_ADDR: u64 = u64::MAX;
-pub(crate) const INIT_ADDR: u64 = 0;
+pub(crate) const NULL_ADDR: u64 = 0;
+/// starts from 1 make sure remapped addr will always greater than NULL_ADDR
+pub(crate) const INIT_ADDR: u64 = 1;
 pub const ADDR_LEN: usize = size_of::<u64>();
-pub(crate) const INIT_ID: u32 = 0;
+pub(crate) const INIT_ID: u64 = 0;
 pub(crate) const INIT_CMD: u32 = 1;
 pub(crate) const NULL_CMD: u32 = u32::MAX;
 /// NOTE: must larger than wmk_oldest_tx(which is 0 by default)
 pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
-pub(crate) const INIT_EPOCH: u64 = 0;
-pub(crate) const NULL_EPOCH: u64 = u64::MAX;
 
 #[derive(Debug, PartialEq)]
 pub enum OpCode {
@@ -44,7 +44,6 @@ pub enum OpCode {
     IoError,
     AbortTx,
     Duplicated,
-    DbFull,
     Unknown,
 }
 
@@ -98,19 +97,6 @@ macro_rules! slice_to_number {
     ($slice:expr, $num:ty) => {{ <$num>::from_le_bytes($slice.try_into().unwrap()) }};
 }
 
-pub(crate) const SEG_BITS: u64 = 32;
-
-pub(crate) const fn pack_id(hi: u32, lo: u32) -> u64 {
-    ((hi as u64) << SEG_BITS) | lo as u64
-}
-
-pub(crate) const fn unpack_id(x: u64) -> (u32, u32) {
-    (
-        (x >> SEG_BITS) as u32,
-        (x & ((1u64 << SEG_BITS) - 1)) as u32,
-    )
-}
-
 pub fn rand_range(range: Range<usize>) -> usize {
     rand::random_range(range)
 }
@@ -120,6 +106,12 @@ static_assert!(size_of::<usize>() == 8, "exepct 64 bits pointer width");
 pub struct RandomPath {
     path: PathBuf,
     del: bool,
+}
+
+impl Default for RandomPath {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RandomPath {
@@ -230,7 +222,7 @@ impl<T> MutRef<T> {
     }
 
     fn dec(&self) -> u32 {
-        unsafe { (*self.inner).refcnt.fetch_sub(1, Release) }
+        unsafe { (*self.inner).refcnt.fetch_sub(1, AcqRel) }
     }
 }
 

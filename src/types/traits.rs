@@ -14,10 +14,10 @@ pub trait ILoader: IInlineSize + Clone {
 
     fn pin(&self, data: BoxRef);
 
-    fn pin_load(&self, addr: u64) -> Option<BoxView>;
+    fn load(&self, addr: u64) -> Option<BoxView>;
 
-    fn pin_load_unchecked(&self, addr: u64) -> BoxView {
-        self.pin_load(addr).expect("must exist")
+    fn load_unchecked(&self, addr: u64) -> BoxView {
+        self.load(addr).expect("must exist")
     }
 }
 
@@ -42,7 +42,7 @@ pub trait IAlloc: IInlineSize {
 
     fn collect(&mut self, addr: &[u64]);
 
-    fn arena_size(&mut self) -> u32;
+    fn arena_size(&mut self) -> usize;
 }
 
 pub trait IKey: Default + ICodec + Clone + Copy + Ord {

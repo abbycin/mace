@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::OpCode;
-use crate::utils::{INIT_ADDR, ROOT_PID};
+use crate::utils::{NULL_ADDR, ROOT_PID};
 
 const SLOT_SIZE: u64 = 1u64 << 16;
 
@@ -23,8 +23,9 @@ pub struct PageMap {
 /// NOTE: require `T` is zeroable
 fn box_new<T>() -> Box<T> {
     use std::alloc;
+    let layout = alloc::Layout::new::<T>();
     unsafe {
-        let ptr = alloc::alloc_zeroed(alloc::Layout::new::<T>()) as *mut T;
+        let ptr = alloc::alloc_zeroed(layout) as *mut T;
         Box::from_raw(ptr)
     }
 }
@@ -46,7 +47,7 @@ impl PageMap {
         let mut lk = self.free.lock().unwrap();
         if let Some(pid) = lk.pop_first() {
             self.index(pid)
-                .compare_exchange(INIT_ADDR, data, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(NULL_ADDR, data, Ordering::AcqRel, Ordering::Relaxed)
                 .expect("impossible");
             return Some(pid);
         }
@@ -57,7 +58,7 @@ impl PageMap {
 
         while cnt < MAX_ID {
             match self.index(pid).compare_exchange(
-                INIT_ADDR,
+                NULL_ADDR,
                 data,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
@@ -72,7 +73,7 @@ impl PageMap {
 
     pub fn unmap(&self, pid: u64, addr: u64) -> Result<(), OpCode> {
         self.index(pid)
-            .compare_exchange(addr, INIT_ADDR, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(addr, NULL_ADDR, Ordering::AcqRel, Ordering::Relaxed)
             .map_err(|_| OpCode::Again)?;
 
         let mut lk = self.free.lock().unwrap();
@@ -204,7 +205,7 @@ impl Swip {
     }
 
     pub(crate) fn is_null(&self) -> bool {
-        self.0 == INIT_ADDR
+        self.0 == NULL_ADDR
     }
 
     pub(crate) fn is_tagged(&self) -> bool {
@@ -228,7 +229,7 @@ impl Swip {
 mod test {
     use crate::{
         map::table::{L1_FANOUT, L2_FANOUT, L3_FANOUT, PageMap},
-        utils::INIT_ADDR,
+        utils::NULL_ADDR,
     };
 
     fn addr(a: u64) -> u64 {
@@ -261,7 +262,7 @@ mod test {
 
         for (idx, pid) in mapped_pid.iter().enumerate() {
             table.unmap(*pid, addr(pids[idx])).unwrap();
-            assert_eq!(table.get(*pid), INIT_ADDR);
+            assert_eq!(table.get(*pid), NULL_ADDR);
         }
 
         assert_eq!(pids.len(), mapped_pid.len());

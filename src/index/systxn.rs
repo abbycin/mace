@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 pub struct SysTxn<'a> {
     pub store: &'a Store,
     g: &'a Guard,
-    pinned: Vec<Page>,
     maps: Vec<(u64, u64)>,
     /// garbage and allocs may overlap, garbage will be set to Junk on success, while allocs will be
     /// set to TombStone on failure
@@ -27,7 +26,6 @@ impl<'a> SysTxn<'a> {
         Self {
             store,
             g,
-            pinned: Vec::new(),
             maps: Vec::new(),
             garbage: Vec::new(),
             allocs: Vec::new(),
@@ -51,12 +49,6 @@ impl<'a> SysTxn<'a> {
         if !self.garbage.is_empty() {
             self.apply_junk();
         }
-
-        self.pinned.clear();
-    }
-
-    pub fn pin(&mut self, p: Page) {
-        self.pinned.push(p);
     }
 
     pub fn alloc(&mut self, size: usize) -> BoxRef {
@@ -150,7 +142,7 @@ impl<'a> SysTxn<'a> {
     ///
     /// this can significantly reduce data file size
     fn recycle(&mut self, addr: &[u64]) {
-        self.store.buffer.tombstone_active(addr, |addr| {
+        self.store.buffer.recycle(addr, |addr| {
             self.garbage.push(addr);
         });
     }
@@ -161,6 +153,8 @@ impl Drop for SysTxn<'_> {
         while let Some((pid, swip)) = self.maps.pop() {
             // the pid is not publish yet, so the unmap here will always succeed
             self.store.page.unmap(pid, swip).expect("never happen");
+            let p = Page::from_swip(swip);
+            p.reclaim();
         }
 
         while let Some((a, b)) = self.allocs.pop() {
@@ -175,9 +169,6 @@ impl Drop for SysTxn<'_> {
             a.dealloc(h.addr, h.total_size as usize);
             a.dec_ref();
         }
-        while let Some(p) = self.pinned.pop() {
-            p.reclaim();
-        }
     }
 }
 
@@ -190,7 +181,7 @@ impl IAlloc for SysTxn<'_> {
         self.garbage.extend_from_slice(addr);
     }
 
-    fn arena_size(&mut self) -> u32 {
+    fn arena_size(&mut self) -> usize {
         self.store.opt.data_file_size
     }
 }

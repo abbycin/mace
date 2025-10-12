@@ -14,7 +14,7 @@ fn gc_data() -> Result<(), OpCode> {
     opt.sync_on_write = false;
     opt.gc_eager = true;
     opt.gc_timeout = 20;
-    opt.gc_ratio = 5;
+    opt.gc_ratio = 2;
     opt.data_file_size = 512 << 10;
     opt.gc_compacted_size = opt.data_file_size as usize;
     let saved = opt.clone();

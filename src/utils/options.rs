@@ -15,10 +15,13 @@ pub struct Options {
     /// compact all cached node on exit. default value is false, it only compact cached nodes that
     /// must be compacted
     pub compact_on_exit: bool,
+    /// allows allocation of more arenas than a fixed value when arena exhaustion occurs, rather than
+    /// waiting for arenas to become available, the default value is false
+    pub over_provision: bool,
     /// hardware concurrency count, range in [1, cores]
     ///
     /// **Once set, it cannot be modified**
-    pub workers: usize,
+    pub workers: u16,
     /// garbage collection cycle (milliseconds)
     pub gc_timeout: u64,
     /// perform compaction when garbage ratio exceed this value, range [0, 100]
@@ -42,7 +45,9 @@ pub struct Options {
     pub cache_count: usize,
     /// a size limit to trigger data file flush, which also control max key-value size, NOTE: too
     /// large a file size will cause the flushing to be slow
-    pub data_file_size: u32,
+    pub data_file_size: usize,
+    /// if wal log file size large than this value, a checkpoint will be created
+    pub max_log_size: usize,
     /// when should we consolidate delta chain, the default value is set to half [`Self::split_elems`]
     /// and it also the maximum value, shrink this value may get better query performance (especially
     /// in large key-value workload)
@@ -86,15 +91,17 @@ impl Options {
     pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
     pub const INLINE_SIZE: u32 = 4096;
     pub const SPLIT_ELEMS: u16 = 512;
+    pub const MAX_ALLOCATIONS: usize = 2 << 30; // 2GB
 
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
             sync_on_write: true,
             compact_on_exit: false,
+            over_provision: false,
             workers: std::thread::available_parallelism()
                 .unwrap()
                 .get()
-                .min(Self::MAX_WORKERS),
+                .min(Self::MAX_WORKERS) as u16,
             tmp_store: false,
             gc_timeout: 50, // 50ms
             gc_ratio: 20,   // 20%
@@ -105,7 +112,8 @@ impl Options {
             cache_capacity: Self::CACHE_CAP,
             cache_evict_pct: 10, // 10% evict 100MB every time
             cache_count: Self::CACHE_CNT,
-            data_file_size: Self::DATA_FILE_SIZE as u32,
+            data_file_size: Self::DATA_FILE_SIZE,
+            max_log_size: Self::MAX_ALLOCATIONS,
             consolidate_threshold: Self::SPLIT_ELEMS / 2,
             wal_buffer_size: Self::WAL_BUF_SZ,
             max_ckpt_per_txn: 1_000_000, // 1 million
@@ -137,7 +145,9 @@ impl Options {
         if self.cache_capacity < Self::MIN_CACHE_CAP {
             self.cache_capacity = Self::CACHE_CAP;
         }
-        self.max_kv_size = self.data_file_size / 2;
+        if self.max_kv_size <= 2 {
+            self.max_kv_size = Self::DATA_FILE_SIZE as u32 / 2;
+        }
         if self.max_inline_size > self.max_kv_size {
             self.max_inline_size = Self::INLINE_SIZE;
         }
@@ -184,7 +194,7 @@ impl Options {
         self.db_root().join("data")
     }
 
-    pub fn data_file(&self, id: u32) -> PathBuf {
+    pub fn data_file(&self, id: u64) -> PathBuf {
         self.data_root()
             .join(format!("{}{}{}", Self::DATA_PREFIX, Self::SEP, id))
     }

@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::AtomicPtr,
     mpsc::{Receiver, Sender},
 };
@@ -23,31 +23,84 @@ use crate::map::cache::NodeCache;
 use crate::map::table::PageMap;
 use crate::types::refbox::BoxRef;
 use crate::utils::lru::Lru;
-use crate::utils::unpack_id;
-use std::sync::atomic::Ordering::{Acquire, Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
+
+struct Ids {
+    addr: u64,
+    arena: u64,
+}
+
+impl Ids {
+    const fn new(addr: u64, arena: u64) -> Self {
+        Self { addr, arena }
+    }
+}
+
+struct Iim {
+    map: RwLock<Vec<Ids>>,
+}
+
+impl Iim {
+    fn new(addr: u64, arena: u64) -> Self {
+        Self {
+            map: RwLock::new(vec![Ids::new(addr, arena)]),
+        }
+    }
+
+    fn find(&self, addr: u64) -> Option<u64> {
+        let lk = self.map.read().expect("can't lock read");
+        let pos = match lk.binary_search_by(|x| x.addr.cmp(&addr)) {
+            Ok(pos) => pos,
+            Err(pos) => {
+                // a recovered Pool don't have previous arena addr
+                if pos == 0 {
+                    return None;
+                }
+                pos - 1
+            }
+        };
+        #[cfg(feature = "extra_check")]
+        {
+            debug_assert!(pos < lk.len());
+            debug_assert!(addr >= lk[pos].addr);
+        }
+        Some(lk[pos].arena)
+    }
+
+    /// the addr is monotonically increasing, so we can perform binary search on
+    /// map
+    fn push(&self, addr: u64, arena: u64) {
+        let mut lk = self.map.write().expect("can't lock write");
+        lk.push(Ids::new(addr, arena));
+    }
+
+    /// the data file flush is FIFO, so we can simply remove the first element and
+    /// left-shift all rest elements
+    fn pop(&self) {
+        let mut lk = self.map.write().expect("can't lock write");
+        lk.remove(0);
+    }
+}
 
 struct Pool {
-    workers: usize,
     flush: Flush,
+    map: Arc<Iim>,
     /// contains all flushed arena
     free: Arc<Queue<Handle<Arena>>>,
     /// contains all non-HOT arena
-    wait: Arc<DashMap<u32, Handle<Arena>>>,
+    wait: Arc<DashMap<u64, Handle<Arena>>>,
     /// currently HOT arena
     cur: AtomicPtr<Arena>,
     numerics: Arc<Numerics>,
+    allow_over_provision: bool,
 }
 
 impl Pool {
     const INIT_ARENA: u32 = 16; // must be power of 2
 
-    fn new(
-        opt: Arc<ParsedOptions>,
-        ctx: Handle<Context>,
-        numerics: Arc<Numerics>,
-    ) -> Result<Pool, OpCode> {
+    fn new(opt: Arc<ParsedOptions>, ctx: Handle<Context>, numerics: Arc<Numerics>) -> Self {
         let workers = opt.workers;
-        let id = Self::get_id(&numerics)?;
+        let id = Self::get_id(&numerics);
         let q = Queue::new(Self::INIT_ARENA as usize);
         for _ in 0..Self::INIT_ARENA {
             let h = Handle::new(Arena::new(opt.data_file_size, workers));
@@ -57,26 +110,21 @@ impl Pool {
         let h = q.pop().unwrap();
 
         let this = Self {
-            workers,
             flush: Flush::new(ctx),
+            map: Arc::new(Iim::new(numerics.address.fetch_add(1, Relaxed), id)),
             free: Arc::new(q),
             wait: Arc::new(DashMap::new()),
             cur: AtomicPtr::new(h.inner()),
             numerics,
+            allow_over_provision: opt.over_provision,
         };
 
         h.reset(id);
-        Ok(this)
+        this
     }
 
-    fn get_id(numerics: &Numerics) -> Result<u32, OpCode> {
-        let id = numerics.next_file_id.fetch_add(1, Relaxed);
-
-        // next id is equal to the oldest, which means there's no space left
-        if id + 1 == numerics.oldest_file_id.load(Acquire) {
-            return Err(OpCode::DbFull);
-        }
-        Ok(id)
+    fn get_id(numerics: &Numerics) -> u64 {
+        numerics.next_file_id.fetch_add(1, Relaxed)
     }
 
     fn current(&self) -> Handle<Arena> {
@@ -84,55 +132,66 @@ impl Pool {
     }
 
     fn load(&self, addr: u64) -> Option<BoxRef> {
-        let (id, off) = unpack_id(addr);
+        let arena_id = self.map.find(addr)?;
         let cur = self.current();
         let cur_id = cur.id();
 
-        if cur_id == id {
-            return Some(cur.load(off));
+        if cur_id == arena_id {
+            return Some(cur.load(addr));
         }
 
-        if let Some(h) = self.wait.get(&id) {
+        if let Some(h) = self.wait.get(&arena_id) {
             if !matches!(h.state(), Arena::WARM | Arena::COLD) {
                 return None;
             }
-            if h.id() == id {
-                return Some(h.load(off));
+            if h.id() == arena_id {
+                return Some(h.load(addr));
             }
         }
         None
     }
 
     /// only one thread can process `install_new` at same time
-    fn install_new(&self, cur: Handle<Arena>) -> Result<(), OpCode> {
-        let id = Self::get_id(&self.numerics)?;
+    fn install_new(&self, cur: Handle<Arena>) {
+        let id = Self::get_id(&self.numerics);
         self.wait.insert(cur.id(), cur);
         self.flush(cur);
 
-        let p = if let Some(p) = self.free.pop() {
-            p
-        } else {
-            Handle::new(Arena::new(cur.cap(), self.workers))
+        // it's ok, since all threads are wait for install new arena so that address
+        // will not be changed before new arena has been installed
+        self.map.push(self.numerics.address.load(Relaxed), id);
+
+        let p = loop {
+            if let Some(p) = self.free.pop() {
+                break p;
+            }
+            if self.allow_over_provision {
+                break Handle::new(Arena::new(cur.cap(), cur.workers()));
+            } else {
+                std::hint::spin_loop();
+            }
         };
         p.reset(id);
 
         self.cur
             .compare_exchange(cur.inner(), p.inner(), Relaxed, Relaxed)
             .expect("never happen");
-        Ok(())
     }
 
     fn flush(&self, h: Handle<Arena>) {
         let wait = self.wait.clone();
         let free = self.free.clone();
+        let map = self.map.clone();
 
         let cb = move || {
             let x = h.set_state(Arena::COLD, Arena::FLUSH);
             assert_eq!(x, Arena::COLD);
+            h.clear();
             wait.remove(&h.id());
             if free.push(h).is_err() {
                 h.reclaim();
             }
+            map.pop();
         };
 
         let _ = self
@@ -164,11 +223,12 @@ impl Pool {
 
 pub(crate) struct Buffers {
     ctx: Handle<Context>,
+    max_log_size: usize,
     /// used for restrict in memory node count
     cache: Arc<NodeCache>,
     table: Arc<PageMap>,
     /// second level cache, provide data for NodeCache
-    remote: Handle<Lru<BoxRef>>,
+    lru: Handle<Lru<BoxRef>>,
     pool: Handle<Pool>,
     tx: Sender<SharedState>,
     rx: Receiver<()>,
@@ -181,30 +241,39 @@ impl Buffers {
         cache: Arc<NodeCache>,
         tx: Sender<SharedState>,
         rx: Receiver<()>,
-    ) -> Result<Self, OpCode> {
+    ) -> Self {
         let opt = ctx.opt.clone();
         let numerics = ctx.numerics.clone();
-        Ok(Self {
+        Self {
             ctx,
+            max_log_size: ctx.opt.max_log_size,
             cache,
             table: pagemap,
-            remote: Handle::new(Lru::new(opt.cache_count)),
-            pool: Handle::new(Pool::new(opt.clone(), ctx, numerics)?),
+            lru: Handle::new(Lru::new(opt.cache_count)),
+            pool: Handle::new(Pool::new(opt.clone(), ctx, numerics)),
             tx,
             rx,
-        })
+        }
     }
 
     pub(crate) fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
         loop {
             let a = self.pool.current();
+            let cur = self.pool.numerics.log_size.load(Relaxed);
+            if cur >= self.max_log_size && a.set_state(Arena::HOT, Arena::WARM) == Arena::HOT {
+                let old = self.pool.numerics.log_size.fetch_sub(cur, Relaxed);
+                assert!(old >= cur);
+                self.pool.install_new(a);
+                continue;
+            }
+
             match a.alloc(&self.pool.numerics, size) {
                 Ok(x) => return Ok((a, x)),
                 Err(e @ OpCode::TooLarge) => return Err(e),
                 Err(OpCode::Again) => continue,
                 Err(OpCode::NeedMore) => {
                     if a.set_state(Arena::HOT, Arena::WARM) == Arena::HOT {
-                        self.pool.install_new(a)?;
+                        self.pool.install_new(a);
                     }
                 }
                 _ => unreachable!("invalid opcode"),
@@ -217,7 +286,7 @@ impl Buffers {
     }
 
     #[cfg(not(feature = "disable_recycle"))]
-    pub(crate) fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
+    pub(crate) fn recycle<F>(&self, addr: &[u64], mut gc: F)
     where
         F: FnMut(u64),
     {
@@ -232,7 +301,7 @@ impl Buffers {
     }
 
     #[cfg(feature = "disable_recycle")]
-    pub(crate) fn tombstone_active<F>(&self, addr: &[u64], mut gc: F)
+    pub(crate) fn recycle<F>(&self, addr: &[u64], mut gc: F)
     where
         F: FnMut(u64),
     {
@@ -246,7 +315,7 @@ impl Buffers {
         let _ = self.rx.recv();
         // make sure flush thread quit before we reclaim mapping
         self.pool.quit();
-        self.remote.reclaim();
+        self.lru.reclaim();
         self.pool.reclaim();
     }
 
@@ -257,7 +326,7 @@ impl Buffers {
             split_elems,
             pool: self.pool,
             ctx: self.ctx,
-            cache: self.remote,
+            cache: self.lru,
             pinned: MutRef::new(DashMap::with_capacity(split_elems as usize)),
         }
     }
@@ -316,7 +385,7 @@ pub struct Loader {
 }
 
 impl Loader {
-    fn load(&self, addr: u64) -> Option<BoxRef> {
+    fn find(&self, addr: u64) -> Option<BoxRef> {
         if let Some(x) = self.cache.get(addr) {
             return Some(x.clone());
         }
@@ -356,17 +425,18 @@ impl ILoader for Loader {
         }
     }
 
+    /// save data come from arena
     fn pin(&self, data: BoxRef) {
         let r = self.pinned.insert(data.header().addr, data);
         debug_assert!(r.is_none());
     }
 
-    fn pin_load(&self, addr: u64) -> Option<BoxView> {
+    fn load(&self, addr: u64) -> Option<BoxView> {
         if let Some(p) = self.pinned.get(&addr) {
             let v = p.view();
             return Some(v);
         }
-        let x = self.load(addr)?;
+        let x = self.find(addr)?;
 
         // concurrent load may happen, we have to make sure that all the load get the same view
         let e = self.pinned.entry(addr);

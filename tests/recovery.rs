@@ -26,7 +26,6 @@ fn intact_meta() {
         kv.put(k, v).expect("can't insert kv");
     }
     kv.commit().unwrap();
-    drop(kv);
 
     let kv = db.begin().unwrap();
     for (i, (k, _)) in pair.iter().enumerate() {
@@ -35,7 +34,6 @@ fn intact_meta() {
         }
     }
     kv.commit().unwrap();
-    drop(kv);
 
     drop(db);
 
@@ -84,11 +82,9 @@ fn bad_meta() {
     let kv = db.begin().unwrap();
     kv.put("114514", "1919810").unwrap();
     kv.commit().unwrap();
-    drop(kv);
 
     let kv = db.begin().unwrap();
     kv.put("mo", "ha").unwrap();
-    kv.rollback().unwrap();
     drop(kv);
 
     drop(db);
@@ -171,7 +167,6 @@ fn recover_after_insert() {
     }
 
     kv.commit().unwrap();
-    drop(kv);
 
     drop(db);
 
@@ -243,7 +238,7 @@ fn put_update(remove_data: bool) {
 
             if s.starts_with(Options::DATA_PREFIX) {
                 let v: Vec<&str> = s.split(Options::SEP).collect();
-                let x = v[1].parse::<u32>().unwrap();
+                let x = v[1].parse::<u64>().unwrap();
                 data_seq = data_seq.max(x);
             }
             if s.starts_with(Options::MANIFEST_PREFIX) {
@@ -278,8 +273,8 @@ fn put_update(remove_data: bool) {
         };
 
         for i in 0..save.workers {
-            w.worker = i as u16;
-            w.write(save.desc_file(i as u16));
+            w.worker = i;
+            w.write(save.desc_file(i));
         }
     }
 
@@ -355,7 +350,6 @@ fn ckpt_wal(keys: usize, wal_len: u32) {
         kv.commit().unwrap();
     }
 
-    drop(kv);
     drop(db);
 
     imcomplete_manifest(&save);

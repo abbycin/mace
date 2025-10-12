@@ -1,7 +1,9 @@
 use crate::cc::context::Context;
 use crate::map::data::{Arena, DataBuilder};
+use crate::meta::IntervalPair;
+use crate::utils::Handle;
 use crate::utils::countblock::Countblock;
-use crate::utils::{Handle, unpack_id};
+use crate::utils::data::Interval;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "metric")]
@@ -32,7 +34,7 @@ macro_rules! record {
 }
 
 fn flush_data(msg: FlushData, mut ctx: Handle<Context>) {
-    let id = msg.id();
+    let file_id = msg.id();
     let mut data_builder = DataBuilder::new();
     let mut map_builder = MapBuilder::new();
 
@@ -45,38 +47,46 @@ fn flush_data(msg: FlushData, mut ctx: Handle<Context>) {
     }
 
     if !data_builder.is_empty() {
-        let path = ctx.opt.data_file(id);
+        let path = ctx.opt.data_file(file_id);
         if !ctx.opt.db_root.exists() {
             log::error!("db_root {:?} not exist", ctx.opt.db_root);
             panic!("db_root {:?} not exist", ctx.opt.db_root);
         }
 
         let tick = ctx.manifest.numerics.tick.load(Relaxed);
-        let fstat = data_builder.stat(id, tick);
+        let fstat = data_builder.stat(file_id, tick);
         let stat = fstat.copy();
         let mut junks = Vec::with_capacity(data_builder.junks.len());
         for f in data_builder.junks.iter() {
             junks.extend_from_slice(f.data_slice::<u64>());
         }
-        junks.sort_unstable_by(|x, y| unpack_id(*x).0.cmp(&unpack_id(*y).0));
-        let stats = ctx.manifest.apply_junks(tick, &junks);
+        junks.sort_unstable();
 
-        let mut txn = ctx.manifest.begin(id);
+        let mut txn = ctx.manifest.begin(file_id);
 
         txn.record(&stat); // new entry
         txn.record(&map_builder.table());
 
-        stats.iter().for_each(|x| txn.record(x));
+        // we must protect stats collection in txn, or else Stat may be logged after the Delete
+        // record (in GC thread), thus in recovery process will create wrong FileStat cause error
+        // such as BitMap index out of range
+        let stats = ctx.manifest.apply_junks(tick, &junks);
+        stats.iter().for_each(|x| {
+            assert_ne!(file_id, x.file_id);
+            txn.record(x)
+        });
 
         // flush before commit
         txn.flush();
-        data_builder.build(tick, path);
+        let Interval { lo, hi } = data_builder.build(tick, path);
+        let ivl = IntervalPair::new(lo, hi, file_id);
+        txn.record(&ivl);
 
         let nbytes = txn.commit();
 
         log::debug!(
             "flush to {:?} active {} frames, size {} sizes {:?} manifest {}",
-            ctx.opt.data_file(id),
+            ctx.opt.data_file(file_id),
             data_builder.active_frames(),
             size,
             msg.sizes(),
@@ -85,13 +95,16 @@ fn flush_data(msg: FlushData, mut ctx: Handle<Context>) {
 
         // create a new mapping must after data has been flushed, so that GC can read fully flushed
         // data file
-        ctx.manifest.add_stat(fstat);
+        ctx.manifest.add_stat_interval(fstat, ivl);
         ctx.manifest.numerics.tick.fetch_add(1, Relaxed);
     }
     msg.mark_done();
 }
 
 fn safe_to_flush(data: &FlushData, ctx: Handle<Context>) -> bool {
+    if data.refcnt() != 0 {
+        return false;
+    }
     let workers = ctx.workers();
     debug_assert_eq!(data.flsn.len(), workers.len());
     for (i, w) in workers.iter().enumerate() {

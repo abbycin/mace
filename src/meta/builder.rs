@@ -7,13 +7,14 @@ use std::{hash::Hasher, path::PathBuf, sync::Arc};
 
 use crate::map::table::Swip;
 use crate::meta::entry::{
-    Begin, DeleteHdr, ENTRY_KIND_LEN, Lid, LidHdr, PageTableHdr, StatHdr, get_record_size,
+    Begin, DelIntervalStartHdr, DeleteHdr, ENTRY_KIND_LEN, IntervalStart, PageTableHdr, StatHdr,
+    get_record_size,
 };
-use crate::meta::{Commit, Delete, FileStat, Stat};
+use crate::meta::{Commit, Delete, FileStat, IntervalPair, Stat};
 use crate::types::traits::IAsSlice;
 use crate::utils::bitmap::BitMap;
 use crate::utils::data::GatherWriter;
-use crate::utils::{Handle, MutRef, NULL_ORACLE, ROOT_PID};
+use crate::utils::{Handle, NULL_ORACLE, ROOT_PID};
 use crate::{
     OpCode,
     meta::{
@@ -84,20 +85,18 @@ impl ManifestBuilder {
 
     pub(crate) fn finish(mut self, snap: Option<u64>) -> Manifest {
         let mut next = ROOT_PID;
-        for (&k, v) in self.table.iter() {
-            next = next.max(k);
-            if v.addr == NULL_ADDR {
-                self.inner.map.insert_free(k);
+        for (&pid, &addr) in self.table.iter() {
+            next = next.max(pid + 1);
+            if addr == NULL_ADDR {
+                self.inner.map.insert_free(pid);
             } else {
                 self.inner
                     .map
-                    .index(k)
-                    .fetch_max(Swip::tagged(v.addr), Relaxed);
+                    .index(pid)
+                    .fetch_max(Swip::tagged(addr), Relaxed);
             }
         }
-        if next != ROOT_PID {
-            self.inner.map.set_next(next + 1);
-        }
+        self.inner.map.set_next(next);
 
         self.inner.delete_files();
         if let Some(snap_id) = snap {
@@ -196,21 +195,24 @@ impl ManifestBuilder {
                     self.calc_crc(f, &mut crc, pos + sz as u64, s.size as usize)?;
                     pos += s.size as u64;
                 }
-                EntryKind::Lid => {
-                    let l = LidHdr::from_slice(p);
-                    handles.push(RecordHandle::new(pos, sz + l.size as usize));
-                    self.calc_crc(f, &mut crc, pos + sz as u64, l.size as usize)?;
-                    pos += l.size as u64;
-                }
                 EntryKind::Delete => {
                     let d = DeleteHdr::from_slice(p);
-                    handles.push(RecordHandle::new(pos, sz + d.size as usize));
-                    self.calc_crc(f, &mut crc, pos + sz as u64, d.size as usize)?;
-                    pos += d.size as u64;
+                    let len = d.size();
+                    handles.push(RecordHandle::new(pos, sz + len));
+                    self.calc_crc(f, &mut crc, pos + sz as u64, len)?;
+                    pos += len as u64;
                 }
-                EntryKind::Meta => {
+                EntryKind::DelInterval => {
+                    let d = DelIntervalStartHdr::from_slice(p);
+                    let len = d.size();
+                    handles.push(RecordHandle::new(pos, sz + len));
+                    self.calc_crc(f, &mut crc, pos + sz as u64, len)?;
+                    pos += len as u64;
+                }
+                EntryKind::Numerics | EntryKind::Interval => {
                     handles.push(RecordHandle::new(pos, sz));
                 }
+                _ => unreachable!("invalid kind {ek:?}"),
             }
             pos += sz as u64;
         }
@@ -244,10 +246,10 @@ impl ManifestBuilder {
             let ek = data[0].try_into().expect("must valid");
 
             match ek {
-                EntryKind::Meta => {
+                EntryKind::Numerics => {
                     let numerics = Numerics::decode(data);
                     assert!(
-                        self.inner.numerics.epoch.load(Relaxed) <= numerics.epoch.load(Relaxed)
+                        self.inner.numerics.address.load(Relaxed) <= numerics.address.load(Relaxed)
                     );
                     assert!(
                         self.inner.numerics.next_manifest_id.load(Relaxed)
@@ -265,10 +267,10 @@ impl ManifestBuilder {
 
                     match e {
                         dashmap::Entry::Vacant(v) => {
-                            let mut fstat = MutRef::new(FileStat {
+                            let mut fstat = FileStat {
                                 inner: stat.inner,
-                                deleted_elems: BitMap::new(stat.inner.active_elems),
-                            });
+                                deleted_elems: BitMap::new(stat.active_elems),
+                            };
                             for &seq in stat.deleted_elems.iter() {
                                 fstat.deleted_elems.set(seq);
                             }
@@ -288,27 +290,7 @@ impl ManifestBuilder {
                 EntryKind::Map => {
                     let table = PageTable::decode(data);
                     for (k, v) in table.iter() {
-                        self.table.add(*k, v.addr, v.epoch);
-                    }
-                }
-                EntryKind::Lid => {
-                    let lid = Lid::decode(data);
-                    // create a clone to avoid dead-lock
-                    let fstat = {
-                        self.inner
-                            .file_stat
-                            .get(&lid.physical_id)
-                            .expect("invalid file id")
-                            .clone()
-                    };
-
-                    // process deleted first, because same id maybe remapped later
-                    for id in &lid.del_lids {
-                        self.inner.file_stat.remove(id);
-                    }
-
-                    for &id in &lid.new_lids {
-                        self.inner.file_stat.insert(id, fstat.clone());
+                        self.table.add(*k, *v);
                     }
                 }
                 EntryKind::Delete => {
@@ -316,6 +298,23 @@ impl ManifestBuilder {
                     lk.clear();
                     let del = Delete::decode(data);
                     lk.extend_from_slice(&del);
+                    for file_id in lk.iter() {
+                        let r = self.inner.file_stat.remove(file_id);
+                        assert!(r.is_some());
+                    }
+                }
+                EntryKind::Interval => {
+                    let ivl = IntervalPair::decode(data);
+                    let mut lk = self.inner.interval.write().expect("can't lock write");
+                    lk.insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
+                }
+                EntryKind::DelInterval => {
+                    let d = IntervalStart::decode(data);
+                    let mut lk = self.inner.interval.write().expect("can't lock write");
+
+                    for lo in d.lo {
+                        lk.remove(lo).expect("must exist");
+                    }
                 }
                 _ => unreachable!("invalid kind: {ek:?}"),
             }

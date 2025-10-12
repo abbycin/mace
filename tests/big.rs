@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write};
 
-use mace::{Mace, OpCode, Options, RandomPath};
+use mace::{Mace, Options, RandomPath};
 use rand::Rng;
 
 #[test]
@@ -72,7 +72,6 @@ fn big_kv() {
         kv.put(k, &val).unwrap();
     }
     kv.commit().unwrap();
-    drop(kv);
 
     let kv = db.begin().unwrap();
     for k in &keys {
@@ -81,7 +80,6 @@ fn big_kv() {
         assert_eq!(x.unwrap().slice(), val.as_slice());
     }
     kv.commit().unwrap();
-    drop(kv);
 
     drop(db);
 
@@ -120,10 +118,9 @@ fn big_kv2() {
     kv.put("key1", vec![233u8; 512]).unwrap();
     kv.put("key2", vec![114u8; db.options().wal_buffer_size])
         .unwrap();
-    let r = kv.put("key3", vec![114u8; db.options().data_file_size as usize]);
-    assert!(r.is_err() && r.err().unwrap() == OpCode::TooLarge);
+    let r = kv.put("key3", vec![114u8; db.options().data_file_size]);
+    assert!(r.is_ok());
     kv.commit().unwrap();
-    drop(kv);
 
     let view = db.view().unwrap();
 

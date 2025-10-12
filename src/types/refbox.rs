@@ -1,16 +1,16 @@
 use crate::static_assert;
 use crate::types::header::TagKind;
-use crate::utils::{NULL_ADDR, NULL_EPOCH, NULL_PID, raw_ptr_to_ref, raw_ptr_to_ref_mut};
+use crate::utils::{NULL_ADDR, NULL_PID, raw_ptr_to_ref, raw_ptr_to_ref_mut};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicU32;
 use std::{
     alloc::{Layout, alloc, dealloc},
-    sync::atomic::Ordering::{Relaxed, Release},
+    sync::atomic::Ordering::{AcqRel, Relaxed},
 };
 
 use super::header::{BaseHeader, BoxHeader, DeltaHeader, RemoteHeader, TagFlag};
 use super::traits::{IAsBoxRef, IBoxHeader, IHeader};
-static_assert!(BoxRef::HDR_LEN == 48);
+static_assert!(BoxRef::HDR_LEN == 40);
 static_assert!(align_of::<BoxHeader>() == align_of::<*const ()>());
 
 #[derive(Clone)]
@@ -30,7 +30,7 @@ impl KeyRef {
 
     pub(crate) fn build(prefix: &[u8], base: &[u8]) -> Self {
         let len = prefix.len() + base.len();
-        let mut b = BoxRef::alloc(len as u32, NULL_ADDR, NULL_EPOCH);
+        let mut b = BoxRef::alloc(len as u32, NULL_ADDR);
         let (dp, db) = b.data_slice_mut()[..len].split_at_mut(prefix.len());
         dp.copy_from_slice(prefix);
         db.copy_from_slice(base);
@@ -39,7 +39,7 @@ impl KeyRef {
     }
 
     pub(crate) fn copy(x: &[u8]) -> Self {
-        let mut b = BoxRef::alloc(x.len() as u32, NULL_ADDR, NULL_EPOCH);
+        let mut b = BoxRef::alloc(x.len() as u32, NULL_ADDR);
         b.data_slice_mut()[..x.len()].copy_from_slice(x);
         let key = unsafe { std::mem::transmute::<&[u8], &[u8]>(&b.data_slice::<u8>()[..x.len()]) };
         Self { key, _src: b }
@@ -81,7 +81,7 @@ impl DerefMut for BoxView {
 }
 
 impl BoxView {
-    pub(crate) fn into_owned(self) -> BoxRef {
+    fn into_owned(self) -> BoxRef {
         BoxRef(self.0)
     }
 
@@ -90,7 +90,7 @@ impl BoxView {
     }
 
     fn dec_ref(&self) -> u32 {
-        raw_ptr_to_ref_mut(self.0).refs.fetch_sub(1, Release)
+        raw_ptr_to_ref_mut(self.0).refs.fetch_sub(1, AcqRel)
     }
 
     pub(crate) fn refcnt(&self) -> u32 {
@@ -137,7 +137,7 @@ impl BoxRef {
     }
 
     /// NOTE: the alignment is hard code to pointer's alignment, and it's true in mace
-    pub(crate) fn alloc(size: u32, addr: u64, epoch: u64) -> BoxRef {
+    pub(crate) fn alloc(size: u32, addr: u64) -> BoxRef {
         let real_size = Self::real_size(size);
         let layout = Layout::array::<u8>(real_size as usize)
             .inspect_err(|x| panic!("bad layout {x:?}"))
@@ -149,7 +149,6 @@ impl BoxRef {
         h.flag = TagFlag::Normal;
         h.pid = NULL_PID;
         h.addr = addr;
-        h.epoch = epoch;
         h.link = NULL_ADDR;
         h.refs.store(1, Relaxed);
         this

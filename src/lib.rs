@@ -18,7 +18,7 @@ mod store;
 mod utils;
 
 mod types;
-pub use index::ValRef;
+pub use index::{Iter, ValRef};
 
 use crate::utils::MutRef;
 
@@ -53,16 +53,16 @@ pub struct Mace {
 impl Mace {
     fn open(store: MutRef<Store>) -> Tree {
         if store.is_fresh() {
-            Tree::new(store, ROOT_PID)
+            Tree::new(store)
         } else {
-            Tree::load(store, ROOT_PID)
+            Tree::load(store)
         }
     }
     pub fn new(opt: ParsedOptions) -> Result<Self, OpCode> {
         let opt = Arc::new(opt);
         let mut recover = Recovery::new(opt.clone());
         let (table, desc, ctx) = recover.phase1()?;
-        let store = MutRef::new(Store::new(table, opt.clone(), ctx)?);
+        let store = MutRef::new(Store::new(table, opt.clone(), ctx));
         let tree = Self::open(store.clone());
 
         recover.phase2(ctx, &desc, &tree);

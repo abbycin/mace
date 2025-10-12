@@ -315,7 +315,7 @@ impl Recovery {
     }
 
     fn load_desc(&self) -> Result<Vec<WalDescHandle>, OpCode> {
-        let mut desc: Vec<WalDescHandle> = (0..self.opt.workers as u16)
+        let mut desc: Vec<WalDescHandle> = (0..self.opt.workers)
             .map(|x| WalDescHandle::new(WalDesc::new(x)))
             .collect();
 

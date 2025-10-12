@@ -13,7 +13,7 @@ use crate::{
 use crossbeam_epoch::Guard;
 use std::sync::{
     Arc,
-    atomic::Ordering::{Relaxed, Release},
+    atomic::Ordering::{AcqRel, Relaxed},
 };
 use std::{cell::Cell, sync::atomic::AtomicU32};
 
@@ -36,7 +36,7 @@ impl Clone for Package<'_> {
 
 impl Package<'_> {
     fn destroy(&self) {
-        if self.refcnt.fetch_sub(1, Release) == 1 {
+        if self.refcnt.fetch_sub(1, AcqRel) == 1 {
             self.ctx.free_worker(self.w);
         }
     }
@@ -62,15 +62,9 @@ fn get_impl<K: AsRef<[u8]>>(
     Ok(r)
 }
 
-fn seek_impl<'a, K>(
-    ctx: &'a Context,
-    tree: &'a Tree,
-    mut w: SyncWorker,
-    prefix: K,
-    p: Package<'a>,
-) -> Iter<'a>
+fn seek_impl<'a, 'b, K>(tree: &'b Tree, mut w: SyncWorker, prefix: K, p: Package<'b>) -> Iter<'b>
 where
-    K: AsRef<[u8]>,
+    K: AsRef<[u8]> + 'a,
 {
     let b = prefix.as_ref();
     let mut e = b.to_vec();
@@ -88,7 +82,7 @@ where
 
     tree.range(
         b..e.as_slice(),
-        move |txid, t| w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid),
+        move |ctx, txid, t| w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid),
         move || {
             p.destroy();
         },
@@ -323,24 +317,12 @@ impl<'a> TxnKV<'a> {
             .map(|x| x.unwrap())
     }
 
-    pub fn commit(&self) -> Result<(), OpCode> {
+    pub fn commit(self) -> Result<(), OpCode> {
         self.should_abort()?;
         self.p.w.commit(self.p.ctx);
         self.p.destroy();
         self.is_end.set(true);
         Ok(())
-    }
-
-    pub fn rollback(&self) -> Result<(), OpCode> {
-        if !self.is_end.get() {
-            let g = crossbeam_epoch::pin();
-            self.p.w.rollback(&g, self.p.ctx, self.tree);
-            self.p.destroy();
-            self.is_end.set(true);
-            Ok(())
-        } else {
-            Err(OpCode::AbortTx)
-        }
     }
 
     #[inline]
@@ -353,18 +335,27 @@ impl<'a> TxnKV<'a> {
     }
 
     /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
+    ///
+    /// **NOTE:** [`Iter`] will save a clone of the resource, so do not save [`Iter`] to avoid
+    /// resource shortage
     #[inline]
-    pub fn seek<K>(&'a self, prefix: K) -> Iter<'a>
+    pub fn seek<'b, K>(&self, prefix: K) -> Iter<'b>
     where
         K: AsRef<[u8]>,
+        'a: 'b,
     {
-        seek_impl(self.p.ctx, self.tree, self.p.w, prefix, self.p.clone())
+        seek_impl(self.tree, self.p.w, prefix, self.p.clone())
     }
 }
 
 impl Drop for TxnKV<'_> {
     fn drop(&mut self) {
-        let _ = self.rollback();
+        if !self.is_end.get() {
+            let g = crossbeam_epoch::pin();
+            self.p.w.rollback(&g, self.p.ctx, self.tree);
+            self.p.destroy();
+            self.is_end.set(true);
+        }
     }
 }
 
@@ -394,12 +385,16 @@ impl<'a> TxnView<'a> {
     }
 
     /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
+    ///
+    /// **NOTE:** [`Iter`] will save a clone of the resource, so do not save [`Iter`] to avoid
+    /// resource shortage
     #[inline]
-    pub fn seek<K>(&'a self, prefix: K) -> Iter<'a>
+    pub fn seek<'b, K>(&self, prefix: K) -> Iter<'b>
     where
         K: AsRef<[u8]>,
+        'a: 'b,
     {
-        seek_impl(self.p.ctx, self.tree, self.p.w, prefix, self.p.clone())
+        seek_impl(self.tree, self.p.w, prefix, self.p.clone())
     }
 }
 
@@ -439,7 +434,7 @@ mod test {
 
         let r = kv.del(k2).expect("can't del");
         assert_eq!(r.slice(), v2);
-        kv.rollback()?;
+        drop(kv);
 
         let kv = db.begin()?;
         let r = kv.get(k1);
@@ -466,7 +461,7 @@ mod test {
 
             let kv = db.begin()?;
             kv.update("1", "11").expect("can't replace");
-            kv.rollback()?;
+            drop(kv);
 
             let view = db.view()?;
             let x = view.get("1").expect("can't get");
@@ -480,7 +475,7 @@ mod test {
             let r = kv.get("2").unwrap();
             assert_eq!(r.slice(), "21".as_bytes());
             kv.del("2")?;
-            kv.rollback()?;
+            drop(kv);
 
             let view = db.view()?;
             let x = view.get("2");
@@ -494,7 +489,7 @@ mod test {
 
             let kv = db.begin()?;
             kv.upsert("11", "11").expect("can't replace");
-            kv.rollback()?;
+            drop(kv);
 
             let view = db.view()?;
             let x = view.get("11").expect("can't get");
@@ -508,7 +503,7 @@ mod test {
             let r = kv.get("22").unwrap();
             assert_eq!(r.slice(), "21".as_bytes());
             kv.del("22")?;
-            kv.rollback()?;
+            drop(kv);
 
             let view = db.view()?;
             let x = view.get("22");

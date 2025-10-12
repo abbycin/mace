@@ -13,7 +13,7 @@ use crate::{
         refbox::{BaseView, BoxView, DeltaView, KeyRef},
         traits::{IAlloc, IAsBoxRef, IBoxHeader, ICodec, IHeader, IKey, ILoader, IVal},
     },
-    utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, unpack_id},
+    utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID},
 };
 
 use super::{header::TagKind, refbox::BoxRef};
@@ -130,7 +130,7 @@ where
     }
 
     pub(crate) fn load(addr: u64, loader: L) -> Option<Self> {
-        let d = loader.pin_load(addr)?;
+        let d = loader.load(addr)?;
         let mut l = Self {
             loader,
             mtx: Arc::new(Mutex::new(())),
@@ -242,8 +242,7 @@ where
 
         let b = DeltaView::from_key_val(a, IntlKey::new(key), Index::new(pid));
         let view = b.view().as_delta();
-        let node = self.insert(view).compact(a, safe_txid, false); // 1/SPLIT_ELEMS chance to run
-        node.loader.pin(b); // pin to new loader (the cloned one)
+        let node = self.insert(view).compact(a, safe_txid); // 1/SPLIT_ELEMS chance to run
         Some(node)
     }
 
@@ -367,23 +366,14 @@ where
         }
     }
 
-    pub(crate) fn compact<A: IAlloc>(
-        &self,
-        a: &mut A,
-        safe_txid: u64,
-        share_pinned: bool,
-    ) -> Node<L> {
+    pub(crate) fn compact<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> Node<L> {
         let b = self.merge_to_base(a, safe_txid);
         let old_h = self.header();
         let mut base = b.view().as_base();
         let new_h = base.header_mut();
         new_h.merging = old_h.merging;
         new_h.merging_child = old_h.merging_child;
-        if share_pinned {
-            Self::new_with_mtx(self.loader.shallow_copy(), b, self.mtx.clone())
-        } else {
-            Self::new(self.loader.clone(), b)
-        }
+        Self::new(self.loader.clone(), b)
     }
 
     fn merge_to_base<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> BoxRef {
@@ -418,21 +408,20 @@ where
                 }
                 let b = DeltaView::from_key_val(a, key.unwrap(), Index::null());
                 let tmp_node = self.insert(b.view().as_delta());
-                let mut p = tmp_node.compact(a, safe_txid, false);
+                let mut p = tmp_node.compact(a, safe_txid);
                 p.header_mut().merging_child = NULL_PID;
                 p.header_mut().split_elems = h.split_elems + 1;
-                p.loader.pin(b); // pin to new loader (the cloned one)
                 p
             }
             MergeOp::MarkParent(pid) => {
                 assert_eq!(self.box_header().node_type, NodeType::Intl);
-                let mut p = self.compact(a, safe_txid, false);
+                let mut p = self.compact(a, safe_txid);
                 p.header_mut().merging_child = pid;
                 p
             }
             MergeOp::MarkChild => {
                 assert_eq!(self.box_header().node_type, NodeType::Leaf);
-                let mut p = self.compact(a, safe_txid, false);
+                let mut p = self.compact(a, safe_txid);
                 p.header_mut().merging = true;
                 p
             }
@@ -522,7 +511,7 @@ where
         log::debug!(
             "---------- show delta {} {:?} elems {} ----------",
             h.pid,
-            unpack_id(h.addr),
+            h.addr,
             self.delta.len()
         );
         if self.header().is_index {
@@ -560,6 +549,7 @@ where
 
         loop {
             let h = d.header();
+            l.total_size += d.total_size as usize;
             if let Some(t) = last_type {
                 assert_eq!(t, h.node_type);
             } else {
@@ -579,10 +569,10 @@ where
                 }
                 _ => unreachable!("bad kind {:?}", h.kind),
             }
-            if h.link == NULL_ADDR {
+            if d.link == NULL_ADDR {
                 break;
             }
-            d = l.loader.pin_load(h.link)?;
+            d = l.loader.load(d.link)?;
         }
         assert!(!l.inner.is_null());
         Some(())
@@ -952,7 +942,6 @@ mod test {
         refbox::{BoxRef, BoxView, DeltaView},
         traits::{IAlloc, IHeader, IInlineSize, ILoader},
     };
-    use crate::utils::INIT_EPOCH;
 
     struct AInner {
         map: Mutex<HashMap<u64, BoxRef>>,
@@ -962,7 +951,6 @@ mod test {
     #[derive(Clone)]
     struct A {
         inner: Rc<AInner>,
-        epoch: u64,
     }
 
     impl A {
@@ -972,7 +960,6 @@ mod test {
                     map: Mutex::new(HashMap::new()),
                     off: AtomicU64::new(0),
                 }),
-                epoch: INIT_EPOCH,
             }
         }
 
@@ -988,14 +975,13 @@ mod test {
                 .inner
                 .off
                 .fetch_add(BoxRef::real_size(size as u32) as u64, Relaxed);
-            let p = BoxRef::alloc(size as u32, addr, self.epoch);
-            self.epoch += 1;
+            let p = BoxRef::alloc(size as u32, addr);
             let mut lk = self.inner.map.lock().unwrap();
             lk.insert(addr, p.clone());
             p
         }
 
-        fn arena_size(&mut self) -> u32 {
+        fn arena_size(&mut self) -> usize {
             64 << 20
         }
 
@@ -1009,7 +995,7 @@ mod test {
     }
 
     impl ILoader for A {
-        fn pin_load(&self, addr: u64) -> Option<BoxView> {
+        fn load(&self, addr: u64) -> Option<BoxView> {
             Some(self.load(addr).view())
         }
 
@@ -1054,7 +1040,7 @@ mod test {
             node.save(d1);
             node = node.insert(d2.view().as_delta());
             node.save(d2);
-            node = node.compact(&mut a, 1, true);
+            node = node.compact(&mut a, 1);
 
             let iter = node.leaf_iter(1);
             assert_eq!(iter.count(), 2);
@@ -1077,7 +1063,7 @@ mod test {
             node.save(delta);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                node = node.compact(&mut a, 3, true);
+                node = node.compact(&mut a, 3);
             }
         }
 
@@ -1091,7 +1077,7 @@ mod test {
             node.save(delta);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                node = node.compact(&mut a, 3, true);
+                node = node.compact(&mut a, 3);
             }
         }
 
@@ -1105,7 +1091,7 @@ mod test {
             node.save(delta);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                node = node.compact(&mut a, 3, true);
+                node = node.compact(&mut a, 3);
             }
         }
 

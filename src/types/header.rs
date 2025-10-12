@@ -37,9 +37,8 @@ pub(crate) struct BoxHeader {
     pub(crate) total_size: u32,
     pub(crate) payload_size: u32,
     pub(crate) pid: u64,
-    /// current BoxRef's logical address
+    /// current BoxRef's logical address which is monotonically increasing
     pub(crate) addr: u64,
-    pub(crate) epoch: u64,
     /// logical address link to next BoxRef
     pub(crate) link: u64,
 }
@@ -83,10 +82,10 @@ static_assert!(align_of::<BaseHeader>() == align_of::<*const ()>());
 static_assert!(align_of::<DeltaHeader>() == align_of::<*const ()>());
 static_assert!(align_of::<RemoteHeader>() == align_of::<*const ()>());
 
-static_assert!(size_of::<BoxHeader>() % 8 == 0);
-static_assert!(size_of::<BaseHeader>() % 8 == 0);
-static_assert!(size_of::<DeltaHeader>() % 8 == 0);
-static_assert!(size_of::<RemoteHeader>() % 8 == 0);
+static_assert!(size_of::<BoxHeader>().is_multiple_of(8));
+static_assert!(size_of::<BaseHeader>().is_multiple_of(8));
+static_assert!(size_of::<DeltaHeader>().is_multiple_of(8));
+static_assert!(size_of::<RemoteHeader>().is_multiple_of(8));
 
 pub(crate) struct Slot {
     meta: u64,

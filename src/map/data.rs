@@ -5,12 +5,12 @@ use io::{File, GatherIO};
 use crate::meta::{FileStat, Numerics, PageTable, StatInner};
 use crate::types::header::TagFlag;
 use crate::types::refbox::BoxRef;
-use crate::types::traits::IHeader;
+use crate::types::traits::{IAsSlice, IHeader};
 use crate::utils::NULL_ADDR;
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
-use crate::utils::data::{AddrPair, GatherWriter, JUNK_LEN, Position};
-use crate::utils::{CachePad, Handle, INIT_ID, NULL_PID, pack_id, raw_ptr_to_ref};
+use crate::utils::data::{AddrPair, GatherWriter, Interval, JUNK_LEN, Position};
+use crate::utils::{CachePad, Handle, INIT_ID, NULL_PID, raw_ptr_to_ref};
 use crate::{OpCode, static_assert};
 use std::alloc::{Layout, alloc_zeroed};
 use std::cell::Cell;
@@ -19,8 +19,8 @@ use std::fmt::Debug;
 use std::hash::Hasher;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
@@ -34,7 +34,7 @@ impl FlushData {
         Self { arena, cb }
     }
 
-    pub fn id(&self) -> u32 {
+    pub fn id(&self) -> u64 {
         self.arena.id()
     }
 
@@ -54,16 +54,17 @@ impl Deref for FlushData {
 // use C repr to fix the layout
 #[repr(C)]
 pub(crate) struct Arena {
+    id: Cell<u64>,
     items: DashMap<u64, BoxRef>,
-    id: Cell<u32>,
     /// flush LSN
     pub(crate) flsn: Box<[CachePad<AtomicU64>]>,
-    real_size: AtomicU64,
+    pub(crate) real_size: AtomicU64,
     // pack file_id and seq
     offset: AtomicU64,
-    cap: u32,
-    refs: AtomicU16,
-    pub(crate) state: AtomicU8,
+    cap: usize,
+    refs: AtomicU32,
+    pub(crate) state: AtomicU16,
+    workers: u16,
 }
 
 impl Deref for Arena {
@@ -76,13 +77,13 @@ impl Deref for Arena {
 
 impl Arena {
     /// memory can be allocated
-    pub(crate) const HOT: u8 = 4;
+    pub(crate) const HOT: u16 = 4;
     /// memory no longer available for allocating
-    pub(crate) const WARM: u8 = 3;
+    pub(crate) const WARM: u16 = 3;
     /// waiting for flush
-    pub(crate) const COLD: u8 = 2;
+    pub(crate) const COLD: u16 = 2;
     /// flushed to disk
-    pub(crate) const FLUSH: u8 = 1;
+    pub(crate) const FLUSH: u16 = 1;
 
     fn alloc_flsn(n: usize) -> Box<[CachePad<AtomicU64>]> {
         static_assert!(size_of::<CachePad<Position>>() == 64);
@@ -97,31 +98,36 @@ impl Arena {
         }
     }
 
-    pub(crate) fn new(cap: u32, workers: usize) -> Self {
+    pub(crate) fn new(cap: usize, workers: u16) -> Self {
         Self {
             items: DashMap::with_capacity(16 << 10),
-            flsn: Self::alloc_flsn(workers),
+            flsn: Self::alloc_flsn(workers as usize),
             id: Cell::new(INIT_ID),
-            refs: AtomicU16::new(0),
+            refs: AtomicU32::new(0),
             offset: AtomicU64::new(0),
             real_size: AtomicU64::new(0),
             cap,
-            state: AtomicU8::new(Self::FLUSH),
+            state: AtomicU16::new(Self::FLUSH),
+            workers,
         }
     }
 
-    pub(crate) fn reset(&self, id: u32) {
+    pub(crate) fn reset(&self, id: u64) {
         self.id.set(id);
         assert_eq!(self.state(), Self::FLUSH);
         self.set_state(Arena::FLUSH, Arena::HOT);
         self.offset.store(0, Relaxed);
-        self.items.clear();
         self.real_size.store(0, Relaxed);
         assert!(self.unref());
+        assert!(self.items.is_empty());
     }
 
-    pub(crate) fn cap(&self) -> u32 {
+    pub(crate) fn cap(&self) -> usize {
         self.cap
+    }
+
+    pub(crate) fn workers(&self) -> u16 {
+        self.flsn.len() as u16
     }
 
     pub(crate) fn sizes(&self) -> (u64, u64) {
@@ -130,39 +136,37 @@ impl Arena {
         (x, y)
     }
 
-    fn alloc_size(&self, size: u32) -> Result<u32, OpCode> {
-        if size > self.cap {
-            return Err(OpCode::TooLarge);
-        }
-
+    fn alloc_size(&self, size: u32) -> Result<(), OpCode> {
         let mut cur = self.real_size.load(Relaxed);
+
         loop {
             // it's possible that other thread change the state to WARM
             if self.state() != Self::HOT {
                 return Err(OpCode::Again);
             }
 
-            let new = cur + size as u64;
-            if new > self.cap as u64 {
+            // this allow us over alloc once
+            if cur > self.cap as u64 {
                 return Err(OpCode::NeedMore);
             }
 
+            let new = cur + size as u64;
             match self.real_size.compare_exchange(cur, new, AcqRel, Acquire) {
                 Ok(_) => {
                     let off = self.offset.fetch_add(1_u64, Relaxed);
                     if off >= u32::MAX as u64 {
                         return Err(OpCode::NeedMore);
                     }
-                    return Ok(off as u32);
+                    return Ok(());
                 }
                 Err(e) => cur = e,
             }
         }
     }
 
-    fn alloc_at(&self, numerics: &Numerics, off: u32, size: u32) -> BoxRef {
-        let addr = pack_id(self.id.get(), off);
-        let p = BoxRef::alloc(size, addr, numerics.epoch.fetch_add(1, Relaxed));
+    fn alloc_at(&self, numerics: &Numerics, size: u32) -> BoxRef {
+        let addr = numerics.address.fetch_add(1, Relaxed);
+        let p = BoxRef::alloc(size, addr);
         self.items.insert(addr, p.clone());
         p
     }
@@ -170,8 +174,8 @@ impl Arena {
     pub fn alloc(&self, numerics: &Numerics, size: u32) -> Result<BoxRef, OpCode> {
         let real_size = BoxRef::real_size(size);
         self.inc_ref();
-        let offset = self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
-        Ok(self.alloc_at(numerics, offset, size))
+        self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
+        Ok(self.alloc_at(numerics, size))
     }
 
     pub(crate) fn dealloc(&self, addr: u64, len: usize) {
@@ -181,18 +185,17 @@ impl Arena {
     }
 
     #[inline]
-    pub(crate) fn load(&self, off: u32) -> BoxRef {
-        let addr = pack_id(self.id(), off);
+    pub(crate) fn load(&self, addr: u64) -> BoxRef {
         self.items.get(&addr).unwrap().value().clone()
     }
 
-    pub(crate) fn set_state(&self, cur: u8, new: u8) -> u8 {
+    pub(crate) fn set_state(&self, cur: u16, new: u16) -> u16 {
         self.state
             .compare_exchange(cur, new, AcqRel, Acquire)
             .unwrap_or_else(|x| x)
     }
 
-    pub(crate) fn state(&self) -> u8 {
+    pub(crate) fn state(&self) -> u16 {
         self.state.load(Relaxed)
     }
 
@@ -224,14 +227,18 @@ impl Arena {
     }
 
     pub(crate) fn dec_ref(&self) {
-        self.refs.fetch_sub(1, Release);
+        self.refs.fetch_sub(1, AcqRel);
+    }
+
+    pub(crate) fn refcnt(&self) -> u32 {
+        self.refs.load(Acquire)
     }
 
     fn unref(&self) -> bool {
         self.refs.load(Acquire) == 0
     }
 
-    pub(crate) fn id(&self) -> u32 {
+    pub(crate) fn id(&self) -> u64 {
         self.id.get()
     }
 }
@@ -249,17 +256,15 @@ impl Debug for Arena {
 
 /// the layout of a flushed arena is:
 /// ```text
-/// high                                      low
-/// +--------+-------------+------------------+
-/// | footer | relocations |  frames (normal) |
-/// +--------+-------------+-------+----------+
-///
+/// +-------------+-------------+-----------+--------+
+/// | data frames | reloactions | intervals | footer |
+/// +-------------+-------------+-----------+--------+
 /// ```
 /// write file from frames to footer while read file from footer to relocations
 #[repr(C, packed(1))]
 #[derive(Default, Debug)]
 pub(crate) struct DataFooter {
-    /// monotonically increasing
+    /// monotonically increasing, it's file_id on flush, average of file_id on compaction
     pub(crate) up2: u64,
     /// item's relocation table
     pub(crate) nr_reloc: u32,
@@ -267,7 +272,7 @@ pub(crate) struct DataFooter {
     pub(crate) nr_active: u32,
     /// active frame size, also the initial total size
     pub(crate) active_size: usize,
-    pub(crate) padding: u32,
+    pub(crate) nr_intervals: u32,
     pub(crate) crc: u32,
 }
 
@@ -282,11 +287,15 @@ impl DataFooter {
     }
 
     fn reloc_pos(&self) -> usize {
+        Self::LEN + self.interval_len()
+    }
+
+    fn interval_pos(&self) -> usize {
         Self::LEN
     }
 
     fn meta_len(&self) -> usize {
-        self.reloc_len()
+        self.reloc_len() * self.interval_len()
     }
 
     fn get<T>(&self, off: usize, n: usize) -> &[T] {
@@ -301,12 +310,24 @@ impl DataFooter {
         self.get(self.reloc_pos(), self.reloc_len())
     }
 
+    fn interval_slice(&self) -> &[u8] {
+        self.get(self.interval_pos(), self.interval_len())
+    }
+
     fn reloc_len(&self) -> usize {
         self.nr_reloc as usize * AddrPair::LEN
     }
 
+    fn interval_len(&self) -> usize {
+        self.nr_intervals as usize * Interval::LEN
+    }
+
     pub(crate) fn relocs(&self) -> &[AddrPair] {
         self.get(self.reloc_pos(), self.nr_reloc as usize)
+    }
+
+    pub(crate) fn intervals(&self) -> &[Interval] {
+        self.get(self.interval_pos(), self.nr_intervals as usize)
     }
 }
 
@@ -319,10 +340,16 @@ pub(crate) struct DataBuilder {
     /// never flush to file
     pub(crate) junks: Vec<BoxRef>,
     reloc: Vec<u8>,
+    interval: Interval,
     frames: Vec<BoxRef>,
 }
 
 impl DataBuilder {
+    fn update_addr(&mut self, addr: u64) {
+        self.interval.lo = self.interval.lo.min(addr);
+        self.interval.hi = self.interval.hi.max(addr);
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             nr_rel: 0,
@@ -331,6 +358,7 @@ impl DataBuilder {
             active_size: 0,
             junks: Vec::new(),
             reloc: Vec::new(),
+            interval: Interval::new(u64::MAX, 0),
             frames: Vec::new(),
         }
     }
@@ -338,10 +366,12 @@ impl DataBuilder {
     pub(crate) fn add(&mut self, f: BoxRef) {
         let h = f.header();
         match h.flag {
+            // NOTE: the pid maybe NULL_PID when it's a sibling or remote page
             TagFlag::Normal | TagFlag::Sibling => {
                 self.nr_active += 1;
                 self.active_size += f.total_size() as usize;
                 self.nr_rel += 1;
+                self.update_addr(h.addr);
                 self.frames.push(f);
             }
             TagFlag::Junk => {
@@ -360,11 +390,10 @@ impl DataBuilder {
         self.frames.len()
     }
 
-    pub(crate) fn stat(&self, id: u32, tick: u64) -> FileStat {
+    pub(crate) fn stat(&self, id: u64, tick: u64) -> FileStat {
         FileStat {
             inner: StatInner {
                 file_id: id,
-                _padding: 0,
                 up1: tick,
                 up2: tick,
                 active_elems: self.nr_active,
@@ -376,7 +405,7 @@ impl DataBuilder {
         }
     }
 
-    pub(crate) fn build(&mut self, tick: u64, path: PathBuf) {
+    pub(crate) fn build(&mut self, file_id: u64, path: PathBuf) -> Interval {
         let mut pos: usize = 0;
         let mut crc = Crc32cHasher::default();
         let mut w = GatherWriter::trunc(&path, 64);
@@ -394,22 +423,28 @@ impl DataBuilder {
             w.queue(s);
         }
 
-        let s = self.reloc.as_slice();
-        crc.write(s);
-        w.queue(s);
+        let rs = self.reloc.as_slice();
+        crc.write(rs);
+        w.queue(rs);
+
+        let is = self.interval.as_slice();
+        crc.write(is);
+        w.queue(is);
 
         let hdr = DataFooter {
-            up2: tick,
+            up2: file_id,
             nr_reloc: self.nr_rel,
             nr_active: self.nr_active,
             active_size: self.active_size,
-            padding: 0,
+            nr_intervals: 1,
             crc: crc.finish() as u32,
         };
 
         w.queue(hdr.as_slice());
         w.flush();
         w.sync();
+
+        self.interval
     }
 }
 
@@ -469,6 +504,7 @@ impl DataMetaReader {
     fn read_meta(&mut self) -> Result<u32, std::io::Error> {
         Self::get_footer(self)?;
         let f = raw_ptr_to_ref(self.buf.data().cast::<DataFooter>());
+        self.get_interval(f)?;
         self.get_reloc(f)?;
         if self.validate {
             self.calc_crc(f)
@@ -493,13 +529,26 @@ impl DataMetaReader {
         Ok(())
     }
 
-    fn get_reloc(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
-        if f.reloc_len() > 0 {
-            self.off -= f.reloc_len() as u64;
-            let s = self.buf.mut_slice(self.pos, f.reloc_len());
+    fn get_interval(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
+        let len = f.interval_len();
+        if len > 0 {
+            self.off -= len as u64;
+            let s = self.buf.mut_slice(self.pos, len);
 
             self.file.read(s, self.off)?;
-            self.pos += f.reloc_len();
+            self.pos += len;
+        }
+        Ok(())
+    }
+
+    fn get_reloc(&mut self, f: &DataFooter) -> Result<(), std::io::Error> {
+        let len = f.reloc_len();
+        if len > 0 {
+            self.off -= len as u64;
+            let s = self.buf.mut_slice(self.pos, len);
+
+            self.file.read(s, self.off)?;
+            self.pos += len;
         }
         Ok(())
     }
@@ -519,6 +568,7 @@ impl DataMetaReader {
         }
 
         h.write(f.reloc_slice());
+        h.write(f.interval_slice());
 
         Ok(h.finish() as u32)
     }
@@ -539,19 +589,22 @@ impl MapBuilder {
         }
     }
 
-    fn add_impl(&mut self, pid: u64, addr: u64, epoch: u64, is_unmap: bool) {
-        self.table
-            .add(pid, if is_unmap { NULL_ADDR } else { addr }, epoch);
+    fn add_impl(&mut self, pid: u64, addr: u64, is_unmap: bool) {
+        debug_assert_ne!(pid, NULL_PID);
+        self.table.add(pid, if is_unmap { NULL_ADDR } else { addr });
     }
 
     pub(crate) fn add(&mut self, f: &BoxRef) {
         let h = f.header();
         match h.flag {
             TagFlag::Normal => {
-                self.add_impl(h.pid, h.addr, h.epoch, false);
+                // ignore those failed in CAS
+                if h.pid != NULL_PID {
+                    self.add_impl(h.pid, h.addr, false);
+                }
             }
             TagFlag::Unmap => {
-                self.add_impl(h.pid, h.addr, h.epoch, true);
+                self.add_impl(h.pid, h.addr, true);
             }
             TagFlag::Sibling => {
                 assert_eq!(h.pid, NULL_PID);
@@ -584,7 +637,7 @@ mod test {
         opt.create_dir();
 
         let (pid, addr) = (114514, 1919810);
-        let mut p = BoxRef::alloc(233, addr, 0);
+        let mut p = BoxRef::alloc(233, addr);
         p.header_mut().pid = pid;
 
         let mut builder = DataBuilder::new();
@@ -598,8 +651,13 @@ mod test {
 
         let d = loader.get_meta().unwrap();
         let reloc = d.relocs();
+        let intervals = d.intervals();
 
         assert_eq!(reloc.len(), 1);
+        assert_eq!(intervals.len(), 1);
+
+        assert_eq!({ intervals[0].lo }, 1919810);
+        assert_eq!({ intervals[0].hi }, 1919810);
 
         let h = p.header();
         let r = &reloc[0];

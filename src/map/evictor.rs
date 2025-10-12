@@ -23,7 +23,7 @@ use crate::{
         refbox::{BoxRef, BoxView},
         traits::{IAlloc, IHeader, IInlineSize},
     },
-    utils::{Handle, data::JUNK_LEN, options::ParsedOptions},
+    utils::{Handle, ROOT_PID, data::JUNK_LEN, options::ParsedOptions},
 };
 
 pub(crate) struct Evictor {
@@ -74,43 +74,50 @@ impl Evictor {
             }
             assert!(!swip.is_tagged());
 
+            let mut compacted = false;
             let old = Page::<Loader>::from_swip(swip.untagged());
-            if old.delta_len() > limit {
-                let mut node = old.compact(self, safe_txid, true);
+            let addr = if old.delta_len() > limit {
+                let mut node = old.compact(self, safe_txid);
                 node.set_pid(old.pid());
                 let addr = node.latest_addr();
                 assert_eq!(addr, node.base_addr());
+                compacted = true;
+                addr
+            } else {
+                old.latest_addr()
+            };
 
-                // NOTE: other threads may perform cas in the same time
-                match self.table.cas(pid, old.swip(), Swip::tagged(addr)) {
-                    Ok(_) => {
+            // NOTE: other threads may perform cas in the same time
+            match self.table.cas(pid, old.swip(), Swip::tagged(addr)) {
+                Ok(_) => {
+                    self.cache.evict_one(pid);
+                    if compacted {
                         old.garbage_collect(self);
-                        g.defer(move || old.reclaim());
-                        g.flush();
-                        self.commit();
                     }
-                    Err(_) => {
-                        // it has been replaced by other thread, in this case, we do NOT retry, it
-                        // will be compacted next time either here or somewhere
-                        self.rollback();
-                    }
+                    // must guarded by EBR, other threads may still use the old page
+                    g.defer(move || old.reclaim());
+                    self.commit();
+                }
+                Err(_) => {
+                    // it has been replaced by other thread, in this case, we do NOT retry, it will
+                    // be evicted next time
+                    self.rollback();
                 }
             }
         }
     }
 
     fn evict_all(&mut self, safe_txid: u64, limit: usize) {
-        let mut pids = Vec::new();
-        self.cache.reclaim(|x| pids.push(x));
+        let end = self.table.len();
 
-        for pid in pids {
+        for pid in ROOT_PID..end {
             let swip = Swip::new(self.table.get(pid));
             if swip.is_null() || swip.is_tagged() {
                 continue;
             }
             let old = Page::<Loader>::from_swip(swip.untagged());
             if self.opt.compact_on_exit || old.delta_len() >= limit {
-                let mut node = old.compact(self, safe_txid, true);
+                let mut node = old.compact(self, safe_txid);
                 node.set_pid(old.pid());
                 self.commit();
             }
@@ -131,17 +138,15 @@ impl Evictor {
                 let Ok(_lk) = old.try_lock() else {
                     continue;
                 };
-                let mut node = old.compact(self, safe_txid, true);
+                let mut node = old.compact(self, safe_txid);
                 node.set_pid(old.pid());
                 let new = Page::new(node);
-                // never retry
-                // probability of successful CAS > 70%
+                // never retry, probability of successful CAS > 70%
                 // NOTE: other threads may perform cas in the same time
                 match self.table.cas(pid, old.swip(), new.swip()) {
                     Ok(_) => {
                         old.garbage_collect(self);
                         g.defer(move || old.reclaim());
-                        g.flush();
                         self.commit();
                     }
                     Err(_) => {
@@ -160,7 +165,7 @@ impl Evictor {
 
         let mut garbage: Vec<u64> = Vec::new();
         std::mem::swap(&mut garbage, &mut self.garbage);
-        self.buffer.tombstone_active(&garbage, |addr| {
+        self.buffer.recycle(&garbage, |addr| {
             self.garbage.push(addr);
         });
 
@@ -208,7 +213,7 @@ impl IAlloc for Evictor {
         b
     }
 
-    fn arena_size(&mut self) -> u32 {
+    fn arena_size(&mut self) -> usize {
         self.opt.data_file_size
     }
 
@@ -240,7 +245,9 @@ fn evictor_loop(mut e: Evictor) {
                     break;
                 }
                 SharedState::Evict => {
-                    e.evict(&g, limit, safe_txid);
+                    if e.cache.full() {
+                        e.evict(&g, limit, safe_txid);
+                    }
                 }
             },
             Err(RecvTimeoutError::Timeout) => {

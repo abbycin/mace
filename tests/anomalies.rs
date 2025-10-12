@@ -401,7 +401,7 @@ impl Executor {
         let mut opt = Options::new(&*path);
 
         opt.tmp_store = tmp;
-        opt.workers = workers.len();
+        opt.workers = workers.len() as u16;
         let db = Arc::new(Mace::new(opt.validate().unwrap()).unwrap());
 
         let mut map = HashMap::new();
@@ -617,7 +617,7 @@ impl Session {
     fn rollback(&mut self) {
         self.cond.set_fn(Closure::new(|| {
             let kv = self.kv.take().unwrap();
-            let _ = kv.rollback();
+            drop(kv);
         }));
         self.sync();
     }

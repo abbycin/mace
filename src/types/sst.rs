@@ -6,7 +6,7 @@ use crate::{
         refbox::RemoteView,
         traits::{ICodec, IKey, ILoader, IVal},
     },
-    utils::{ADDR_LEN, raw_ptr_to_ref, unpack_id},
+    utils::{ADDR_LEN, raw_ptr_to_ref},
 };
 
 use super::header::BaseHeader;
@@ -62,7 +62,7 @@ where
     where
         L: ILoader,
     {
-        let mut p = l.pin_load_unchecked(addr).as_remote();
+        let mut p = l.load_unchecked(addr).as_remote();
         let data = p.raw_mut();
         let k = K::decode_from(data);
         let v = V::decode_from(&data[k.packed_size()..]);
@@ -79,7 +79,7 @@ where
         if s.is_inline() {
             K::decode_from(&raw[Slot::LOCAL_LEN..])
         } else {
-            let mut p = l.pin_load_unchecked(s.addr()).as_remote();
+            let mut p = l.load_unchecked(s.addr()).as_remote();
             K::decode_from(p.raw_mut())
         }
     }
@@ -155,10 +155,7 @@ where
         L: ILoader,
     {
         let elems = self.header().elems as usize;
-        log::debug!(
-            "---------- show page {pid} {:?} elems {elems} ----------",
-            unpack_id(addr),
-        );
+        log::debug!("---------- show page {pid} {addr} elems {elems} ----------");
         for i in 0..elems {
             let (k, v, _) = self.get_unchecked(l, i);
             log::debug!("{} => {}", k.to_string(), v.to_string());

@@ -28,7 +28,7 @@ fn main() -> Result<(), OpCode> {
     // rollback
     let kv = db.begin()?;
     kv.put("mo", "ha")?;
-    kv.rollback()?;
+    drop(kv);
 
     // start a read-only Txn
     let view = db.view()?;

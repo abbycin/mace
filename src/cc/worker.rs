@@ -35,7 +35,7 @@ pub struct Worker {
 impl Worker {
     fn new(desc: WalDescHandle, numerics: Arc<Numerics>, opt: Arc<ParsedOptions>) -> Self {
         Self {
-            cc: ConcurrencyControl::new(opt.workers),
+            cc: ConcurrencyControl::new(opt.workers as usize),
             start_ckpt: RwLock::new(Position::default()),
             tx_id: AtomicU64::new(0),
             start_ts: 0,
@@ -106,7 +106,7 @@ impl SyncWorker {
     pub(crate) fn commit(&self, ctx: &Context) {
         let mut ms = *self;
         let w = ms.deref_mut();
-        let txid = w.tx_id.load(Relaxed);
+        let txid = w.start_ts;
         w.tx_id.store(0, Release); // sync with cc
 
         if !w.modified {
@@ -127,7 +127,7 @@ impl SyncWorker {
         const SMALL_SIZE: usize = 256;
         let mut ms = *self;
         let w = ms.deref_mut();
-        let txid = w.tx_id.load(Relaxed);
+        let txid = w.start_ts;
         w.tx_id.store(0, Release); // sync with cc
         if !w.modified {
             w.logging.record_abort(txid);

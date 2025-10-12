@@ -50,22 +50,37 @@ impl AddrPair {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct AddrMap {
-    pub epoch: u64,
-    /// pack_id(file_id, offset)
-    pub addr: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
 #[repr(C, packed(1))]
 pub struct MapEntry {
     pub page_id: u64,
     // NULL_ADDR for delete mark
     pub page_addr: u64,
-    pub epoch: u64,
 }
 
 impl IAsSlice for MapEntry {}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed(1))]
+pub struct Interval {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+impl Debug for Interval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("[{}, {}]", { self.lo }, { self.hi }))
+    }
+}
+
+impl Interval {
+    pub const LEN: usize = size_of::<Self>();
+
+    pub const fn new(lo: u64, hi: u64) -> Self {
+        Self { lo, hi }
+    }
+}
+
+impl IAsSlice for Interval {}
 
 pub struct GatherWriter {
     path: PathBuf,
@@ -219,7 +234,7 @@ impl WalDesc {
     pub(crate) fn new(wid: u16) -> Self {
         Self {
             checkpoint: Position::default(),
-            wal_id: INIT_ID as u64,
+            wal_id: INIT_ID,
             worker: wid,
             padding: 0,
             checksum: 0,

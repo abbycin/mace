@@ -1,10 +1,10 @@
+use crate::ROOT_PID;
 use crate::cc::context::Context;
 use crate::map::buffer::Buffers;
 use crate::map::create_buffer;
 use crate::map::table::PageMap;
 use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, NULL_PID};
-use crate::{OpCode, ROOT_PID};
 use std::sync::Arc;
 
 pub struct Store {
@@ -15,17 +15,13 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(
-        page: Arc<PageMap>,
-        opt: Arc<ParsedOptions>,
-        ctx: Handle<Context>,
-    ) -> Result<Self, OpCode> {
-        Ok(Self {
-            buffer: create_buffer(page.clone(), ctx, opt.clone(), ctx.numerics.clone())?,
+    pub fn new(page: Arc<PageMap>, opt: Arc<ParsedOptions>, ctx: Handle<Context>) -> Self {
+        Self {
+            buffer: create_buffer(page.clone(), ctx, opt.clone(), ctx.numerics.clone()),
             context: ctx,
             page,
             opt,
-        })
+        }
     }
 
     // since NEXT_ID starts from 1, the ROOT's addr can't be 0 when it's not first run

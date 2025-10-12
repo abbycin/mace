@@ -303,6 +303,7 @@ impl Logging {
             }
 
             self.flushed_lsn.store(self.seq, Relaxed);
+            self.numerics.log_size.fetch_add(len, Relaxed);
         }
     }
 

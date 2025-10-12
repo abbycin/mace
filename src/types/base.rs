@@ -214,7 +214,7 @@ impl BaseView {
         pos: &mut u32,
         iter: &mut SeekableIter<'a>,
     ) -> u64 {
-        let arena_size = a.arena_size() as usize;
+        let arena_size = a.arena_size();
         let mut head = None;
         let mut tail: Option<BaseView> = None;
         let mut beg = iter.curr_pos();
@@ -402,7 +402,7 @@ impl BaseView {
     }
 
     fn load_remote<L: ILoader>(&self, l: &L, addr: u64, off: usize, len: usize) -> &[u8] {
-        let p = l.pin_load_unchecked(addr);
+        let p = l.load_unchecked(addr);
         let r = p.as_remote();
         let s = r.raw();
         &s[off..off + len]
@@ -499,7 +499,7 @@ where
                 let link = p.box_header().link;
                 self.sibling_pos = 0;
                 if link != NULL_ADDR {
-                    self.sibling = Some(self.loader.pin_load_unchecked(link).as_base());
+                    self.sibling = Some(self.loader.load_unchecked(link).as_base());
                     continue;
                 }
                 self.sibling.take();
@@ -510,7 +510,7 @@ where
             self.beg += 1;
             if let Some(s) = v.sibling() {
                 self.sib_key = k.raw;
-                self.sibling = Some(self.loader.pin_load_unchecked(s.addr()).as_base());
+                self.sibling = Some(self.loader.load_unchecked(s.addr()).as_base());
                 self.sibling_pos = 0;
                 Some((k, v.unpack_sibling()))
             } else {
@@ -603,7 +603,7 @@ where
                 self.sibling_pos = 0;
                 let link = p.box_header().link;
                 if link != 0 {
-                    self.sibling = Some(self.loader.pin_load_unchecked(link).as_base());
+                    self.sibling = Some(self.loader.load_unchecked(link).as_base());
                     continue;
                 }
                 self.sibling = None;
@@ -629,7 +629,7 @@ where
         if let Some(s) = v.sibling() {
             self.sib_key = k.raw;
             self.sibling_pos = 0;
-            self.sibling = Some(self.loader.pin_load_unchecked(s.addr()).as_base());
+            self.sibling = Some(self.loader.load_unchecked(s.addr()).as_base());
             return Some((
                 LeafSeg::new(self.prefix(), k.raw, k.ver),
                 v.unpack_sibling(),
@@ -779,7 +779,7 @@ struct SeekableIter<'a> {
 impl<'a> SeekableIter<'a> {
     fn new() -> Self {
         Self {
-            data: Vec::with_capacity(Options::SPLIT_ELEMS as usize * 4),
+            data: Vec::with_capacity(Options::SPLIT_ELEMS as usize * 2),
             index: 0,
         }
     }
@@ -809,7 +809,6 @@ impl<'a> SeekableIter<'a> {
 
 #[cfg(test)]
 mod test {
-    use crate::utils::INIT_EPOCH;
     use crate::{
         types::{
             data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Value, Ver},
@@ -829,7 +828,6 @@ mod test {
     #[derive(Clone)]
     struct Allocator {
         inner: MutRef<Inner>,
-        epoch: u64,
     }
 
     impl Allocator {
@@ -839,7 +837,6 @@ mod test {
                     off: Cell::new(0),
                     map: HashMap::new(),
                 }),
-                epoch: INIT_EPOCH,
             }
         }
     }
@@ -849,21 +846,20 @@ mod test {
             let r = &mut self.inner;
             let old = r.off.get();
             r.off.set(old + size as u64);
-            let b = BoxRef::alloc(size as u32, old, self.epoch);
-            self.epoch += 1;
+            let b = BoxRef::alloc(size as u32, old);
             r.map.insert(old, b.clone());
             b
         }
 
         fn collect(&mut self, _addr: &[u64]) {}
 
-        fn arena_size(&mut self) -> u32 {
+        fn arena_size(&mut self) -> usize {
             1 << 20
         }
     }
 
     impl ILoader for Allocator {
-        fn pin_load(&self, addr: u64) -> Option<BoxView> {
+        fn load(&self, addr: u64) -> Option<BoxView> {
             Some(self.inner.map.get(&addr).unwrap().view())
         }
 
