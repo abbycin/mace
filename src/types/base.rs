@@ -1,15 +1,15 @@
-use std::{collections::VecDeque, ptr::null_mut};
+use std::{cell::Cell, collections::VecDeque, ptr::null_mut};
 
 use crate::{
-    Options, number_to_slice, slice_to_number,
+    Options,
     types::{
-        data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Sibling, Value, Ver},
-        header::{BaseHeader, NodeType, SLOT_LEN, Slot, SlotType, TagFlag, TagKind},
-        refbox::{BaseView, BoxRef, RemoteView},
+        data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
+        header::{BaseHeader, NodeType, SLOT_LEN, SlotType, TagFlag, TagKind},
+        refbox::{BaseView, BoxRef},
         sst::Sst,
-        traits::{IAlloc, IBoxHeader, ICodec, IHeader, IKey, ILoader, IVal},
+        traits::{IAlloc, IBoxHeader, ICodec, IHeader, IKey, IKeyCodec, ILoader},
     },
-    utils::{ADDR_LEN, NULL_ADDR, NULL_PID},
+    utils::{NULL_ADDR, NULL_PID},
 };
 
 impl BaseView {
@@ -23,11 +23,6 @@ impl BaseView {
         self.0.is_null()
     }
 
-    pub(crate) fn remote(&self) -> &[u64] {
-        let h = self.header();
-        unsafe { std::slice::from_raw_parts(self.0.add(1).cast::<u64>(), h.nr_remote as usize) }
-    }
-
     pub(crate) fn calc_prefix(lo: &[u8], hi: &Option<&[u8]>) -> usize {
         if let Some(hi) = hi {
             lo.iter()
@@ -39,32 +34,31 @@ impl BaseView {
         }
     }
 
-    pub(crate) fn new_leaf<'a, A, I, F>(
+    pub(crate) fn new_leaf<'a, A, L, I>(
         a: &mut A,
+        l: &L,
         lo: &[u8],
         hi: Option<&[u8]>,
-        sibling: u64,
-        f: F,
+        right_sibling: u64,
+        iter: &mut I,
     ) -> BoxRef
     where
         A: IAlloc,
-        I: Iterator<Item = (LeafSeg<'a>, Value<Record>)>,
-        F: Fn() -> I,
+        L: ILoader,
+        I: Iterator<Item = (LeafSeg<'a>, Val<'a>)>,
     {
-        let inline_size = a.inline_size() as usize;
+        let inline_size = a.inline_size();
         let mut elems = 0;
         let mut hints = VecDeque::new();
-        let mut fixed = false;
+        let mut is_new_sibling = false;
         let mut last_raw: Option<LeafSeg<'a>> = None;
         let mut pos = 0;
         let mut payload_sz = 0;
         let mut seekable = SeekableIter::new();
-        let mut remote_cnt = 0;
         let prefix_len = Self::calc_prefix(lo, &hi);
         #[cfg(feature = "extra_check")]
         let mut last_k: Option<LeafSeg> = None;
 
-        let iter = f();
         for (ks, v) in iter {
             #[cfg(feature = "extra_check")]
             {
@@ -79,32 +73,23 @@ impl BaseView {
             if let Some(ref raw) = last_raw
                 && raw.raw_cmp(&k).is_eq()
             {
-                if !fixed {
-                    fixed = true;
-                    payload_sz += ADDR_LEN; // plus extra addr size
-                    remote_cnt += 1; // sibling itself
+                if !is_new_sibling {
+                    is_new_sibling = true;
+                    payload_sz += Val::calc_size(true, inline_size, v.data_size());
                     hints.push_back((pos - 1, 0));
                 }
                 let (_, cnt) = hints.back_mut().unwrap();
                 *cnt += 1;
                 pos += 1;
-                if v.packed_size() + Ver::len() > inline_size {
-                    remote_cnt += 1; // (ver, value) in sibling
-                }
                 continue;
             }
 
-            let kv_sz = k.packed_size() + v.packed_size();
             pos += 1;
             last_raw = Some(k);
-            fixed = false;
-            if kv_sz > inline_size {
-                payload_sz += Slot::REMOTE_LEN;
-                remote_cnt += 1; // (key, value) in sst
-            } else {
-                payload_sz += Slot::LOCAL_LEN;
-                payload_sz += kv_sz;
-            }
+            is_new_sibling = false;
+            payload_sz += k.packed_size();
+            let vsz = v.data_size();
+            payload_sz += Val::calc_size(false, inline_size, vsz);
             elems += 1;
         }
 
@@ -115,40 +100,38 @@ impl BaseView {
             lo,
             hi,
             elems,
-            sibling,
-            &mut remote_cnt,
+            right_sibling,
             prefix_len,
         );
 
         let mut base = b.view().as_base();
-        let mut remote = Vec::with_capacity(remote_cnt as usize);
-        let mut builder = Builder::from(&mut remote, remote_cnt as usize, base.data_mut(), elems);
-        builder.setup_range(a, lo, hi);
+        let mut builder = Builder::from(base.data_mut(), elems);
+        builder.setup_boundary_keys(lo, hi);
 
         pos = 0;
         loop {
-            let Some(&(k, v)) = seekable.next() else {
+            let Some((k, v)) = seekable.next() else {
                 break;
             };
 
+            let (r, _) = v.get_record(l);
+            let remote = v.get_remote();
             let Some((idx, _)) = hints.front() else {
-                builder.add(&k, &v, a);
+                builder.add_leaf(inline_size, k, &r, NULL_ADDR, remote);
                 pos += 1;
                 continue;
             };
 
             if pos == *idx {
                 let (_, cnt) = hints.pop_front().unwrap();
-                let addr =
-                    Self::save_versions(a, &mut builder, cnt as usize, &mut pos, &mut seekable);
+                let sib_addr = Self::save_versions(a, l, cnt as usize, &mut pos, &seekable);
 
-                builder.add(&k, &Value::Sib(Sibling::from(addr, &v)), a);
+                builder.add_leaf(inline_size, k, &r, sib_addr, remote);
             } else {
-                builder.add(&k, &v, a);
+                builder.add_leaf(inline_size, k, &r, NULL_ADDR, remote);
             }
             pos += 1;
         }
-        base.remote_mut().copy_from_slice(&remote);
         b
     }
 
@@ -165,55 +148,39 @@ impl BaseView {
         F: Fn() -> I,
     {
         let prefix_len = Self::calc_prefix(lo, &hi);
-        let inline_size = a.inline_size() as usize;
-        let mut remote_cnt = 0;
         let mut elems = 0;
         let sz: usize = f()
             .map(|(k, v)| {
                 elems += 1;
-                let sz = k.remove_prefix(prefix_len).packed_size() + v.packed_size();
-                if sz > inline_size {
-                    remote_cnt += 1;
-                    Slot::REMOTE_LEN
-                } else {
-                    sz + Slot::LOCAL_LEN
-                }
+                let ksz = k.remove_prefix(prefix_len).packed_size();
+                let vsz = v.packed_size();
+                ksz + vsz
             })
             .sum();
 
         let hdr_sz = elems * SLOT_LEN + Self::HDR_LEN;
-        let b = Self::alloc::<true, _>(
-            a,
-            hdr_sz + sz,
-            lo,
-            hi,
-            elems,
-            sibling,
-            &mut remote_cnt,
-            prefix_len,
-        );
-        let mut remote = Vec::with_capacity(remote_cnt as usize);
+        let b = Self::alloc::<true, _>(a, hdr_sz + sz, lo, hi, elems, sibling, prefix_len);
         let mut base = b.view().as_base();
-        let mut builder = Builder::from(&mut remote, remote_cnt as usize, base.data_mut(), elems);
-        builder.setup_range(a, lo, hi);
+        let mut builder = Builder::from(base.data_mut(), elems);
+        builder.setup_boundary_keys(lo, hi);
 
         let iter = f();
         for (k, v) in iter {
             let k = k.remove_prefix(prefix_len);
-            builder.add(&k, &v, a);
+            builder.add_intl(&k, &v);
         }
-        base.remote_mut().copy_from_slice(&remote);
 
         b
     }
 
-    fn save_versions<'a, A: IAlloc>(
+    fn save_versions<'a, A: IAlloc, L: ILoader>(
         a: &mut A,
-        main_builder: &mut Builder,
+        l: &L,
         mut cnt: usize,
         pos: &mut u32,
-        iter: &mut SeekableIter<'a>,
+        iter: &SeekableIter<'a>,
     ) -> u64 {
+        let inline_size = a.inline_size();
         let arena_size = a.arena_size();
         let mut head = None;
         let mut tail: Option<BaseView> = None;
@@ -224,12 +191,7 @@ impl BaseView {
             let mut len = Self::HDR_LEN;
             while cnt > 0 {
                 let (_, v) = iter.next().unwrap();
-                let kv_sz = Ver::len() + v.packed_size();
-                let sz = if kv_sz > a.inline_size() as usize {
-                    Slot::REMOTE_LEN
-                } else {
-                    kv_sz + Slot::LOCAL_LEN
-                };
+                let sz = Ver::len() + Val::calc_size(false, inline_size, v.data_size());
                 let tmp = len + sz + SLOT_LEN;
                 if tmp > arena_size {
                     break;
@@ -240,23 +202,21 @@ impl BaseView {
             }
             iter.seek_to(saved);
 
-            // remote_cnt was collected in previous iteration, siblings are already included, so we set to 0
-            let mut cnt = 0;
-            let b = Self::alloc::<false, _>(a, len, &[], None, beg - saved, NULL_PID, &mut cnt, 0);
+            let b = Self::alloc::<false, _>(a, len, &[], None, beg - saved, NULL_PID, 0);
             // NOTE: this is the only place to set flag to Sibling
             let mut base = b.view().as_base();
             base.box_header_mut().flag = TagFlag::Sibling;
-            let mut builder = Builder::from(main_builder.remote, 0, base.data_mut(), beg - saved);
-            builder.setup_range(a, &[], None);
+            let mut builder = Builder::from(base.data_mut(), beg - saved);
+            builder.setup_boundary_keys(&[], None);
 
             for _ in saved..beg {
                 let (k, v) = iter.next().unwrap();
-                builder.add(&k.ver, v, a);
+                let (r, _) = v.get_record(l);
+                builder.add_leaf(inline_size, &k.ver, &r, NULL_ADDR, v.get_remote());
                 *pos += 1;
             }
 
             let addr = base.box_header().addr;
-            main_builder.save_remote(addr);
 
             if head.is_none() {
                 head = Some(addr);
@@ -271,29 +231,20 @@ impl BaseView {
         head.unwrap()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn alloc<const IS_INDEX: bool, A: IAlloc>(
         a: &mut A,
         mut size: usize,
         lo: &[u8],
         hi: Option<&[u8]>,
         elems: usize,
-        sibling: u64,
-        remote_cnt: &mut u16,
+        right_sibling: u64,
         prefix_len: usize,
     ) -> BoxRef {
         let hi_len = hi.map_or(0, |x| x.len());
 
-        let boundary_len = lo.len() + hi_len;
         // we don't use slot to encode lo/hi length, since the length has been saved in header
-        size += if boundary_len > a.inline_size() as usize {
-            *remote_cnt += 1;
-            Slot::REMOTE_LEN
-        } else {
-            boundary_len
-        };
-
-        size += *remote_cnt as usize * ADDR_LEN;
+        // and the lo/hi keys are both stored in sst directly discard it's length
+        size += lo.len() + hi.map_or(0, |x| x.len());
 
         let mut p = a.allocate(size);
         let h = p.header_mut();
@@ -309,7 +260,7 @@ impl BaseView {
         let h = b.header_mut();
         h.elems = elems as u16;
         h.size = size as u32;
-        h.right_sibling = sibling;
+        h.right_sibling = right_sibling;
         h.merging_child = NULL_PID;
         h.lo_len = lo.len() as u32;
         h.hi_len = hi_len as u32;
@@ -317,7 +268,7 @@ impl BaseView {
         h.split_elems = 0;
         h.prefix_len = prefix_len as u32;
         h.is_index = IS_INDEX;
-        h.nr_remote = *remote_cnt;
+        h.padding = 0;
 
         p
     }
@@ -332,9 +283,9 @@ impl BaseView {
         let hdr2 = other.header();
         assert_eq!(hdr1.is_index, hdr2.is_index);
 
-        let lo1 = self.lo(loader);
-        let lo2 = other.lo(loader);
-        let hi = other.hi(loader);
+        let lo1 = self.lo();
+        let lo2 = other.lo();
+        let hi = other.hi();
         let sibling = hdr2.right_sibling;
         let elems1 = hdr1.elems as usize;
         let elems2 = hdr2.elems as usize;
@@ -343,117 +294,85 @@ impl BaseView {
 
         if hdr1.is_index {
             let f = || {
-                let l = self.range_iter::<L, IntlKey, Index>(loader, 0, elems1);
-                let r = other.range_iter::<L, IntlKey, Index>(loader, 0, elems2);
+                let l = self.range_iter::<L, IntlKey>(loader, 0, elems1);
+                let r = other.range_iter::<L, IntlKey>(loader, 0, elems2);
                 FuseBaseIter::new(loader, &lo1[..pl1], &lo2[..pl2], l, r)
             };
             Self::new_intl(a, lo1, hi, sibling, f)
         } else {
-            let f = || {
-                let l = self.range_iter::<L, Key, Value<Record>>(loader, 0, elems1);
-                let r = other.range_iter::<L, Key, Value<Record>>(loader, 0, elems2);
-                FuseBaseIter::new(loader, &lo1[..pl1], &lo2[..pl2], l, r)
-            };
-            Self::new_leaf(a, lo1, hi, sibling, f)
+            let l = self.range_iter::<L, Key>(loader, 0, elems1);
+            let r = other.range_iter::<L, Key>(loader, 0, elems2);
+            let mut iter = FuseBaseIter::new(loader, &lo1[..pl1], &lo2[..pl2], l, r);
+            Self::new_leaf(a, loader, lo1, hi, sibling, &mut iter)
         }
-    }
-
-    pub(crate) fn remote_mut(&mut self) -> &mut [u64] {
-        let h = self.header();
-        unsafe { std::slice::from_raw_parts_mut(self.0.add(1).cast::<u64>(), h.nr_remote as usize) }
     }
 
     /// the data means slot + hi/lo + key-value, excluding header and remotes
     fn data_mut(&mut self) -> &mut [u8] {
         let h = self.header();
-        let remote_len = h.nr_remote as usize * ADDR_LEN;
         unsafe {
             std::slice::from_raw_parts_mut(
-                self.0.add(1).cast::<u8>().add(remote_len),
-                h.size as usize - Self::HDR_LEN - remote_len,
+                self.0.add(1).cast::<u8>(),
+                h.size as usize - Self::HDR_LEN,
             )
         }
     }
 
     fn data(&self) -> &[u8] {
         let h = self.header();
-        let remote_len = h.nr_remote as usize * ADDR_LEN;
         unsafe {
-            std::slice::from_raw_parts(
-                self.0.add(1).cast::<u8>().add(remote_len),
-                h.size as usize - Self::HDR_LEN - remote_len,
-            )
+            std::slice::from_raw_parts(self.0.add(1).cast::<u8>(), h.size as usize - Self::HDR_LEN)
         }
     }
 
-    pub(crate) fn lo<L: ILoader>(&self, l: &L) -> &[u8] {
+    pub(crate) fn lo(&self) -> &[u8] {
         let h = self.header();
         if h.lo_len == 0 {
             return &[];
         }
-        let sz = h.lo_len + h.hi_len;
         let off = h.elems as usize * SLOT_LEN;
-        if sz <= l.inline_size() {
-            &self.data()[off..off + h.lo_len as usize]
-        } else {
-            let addr = slice_to_number!(&self.data()[off..off + Slot::REMOTE_LEN], u64);
-            self.load_remote(l, addr, 0, h.lo_len as usize)
-        }
+        &self.data()[off..off + h.lo_len as usize]
     }
 
-    fn load_remote<L: ILoader>(&self, l: &L, addr: u64, off: usize, len: usize) -> &[u8] {
-        let p = l.load_unchecked(addr);
-        let r = p.as_remote();
-        let s = r.raw();
-        &s[off..off + len]
-    }
-
-    pub(crate) fn hi<L: ILoader>(&self, l: &L) -> Option<&[u8]> {
+    pub(crate) fn hi(&self) -> Option<&[u8]> {
         let h = self.header();
         if h.hi_len == 0 {
             return None;
         }
         let off = h.elems as usize * SLOT_LEN;
         let sz = h.lo_len + h.hi_len;
-        if sz <= l.inline_size() {
-            Some(&self.data()[off + h.lo_len as usize..off + sz as usize])
-        } else {
-            let addr = slice_to_number!(&self.data()[off..off + Slot::REMOTE_LEN], u64);
-            Some(self.load_remote(l, addr, h.lo_len as usize, h.hi_len as usize))
-        }
+        Some(&self.data()[off + h.lo_len as usize..off + sz as usize])
     }
 
-    pub(crate) fn range_iter<'a, L, K, V>(
+    pub(crate) fn range_iter<'a, L, K>(
         &'a self,
         l: &'a L,
         beg: usize,
         end: usize,
-    ) -> BaseIter<'a, L, K, V>
+    ) -> BaseIter<'a, L, K>
     where
         L: ILoader,
         K: IKey,
-        V: IVal,
     {
         if self.is_null() {
-            BaseIter::new(l, self.sst(), 0, 0)
+            BaseIter::<L, K>::new(l, self.sst::<K>(), 0, 0)
         } else {
-            BaseIter::new(l, self.sst(), beg, end)
+            BaseIter::<L, K>::new(l, self.sst::<K>(), beg, end)
         }
     }
 
-    pub(crate) fn sst<K, V>(&self) -> Sst<K, V> {
-        Sst::<K, V>::new(self.0)
+    pub(crate) fn sst<K>(&self) -> Sst<K> {
+        Sst::<K>::new(self.0)
     }
 }
 
-pub(crate) struct BaseIter<'a, L, K, V>
+pub(crate) struct BaseIter<'a, L, K>
 where
     L: ILoader,
     K: IKey,
-    V: IVal,
 {
-    loader: &'a L,
-    sst: Sst<K, V>,
+    pub loader: &'a L,
+    sst: Sst<K>,
     beg: usize,
     end: usize,
     sib_key: &'a [u8],
@@ -461,13 +380,12 @@ where
     sibling_pos: usize,
 }
 
-impl<'a, L, K, V> BaseIter<'a, L, K, V>
+impl<'a, L, K> BaseIter<'a, L, K>
 where
     L: ILoader,
     K: IKey,
-    V: IVal,
 {
-    fn new(loader: &'a L, sst: Sst<K, V>, beg: usize, end: usize) -> Self {
+    fn new(loader: &'a L, sst: Sst<K>, beg: usize, end: usize) -> Self {
         Self {
             loader,
             sst,
@@ -480,21 +398,19 @@ where
     }
 }
 
-impl<'a, L> Iterator for BaseIter<'a, L, Key<'a>, Value<Record>>
+impl<'a, L> Iterator for BaseIter<'a, L, Key<'a>>
 where
     L: ILoader,
 {
-    type Item = (Key<'a>, Value<Record>);
+    type Item = (Key<'a>, Val<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(p) = self.sibling.as_ref() {
             if self.sibling_pos < p.header().elems as usize {
-                let (ver, v, _) = p
-                    .sst::<Ver, Value<Record>>()
-                    .get_unchecked(self.loader, self.sibling_pos);
+                let (ver, val) = p.sst::<Ver>().kv_at(self.sibling_pos);
                 self.sibling_pos += 1;
                 let k = Key::new(self.sib_key, ver);
-                return Some((k, v));
+                return Some((k, val));
             } else {
                 let link = p.box_header().link;
                 self.sibling_pos = 0;
@@ -506,13 +422,14 @@ where
             }
         }
         if self.beg < self.end {
-            let (k, v, _) = self.sst.get_unchecked(self.loader, self.beg);
+            let (k, v) = self.sst.kv_at::<Val>(self.beg);
             self.beg += 1;
-            if let Some(s) = v.sibling() {
+            if let Some(addr) = v.get_sibling() {
                 self.sib_key = k.raw;
-                self.sibling = Some(self.loader.load_unchecked(s.addr()).as_base());
+                self.sibling = Some(self.loader.load_unchecked(addr).as_base());
                 self.sibling_pos = 0;
-                Some((k, v.unpack_sibling()))
+                // the sibling is still in `v`
+                Some((k, v))
             } else {
                 Some((k, v))
             }
@@ -522,7 +439,7 @@ where
     }
 }
 
-impl<'a, L> Iterator for BaseIter<'a, L, IntlKey<'a>, Index>
+impl<'a, L> Iterator for BaseIter<'a, L, IntlKey<'a>>
 where
     L: ILoader,
 {
@@ -530,7 +447,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.beg < self.end {
-            let (k, v, _) = self.sst.get_unchecked(self.loader, self.beg);
+            let (k, v) = self.sst.kv_at(self.beg);
             self.beg += 1;
             Some((k, v))
         } else {
@@ -539,35 +456,33 @@ where
     }
 }
 
-struct FuseBaseIter<'a, L, K, V>
+struct FuseBaseIter<'a, L, K>
 where
     L: ILoader,
     K: IKey,
-    V: IVal,
 {
     first: bool,
     loader: &'a L,
     prefix1: &'a [u8],
     prefix2: &'a [u8],
-    iter1: BaseIter<'a, L, K, V>,
-    iter2: BaseIter<'a, L, K, V>,
+    iter1: BaseIter<'a, L, K>,
+    iter2: BaseIter<'a, L, K>,
     sib_key: &'a [u8],
     sibling: Option<BaseView>,
     sibling_pos: usize,
 }
 
-impl<'a, L, K, V> FuseBaseIter<'a, L, K, V>
+impl<'a, L, K> FuseBaseIter<'a, L, K>
 where
     L: ILoader,
     K: IKey,
-    V: IVal,
 {
     fn new(
         loader: &'a L,
         prefix1: &'a [u8],
         prefix2: &'a [u8],
-        i1: BaseIter<'a, L, K, V>,
-        i2: BaseIter<'a, L, K, V>,
+        i1: BaseIter<'a, L, K>,
+        i2: BaseIter<'a, L, K>,
     ) -> Self {
         Self {
             first: true,
@@ -591,11 +506,11 @@ where
     }
 }
 
-impl<'a, L> Iterator for FuseBaseIter<'a, L, Key<'a>, Value<Record>>
+impl<'a, L> Iterator for FuseBaseIter<'a, L, Key<'a>>
 where
     L: ILoader,
 {
-    type Item = (LeafSeg<'a>, Value<Record>);
+    type Item = (LeafSeg<'a>, Val<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(p) = self.sibling.as_ref() {
@@ -608,9 +523,7 @@ where
                 }
                 self.sibling = None;
             } else {
-                let (ver, v, _) = p
-                    .sst::<Ver, Value<Record>>()
-                    .get_unchecked(self.loader, self.sibling_pos);
+                let (ver, v) = p.sst::<Ver>().kv_at(self.sibling_pos);
                 self.sibling_pos += 1;
                 let k = LeafSeg::new(self.prefix(), self.sib_key, ver);
                 return Some((k, v));
@@ -626,20 +539,17 @@ where
             next.unwrap()
         };
 
-        if let Some(s) = v.sibling() {
+        if let Some(addr) = v.get_sibling() {
             self.sib_key = k.raw;
             self.sibling_pos = 0;
-            self.sibling = Some(self.loader.load_unchecked(s.addr()).as_base());
-            return Some((
-                LeafSeg::new(self.prefix(), k.raw, k.ver),
-                v.unpack_sibling(),
-            ));
+            self.sibling = Some(self.loader.load_unchecked(addr).as_base());
+            return Some((LeafSeg::new(self.prefix(), k.raw, k.ver), v));
         }
         Some((LeafSeg::new(self.prefix(), k.raw, k.ver), v))
     }
 }
 
-impl<'a, L> Iterator for FuseBaseIter<'a, L, IntlKey<'a>, Index>
+impl<'a, L> Iterator for FuseBaseIter<'a, L, IntlKey<'a>>
 where
     L: ILoader,
 {
@@ -658,12 +568,11 @@ where
 
 /// the layout of sst:
 /// ```text
-/// +---------+-------------+-------------+---------+--------+----------+
-/// | header  | remote addr | index table | low key | hi key |key-value |
-/// +---------+-------------+-------------+---------+--------+----------+
+/// +---------+-------------+---------+--------+----------+
+/// | header  | index table | low key | hi key |key-value |
+/// +---------+-------------+---------+--------+----------+
 /// ```
 struct Builder<'a> {
-    remote: &'a mut Vec<u64>,
     slots: &'a mut [SlotType],
     payload: &'a mut [u8],
     pos: usize,
@@ -673,68 +582,31 @@ struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     /// the `s` is starts from index table
-    fn from(remote: &'a mut Vec<u64>, nr_remote: usize, s: &'a mut [u8], elems: usize) -> Self {
+    fn from(s: &'a mut [u8], elems: usize) -> Self {
         let offset = elems * SLOT_LEN;
         let slots = unsafe {
             let p = s.as_mut_ptr().cast::<SlotType>();
             std::slice::from_raw_parts_mut(p, elems)
         };
         Self {
-            remote,
             slots,
             payload: s,
-            pos: BaseView::HDR_LEN + nr_remote * ADDR_LEN,
+            pos: BaseView::HDR_LEN,
             index: 0,
             offset,
         }
     }
 
-    /// NOTE: because the lo/hi_len are saved in header, neither varint nor fixed size encode is
-    /// applied here
-    fn setup_range<A: IAlloc>(&mut self, a: &mut A, lo: &[u8], hi: Option<&[u8]>) {
+    fn setup_boundary_keys(&mut self, lo: &[u8], hi: Option<&[u8]>) {
         let hi_len = hi.map_or(0, |x| x.len());
         let boundary_len = lo.len() + hi_len;
 
         if boundary_len > 0 {
-            if boundary_len <= a.inline_size() as usize {
-                self.payload[self.offset..self.offset + lo.len()].copy_from_slice(lo);
-                self.offset += lo.len();
-                self.payload[self.offset..self.offset + hi_len]
-                    .copy_from_slice(hi.map_or(&[], |x| x));
-                self.offset += hi_len;
-            } else {
-                let p = RemoteView::alloc(a, boundary_len);
-                self.save_remote(p.header().addr);
-                let mut r = p.view().as_remote();
-                let dst = r.raw_mut();
-                dst[0..lo.len()].copy_from_slice(lo);
-                dst[lo.len()..].copy_from_slice(hi.map_or(&[], |x| x));
-                // record remote addr in where lo/hi belong in sst
-                number_to_slice!(
-                    p.header().addr,
-                    self.payload[self.offset..self.offset + Slot::REMOTE_LEN]
-                );
-                self.offset += Slot::REMOTE_LEN;
-            }
+            self.payload[self.offset..self.offset + lo.len()].copy_from_slice(lo);
+            self.offset += lo.len();
+            self.payload[self.offset..self.offset + hi_len].copy_from_slice(hi.map_or(&[], |x| x));
+            self.offset += hi_len;
         }
-    }
-
-    fn add_remote<K, V, A: IAlloc>(&mut self, total: usize, k: &K, v: &V, a: &mut A) -> usize
-    where
-        K: ICodec,
-        V: ICodec,
-    {
-        let p = RemoteView::alloc(a, total);
-        let s = Slot::from_remote(p.header().addr);
-        self.save_remote(s.addr());
-        let slot_sz = s.packed_size();
-        s.encode_to(self.slice(self.offset, slot_sz));
-        let mut r = p.view().as_remote();
-        let remote_data = r.raw_mut();
-        let ksz = k.packed_size();
-        k.encode_to(&mut remote_data[..ksz]);
-        v.encode_to(&mut remote_data[ksz..]);
-        slot_sz
     }
 
     #[inline]
@@ -742,64 +614,74 @@ impl<'a> Builder<'a> {
         &mut self.payload[b..b + len]
     }
 
-    fn add<K, V, A: IAlloc>(&mut self, k: &K, v: &V, a: &mut A)
+    fn add_intl<K>(&mut self, k: &K, v: &Index)
     where
         K: ICodec,
-        V: ICodec,
     {
         let (ksz, vsz) = (k.packed_size(), v.packed_size());
-        let mut total_sz = ksz + vsz;
+        k.encode_to(self.slice(self.offset, ksz));
+        v.encode_to(self.slice(self.offset + ksz, vsz));
 
-        if total_sz <= a.inline_size() as usize {
-            let s = Slot::inline();
-            let slot_sz = s.packed_size();
-            s.encode_to(self.slice(self.offset, slot_sz));
-            k.encode_to(self.slice(self.offset + slot_sz, ksz));
-            v.encode_to(self.slice(self.offset + slot_sz + ksz, vsz));
-            total_sz += slot_sz;
-        } else {
-            total_sz = self.add_remote(total_sz, k, v, a);
-        }
-
-        self.slots[self.index] = (self.pos + self.offset) as SlotType;
-        self.index += 1;
-        self.offset += total_sz;
+        self.update_slot(ksz + vsz);
     }
 
-    fn save_remote(&mut self, addr: u64) {
-        self.remote.push(addr);
+    fn add_leaf<K>(&mut self, limit: usize, k: &K, v: &Record, sib: u64, remote: u64)
+    where
+        K: ICodec,
+    {
+        let ksz = k.packed_size();
+        let vsz = v.packed_size();
+        let val_sz = Val::calc_size(sib != NULL_ADDR, limit, vsz);
+
+        k.encode_to(self.slice(self.offset, ksz));
+        if vsz <= limit {
+            #[cfg(feature = "extra_check")]
+            assert_eq!(remote, NULL_ADDR);
+            Val::encode_inline(self.slice(self.offset + ksz, val_sz), sib, v);
+        } else {
+            Val::encode_remote(self.slice(self.offset + ksz, val_sz), sib, remote, v);
+        }
+
+        self.update_slot(ksz + val_sz);
+    }
+
+    #[inline(always)]
+    fn update_slot(&mut self, total_size: usize) {
+        self.slots[self.index] = (self.pos + self.offset) as SlotType;
+        self.index += 1;
+        self.offset += total_size;
     }
 }
 
 struct SeekableIter<'a> {
-    data: Vec<(LeafSeg<'a>, Value<Record>)>,
-    index: usize,
+    data: Vec<(LeafSeg<'a>, Val<'a>)>,
+    index: Cell<usize>,
 }
 
 impl<'a> SeekableIter<'a> {
     fn new() -> Self {
         Self {
-            data: Vec::with_capacity(Options::SPLIT_ELEMS as usize * 2),
-            index: 0,
+            data: Vec::with_capacity(Options::MAX_SPLIT_ELEMS as usize * 2),
+            index: Cell::new(0),
         }
     }
 
-    fn add(&mut self, k: LeafSeg<'a>, v: Value<Record>) {
+    fn add(&mut self, k: LeafSeg<'a>, v: Val<'a>) {
         self.data.push((k, v));
     }
 
-    fn seek_to(&mut self, pos: usize) {
-        self.index = pos;
+    fn seek_to(&self, pos: usize) {
+        self.index.set(pos);
     }
 
     fn curr_pos(&self) -> usize {
-        self.index
+        self.index.get()
     }
 
-    fn next(&mut self) -> Option<&(LeafSeg<'a>, Value<Record>)> {
-        if self.index < self.data.len() {
-            let idx = self.index;
-            self.index += 1;
+    fn next(&self) -> Option<&(LeafSeg<'a>, Val<'a>)> {
+        let idx = self.index.get();
+        if idx < self.data.len() {
+            self.index.set(idx + 1);
             Some(&self.data[idx])
         } else {
             None
@@ -810,13 +692,14 @@ impl<'a> SeekableIter<'a> {
 #[cfg(test)]
 mod test {
     use crate::{
+        Options,
         types::{
-            data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Value, Ver},
+            data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
             header::TagKind,
             refbox::{BaseView, BoxRef, BoxView},
-            traits::{IAlloc, IHeader, IInlineSize, ILoader},
+            traits::{IAlloc, ICodec, IHeader, ILoader},
         },
-        utils::{MutRef, NULL_PID},
+        utils::{MutRef, NULL_ADDR, NULL_PID},
     };
     use std::{cell::Cell, collections::HashMap};
 
@@ -856,6 +739,10 @@ mod test {
         fn arena_size(&mut self) -> usize {
             1 << 20
         }
+
+        fn inline_size(&self) -> usize {
+            Options::INLINE_SIZE
+        }
     }
 
     impl ILoader for Allocator {
@@ -864,7 +751,7 @@ mod test {
         }
 
         fn pin(&self, data: BoxRef) {
-            self.inner.raw().map.insert(data.header().addr, data);
+            self.inner.raw_ref().map.insert(data.header().addr, data);
         }
 
         fn shallow_copy(&self) -> Self {
@@ -872,20 +759,14 @@ mod test {
         }
     }
 
-    impl IInlineSize for Allocator {
-        fn inline_size(&self) -> u32 {
-            2048
-        }
-    }
-
     #[derive(Clone, Copy)]
     struct LeafData<'a> {
-        data: &'a [(LeafSeg<'a>, Value<Record>)],
+        data: &'a [(LeafSeg<'a>, Val<'a>)],
         pos: usize,
     }
 
     impl<'a> Iterator for LeafData<'a> {
-        type Item = (LeafSeg<'a>, Value<Record>);
+        type Item = (LeafSeg<'a>, Val<'a>);
         fn next(&mut self) -> Option<Self::Item> {
             if self.pos == self.data.len() {
                 return None;
@@ -908,60 +789,67 @@ mod test {
         let th = b.header();
         assert_eq!(th.kind, TagKind::Base);
 
-        let empty = LeafData { data: &[], pos: 0 };
-        let b = BaseView::new_leaf(&mut a, [].as_slice(), None, NULL_PID, || empty);
+        let mut empty = LeafData { data: &[], pos: 0 };
+        let l = a.clone();
+        let b = BaseView::new_leaf(&mut a, &l, [].as_slice(), None, NULL_PID, &mut empty);
         let th = b.header();
         assert_eq!(th.kind, TagKind::Base);
     }
 
     #[test]
     fn builder_leaf() {
-        macro_rules! test {
-            ($l: expr, $r: expr, $k: expr, $tx: expr, $cmd: expr, $v: expr, $w:expr) => {
-                assert_eq!($l.raw, $k.as_bytes());
-                assert_eq!($l.txid, $tx);
-                assert_eq!($l.cmd, $cmd);
-                assert_eq!($r.as_ref().data(), $v.as_bytes());
-                assert_eq!($r.as_ref().worker_id(), $w);
-            };
+        #[allow(clippy::too_many_arguments)]
+        fn check(k: &Key, v: &Val, l: &Allocator, ks: &str, txid: u64, cmd: u32, vs: &str, w: u16) {
+            assert_eq!(k.raw, ks.as_bytes());
+            assert_eq!(k.txid, txid);
+            assert_eq!(k.cmd, cmd);
+            let (r, _) = v.get_record(l);
+            assert_eq!(r.data(), vs.as_bytes());
+            assert_eq!(r.worker_id(), w);
         }
 
+        fn gen_val(a: &mut Allocator, r: Record) -> Val<'static> {
+            let sz = Val::calc_size(false, a.inline_size(), r.packed_size());
+            let mut b = a.allocate(sz);
+            Val::encode_inline(b.data_slice_mut::<u8>(), NULL_ADDR, &r);
+            Val::from_raw(unsafe { std::mem::transmute::<&[u8], &[u8]>(b.data_slice::<u8>()) })
+        }
+
+        let mut a = Allocator::new();
         // NOTE: the kv should be ordered
-        let kv = LeafData {
+        let mut kv = LeafData {
             data: &[
                 (
                     LeafSeg::new(&[], "foo".as_bytes(), Ver::new(2, 1)),
-                    Value::Put(Record::normal(1, "bar".as_bytes())),
+                    gen_val(&mut a, Record::normal(1, "bar".as_bytes())),
                 ),
                 (
                     LeafSeg::new(&[], "foo".as_bytes(), Ver::new(1, 1)),
-                    Value::Put(Record::normal(1, "foo".as_bytes())),
+                    gen_val(&mut a, Record::normal(1, "foo".as_bytes())),
                 ),
                 (
                     LeafSeg::new(&[], "mo".as_bytes(), Ver::new(3, 1)),
-                    Value::Put(Record::normal(1, "ha".as_bytes())),
+                    gen_val(&mut a, Record::normal(1, "ha".as_bytes())),
                 ),
             ],
             pos: 0,
         };
-        let mut a = Allocator::new();
         let l = a.clone();
 
-        let b = BaseView::new_leaf(&mut a, &[], None, NULL_PID, || kv);
+        let b = BaseView::new_leaf(&mut a, &l, &[], None, NULL_PID, &mut kv);
         let base = b.view().as_base();
-        let mut iter =
-            base.range_iter::<Allocator, Key, Value<Record>>(&l, 0, base.header().elems as usize);
+        let mut iter = base.range_iter::<Allocator, Key>(&l, 0, base.header().elems as usize);
 
         let (k, v) = iter.next().unwrap();
 
-        test!(k, v, "foo", 2, 1, "bar", 1);
+        check(&k, &v, &l, "foo", 2, 1, "bar", 1);
 
-        assert!(v.sibling().is_none());
+        assert!(v.get_sibling().is_some());
 
         iter.next(); // skip the expanded sibling
 
         let (k, v) = iter.next().unwrap();
-        test!(k, v, "mo", 3, 1, "ha", 1);
+        check(&k, &v, &l, "mo", 3, 1, "ha", 1);
 
         assert!(iter.next().is_none());
     }
@@ -986,8 +874,7 @@ mod test {
             kv.iter().map(|&(k, v)| (IntlSeg::new(&[], k.raw), v))
         });
         let base = b.view().as_base();
-        let mut iter =
-            base.range_iter::<Allocator, IntlKey, Index>(&l, 0, base.header().elems as usize);
+        let mut iter = base.range_iter::<Allocator, IntlKey>(&l, 0, base.header().elems as usize);
 
         let (k, v) = iter.next().unwrap();
         test!(k, v, "foo", 1);

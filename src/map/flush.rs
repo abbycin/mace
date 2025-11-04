@@ -1,10 +1,11 @@
 use crate::cc::context::Context;
 use crate::map::data::{Arena, DataBuilder};
-use crate::meta::IntervalPair;
+use crate::meta::{FileId, IntervalPair, MetaKind, TxnKind};
 use crate::utils::Handle;
 use crate::utils::countblock::Countblock;
 use crate::utils::data::Interval;
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "metric")]
 use std::sync::atomic::AtomicUsize;
@@ -53,7 +54,7 @@ fn flush_data(msg: FlushData, mut ctx: Handle<Context>) {
             panic!("db_root {:?} not exist", ctx.opt.db_root);
         }
 
-        let tick = ctx.manifest.numerics.tick.load(Relaxed);
+        let tick = ctx.manifest.numerics.next_file_id.load(Relaxed);
         let fstat = data_builder.stat(file_id, tick);
         let stat = fstat.copy();
         let mut junks = Vec::with_capacity(data_builder.junks.len());
@@ -62,25 +63,27 @@ fn flush_data(msg: FlushData, mut ctx: Handle<Context>) {
         }
         junks.sort_unstable();
 
-        let mut txn = ctx.manifest.begin(file_id);
-
-        txn.record(&stat); // new entry
-        txn.record(&map_builder.table());
-
-        // we must protect stats collection in txn, or else Stat may be logged after the Delete
-        // record (in GC thread), thus in recovery process will create wrong FileStat cause error
-        // such as BitMap index out of range
         let stats = ctx.manifest.apply_junks(tick, &junks);
+
+        let mut txn = ctx.manifest.begin(TxnKind::FLush);
+
+        let fid = FileId { file_id };
+        txn.record(MetaKind::FileId, &fid);
+        txn.sync(); // necessary, before data file was flushed
+
+        txn.record(MetaKind::Numerics, ctx.manifest.numerics.deref());
+        txn.record(MetaKind::Stat, &stat); // new entry
+        txn.record(MetaKind::Map, &map_builder.table());
+
         stats.iter().for_each(|x| {
             assert_ne!(file_id, x.file_id);
-            txn.record(x)
+            txn.record(MetaKind::Stat, x)
         });
 
-        // flush before commit
-        txn.flush();
+        // data file must be flushed after FileId flushed and before txn commit
         let Interval { lo, hi } = data_builder.build(tick, path);
         let ivl = IntervalPair::new(lo, hi, file_id);
-        txn.record(&ivl);
+        txn.record(MetaKind::Interval, &ivl);
 
         let nbytes = txn.commit();
 
@@ -96,7 +99,7 @@ fn flush_data(msg: FlushData, mut ctx: Handle<Context>) {
         // create a new mapping must after data has been flushed, so that GC can read fully flushed
         // data file
         ctx.manifest.add_stat_interval(fstat, ivl);
-        ctx.manifest.numerics.tick.fetch_add(1, Relaxed);
+        ctx.manifest.numerics.signal.fetch_add(1, Relaxed);
     }
     msg.mark_done();
 }

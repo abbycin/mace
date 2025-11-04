@@ -7,7 +7,7 @@ use crate::{
         worker::SyncWorker,
     },
     index::tree::{Iter, Tree},
-    types::data::{Key, Record, Value, Ver},
+    types::data::{Key, Record, Ver},
     utils::{INIT_CMD, NULL_CMD},
 };
 use crossbeam_epoch::Guard;
@@ -140,7 +140,7 @@ impl<'a> TxnKV<'a> {
         let start_ts = self.p.w.start_ts;
         let (wid, cmd_id) = (self.p.w.id, self.cmd_id());
         let key = Key::new(k, Ver::new(start_ts, cmd_id));
-        let val = Value::Put(Record::normal(wid, v));
+        let val = Record::normal(wid, v);
 
         self.tree
             .update(&g, key, val, |opt| f(opt, *key.ver(), self.p.w))
@@ -278,12 +278,12 @@ impl<'a> TxnKV<'a> {
         let mut w = self.p.w;
         let (wid, start_ts) = (w.id, w.start_ts);
         let key = Key::new(k.as_ref(), Ver::new(start_ts, self.cmd_id()));
-        let val = Value::Del(Record::remove(wid));
+        let val = Record::remove(wid);
         let mut logged = false;
         let g = crossbeam_epoch::pin();
 
         self.tree
-            .update::<Record, _>(&g, key, val, |opt| match opt {
+            .update(&g, key, val, |opt| match opt {
                 None => Err(OpCode::NotFound),
                 Some((rk, rv)) => {
                     if rv.is_del() {

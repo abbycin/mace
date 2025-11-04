@@ -34,11 +34,12 @@ impl Drop for Inner {
         #[cfg(feature = "metric")]
         {
             use crate::index::{g_alloc_status, g_cas_status};
-            use crate::map::g_flush_status;
+            use crate::map::{g_flush_status, g_pool_status};
 
             log::info!("\n{:#?}", g_alloc_status());
             log::info!("\n{:#?}", g_cas_status());
             log::info!("\n{:#?}", g_flush_status());
+            log::info!("\n{:#?}", g_pool_status());
         }
         self.gc.quit();
         self.store.quit();

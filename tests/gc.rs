@@ -1,12 +1,7 @@
-#[cfg(feature = "disable_recycle")]
-use std::fs::File;
-#[cfg(feature = "disable_recycle")]
-use std::io::Write;
-
 use mace::{Mace, OpCode, Options, RandomPath};
 
-#[cfg(feature = "disable_recycle")]
 #[test]
+#[ignore = "it's hard to produce enough garbage in release mode, run it manually instead"]
 fn gc_data() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
@@ -14,9 +9,9 @@ fn gc_data() -> Result<(), OpCode> {
     opt.sync_on_write = false;
     opt.gc_eager = true;
     opt.gc_timeout = 20;
-    opt.gc_ratio = 2;
+    opt.gc_ratio = 1;
     opt.data_file_size = 512 << 10;
-    opt.gc_compacted_size = opt.data_file_size as usize;
+    opt.gc_compacted_size = opt.data_file_size;
     let saved = opt.clone();
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
@@ -33,6 +28,18 @@ fn gc_data() -> Result<(), OpCode> {
         kv.commit()?;
     }
 
+    let kv = db.begin()?;
+    let mut rest = vec![];
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..cap {
+        if rand::random_bool(0.5) {
+            kv.del(&pair[i])?;
+        } else {
+            rest.push(i);
+        }
+    }
+    kv.commit()?;
+
     drop(db);
 
     break_meta(&saved);
@@ -41,7 +48,8 @@ fn gc_data() -> Result<(), OpCode> {
     opt.tmp_store = true;
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
-    for k in &pair {
+    for i in rest {
+        let k = &pair[i];
         let view = db.view().unwrap();
         view.get(k).unwrap();
     }
@@ -82,7 +90,6 @@ fn abort_txn() {
     assert!(r.is_err() && r.err().unwrap() == OpCode::AbortTx);
 }
 
-#[cfg(feature = "disable_recycle")]
 #[test]
 fn gc_wal() {
     let path = RandomPath::tmp();
@@ -90,6 +97,7 @@ fn gc_wal() {
     opt.wal_file_size = 4096;
     opt.gc_timeout = 2;
     opt.workers = 1;
+    opt.max_log_size = 1024;
     opt.keep_stable_wal_file = true;
     opt.data_file_size = 100 << 10; // make sure checkpoint was taken
     let db = Mace::new(opt.validate().unwrap()).unwrap();
@@ -115,8 +123,11 @@ fn gc_wal() {
     assert!(backup.exists());
 }
 
-#[cfg(feature = "disable_recycle")]
+#[allow(unused)]
 fn break_meta(opt: &Options) {
+    use std::fs::File;
+    use std::io::Write;
+
     let d = std::fs::read_dir(opt.db_root()).unwrap();
     let mut last = 0;
     for f in d.flatten() {

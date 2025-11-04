@@ -1,6 +1,6 @@
 [package]
 name = "mace"
-version = "0.0.14"
+version = "0.0.15"
 edition = "2024"
 authors = ["abbytsing@gmail.com"]
 readme = "README.md"
@@ -26,7 +26,6 @@ logger = { path = "deps/logger" }
 default = []
 extra_check = []
 metric = []
-disable_recycle = []
 
 [profile.release]
 opt-level = 3

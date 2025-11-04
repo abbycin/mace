@@ -1,8 +1,10 @@
 use crc32c::Crc32cHasher;
 use io::{File, GatherIO};
 use std::{
-    collections::HashSet,
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet},
     hash::Hasher,
+    ops::Deref,
     sync::{
         Arc,
         atomic::Ordering::Relaxed,
@@ -16,7 +18,9 @@ use crate::{
     Options, Store,
     cc::context::Context,
     map::data::{DataFooter, DataMetaReader},
-    meta::{Delete, FileStat, IntervalPair, IntervalStart, Numerics, StatInner},
+    meta::{
+        DelInterval, Delete, FileId, FileStat, IntervalPair, MetaKind, Numerics, StatInner, TxnKind,
+    },
     types::traits::IAsSlice,
     utils::{
         Handle, MutRef,
@@ -49,9 +53,9 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                             pause = false;
                         }
                         GC_START => {
+                            gc.process_wal();
                             gc.process_manifest();
                             gc.process_data();
-                            gc.process_wal();
                             sem.post();
                         }
                         GC_QUIT => break,
@@ -59,9 +63,9 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                     },
                     Err(RecvTimeoutError::Timeout) => {
                         if !pause {
+                            gc.process_wal();
                             gc.process_manifest();
                             gc.process_data();
-                            gc.process_wal();
                         }
                     }
                     Err(e) => {
@@ -116,8 +120,6 @@ pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
         ctx,
         store,
         last_ckpt_seq,
-        last_raio: 0,
-        last_total: 0,
     };
     gc_thread(gc, rx, sem.clone());
     GCHandle {
@@ -146,8 +148,10 @@ impl Score {
 
     fn calc_decline_rate(stat: &FileStat, now: u64) -> f64 {
         let free = stat.total_size.saturating_sub(stat.active_size);
+        // no junk has been applied yet, or
+        // it's possible gc and flush thread get same tick
         if free == 0 || stat.up2 == now {
-            return f64::MIN; // skip newborn
+            return f64::MIN;
         }
 
         -(stat.active_size as f64 / free as f64).powi(2)
@@ -155,16 +159,40 @@ impl Score {
     }
 }
 
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match other.rate.partial_cmp(&self.rate) {
+            Some(Ordering::Equal) => self.id.cmp(&other.id),
+            Some(o) => o,
+            None => Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Score {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Score {}
+
 struct GarbageCollector {
     numerics: Arc<Numerics>,
     ctx: Handle<Context>,
     store: MutRef<Store>,
     last_ckpt_seq: Vec<u64>,
-    last_raio: u64,
-    last_total: u64,
 }
 
 impl GarbageCollector {
+    const MAX_ELEMS: usize = 1024;
+
     /// with SSD support, for TB level data directly write manifest snapshot is acceptable
     fn process_manifest(&mut self) {
         self.ctx.manifest.try_clean();
@@ -175,69 +203,53 @@ impl GarbageCollector {
         let tgt_size = self.store.opt.gc_compacted_size;
         let eager = self.store.opt.gc_eager;
 
-        'again: loop {
-            let mut total = 0u64;
-            let mut active = 0u64;
-            self.ctx.manifest.file_stat.iter().for_each(|x| {
-                total += x.total_size as u64;
-                active += x.active_size as u64;
-            });
+        let (total, active) = self.ctx.manifest.stat_ctx.total_active();
+        if total == 0 {
+            return;
+        }
+        let ratio = (total - active) * 100 / total;
+        // log::trace!("ratio {ratio} tgt_ratio {tgt_ratio} total {total} active {active}");
+        if ratio < tgt_ratio {
+            return;
+        }
 
-            if total == 0 {
-                return;
-            }
-            let ratio = (total - active) * 100 / total;
-            // log::trace!("ratio {ratio} tgt_ratio {tgt_ratio} total {total} active {active}");
-            if ratio < tgt_ratio {
-                return;
-            }
-
-            // we have cleaned some segments, but the total size and ratio remain unchanged, no need
-            // to clean
-            if self.last_raio == ratio && self.last_total == total {
-                return;
-            }
-
-            self.last_raio = ratio;
-            self.last_total = total;
-
-            let tick = self.numerics.tick.load(Relaxed);
-            let mut q = Vec::new();
-            let mut unlinked = HashSet::new();
-            self.ctx.manifest.file_stat.iter().for_each(|x| {
-                let s = x.value();
-                // a data file has no active frame will be unlinked directly
-                if s.active_elems == 0 {
-                    unlinked.insert(s.file_id);
+        let tick = self.numerics.next_file_id.load(Relaxed);
+        let mut heap = BinaryHeap::new();
+        let mut unlinked = HashSet::new();
+        self.ctx.manifest.stat_ctx.iter().for_each(|x| {
+            let s = x.value();
+            // a data file has no active frame will be unlinked directly
+            if s.active_elems == 0 {
+                unlinked.insert(s.file_id);
+            } else {
+                let score = Score::from(s, tick);
+                if heap.len() < Self::MAX_ELEMS {
+                    heap.push(score);
                 } else {
-                    q.push(Score::from(s, tick));
-                }
-            });
-
-            q.sort_unstable_by(|x, y| {
-                // ascending order so that we can `pop` the min decline rate one (since we applied
-                // `-` to the rate)
-                x.rate
-                    .partial_cmp(&y.rate)
-                    .unwrap_or_else(|| x.id.cmp(&y.id))
-            });
-
-            let mut victims = vec![];
-            let mut sum = 0;
-            while let Some(x) = q.pop() {
-                // NOTE: junks are not take into account
-                sum += x.size;
-                victims.push(x);
-
-                if sum >= tgt_size {
-                    self.compact(victims, unlinked);
-                    continue 'again;
+                    let top = heap.peek().unwrap();
+                    // use is_gt here, see Score's Ord impl
+                    if top.cmp(&score).is_gt() {
+                        heap.pop();
+                        heap.push(score);
+                    }
                 }
             }
-            if eager {
+        });
+
+        let mut victims = vec![];
+        let mut sum = 0;
+        let mut tmp = Vec::from_iter(heap); // reclaim max rate first
+        while let Some(x) = tmp.pop() {
+            sum += x.size;
+            victims.push(x);
+
+            if sum >= tgt_size && victims.len() > 1 {
                 self.compact(victims, unlinked);
+                return;
             }
-            break;
+        }
+        if eager && victims.len() > 1 {
+            self.compact(victims, unlinked);
         }
     }
 
@@ -281,11 +293,11 @@ impl GarbageCollector {
 
     fn compact(&mut self, victims: Vec<Score>, unlinked: HashSet<u64>) {
         let opt = &self.store.opt;
-        let mut builder = ReWriter::new(opt, victims.len());
+        let file_id = self.numerics.next_file_id.fetch_add(1, Relaxed);
+        let mut builder = ReWriter::new(file_id, opt, victims.len());
         let mut obsoleted: Delete = Delete::default();
         let mut remap_intervals = Vec::with_capacity(victims.len());
-        let mut del_intervals = IntervalStart::default();
-        let file_id = self.numerics.next_file_id.fetch_add(1, Relaxed);
+        let mut del_intervals = DelInterval::default();
 
         unlinked.iter().for_each(|x| {
             let mut loader = DataMetaReader::new(opt.data_file(*x), true).expect("never happen");
@@ -297,19 +309,22 @@ impl GarbageCollector {
             obsoleted.push(*x);
         });
 
+        self.ctx.manifest.stat_ctx.start_collect_junks(); // stop in update_stat_interval
         victims.iter().for_each(|x| {
             let mut loader = DataMetaReader::new(opt.data_file(x.id), true).expect("never happen");
             let hdr = loader.get_meta().unwrap();
             let ivls = hdr.intervals();
             let mut im = InactiveMap::new(ivls);
+            let stat = self.ctx.manifest.stat_ctx.get(&x.id).expect("must exist");
+            let bitmap = stat.deleted_elems.clone();
+            drop(stat);
 
             // collect active frames
             let v: Vec<Entry> = hdr
                 .relocs()
                 .iter()
                 .filter(|m| {
-                    let stat = self.ctx.manifest.file_stat.get(&x.id).unwrap();
-                    if !stat.deleted_elems.test(m.val.seq) {
+                    if !bitmap.test(m.val.seq) {
                         im.test(m.key);
                         true
                     } else {
@@ -335,35 +350,45 @@ impl GarbageCollector {
             }
         });
 
-        let fstat = builder.stat(file_id);
-        let stat = fstat.copy();
+        let mut txn = self.ctx.manifest.begin(TxnKind::GC);
 
-        let mut txn = self.ctx.manifest.begin(file_id);
+        let fid = FileId { file_id };
+        txn.record(MetaKind::FileId, &fid);
+        txn.sync(); // necessary, before data file was flushed
 
-        txn.record(&stat);
-        // 1. record delete first
-        txn.record(&del_intervals);
-        // 2. then record remapping, old intervals are point to new file_id
-        for i in &remap_intervals {
-            txn.record(i);
-        }
-        // in case crash happens before/during deleting files
-        txn.record(&obsoleted);
+        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
 
-        // flush before commit, simplify recover process
-        txn.flush();
-        builder
-            .build(file_id)
+        // data file must be flushed after FileId flushed and before txn commit
+        let (fstat, relocs) = builder
+            .build()
             .inspect_err(|e| {
                 log::error!("error {e}");
             })
             .unwrap();
 
-        txn.commit();
+        // the only problem is junks collected by flush thread maybe too many
+        let stat = self.ctx.manifest.update_stat_interval(
+            fstat,
+            relocs,
+            &obsoleted,
+            &del_intervals,
+            &remap_intervals,
+        );
 
-        self.ctx
-            .manifest
-            .update_stat_interval(fstat, &obsoleted, &del_intervals, &remap_intervals);
+        txn.record(MetaKind::Stat, &stat);
+
+        // 1. record delete first
+        if !del_intervals.is_empty() {
+            txn.record(MetaKind::DelInterval, &del_intervals);
+        }
+        // 2. then record remapping, old intervals are point to new file_id
+        for i in &remap_intervals {
+            txn.record(MetaKind::Interval, i);
+        }
+        // in case crash happens before/during deleting files
+        txn.record(MetaKind::Delete, &obsoleted);
+
+        txn.commit();
 
         // 3. it's safe to clean obsolete files, becuase they are not referenced
         self.ctx.manifest.save_obsolete_files(&obsoleted);
@@ -372,9 +397,8 @@ impl GarbageCollector {
 }
 
 struct ReWriter<'a> {
+    file_id: u64,
     items: Vec<Item>,
-    active_elems: u32,
-    active_size: usize,
     intervals: Vec<u8>,
     nr_interval: u32,
     sum_up2: u64,
@@ -383,11 +407,10 @@ struct ReWriter<'a> {
 }
 
 impl<'a> ReWriter<'a> {
-    fn new(opt: &'a Options, cap: usize) -> Self {
+    fn new(file_id: u64, opt: &'a Options, cap: usize) -> Self {
         Self {
+            file_id,
             items: Vec::with_capacity(cap),
-            active_elems: 0,
-            active_size: 0,
             intervals: Vec::with_capacity(cap),
             nr_interval: 0,
             sum_up2: 0,
@@ -398,8 +421,6 @@ impl<'a> ReWriter<'a> {
 
     fn add_frame(&mut self, item: Item) {
         self.sum_up2 += item.up2;
-        self.active_elems += item.pos.len() as u32;
-        self.active_size += item.pos.iter().map(|x| x.len).sum::<u32>() as usize;
         self.items.push(item);
     }
 
@@ -409,38 +430,23 @@ impl<'a> ReWriter<'a> {
         self.nr_interval += 1;
     }
 
-    fn stat(&self, id: u64) -> FileStat {
-        let up2 = self.sum_up2 / self.total;
-        FileStat {
-            inner: StatInner {
-                file_id: id,
-                up1: up2,
-                up2,
-                active_elems: self.active_elems,
-                total_elems: self.active_elems,
-                active_size: self.active_size,
-                total_size: self.active_size,
-            },
-            deleted_elems: BitMap::new(self.active_elems),
-        }
-    }
-
-    fn build(&mut self, id: u64) -> Result<(), std::io::Error> {
+    fn build(&mut self) -> Result<(FileStat, HashMap<u64, (u32, u32)>), std::io::Error> {
         let up2 = self.sum_up2 / self.total;
         let mut block = Block::alloc(1 << 20);
         let mut seq = 0;
         let mut off = 0;
-        let path = self.opt.data_file(id);
+        let path = self.opt.data_file(self.file_id);
         let mut writer = GatherWriter::append(&path, 128);
         let mut crc = Crc32cHasher::default();
         let mut reloc: Vec<u8> = Vec::new();
+        let mut reloc_map = HashMap::new();
 
         self.items.sort_unstable_by(|x, y| x.id.cmp(&y.id));
 
         for item in &self.items {
             let reader = File::options()
                 .read(true)
-                .open(&self.opt.data_file(item.id))
+                .open(self.opt.data_file(item.id))
                 .unwrap();
             for e in &item.pos {
                 let len = e.len as usize;
@@ -455,6 +461,7 @@ impl<'a> ReWriter<'a> {
 
                 let m = AddrPair::new(e.key, off, e.len, seq);
                 reloc.extend_from_slice(m.as_slice());
+                reloc_map.insert(e.key, (e.len, seq));
                 off += e.len as usize;
                 seq += 1;
             }
@@ -482,7 +489,20 @@ impl<'a> ReWriter<'a> {
         writer.flush();
         writer.sync();
         log::info!("compacted to {path:?} {footer:?}");
-        Ok(())
+
+        let stat = FileStat {
+            inner: StatInner {
+                file_id: self.file_id,
+                up1: up2,
+                up2,
+                active_elems: seq,
+                total_elems: seq,
+                active_size: off,
+                total_size: off,
+            },
+            deleted_elems: BitMap::new(seq),
+        };
+        Ok((stat, reloc_map))
     }
 }
 
@@ -499,8 +519,11 @@ impl Item {
 }
 
 struct Entry {
+    /// logical address
     key: u64,
+    /// offset in data file
     off: usize,
+    /// length of record
     len: u32,
 }
 

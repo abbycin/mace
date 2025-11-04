@@ -1,9 +1,12 @@
-use std::{cmp::Ordering, ops::Deref};
+use std::{cmp::Ordering, fmt::Display, ops::Deref};
 
 use crate::{
     number_to_slice, slice_to_number,
-    types::traits::{ICodec, IKey, IVal, IValCodec},
-    utils::{ADDR_LEN, NULL_PID, to_str, varint::Varint32},
+    types::{
+        refbox::RemoteView,
+        traits::{ICodec, IDecode, IKey, IKeyCodec, ILoader, IVal},
+    },
+    utils::{ADDR_LEN, NULL_ADDR, NULL_PID, to_str, varint::Varint32},
 };
 
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
@@ -44,25 +47,29 @@ impl ICodec for IntlKey<'_> {
         Varint32::size(self.raw.len()) + self.raw.len()
     }
 
-    fn remove_prefix(&self, prefix_len: usize) -> Self {
-        debug_assert!(self.raw.len() >= prefix_len);
-        Self {
-            raw: &self.raw[prefix_len..],
-        }
-    }
-
     fn encode_to(&self, to: &mut [u8]) {
         debug_assert_eq!(to.len(), self.packed_size());
         let (l, r) = to.split_at_mut(Varint32::size(to.len()));
         Varint32::encode(l, self.raw.len() as u32);
         r.copy_from_slice(self.raw);
     }
+}
 
+impl IDecode for IntlKey<'_> {
     fn decode_from(src: &[u8]) -> Self {
         let (raw_len, n) = Varint32::decode(src).unwrap();
         let raw = &src[n..n + raw_len as usize];
         Self {
             raw: unsafe { std::mem::transmute::<&[u8], &[u8]>(raw) },
+        }
+    }
+}
+
+impl IKeyCodec for IntlKey<'_> {
+    fn remove_prefix(&self, prefix_len: usize) -> Self {
+        debug_assert!(self.raw.len() >= prefix_len);
+        Self {
+            raw: &self.raw[prefix_len..],
         }
     }
 }
@@ -112,17 +119,21 @@ impl Ord for Key<'_> {
     }
 }
 
+impl IDecode for Key<'_> {
+    fn decode_from(data: &[u8]) -> Self {
+        let (len, n) = Varint32::decode(data).unwrap();
+        let (num, raw) = data[n..n + len as usize].split_at(Ver::len());
+
+        Self {
+            raw: unsafe { std::mem::transmute::<&[u8], &[u8]>(raw) },
+            ver: Ver::decode_from(num),
+        }
+    }
+}
+
 impl ICodec for Key<'_> {
     fn packed_size(&self) -> usize {
         self.len() + Varint32::size(self.len())
-    }
-
-    fn remove_prefix(&self, prefix_len: usize) -> Self {
-        debug_assert!(self.raw.len() >= prefix_len);
-        Self {
-            raw: &self.raw[prefix_len..],
-            ver: self.ver,
-        }
     }
 
     fn encode_to(&self, to: &mut [u8]) {
@@ -133,14 +144,14 @@ impl ICodec for Key<'_> {
         self.ver.encode_to(num);
         raw.copy_from_slice(self.raw);
     }
+}
 
-    fn decode_from(data: &[u8]) -> Self {
-        let (len, n) = Varint32::decode(data).unwrap();
-        let (num, raw) = data[n..n + len as usize].split_at(Ver::len());
-
+impl IKeyCodec for Key<'_> {
+    fn remove_prefix(&self, prefix_len: usize) -> Self {
+        debug_assert!(self.raw.len() >= prefix_len);
         Self {
-            raw: unsafe { std::mem::transmute::<&[u8], &[u8]>(raw) },
-            ver: Ver::decode_from(num),
+            raw: &self.raw[prefix_len..],
+            ver: self.ver,
         }
     }
 }
@@ -174,14 +185,16 @@ impl IKey for Ver {
     }
 }
 
+impl IKeyCodec for Ver {
+    fn remove_prefix(&self, _prefix_len: usize) -> Self {
+        *self
+    }
+}
+
 // TODO: varint encode/decode, space-time trade-off
 impl ICodec for Ver {
     fn packed_size(&self) -> usize {
         Self::len()
-    }
-
-    fn remove_prefix(&self, _prefix_len: usize) -> Self {
-        *self
     }
 
     fn encode_to(&self, to: &mut [u8]) {
@@ -190,7 +203,9 @@ impl ICodec for Ver {
         number_to_slice!(self.txid, x);
         number_to_slice!(self.cmd, y);
     }
+}
 
+impl IDecode for Ver {
     fn decode_from(raw: &[u8]) -> Self {
         Self {
             txid: slice_to_number!(raw[..size_of::<u64>()], u64),
@@ -228,6 +243,22 @@ impl ICodec for IntlSeg<'_> {
         self.len() + Varint32::size(self.len())
     }
 
+    fn encode_to(&self, to: &mut [u8]) {
+        let (len, data) = to.split_at_mut(Varint32::size(self.len()));
+        let (p, b) = data.split_at_mut(self.prefix.len());
+        Varint32::encode(len, self.len() as u32);
+        p.copy_from_slice(self.prefix);
+        b.copy_from_slice(self.base);
+    }
+}
+
+impl IDecode for IntlSeg<'_> {
+    fn decode_from(_raw: &[u8]) -> Self {
+        unimplemented!()
+    }
+}
+
+impl IKeyCodec for IntlSeg<'_> {
     fn remove_prefix(&self, prefix_len: usize) -> Self {
         debug_assert!(self.len() >= prefix_len);
         if prefix_len >= self.prefix.len() {
@@ -242,18 +273,6 @@ impl ICodec for IntlSeg<'_> {
                 base: self.base,
             }
         }
-    }
-
-    fn decode_from(_raw: &[u8]) -> Self {
-        unimplemented!()
-    }
-
-    fn encode_to(&self, to: &mut [u8]) {
-        let (len, data) = to.split_at_mut(Varint32::size(self.len()));
-        let (p, b) = data.split_at_mut(self.prefix.len());
-        Varint32::encode(len, self.len() as u32);
-        p.copy_from_slice(self.prefix);
-        b.copy_from_slice(self.base);
     }
 }
 
@@ -299,10 +318,24 @@ impl ICodec for LeafSeg<'_> {
         self.len() + Varint32::size(self.len())
     }
 
+    fn encode_to(&self, to: &mut [u8]) {
+        let (len, data) = to.split_at_mut(Varint32::size(to.len()));
+        Varint32::encode(len, self.len() as u32);
+        let (ver, k) = data.split_at_mut(Ver::len());
+        self.ver.encode_to(ver);
+        let (p, b) = k.split_at_mut(self.prefix.len());
+        p.copy_from_slice(self.prefix);
+        b.copy_from_slice(self.base);
+    }
+}
+
+impl IDecode for LeafSeg<'_> {
     fn decode_from(_raw: &[u8]) -> Self {
         unimplemented!()
     }
+}
 
+impl IKeyCodec for LeafSeg<'_> {
     fn remove_prefix(&self, prefix_len: usize) -> Self {
         debug_assert!(self.len() - Ver::len() >= prefix_len);
         if prefix_len >= self.prefix.len() {
@@ -320,229 +353,151 @@ impl ICodec for LeafSeg<'_> {
             }
         }
     }
-
-    fn encode_to(&self, to: &mut [u8]) {
-        let (len, data) = to.split_at_mut(Varint32::size(to.len()));
-        Varint32::encode(len, self.len() as u32);
-        let (ver, k) = data.split_at_mut(Ver::len());
-        self.ver.encode_to(ver);
-        let (p, b) = k.split_at_mut(self.prefix.len());
-        p.copy_from_slice(self.prefix);
-        b.copy_from_slice(self.base);
-    }
 }
 
+/// 1. inline data
+///```text
+/// +-----+----------+------+
+/// | HDR | DATA LEN | DATA |
+/// +-----+----------+------+
+///```
+/// 2. inline data with sibling
+///```text
+/// +-----+----------+----------+------+
+/// | HDR | DATA LEN | SIB ADDR | DATA |
+/// +-----+----------+----------+------+
+///```
+/// 3. remote data
+///```text
+/// +-----+----------+-------------+
+/// | HDR | DATA LEN | REMOTE ADDR |
+/// +-----+----------+-------------+
+///```
+/// 4. remote data with sibling
+///```text
+/// +-----+----------+----------+-------------+
+/// | HDR | DATA LEN | SIB ADDR | REMOTE ADDR |
+/// +-----+----------+----------+-------------+
+/// ```
 #[derive(Clone, Copy)]
-pub struct Sibling<T> {
-    addr: u64,
-    data: T,
+pub struct Val<'a> {
+    data: &'a [u8],
 }
 
-impl<T> Sibling<T> {
-    pub const DEL_BIT: u64 = 1 << 63;
-
-    pub fn put(addr: u64, data: T) -> Self {
-        Self { addr, data }
-    }
-
-    pub fn del(addr: u64, data: T) -> Self {
-        Self {
-            addr: addr | Self::DEL_BIT,
-            data,
-        }
-    }
-
-    pub fn addr(&self) -> u64 {
-        self.addr & !Self::DEL_BIT
-    }
+impl<'a> Val<'a> {
+    const DEL_BIT: u8 = 0b0000_0001;
+    const SIB_BIT: u8 = 0b1000_0000;
+    const REMOTE_BIT: u8 = 0b0001_0000;
+    const SIB_LEN: usize = ADDR_LEN;
+    const DATA_LEN: usize = size_of::<u32>();
+    const HDR_LEN: usize = 1;
 
     pub fn is_tombstone(&self) -> bool {
-        self.addr & Self::DEL_BIT != 0
+        self.data[0] & Self::DEL_BIT != 0
     }
 
-    pub fn as_ref(&self) -> &T {
-        &self.data
+    pub fn is_sibling(&self) -> bool {
+        self.data[0] & Self::SIB_BIT != 0
     }
-}
 
-impl<T> Sibling<T>
-where
-    T: IValCodec,
-{
-    pub fn from(addr: u64, v: &Value<T>) -> Self {
-        if v.is_del() {
-            Sibling::del(addr, *v.as_ref())
+    fn is_inline(&self) -> bool {
+        self.data[0] & Self::REMOTE_BIT == 0
+    }
+
+    fn data_offset(&self) -> usize {
+        Self::HDR_LEN + Self::DATA_LEN + self.is_sibling() as usize * Self::SIB_LEN
+    }
+
+    pub fn from_raw(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    pub fn data_size(&self) -> usize {
+        Self::read::<u32>(self.data, Self::HDR_LEN) as usize
+    }
+
+    pub fn get_record<L: ILoader>(&self, l: &L) -> (Record, RemoteView) {
+        let off = self.data_offset();
+        let len = self.data_size();
+        let (src, r) = if self.is_inline() {
+            (&self.data[off..], RemoteView::null())
         } else {
-            Sibling::put(addr, *v.as_ref())
-        }
-    }
-}
-
-impl<T> IValCodec for Sibling<T>
-where
-    T: IValCodec,
-{
-    fn size(&self) -> usize {
-        ADDR_LEN + self.data.size()
+            let addr = Self::read::<u64>(self.data, off);
+            let r = l.load_unchecked(addr).as_remote();
+            (r.raw(), r)
+        };
+        (Record::decode_from(&src[..len]), r)
     }
 
-    fn encode(&self, to: &mut [u8]) {
-        debug_assert_eq!(self.size(), to.len());
-        let (addr, data) = to.split_at_mut(ADDR_LEN);
-        number_to_slice!(self.addr, addr);
-        self.data.encode(data);
-    }
-
-    fn decode(from: &[u8]) -> Self {
-        let (addr, data) = from.split_at(ADDR_LEN);
-        Self {
-            addr: slice_to_number!(addr, u64),
-            data: T::decode(data),
+    pub fn get_sibling(&self) -> Option<u64> {
+        if self.is_sibling() {
+            Some(Self::read::<u64>(self.data, Self::HDR_LEN + Self::DATA_LEN))
+        } else {
+            None
         }
     }
 
-    fn to_string(&self) -> String {
-        format!(
-            "({} {}, {})",
-            self.addr(),
-            self.is_tombstone(),
-            self.data.to_string()
-        )
-    }
-}
-
-#[derive(Default, Clone, Copy)]
-pub enum Value<T> {
-    Put(T),
-    Del(T),
-    Sib(Sibling<T>),
-    #[default]
-    Unused,
-}
-
-impl<T> Value<T>
-where
-    T: IValCodec,
-{
-    pub fn len(&self) -> usize {
-        match self {
-            Value::Put(x) => x.size(),
-            Value::Del(x) => x.size(),
-            Value::Sib(x) => x.size(),
-            Value::Unused => unreachable!(),
+    pub fn get_remote(&self) -> u64 {
+        if self.is_inline() {
+            NULL_ADDR
+        } else {
+            let off = self.data_offset();
+            Self::read::<u64>(self.data, off)
         }
     }
 
-    pub fn is_del(&self) -> bool {
-        match self {
-            Value::Del(_) => true,
-            Value::Put(_) => false,
-            Value::Sib(x) => x.is_tombstone(),
-            Value::Unused => unreachable!(),
-        }
-    }
-
-    pub fn sibling(&self) -> Option<&Sibling<T>> {
-        match self {
-            Value::Sib(x) => Some(x),
-            _ => None,
-        }
-    }
-
-    pub fn as_ref(&self) -> &T {
-        match self {
-            Value::Put(x) => x,
-            Value::Del(x) => x,
-            Value::Sib(x) => x.as_ref(),
-            Value::Unused => unreachable!(),
-        }
-    }
-
-    pub fn unpack_sibling(&self) -> Self {
-        if let Some(s) = self.sibling() {
-            if s.is_tombstone() {
-                Value::Del(*s.as_ref())
+    pub fn calc_size(is_sib: bool, min_blob_size: usize, val_size: usize) -> usize {
+        Self::HDR_LEN
+            + Self::DATA_LEN
+            + if is_sib { Self::SIB_LEN } else { 0 }
+            + if min_blob_size < val_size {
+                ADDR_LEN
             } else {
-                Value::Put(*s.as_ref())
+                val_size
             }
-        } else {
-            *self
+    }
+
+    pub fn encode_inline<V: IVal>(dst: &mut [u8], sib: u64, v: &V) {
+        dst[0] = v.is_tombstone() as u8;
+        let mut off = Self::HDR_LEN;
+        Self::write::<u32>(dst, off, v.packed_size() as u32);
+        off += Self::DATA_LEN;
+        if sib != NULL_ADDR {
+            dst[0] |= Self::SIB_BIT;
+            Self::write::<u64>(dst, off, sib);
+            off += Self::SIB_LEN;
         }
+        v.encode_to(&mut dst[off..]);
+    }
+
+    pub fn encode_remote<V: IVal>(dst: &mut [u8], sib: u64, remote: u64, v: &V) {
+        dst[0] = v.is_tombstone() as u8;
+        dst[0] |= Self::REMOTE_BIT;
+        let mut off = Self::HDR_LEN;
+        Self::write::<u32>(dst, off, v.packed_size() as u32);
+        off += Self::DATA_LEN;
+        if sib != NULL_ADDR {
+            dst[0] |= Self::SIB_BIT;
+            Self::write::<u64>(dst, off, sib);
+            off += Self::SIB_LEN;
+        }
+        Self::write::<u64>(dst, off, remote);
+    }
+
+    fn write<T>(dst: &mut [u8], off: usize, data: T) {
+        let p = &mut dst[off..off + size_of::<T>()].as_mut_ptr();
+        unsafe { p.cast::<T>().write_unaligned(data) };
+    }
+
+    fn read<T>(src: &[u8], off: usize) -> T {
+        let p = src[off..off + size_of::<T>()].as_ptr();
+        unsafe { p.cast::<T>().read_unaligned() }
     }
 }
 
-const VALUE_PUT_BIT: u8 = 7;
-const VALUE_DEL_BIT: u8 = 11;
-const VALUE_SIB_BIT: u8 = 17;
-
-impl<T> ICodec for Value<T>
-where
-    T: IValCodec,
-{
-    /// using extra 1 byte for Put or Del, since value can be empty(zero length slice)
-    fn packed_size(&self) -> usize {
-        let len = self.len() + 1;
-        Varint32::size(len) + len
-    }
-
-    fn remove_prefix(&self, _prefix_len: usize) -> Self {
-        unimplemented!()
-    }
-
-    fn encode_to(&self, to: &mut [u8]) {
-        debug_assert_eq!(to.len(), self.packed_size());
-        let (len, payload) = to.split_at_mut(Varint32::size(to.len()));
-        Varint32::encode(len, 1 + self.len() as u32);
-        let (id, payload) = payload.split_at_mut(1);
-        match self {
-            Value::Put(x) => {
-                id[0] = VALUE_PUT_BIT;
-                x.encode(payload);
-            }
-            Value::Del(x) => {
-                id[0] = VALUE_DEL_BIT;
-                x.encode(payload);
-            }
-            Value::Sib(x) => {
-                id[0] = VALUE_SIB_BIT;
-                x.encode(payload);
-            }
-            Value::Unused => unreachable!(),
-        }
-    }
-
+impl IDecode for Val<'_> {
     fn decode_from(raw: &[u8]) -> Self {
-        let (len, n) = Varint32::decode(raw).unwrap();
-        let state = raw[n];
-        let b = &raw[n + 1..n + len as usize];
-
-        match state {
-            VALUE_DEL_BIT => Value::Del(T::decode(b)),
-            VALUE_PUT_BIT => Value::Put(T::decode(b)),
-            VALUE_SIB_BIT => {
-                let s = Sibling::<T>::decode(b);
-                Value::Sib(s)
-            }
-            _ => unreachable!("invalid state {}", state),
-        }
-    }
-}
-
-impl<T> IVal for Value<T>
-where
-    T: IValCodec,
-{
-    fn to_string(&self) -> String {
-        match self {
-            Value::Del(x) => format!("<del, {}>", x.to_string()),
-            Value::Put(x) => format!("<put, {}>", x.to_string()),
-            Value::Sib(x) => format!("<sib, {}>", x.to_string()),
-            Value::Unused => unreachable!(),
-        }
-    }
-
-    fn is_tombstone(&self) -> bool {
-        self.is_del()
+        Self::from_raw(unsafe { std::mem::transmute::<&[u8], &[u8]>(raw) })
     }
 }
 
@@ -566,10 +521,6 @@ impl Index {
 }
 
 impl IVal for Index {
-    fn to_string(&self) -> String {
-        format!("{{ pid: {} }}", self.pid)
-    }
-
     fn is_tombstone(&self) -> bool {
         self.pid == NULL_PID
     }
@@ -580,15 +531,13 @@ impl ICodec for Index {
         Self::len()
     }
 
-    fn remove_prefix(&self, _prefix_len: usize) -> Self {
-        unimplemented!()
-    }
-
     fn encode_to(&self, to: &mut [u8]) {
         debug_assert_eq!(to.len(), self.packed_size());
         number_to_slice!(self.pid, to);
     }
+}
 
+impl IDecode for Index {
     fn decode_from(raw: &[u8]) -> Self {
         debug_assert!(raw.len() >= size_of::<u64>());
         Self {
@@ -597,7 +546,13 @@ impl ICodec for Index {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Copy, Debug)]
+impl Display for Index {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{:?}", self))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Copy)]
 pub struct Record {
     worker_id: u16,
     data: &'static [u8],
@@ -647,27 +602,40 @@ impl Record {
     }
 }
 
-impl IValCodec for Record {
-    fn size(&self) -> usize {
+impl ICodec for Record {
+    fn packed_size(&self) -> usize {
         self.size()
     }
 
-    fn encode(&self, to: &mut [u8]) {
+    fn encode_to(&self, to: &mut [u8]) {
         self.as_slice(to);
     }
+}
 
-    fn decode(raw: &[u8]) -> Self {
+impl IDecode for Record {
+    fn decode_from(raw: &[u8]) -> Self {
         let s = unsafe { std::slice::from_raw_parts(raw.as_ptr(), raw.len()) };
         Self::from_slice(s)
     }
+}
 
-    fn to_string(&self) -> String {
-        format!(
-            "Record {{ tombstone: {}, worker_id: {}, data: {} }}",
-            self.data().is_empty(),
-            self.worker_id(),
-            to_str(self.data)
-        )
+impl IVal for Record {
+    fn is_tombstone(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+impl Display for Record {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_tombstone() {
+            f.write_fmt(format_args!("<del-{}>", self.worker_id))
+        } else {
+            f.write_fmt(format_args!(
+                "<normal-{}> {}",
+                self.worker_id,
+                to_str(self.data)
+            ))
+        }
     }
 }
 
@@ -705,12 +673,23 @@ impl Ord for Ver {
 
 #[cfg(test)]
 mod test {
-    use crate::types::{
-        data::{IntlKey, Record, Ver},
-        traits::ICodec,
+    use std::{
+        cell::RefCell,
+        collections::HashMap,
+        sync::{Arc, atomic::AtomicU64},
     };
 
-    use super::{Index, Key, Sibling, Value};
+    use crate::{
+        Options,
+        types::{
+            data::{IntlKey, Record, Val, Ver},
+            refbox::{BoxRef, RemoteView},
+            traits::{IAlloc, IBoxHeader, ICodec, IDecode, IHeader, ILoader},
+        },
+        utils::NULL_ADDR,
+    };
+
+    use super::{Index, Key};
 
     #[test]
     fn test_key_codec() {
@@ -734,31 +713,138 @@ mod test {
 
     #[test]
     fn test_val_codec() {
-        let put = Value::Put(Record::normal(1, "114514".as_bytes()));
-        let del = Value::Del(Record::remove(1));
-        let sib = Value::Sib(Sibling::put(
-            233,
-            Record::normal(1, "1145141919810".as_bytes()),
-        ));
-        let mut put_buf = vec![0u8; put.packed_size()];
-        let mut del_buf = vec![0u8; del.packed_size()];
-        let mut sib_buf = vec![0u8; sib.packed_size()];
+        #[derive(Clone)]
+        struct L {
+            m: RefCell<HashMap<u64, BoxRef>>,
+            addr: Arc<AtomicU64>,
+        }
 
-        put.encode_to(&mut put_buf);
-        del.encode_to(&mut del_buf);
-        sib.encode_to(&mut sib_buf);
+        impl L {
+            fn new() -> Self {
+                Self {
+                    m: RefCell::new(HashMap::new()),
+                    addr: Arc::new(AtomicU64::new(114)),
+                }
+            }
+        }
 
-        let pb = put_buf.as_slice();
-        let db = del_buf.as_slice();
-        let sb = sib_buf.as_slice();
+        impl IAlloc for L {
+            fn allocate(&mut self, size: usize) -> BoxRef {
+                let addr = self.addr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let b = BoxRef::alloc(size as u32, addr);
+                self.m.borrow_mut().insert(addr, b.clone());
+                b
+            }
 
-        let dp = Value::<Record>::decode_from(pb);
-        let dd = Value::<Record>::decode_from(db);
-        let ds = Value::<Record>::decode_from(sb);
+            fn arena_size(&mut self) -> usize {
+                64 << 20
+            }
 
-        assert!(dp.as_ref().eq(put.as_ref()));
-        assert!(dd.as_ref().eq(del.as_ref()));
-        assert!(ds.as_ref().eq(sib.as_ref()));
+            fn collect(&mut self, _addr: &[u64]) {}
+
+            fn inline_size(&self) -> usize {
+                Options::INLINE_SIZE
+            }
+        }
+
+        impl ILoader for L {
+            fn load(&self, addr: u64) -> Option<crate::types::refbox::BoxView> {
+                self.m.borrow().get(&addr).map(|x| x.view())
+            }
+
+            fn load_unchecked(&self, addr: u64) -> crate::types::refbox::BoxView {
+                self.load(addr).unwrap()
+            }
+
+            fn pin(&self, data: BoxRef) {
+                self.m.borrow_mut().insert(data.header().addr, data);
+            }
+
+            fn shallow_copy(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let put = Record::normal(1, "114514".as_bytes());
+        let del = Record::remove(1);
+        let sib = Record::normal(1, "1145141919810".as_bytes());
+
+        let mut inline_size = 1 << 20;
+        let sib_addr = 192608;
+
+        {
+            let l = L::new();
+            let mut put_buf = vec![0u8; Val::calc_size(false, inline_size, put.packed_size())];
+            let mut del_buf = vec![0u8; Val::calc_size(false, inline_size, del.packed_size())];
+            let mut sib_buf = vec![0u8; Val::calc_size(true, inline_size, sib.packed_size())];
+
+            Val::encode_inline(&mut put_buf, NULL_ADDR, &put);
+            Val::encode_inline(&mut del_buf, NULL_ADDR, &del);
+            Val::encode_inline(&mut sib_buf, sib_addr, &sib);
+
+            let vp = Val::from_raw(&put_buf);
+            let vd = Val::from_raw(&del_buf);
+            let vs = Val::from_raw(&sib_buf);
+
+            let dp = vp.get_record(&l).0;
+            let dd = vd.get_record(&l).0;
+            let ds = vs.get_record(&l).0;
+
+            assert!(dp.eq(&put));
+            assert!(dd.eq(&del));
+            assert!(ds.eq(&sib));
+
+            assert!(vp.get_sibling().is_none());
+            assert!(vd.get_sibling().is_none());
+            assert_eq!(vs.get_sibling(), Some(sib_addr));
+        }
+
+        inline_size = 1;
+        {
+            let mut l = L::new();
+            let mut put_buf = vec![0u8; Val::calc_size(false, inline_size, put.packed_size())];
+            let mut del_buf = vec![0u8; Val::calc_size(false, inline_size, del.packed_size())];
+            let mut sib_buf = vec![0u8; Val::calc_size(true, inline_size, sib.packed_size())];
+
+            fn encode_to(a: &mut L, x: &Record) -> u64 {
+                let b = RemoteView::alloc(a, x.packed_size());
+                let mut r = b.view().as_remote();
+                x.encode_to(r.raw_mut());
+                b.header().addr
+            }
+
+            let pa = encode_to(&mut l, &put);
+            let da = encode_to(&mut l, &del);
+            let sa = encode_to(&mut l, &sib);
+
+            Val::encode_remote(&mut put_buf, NULL_ADDR, pa, &put);
+            Val::encode_remote(&mut del_buf, NULL_ADDR, da, &del);
+            Val::encode_remote(&mut sib_buf, sib_addr, sa, &sib);
+
+            let vp = Val::from_raw(&put_buf);
+            let vd = Val::from_raw(&del_buf);
+            let vs = Val::from_raw(&sib_buf);
+
+            let (dp, rp) = vp.get_record(&l);
+            let (dd, rd) = vd.get_record(&l);
+            let (ds, rs) = vs.get_record(&l);
+
+            assert!(dp.eq(&put));
+            assert!(dd.eq(&del));
+            assert!(ds.eq(&sib));
+
+            assert_eq!(rp.box_header().addr, pa);
+            assert_eq!(rd.box_header().addr, da);
+            assert_eq!(rs.box_header().addr, sa);
+
+            assert_eq!(vp.get_remote(), pa);
+            assert_eq!(vd.get_remote(), da);
+            assert_eq!(vs.get_remote(), sa);
+
+            assert!(vp.get_sibling().is_none());
+            assert!(vd.get_sibling().is_none());
+            assert_eq!(vs.get_sibling(), Some(sib_addr));
+        }
     }
 
     #[test]
@@ -787,18 +873,5 @@ mod test {
 
         assert_eq!(dk.raw, k.raw);
         assert_eq!(dv, v);
-    }
-
-    #[test]
-    fn sibling() {
-        let s = Sibling::put(233, Record::normal(1, "114514".as_bytes()));
-        let v = Value::Sib(s);
-        let mut buf = vec![0u8; v.packed_size()];
-
-        v.encode_to(&mut buf);
-
-        let dv = Value::<Record>::decode_from(buf.as_slice());
-
-        assert_eq!(dv.sibling().unwrap().addr, 233);
     }
 }

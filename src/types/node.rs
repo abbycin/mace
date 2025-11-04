@@ -7,11 +7,11 @@ use std::{
 use crate::{
     types::{
         base::BaseIter,
-        data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Value, Ver},
+        data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
         header::{BoxHeader, NodeType},
         imtree::{ImTree, Iter, RangeIter},
         refbox::{BaseView, BoxView, DeltaView, KeyRef},
-        traits::{IAlloc, IAsBoxRef, IBoxHeader, ICodec, IHeader, IKey, ILoader, IVal},
+        traits::{IAlloc, IAsBoxRef, IBoxHeader, IDecode, IHeader, IKey, ILoader, IVal},
     },
     utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID},
 };
@@ -47,6 +47,8 @@ fn leaf_cmp(x: &DeltaView, y: &DeltaView) -> Ordering {
 fn null_cmp(_x: &DeltaView, _y: &DeltaView) -> Ordering {
     unimplemented!()
 }
+
+pub type Junks = Vec<u64>;
 
 pub(crate) enum MergeOp {
     Merged,
@@ -85,8 +87,12 @@ where
         &self.loader
     }
 
-    pub(crate) fn save(&self, b: BoxRef) {
+    /// a DeltaView's owner
+    pub(crate) fn save(&self, b: BoxRef, r: Option<BoxRef>) {
         self.loader.pin(b);
+        if let Some(x) = r {
+            self.loader.pin(x);
+        }
     }
 
     pub(crate) fn pid(&self) -> u64 {
@@ -98,10 +104,9 @@ where
     }
 
     pub(crate) fn new_leaf<A: IAlloc>(a: &mut A, loader: L) -> Node<L> {
-        let empty: &[(LeafSeg, Value<Record>)] = &[];
-        let b = BaseView::new_leaf(a, [].as_slice(), None, NULL_PID, || {
-            empty.iter().map(|x| (x.0, x.1))
-        });
+        let empty: &[(LeafSeg, Val)] = &[];
+        let mut iter = empty.iter().map(|x| (x.0, x.1));
+        let b = BaseView::new_leaf(a, &loader, [].as_slice(), None, NULL_PID, &mut iter);
         Self::new(loader, b)
     }
 
@@ -120,12 +125,17 @@ where
         self.inner.box_header().addr
     }
 
-    pub(crate) fn garbage_collect<A: IAlloc>(&self, a: &mut A) {
+    pub(crate) fn base_box(&self) -> BoxRef {
+        self.inner.as_box()
+    }
+
+    pub(crate) fn garbage_collect<A: IAlloc>(&self, a: &mut A, junks: &[u64]) {
+        // collect key-value addr, if value is remote and invisible, it has been collected in junks
         self.delta
             .iter()
             .for_each(|x| a.collect(&[x.box_header().addr]));
 
-        a.collect(self.inner.remote());
+        a.collect(junks);
         a.collect(&[self.base_addr()]);
     }
 
@@ -181,22 +191,14 @@ where
         a: &mut A,
         other: &Node<L>,
         safe_txid: u64,
-    ) -> Node<L> {
-        let lb = self.merge_to_base(a, safe_txid);
-        let rb = other.merge_to_base(a, safe_txid);
+    ) -> (Node<L>, Junks, Junks) {
+        let (lb, lj) = self.merge_to_base(a, safe_txid);
+        let (rb, rj) = other.merge_to_base(a, safe_txid);
         let (lhs, rhs) = (lb.view().as_base(), rb.view().as_base());
 
         let mut node = Self::new(self.loader.clone(), lhs.merge(a, &self.loader, rhs));
         node.header_mut().split_elems = self.header().split_elems;
-        node
-    }
-
-    pub(crate) fn lo(&self) -> &[u8] {
-        self.inner.lo(&self.loader)
-    }
-
-    pub(crate) fn hi(&self) -> Option<&[u8]> {
-        self.inner.hi(&self.loader)
+        (node, lj, rj)
     }
 
     pub(crate) fn child_index(&self, k: &[u8]) -> (bool, u64) {
@@ -211,24 +213,25 @@ where
                 assert!(hi > k);
             }
         }
-        let sst = self.sst::<IntlKey, Index>();
-        let pos = match sst.search_by(&self.loader, &IntlKey::new(k), |x, y| x.raw.cmp(y.raw)) {
+        let sst = self.sst::<IntlKey>();
+        let pos = match sst.search_by(&IntlKey::new(k), |x, y| x.raw.cmp(y.raw)) {
             Ok(pos) => pos,
             Err(pos) => pos.max(1) - 1,
         };
 
-        let (_, v, _) = sst.get_unchecked(&self.loader, pos);
+        let (_, v) = sst.kv_at::<Index>(pos);
         (pos == 0, v.pid)
     }
 
-    /// this method will compact list into sst for better query performance
+    /// NOTE: before we add lock, it will search key in current node and return None if find, after
+    /// add lock, the search is useless, so it was removed, but we keep return an Option<Node<L>>
     pub(crate) fn insert_index<A: IAlloc>(
         &self,
         a: &mut A,
         key: &[u8],
         pid: u64,
         safe_txid: u64,
-    ) -> Option<Node<L>> {
+    ) -> Option<(Node<L>, Junks)> {
         #[cfg(feature = "extra_check")]
         if key < self.lo()
             || if let Some(hi) = self.hi() {
@@ -240,13 +243,12 @@ where
             panic!("somehow it happens");
         }
 
-        let b = DeltaView::from_key_val(a, IntlKey::new(key), Index::new(pid));
+        let b = DeltaView::from_key_index(a, IntlKey::new(key), Index::new(pid));
         let view = b.view().as_delta();
-        let node = self.insert(view).compact(a, safe_txid); // 1/SPLIT_ELEMS chance to run
-        Some(node)
+        Some(self.insert(view).compact(a, safe_txid)) // 1/SPLIT_ELEMS chance to run
     }
 
-    fn decode_pefix<K, V>(
+    fn decode_pefix<K>(
         &self,
         pos: usize,
         prefix_len: usize,
@@ -255,9 +257,8 @@ where
     ) -> (Vec<u8>, (usize, usize))
     where
         K: IKey,
-        V: IVal,
     {
-        let k = self.sst::<K, V>().key_at(&self.loader, pos);
+        let k = self.sst::<K>().key_at(pos);
         let mut sep = Vec::with_capacity(prefix_len + k.raw().len());
         sep.extend_from_slice(&lo[..prefix_len]);
         sep.extend_from_slice(k.raw());
@@ -281,8 +282,7 @@ where
         let sibling = self.header().right_sibling;
 
         let (l, r) = if h.is_index {
-            let (sep_key, (llen, rlen)) =
-                self.decode_pefix::<IntlKey, Index>(sep, prefix_len, lo, &hi);
+            let (sep_key, (llen, rlen)) = self.decode_pefix::<IntlKey>(sep, prefix_len, lo, &hi);
             let lhs_prefix = &lo[..llen];
             let rhs_prefix = &sep_key[..rlen];
             // NOTE: the prefix will never shrink in split
@@ -290,33 +290,33 @@ where
             (
                 BaseView::new_intl(a, lo, Some(sep_key.as_slice()), sibling, || {
                     self.inner
-                        .range_iter::<L, IntlKey, Index>(&self.loader, 0, sep)
+                        .range_iter::<L, IntlKey>(&self.loader, 0, sep)
                         .map(|(k, v)| (IntlSeg::new(lhs_prefix, &k.raw[ld..]), v))
                 }),
                 BaseView::new_intl(a, sep_key.as_slice(), hi, sibling, || {
                     self.inner
-                        .range_iter::<L, IntlKey, Index>(&self.loader, sep, elems)
+                        .range_iter::<L, IntlKey>(&self.loader, sep, elems)
                         .map(|(k, v)| (IntlSeg::new(rhs_prefix, &k.raw[rd..]), v))
                 }),
             )
         } else {
-            let (sep_key, (llen, rlen)) =
-                self.decode_pefix::<Key, Value<Record>>(sep, prefix_len, lo, &hi);
+            let (sep_key, (llen, rlen)) = self.decode_pefix::<Key>(sep, prefix_len, lo, &hi);
             let lhs_prefix = &lo[..llen];
             let rhs_prefix = &sep_key[..rlen];
             // NOTE: the prefix will never shrink in split
             let (ld, rd) = (lhs_prefix.len() - prefix_len, rhs_prefix.len() - prefix_len);
+            let loader = self.loader();
+            let mut liter = self
+                .inner
+                .range_iter::<L, Key>(&self.loader, 0, sep)
+                .map(|(k, v)| (LeafSeg::new(lhs_prefix, &k.raw[ld..], k.ver), v));
+            let mut riter = self
+                .inner
+                .range_iter::<L, Key>(&self.loader, sep, elems)
+                .map(|(k, v)| (LeafSeg::new(rhs_prefix, &k.raw[rd..], k.ver), v));
             (
-                BaseView::new_leaf(a, lo, Some(sep_key.as_slice()), sibling, || {
-                    self.inner
-                        .range_iter::<L, Key, Value<Record>>(&self.loader, 0, sep)
-                        .map(|(k, v)| (LeafSeg::new(lhs_prefix, &k.raw[ld..], k.ver), v))
-                }),
-                BaseView::new_leaf(a, sep_key.as_slice(), hi, sibling, || {
-                    self.inner
-                        .range_iter::<L, Key, Value<Record>>(&self.loader, sep, elems)
-                        .map(|(k, v)| (LeafSeg::new(rhs_prefix, &k.raw[rd..], k.ver), v))
-                }),
+                BaseView::new_leaf(a, loader, lo, Some(sep_key.as_slice()), sibling, &mut liter),
+                BaseView::new_leaf(a, loader, sep_key.as_slice(), hi, sibling, &mut riter),
             )
         };
 
@@ -346,7 +346,7 @@ where
     }
 
     #[allow(clippy::iter_skip_zero)]
-    pub(crate) fn leaf_iter(&'_ self, safe_txid: u64) -> LeafIter<'_, L> {
+    fn leaf_iter(&'_ self, safe_txid: u64) -> LeafIter<'_, L> {
         debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
         let len = self.header().prefix_len as usize;
         let lo = self.lo();
@@ -361,30 +361,36 @@ where
             filter: LeafFilter {
                 txid: safe_txid,
                 last: None,
+                junks: Vec::new(),
                 skip_dup: false,
             },
         }
     }
 
-    pub(crate) fn compact<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> Node<L> {
-        let b = self.merge_to_base(a, safe_txid);
+    pub(crate) fn compact<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> (Node<L>, Junks) {
+        let (b, j) = self.merge_to_base(a, safe_txid);
         let old_h = self.header();
         let mut base = b.view().as_base();
         let new_h = base.header_mut();
         new_h.merging = old_h.merging;
         new_h.merging_child = old_h.merging_child;
-        Self::new(self.loader.clone(), b)
+        (Self::new(self.loader.clone(), b), j)
     }
 
-    fn merge_to_base<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> BoxRef {
+    fn merge_to_base<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> (BoxRef, Junks) {
         let h = self.header();
         let lo = self.lo();
         let hi = self.hi();
 
         if h.is_index {
-            BaseView::new_intl(a, lo, hi, h.right_sibling, || self.intl_iter())
+            (
+                BaseView::new_intl(a, lo, hi, h.right_sibling, || self.intl_iter()),
+                Vec::new(),
+            )
         } else {
-            BaseView::new_leaf(a, lo, hi, h.right_sibling, || self.leaf_iter(safe_txid))
+            let mut iter = self.leaf_iter(safe_txid);
+            let b = BaseView::new_leaf(a, self.loader(), lo, hi, h.right_sibling, &mut iter);
+            (b, iter.filter.junks)
         }
     }
 
@@ -393,7 +399,7 @@ where
         a: &mut A,
         op: MergeOp,
         safe_txid: u64,
-    ) -> Node<L> {
+    ) -> (Node<L>, Junks) {
         match op {
             MergeOp::Merged => {
                 assert_eq!(self.box_header().node_type, NodeType::Intl);
@@ -406,24 +412,24 @@ where
                         break;
                     }
                 }
-                let b = DeltaView::from_key_val(a, key.unwrap(), Index::null());
+                let b = DeltaView::from_key_index(a, key.unwrap(), Index::null());
                 let tmp_node = self.insert(b.view().as_delta());
-                let mut p = tmp_node.compact(a, safe_txid);
+                let (mut p, j) = tmp_node.compact(a, safe_txid);
                 p.header_mut().merging_child = NULL_PID;
                 p.header_mut().split_elems = h.split_elems + 1;
-                p
+                (p, j)
             }
             MergeOp::MarkParent(pid) => {
                 assert_eq!(self.box_header().node_type, NodeType::Intl);
-                let mut p = self.compact(a, safe_txid);
+                let (mut p, j) = self.compact(a, safe_txid);
                 p.header_mut().merging_child = pid;
-                p
+                (p, j)
             }
             MergeOp::MarkChild => {
                 assert_eq!(self.box_header().node_type, NodeType::Leaf);
-                let mut p = self.compact(a, safe_txid);
+                let (mut p, j) = self.compact(a, safe_txid);
                 p.header_mut().merging = true;
-                p
+                (p, j)
             }
         }
     }
@@ -458,34 +464,34 @@ where
         self.addr
     }
 
-    pub(crate) fn find_latest<K, V, F>(&self, key: &K, f: F) -> Option<(K, V, BoxRef)>
+    /// when value is inlined return node (or delta) or else retuen remote, the node (or delta) is
+    /// always valid when node is valid, the returned key is valid too
+    pub(crate) fn find_latest<K, F>(&self, key: &K, f: F) -> Option<(K, Record, BoxRef)>
     where
         K: IKey,
-        V: IVal,
         F: Fn(&K, &K) -> Ordering,
     {
         let data = self.delta.find(key, |x, y| f(&K::decode_from(x.key()), y));
         if let Some(x) = data {
             let k = K::decode_from(x.key());
+            let v = x.val();
             if k.raw().cmp(key.raw()).is_eq() {
-                return Some((k, V::decode_from(x.val()), x.as_box()));
+                let (v, r) = v.get_record(&self.loader);
+                return Some((k, v, r.map_or_else(|| self.base_box(), |x| x.as_box())));
             }
         }
-        self.search_sst(key)
+        self.search_sst(key).map(|(k, v)| {
+            let (v, r) = v.get_record(&self.loader);
+            (k, v, r.map_or_else(|| self.base_box(), |x| x.as_box()))
+        })
     }
 
-    pub(crate) fn search_sst<K, V>(&self, key: &K) -> Option<(K, V, BoxRef)>
-    where
-        K: IKey,
-        V: IVal,
-    {
+    pub(crate) fn search_sst<'a, K: IKey>(&self, key: &K) -> Option<(K, Val<'a>)> {
+        debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
         if self.header().elems > 0 {
-            let sst = self.inner.sst::<K, V>();
-            let pos = sst
-                .search_by(&self.loader, key, |x, y| x.raw().cmp(y.raw()))
-                .ok()?;
-            let (k, v, r) = sst.get_unchecked(&self.loader, pos);
-            Some((k, v, r.map_or_else(|| self.inner.as_box(), |x| x.as_box())))
+            let sst = self.inner.sst::<K>();
+            let pos = sst.search_by(key, |x, y| x.raw().cmp(y.raw())).ok()?;
+            Some(sst.kv_at(pos))
         } else {
             // it not just ROOT_PID may have empty elems, it's same to those nodes have been compacted
             // with all elems were filtered out
@@ -518,20 +524,21 @@ where
             let it = self.delta.iter();
             for x in it {
                 let k = IntlKey::decode_from(x.key());
-                let v = Index::decode_from(x.val());
-                log::debug!("{} => {}", k.to_string(), v.to_string());
+                let v = Index::decode_from(x.index());
+                log::debug!("{} => {}", k.to_string(), v);
             }
-            let sst = self.sst::<IntlKey, Index>();
-            sst.show(self.loader(), h.pid, h.addr);
+            let sst = self.sst::<IntlKey>();
+            sst.show_intl(h.pid, h.addr);
         } else {
             let it = self.delta.iter();
             for x in it {
                 let k = Key::decode_from(x.key());
-                let v = Value::<Record>::decode_from(x.val());
-                log::debug!("{} => {}", k.to_string(), v.to_string());
+                let val = x.val();
+                let (r, _) = val.get_record(&self.loader);
+                log::debug!("{} => {}", k.to_string(), r);
             }
-            let sst = self.sst::<Key, Value<Record>>();
-            sst.show(self.loader(), h.pid, h.addr);
+            let sst = self.sst::<Key>();
+            sst.show_leaf(self.loader(), h.pid, h.addr);
         }
     }
 
@@ -600,8 +607,7 @@ where
                     Err(0)
                 } else {
                     let key = Key::new(b.key(), Ver::new(NULL_ORACLE, NULL_CMD));
-                    self.sst::<Key, Value<Record>>()
-                        .lower_bound(&self.loader, &key)
+                    self.sst::<Key>().lower_bound(&key)
                 };
 
                 (IterAdaptor::Range(r), pos.unwrap_or_else(|x| x))
@@ -626,8 +632,7 @@ where
                     Err(0)
                 } else {
                     let key = Key::new(b.key(), Ver::new(NULL_ORACLE, NULL_CMD));
-                    self.sst::<Key, Value<Record>>()
-                        .lower_bound(&self.loader, &key)
+                    self.sst::<Key>().lower_bound(&key)
                 };
                 let pos = match inner_pos {
                     Ok(x) => x + 1, // exclude
@@ -695,7 +700,7 @@ where
     prefix: &'a [u8],
     next_l: Option<(IntlSeg<'a>, Index)>,
     next_r: Option<(IntlSeg<'a>, Index)>,
-    sst_iter: BaseIter<'a, L, IntlKey<'a>, Index>,
+    sst_iter: BaseIter<'a, L, IntlKey<'a>>,
     delta_iter: IterAdaptor<'a, &'a [u8]>,
 }
 
@@ -704,9 +709,9 @@ where
     L: ILoader,
 {
     prefix: &'a [u8],
-    next_l: Option<(LeafSeg<'a>, Value<Record>)>,
-    next_r: Option<(LeafSeg<'a>, Value<Record>)>,
-    sst_iter: BaseIter<'a, L, Key<'a>, Value<Record>>,
+    next_l: Option<(LeafSeg<'a>, Val<'a>)>,
+    next_r: Option<(LeafSeg<'a>, Val<'a>)>,
+    sst_iter: BaseIter<'a, L, Key<'a>>,
     delta_iter: IterAdaptor<'a, &'a [u8]>,
     filter: LeafFilter<'a>,
 }
@@ -716,9 +721,9 @@ where
     L: ILoader,
 {
     prefix: &'a [u8],
-    next_l: Option<(Key<'a>, Value<Record>, KeyRef)>,
-    next_r: Option<(Key<'a>, Value<Record>, KeyRef)>,
-    sst_iter: BaseIter<'a, L, Key<'a>, Value<Record>>,
+    next_l: Option<(Key<'a>, Record, KeyRef, Option<BoxRef>)>,
+    next_r: Option<(Key<'a>, Record, KeyRef, Option<BoxRef>)>,
+    sst_iter: BaseIter<'a, L, Key<'a>>,
     delta_iter: IterAdaptor<'a, KeyRef>,
 }
 
@@ -737,7 +742,7 @@ where
                 // NOTE: split raw into two parts which simplify comparation
                 self.next_l = Some((
                     IntlSeg::new(self.prefix, &k.raw[self.prefix.len()..]),
-                    Index::decode_from(x.val()),
+                    Index::decode_from(x.index()),
                 ));
             }
 
@@ -787,7 +792,7 @@ impl<'a, L> Iterator for LeafIter<'a, L>
 where
     L: ILoader,
 {
-    type Item = (LeafSeg<'a>, Value<Record>);
+    type Item = (LeafSeg<'a>, Val<'a>);
 
     // TODO: `self.next_l/r = Some(xx)` cause too many l1d-load-misses, maybe we can return Key
     // instead, and apply prefix then remove new prefix in `Base::new_leaf`
@@ -796,7 +801,9 @@ where
             if self.next_r.is_none()
                 && let Some((k, v)) = self.sst_iter.next()
             {
-                debug_assert!(v.sibling().is_none());
+                if let Some(sib) = v.get_sibling() {
+                    self.filter.junks.push(sib);
+                }
                 self.next_r = Some((LeafSeg::new(self.prefix, k.raw, k.ver), v));
             }
 
@@ -804,7 +811,7 @@ where
                 && let Some(x) = self.delta_iter.next()
             {
                 let k = Key::decode_from(x.key());
-                let v = Value::<Record>::decode_from(x.val());
+                let v = x.val();
                 self.next_l = Some((
                     LeafSeg::new(self.prefix, &k.raw[self.prefix.len()..], k.ver),
                     v,
@@ -849,22 +856,34 @@ impl<'a, L> Iterator for RawLeafIter<'a, L>
 where
     L: ILoader,
 {
-    type Item = (Key<'a>, Value<Record>, KeyRef);
+    type Item = (Key<'a>, Record, KeyRef, Option<BoxRef>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_l.is_none()
             && let Some(x) = self.delta_iter.next()
         {
             let k = Key::decode_from(x.key());
-            let v = Value::<Record>::decode_from(x.val());
-            self.next_l = Some((k, v, KeyRef::new(k.raw, x.as_box())));
+            let val = x.val();
+            let (v, r) = val.get_record(self.sst_iter.loader);
+            self.next_l = Some((
+                k,
+                v,
+                KeyRef::new(k.raw, x.as_box()),
+                r.map_or(None, |x| Some(x.as_box())),
+            ));
         }
 
         if self.next_r.is_none()
-            && let Some((k, v)) = self.sst_iter.next()
+            && let Some((k, val)) = self.sst_iter.next()
         {
             let kr = KeyRef::build(self.prefix, k.raw);
-            self.next_r = Some((Key::new(kr.key(), k.ver), v, kr));
+            let (v, r) = val.get_record(self.sst_iter.loader);
+            self.next_r = Some((
+                Key::new(kr.key(), k.ver),
+                v,
+                kr,
+                r.map_or(None, |x| Some(x.as_box())),
+            ));
         }
 
         return match (self.next_l.take(), self.next_r.take()) {
@@ -889,12 +908,12 @@ where
 struct LeafFilter<'a> {
     txid: u64,
     last: Option<&'a [u8]>,
+    junks: Junks,
     skip_dup: bool,
 }
 
 impl<'a> LeafFilter<'a> {
-    fn check(&mut self, x: &(LeafSeg<'a>, Value<Record>)) -> bool {
-        let (k, v) = x;
+    fn check_impl(&mut self, k: &LeafSeg<'a>, v: &Val) -> bool {
         if let Some(last) = self.last
             && last == k.raw()
         {
@@ -908,19 +927,34 @@ impl<'a> LeafFilter<'a> {
 
             // it's the oldest version, the rest versions will never be accessed by any txn
             self.skip_dup = true;
-            match v {
-                // skip only when removed and is safe
-                Value::Del(_) => return false,
-                _ => return true,
-            }
+            // skip only when removed and is safe
+            return !v.is_tombstone();
         }
 
         self.last = Some(k.raw());
         self.skip_dup = k.txid() <= self.txid;
-        match v {
-            // skip only when removed and is safe
-            Value::Del(_) if k.txid() <= self.txid => false,
-            _ => true,
+        // skip only when removed and is safe
+        if v.is_tombstone() && self.skip_dup {
+            return false;
+        }
+        true
+    }
+
+    #[inline(always)]
+    fn check(&mut self, x: &(LeafSeg<'a>, Val)) -> bool {
+        let (k, v) = x;
+        if !self.check_impl(k, v) {
+            self.collect(v);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn collect(&mut self, v: &Val) {
+        let remote = v.get_remote();
+        if remote != NULL_ADDR {
+            self.junks.push(remote);
         }
     }
 }
@@ -936,11 +970,14 @@ mod test {
         },
     };
 
-    use crate::types::{
-        data::{Key, Record, Value, Ver},
-        node::Node,
-        refbox::{BoxRef, BoxView, DeltaView},
-        traits::{IAlloc, IHeader, IInlineSize, ILoader},
+    use crate::{
+        Options,
+        types::{
+            data::{Key, Record, Ver},
+            node::Node,
+            refbox::{BoxRef, BoxView, DeltaView},
+            traits::{IAlloc, IHeader, ILoader},
+        },
     };
 
     struct AInner {
@@ -986,11 +1023,9 @@ mod test {
         }
 
         fn collect(&mut self, _addr: &[u64]) {}
-    }
 
-    impl IInlineSize for A {
-        fn inline_size(&self) -> u32 {
-            2048
+        fn inline_size(&self) -> usize {
+            Options::INLINE_SIZE
         }
     }
 
@@ -1019,34 +1054,34 @@ mod test {
             let l = a.clone();
             let mut node = Node::new_leaf(&mut a, l);
 
-            let d1 = DeltaView::from_key_val(
+            let (d1, r1) = DeltaView::from_key_val(
                 &mut a,
-                Key::new("foo".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1)),
-                Value::Put(Record::normal(1, "1".as_bytes())),
+                &Key::new("foo".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1)),
+                &Record::normal(1, "1".as_bytes()),
             );
-            let d2 = DeltaView::from_key_val(
+            let (d2, r2) = DeltaView::from_key_val(
                 &mut a,
-                Key::new("foo".as_bytes(), Ver::new(txid.load(Relaxed), 2)),
-                Value::Put(Record::normal(1, "2".as_bytes())),
+                &Key::new("foo".as_bytes(), Ver::new(txid.load(Relaxed), 2)),
+                &Record::normal(1, "2".as_bytes()),
             );
 
-            let d3 = DeltaView::from_key_val(
+            let (d3, r3) = DeltaView::from_key_val(
                 &mut a,
-                Key::new("foo".as_bytes(), Ver::new(txid.load(Relaxed), 3)),
-                Value::Del(Record::remove(1)),
+                &Key::new("foo".as_bytes(), Ver::new(txid.load(Relaxed), 3)),
+                &Record::remove(1),
             );
 
             node = node.insert(d1.view().as_delta());
-            node.save(d1);
+            node.save(d1, r1);
             node = node.insert(d2.view().as_delta());
-            node.save(d2);
-            node = node.compact(&mut a, 1);
+            node.save(d2, r2);
+            (node, _) = node.compact(&mut a, 1);
 
             let iter = node.leaf_iter(1);
             assert_eq!(iter.count(), 2);
 
             node = node.insert(d3.view().as_delta());
-            node.save(d3);
+            node.save(d3, r3);
             let iter = node.leaf_iter(3);
             assert_eq!(iter.count(), 0);
         }
@@ -1057,13 +1092,13 @@ mod test {
         for i in 0..30 {
             let raw = format!("key_{i}");
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
-            let v = Value::Put(Record::normal(1, raw.as_bytes()));
-            let delta = DeltaView::from_key_val(&mut a, k, v);
+            let v = Record::normal(1, raw.as_bytes());
+            let (delta, r) = DeltaView::from_key_val(&mut a, &k, &v);
             node = node.insert(delta.view().as_delta());
-            node.save(delta);
+            node.save(delta, r);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                node = node.compact(&mut a, 3);
+                (node, _) = node.compact(&mut a, 3);
             }
         }
 
@@ -1071,13 +1106,13 @@ mod test {
         for i in 0..20 {
             let raw = format!("key_{i}");
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 0));
-            let v = Value::Del(Record::remove(1));
-            let delta = DeltaView::from_key_val(&mut a, k, v);
+            let v = Record::remove(1);
+            let (delta, r) = DeltaView::from_key_val(&mut a, &k, &v);
             node = node.insert(delta.view().as_delta());
-            node.save(delta);
+            node.save(delta, r);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                node = node.compact(&mut a, 3);
+                (node, _) = node.compact(&mut a, 3);
             }
         }
 
@@ -1085,13 +1120,13 @@ mod test {
         for i in 30..31 {
             let raw = format!("key_{i}");
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 0));
-            let v = Value::Put(Record::normal(1, raw.as_bytes()));
-            let delta = DeltaView::from_key_val(&mut a, k, v);
+            let v = Record::normal(1, raw.as_bytes());
+            let (delta, r) = DeltaView::from_key_val(&mut a, &k, &v);
             node = node.insert(delta.view().as_delta());
-            node.save(delta);
+            node.save(delta, r);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                node = node.compact(&mut a, 3);
+                (node, _) = node.compact(&mut a, 3);
             }
         }
 

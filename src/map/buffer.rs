@@ -12,7 +12,7 @@ use crate::{
     types::{
         page::Page,
         refbox::BoxView,
-        traits::{IHeader, IInlineSize, ILoader},
+        traits::{IHeader, ILoader},
     },
     utils::{Handle, MutRef, options::ParsedOptions, queue::Queue},
 };
@@ -82,6 +82,38 @@ impl Iim {
     }
 }
 
+#[cfg(feature = "metric")]
+#[derive(Debug)]
+pub struct PoolStat {
+    nr_spin: AtomicUsize,
+    nr_alloc: AtomicUsize,
+    nr_free: AtomicUsize,
+}
+
+#[cfg(feature = "metric")]
+static G_POOL_STAT: PoolStat = PoolStat {
+    nr_spin: AtomicUsize::new(0),
+    nr_alloc: AtomicUsize::new(0),
+    nr_free: AtomicUsize::new(0),
+};
+
+#[cfg(feature = "metric")]
+macro_rules! inc_count {
+    ($field: ident) => {
+        G_POOL_STAT.$field.fetch_add(1, Relaxed)
+    };
+}
+
+#[cfg(not(feature = "metric"))]
+macro_rules! inc_count {
+    ($field: ident) => {};
+}
+
+#[cfg(feature = "metric")]
+pub fn g_pool_status() -> &'static PoolStat {
+    &G_POOL_STAT
+}
+
 struct Pool {
     flush: Flush,
     map: Arc<Iim>,
@@ -119,6 +151,7 @@ impl Pool {
             allow_over_provision: opt.over_provision,
         };
 
+        inc_count!(nr_alloc);
         h.reset(id);
         this
     }
@@ -161,6 +194,8 @@ impl Pool {
         // will not be changed before new arena has been installed
         self.map.push(self.numerics.address.load(Relaxed), id);
 
+        let mut is_spin = false;
+        inc_count!(nr_alloc);
         let p = loop {
             if let Some(p) = self.free.pop() {
                 break p;
@@ -168,6 +203,10 @@ impl Pool {
             if self.allow_over_provision {
                 break Handle::new(Arena::new(cur.cap(), cur.workers()));
             } else {
+                if !is_spin {
+                    is_spin = true;
+                    inc_count!(nr_spin);
+                }
                 std::hint::spin_loop();
             }
         };
@@ -192,6 +231,7 @@ impl Pool {
                 h.reclaim();
             }
             map.pop();
+            inc_count!(nr_free);
         };
 
         let _ = self
@@ -285,7 +325,6 @@ impl Buffers {
         self.pool.current().record_lsn(worker_id, seq);
     }
 
-    #[cfg(not(feature = "disable_recycle"))]
     pub(crate) fn recycle<F>(&self, addr: &[u64], mut gc: F)
     where
         F: FnMut(u64),
@@ -300,16 +339,6 @@ impl Buffers {
         a.dec_ref();
     }
 
-    #[cfg(feature = "disable_recycle")]
-    pub(crate) fn recycle<F>(&self, addr: &[u64], mut gc: F)
-    where
-        F: FnMut(u64),
-    {
-        for i in addr {
-            gc(*i);
-        }
-    }
-
     pub(crate) fn quit(&self) {
         let _ = self.tx.send(SharedState::Quit);
         let _ = self.rx.recv();
@@ -322,7 +351,6 @@ impl Buffers {
     pub(crate) fn loader(&self) -> Loader {
         let split_elems = self.ctx.opt.split_elems as u32;
         Loader {
-            max_inline_size: self.ctx.opt.max_inline_size,
             split_elems,
             pool: self.pool,
             ctx: self.ctx,
@@ -375,7 +403,6 @@ impl Buffers {
 }
 
 pub struct Loader {
-    max_inline_size: u32,
     split_elems: u32,
     pool: Handle<Pool>,
     ctx: Handle<Context>,
@@ -403,7 +430,6 @@ impl Loader {
 impl Clone for Loader {
     fn clone(&self) -> Self {
         Self {
-            max_inline_size: self.max_inline_size,
             split_elems: self.split_elems,
             pool: self.pool,
             ctx: self.ctx,
@@ -416,7 +442,6 @@ impl Clone for Loader {
 impl ILoader for Loader {
     fn shallow_copy(&self) -> Self {
         Self {
-            max_inline_size: self.max_inline_size,
             split_elems: self.split_elems,
             pool: self.pool,
             ctx: self.ctx,
@@ -448,11 +473,5 @@ impl ILoader for Loader {
                 Some(r)
             }
         }
-    }
-}
-
-impl IInlineSize for Loader {
-    fn inline_size(&self) -> u32 {
-        self.max_inline_size
     }
 }

@@ -3,7 +3,7 @@ use crate::index::Node;
 use crate::map::data::Arena;
 use crate::types::header::TagFlag;
 use crate::types::refbox::{BoxRef, BoxView};
-use crate::types::traits::{IAlloc, IHeader, IInlineSize};
+use crate::types::traits::{IAlloc, IHeader};
 use crate::utils::Handle;
 use crate::utils::data::JUNK_LEN;
 use crate::{Store, index::Page};
@@ -71,7 +71,7 @@ impl<'a> SysTxn<'a> {
     }
 
     /// unmap pid from page table then recycle space
-    pub fn unmap(&mut self, p: Page) -> Result<(), OpCode> {
+    pub fn unmap(&mut self, p: Page, old_junks: &[u64]) -> Result<(), OpCode> {
         // allocate only TagHeader
         let mut unmap = self.alloc(0);
         let h = unmap.header_mut();
@@ -80,7 +80,7 @@ impl<'a> SysTxn<'a> {
         h.pid = pid;
 
         self.store.page.unmap(pid, p.swip()).map(|_| {
-            p.garbage_collect(self);
+            p.garbage_collect(self, old_junks);
             self.store.buffer.evict(pid);
             self.g.defer(move || p.reclaim());
         })
@@ -104,7 +104,7 @@ impl<'a> SysTxn<'a> {
     }
 
     /// return new page on success,the old page will be reclaimed
-    pub fn replace(&mut self, old: Page, node: Node) -> Result<Page, OpCode> {
+    pub fn replace(&mut self, old: Page, node: Node, old_junks: &[u64]) -> Result<Page, OpCode> {
         let pid = old.pid();
         let mut new = Page::new(node);
         new.set_pid(pid);
@@ -112,7 +112,7 @@ impl<'a> SysTxn<'a> {
             .page
             .cas(pid, old.swip(), new.swip())
             .map(|_| {
-                old.garbage_collect(self);
+                old.garbage_collect(self, old_junks);
                 self.store.buffer.warm(pid, new.size());
                 self.g.defer(move || old.reclaim());
                 new
@@ -184,11 +184,9 @@ impl IAlloc for SysTxn<'_> {
     fn arena_size(&mut self) -> usize {
         self.store.opt.data_file_size
     }
-}
 
-impl IInlineSize for SysTxn<'_> {
-    fn inline_size(&self) -> u32 {
-        self.store.opt.max_inline_size
+    fn inline_size(&self) -> usize {
+        self.store.opt.inline_size
     }
 }
 

@@ -18,8 +18,9 @@ use crate::{
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
-pub(crate) enum EntryKind {
+pub enum MetaKind {
     Begin,
+    FileId,
     Commit,
     Numerics,
     Interval,
@@ -30,44 +31,87 @@ pub(crate) enum EntryKind {
     KindEnd,
 }
 
-impl IAsSlice for EntryKind {}
+impl IAsSlice for MetaKind {}
 
-impl TryFrom<u8> for EntryKind {
+impl TryFrom<u8> for MetaKind {
     type Error = OpCode;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         if value > Self::KindEnd as u8 {
             Err(OpCode::BadData)
         } else {
-            Ok(unsafe { std::mem::transmute::<u8, EntryKind>(value) })
+            Ok(unsafe { std::mem::transmute::<u8, MetaKind>(value) })
         }
     }
 }
 
-pub(crate) const ENTRY_KIND_LEN: usize = size_of::<EntryKind>();
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum TxnKind {
+    FLush = 3,
+    GC,
+    Dump,
+}
 
 #[repr(C, packed(1))]
-pub(crate) struct Begin {
+pub(crate) struct GenericHdr {
+    pub(crate) kind: MetaKind,
     pub(crate) txid: u64,
 }
 
-impl IAsSlice for Begin {}
+impl GenericHdr {
+    pub(crate) const SIZE: usize = size_of::<Self>();
+
+    pub(crate) const fn new(kind: MetaKind, txid: u64) -> Self {
+        Self { kind, txid }
+    }
+
+    pub(crate) fn decode(src: &[u8]) -> Result<Self, OpCode> {
+        debug_assert!(src.len() >= Self::SIZE);
+        let _kind: MetaKind = src[0].try_into()?;
+        Ok(GenericHdr::from_slice(src))
+    }
+}
+
+impl IAsSlice for GenericHdr {}
+
+#[derive(Clone, Copy)]
+pub struct Begin(pub TxnKind);
 
 impl IMetaCodec for Begin {
     fn packed_size(&self) -> usize {
-        ENTRY_KIND_LEN + size_of::<Self>()
+        size_of::<Self>()
+    }
+
+    fn encode(&self, to: &mut [u8]) {
+        to[0] = self.0 as u8;
+    }
+
+    fn decode(src: &[u8]) -> Self {
+        assert!(src[0] <= TxnKind::Dump as u8);
+        assert!(src[0] >= TxnKind::FLush as u8);
+        Begin(unsafe { std::mem::transmute::<u8, TxnKind>(src[0]) })
+    }
+}
+
+#[repr(C, packed(1))]
+pub struct FileId {
+    pub file_id: u64,
+}
+
+impl IAsSlice for FileId {}
+
+impl IMetaCodec for FileId {
+    fn packed_size(&self) -> usize {
+        size_of::<Self>()
     }
 
     fn encode(&self, to: &mut [u8]) {
         assert_eq!(to.len(), self.packed_size());
-        let k = EntryKind::Begin;
-        to[..ENTRY_KIND_LEN].copy_from_slice(k.as_slice());
-        to[ENTRY_KIND_LEN..].copy_from_slice(self.as_slice());
+        to.copy_from_slice(self.as_slice());
     }
 
     fn decode(src: &[u8]) -> Self {
-        let k = EntryKind::from_slice(src);
-        assert_eq!(k, EntryKind::Begin);
-        Begin::from_slice(&src[ENTRY_KIND_LEN..])
+        FileId::from_slice(src)
     }
 }
 
@@ -82,20 +126,16 @@ impl IAsSlice for Commit {}
 
 impl IMetaCodec for Commit {
     fn packed_size(&self) -> usize {
-        ENTRY_KIND_LEN + size_of::<Self>()
+        size_of::<Self>()
     }
 
     fn encode(&self, to: &mut [u8]) {
         assert_eq!(to.len(), self.packed_size());
-        let k = EntryKind::Commit;
-        to[..ENTRY_KIND_LEN].copy_from_slice(k.as_slice());
-        to[ENTRY_KIND_LEN..].copy_from_slice(self.as_slice());
+        to.copy_from_slice(self.as_slice());
     }
 
     fn decode(src: &[u8]) -> Self {
-        let k = EntryKind::from_slice(src);
-        assert_eq!(k, EntryKind::Commit);
-        Commit::from_slice(&src[ENTRY_KIND_LEN..])
+        Commit::from_slice(src)
     }
 }
 
@@ -154,14 +194,14 @@ impl DerefMut for FileStat {
 }
 
 impl FileStat {
-    pub(super) fn update(&mut self, tick: u64, reloc: Reloc) {
+    pub(super) fn update(&mut self, tick: u64, reloc: &Reloc) {
         self.active_elems -= 1;
         self.active_size -= reloc.len as usize;
         self.deleted_elems.set(reloc.seq);
 
         if self.up1 < tick {
-            self.up1 = self.up2;
-            self.up2 = tick;
+            self.up2 = self.up1;
+            self.up1 = tick;
         }
     }
 
@@ -184,19 +224,17 @@ impl IAsSlice for StatHdr {}
 
 impl IMetaCodec for Stat {
     fn packed_size(&self) -> usize {
-        ENTRY_KIND_LEN + size_of::<StatHdr>() + self.len()
+        size_of::<StatHdr>() + self.len()
     }
 
     fn encode(&self, to: &mut [u8]) {
         assert_eq!(to.len(), self.packed_size());
-        let k = EntryKind::Stat;
-        to[..ENTRY_KIND_LEN].copy_from_slice(k.as_slice());
         let hdr = StatHdr {
             elems: self.deleted_elems.len() as u32,
             size: self.len() as u32,
         };
-        to[ENTRY_KIND_LEN..ENTRY_KIND_LEN + size_of::<StatHdr>()].copy_from_slice(hdr.as_slice());
-        let dst = &mut to[ENTRY_KIND_LEN + size_of::<StatHdr>()..];
+        to[0..hdr.len()].copy_from_slice(hdr.as_slice());
+        let dst = &mut to[hdr.len()..];
         let inner_s = self.inner.as_slice();
         dst[..inner_s.len()].copy_from_slice(inner_s);
         let src = unsafe {
@@ -207,17 +245,15 @@ impl IMetaCodec for Stat {
     }
 
     fn decode(src: &[u8]) -> Self {
-        let k = EntryKind::from_slice(src);
-        assert_eq!(k, EntryKind::Stat);
-        let hdr = StatHdr::from_slice(&src[ENTRY_KIND_LEN..]);
-        let inner = StatInner::from_slice(&src[ENTRY_KIND_LEN + size_of::<StatHdr>()..]);
+        let hdr = StatHdr::from_slice(src);
+        let inner = StatInner::from_slice(&src[hdr.len()..]);
         let mut stat = Stat {
             inner,
             deleted_elems: vec![],
         };
         let seq = unsafe {
             src.as_ptr()
-                .add(ENTRY_KIND_LEN + size_of::<StatHdr>() + size_of::<StatInner>())
+                .add(hdr.len() + size_of::<StatInner>())
                 .cast::<u32>()
         };
 
@@ -291,32 +327,23 @@ impl IAsSlice for PageTableHdr {}
 
 impl IMetaCodec for PageTable {
     fn packed_size(&self) -> usize {
-        ENTRY_KIND_LEN + size_of::<PageTableHdr>() + self.len()
+        size_of::<PageTableHdr>() + self.len()
     }
 
     fn encode(&self, to: &mut [u8]) {
         assert_eq!(to.len(), self.packed_size());
-        let k = EntryKind::Map;
-        to[0..ENTRY_KIND_LEN].copy_from_slice(k.as_slice());
         let hdr = PageTableHdr {
             elems: self.data.len() as u32,
             size: self.len(),
         };
-        to[ENTRY_KIND_LEN..ENTRY_KIND_LEN + size_of::<PageTableHdr>()]
-            .copy_from_slice(hdr.as_slice());
-        to[ENTRY_KIND_LEN + size_of::<PageTableHdr>()..].copy_from_slice(&self.collect());
+        to[0..hdr.len()].copy_from_slice(hdr.as_slice());
+        to[hdr.len()..].copy_from_slice(&self.collect());
     }
 
     fn decode(src: &[u8]) -> Self {
-        let k = EntryKind::from_slice(src);
-        assert_eq!(k, EntryKind::Map);
-        let hdr = PageTableHdr::from_slice(&src[ENTRY_KIND_LEN..]);
+        let hdr = PageTableHdr::from_slice(src);
         let mut table = PageTable::default();
-        let p = unsafe {
-            src.as_ptr()
-                .add(ENTRY_KIND_LEN + size_of::<PageTableHdr>())
-                .cast::<MapEntry>()
-        };
+        let p = unsafe { src.as_ptr().add(hdr.len()).cast::<MapEntry>() };
 
         for i in 0..hdr.elems as usize {
             let m = unsafe { p.add(i).read_unaligned() };
@@ -328,18 +355,15 @@ impl IMetaCodec for PageTable {
 }
 
 #[derive(Debug)]
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct Numerics {
-    pub txid: u64,
-    /// a snapshot of current flushed data file id
-    pub flushed_id: u64,
+    /// notify log data has been flushed
+    pub signal: AtomicU64,
     pub next_file_id: AtomicU64,
     pub next_manifest_id: AtomicU64,
     pub oracle: AtomicU64,
     /// it's the logical address to a frame
     pub address: AtomicU64,
-    /// a singal that notify data file has been flushed by flush thread
-    pub tick: AtomicU64,
     pub wmk_oldest: AtomicU64,
     pub log_size: AtomicUsize,
 }
@@ -353,13 +377,11 @@ impl Numerics {
 impl Default for Numerics {
     fn default() -> Self {
         Self {
-            txid: 0,
-            flushed_id: INIT_ID,
+            signal: AtomicU64::new(INIT_ID),
             next_file_id: AtomicU64::new(INIT_ID),
             next_manifest_id: AtomicU64::new(INIT_ID),
             oracle: AtomicU64::new(INIT_ORACLE),
             address: AtomicU64::new(INIT_ADDR),
-            tick: AtomicU64::new(0),
             wmk_oldest: AtomicU64::new(0),
             log_size: AtomicUsize::new(0),
         }
@@ -380,20 +402,16 @@ impl IAsSlice for Numerics {}
 
 impl IMetaCodec for Numerics {
     fn packed_size(&self) -> usize {
-        size_of::<Self>() + ENTRY_KIND_LEN
+        size_of::<Self>()
     }
 
     fn encode(&self, to: &mut [u8]) {
         assert_eq!(to.len(), self.packed_size());
-        let k = EntryKind::Numerics;
-        to[..ENTRY_KIND_LEN].copy_from_slice(k.as_slice());
-        to[ENTRY_KIND_LEN..].copy_from_slice(self.as_slice());
+        to.copy_from_slice(self.as_slice());
     }
 
     fn decode(src: &[u8]) -> Self {
-        let k = EntryKind::from_slice(src);
-        assert_eq!(k, EntryKind::Numerics);
-        Numerics::from_slice(&src[ENTRY_KIND_LEN..])
+        Numerics::from_slice(src)
     }
 }
 
@@ -430,33 +448,25 @@ impl IAsSlice for DeleteHdr {}
 
 impl IMetaCodec for Delete {
     fn packed_size(&self) -> usize {
-        self.id.len() * size_of::<u64>() + ENTRY_KIND_LEN + size_of::<DeleteHdr>()
+        self.id.len() * size_of::<u64>() + size_of::<DeleteHdr>()
     }
 
     fn encode(&self, to: &mut [u8]) {
         assert_eq!(to.len(), self.packed_size());
-        let k = EntryKind::Delete;
-        to[..ENTRY_KIND_LEN].copy_from_slice(k.as_slice());
         let hdr = DeleteHdr {
             nr_id: self.id.len() as u32,
         };
-        to[ENTRY_KIND_LEN..ENTRY_KIND_LEN + size_of::<DeleteHdr>()].copy_from_slice(hdr.as_slice());
+        to[0..hdr.len()].copy_from_slice(hdr.as_slice());
         let src = unsafe {
             let p = self.id.as_ptr().cast::<u8>();
             std::slice::from_raw_parts(p, self.len() * size_of::<u64>())
         };
-        to[ENTRY_KIND_LEN + size_of::<DeleteHdr>()..].copy_from_slice(src);
+        to[hdr.len()..].copy_from_slice(src);
     }
 
     fn decode(src: &[u8]) -> Self {
-        let k = EntryKind::from_slice(src);
-        assert_eq!(k, EntryKind::Delete);
-        let hdr = DeleteHdr::from_slice(&src[ENTRY_KIND_LEN..]);
-        let p = unsafe {
-            src.as_ptr()
-                .add(ENTRY_KIND_LEN + size_of::<DeleteHdr>())
-                .cast::<u64>()
-        };
+        let hdr = DeleteHdr::from_slice(src);
+        let p = unsafe { src.as_ptr().add(hdr.len()).cast::<u64>() };
         let mut r = Delete::default();
         for i in 0..hdr.nr_id as usize {
             let id = unsafe { p.add(i).read_unaligned() };
@@ -487,29 +497,25 @@ impl IAsSlice for IntervalPair {}
 
 impl IMetaCodec for IntervalPair {
     fn packed_size(&self) -> usize {
-        size_of::<Self>() + ENTRY_KIND_LEN
+        size_of::<Self>()
     }
 
     fn encode(&self, to: &mut [u8]) {
         assert_eq!(to.len(), self.packed_size());
-        let k = EntryKind::Interval;
-        to[..ENTRY_KIND_LEN].copy_from_slice(k.as_slice());
-        to[ENTRY_KIND_LEN..].copy_from_slice(self.as_slice());
+        to.copy_from_slice(self.as_slice());
     }
 
     fn decode(src: &[u8]) -> Self {
-        let k = EntryKind::from_slice(src);
-        assert_eq!(k, EntryKind::Interval);
-        Self::from_slice(&src[ENTRY_KIND_LEN..])
+        Self::from_slice(src)
     }
 }
 
 #[derive(Default)]
-pub struct IntervalStart {
+pub struct DelInterval {
     pub lo: Vec<u64>,
 }
 
-impl Deref for IntervalStart {
+impl Deref for DelInterval {
     type Target = Vec<u64>;
 
     fn deref(&self) -> &Self::Target {
@@ -517,7 +523,7 @@ impl Deref for IntervalStart {
     }
 }
 
-impl DerefMut for IntervalStart {
+impl DerefMut for DelInterval {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.lo
     }
@@ -537,36 +543,27 @@ impl DelIntervalStartHdr {
 
 impl IAsSlice for DelIntervalStartHdr {}
 
-impl IMetaCodec for IntervalStart {
+impl IMetaCodec for DelInterval {
     fn packed_size(&self) -> usize {
-        self.lo.len() * size_of::<u64>() + ENTRY_KIND_LEN + size_of::<DelIntervalStartHdr>()
+        self.lo.len() * size_of::<u64>() + size_of::<DelIntervalStartHdr>()
     }
 
     fn encode(&self, to: &mut [u8]) {
-        let k = EntryKind::DelInterval;
-        to[..ENTRY_KIND_LEN].copy_from_slice(k.as_slice());
         let hdr = DelIntervalStartHdr {
             nr_lo: self.lo.len() as u16,
         };
-        to[ENTRY_KIND_LEN..ENTRY_KIND_LEN + size_of::<DelIntervalStartHdr>()]
-            .copy_from_slice(hdr.as_slice());
+        to[0..hdr.len()].copy_from_slice(hdr.as_slice());
         let src = unsafe {
             let p = self.lo.as_ptr().cast::<u8>();
             std::slice::from_raw_parts(p, self.lo.len() * size_of::<u64>())
         };
-        to[ENTRY_KIND_LEN + size_of::<DelIntervalStartHdr>()..].copy_from_slice(src);
+        to[hdr.len()..].copy_from_slice(src);
     }
 
     fn decode(src: &[u8]) -> Self {
-        let k = EntryKind::from_slice(src);
-        assert_eq!(k, EntryKind::DelInterval);
-        let hdr = DelIntervalStartHdr::from_slice(&src[ENTRY_KIND_LEN..]);
-        let p = unsafe {
-            src.as_ptr()
-                .add(ENTRY_KIND_LEN + size_of::<DelIntervalStartHdr>())
-                .cast::<u64>()
-        };
-        let mut r = IntervalStart::default();
+        let hdr = DelIntervalStartHdr::from_slice(src);
+        let p = unsafe { src.as_ptr().add(hdr.len()).cast::<u64>() };
+        let mut r = DelInterval::default();
         for i in 0..hdr.nr_lo as usize {
             let id = unsafe { p.add(i).read_unaligned() };
             r.lo.push(id);
@@ -575,18 +572,19 @@ impl IMetaCodec for IntervalStart {
     }
 }
 
-pub(crate) fn get_record_size(h: EntryKind, size: usize) -> Result<usize, OpCode> {
+pub(crate) fn get_record_size(h: MetaKind, size: usize) -> Result<usize, OpCode> {
     let sz = match h {
-        EntryKind::Begin => size_of::<Begin>(),
-        EntryKind::Commit => size_of::<Commit>(),
-        EntryKind::Numerics => size_of::<Numerics>(),
-        EntryKind::Interval => size_of::<IntervalPair>(),
-        EntryKind::Delete => size_of::<DeleteHdr>(),
-        EntryKind::Map => size_of::<PageTableHdr>(),
-        EntryKind::Stat => size_of::<StatHdr>(),
-        EntryKind::DelInterval => size_of::<DelIntervalStartHdr>(),
+        MetaKind::Begin => size_of::<Begin>(),
+        MetaKind::Commit => size_of::<Commit>(),
+        MetaKind::Numerics => size_of::<Numerics>(),
+        MetaKind::Interval => size_of::<IntervalPair>(),
+        MetaKind::Delete => size_of::<DeleteHdr>(),
+        MetaKind::Map => size_of::<PageTableHdr>(),
+        MetaKind::Stat => size_of::<StatHdr>(),
+        MetaKind::DelInterval => size_of::<DelIntervalStartHdr>(),
+        MetaKind::FileId => size_of::<FileId>(),
         _ => unreachable!("invalid kind {h:?}"),
-    } + 1; // including EntryKind
+    } + GenericHdr::SIZE;
     if size >= sz {
         Ok(sz)
     } else {

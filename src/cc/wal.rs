@@ -13,7 +13,7 @@ use crate::{
     cc::worker::SyncWorker,
     static_assert,
     types::{
-        data::{Key, Record, Value, Ver},
+        data::{Key, Record, Ver},
         traits::ITree,
     },
     utils::{INIT_CMD, block::Block, data::Position},
@@ -429,6 +429,7 @@ impl<'a> WalReader<'a> {
                 let h: EntryType = s[0].into();
                 let sz = wal_record_sz(h);
                 assert!(pos + sz as u64 <= end);
+                assert!(sz <= block.len());
 
                 f.read(&mut s[0..sz], pos).unwrap();
                 match h {
@@ -503,9 +504,9 @@ impl<'a> WalReader<'a> {
         *cmd += 1; // make sure that cmd is increasing in same txn
         let raw = c.key();
         let val = if tombstone {
-            Value::Del(Record::remove(c.worker_id))
+            Record::remove(c.worker_id)
         } else {
-            Value::Put(Record::normal(c.worker_id, data))
+            Record::normal(c.worker_id, data)
         };
 
         let mut w = if let Some(w) = worker {

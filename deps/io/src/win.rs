@@ -1,7 +1,7 @@
 use std::{
     io::{self, Write},
     os::windows::fs::FileExt,
-    path::PathBuf,
+    path::Path,
 };
 
 use crate::{GatherIO, IoVec, OpenOptions};
@@ -11,7 +11,7 @@ pub struct File {
 }
 
 impl OpenOptions {
-    pub fn open(&self, path: &PathBuf) -> Result<File, io::Error> {
+    pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<File, io::Error> {
         File::open(path, self)
     }
 }
@@ -21,7 +21,7 @@ impl File {
         OpenOptions::new()
     }
 
-    fn open(path: &PathBuf, opt: &OpenOptions) -> Result<File, io::Error> {
+    fn open<P: AsRef<Path>>(path: P, opt: &OpenOptions) -> Result<File, io::Error> {
         let file = std::fs::File::options()
             .read(opt.read)
             .write(opt.write)

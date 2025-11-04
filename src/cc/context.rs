@@ -21,7 +21,6 @@ pub struct Context {
 impl Context {
     pub fn new(opt: Arc<ParsedOptions>, manifest: Manifest, desc: &[WalDescHandle]) -> Self {
         let cores = opt.workers as usize;
-        // NOTE: the elements of desc were ordered by worker id
         assert_eq!(cores, desc.len());
         let mut w = Vec::with_capacity(cores);
         // queue elems must > 1, when worker is 1, the next_power_of_two is 1 too, so we plus 1 here

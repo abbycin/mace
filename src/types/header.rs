@@ -1,6 +1,6 @@
 use std::sync::atomic::AtomicU32;
 
-use crate::{static_assert, types::traits::ICodec};
+use crate::static_assert;
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[repr(u8)]
@@ -55,7 +55,8 @@ pub(crate) struct DeltaHeader {
 pub(crate) struct BaseHeader {
     /// key-value count
     pub(crate) elems: u16,
-    /// elems to trigger merge when necessary, set when split happen
+    /// elems to trigger merge when necessary, set when split happen, deprecated, becuase we're not
+    /// split by node size anymore, we keep it to avoid passing node elems limit configuration
     pub(crate) split_elems: u16,
     /// total size (including header, remote address)
     pub(crate) size: u32,
@@ -66,10 +67,9 @@ pub(crate) struct BaseHeader {
     pub(crate) lo_len: u32,
     pub(crate) hi_len: u32,
     pub(crate) prefix_len: u32,
-    /// indirect addr count, including big key-val in sst, sibling itself and big ver-val in sibling
-    pub(crate) nr_remote: u16,
     pub(crate) merging: bool,
     pub(crate) is_index: bool,
+    pub(crate) padding: u16,
 } // sst
 
 #[repr(C, align(8))]
@@ -86,72 +86,6 @@ static_assert!(size_of::<BoxHeader>().is_multiple_of(8));
 static_assert!(size_of::<BaseHeader>().is_multiple_of(8));
 static_assert!(size_of::<DeltaHeader>().is_multiple_of(8));
 static_assert!(size_of::<RemoteHeader>().is_multiple_of(8));
-
-pub(crate) struct Slot {
-    meta: u64,
-}
-
-impl Slot {
-    const INDIRECT_BIT: u64 = 1 << 63;
-    const MASK: u8 = 0x80; // highest byte mask
-    pub const REMOTE_LEN: usize = size_of::<Self>();
-    pub const LOCAL_LEN: usize = 1;
-
-    pub(crate) const fn from_remote(addr: u64) -> Self {
-        Self {
-            meta: addr | Self::INDIRECT_BIT,
-        }
-    }
-
-    pub(crate) const fn inline() -> Self {
-        Self { meta: 0 }
-    }
-
-    #[inline]
-    pub(crate) const fn is_inline(&self) -> bool {
-        self.meta & Self::INDIRECT_BIT == 0
-    }
-
-    pub(crate) const fn addr(&self) -> u64 {
-        debug_assert!(!self.is_inline());
-        self.meta & !Self::INDIRECT_BIT
-    }
-}
-
-impl ICodec for Slot {
-    fn packed_size(&self) -> usize {
-        if self.is_inline() {
-            Self::LOCAL_LEN
-        } else {
-            Self::REMOTE_LEN
-        }
-    }
-
-    fn remove_prefix(&self, _prefix_len: usize) -> Self {
-        unimplemented!()
-    }
-
-    fn encode_to(&self, to: &mut [u8]) {
-        if self.is_inline() {
-            to[0] = self.meta as u8;
-        } else {
-            debug_assert!(to.len() == Self::REMOTE_LEN);
-            let be = self.meta.to_be_bytes();
-            to.copy_from_slice(&be);
-        }
-    }
-
-    fn decode_from(raw: &[u8]) -> Self {
-        let meta = raw[0];
-        if meta & Self::MASK == 0 {
-            Self::inline()
-        } else {
-            Self {
-                meta: <u64>::from_be_bytes((&raw[..Self::REMOTE_LEN]).try_into().unwrap()),
-            }
-        }
-    }
-}
 
 pub(crate) type SlotType = u32;
 pub(crate) const SLOT_LEN: usize = size_of::<SlotType>();

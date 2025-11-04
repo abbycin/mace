@@ -16,7 +16,7 @@ use crate::cc::wal::{
 use crate::index::tree::Tree;
 use crate::meta::Manifest;
 use crate::meta::builder::ManifestBuilder;
-use crate::types::data::{Key, Record, Value, Ver};
+use crate::types::data::{Key, Record, Ver};
 use crate::utils::block::Block;
 use crate::utils::data::{Position, WalDesc, WalDescHandle};
 use crate::utils::lru::LruInner;
@@ -43,6 +43,8 @@ pub(crate) struct Recovery {
 }
 
 impl Recovery {
+    const INIT_BLOCK_SIZE: usize = 1 << 20;
+
     pub(crate) fn new(opt: Arc<ParsedOptions>) -> Self {
         Self {
             opt,
@@ -66,7 +68,7 @@ impl Recovery {
         let g = crossbeam_epoch::pin();
         let numerics = &ctx.manifest.numerics;
         let mut oracle = numerics.oracle.load(Relaxed);
-        let mut block = Block::alloc(self.opt.max_data_size());
+        let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
 
         for d in desc.iter() {
             // analyze and redo starts from latest checkpoint
@@ -171,6 +173,7 @@ impl Recovery {
                 let Some(sz) = Self::get_size(et, (end - pos) as usize) else {
                     break;
                 };
+                debug_assert!(sz < Self::INIT_BLOCK_SIZE);
 
                 log::trace!("pos {pos} sz {sz} {et:?}");
                 f.read(&mut buf[0..sz], pos).unwrap();
@@ -213,6 +216,9 @@ impl Recovery {
                             break;
                         }
                         loc.len = (sz + u.payload_len()) as u32;
+                        if block.len() < loc.len as usize {
+                            block.realloc(loc.len as usize);
+                        }
                         log::trace!("{pos} => {u:?}");
                         loc.pos.offset = pos - sz as u64;
 
@@ -272,6 +278,7 @@ impl Recovery {
             let Some(f) = Self::get_file(&cache, cap, &self.opt, wid, pos.file_id) else {
                 break;
             };
+            assert!(len as usize <= block.len());
             f.read(block.mut_slice(0, len as usize), pos.offset)
                 .unwrap();
             let c = ptr_to::<WalUpdate>(block.data());
@@ -281,24 +288,24 @@ impl Recovery {
             let r = match c.sub_type() {
                 PayloadType::Insert => {
                     let i = c.put();
-                    let val = Value::Put(Record::normal(c.worker_id, i.val()));
+                    let val = Record::normal(c.worker_id, i.val());
                     tree.put(g, key, val)
                 }
                 PayloadType::Update => {
                     let u = c.update();
-                    let val = Value::Put(Record::normal(c.worker_id, u.new_val()));
+                    let val = Record::normal(c.worker_id, u.new_val());
                     tree.put(g, key, val)
                 }
                 PayloadType::Delete => {
-                    let val = Value::Del(Record::remove(c.worker_id));
+                    let val = Record::remove(c.worker_id);
                     tree.put(g, key, val)
                 }
                 PayloadType::Clr => {
                     let r = c.clr();
                     let val = if r.is_tombstone() {
-                        Value::Del(Record::remove(c.worker_id))
+                        Record::remove(c.worker_id)
                     } else {
-                        Value::Put(Record::normal(c.worker_id, r.val()))
+                        Record::normal(c.worker_id, r.val())
                     };
                     tree.put(g, key, val)
                 }
@@ -344,7 +351,7 @@ impl Recovery {
     fn load_manifest(&self) -> Result<Manifest, OpCode> {
         let mut nums = Vec::new();
         let mut snap = None; // latest snapshot
-        Self::readdir(&self.opt.db_root, |path, name| {
+        Self::readdir(&self.opt.log_root(), |path, name| {
             if name.ends_with("tmp") {
                 // remove imcomplete dump
                 let _ = std::fs::remove_file(path);

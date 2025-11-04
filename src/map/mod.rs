@@ -34,4 +34,6 @@ pub(crate) fn create_buffer(
 }
 
 #[cfg(feature = "metric")]
+pub use buffer::g_pool_status;
+#[cfg(feature = "metric")]
 pub use flush::g_flush_status;

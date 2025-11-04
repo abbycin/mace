@@ -5,11 +5,7 @@ use crate::types::{
     refbox::{BoxRef, BoxView},
 };
 
-pub trait IInlineSize {
-    fn inline_size(&self) -> u32;
-}
-
-pub trait ILoader: IInlineSize + Clone {
+pub trait ILoader: Clone {
     fn shallow_copy(&self) -> Self;
 
     fn pin(&self, data: BoxRef);
@@ -37,44 +33,38 @@ pub trait IHeader<T> {
     fn header_mut(&mut self) -> &mut T;
 }
 
-pub trait IAlloc: IInlineSize {
+pub trait IAlloc {
     fn allocate(&mut self, size: usize) -> BoxRef;
 
     fn collect(&mut self, addr: &[u64]);
 
     fn arena_size(&mut self) -> usize;
+
+    fn inline_size(&self) -> usize;
 }
 
-pub trait IKey: Default + ICodec + Clone + Copy + Ord {
+pub trait IKey: Default + IKeyCodec + Ord {
     fn raw(&self) -> &[u8];
 
     fn to_string(&self) -> String;
 }
 
-pub trait ICodec {
-    fn remove_prefix(&self, prefix_len: usize) -> Self;
-
-    fn packed_size(&self) -> usize;
-
-    fn encode_to(&self, to: &mut [u8]);
-
+pub trait IDecode {
     fn decode_from(raw: &[u8]) -> Self;
 }
 
-pub trait IVal: ICodec + Copy + Clone + Default {
-    fn to_string(&self) -> String;
+pub trait ICodec: IDecode + Copy {
+    fn packed_size(&self) -> usize;
 
-    fn is_tombstone(&self) -> bool;
+    fn encode_to(&self, to: &mut [u8]);
 }
 
-pub trait IValCodec: Copy {
-    fn size(&self) -> usize;
+pub trait IKeyCodec: ICodec {
+    fn remove_prefix(&self, prefix_len: usize) -> Self;
+}
 
-    fn encode(&self, to: &mut [u8]);
-
-    fn decode(from: &[u8]) -> Self;
-
-    fn to_string(&self) -> String;
+pub trait IVal: ICodec + Clone {
+    fn is_tombstone(&self) -> bool;
 }
 
 pub trait ITree {
@@ -93,5 +83,9 @@ pub trait IAsSlice: Sized {
     fn from_slice(x: &[u8]) -> Self {
         assert!(x.len() >= size_of::<Self>());
         unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
+    }
+
+    fn len(&self) -> usize {
+        size_of::<Self>()
     }
 }

@@ -2,28 +2,29 @@ use std::{cmp::Ordering, marker::PhantomData};
 
 use crate::{
     types::{
-        header::{Slot, SlotType},
-        refbox::RemoteView,
-        traits::{ICodec, IKey, ILoader, IVal},
+        data::{Index, Val},
+        header::SlotType,
+        traits::{IDecode, IKey, IKeyCodec, ILoader},
     },
-    utils::{ADDR_LEN, raw_ptr_to_ref},
+    utils::raw_ptr_to_ref,
 };
 
 use super::header::BaseHeader;
 
 /// the layout of sst:
 /// ```text
-/// +---------+-------------+-------------+---------+--------+----------+
-/// | header  | remote addr | index table | low key | hi key |key-value |
-/// +---------+-------------+-------------+---------+--------+----------+
+/// +---------+-------------+---------+--------+----------+
+/// | header  | index table | low key | hi key |key-value |
+/// +---------+-------------+---------+--------+----------+
 /// ```
+
 #[derive(Clone, Copy)]
-pub(crate) struct Sst<K, V> {
+pub(crate) struct Sst<K> {
     data: *mut BaseHeader,
-    _marker: PhantomData<(K, V)>,
+    _marker: PhantomData<K>,
 }
 
-impl<K, V> Sst<K, V> {
+impl<K> Sst<K> {
     pub(crate) fn new(data: *mut BaseHeader) -> Self {
         debug_assert!(!data.is_null());
         Self {
@@ -38,71 +39,26 @@ impl<K, V> Sst<K, V> {
 
     fn data_at(&self, pos: usize) -> &[u8] {
         let h = self.header();
-        let slot_start = size_of::<BaseHeader>() + h.nr_remote as usize * ADDR_LEN;
         unsafe {
-            let off = self
-                .data
-                .cast::<u8>()
-                .add(slot_start)
-                .cast::<SlotType>()
-                .add(pos)
-                .read() as usize;
+            let off = self.data.add(1).cast::<SlotType>().add(pos).read() as usize;
             let p = self.data.cast::<u8>().add(off);
             std::slice::from_raw_parts(p, h.size as usize - off)
         }
     }
 }
 
-impl<K, V> Sst<K, V>
+impl<K> Sst<K>
 where
-    K: Ord + ICodec,
-    V: ICodec,
+    K: Ord + IKeyCodec,
 {
-    fn get_remote<L>(l: &L, addr: u64) -> (K, V, Option<RemoteView>)
-    where
-        L: ILoader,
-    {
-        let mut p = l.load_unchecked(addr).as_remote();
-        let data = p.raw_mut();
-        let k = K::decode_from(data);
-        let v = V::decode_from(&data[k.packed_size()..]);
-        (k, v, Some(p))
-    }
-
-    pub(crate) fn key_at<L>(&self, l: &L, pos: usize) -> K
-    where
-        L: ILoader,
-    {
+    /// key is always inline
+    pub(crate) fn key_at(&self, pos: usize) -> K {
         let raw = self.data_at(pos);
-        let s = Slot::decode_from(raw);
-
-        if s.is_inline() {
-            K::decode_from(&raw[Slot::LOCAL_LEN..])
-        } else {
-            let mut p = l.load_unchecked(s.addr()).as_remote();
-            K::decode_from(p.raw_mut())
-        }
+        K::decode_from(raw)
     }
 
-    pub(crate) fn get_unchecked<L>(&self, l: &L, pos: usize) -> (K, V, Option<RemoteView>)
+    pub(crate) fn search_by<F>(&self, key: &K, f: F) -> Result<usize, usize>
     where
-        L: ILoader,
-    {
-        let raw = self.data_at(pos);
-        let s = Slot::decode_from(raw);
-
-        if s.is_inline() {
-            let k = K::decode_from(&raw[Slot::LOCAL_LEN..]);
-            let v = V::decode_from(&raw[Slot::LOCAL_LEN + k.packed_size()..]);
-            (k, v, None)
-        } else {
-            Self::get_remote(l, s.addr())
-        }
-    }
-
-    pub(crate) fn search_by<L, F>(&self, l: &L, key: &K, f: F) -> Result<usize, usize>
-    where
-        L: ILoader,
         F: Fn(&K, &K) -> Ordering,
     {
         let h = self.header();
@@ -112,7 +68,7 @@ where
 
         while lo < hi {
             let mid = lo + ((hi - lo) >> 1);
-            let k = self.key_at(l, mid);
+            let k = self.key_at(mid);
             match f(&k, &rk) {
                 Ordering::Equal => return Ok(mid),
                 Ordering::Greater => hi = mid,
@@ -123,10 +79,7 @@ where
         Err(lo)
     }
 
-    pub(crate) fn lower_bound<L>(&self, l: &L, k: &K) -> Result<usize, usize>
-    where
-        L: ILoader,
-    {
+    pub(crate) fn lower_bound(&self, k: &K) -> Result<usize, usize> {
         let h = self.header();
         let elems = h.elems as usize;
         let rk = k.remove_prefix(h.prefix_len as usize);
@@ -134,7 +87,7 @@ where
 
         while lo < hi {
             let mid = lo + ((hi - lo) >> 1);
-            let key = self.key_at(l, mid);
+            let key = self.key_at(mid);
             match key.cmp(&rk) {
                 Ordering::Less => lo = mid + 1,
                 _ => hi = mid,
@@ -145,20 +98,34 @@ where
     }
 }
 
-impl<K, V> Sst<K, V>
+impl<K> Sst<K>
 where
     K: IKey,
-    V: IVal,
 {
-    pub(crate) fn show<L>(&self, l: &L, pid: u64, addr: u64)
-    where
-        L: ILoader,
-    {
+    pub fn kv_at<V: IDecode>(&self, pos: usize) -> (K, V) {
+        let raw = self.data_at(pos);
+        let k = K::decode_from(raw);
+        let v = V::decode_from(&raw[k.packed_size()..]);
+        (k, v)
+    }
+
+    pub(crate) fn show_intl(&self, pid: u64, addr: u64) {
         let elems = self.header().elems as usize;
         log::debug!("---------- show page {pid} {addr} elems {elems} ----------");
         for i in 0..elems {
-            let (k, v, _) = self.get_unchecked(l, i);
-            log::debug!("{} => {}", k.to_string(), v.to_string());
+            let (k, v) = self.kv_at::<Index>(i);
+            log::debug!("{} => {}", k.to_string(), v);
+        }
+        log::debug!("---------- end ----------");
+    }
+
+    pub(crate) fn show_leaf<L: ILoader>(&self, l: &L, pid: u64, addr: u64) {
+        let elems = self.header().elems as usize;
+        log::debug!("---------- show page {pid} {addr} elems {elems} ----------");
+        for i in 0..elems {
+            let (k, v) = self.kv_at::<Val>(i);
+            let (r, _) = v.get_record(l);
+            log::debug!("{} => {}", k.to_string(), r);
         }
         log::debug!("---------- end ----------");
     }

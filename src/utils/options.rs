@@ -35,14 +35,17 @@ pub struct Options {
     pub tmp_store: bool,
     /// where to store database files
     pub(crate) db_root: PathBuf,
-    /// where to store wal files, the default value is `db_root/wal`
-    pub wal_root: PathBuf,
+    /// where to store log files, the default value is `db_root/log`
+    pub log_root: PathBuf,
     /// node cache memory size
     pub cache_capacity: usize,
     /// percent of items will be evicted at once, default is 10%
     pub cache_evict_pct: usize,
     /// delta cache count, shard into 32 slots, which act as a secondary cache to node cache
     pub cache_count: usize,
+    /// for branch node, the key and index are always inlined, for leaf node, the key and val header
+    /// and value that less than [`Self::INLINE_SIZE`] are always inlined too
+    pub inline_size: usize,
     /// a size limit to trigger data file flush, which also control max key-value size, NOTE: too
     /// large a file size will cause the flushing to be slow
     pub data_file_size: usize,
@@ -63,18 +66,8 @@ pub struct Options {
     /// if set to true, the unused stable wal file (never used in recovery) will be removed, default
     /// value is `false`
     pub keep_stable_wal_file: bool,
-    /// max key-value size support, it must less than 4GB (because we have to add extra headers or
-    /// something else), the default value is **half** of [`Self::arena_size`]
-    ///
-    /// **Once set, it cannot be modified**
-    pub max_kv_size: u32,
-    /// max size that key-val can be save into sst (B+ Tree Node) rather than save as a pointer to
-    /// remote address the default value is 2048, the same must less than [`Self::max_kv_size`]
-    ///
-    /// **Once set, it cannot be modified**
-    pub max_inline_size: u32,
-    /// control max elements in sst (B+ Tree Node), the default value is 512, the sst size which is
-    /// approximate [`Self::max_inline_size`] * [`Self::split_elem`] must less than [`Self::max_kv_size`]
+    /// control max elements in sst (B+ Tree Node), the default value is 512, the sst size is around
+    /// [`Self::INLINE_SIZE`] * [`Self::split_elems`], big KVs will be stored outside of sst
     ///
     /// **Once set, it cannot be modified**
     pub split_elems: u16,
@@ -89,9 +82,11 @@ impl Options {
     pub const FILE_CACHE: usize = 512;
     pub const WAL_BUF_SZ: usize = 8 << 20; // 8MB
     pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
-    pub const INLINE_SIZE: u32 = 4096;
-    pub const SPLIT_ELEMS: u16 = 512;
-    pub const MAX_ALLOCATIONS: usize = 2 << 30; // 2GB
+    pub const INLINE_SIZE: usize = 8192;
+    pub const MAX_SPLIT_ELEMS: u16 = 512;
+    pub const MAX_LOG_SIZE: usize = 72 << 20;
+    const MIN_SPLIT_ELEMS: u16 = 64;
+    pub(crate) const MAX_KV_SIZE: usize = 1 << 30; // 1GB
 
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         Self {
@@ -103,39 +98,35 @@ impl Options {
                 .get()
                 .min(Self::MAX_WORKERS) as u16,
             tmp_store: false,
-            gc_timeout: 50, // 50ms
-            gc_ratio: 20,   // 20%
+            gc_timeout: 60 * 1000, // 1min
+            gc_ratio: 20,          // 20%
             gc_eager: true,
             gc_compacted_size: Self::DATA_FILE_SIZE,
             db_root: db_root.as_ref().to_path_buf(),
-            wal_root: db_root.as_ref().to_path_buf(),
+            log_root: db_root.as_ref().to_path_buf(),
             cache_capacity: Self::CACHE_CAP,
-            cache_evict_pct: 10, // 10% evict 100MB every time
+            cache_evict_pct: 10, // 10%
             cache_count: Self::CACHE_CNT,
+            inline_size: Self::INLINE_SIZE,
             data_file_size: Self::DATA_FILE_SIZE,
-            max_log_size: Self::MAX_ALLOCATIONS,
-            consolidate_threshold: Self::SPLIT_ELEMS / 2,
+            max_log_size: Self::MAX_LOG_SIZE,
+            consolidate_threshold: Self::MAX_SPLIT_ELEMS / 2,
             wal_buffer_size: Self::WAL_BUF_SZ,
             max_ckpt_per_txn: 1_000_000, // 1 million
             wal_file_size: Self::WAL_FILE_SZ as u32,
-            max_kv_size: Self::DATA_FILE_SIZE as u32 / 2,
             keep_stable_wal_file: false,
-            max_inline_size: Self::INLINE_SIZE,
-            split_elems: Self::SPLIT_ELEMS,
+            split_elems: Self::MAX_SPLIT_ELEMS,
         }
     }
 
-    /// the length of the kv plus the length of the metadata must be less than this value
-    pub(crate) fn max_data_size(&self) -> usize {
-        self.max_kv_size as usize
+    pub(crate) fn max_delta_len(&self) -> usize {
+        self.split_elems as usize / 100
     }
 
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
-        // make sure base page smaller than arena size
-        if self.max_inline_size as usize * self.split_elems as usize > self.max_kv_size as usize {
-            self.max_inline_size = Self::INLINE_SIZE;
-            self.split_elems = Self::SPLIT_ELEMS;
-        }
+        self.split_elems = self
+            .split_elems
+            .clamp(Self::MIN_SPLIT_ELEMS, Self::MAX_SPLIT_ELEMS);
         if self.consolidate_threshold > self.split_elems / 2 {
             self.consolidate_threshold = self.split_elems / 2;
         }
@@ -145,29 +136,27 @@ impl Options {
         if self.cache_capacity < Self::MIN_CACHE_CAP {
             self.cache_capacity = Self::CACHE_CAP;
         }
-        if self.max_kv_size <= 2 {
-            self.max_kv_size = Self::DATA_FILE_SIZE as u32 / 2;
-        }
-        if self.max_inline_size > self.max_kv_size {
-            self.max_inline_size = Self::INLINE_SIZE;
-        }
 
-        self.create_dir();
+        self.create_dir().map_err(|e| {
+            eprintln!("create dir fail {e:?}");
+            OpCode::IoError
+        })?;
         Ok(ParsedOptions { inner: self })
     }
 
-    pub fn create_dir(&self) {
-        let (db_root, data_root, wal_root) = (self.db_root(), self.data_root(), self.wal_root());
+    pub fn create_dir(&self) -> std::io::Result<()> {
+        let (db_root, data_root, log_root) = (self.db_root(), self.data_root(), self.log_root());
 
         if !db_root.exists() {
-            std::fs::create_dir_all(db_root).expect("cant' create db root");
+            std::fs::create_dir_all(db_root)?;
         }
         if !data_root.exists() {
-            std::fs::create_dir_all(data_root).expect("can't create data root");
+            std::fs::create_dir_all(data_root)?;
         }
-        if !wal_root.exists() {
-            std::fs::create_dir_all(wal_root).expect("can't create wal root");
+        if !log_root.exists() {
+            std::fs::create_dir_all(log_root)?;
         }
+        Ok(())
     }
 }
 
@@ -199,11 +188,11 @@ impl Options {
             .join(format!("{}{}{}", Self::DATA_PREFIX, Self::SEP, id))
     }
 
-    pub fn wal_root(&self) -> PathBuf {
-        if self.wal_root == self.db_root {
-            self.db_root.join("wal")
+    pub fn log_root(&self) -> PathBuf {
+        if self.log_root == self.db_root {
+            self.db_root.join("log")
         } else {
-            self.wal_root.clone()
+            self.log_root.clone()
         }
     }
 
@@ -212,7 +201,7 @@ impl Options {
     }
 
     pub fn wal_file(&self, wid: u16, seq: u64) -> PathBuf {
-        self.wal_root().join(format!(
+        self.log_root().join(format!(
             "{}{}{}{}{}",
             Self::WAL_PREFIX,
             Self::SEP,
@@ -223,7 +212,7 @@ impl Options {
     }
 
     pub fn wal_backup(&self, wid: u16, seq: u64) -> PathBuf {
-        self.wal_root().join(format!(
+        self.log_root().join(format!(
             "{}{}{}{}{}",
             Self::WAL_STABLE,
             Self::SEP,
@@ -234,11 +223,11 @@ impl Options {
     }
 
     pub fn desc_file(&self, wid: u16) -> PathBuf {
-        self.wal_root().join(format!("meta_{wid}"))
+        self.log_root().join(format!("meta_{wid}"))
     }
 
     pub fn manifest(&self, seq: u64) -> PathBuf {
-        self.db_root
+        self.log_root()
             .join(format!("{}{}{}", Self::MANIFEST_PREFIX, Self::SEP, seq))
     }
 

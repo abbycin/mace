@@ -885,10 +885,11 @@ mod test {
 
     use rand::seq::SliceRandom;
 
-    use crate::types::data::{Key, Record, Value, Ver};
+    use crate::Options;
+    use crate::types::data::{Key, Record, Ver};
     use crate::types::imtree::{ImTree, NODE_SIZE};
     use crate::types::refbox::{BoxRef, DeltaView};
-    use crate::types::traits::{IAlloc, IInlineSize};
+    use crate::types::traits::IAlloc;
 
     static G_VER: AtomicUsize = AtomicUsize::new(1);
 
@@ -907,10 +908,9 @@ mod test {
         fn arena_size(&mut self) -> usize {
             1 << 20
         }
-    }
-    impl IInlineSize for Allocator {
-        fn inline_size(&self) -> u32 {
-            2048
+
+        fn inline_size(&self) -> usize {
+            Options::INLINE_SIZE
         }
     }
 
@@ -1029,10 +1029,10 @@ mod test {
         let mut im = ImTree::<DeltaView>::new(|x, y| x.key().cmp(y.key()));
         let mut a = Allocator;
 
-        let delta = DeltaView::from_key_val(
+        let (delta, _r) = DeltaView::from_key_val(
             &mut a,
-            Key::new("foo".as_bytes(), Ver::new(1, 0)),
-            Value::Put(Record::normal(1, "bar".as_bytes())),
+            &Key::new("foo".as_bytes(), Ver::new(1, 0)),
+            &Record::normal(1, "bar".as_bytes()),
         );
         im = im.update(delta.view().as_delta());
 

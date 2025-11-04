@@ -213,7 +213,11 @@ impl<T> MutRef<T> {
 
     #[allow(unused)]
     #[allow(clippy::mut_from_ref)]
-    pub fn raw(&self) -> &mut T {
+    pub fn raw_ref(&self) -> &mut T {
+        unsafe { &mut (*self.inner).raw }
+    }
+
+    pub fn raw_ptr(&self) -> *mut T {
         unsafe { &mut (*self.inner).raw }
     }
 

@@ -19,9 +19,10 @@ use crate::{
     meta::Numerics,
     types::{
         header::TagFlag,
+        node::Junks,
         page::Page,
         refbox::{BoxRef, BoxView},
-        traits::{IAlloc, IHeader, IInlineSize},
+        traits::{IAlloc, IHeader},
     },
     utils::{Handle, ROOT_PID, data::JUNK_LEN, options::ParsedOptions},
 };
@@ -76,15 +77,15 @@ impl Evictor {
 
             let mut compacted = false;
             let old = Page::<Loader>::from_swip(swip.untagged());
-            let addr = if old.delta_len() > limit {
-                let mut node = old.compact(self, safe_txid);
+            let (addr, junks) = if old.delta_len() > limit {
+                let (mut node, j) = old.compact(self, safe_txid);
                 node.set_pid(old.pid());
                 let addr = node.latest_addr();
                 assert_eq!(addr, node.base_addr());
                 compacted = true;
-                addr
+                (addr, j)
             } else {
-                old.latest_addr()
+                (old.latest_addr(), Junks::new())
             };
 
             // NOTE: other threads may perform cas in the same time
@@ -92,7 +93,7 @@ impl Evictor {
                 Ok(_) => {
                     self.cache.evict_one(pid);
                     if compacted {
-                        old.garbage_collect(self);
+                        old.garbage_collect(self, &junks);
                     }
                     // must guarded by EBR, other threads may still use the old page
                     g.defer(move || old.reclaim());
@@ -117,8 +118,9 @@ impl Evictor {
             }
             let old = Page::<Loader>::from_swip(swip.untagged());
             if self.opt.compact_on_exit || old.delta_len() >= limit {
-                let mut node = old.compact(self, safe_txid);
+                let (mut node, junks) = old.compact(self, safe_txid);
                 node.set_pid(old.pid());
+                old.garbage_collect(self, &junks);
                 self.commit();
             }
             old.reclaim();
@@ -138,14 +140,14 @@ impl Evictor {
                 let Ok(_lk) = old.try_lock() else {
                     continue;
                 };
-                let mut node = old.compact(self, safe_txid);
+                let (mut node, junks) = old.compact(self, safe_txid);
                 node.set_pid(old.pid());
                 let new = Page::new(node);
                 // never retry, probability of successful CAS > 70%
                 // NOTE: other threads may perform cas in the same time
                 match self.table.cas(pid, old.swip(), new.swip()) {
                     Ok(_) => {
-                        old.garbage_collect(self);
+                        old.garbage_collect(self, &junks);
                         g.defer(move || old.reclaim());
                         self.commit();
                     }
@@ -220,11 +222,9 @@ impl IAlloc for Evictor {
     fn collect(&mut self, addr: &[u64]) {
         self.garbage.extend_from_slice(addr);
     }
-}
 
-impl IInlineSize for Evictor {
-    fn inline_size(&self) -> u32 {
-        self.opt.max_inline_size
+    fn inline_size(&self) -> usize {
+        self.opt.inline_size
     }
 }
 
@@ -232,10 +232,10 @@ fn evictor_loop(mut e: Evictor) {
     const TMO_MS: u64 = 200;
     const COMPACT_TMO: u64 = 5 * TMO_MS;
     let mut compact_cnt = 0;
+    let limit = e.opt.max_delta_len();
     loop {
         let r = e.rx.recv_timeout(Duration::from_millis(200));
         let g = crossbeam_epoch::pin();
-        let limit = e.opt.split_elems as usize / 4;
         let safe_txid = e.numerics.safe_tixd();
 
         match r {

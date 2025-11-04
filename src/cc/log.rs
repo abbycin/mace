@@ -86,7 +86,7 @@ impl Logging {
             seq: 0,
             flushed_lsn: AtomicU64::new(0),
             ops: 0,
-            last_data: numerics.tick.load(Relaxed),
+            last_data: numerics.signal.load(Relaxed),
             writer,
             opt,
             desc,
@@ -251,7 +251,7 @@ impl Logging {
         if !self.enable_ckpt.load(Relaxed) {
             return;
         }
-        let cur = self.numerics.tick.load(Relaxed);
+        let cur = self.numerics.signal.load(Relaxed);
 
         if cur == self.last_data {
             return;

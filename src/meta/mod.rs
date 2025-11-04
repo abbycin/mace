@@ -1,14 +1,15 @@
 use std::{
-    collections::HashMap,
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
     hash::Hasher,
     ops::Deref,
     path::PathBuf,
     ptr::null_mut,
     sync::{
-        Arc, Mutex, MutexGuard, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{
             AtomicBool, AtomicU64,
-            Ordering::{Relaxed, Release},
+            Ordering::{AcqRel, Acquire, Relaxed, Release},
         },
     },
 };
@@ -24,10 +25,14 @@ use crate::{
         data::DataMetaReader,
         table::{PageMap, Swip},
     },
-    meta::entry::{Begin, Commit},
-    types::{page::Page, refbox::BoxRef, traits::IHeader},
+    meta::entry::{Commit, GenericHdr},
+    types::{
+        page::Page,
+        refbox::BoxRef,
+        traits::{IAsSlice, IHeader},
+    },
     utils::{
-        Handle, ROOT_PID,
+        Handle, MutRef, ROOT_PID,
         block::{Block, Ring},
         data::{GatherWriter, Reloc},
         interval::IntervalMap,
@@ -39,7 +44,8 @@ use crate::{
 pub(crate) mod builder;
 mod entry;
 pub use entry::{
-    Delete, FileStat, IntervalPair, IntervalStart, Numerics, PageTable, Stat, StatInner,
+    Begin, DelInterval, Delete, FileId, FileStat, IntervalPair, MetaKind, Numerics, PageTable,
+    Stat, StatInner, TxnKind,
 };
 
 const LOG_BUF_SZ: usize = 64 << 20;
@@ -52,102 +58,108 @@ pub(crate) trait IMetaCodec {
     fn decode(src: &[u8]) -> Self;
 }
 
+struct WriteCtx {
+    ring: Ring,
+    writer: GatherWriter,
+}
+
 pub(crate) struct Manifest {
     pub(crate) numerics: Arc<Numerics>,
     pub(crate) map: Arc<PageMap>,
     /// interval to file_id map, multiple intervals may point to same file_id after compaction
     pub(crate) interval: RwLock<IntervalMap>,
     /// file_id to stat map
-    pub(crate) file_stat: DashMap<u64, FileStat>,
+    pub(crate) stat_ctx: StatContext,
     pub(crate) is_cleaning: AtomicBool,
     txid: AtomicU64,
     obsolete_files: Mutex<Vec<u64>>,
     cache: Lru<FileReader>,
     opt: Arc<ParsedOptions>,
-    writer: Handle<GatherWriter>,
-    ring: Handle<Ring>,
-    txn_lock: Mutex<()>,
+    wctx: Handle<Mutex<WriteCtx>>,
     /// when multiple thread are trying to load data from a file, only one can successfully lock
     non_dup_lock: Mutex<()>,
 }
 
 impl Drop for Manifest {
     fn drop(&mut self) {
-        self.writer.reclaim();
-        self.ring.reclaim();
+        self.wctx.reclaim();
     }
 }
 
-pub(crate) struct Txn<'a> {
-    _guard: MutexGuard<'a, ()>,
+pub(crate) struct Txn {
+    wctx: Handle<Mutex<WriteCtx>>,
     txid: u64,
-    ring: Handle<Ring>,
-    writer: Handle<GatherWriter>,
     h: Crc32cHasher,
-    nbytes: u64,
+    nbytes: Cell<u64>,
 }
 
-impl Txn<'_> {
+impl Txn {
     pub(crate) fn commit(mut self) -> u64 {
         let c = Commit {
             txid: self.txid,
             checksum: self.h.finish() as u32,
         };
-        self.record(&c);
-        self.nbytes
+        self.record(MetaKind::Commit, &c);
+        self.sync();
+        self.nbytes.get()
     }
 
-    pub(crate) fn record<T>(&mut self, x: &T)
+    pub(crate) fn record<T>(&mut self, kind: MetaKind, x: &T)
     where
         T: IMetaCodec,
     {
-        let size = x.packed_size();
-        if size > self.ring.len() {
-            return self.record_large(x);
+        let hdr = GenericHdr::new(kind, self.txid);
+        let mut wctx = self.wctx.lock().expect("lock fail");
+        let size = x.packed_size() + hdr.len();
+        if size > wctx.ring.len() {
+            return self.record_large(&mut wctx, &hdr, x);
         }
 
-        let buf = self.alloc(size);
-        x.encode(buf);
-        self.nbytes += buf.len() as u64;
+        let buf = Self::alloc(&mut wctx, size);
+        let hdr_dst = &mut buf[0..hdr.len()];
+        hdr_dst.copy_from_slice(hdr.as_slice());
+        x.encode(&mut buf[hdr.len()..]);
+        self.nbytes.set(self.nbytes.get() + buf.len() as u64);
         self.h.write(buf);
     }
 
-    fn record_large<T>(&mut self, x: &T)
+    pub(crate) fn sync(&self) {
+        let mut wctx = self.wctx.lock().expect("lock fail");
+        Self::flush(&mut wctx);
+    }
+
+    fn record_large<T>(&self, wctx: &mut WriteCtx, hdr: &GenericHdr, x: &T)
     where
         T: IMetaCodec,
     {
         let buf = Block::alloc(x.packed_size());
         let s = buf.mut_slice(0, buf.len());
-        x.encode(s);
-        self.nbytes += buf.len() as u64;
-        self.flush();
-        self.writer.write(s);
+        let hdr_dst = &mut s[0..hdr.len()];
+        hdr_dst.copy_from_slice(hdr.as_slice());
+        x.encode(&mut s[hdr.len()..]);
+        self.nbytes.set(self.nbytes.get() + buf.len() as u64);
+        Self::flush(wctx);
+        wctx.writer.write(s);
     }
 
-    fn alloc<'a>(&mut self, size: usize) -> &'a mut [u8] {
-        let rest = self.ring.len() - self.ring.tail();
+    fn alloc<'a>(wctx: &mut WriteCtx, size: usize) -> &'a mut [u8] {
+        let rest = wctx.ring.len() - wctx.ring.tail();
         if rest < size {
-            self.flush();
-            self.ring.prod(rest);
-            self.ring.cons(rest);
+            Self::flush(wctx);
+            wctx.ring.prod(rest);
+            wctx.ring.cons(rest);
         }
-        self.ring.prod(size)
+        wctx.ring.prod(size)
     }
 
-    pub(crate) fn flush(&mut self) {
-        let len = self.ring.distance();
+    fn flush(wctx: &mut WriteCtx) {
+        let len = wctx.ring.distance();
         if len > 0 {
-            self.writer.write(self.ring.slice(self.ring.head(), len));
-            self.ring.cons(len);
+            wctx.writer.write(wctx.ring.slice(wctx.ring.head(), len));
+            wctx.ring.cons(len);
 
-            self.writer.sync();
+            wctx.writer.sync();
         }
-    }
-}
-
-impl Drop for Txn<'_> {
-    fn drop(&mut self) {
-        self.flush();
     }
 }
 
@@ -188,17 +200,26 @@ impl Manifest {
             numerics: Arc::new(Numerics::default()),
             map: Arc::new(PageMap::default()),
             interval: RwLock::new(IntervalMap::new()),
-            file_stat: DashMap::new(),
+            stat_ctx: StatContext::new(),
             is_cleaning: AtomicBool::new(false),
             txid: AtomicU64::new(0),
             obsolete_files: Mutex::new(Vec::new()),
             cache: Lru::new(256),
             opt,
-            writer: null_mut::<GatherWriter>().into(),
-            ring: Handle::new(Ring::new(LOG_BUF_SZ)),
-            txn_lock: Mutex::new(()),
+            wctx: null_mut::<Mutex<WriteCtx>>().into(),
             non_dup_lock: Mutex::new(()),
         }
+    }
+
+    pub(crate) fn init(&mut self, file_id: u64, txid: u64) {
+        let id = self.numerics.next_manifest_id.load(Relaxed);
+        self.wctx = Handle::new(Mutex::new(WriteCtx {
+            ring: Ring::new(LOG_BUF_SZ),
+            writer: GatherWriter::append(&self.opt.manifest(id), 32),
+        }));
+
+        self.numerics.next_file_id.store(file_id + 1, Relaxed);
+        self.txid.store(txid + 1, Relaxed);
     }
 
     pub(crate) fn add_stat_interval(&mut self, stat: FileStat, ivl: IntervalPair) {
@@ -206,34 +227,65 @@ impl Manifest {
         // will not happen
         let mut lk = self.interval.write().expect("can't lock write");
         lk.insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
-        self.file_stat.insert(stat.file_id, stat);
+        assert_eq!(stat.active_size, stat.total_size);
+        self.stat_ctx.add_stat(stat);
     }
 
     pub(crate) fn update_stat_interval(
         &self,
-        stat: FileStat,
+        mut fstat: FileStat,
+        relocs: HashMap<u64, (u32, u32)>,
         obsoleted: &[u64],
-        del: &[u64],
-        ivls: &[IntervalPair],
-    ) {
+        del_intervals: &[u64],
+        remap_intervals: &[IntervalPair],
+    ) -> Stat {
+        assert_eq!(fstat.active_size, fstat.total_size);
+        let mut set: HashSet<u64> = HashSet::from_iter(del_intervals.iter().cloned());
+        for i in remap_intervals {
+            set.remove(&i.lo_addr);
+        }
+
         // this lock guard protect both interval and file_stat in Manifest so that partail lookup
         // will not happen
         let mut lk = self.interval.write().expect("can't lock write");
-        for &lo in del {
+        // must be guarded by lock, or else if we are failed to lock interval, the frames deactived
+        // by flush thread will be lost
+        self.stat_ctx.stop_collect_junks();
+
+        // apply deactived frames while we are performing compaction
+        let mut seqs = vec![];
+        let mut junks = self.stat_ctx.junks.borrow_mut();
+        for (_, q) in junks.iter_mut() {
+            for addr in q.iter() {
+                if let Some(&(size, seq)) = relocs.get(addr) {
+                    fstat.active_size -= size as usize;
+                    fstat.active_elems -= 1;
+                    fstat.deleted_elems.set(seq);
+                    seqs.push(seq);
+                }
+            }
+        }
+        junks.clear();
+
+        for lo in set {
             let r = lk.remove(lo);
             assert!(r.is_some());
         }
-        for i in ivls {
+        for i in remap_intervals {
             lk.update(i.lo_addr, i.hi_addr, i.file_id);
         }
 
         for &id in obsoleted {
-            self.file_stat.remove(&id);
+            self.stat_ctx.remove_stat(id);
             self.cache.del(id);
         }
 
-        let r = self.file_stat.insert(stat.file_id, stat);
-        assert!(r.is_none());
+        let stat = Stat {
+            inner: fstat.inner,
+            deleted_elems: seqs,
+        };
+        self.stat_ctx.add_stat(fstat);
+        stat
     }
 
     pub(crate) fn apply_junks(&self, tick: u64, junks: &[u64]) -> Vec<Stat> {
@@ -241,14 +293,11 @@ impl Manifest {
         // this lock guard protect both interval and file_stat in Manifest so that partail lookup
         // will not happen
         let lk = self.interval.read().expect("can't lock read");
-        for &pos in junks {
-            // the junk addr may belong to non-flushed arena (when disable_recycle feature enable)
-            let Some(file_id) = lk.find(pos) else {
-                continue;
-            };
-            if let Some(mut stat) = self.file_stat.get_mut(&file_id) {
-                let reloc = self.get_reloc(stat.file_id, pos);
-                stat.update(tick, reloc);
+        for &addr in junks {
+            let file_id = lk.find(addr).expect("must exist");
+            if let Some(mut stat) = self.stat_ctx.get_mut(&file_id) {
+                let reloc = self.get_reloc(file_id, addr);
+                self.stat_ctx.update_stat(&mut stat, addr, &reloc, tick);
                 let e = h.entry(stat.file_id);
                 e.and_modify(|x| {
                     x.inner = stat.inner;
@@ -258,39 +307,31 @@ impl Manifest {
                     inner: stat.inner,
                     deleted_elems: vec![reloc.seq],
                 });
-            }
+            };
         }
         h.values().cloned().collect()
     }
 
-    pub(crate) fn begin(&'_ self, file_id: u64) -> Txn<'_> {
-        let guard = self.txn_lock.lock().unwrap();
-        let mut numerics = self.numerics.deref().clone();
+    pub(crate) fn begin(&self, kind: TxnKind) -> Txn {
         let txid = self.txid.fetch_add(1, Relaxed);
-        numerics.flushed_id = file_id;
-        numerics.txid = txid;
         let mut txn = Txn {
-            _guard: guard,
+            wctx: self.wctx,
             txid,
-            ring: self.ring,
-            writer: self.writer,
             h: Crc32cHasher::default(),
-            nbytes: 0,
+            nbytes: Cell::new(0),
         };
-        let b = Begin { txid };
-        txn.record(&b);
-        txn.record(&numerics);
+        txn.record(MetaKind::Begin, &Begin(kind));
         txn
     }
 
     pub(crate) fn try_clean(&mut self) {
-        let Ok(_lk) = self.txn_lock.try_lock() else {
+        let Ok(wctx) = self.wctx.try_lock() else {
             return;
         };
-        if self.writer.pos() < Self::CLEAN_SIZE {
+        if wctx.writer.pos() < Self::CLEAN_SIZE {
             return;
         }
-        drop(_lk);
+        drop(wctx);
         if self
             .is_cleaning
             .compare_exchange(false, true, Relaxed, Relaxed)
@@ -302,27 +343,28 @@ impl Manifest {
         let prev_id = self.bump_id();
         let snap_id = prev_id + 1;
         let tmp_path = self.opt.snapshot(snap_id).with_extension("tmp");
-        let mut numerics = self.numerics.deref().clone();
         let last_pid = self.map.len();
         let mut table = PageTable::default();
         const LIMIT: usize = 8192; // estimate 128KB
-        let w = Handle::new(GatherWriter::append(&tmp_path, 32));
-        let ring = Handle::new(Ring::new(LOG_BUF_SZ));
-        let mtx = Mutex::new(());
+        // automatically reclaim
+        let b = MutRef::new(Mutex::new(WriteCtx {
+            ring: Ring::new(LOG_BUF_SZ),
+            writer: GatherWriter::append(&tmp_path, 32),
+        }));
 
         let txid = self.txid.fetch_add(1, Relaxed);
-        numerics.txid = txid;
 
         let mut txn = Txn {
+            wctx: b.raw_ptr().into(),
             txid,
-            _guard: mtx.lock().unwrap(),
             h: Crc32cHasher::default(),
-            ring,
-            writer: w,
-            nbytes: 0,
+            nbytes: Cell::new(0),
         };
 
-        txn.record(&numerics);
+        txn.record(MetaKind::Begin, &Begin(TxnKind::Dump));
+
+        let numerics = self.numerics.deref().clone();
+        txn.record(MetaKind::Numerics, &numerics);
 
         let g = crossbeam_epoch::pin(); // guard page
         for pid in ROOT_PID..last_pid {
@@ -338,28 +380,26 @@ impl Manifest {
             };
             table.add(pid, addr);
             if table.len() == LIMIT {
-                txn.record(&table);
+                txn.record(MetaKind::Map, &table);
                 table.clear();
             }
         }
         drop(g);
 
-        for fstat in self.file_stat.iter() {
+        for fstat in self.stat_ctx.iter() {
             let stat = fstat.copy();
-            txn.record(&stat);
+            txn.record(MetaKind::Stat, &stat);
         }
 
         let lk = self.interval.read().expect("can't lock read");
         for (&lo, &(hi, id)) in lk.iter() {
             let ivl = IntervalPair::new(lo, hi, id);
-            txn.record(&ivl);
+            txn.record(MetaKind::Interval, &ivl);
         }
         drop(lk);
 
         let nbytes = txn.commit();
         log::info!("write manifest snapshot: {nbytes} bytes");
-        ring.reclaim();
-        w.reclaim();
 
         std::fs::rename(tmp_path, self.opt.snapshot(snap_id)).expect("can't fail");
 
@@ -387,24 +427,20 @@ impl Manifest {
     }
 
     fn bump_id(&mut self) -> u64 {
-        let _lk = self.txn_lock.lock().unwrap();
+        let mut wctx = self.wctx.lock().unwrap();
         let old = self.numerics.next_manifest_id.fetch_add(2, Release);
-        self.writer.reset(&self.opt.manifest(old + 2));
+        wctx.writer.reset(&self.opt.manifest(old + 2));
         old
     }
 
     pub(crate) fn load_impl(&self, addr: u64) -> Option<BoxRef> {
         let file_id = {
-            // this lock guard protect both interval and file_stat in Manifest, so that partial lookup
-            // will not happen
             let lk = self.interval.read().expect("can't lock read");
-            let lid = lk.find(addr).expect("must exist");
-            // a read lock guard the whole function, it's necessary
-            let Some(stat) = self.file_stat.get(&lid) else {
-                log::error!("can't get physical id by {addr}");
-                panic!("can't get physical id by logical id {lid}");
+            let Some(file_id) = lk.find(addr) else {
+                log::error!("can't find file_id in interval by {}", addr);
+                panic!("can't find file_id in interval by {}", addr);
             };
-            stat.file_id
+            file_id
         };
 
         loop {
@@ -441,7 +477,11 @@ impl Manifest {
     fn get_reloc(&self, file_id: u64, pos: u64) -> Reloc {
         loop {
             if let Some(x) = self.cache.get(file_id) {
-                return *x.map.get(&pos).expect("addr in Junk but not flushed");
+                let Some(&tmp) = x.map.get(&pos) else {
+                    log::error!("can't find reloc, file_id {file_id} key {pos}");
+                    panic!("can't find reloc, file_id {file_id} key {pos}");
+                };
+                return tmp;
             }
 
             let Ok(_lk) = self.non_dup_lock.try_lock() else {
@@ -455,5 +495,84 @@ impl Manifest {
         let f = FileReader::open(self.opt.data_file(file_id))?;
         self.cache.add(file_id, f);
         Some(())
+    }
+}
+
+pub(crate) struct StatContext {
+    map: DashMap<u64, FileStat>,
+    junks: RefCell<HashMap<u64, Vec<u64>>>,
+    should_collect_junk: AtomicBool,
+    total_size: AtomicU64,
+    active_size: AtomicU64,
+}
+
+impl Deref for StatContext {
+    type Target = DashMap<u64, FileStat>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl StatContext {
+    fn new() -> Self {
+        Self {
+            map: DashMap::new(),
+            junks: RefCell::new(HashMap::new()),
+            should_collect_junk: AtomicBool::new(false),
+            total_size: AtomicU64::new(0),
+            active_size: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn total_active(&self) -> (u64, u64) {
+        (
+            self.total_size.load(Acquire),
+            self.active_size.load(Acquire),
+        )
+    }
+
+    pub(crate) fn update_size(&self, active_size: u64, total_size: u64) {
+        self.active_size.fetch_add(active_size, Relaxed);
+        self.total_size.fetch_add(total_size, Relaxed);
+    }
+
+    pub(crate) fn add_stat(&self, stat: FileStat) {
+        self.update_size(stat.active_size as u64, stat.total_size as u64);
+
+        let r = self.map.insert(stat.file_id, stat);
+        assert!(r.is_none());
+    }
+
+    pub(crate) fn remove_stat(&self, file_id: u64) {
+        if let Some((_, v)) = self.map.remove(&file_id) {
+            self.decrease(v.active_size as u64, v.total_size as u64);
+        }
+    }
+
+    pub(crate) fn update_stat(&self, stat: &mut FileStat, junk: u64, reloc: &Reloc, tick: u64) {
+        self.active_size.fetch_sub(reloc.len as u64, Release);
+        stat.update(tick, reloc);
+        if self.should_collect_junk.load(Acquire) {
+            let mut m = self.junks.borrow_mut();
+            if let Some(q) = m.get_mut(&stat.file_id) {
+                q.push(junk);
+            }
+        }
+    }
+
+    pub(crate) fn start_collect_junks(&self) {
+        self.should_collect_junk.store(true, Release);
+    }
+
+    pub(crate) fn stop_collect_junks(&self) {
+        self.should_collect_junk.store(false, Release);
+    }
+
+    fn decrease(&self, active_size: u64, total_size: u64) {
+        let old = self.active_size.fetch_sub(active_size, AcqRel);
+        assert!(old >= active_size);
+
+        let old = self.total_size.fetch_sub(total_size, AcqRel);
+        assert!(old >= total_size);
     }
 }

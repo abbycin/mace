@@ -3,10 +3,6 @@ use std::collections::{
     btree_map::{Entry, Iter},
 };
 
-/// use a global lock is enough for our case, (Optimistic) Lock-Coupling make it too complicate
-/// and since we don't support overlap interval, in GC we must remove old interval first and
-/// then insert merged interval, in this case (Optimistic) Lock-Coupling will not work
-/// FIXME: since we never remove active frame's interval, this may allow us decopule Inerval from FileStat
 pub struct IntervalMap {
     map: BTreeMap<u64, (u64, u64)>,
 }

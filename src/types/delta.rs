@@ -1,14 +1,49 @@
-use crate::types::{
-    header::{DeltaHeader, TagKind},
-    refbox::{BoxRef, DeltaView},
-    traits::{IAlloc, ICodec, IHeader},
+use crate::{
+    types::{
+        data::Val,
+        header::{DeltaHeader, NodeType, TagKind},
+        refbox::{BoxRef, DeltaView, RemoteView},
+        traits::{IAlloc, IBoxHeader, ICodec, IHeader, IKey, IVal},
+    },
+    utils::NULL_ADDR,
 };
 
 impl DeltaView {
     pub(crate) const HDR_LEN: usize = size_of::<DeltaHeader>();
 
-    /// NOTE: the delta is always allocated togather and no indiraction
-    pub(crate) fn from_key_val<A: IAlloc, K: ICodec, V: ICodec>(a: &mut A, k: K, v: V) -> BoxRef {
+    pub(crate) fn from_key_val<A: IAlloc, K: IKey, V: IVal>(
+        a: &mut A,
+        k: &K,
+        v: &V,
+    ) -> (BoxRef, Option<BoxRef>) {
+        let ksz = k.packed_size();
+        let vsz = v.packed_size();
+        let inline_size = a.inline_size();
+        let is_remote = vsz > inline_size;
+
+        let sz = Val::calc_size(false, inline_size, vsz);
+        let d = a.allocate(ksz + sz + Self::HDR_LEN);
+        let mut view = d.view();
+        view.header_mut().kind = TagKind::Delta;
+        let mut delta = view.as_delta();
+        *delta.header_mut() = DeltaHeader {
+            klen: ksz as u32,
+            vlen: sz as u32,
+        };
+        k.encode_to(delta.key_mut());
+        if !is_remote {
+            Val::encode_inline(delta.val_mut(), NULL_ADDR, v);
+            (d, None)
+        } else {
+            let r = RemoteView::alloc(a, vsz);
+            let mut view = r.view().as_remote();
+            v.encode_to(view.raw_mut());
+            Val::encode_remote(delta.val_mut(), NULL_ADDR, view.addr(), v);
+            (d, Some(r))
+        }
+    }
+
+    pub(crate) fn from_key_index<A: IAlloc, K: ICodec, V: ICodec>(a: &mut A, k: K, v: V) -> BoxRef {
         let sz = k.packed_size() + v.packed_size() + Self::HDR_LEN;
         let d = a.allocate(sz);
         let mut view = d.view();
@@ -33,17 +68,27 @@ impl DeltaView {
         unsafe { std::slice::from_raw_parts(self.data_ptr(0), h.klen as usize) }
     }
 
-    pub(crate) fn val(&self) -> &[u8] {
+    pub(crate) fn val<'a>(&self) -> Val<'a> {
+        debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
+        let h = self.header();
+        let p = self.data_ptr(h.klen as u64);
+        let v = unsafe { std::slice::from_raw_parts(p, h.vlen as usize) };
+        Val::from_raw(v)
+    }
+
+    /// for Index only
+    pub(crate) fn index(&self) -> &[u8] {
+        debug_assert_eq!(self.box_header().node_type, NodeType::Intl);
         let h = self.header();
         unsafe { std::slice::from_raw_parts(self.data_ptr(h.klen as u64), h.vlen as usize) }
     }
 
-    pub(crate) fn key_mut(&mut self) -> &mut [u8] {
+    fn key_mut(&mut self) -> &mut [u8] {
         let h = self.header();
         unsafe { std::slice::from_raw_parts_mut(self.data_ptr(0), h.klen as usize) }
     }
 
-    pub(crate) fn val_mut(&mut self) -> &mut [u8] {
+    fn val_mut(&mut self) -> &mut [u8] {
         let h = self.header();
         unsafe { std::slice::from_raw_parts_mut(self.data_ptr(h.klen as u64), h.vlen as usize) }
     }

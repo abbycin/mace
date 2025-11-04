@@ -163,14 +163,14 @@ impl BoxRef {
     }
 
     /// NOTE: for T is not u8, the caller **MUST** make sure T is aligned to pointer size
-    pub(crate) fn data_slice<T>(&self) -> &[T] {
+    pub(crate) fn data_slice<'a, T>(&self) -> &'a [T] {
         let h = self.header();
         let len = h.total_size as usize - Self::HDR_LEN;
         unsafe { std::slice::from_raw_parts(self.0.add(1).cast::<_>(), len / size_of::<T>()) }
     }
 
     /// NOTE: for T is not u8, the caller **MUST** make sure T is aligned to pointer size
-    pub(crate) fn data_slice_mut<T>(&mut self) -> &mut [T] {
+    pub(crate) fn data_slice_mut<'a, T>(&mut self) -> &'a mut [T] {
         let h = self.header();
         let len = h.total_size as usize - Self::HDR_LEN;
         unsafe { std::slice::from_raw_parts_mut(self.0.add(1).cast::<_>(), len / size_of::<T>()) }

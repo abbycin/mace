@@ -1,19 +1,20 @@
 use super::{Node, Page, systxn::SysTxn};
 
+use crate::Options;
 use crate::cc::context::Context;
 use crate::map::buffer::Loader;
-use crate::types::data::Record;
+use crate::types::data::{Record, Val};
 use crate::types::node::RawLeafIter;
 use crate::types::refbox::{DeltaView, KeyRef};
-use crate::types::traits::{IAsBoxRef, IBoxHeader, IHeader, ILoader};
+use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::{MutRef, ROOT_PID};
 use crate::{
     OpCode, Store,
     types::{
-        data::{Index, IntlKey, Key, Value, Ver},
+        data::{Index, IntlKey, Key, Ver},
         node::MergeOp,
         refbox::BoxRef,
-        traits::{ICodec, IKey, ITree, IVal, IValCodec},
+        traits::{ICodec, IKey, ITree, IVal},
     },
     utils::{NULL_CMD, NULL_PID},
 };
@@ -38,25 +39,25 @@ macro_rules! inc_cas {
 
 #[derive(Clone)]
 pub struct ValRef {
-    raw: Value<Record>,
+    raw: Record,
     _owner: BoxRef,
 }
 
 impl ValRef {
-    fn new(raw: Value<Record>, f: BoxRef) -> Self {
+    fn new(raw: Record, f: BoxRef) -> Self {
         Self { raw, _owner: f }
     }
 
     pub fn slice(&self) -> &[u8] {
-        self.raw.as_ref().data()
+        self.raw.data()
     }
 
     pub fn to_vec(self) -> Vec<u8> {
-        self.raw.as_ref().data().to_vec()
+        self.raw.data().to_vec()
     }
 
     pub(crate) fn unwrap(&self) -> &Record {
-        self.raw.as_ref()
+        &self.raw
     }
 
     pub(crate) fn is_put(&self) -> bool {
@@ -64,7 +65,7 @@ impl ValRef {
     }
 
     pub(crate) fn is_del(&self) -> bool {
-        self.raw.is_del()
+        self.raw.is_tombstone()
     }
 }
 
@@ -115,14 +116,17 @@ impl Tree {
     }
 
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
-        if let Some(p) = self.store.buffer.load(pid)? {
-            let child_pid = p.header().merging_child;
-            if child_pid != 0 {
-                self.merge_node(&p, child_pid, g)?;
+        loop {
+            if let Some(p) = self.store.buffer.load(pid)? {
+                let child_pid = p.header().merging_child;
+                if child_pid != NULL_PID {
+                    self.merge_node(&p, child_pid, g)?;
+                    continue;
+                }
+                return Ok(Some(p));
+            } else {
+                return Ok(None);
             }
-            Ok(Some(p))
-        } else {
-            Ok(None)
         }
     }
 
@@ -132,7 +136,7 @@ impl Tree {
     // 4. remove index to child from it's parent
     // 5. unmap child pid from page table
     fn merge_node(&self, parent_ptr: &Page, child_pid: u64, g: &Guard) -> Result<(), OpCode> {
-        // NOTE: a large lock is necessary because the merge process must be exclusive
+        // NOTE: a big lock is necessary because the merge process must be exclusive
         let Ok(_lk) = parent_ptr.try_lock() else {
             // retrun Ok let cooperative threads not retry
             return Ok(());
@@ -183,10 +187,10 @@ impl Tree {
             let mut txn = self.begin(g);
             // further check if it's really the left sibling of child
             if next_pid == child_pid {
-                let new_node = cursor_ptr.merge_node(&mut txn, &child_ptr, safe_txid);
+                let (new_node, lj, rj) = cursor_ptr.merge_node(&mut txn, &child_ptr, safe_txid);
                 inc_cas!(merge);
-                if txn.replace(cursor_ptr, new_node).is_ok() {
-                    child_ptr.garbage_collect(&mut txn);
+                if txn.replace(cursor_ptr, new_node, &lj).is_ok() {
+                    child_ptr.garbage_collect(&mut txn, &rj);
                     txn.commit();
                     break;
                 }
@@ -218,7 +222,7 @@ impl Tree {
         // 5.
         debug_assert_eq!(child_ptr.box_header().pid, child_pid);
         let mut txn = self.begin(g);
-        txn.unmap(child_ptr)?;
+        txn.unmap(child_ptr, &[])?; // child's junks were already collected
         txn.commit();
 
         Ok(())
@@ -234,9 +238,9 @@ impl Tree {
         let mut parent = Cow::Borrowed(parent_ptr);
         loop {
             let mut txn = self.begin(g);
-            let new_ptr = parent_ptr.process_merge(&mut txn, MergeOp::Merged, safe_txid);
+            let (new_ptr, j) = parent_ptr.process_merge(&mut txn, MergeOp::Merged, safe_txid);
             inc_cas!(remove_node);
-            if txn.replace(*parent, new_ptr).is_ok() {
+            if txn.replace(*parent, new_ptr, &j).is_ok() {
                 txn.commit();
                 return Ok(true);
             }
@@ -275,9 +279,9 @@ impl Tree {
             }
 
             let mut txn = self.begin(g);
-            let new_node = page.process_merge(&mut txn, MergeOp::MarkChild, safe_txid);
+            let (new_node, j) = page.process_merge(&mut txn, MergeOp::MarkChild, safe_txid);
             inc_cas!(mark_merge);
-            if let Ok(new_page) = txn.replace(page, new_node) {
+            if let Ok(new_page) = txn.replace(page, new_node, &j) {
                 txn.commit();
                 return Ok(Some(new_page));
             }
@@ -313,7 +317,8 @@ impl Tree {
 
         // 3.
         inc_cas!(split1);
-        let lpage = txn.replace(node, lnode).inspect_err(|_| {
+        let junks = &[]; // split is always happen after node was consolidated, it has no junks
+        let lpage = txn.replace(node, lnode, junks).inspect_err(|_| {
             inc_cas!(split_fail1);
         })?;
         self.store.buffer.cache(rpage);
@@ -331,13 +336,12 @@ impl Tree {
                 return Ok(());
             }
             // 4.
-            let new_node = parent.insert_index(&mut txn, lo, rpid, safe_txid);
-            if new_node.is_none() {
+            let Some((new_node, j)) = parent.insert_index(&mut txn, lo, rpid, safe_txid) else {
                 // may conflict with other thread
                 return Ok(());
-            }
+            };
             inc_cas!(split2);
-            txn.replace(parent, new_node.unwrap()).inspect_err(|_| {
+            txn.replace(parent, new_node, &j).inspect_err(|_| {
                 inc_cas!(split_fail2);
             })?;
             // publish new parent to global
@@ -365,7 +369,7 @@ impl Tree {
         let mut txn = self.begin(g);
 
         // compact is required, since other thread may already insert new data after step 3
-        let mut lnode = root.compact(&mut txn, safe_txid);
+        let (mut lnode, j) = root.compact(&mut txn, safe_txid);
         lnode.header_mut().right_sibling = rpid;
         let mut lpage = Page::new(lnode);
 
@@ -381,7 +385,7 @@ impl Tree {
         );
 
         inc_cas!(split_root);
-        let n = txn.replace(root, new_root_node).inspect_err(|_| {
+        let n = txn.replace(root, new_root_node, &j).inspect_err(|_| {
             inc_cas!(split_root_fail);
         })?;
         assert_eq!(n.box_header().pid, ROOT_PID);
@@ -466,14 +470,13 @@ impl Tree {
                 }
 
                 // create a new index in intl node
-                let split_node = unsplit.insert_index(&mut txn, lo, cursor, self.txid());
-
-                if split_node.is_none() {
+                let Some((split_node, j)) = unsplit.insert_index(&mut txn, lo, cursor, self.txid())
+                else {
                     return Err(OpCode::Again);
-                }
+                };
 
                 inc_cas!(coop);
-                txn.replace(unsplit, split_node.unwrap()).inspect_err(|_| {
+                txn.replace(unsplit, split_node, &j).inspect_err(|_| {
                     inc_cas!(coop_fail);
                 })?;
                 txn.commit();
@@ -508,9 +511,9 @@ impl Tree {
 
         // consolidation never retry
         let mut txn = self.begin(g);
-        let new_node = page.compact(&mut txn, self.txid());
+        let (new_node, j) = page.compact(&mut txn, self.txid());
         inc_cas!(compact);
-        if txn.replace(page, new_node).is_ok() {
+        if txn.replace(page, new_node, &j).is_ok() {
             txn.commit();
         } else {
             inc_cas!(compact_fail);
@@ -526,9 +529,10 @@ impl Tree {
         let pid = cur.pid();
 
         if parent.can_merge_child(pid) {
-            let new_parent = parent.process_merge(&mut txn, MergeOp::MarkParent(pid), self.txid());
+            let (new_parent, j) =
+                parent.process_merge(&mut txn, MergeOp::MarkParent(pid), self.txid());
             inc_cas!(try_merge);
-            let new_page = txn.replace(parent, new_parent).inspect_err(|_| {
+            let new_page = txn.replace(parent, new_parent, &j).inspect_err(|_| {
                 inc_cas!(try_merge_fail);
             })?;
             txn.commit();
@@ -547,7 +551,7 @@ impl Tree {
         let (wid, seq) = check(old, k)?;
 
         let mut txn = self.begin(g);
-        let b = DeltaView::from_key_val(&mut txn, *k, *v);
+        let (b, r) = DeltaView::from_key_val(&mut txn, k, v);
         let mut new = Page::new(old.insert(b.view().as_delta()));
 
         // because each thread contains their private data, we have to load the current page by pid
@@ -562,7 +566,7 @@ impl Tree {
         }
 
         txn.record_and_commit(wid as usize, seq);
-        new.save(b); // save the delta itself until page was reclaimed
+        new.save(b, r); // save the delta itself until page was reclaimed
 
         Ok(())
     }
@@ -597,15 +601,15 @@ impl Tree {
         }
     }
 
-    fn try_update<T, F>(
+    fn try_update<V, F>(
         &self,
         g: &Guard,
         key: &Key,
-        val: &Value<T>,
+        val: &V,
         visible: &mut F,
     ) -> Result<Option<ValRef>, OpCode>
     where
-        T: IValCodec,
+        V: IVal,
         F: FnMut(&Option<(Key, ValRef)>) -> Result<(u16, u64), OpCode>,
     {
         let page = self.find_leaf(g, key.raw)?;
@@ -614,7 +618,7 @@ impl Tree {
         self.link(g, page, key, val, |pg, k| {
             let tmp = pg.find_latest(k, |x, y| x.raw.cmp(y.raw));
             // use the full key from input argument and the version from the exists latest one
-            r = tmp.map(|(x, y, t)| (Key::new(k.raw, x.ver), ValRef::new(y, t)));
+            r = tmp.map(|(x, y, b)| (Key::new(k.raw, x.ver), ValRef::new(y, b)));
             visible(&r)
         })?;
 
@@ -622,19 +626,19 @@ impl Tree {
     }
 
     // NOTE: the `visible` function may be called multiple times
-    pub fn update<T, V>(
+    pub fn update<V, F>(
         &self,
         g: &Guard,
         key: Key,
-        val: Value<T>,
-        mut visible: V,
+        val: V,
+        mut visible: F,
     ) -> Result<Option<ValRef>, OpCode>
     where
-        T: IValCodec,
-        V: FnMut(&Option<(Key, ValRef)>) -> Result<(u16, u64), OpCode>,
+        V: IVal,
+        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u16, u64), OpCode>,
     {
         let size = key.packed_size() + val.packed_size();
-        if size > self.store.opt.max_data_size() {
+        if size > Options::MAX_KV_SIZE {
             return Err(OpCode::TooLarge);
         }
         loop {
@@ -654,13 +658,11 @@ impl Tree {
     pub fn get<'b>(&'b self, g: &Guard, key: Key<'b>) -> Result<(Key<'b>, ValRef), OpCode> {
         let page = self.find_leaf(g, key.raw())?;
 
-        let Some((k, v, p)) =
-            page.find_latest::<Key, Value<Record>, _>(&key, |x, y| x.raw().cmp(y.raw()))
-        else {
+        let Some((k, v, b)) = page.find_latest(&key, |x, y| x.raw().cmp(y.raw())) else {
             return Err(OpCode::NotFound);
         };
 
-        Ok((k, ValRef::new(v, p)))
+        Ok((k, ValRef::new(v, b)))
     }
 
     pub fn range<'a, K, R, F, D>(&'a self, range: R, visible: F, dtor: D) -> Iter<'a>
@@ -685,6 +687,7 @@ impl Tree {
             tree: self,
             lo,
             hi,
+            val_ref: None,
             iter: None,
             cache: None,
             checker: Box::new(visible),
@@ -711,19 +714,16 @@ impl Tree {
 
         while addr != NULL_PID {
             let ptr = l.load(addr).ok_or(OpCode::NotFound)?.as_base();
-            let sst = ptr.sst::<Ver, Value<Record>>();
-            let pos = sst.lower_bound(l, &ver).unwrap_or_else(|pos| pos);
+            let sst = ptr.sst::<Ver>();
+            let pos = sst.lower_bound(&ver).unwrap_or_else(|pos| pos);
             if pos < sst.header().elems as usize {
-                let (k, v, r) = sst.get_unchecked(l, pos);
-
-                if visible(k.txid, v.as_ref()) {
-                    if v.is_del() {
+                let (k, v) = sst.kv_at::<Val>(pos);
+                let (v, r) = v.get_record(l);
+                if visible(k.txid, &v) {
+                    if v.is_tombstone() {
                         return Err(OpCode::NotFound);
                     }
-                    return Ok(ValRef::new(
-                        v,
-                        r.map_or_else(|| ptr.as_box(), |x| x.as_box()),
-                    ));
+                    return Ok(ValRef::new(v, r.map_or(ptr.as_box(), |x| x.as_box())));
                 }
             }
             addr = ptr.box_header().link;
@@ -750,28 +750,31 @@ impl Tree {
         );
 
         for x in it {
-            let v = Value::<Record>::decode_from(x.val());
-            if v.is_del() {
+            let val = x.val();
+            if val.is_tombstone() {
                 return Err(OpCode::NotFound);
             }
+            let (r, v) = val.get_record(page.loader());
             let k = Key::decode_from(x.key());
-            if visible(k.txid, v.as_ref()) {
-                return Ok(ValRef::new(v, x.as_box()));
+            if visible(k.txid, &r) {
+                return Ok(ValRef::new(r, v.map_or_else(|| x.as_box(), |x| x.as_box())));
             }
         }
 
         // Key::raw is unique in sst
-        let (k, v, t) = page
-            .search_sst::<Key, Value<Record>>(&key)
-            .ok_or(OpCode::NotFound)?;
-        if v.is_del() {
+        let (k, val) = page.search_sst(&key).ok_or(OpCode::NotFound)?;
+        if val.is_tombstone() {
             return Err(OpCode::NotFound);
         }
-        if visible(k.txid, v.as_ref()) {
-            return Ok(ValRef::new(v, t));
+        let (record, r) = val.get_record(page.loader());
+        if visible(k.txid, &record) {
+            return Ok(ValRef::new(
+                record,
+                r.map_or_else(|| page.base_box(), |x| x.as_box()),
+            ));
         }
-        if let Some(s) = v.sibling() {
-            return self.traverse_sibling(page.loader(), key.txid, s.addr(), &mut visible);
+        if let Some(addr) = val.get_sibling() {
+            return self.traverse_sibling(page.loader(), key.txid, addr, &mut visible);
         }
         Err(OpCode::NotFound)
     }
@@ -791,6 +794,7 @@ pub struct Iter<'a> {
     tree: &'a Tree,
     lo: Bound<KeyRef>,
     hi: Bound<Vec<u8>>,
+    val_ref: Option<BoxRef>,
     iter: Option<RawLeafIter<'a, Loader>>,
     cache: Option<Node>,
     checker: Box<dyn FnMut(&Context, u64, &Record) -> bool + 'a>,
@@ -859,6 +863,7 @@ impl Iter<'_> {
 
     fn get_next(&mut self) -> Option<<Self as Iterator>::Item> {
         let g = crossbeam_epoch::pin();
+        self.val_ref = None;
 
         while !self.collapsed() {
             let node = if let Some(node) = self.cache.take() {
@@ -896,23 +901,24 @@ impl Iter<'_> {
             }
 
             let iter = self.iter.as_mut().unwrap();
-            let r = iter.find(|(k, v, r)| {
+            let r = iter.find(|(k, v, kr, _vr)| {
                 let ok = match &self.lo {
                     Bound::Unbounded => true,
                     Bound::Included(b) => k.raw >= b.key(),
                     Bound::Excluded(b) => k.raw > b.key(),
                 };
-                if ok && (self.checker)(&self.tree.store.context, k.txid, v.as_ref()) {
-                    self.filter.check(k.raw, v.is_del(), r.clone())
+                if ok && (self.checker)(&self.tree.store.context, k.txid, v) {
+                    self.filter.check(k.raw, v.is_tombstone(), kr.clone())
                 } else {
                     false
                 }
             });
 
-            if let Some((k, v, b)) = r.map(|(k, v, b)| (k.raw, v, b)) {
-                self.lo = Bound::Excluded(b);
+            if let Some((k, v, kr, vr)) = r.map(|(k, v, kr, vr)| (k.raw, v, kr, vr)) {
+                self.lo = Bound::Excluded(kr);
+                self.val_ref = vr;
                 // it's safe, since `b` has been saved
-                let v = unsafe { std::mem::transmute::<&[u8], &[u8]>(v.as_ref().data()) };
+                let v = unsafe { std::mem::transmute::<&[u8], &[u8]>(v.data()) };
 
                 match self.hi {
                     Bound::Unbounded => return Some((k, v)),

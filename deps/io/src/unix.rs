@@ -2,7 +2,7 @@ use std::{
     ffi::CString,
     io,
     os::{raw::c_void, unix::ffi::OsStrExt},
-    path::PathBuf,
+    path::Path,
 };
 
 use libc::{
@@ -23,7 +23,7 @@ pub struct File {
 }
 
 impl OpenOptions {
-    pub fn open(&self, path: &PathBuf) -> Result<File, io::Error> {
+    pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<File, io::Error> {
         let mut flag = O_RDONLY; // file is implicitly readable
 
         if self.write {
@@ -66,8 +66,8 @@ impl File {
         OpenOptions::new()
     }
 
-    pub fn open(path: &PathBuf, flag: c_int) -> Result<Self, io::Error> {
-        let osstr = path.as_os_str();
+    pub fn open<P: AsRef<Path>>(path: P, flag: c_int) -> Result<Self, io::Error> {
+        let osstr = path.as_ref().as_os_str();
         let c_string = CString::new(osstr.as_bytes()).expect("can't translate path to c string");
         let file = unsafe { open(c_string.as_ptr(), flag, 0o644) };
         if file < 0 {
@@ -112,7 +112,7 @@ impl GatherIO for File {
             }
         }
 
-        Ok(sz as usize)
+        Ok(sz)
     }
 
     fn write(&mut self, data: &[u8]) -> Result<usize, io::Error> {

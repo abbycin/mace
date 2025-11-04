@@ -1,3 +1,11 @@
+## [0.0.15] 2025-11-04
+### Changes
+- Optimize data file's gc_ratio calculation and victims selection
+- Separate key-value storage, keys and small values are always stored in sst, while big value will be stored out of sst
+
+### Bug fixes
+- Fixed garbage can't be cleaned (active frames after filter mey be marked as deactive by flush thread)
+
 ## [0.0.14] 2025-10-12
 ### Changes
 - Add a layer of indirection allows the data file ID to be represented using 64 bits

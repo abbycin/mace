@@ -459,11 +459,11 @@ pub(crate) struct DataMetaReader {
 }
 
 impl DataMetaReader {
-    fn open<T: AsRef<Path>>(path: T, validate: bool) -> Result<Self, OpCode> {
+    fn open<P: AsRef<Path>>(path: P, validate: bool) -> Result<Self, OpCode> {
         let file = File::options()
             .read(true)
             .trunc(false)
-            .open(&path.as_ref().to_path_buf())
+            .open(path)
             .map_err(|_| {
                 // log::warn!("can't open {:?} {}", path.as_ref(), x);
                 OpCode::IoError
@@ -634,7 +634,7 @@ mod test {
         let mut opt = Options::new(&*path);
         opt.tmp_store = true;
 
-        opt.create_dir();
+        let _ = opt.create_dir();
 
         let (pid, addr) = (114514, 1919810);
         let mut p = BoxRef::alloc(233, addr);
