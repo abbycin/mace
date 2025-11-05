@@ -232,7 +232,7 @@ impl CommitTree {
         drop(rlk);
 
         for w in ctx.workers().iter() {
-            if this_worker == w.logging.desc.worker {
+            if this_worker == w.logging.worker {
                 continue;
             }
 

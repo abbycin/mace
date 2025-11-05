@@ -1,3 +1,8 @@
+## [0.0.16] 2025-11-05
+### Bug fixes
+- Fixed manifest's txid was not initialized correctly
+- Fixed some obsolete WAL files can't be removed
+
 ## [0.0.15] 2025-11-04
 ### Changes
 - Optimize data file's gc_ratio calculation and victims selection

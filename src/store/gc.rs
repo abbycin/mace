@@ -110,16 +110,10 @@ impl GCHandle {
 pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
     let (tx, rx) = channel();
     let sem = Arc::new(Countblock::new(1));
-    let mut last_ckpt_seq = Vec::with_capacity(store.opt.workers as usize);
-    store.context.workers().iter().for_each(|w| {
-        let seq = w.logging.last_ckpt().file_id;
-        last_ckpt_seq.push(seq);
-    });
     let gc = GarbageCollector {
         numerics: ctx.numerics.clone(),
         ctx,
         store,
-        last_ckpt_seq,
     };
     gc_thread(gc, rx, sem.clone());
     GCHandle {
@@ -187,7 +181,6 @@ struct GarbageCollector {
     numerics: Arc<Numerics>,
     ctx: Handle<Context>,
     store: MutRef<Store>,
-    last_ckpt_seq: Vec<u64>,
 }
 
 impl GarbageCollector {
@@ -255,15 +248,21 @@ impl GarbageCollector {
 
     fn process_wal(&mut self) {
         for w in self.store.context.workers().iter() {
-            let id = w.id as usize;
             let lk = w.start_ckpt.read().unwrap();
-            let ckpt_seq = lk.file_id;
+            let checkpoint_id = lk.file_id;
             drop(lk);
-            if self.last_ckpt_seq[id] == ckpt_seq {
+            let lk = w.logging.desc.lock().unwrap();
+            let oldest_id = lk.oldest_id;
+            drop(lk);
+
+            if oldest_id == checkpoint_id {
                 continue;
             }
-            Self::process_one_wal(&self.store.opt, w.id, self.last_ckpt_seq[id], ckpt_seq);
-            self.last_ckpt_seq[id] = ckpt_seq;
+
+            // [oldest_id, checkpoint_id)
+            Self::process_one_wal(&self.store.opt, w.id, oldest_id, checkpoint_id);
+            let mut desc = w.logging.desc.lock().unwrap();
+            desc.update_oldest(self.ctx.opt.desc_file(w.id), checkpoint_id);
         }
     }
 

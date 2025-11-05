@@ -34,12 +34,13 @@ pub struct Worker {
 
 impl Worker {
     fn new(desc: WalDescHandle, numerics: Arc<Numerics>, opt: Arc<ParsedOptions>) -> Self {
+        let id = { desc.lock().expect("can't lock").worker };
         Self {
             cc: ConcurrencyControl::new(opt.workers as usize),
             start_ckpt: RwLock::new(Position::default()),
             tx_id: AtomicU64::new(0),
             start_ts: 0,
-            id: desc.worker,
+            id,
             logging: Logging::new(desc, numerics, opt),
             modified: false,
         }

@@ -8,6 +8,7 @@ use std::fs::File;
 use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// packed logical id and offset
 pub(crate) const JUNK_LEN: usize = size_of::<u64>();
@@ -224,7 +225,8 @@ impl Eq for Position {}
 #[repr(C)]
 pub(crate) struct WalDesc {
     pub checkpoint: Position,
-    pub wal_id: u64,
+    pub oldest_id: u64,
+    pub latest_id: u64,
     pub worker: u16,
     padding: u16,
     pub checksum: u32,
@@ -234,7 +236,8 @@ impl WalDesc {
     pub(crate) fn new(wid: u16) -> Self {
         Self {
             checkpoint: Position::default(),
-            wal_id: INIT_ID,
+            oldest_id: INIT_ID,
+            latest_id: INIT_ID,
             worker: wid,
             padding: 0,
             checksum: 0,
@@ -267,7 +270,18 @@ impl WalDesc {
         self.crc32() == self.checksum
     }
 
-    pub fn sync<P>(&mut self, path: P)
+    pub fn update_oldest<P: AsRef<Path>>(&mut self, path: P, oldest_id: u64) {
+        self.oldest_id = oldest_id;
+        self.sync(path);
+    }
+
+    pub fn update_ckpt<P: AsRef<Path>>(&mut self, path: P, ckpt: Position, latest_id: u64) {
+        self.checkpoint = ckpt;
+        self.latest_id = latest_id;
+        self.sync(path);
+    }
+
+    fn sync<P>(&mut self, path: P)
     where
         P: AsRef<Path>,
     {
@@ -293,4 +307,4 @@ impl WalDesc {
     }
 }
 
-pub(crate) type WalDescHandle = MutRef<WalDesc>;
+pub(crate) type WalDescHandle = MutRef<Mutex<WalDesc>>;

@@ -37,6 +37,7 @@ impl<'a> LogBuilder<'a> {
 }
 
 pub struct Logging {
+    pub worker: u16,
     ring: Ring,
     enable_ckpt: AtomicBool,
     /// save last checkpoint position, used by gc
@@ -71,15 +72,19 @@ impl Logging {
         numerics: Arc<Numerics>,
         opt: Arc<ParsedOptions>,
     ) -> Self {
-        let writer = GatherWriter::append(&opt.wal_file(desc.worker, desc.wal_id), 16);
+        let (worker, last_id, ckpt_pos) = {
+            let d = desc.lock().expect("can't lock");
+            (d.worker, d.latest_id, d.checkpoint)
+        };
+        let writer = GatherWriter::append(&opt.wal_file(worker, last_id), 16);
         let pos = Position {
-            file_id: desc.wal_id,
+            file_id: last_id,
             offset: writer.pos(),
         };
         Self {
             ring: Ring::new(opt.wal_buffer_size),
             enable_ckpt: AtomicBool::new(false),
-            last_ckpt: desc.checkpoint,
+            last_ckpt: ckpt_pos,
             ckpt_cnt: 0,
             log_pos: pos,
             lsn: pos,
@@ -87,6 +92,7 @@ impl Logging {
             flushed_lsn: AtomicU64::new(0),
             ops: 0,
             last_data: numerics.signal.load(Relaxed),
+            worker,
             writer,
             opt,
             desc,
@@ -119,7 +125,7 @@ impl Logging {
 
             self.flush();
             self.writer
-                .reset(&self.opt.wal_file(self.desc.worker, self.log_pos.file_id));
+                .reset(&self.opt.wal_file(self.worker, self.log_pos.file_id));
             self.sync_desc();
         }
 
@@ -193,7 +199,7 @@ impl Logging {
         let u = WalUpdate {
             wal_type: EntryType::Update,
             sub_type: w.sub_type(),
-            worker_id: self.desc.worker,
+            worker_id: self.worker,
             size: payload_size as u32,
             cmd_id: ver.cmd,
             klen: k.len() as u32,
@@ -260,7 +266,7 @@ impl Logging {
 
         log::trace!(
             "worker {} checkpoint {:?} curr {} last {}",
-            self.desc.worker,
+            self.worker,
             last_ckpt,
             cur,
             self.last_data
@@ -286,10 +292,12 @@ impl Logging {
     }
 
     fn sync_desc(&self) {
-        let mut desc = self.desc.clone();
-        desc.checkpoint = self.last_ckpt;
-        desc.wal_id = self.log_pos.file_id;
-        desc.sync(self.opt.desc_file(self.desc.worker));
+        let mut desc = self.desc.lock().expect("can't lock");
+        desc.update_ckpt(
+            self.opt.desc_file(self.worker),
+            self.last_ckpt,
+            self.log_pos.file_id,
+        );
     }
 
     fn flush(&mut self) {

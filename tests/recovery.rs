@@ -259,14 +259,16 @@ fn put_update(remove_data: bool) {
             let size = f.metadata().unwrap().len();
             f.set_len(size - 10).unwrap();
         }
-        // by the way, we assume log file is not cleaned, and we modify desc file to force it recover
+        // NOTE: this is a copy of real WalDesc
+        // by the way, we assume log files are not cleaned, and we modify desc file to force it recover
         // from log file
         let mut w = WalDesc {
             checkpoint: Position {
                 file_id: 0,
                 offset: 0,
             },
-            wal_id: 0,
+            oldest_id: 0,
+            latest_id: 0,
             worker: 0,
             padding: 0,
             checksum: 0,
@@ -446,7 +448,8 @@ struct Position {
 #[repr(C)]
 struct WalDesc {
     checkpoint: Position,
-    wal_id: u64,
+    oldest_id: u64,
+    latest_id: u64,
     worker: u16,
     padding: u16,
     checksum: u32,

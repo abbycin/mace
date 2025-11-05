@@ -3,8 +3,8 @@ use std::cmp::max;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex};
 
 use io::{File, GatherIO};
 
@@ -71,8 +71,12 @@ impl Recovery {
         let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
 
         for d in desc.iter() {
+            let (worker, checkpoint) = {
+                let x = d.lock().expect("cant' lock");
+                (x.worker, x.checkpoint)
+            };
             // analyze and redo starts from latest checkpoint
-            let cur_oracle = self.analyze(&g, d.worker, d.checkpoint, &mut block, tree);
+            let cur_oracle = self.analyze(&g, worker, checkpoint, &mut block, tree);
             oracle = max(oracle, cur_oracle);
             g.flush();
         }
@@ -323,10 +327,11 @@ impl Recovery {
 
     fn load_desc(&self) -> Result<Vec<WalDescHandle>, OpCode> {
         let mut desc: Vec<WalDescHandle> = (0..self.opt.workers)
-            .map(|x| WalDescHandle::new(WalDesc::new(x)))
+            .map(|x| WalDescHandle::new(Mutex::new(WalDesc::new(x))))
             .collect();
 
-        for x in &mut desc {
+        for d in &mut desc {
+            let mut x = d.lock().expect("can't lock");
             let path = self.opt.desc_file(x.worker);
             if !path.exists() {
                 log::trace!("no log record for worker {}", x.worker);

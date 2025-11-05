@@ -85,10 +85,11 @@ impl ManifestBuilder {
                 // non-last manifest is imcomplete, refuse to work
                 return Err(OpCode::BadData);
             }
-            Ok(()) => {
+            Ok(txid) => {
                 if self.undo_table.len() > 2 {
                     return Err(OpCode::BadData);
                 }
+                self.max_txid = self.max_txid.max(txid);
             }
             _ => {}
         }
@@ -148,9 +149,10 @@ impl ManifestBuilder {
         Ok(())
     }
 
-    fn analyze(&mut self, f: &File) -> Result<(), OpCode> {
+    fn analyze(&mut self, f: &File) -> Result<u64, OpCode> {
         let end = f.size().unwrap();
         let mut pos = 0;
+        let mut max_txid = u64::MIN;
 
         while pos < end {
             let hdr_s = self.buffer.mut_slice(0, GenericHdr::SIZE);
@@ -208,6 +210,7 @@ impl ManifestBuilder {
                     let r = self.data_file.remove(&txid);
                     assert!(r.is_some());
                     self.checksum.remove(&txid);
+                    max_txid = max_txid.max(txid);
                 }
                 MetaKind::Map => {
                     let h = PageTableHdr::from_slice(p);
@@ -245,7 +248,7 @@ impl ManifestBuilder {
             pos += sz as u64;
         }
 
-        Ok(())
+        Ok(max_txid)
     }
 
     fn redo(&mut self, f: &File) {
