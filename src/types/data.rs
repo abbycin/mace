@@ -423,7 +423,7 @@ impl<'a> Val<'a> {
             (&self.data[off..], RemoteView::null())
         } else {
             let addr = Self::read::<u64>(self.data, off);
-            let r = l.load_unchecked(addr).as_remote();
+            let r = l.load_remote_unchecked(addr).as_remote();
             (r.raw(), r)
         };
         (Record::decode_from(&src[..len]), r)
@@ -762,6 +762,10 @@ mod test {
 
             fn shallow_copy(&self) -> Self {
                 self.clone()
+            }
+
+            fn load_remote(&self, addr: u64) -> Option<crate::types::refbox::BoxView> {
+                self.load(addr)
             }
         }
 

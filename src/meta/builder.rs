@@ -1,15 +1,18 @@
 use crc32c::Crc32cHasher;
 use io::{File, GatherIO};
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
 use std::{hash::Hasher, path::PathBuf, sync::Arc};
 
 use crate::map::table::Swip;
 use crate::meta::entry::{
-    DelInterval, DelIntervalStartHdr, DeleteHdr, GenericHdr, PageTableHdr, StatHdr, TxnKind,
+    BlobStat, DelInterval, DelIntervalStartHdr, DeleteHdr, GenericHdr, PageTableHdr, StatHdr,
     get_record_size,
 };
-use crate::meta::{Begin, Commit, Delete, FileId, FileStat, IntervalPair, Stat};
+use crate::meta::{
+    Begin, Commit, DataStat, Delete, FileId, IntervalPair, MemBlobStat, MemDataStat,
+};
 use crate::types::traits::IAsSlice;
 use crate::utils::ROOT_PID;
 use crate::utils::bitmap::BitMap;
@@ -39,10 +42,13 @@ pub(crate) struct ManifestBuilder {
     redo_table: BTreeMap<u64, Vec<RecordHandle>>,
     undo_table: HashSet<u64>,
     checksum: HashMap<u64, Crc32cHasher>,
-    /// txid -> file_id
+    /// txid -> data file id
     data_file: HashMap<u64, u64>,
+    /// txid -> blob file id
+    blob_file: HashMap<u64, u64>,
     max_txid: u64,
-    max_flush_id: u64,
+    max_data_id: u64,
+    max_blob_id: u64,
     table: PageTable,
     buffer: Block,
 }
@@ -55,8 +61,10 @@ impl ManifestBuilder {
             undo_table: HashSet::new(),
             checksum: HashMap::new(),
             data_file: HashMap::new(),
+            blob_file: HashMap::new(),
             max_txid: 0,
-            max_flush_id: 0,
+            max_data_id: 0,
+            max_blob_id: 0,
             table: PageTable::default(),
             buffer: Block::alloc(1 << 20),
         }
@@ -117,15 +125,16 @@ impl ManifestBuilder {
             self.inner.unlink_old(snap_id);
         }
 
-        for item in self.inner.stat_ctx.iter() {
+        for item in self.inner.data_stat.iter() {
             let v = item.value();
             self.inner
-                .stat_ctx
+                .data_stat
                 .update_size(v.active_size as u64, v.total_size as u64);
         }
 
         // append to old file
-        self.inner.init(self.max_flush_id, self.max_txid);
+        self.inner
+            .init(self.max_data_id, self.max_blob_id, self.max_txid);
 
         self.inner
     }
@@ -188,7 +197,6 @@ impl ManifestBuilder {
             match kind {
                 MetaKind::Begin => {
                     let _ = Begin::decode(p);
-                    handles.push(RecordHandle::new(pos, sz));
                     if !self.undo_table.insert(txid) {
                         log::error!("duplicated txn Begin");
                         return Err(OpCode::BadData);
@@ -196,8 +204,13 @@ impl ManifestBuilder {
                 }
                 MetaKind::FileId => {
                     let fid = FileId::decode(p);
-                    self.data_file.insert(txid, fid.file_id);
-                    self.max_flush_id = self.max_flush_id.max(fid.file_id);
+                    if fid.is_blob {
+                        self.blob_file.insert(txid, fid.file_id);
+                        self.max_blob_id = self.max_blob_id.max(fid.file_id);
+                    } else {
+                        self.data_file.insert(txid, fid.file_id);
+                        self.max_data_id = self.max_data_id.max(fid.file_id);
+                    }
                 }
                 MetaKind::Commit => {
                     let x = Commit::decode(p);
@@ -207,8 +220,8 @@ impl ManifestBuilder {
                     }
                     let exist = self.undo_table.remove(&txid);
                     assert!(exist);
-                    let r = self.data_file.remove(&txid);
-                    assert!(r.is_some());
+                    self.data_file.remove(&txid);
+                    self.blob_file.remove(&txid);
                     self.checksum.remove(&txid);
                     max_txid = max_txid.max(txid);
                 }
@@ -218,27 +231,27 @@ impl ManifestBuilder {
                     Self::calc_crc(&mut self.buffer, f, crc, pos + sz as u64, h.size)?;
                     pos += h.size as u64;
                 }
-                MetaKind::Stat => {
+                MetaKind::DataStat | MetaKind::BlobStat => {
                     let s = StatHdr::from_slice(p);
                     handles.push(RecordHandle::new(pos, sz + s.size as usize));
                     Self::calc_crc(&mut self.buffer, f, crc, pos + sz as u64, s.size as usize)?;
                     pos += s.size as u64;
                 }
-                MetaKind::Delete => {
+                MetaKind::DataDelete | MetaKind::BlobDelete => {
                     let d = DeleteHdr::from_slice(p);
                     let len = d.size();
                     handles.push(RecordHandle::new(pos, sz + len));
                     Self::calc_crc(&mut self.buffer, f, crc, pos + sz as u64, len)?;
                     pos += len as u64;
                 }
-                MetaKind::DelInterval => {
+                MetaKind::DataDelInterval | MetaKind::BlobDelInterval => {
                     let d = DelIntervalStartHdr::from_slice(p);
                     let len = d.size();
                     handles.push(RecordHandle::new(pos, sz + len));
                     Self::calc_crc(&mut self.buffer, f, crc, pos + sz as u64, len)?;
                     pos += len as u64;
                 }
-                MetaKind::Numerics | MetaKind::Interval => {
+                MetaKind::Numerics | MetaKind::DataInterval | MetaKind::BlobInterval => {
                     handles.push(RecordHandle::new(pos, sz));
                 }
                 MetaKind::KindEnd => {
@@ -258,7 +271,11 @@ impl ManifestBuilder {
         }
         // and then remove data file in uncommit txn
         for (_, &file_id) in self.data_file.iter() {
-            self.remove_data_file(file_id);
+            self.remove_file(file_id, false);
+        }
+
+        for (_, &file_id) in self.blob_file.iter() {
+            self.remove_file(file_id, true);
         }
 
         let mut table = BTreeMap::new();
@@ -270,12 +287,14 @@ impl ManifestBuilder {
         //
         // the table is iterate by txid order, thus if flush txid is smaller than gc's, delta stats
         // will be first inserted and then deleted by later parse gc's Delete, if flush txid bigger
-        // than gc's, the delta stats will be skipped by `deleted` which recorded whe parse Delete
-        // before parse flush txn
-        let mut deleted = HashSet::new();
-        let mut previous_is_not_gc = false;
+        // than gc's, the delta stats will be skipped by `xx_deleted` which was recorded when parse
+        // Delete before parse flush txn
+        // NOTE: the `xx_deleted` must not be `clear`, because multiple Delete may happen before the
+        // delta stat was recorded (see process_obsoleted_data/blob and rewrite_data/blob)
+        let mut data_deleted = HashSet::new();
+        let mut blob_deleted = HashSet::new();
         for (_, handles) in table.iter() {
-            self.redo_impl(f, handles, &mut previous_is_not_gc, &mut deleted);
+            self.redo_impl(f, handles, &mut data_deleted, &mut blob_deleted);
         }
     }
 
@@ -283,8 +302,8 @@ impl ManifestBuilder {
         &mut self,
         f: &File,
         handles: &[RecordHandle],
-        non_gc: &mut bool,
-        deleted: &mut HashSet<u64>,
+        data_deleted: &mut HashSet<u64>,
+        blob_deleted: &mut HashSet<u64>,
     ) {
         for h in handles {
             if h.size > self.buffer.len() {
@@ -296,10 +315,6 @@ impl ManifestBuilder {
             let data = &buf[GenericHdr::SIZE..];
 
             match kind {
-                MetaKind::Begin => {
-                    let b = Begin::decode(data);
-                    *non_gc = b.0 != TxnKind::GC;
-                }
                 MetaKind::Numerics => {
                     let src = Numerics::decode(data);
                     macro_rules! set {
@@ -313,7 +328,7 @@ impl ManifestBuilder {
                         self.inner.numerics,
                         src;
                         signal,
-                        next_file_id,
+                        next_data_id,
                         next_manifest_id,
                         oracle,
                         address,
@@ -321,31 +336,61 @@ impl ManifestBuilder {
                         log_size
                     );
                 }
-                MetaKind::Stat => {
-                    let stat = Stat::decode(data);
-                    let e = self.inner.stat_ctx.entry(stat.file_id);
-                    if deleted.remove(&stat.file_id) {
+                MetaKind::DataStat => {
+                    let stat = DataStat::decode(data);
+                    let e = self.inner.data_stat.entry(stat.file_id);
+                    if data_deleted.contains(&stat.file_id) {
                         continue;
                     }
 
                     match e {
                         dashmap::Entry::Vacant(v) => {
-                            let mut fstat = FileStat {
+                            let mut fstat = MemDataStat {
                                 inner: stat.inner,
-                                deleted_elems: BitMap::new(stat.active_elems),
+                                mask: BitMap::new(stat.active_elems),
                             };
-                            for &seq in stat.deleted_elems.iter() {
-                                fstat.deleted_elems.set(seq);
+                            for &seq in stat.inactive_elems.iter() {
+                                fstat.mask.set(seq);
                             }
                             v.insert(fstat);
                         }
                         dashmap::Entry::Occupied(mut o) => {
                             let fstat = o.get_mut();
-                            assert_eq!(stat.inner.file_id, fstat.inner.file_id);
+                            assert_eq!(stat.file_id, fstat.file_id);
                             fstat.inner = stat.inner;
 
-                            for &seq in stat.deleted_elems.iter() {
-                                fstat.deleted_elems.set(seq);
+                            for &seq in stat.inactive_elems.iter() {
+                                fstat.mask.set(seq);
+                            }
+                        }
+                    }
+                }
+                MetaKind::BlobStat => {
+                    let stat = BlobStat::decode(data);
+                    let mut b = self.inner.blob_stat.map.write().unwrap();
+                    let e = b.entry(stat.file_id);
+                    if blob_deleted.contains(&stat.file_id) {
+                        continue;
+                    }
+
+                    match e {
+                        Entry::Vacant(v) => {
+                            let mut bstat = MemBlobStat {
+                                inner: stat.inner,
+                                mask: BitMap::new(stat.nr_active),
+                            };
+                            for &seq in stat.inactive_elems.iter() {
+                                bstat.mask.set(seq);
+                            }
+                            v.insert(bstat);
+                        }
+                        Entry::Occupied(mut o) => {
+                            let bstat = o.get_mut();
+                            assert_eq!(bstat.file_id, stat.file_id);
+                            bstat.inner = stat.inner;
+
+                            for &seq in stat.inactive_elems.iter() {
+                                bstat.mask.set(seq);
                             }
                         }
                     }
@@ -356,29 +401,71 @@ impl ManifestBuilder {
                         self.table.add(*k, *v);
                     }
                 }
-                MetaKind::Delete => {
-                    let mut lk = self.inner.obsolete_files.lock().unwrap();
+                MetaKind::DataDelete => {
+                    let mut lk = self.inner.obsolete_data.lock().unwrap();
                     lk.clear();
                     let del = Delete::decode(data);
                     lk.extend_from_slice(&del);
-                    if *non_gc {
-                        deleted.clear();
-                    }
-                    deleted.extend(del.iter());
+                    data_deleted.extend(del.iter());
 
-                    for file_id in lk.iter() {
-                        let r = self.inner.stat_ctx.remove(file_id);
+                    for file_id in del.iter() {
+                        let r = self.inner.data_stat.remove(file_id);
                         assert!(r.is_some());
                     }
                 }
-                MetaKind::Interval => {
-                    let ivl = IntervalPair::decode(data);
-                    let mut lk = self.inner.interval.write().expect("can't lock write");
-                    lk.insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
+                MetaKind::BlobDelete => {
+                    let mut lk = self.inner.obsolete_blob.lock().unwrap();
+                    lk.clear();
+                    let del = Delete::decode(data);
+                    lk.extend_from_slice(&del);
+                    blob_deleted.extend(del.iter());
+
+                    for &file_id in del.iter() {
+                        let r = self.inner.blob_stat.remove_stat(file_id);
+                        assert!(r.is_some());
+                    }
                 }
-                MetaKind::DelInterval => {
+                MetaKind::DataInterval => {
+                    let ivl = IntervalPair::decode(data);
+                    let mut lk = self
+                        .inner
+                        .data_stat
+                        .interval
+                        .write()
+                        .expect("can't lock write");
+                    lk.upsert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
+                }
+                MetaKind::BlobInterval => {
+                    let ivl = IntervalPair::decode(data);
+                    let mut lk = self
+                        .inner
+                        .blob_stat
+                        .interval
+                        .write()
+                        .expect("can't lock write");
+                    lk.upsert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
+                }
+                MetaKind::DataDelInterval => {
                     let d = DelInterval::decode(data);
-                    let mut lk = self.inner.interval.write().expect("can't lock write");
+                    let mut lk = self
+                        .inner
+                        .data_stat
+                        .interval
+                        .write()
+                        .expect("can't lock write");
+
+                    for lo in d.lo {
+                        lk.remove(lo).expect("must exist");
+                    }
+                }
+                MetaKind::BlobDelInterval => {
+                    let d = DelInterval::decode(data);
+                    let mut lk = self
+                        .inner
+                        .blob_stat
+                        .interval
+                        .write()
+                        .expect("can't lock write");
 
                     for lo in d.lo {
                         lk.remove(lo).expect("must exist");
@@ -389,8 +476,12 @@ impl ManifestBuilder {
         }
     }
 
-    fn remove_data_file(&self, file_id: u64) {
-        let path = self.inner.opt.data_file(file_id);
+    fn remove_file(&self, file_id: u64, is_blob: bool) {
+        let path = if is_blob {
+            self.inner.opt.blob_file(file_id)
+        } else {
+            self.inner.opt.data_file(file_id)
+        };
         if path.exists() {
             log::info!("remove useless data file {path:?}");
             let _ = std::fs::remove_file(path);

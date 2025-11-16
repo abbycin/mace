@@ -60,16 +60,16 @@ impl Block {
         align_up(self.len as usize, self.align as usize)
     }
 
-    pub(crate) fn mut_slice<'a>(&self, off: usize, len: usize) -> &'a mut [u8] {
-        debug_assert!(len <= self.len as usize);
+    pub(crate) fn mut_slice<'a, T>(&self, off: usize, count: usize) -> &'a mut [T] {
+        debug_assert!(count * size_of::<T>() <= self.len as usize);
 
-        unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) }
+        unsafe { std::slice::from_raw_parts_mut(self.data.add(off).cast::<T>(), count) }
     }
 
-    pub(crate) fn slice<'a>(&self, off: usize, len: usize) -> &'a [u8] {
-        debug_assert!(len <= self.len as usize);
+    pub(crate) fn slice<'a, T>(&self, off: usize, count: usize) -> &'a [T] {
+        debug_assert!(count * size_of::<T>() <= self.len as usize);
 
-        unsafe { std::slice::from_raw_parts(self.data.add(off), len) }
+        unsafe { std::slice::from_raw_parts(self.data.add(off).cast::<T>(), count) }
     }
 
     pub(crate) fn realloc(&mut self, size: usize) {

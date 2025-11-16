@@ -159,7 +159,11 @@ impl BoxRef {
     pub(crate) fn dump_slice(&self) -> &[u8] {
         let p = self.0 as *const u8;
         let off = size_of::<AtomicU32>();
-        unsafe { std::slice::from_raw_parts(p.add(off), self.total_size() as usize - off) }
+        unsafe { std::slice::from_raw_parts(p.add(off), self.dump_len()) }
+    }
+
+    pub(crate) fn dump_len(&self) -> usize {
+        self.total_size() as usize - size_of::<AtomicU32>()
     }
 
     /// NOTE: for T is not u8, the caller **MUST** make sure T is aligned to pointer size

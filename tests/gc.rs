@@ -1,7 +1,6 @@
 use mace::{Mace, OpCode, Options, RandomPath};
 
 #[test]
-#[ignore = "it's hard to produce enough garbage in release mode, run it manually instead"]
 fn gc_data() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
@@ -9,7 +8,7 @@ fn gc_data() -> Result<(), OpCode> {
     opt.sync_on_write = false;
     opt.gc_eager = true;
     opt.gc_timeout = 20;
-    opt.gc_ratio = 1;
+    opt.data_garbage_ratio = 1;
     opt.data_file_size = 512 << 10;
     opt.gc_compacted_size = opt.data_file_size;
     let saved = opt.clone();
@@ -25,6 +24,12 @@ fn gc_data() -> Result<(), OpCode> {
     for k in &pair {
         let kv = db.begin().unwrap();
         kv.put(k, k)?;
+        kv.commit()?;
+    }
+
+    for k in &pair {
+        let kv = db.begin().unwrap();
+        kv.update(k, k)?;
         kv.commit()?;
     }
 
@@ -69,6 +74,84 @@ fn gc_data() -> Result<(), OpCode> {
         }
     }
     assert!(count < max_id);
+    Ok(())
+}
+
+#[test]
+fn gc_blob() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    #[cfg(not(target_os = "linux"))]
+    {
+        opt.data_handle_cache_capacity = 32;
+        opt.blob_handle_cache_capacity = 32;
+    }
+    opt.blob_garbage_ratio = 1;
+    opt.blob_gc_ratio = 20;
+    opt.blob_max_size = 1 << 20;
+    opt.gc_timeout = 20;
+    opt.inline_size = 1024;
+    opt.max_log_size = 20480;
+    let db = Mace::new(opt.validate()?)?;
+    let cap = 10000;
+    let val = vec![b'x'; 10240];
+    let mut pair = Vec::with_capacity(cap);
+
+    for i in 0..cap {
+        pair.push(format!("{i:08}"));
+    }
+
+    for k in &pair {
+        let kv = db.begin()?;
+        kv.put(k, &val)?;
+        kv.commit()?;
+    }
+
+    for k in &pair {
+        let kv = db.begin()?;
+        kv.update(k, &val)?;
+        kv.commit()?;
+    }
+
+    let kv = db.begin()?;
+    let mut rest = vec![];
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..cap {
+        if rand::random_bool(0.8) {
+            kv.del(&pair[i])?;
+        } else {
+            rest.push(i);
+        }
+    }
+    kv.commit()?;
+
+    for i in rest {
+        let k = &pair[i];
+        let view = db.view().unwrap();
+        view.get(k).unwrap();
+    }
+
+    let mut opt = db.options().clone();
+
+    drop(db);
+
+    opt.tmp_store = true;
+    let mut count = 0;
+    let mut max_id = 0;
+    let dir = std::fs::read_dir(opt.data_root()).unwrap();
+    for d in dir {
+        let x = d.unwrap();
+        let f = x.file_name();
+        let name = f.to_str().unwrap();
+        if name.starts_with(Options::BLOB_PREFIX) {
+            let v: Vec<&str> = name.split(Options::SEP).collect();
+            let id = v[1].parse::<u32>().expect("invalid number");
+            count += 1;
+            max_id = max_id.max(id);
+        }
+    }
+    assert!(count < max_id);
+
     Ok(())
 }
 

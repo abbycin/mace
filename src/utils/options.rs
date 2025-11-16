@@ -25,12 +25,18 @@ pub struct Options {
     /// garbage collection cycle (milliseconds)
     pub gc_timeout: u64,
     /// perform compaction when garbage ratio exceed this value, range [0, 100]
-    pub gc_ratio: u32,
+    pub data_garbage_ratio: u32,
     /// perform compaction when [`Self::gc_ratio`] is reached
     pub gc_eager: bool,
     /// if [`Self::gc_eager`] is not set, the compaction will only be triggered when active data
     /// size can be compacted into [`Self::gc_compacted_size`], the default setting is [`Self::data_file_size`]
     pub gc_compacted_size: usize,
+    /// the size limit of blob file
+    pub blob_max_size: usize,
+    /// trigger blob gc when garbage ratio exceed this value, range [0, 100]
+    pub blob_garbage_ratio: usize,
+    /// choose [`Self::blob_gc_ratio`] oldest blob files to perform everytime then gc timeout
+    pub blob_gc_ratio: usize,
     /// is temperary storage, if true, db_root will be unlinked on exit
     pub tmp_store: bool,
     /// where to store database files
@@ -42,14 +48,29 @@ pub struct Options {
     /// percent of items will be evicted at once, default is 10%
     pub cache_evict_pct: usize,
     /// delta cache count, shard into 32 slots, which act as a secondary cache to node cache
+    /// which has two priority: High and Low, the Low priority is used for big value only
     pub cache_count: usize,
+    /// the High priority cache ratio of [`Self::cache_count`], range from [0, 100]
+    pub high_priority_ratio: usize,
+    /// max cache count for open data file concurrently, which is used for load pages from data file
+    pub data_handle_cache_capacity: usize,
+    /// max cache count for open blob file concurrently, which is used for load pages from blob file
+    pub blob_handle_cache_capacity: usize,
     /// for branch node, the key and index are always inlined, for leaf node, the key and val header
     /// and value that less than [`Self::INLINE_SIZE`] are always inlined too
     pub inline_size: usize,
-    /// a size limit to trigger data file flush, which also control max key-value size, NOTE: too
-    /// large a file size will cause the flushing to be slow
+    /// a size limit to trigger data file flushed
+    ///
+    /// NOTE:
+    /// - too large a file size will cause the flushing to be slow
+    /// - this option will be affected by [`Self::max_log_size`], a checkpoint will cause unfull data buffer to be flushed
     pub data_file_size: usize,
-    /// if wal log file size large than this value, a checkpoint will be created
+    /// if wal log file size large than this value times [`Self::workers`], a checkpoint will be created
+    ///
+    /// for example: set [`Self::max_log_size`] to 10MB and there are 10 workers, then a checkpoint
+    /// will be created when log size are exceed 100MB
+    ///
+    /// this value should be larger than [`Self::data_file_size`]
     pub max_log_size: usize,
     /// when should we consolidate delta chain, the default value is set to half [`Self::split_elems`]
     /// and it also the maximum value, shrink this value may get better query performance (especially
@@ -58,8 +79,10 @@ pub struct Options {
     /// WAL ring buffer size, must greater than [`Self::page_size`] and must be power of 2
     pub wal_buffer_size: usize,
     /// the count of checkpoints that a txn can span, ie, the length limit of a txn, if a txn length
-    /// exceed the limit, it will be forcibly aborted, NOTE: checkpoint was taken when a buffer was
-    /// flushed, while the real data in arena is very few, so this option is an estimated value
+    /// exceed the limit, it will be forcibly aborted
+    ///
+    /// NOTE: checkpoint was taken when a buffer was flushed, however, the real data in arena may be
+    /// scarce, so this option is an estimated value
     pub max_ckpt_per_txn: usize,
     /// WAL file size limit which will trigger switch to new WAL file, at most 2GB
     pub wal_file_size: u32,
@@ -98,15 +121,21 @@ impl Options {
                 .get()
                 .min(Self::MAX_WORKERS) as u16,
             tmp_store: false,
-            gc_timeout: 60 * 1000, // 1min
-            gc_ratio: 20,          // 20%
+            gc_timeout: 60 * 1000,  // 1min
+            data_garbage_ratio: 20, // 20%
             gc_eager: true,
             gc_compacted_size: Self::DATA_FILE_SIZE,
+            blob_max_size: 256 << 20, // 256MB
+            blob_garbage_ratio: 50,   // 50%
+            blob_gc_ratio: 25,        // 25%
             db_root: db_root.as_ref().to_path_buf(),
             log_root: db_root.as_ref().to_path_buf(),
             cache_capacity: Self::CACHE_CAP,
             cache_evict_pct: 10, // 10%
             cache_count: Self::CACHE_CNT,
+            high_priority_ratio: 80, // 80%
+            data_handle_cache_capacity: 128,
+            blob_handle_cache_capacity: 128,
             inline_size: Self::INLINE_SIZE,
             data_file_size: Self::DATA_FILE_SIZE,
             max_log_size: Self::MAX_LOG_SIZE,
@@ -130,7 +159,7 @@ impl Options {
         if self.consolidate_threshold > self.split_elems / 2 {
             self.consolidate_threshold = self.split_elems / 2;
         }
-        if self.cache_count < LRU_SHARD {
+        if self.cache_count / LRU_SHARD < 10 {
             self.cache_count = Self::CACHE_CNT;
         }
         if self.cache_capacity < Self::MIN_CACHE_CAP {
@@ -175,6 +204,7 @@ impl Deref for ParsedOptions {
 impl Options {
     pub const SEP: &'static str = "_";
     pub const DATA_PREFIX: &'static str = "data";
+    pub const BLOB_PREFIX: &'static str = "blob";
     pub const WAL_PREFIX: &'static str = "wal";
     pub const WAL_STABLE: &'static str = "stable-wal";
     pub const MANIFEST_PREFIX: &'static str = "manifest";
@@ -186,6 +216,11 @@ impl Options {
     pub fn data_file(&self, id: u64) -> PathBuf {
         self.data_root()
             .join(format!("{}{}{}", Self::DATA_PREFIX, Self::SEP, id))
+    }
+
+    pub fn blob_file(&self, id: u64) -> PathBuf {
+        self.data_root()
+            .join(format!("{}{}{}", Self::BLOB_PREFIX, Self::SEP, id))
     }
 
     pub fn log_root(&self) -> PathBuf {

@@ -10,7 +10,11 @@ use crate::{
     cc::context::Context,
     map::{buffer::Buffers, cache::NodeCache, evictor::Evictor, table::PageMap},
     meta::Numerics,
-    utils::{Handle, options::ParsedOptions},
+    utils::{
+        Handle,
+        data::{AddrPair, Interval},
+        options::ParsedOptions,
+    },
 };
 
 pub(crate) enum SharedState {
@@ -37,3 +41,23 @@ pub(crate) fn create_buffer(
 pub use buffer::g_pool_status;
 #[cfg(feature = "metric")]
 pub use flush::g_flush_status;
+
+pub(crate) trait IFooter: Default {
+    const LEN: usize = size_of::<Self>();
+
+    fn nr_interval(&self) -> usize;
+
+    fn nr_reloc(&self) -> usize;
+
+    fn reloc_crc(&self) -> u32;
+
+    fn interval_crc(&self) -> u32;
+
+    fn interval_len(&self) -> usize {
+        self.nr_interval() * Interval::LEN
+    }
+
+    fn reloc_len(&self) -> usize {
+        self.nr_reloc() * AddrPair::LEN
+    }
+}

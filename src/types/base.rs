@@ -757,6 +757,10 @@ mod test {
         fn shallow_copy(&self) -> Self {
             self.clone()
         }
+
+        fn load_remote(&self, addr: u64) -> Option<BoxView> {
+            self.load(addr)
+        }
     }
 
     #[derive(Clone, Copy)]

@@ -1,3 +1,16 @@
+## [0.0.17] 2025-11-16
+### New Features
+- Support value separate storage by default, user can set `Options::inline_size` to control whether value should be stored in blob files
+
+### Changes
+- Support verify checksum everytime when load data from disk (including GC)
+- The data file footer has been changed (swapped relocations and intervals)
+- Add priority LRU cache to support cache blob (which is Low priority)
+
+### Bug fixes
+- Fxied `index out of bound error` in builder.rs:redo_impl by never `clear` the `data/blob_deleted`
+- Fixed GC assertion because of remove `del_intervals` more then once
+
 ## [0.0.16] 2025-11-05
 ### Bug fixes
 - Fixed manifest's txid was not initialized correctly

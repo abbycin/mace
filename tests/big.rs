@@ -11,7 +11,7 @@ fn upsert_delete() {
     opt.tmp_store = false;
     opt.gc_eager = true;
     opt.gc_timeout = 1000;
-    opt.gc_ratio = 10;
+    opt.data_garbage_ratio = 10;
     opt.wal_file_size = 32 << 20;
 
     let db = Mace::new(opt.validate().unwrap()).unwrap();

@@ -14,7 +14,12 @@ use crate::{
         refbox::BoxView,
         traits::{IHeader, ILoader},
     },
-    utils::{Handle, MutRef, options::ParsedOptions, queue::Queue},
+    utils::{
+        Handle, MutRef,
+        lru::{CachePriority, ShardPriorityLru},
+        options::ParsedOptions,
+        queue::Queue,
+    },
 };
 use dashmap::{DashMap, Entry};
 
@@ -22,7 +27,6 @@ use super::{cache::CacheState, data::FlushData, flush::Flush};
 use crate::map::cache::NodeCache;
 use crate::map::table::PageMap;
 use crate::types::refbox::BoxRef;
-use crate::utils::lru::Lru;
 use std::sync::atomic::Ordering::Relaxed;
 
 struct Ids {
@@ -157,7 +161,7 @@ impl Pool {
     }
 
     fn get_id(numerics: &Numerics) -> u64 {
-        numerics.next_file_id.fetch_add(1, Relaxed)
+        numerics.next_data_id.fetch_add(1, Relaxed)
     }
 
     fn current(&self) -> Handle<Arena> {
@@ -268,7 +272,7 @@ pub(crate) struct Buffers {
     cache: Arc<NodeCache>,
     table: Arc<PageMap>,
     /// second level cache, provide data for NodeCache
-    lru: Handle<Lru<BoxRef>>,
+    lru: Handle<ShardPriorityLru<BoxRef>>,
     pool: Handle<Pool>,
     tx: Sender<SharedState>,
     rx: Receiver<()>,
@@ -286,10 +290,13 @@ impl Buffers {
         let numerics = ctx.numerics.clone();
         Self {
             ctx,
-            max_log_size: ctx.opt.max_log_size,
+            max_log_size: ctx.opt.max_log_size * ctx.opt.workers as usize,
             cache,
             table: pagemap,
-            lru: Handle::new(Lru::new(opt.cache_count)),
+            lru: Handle::new(ShardPriorityLru::new(
+                opt.cache_count,
+                opt.high_priority_ratio,
+            )),
             pool: Handle::new(Pool::new(opt.clone(), ctx, numerics)),
             tx,
             rx,
@@ -331,9 +338,9 @@ impl Buffers {
     {
         let a = self.pool.current();
         a.inc_ref();
-        for i in addr {
+        for &i in addr {
             if !a.recycle(i) {
-                gc(*i);
+                gc(i);
             }
         }
         a.dec_ref();
@@ -406,7 +413,7 @@ pub struct Loader {
     split_elems: u32,
     pool: Handle<Pool>,
     ctx: Handle<Context>,
-    cache: Handle<Lru<BoxRef>>,
+    cache: Handle<ShardPriorityLru<BoxRef>>,
     /// it's per-node context
     pinned: MutRef<DashMap<u64, BoxRef>>,
 }
@@ -417,11 +424,11 @@ impl Loader {
             return Some(x.clone());
         }
         if let Some(x) = self.pool.load(addr) {
-            self.cache.add(addr, x.clone());
+            self.cache.add(CachePriority::High, addr, x.clone());
             return Some(x);
         }
-        let x = self.ctx.manifest.load_impl(addr)?;
-        self.cache.add(addr, x.clone());
+        let x = self.ctx.manifest.load_data(addr)?;
+        self.cache.add(CachePriority::High, addr, x.clone());
         Some(x)
     }
 }
@@ -473,5 +480,20 @@ impl ILoader for Loader {
                 Some(r)
             }
         }
+    }
+
+    fn load_remote(&self, addr: u64) -> Option<BoxView> {
+        if let Some(x) = self.cache.get(addr) {
+            return Some(x.view());
+        }
+        if let Some(x) = self.pool.load(addr) {
+            self.cache.add(CachePriority::Low, addr, x.clone());
+            return Some(x.view());
+        }
+
+        let b = self.ctx.manifest.load_blob(addr)?;
+        let v = b.view();
+        self.cache.add(CachePriority::Low, addr, b);
+        Some(v)
     }
 }

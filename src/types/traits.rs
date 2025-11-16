@@ -12,8 +12,14 @@ pub trait ILoader: Clone {
 
     fn load(&self, addr: u64) -> Option<BoxView>;
 
+    fn load_remote(&self, addr: u64) -> Option<BoxView>;
+
     fn load_unchecked(&self, addr: u64) -> BoxView {
         self.load(addr).expect("must exist")
+    }
+
+    fn load_remote_unchecked(&self, addr: u64) -> BoxView {
+        self.load_remote(addr).expect("must exist")
     }
 }
 

@@ -19,7 +19,7 @@ use crate::meta::builder::ManifestBuilder;
 use crate::types::data::{Key, Record, Ver};
 use crate::utils::block::Block;
 use crate::utils::data::{Position, WalDesc, WalDescHandle};
-use crate::utils::lru::LruInner;
+use crate::utils::lru::Lru;
 use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, NULL_CMD, NULL_ORACLE};
 use crate::{OpCode, static_assert};
@@ -251,7 +251,7 @@ impl Recovery {
     }
 
     fn get_file(
-        cache: &LruInner<(u32, u64), Rc<File>>,
+        cache: &Lru<(u32, u64), Rc<File>>,
         cap: usize,
         opt: &Options,
         wid: u32,
@@ -272,7 +272,7 @@ impl Recovery {
     }
 
     fn redo(&mut self, block: &mut Block, g: &Guard, tree: &Tree) {
-        let cache = LruInner::new();
+        let cache = Lru::new();
         let cap = 32;
 
         // NOTE: because the `Ver` is descending ordered by txid first, we call `rev` here to make

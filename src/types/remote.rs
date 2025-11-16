@@ -10,11 +10,24 @@ use crate::{
 };
 
 impl RemoteView {
+    const TAG: u64 = 1 << 63;
     pub fn alloc<A: IAlloc>(a: &mut A, size: usize) -> BoxRef {
         let mut p = a.allocate(size + size_of::<RemoteHeader>());
         p.header_mut().kind = TagKind::Remote;
         p.view().as_remote().header_mut().size = size;
         p
+    }
+
+    pub const fn tag(addr: u64) -> u64 {
+        Self::TAG | addr
+    }
+
+    pub const fn is_tagged(addr: u64) -> bool {
+        Self::TAG & addr != 0
+    }
+
+    pub const fn untagged(addr: u64) -> u64 {
+        addr & !Self::TAG
     }
 
     pub fn null() -> Self {

@@ -13,15 +13,31 @@ use std::sync::Mutex;
 /// packed logical id and offset
 pub(crate) const JUNK_LEN: usize = size_of::<u64>();
 
+#[derive(Clone, Copy)]
+pub struct LenSeq {
+    pub len: u32,
+    pub seq: u32,
+}
+
+impl LenSeq {
+    pub const fn new(len: u32, seq: u32) -> Self {
+        Self { len, seq }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed(1))]
 pub struct Reloc {
     /// frame offset in page file
     pub(crate) off: usize,
-    /// frame's length including header
-    pub(crate) len: u32,
+    /// frame length including header, only used for data load
+    pub(crate) total_len: u32,
+    /// real data length that dumpped to file, for rewrite and MDC accounting
+    pub(crate) data_len: u32,
     /// index in reclocation table
     pub(crate) seq: u32,
+    /// checksum of page
+    pub(crate) crc: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,20 +51,21 @@ pub struct AddrPair {
 
 impl AddrPair {
     pub const LEN: usize = size_of::<Self>();
-    pub fn new(key: u64, off: usize, len: u32, seq: u32) -> Self {
+    pub fn new(key: u64, off: usize, total_len: u32, data_len: u32, seq: u32, crc: u32) -> Self {
         Self {
             key,
-            val: Reloc { off, len, seq },
-        }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe {
-            let p = self as *const Self as *const u8;
-            std::slice::from_raw_parts(p, Self::LEN)
+            val: Reloc {
+                off,
+                total_len,
+                data_len,
+                seq,
+                crc,
+            },
         }
     }
 }
+
+impl IAsSlice for AddrPair {}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed(1))]
@@ -296,6 +313,7 @@ impl WalDesc {
             .truncate(true)
             .create(true)
             .open(tmp)
+            .inspect_err(|e| log::error!("can't open, {e:?}"))
             .expect("can't open desc file");
 
         self.checksum = self.crc32();

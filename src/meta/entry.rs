@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fmt::Debug,
     ops::{Deref, DerefMut},
     ptr::addr_of_mut,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
@@ -23,11 +24,15 @@ pub enum MetaKind {
     FileId,
     Commit,
     Numerics,
-    Interval,
-    Stat,
+    DataInterval,
+    BlobInterval,
+    DataStat,
+    BlobStat,
     Map,
-    Delete,
-    DelInterval,
+    DataDelete,
+    BlobDelete,
+    DataDelInterval,
+    BlobDelInterval,
     KindEnd,
 }
 
@@ -48,7 +53,8 @@ impl TryFrom<u8> for MetaKind {
 #[repr(u8)]
 pub enum TxnKind {
     FLush = 3,
-    GC,
+    DataGC,
+    BlobGC,
     Dump,
 }
 
@@ -95,7 +101,24 @@ impl IMetaCodec for Begin {
 
 #[repr(C, packed(1))]
 pub struct FileId {
+    pub is_blob: bool,
     pub file_id: u64,
+}
+
+impl FileId {
+    pub fn blob(file_id: u64) -> Self {
+        Self {
+            is_blob: true,
+            file_id,
+        }
+    }
+
+    pub fn data(file_id: u64) -> Self {
+        Self {
+            is_blob: false,
+            file_id,
+        }
+    }
 }
 
 impl IAsSlice for FileId {}
@@ -141,7 +164,7 @@ impl IMetaCodec for Commit {
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct StatInner {
+pub struct DataStatInner {
     pub file_id: u64,
     /// up1 and up2, see [Efficiently Reclaiming Space in a Log Structured Store](https://ieeexplore.ieee.org/document/9458684)
     pub up1: u64,
@@ -152,52 +175,52 @@ pub struct StatInner {
     pub total_size: usize,
 }
 
-impl IAsSlice for StatInner {}
+impl IAsSlice for DataStatInner {}
 
 #[derive(Clone)]
-pub struct Stat {
-    pub inner: StatInner,
-    pub deleted_elems: Vec<u32>,
+pub struct DataStat {
+    pub inner: DataStatInner,
+    pub inactive_elems: Vec<u32>,
 }
 
-impl Deref for Stat {
-    type Target = StatInner;
+impl Deref for DataStat {
+    type Target = DataStatInner;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-pub struct FileStat {
-    pub inner: StatInner,
-    pub deleted_elems: BitMap,
+pub struct MemDataStat {
+    pub inner: DataStatInner,
+    pub mask: BitMap,
 }
 
-impl Stat {
+impl DataStat {
     fn len(&self) -> usize {
-        size_of::<StatInner>() + self.deleted_elems.len() * size_of::<u32>()
+        size_of::<DataStatInner>() + self.inactive_elems.len() * size_of::<u32>()
     }
 }
 
-impl Deref for FileStat {
-    type Target = StatInner;
+impl Deref for MemDataStat {
+    type Target = DataStatInner;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl DerefMut for FileStat {
+impl DerefMut for MemDataStat {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-impl FileStat {
+impl MemDataStat {
     pub(super) fn update(&mut self, tick: u64, reloc: &Reloc) {
         self.active_elems -= 1;
-        self.active_size -= reloc.len as usize;
-        self.deleted_elems.set(reloc.seq);
+        self.active_size -= reloc.data_len as usize;
+        self.mask.set(reloc.seq);
 
         if self.up1 < tick {
             self.up2 = self.up1;
@@ -205,10 +228,10 @@ impl FileStat {
         }
     }
 
-    pub(crate) fn copy(&self) -> Stat {
-        Stat {
+    pub(crate) fn copy(&self) -> DataStat {
+        DataStat {
             inner: self.inner,
-            deleted_elems: vec![],
+            inactive_elems: Vec::new(),
         }
     }
 }
@@ -222,7 +245,7 @@ pub(crate) struct StatHdr {
 
 impl IAsSlice for StatHdr {}
 
-impl IMetaCodec for Stat {
+impl IMetaCodec for DataStat {
     fn packed_size(&self) -> usize {
         size_of::<StatHdr>() + self.len()
     }
@@ -230,7 +253,7 @@ impl IMetaCodec for Stat {
     fn encode(&self, to: &mut [u8]) {
         assert_eq!(to.len(), self.packed_size());
         let hdr = StatHdr {
-            elems: self.deleted_elems.len() as u32,
+            elems: self.inactive_elems.len() as u32,
             size: self.len() as u32,
         };
         to[0..hdr.len()].copy_from_slice(hdr.as_slice());
@@ -238,29 +261,144 @@ impl IMetaCodec for Stat {
         let inner_s = self.inner.as_slice();
         dst[..inner_s.len()].copy_from_slice(inner_s);
         let src = unsafe {
-            let p = self.deleted_elems.as_ptr().cast::<u8>();
-            std::slice::from_raw_parts(p, self.len() - size_of::<StatInner>())
+            let p = self.inactive_elems.as_ptr().cast::<u8>();
+            std::slice::from_raw_parts(p, self.len() - size_of::<DataStatInner>())
         };
         dst[inner_s.len()..].copy_from_slice(src);
     }
 
     fn decode(src: &[u8]) -> Self {
         let hdr = StatHdr::from_slice(src);
-        let inner = StatInner::from_slice(&src[hdr.len()..]);
-        let mut stat = Stat {
+        let inner = DataStatInner::from_slice(&src[hdr.len()..]);
+        let mut stat = DataStat {
             inner,
-            deleted_elems: vec![],
+            inactive_elems: Vec::with_capacity(hdr.elems as usize),
         };
         let seq = unsafe {
             src.as_ptr()
-                .add(hdr.len() + size_of::<StatInner>())
+                .add(hdr.len() + size_of::<DataStatInner>())
                 .cast::<u32>()
         };
 
         for i in 0..hdr.elems as usize {
             unsafe {
                 let x = seq.add(i).read_unaligned();
-                stat.deleted_elems.push(x);
+                stat.inactive_elems.push(x);
+            }
+        }
+        stat
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct BlobStatInner {
+    pub file_id: u64,
+    pub active_size: usize,
+    pub nr_active: u32,
+    pub nr_total: u32,
+}
+
+impl IAsSlice for BlobStatInner {}
+
+#[derive(Clone)]
+pub struct MemBlobStat {
+    pub inner: BlobStatInner,
+    pub mask: BitMap,
+}
+
+impl MemBlobStat {
+    pub(super) fn update(&mut self, reloc: &Reloc) {
+        self.nr_active -= 1;
+        self.active_size -= reloc.data_len as usize;
+        self.mask.set(reloc.seq);
+    }
+
+    pub fn copy(&self) -> BlobStat {
+        BlobStat {
+            inner: self.inner,
+            inactive_elems: Vec::new(),
+        }
+    }
+}
+
+pub struct BlobStat {
+    pub inner: BlobStatInner,
+    pub inactive_elems: Vec<u32>,
+}
+
+impl BlobStat {
+    fn len(&self) -> usize {
+        size_of::<BlobStatInner>() + self.inactive_elems.len() * size_of::<u32>()
+    }
+}
+
+impl Deref for BlobStat {
+    type Target = BlobStatInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for BlobStat {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Deref for MemBlobStat {
+    type Target = BlobStatInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for MemBlobStat {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl IMetaCodec for BlobStat {
+    fn packed_size(&self) -> usize {
+        size_of::<StatHdr>() + self.len()
+    }
+
+    fn encode(&self, to: &mut [u8]) {
+        assert_eq!(to.len(), self.packed_size());
+        let hdr = StatHdr {
+            elems: self.inactive_elems.len() as u32,
+            size: self.len() as u32,
+        };
+        to[0..hdr.len()].copy_from_slice(hdr.as_slice());
+        let dst = &mut to[hdr.len()..];
+        let inner = self.inner.as_slice();
+        dst[..inner.len()].copy_from_slice(inner);
+        let junks = unsafe {
+            let p = self.inactive_elems.as_ptr().cast::<u8>();
+            std::slice::from_raw_parts(p, self.len() - size_of::<BlobStatInner>())
+        };
+        dst[inner.len()..].copy_from_slice(junks);
+    }
+
+    fn decode(src: &[u8]) -> Self {
+        let hdr = StatHdr::from_slice(src);
+        let inner = BlobStatInner::from_slice(&src[hdr.len()..]);
+        let mut stat = BlobStat {
+            inner,
+            inactive_elems: Vec::with_capacity(hdr.elems as usize),
+        };
+        let seq = unsafe {
+            src.as_ptr()
+                .add(hdr.len() + size_of::<BlobStatInner>())
+                .cast::<u32>()
+        };
+
+        for i in 0..hdr.elems as usize {
+            unsafe {
+                let x = seq.add(i).read_unaligned();
+                stat.inactive_elems.push(x);
             }
         }
         stat
@@ -359,7 +497,8 @@ impl IMetaCodec for PageTable {
 pub struct Numerics {
     /// notify log data has been flushed
     pub signal: AtomicU64,
-    pub next_file_id: AtomicU64,
+    pub next_data_id: AtomicU64,
+    pub next_blob_id: AtomicU64,
     pub next_manifest_id: AtomicU64,
     pub oracle: AtomicU64,
     /// it's the logical address to a frame
@@ -378,7 +517,8 @@ impl Default for Numerics {
     fn default() -> Self {
         Self {
             signal: AtomicU64::new(INIT_ID),
-            next_file_id: AtomicU64::new(INIT_ID),
+            next_data_id: AtomicU64::new(INIT_ID),
+            next_blob_id: AtomicU64::new(INIT_ID),
             next_manifest_id: AtomicU64::new(INIT_ID),
             oracle: AtomicU64::new(INIT_ORACLE),
             address: AtomicU64::new(INIT_ADDR),
@@ -417,7 +557,13 @@ impl IMetaCodec for Numerics {
 
 #[derive(Default)]
 pub struct Delete {
-    id: Vec<u64>,
+    pub id: Vec<u64>,
+}
+
+impl From<Vec<u64>> for Delete {
+    fn from(value: Vec<u64>) -> Self {
+        Self { id: value }
+    }
 }
 
 impl Deref for Delete {
@@ -490,6 +636,15 @@ impl IntervalPair {
             hi_addr: hi,
             file_id,
         }
+    }
+}
+
+impl Debug for IntervalPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "[{}, {}] => {}",
+            self.lo_addr, self.hi_addr, self.file_id
+        ))
     }
 }
 
@@ -577,11 +732,11 @@ pub(crate) fn get_record_size(h: MetaKind, size: usize) -> Result<usize, OpCode>
         MetaKind::Begin => size_of::<Begin>(),
         MetaKind::Commit => size_of::<Commit>(),
         MetaKind::Numerics => size_of::<Numerics>(),
-        MetaKind::Interval => size_of::<IntervalPair>(),
-        MetaKind::Delete => size_of::<DeleteHdr>(),
+        MetaKind::DataInterval | MetaKind::BlobInterval => size_of::<IntervalPair>(),
+        MetaKind::DataDelete | MetaKind::BlobDelete => size_of::<DeleteHdr>(),
         MetaKind::Map => size_of::<PageTableHdr>(),
-        MetaKind::Stat => size_of::<StatHdr>(),
-        MetaKind::DelInterval => size_of::<DelIntervalStartHdr>(),
+        MetaKind::DataStat | MetaKind::BlobStat => size_of::<StatHdr>(),
+        MetaKind::DataDelInterval | MetaKind::BlobDelInterval => size_of::<DelIntervalStartHdr>(),
         MetaKind::FileId => size_of::<FileId>(),
         _ => unreachable!("invalid kind {h:?}"),
     } + GenericHdr::SIZE;

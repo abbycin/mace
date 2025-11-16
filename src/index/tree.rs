@@ -557,7 +557,7 @@ impl Tree {
         // because each thread contains their private data, we have to load the current page by pid
         // and retry (insert delta to the loaded page) on failure caused by both insert/compaction,
         // meanwhile, smo may also cause update fail, we simply restart the whole insert procedure
-        // TODO: potentail decline in performance
+        // TODO: potential performance degradation
         inc_cas!(link);
         if txn.update(old, &mut new).is_err() {
             inc_cas!(link_fail);

@@ -10,7 +10,7 @@ use crate::{
         data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
         header::{BoxHeader, NodeType},
         imtree::{ImTree, Iter, RangeIter},
-        refbox::{BaseView, BoxView, DeltaView, KeyRef},
+        refbox::{BaseView, BoxView, DeltaView, KeyRef, RemoteView},
         traits::{IAlloc, IAsBoxRef, IBoxHeader, IDecode, IHeader, IKey, ILoader, IVal},
     },
     utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID},
@@ -954,7 +954,7 @@ impl<'a> LeafFilter<'a> {
     fn collect(&mut self, v: &Val) {
         let remote = v.get_remote();
         if remote != NULL_ADDR {
-            self.junks.push(remote);
+            self.junks.push(RemoteView::tag(remote));
         }
     }
 }
@@ -1041,6 +1041,10 @@ mod test {
 
         fn shallow_copy(&self) -> Self {
             self.clone()
+        }
+
+        fn load_remote(&self, addr: u64) -> Option<BoxView> {
+            <Self as ILoader>::load(self, addr)
         }
     }
 

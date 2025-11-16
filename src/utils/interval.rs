@@ -21,6 +21,22 @@ impl IntervalMap {
         self.map.insert(lo, (hi, val));
     }
 
+    /// used by recovery only, because it's possible that same interval point to another val
+    pub fn upsert(&mut self, lo: u64, hi: u64, val: u64) {
+        let e = self.map.entry(lo);
+        match e {
+            Entry::Vacant(v) => {
+                v.insert((hi, val));
+            }
+            Entry::Occupied(mut o) => {
+                let old = o.get_mut();
+                #[cfg(feature = "extra_check")]
+                assert_eq!(old.0, hi);
+                old.1 = val;
+            }
+        }
+    }
+
     pub fn update(&mut self, lo: u64, _hi: u64, val: u64) {
         let e = self.map.entry(lo);
         match e {
