@@ -16,7 +16,7 @@ use libc::__error;
 #[cfg(target_os = "linux")]
 use libc::__errno_location;
 
-use crate::{GatherIO, OpenOptions};
+use crate::io::{GatherIO, IoVec, OpenOptions};
 
 pub struct File {
     file: i32,
@@ -132,7 +132,7 @@ impl GatherIO for File {
         }
     }
 
-    fn writev(&mut self, data: &mut [crate::IoVec], total_len: usize) -> Result<(), io::Error> {
+    fn writev(&mut self, data: &mut [IoVec], total_len: usize) -> Result<(), io::Error> {
         let mut count = data.len() as c_int;
         let mut iov = data.as_mut_ptr().cast::<iovec>();
 

@@ -124,7 +124,7 @@ pub(crate) struct Lru<K, V> {
 
 // it's larger than 64 on macOS
 #[cfg(not(target_os = "macos"))]
-crate::static_assert!(size_of::<Lru<u32, io::File>>() == 64);
+crate::static_assert!(size_of::<Lru<u32, crate::io::File>>() == 64);
 
 unsafe impl<K, V> Send for Lru<K, V> {}
 unsafe impl<K, V> Sync for Lru<K, V> {}

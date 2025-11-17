@@ -1,8 +1,8 @@
 use crate::types::traits::IAsSlice;
 
 use super::{INIT_ID, MutRef, rand_range};
+use crate::io::{self, GatherIO, IoVec};
 use crc32c::Crc32cHasher;
-use io::{GatherIO, IoVec};
 use std::fmt::Debug;
 use std::fs::File;
 use std::hash::Hasher;
@@ -30,10 +30,8 @@ impl LenSeq {
 pub struct Reloc {
     /// frame offset in page file
     pub(crate) off: usize,
-    /// frame length including header, only used for data load
-    pub(crate) total_len: u32,
-    /// real data length that dumpped to file, for rewrite and MDC accounting
-    pub(crate) data_len: u32,
+    /// frame length including header (excluding refcnt)
+    pub(crate) len: u32,
     /// index in reclocation table
     pub(crate) seq: u32,
     /// checksum of page
@@ -51,16 +49,10 @@ pub struct AddrPair {
 
 impl AddrPair {
     pub const LEN: usize = size_of::<Self>();
-    pub fn new(key: u64, off: usize, total_len: u32, data_len: u32, seq: u32, crc: u32) -> Self {
+    pub fn new(key: u64, off: usize, len: u32, seq: u32, crc: u32) -> Self {
         Self {
             key,
-            val: Reloc {
-                off,
-                total_len,
-                data_len,
-                seq,
-                crc,
-            },
+            val: Reloc { off, len, seq, crc },
         }
     }
 }

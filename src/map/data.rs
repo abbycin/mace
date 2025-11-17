@@ -1,6 +1,6 @@
+use crate::io::{File, GatherIO};
 use crc32c::Crc32cHasher;
 use dashmap::DashMap;
-use io::{File, GatherIO};
 
 use crate::map::IFooter;
 use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, Numerics, PageTable};
@@ -130,12 +130,6 @@ impl Arena {
 
     pub(crate) fn workers(&self) -> u16 {
         self.flsn.len() as u16
-    }
-
-    pub(crate) fn sizes(&self) -> (u64, u64) {
-        let x = self.real_size.load(Relaxed);
-        let y = self.offset.load(Relaxed);
-        (x, y)
     }
 
     fn alloc_size(&self, size: u32) -> Result<(), OpCode> {
@@ -402,10 +396,6 @@ impl FileBuilder {
         self.data.is_empty() && self.data_junks.is_empty() && self.blobs.is_empty()
     }
 
-    pub(crate) fn active_frames(&self) -> usize {
-        self.data.len()
-    }
-
     pub(crate) fn data_stat(&self, id: u64, tick: u64) -> MemDataStat {
         let n = self.data.len() as u32;
         MemDataStat {
@@ -446,16 +436,7 @@ impl FileBuilder {
             let mut crc = Crc32cHasher::default();
             crc.write(s);
             w.queue(s);
-            // we save both total_size (including alignment) and real dump size. for loader, it must
-            // use total_size to properly allocate algined memory and copy from real dump size data
-            let reloc = AddrPair::new(
-                h.addr,
-                pos,
-                h.total_size,
-                s.len() as u32,
-                seq as u32,
-                crc.finish() as u32,
-            );
+            let reloc = AddrPair::new(h.addr, pos, s.len() as u32, seq as u32, crc.finish() as u32);
             relocs.extend_from_slice(reloc.as_slice());
             pos += s.len();
         }
@@ -497,14 +478,7 @@ impl FileBuilder {
             let mut crc = Crc32cHasher::default();
             crc.write(s);
             w.queue(s);
-            let reloc = AddrPair::new(
-                h.addr,
-                pos,
-                h.total_size,
-                s.len() as u32,
-                seq as u32,
-                crc.finish() as u32,
-            );
+            let reloc = AddrPair::new(h.addr, pos, s.len() as u32, seq as u32, crc.finish() as u32);
             relocs.extend_from_slice(reloc.as_slice());
             pos += s.len();
         }
@@ -713,15 +687,13 @@ mod test {
         assert_eq!({ intervals[0].lo }, addr1);
         assert_eq!({ intervals[0].hi }, addr);
 
-        let h = p.header();
         let r = &reloc[0];
         assert_eq!({ r.key }, addr);
         assert_eq!({ r.val.off }, 0);
-        assert_eq!({ r.val.total_len }, h.total_size);
+        assert_eq!({ r.val.len }, p.dump_len() as u32);
 
-        let h1 = p1.header();
         let r1 = &reloc[1];
         assert_eq!({ r1.key }, addr1);
-        assert_eq!({ r1.val.total_len }, h1.total_size);
+        assert_eq!({ r1.val.len }, p1.dump_len() as u32);
     }
 }

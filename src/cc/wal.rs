@@ -7,10 +7,9 @@ use std::{
     rc::Rc,
 };
 
-use io::{File, GatherIO};
-
 use crate::{
     cc::worker::SyncWorker,
+    io::{self, File, GatherIO},
     static_assert,
     types::{
         data::{Key, Record, Ver},

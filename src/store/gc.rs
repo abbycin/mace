@@ -1,5 +1,4 @@
 use crc32c::Crc32cHasher;
-use io::{File, GatherIO};
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
@@ -17,6 +16,7 @@ use std::{
 use crate::{
     Options, Store,
     cc::context::Context,
+    io::{File, GatherIO},
     map::data::{BlobFooter, DataFooter, MetaReader},
     meta::{
         BlobStatInner, DataStatInner, DelInterval, Delete, FileId, IntervalPair, MemBlobStat,
@@ -404,8 +404,7 @@ impl GarbageCollector {
                         Entry {
                             key: m.key,
                             off: m.val.off,
-                            total_len: m.val.total_len,
-                            data_len: m.val.data_len,
+                            len: m.val.len,
                             crc: m.val.crc,
                         }
                     })
@@ -510,8 +509,7 @@ impl GarbageCollector {
                         Entry {
                             key: x.key,
                             off: x.val.off,
-                            total_len: x.val.total_len,
-                            data_len: x.val.data_len,
+                            len: x.val.len,
                             crc: x.val.crc,
                         }
                     })
@@ -631,12 +629,12 @@ impl<'a> DataReWriter<'a> {
                 .open(self.opt.data_file(item.id))
                 .unwrap();
             for e in &item.pos {
-                let len = e.data_len as usize;
+                let len = e.len as usize;
                 let crc = copy(&reader, &mut writer, buf, len, e.off as u64)?;
                 assert_eq!(crc, e.crc);
-                let m = AddrPair::new(e.key, off, e.total_len, e.data_len, seq, crc);
+                let m = AddrPair::new(e.key, off, e.len, seq, crc);
                 reloc.extend_from_slice(m.as_slice());
-                reloc_map.insert(e.key, LenSeq::new(e.data_len, seq));
+                reloc_map.insert(e.key, LenSeq::new(e.len, seq));
                 off += len;
                 seq += 1;
             }
@@ -737,12 +735,12 @@ impl<'a> BlobRewriter<'a> {
                 .unwrap();
 
             for e in &item.pos {
-                let len = e.data_len as usize;
+                let len = e.len as usize;
                 let crc = copy(&reader, &mut w, buf, len, e.off as u64)?;
                 assert_eq!(crc, e.crc);
-                let m = AddrPair::new(e.key, off, e.total_len, e.data_len, seq, crc);
+                let m = AddrPair::new(e.key, off, e.len, seq, crc);
                 reloc.extend_from_slice(m.as_slice());
-                map.insert(e.key, LenSeq::new(e.data_len, seq));
+                map.insert(e.key, LenSeq::new(e.len, seq));
                 off += len;
                 seq += 1;
             }
@@ -810,10 +808,8 @@ struct Entry {
     key: u64,
     /// offset in data file
     off: usize,
-    /// length of record
-    total_len: u32,
-    /// data length
-    data_len: u32,
+    /// length of dumpped BoxRef
+    len: u32,
     /// old checksum
     crc: u32,
 }

@@ -12,6 +12,7 @@ use utils::{ROOT_PID, options::ParsedOptions};
 
 mod cc;
 mod index;
+mod io;
 mod map;
 mod meta;
 mod store;

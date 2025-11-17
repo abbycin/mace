@@ -6,12 +6,6 @@ pub struct IoVec {
     pub len: usize,
 }
 
-impl IoVec {
-    pub const fn new(data: *const u8, len: usize) -> Self {
-        Self { data, len }
-    }
-}
-
 impl From<&[u8]> for IoVec {
     fn from(value: &[u8]) -> Self {
         unsafe { std::mem::transmute(value) }

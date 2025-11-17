@@ -1,3 +1,7 @@
+## [0.0.18] 2025-11-17
+### Changes
+- Reduce `Reloc` size
+
 ## [0.0.17] 2025-11-16
 ### New Features
 - Support value separate storage by default, user can set `Options::inline_size` to control whether value should be stored in blob files

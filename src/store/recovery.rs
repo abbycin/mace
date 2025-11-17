@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 
-use io::{File, GatherIO};
+use crate::io::{File, GatherIO};
 
 use crate::cc::context::Context;
 use crate::cc::wal::{

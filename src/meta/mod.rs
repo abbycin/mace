@@ -17,10 +17,10 @@ use std::{
 
 use crc32c::Crc32cHasher;
 use dashmap::DashMap;
-use io::{File, GatherIO};
 
 use crate::{
     Options,
+    io::{File, GatherIO},
     map::{
         IFooter,
         buffer::Loader,
@@ -181,14 +181,18 @@ fn new_reader<T: IFooter>(path: PathBuf) -> Option<FileReader> {
 impl FileReader {
     fn read_at(&self, pos: u64) -> BoxRef {
         let m = self.map.get(&pos).expect("never happen");
-        let mut p = BoxRef::alloc(m.total_len - BoxRef::HDR_LEN as u32, pos);
+        let real_size = BoxRef::real_size_from_dump(m.len);
+        let mut p = BoxRef::alloc_exact(real_size, pos);
         let mut crc = Crc32cHasher::default();
 
         let dst = p.load_slice();
         self.file.read(dst, m.off as u64).expect("can't read");
         crc.write(dst);
         debug_assert_eq!(p.view().refcnt(), 1);
-        debug_assert!(p.header().payload_size <= (m.total_len - BoxRef::HDR_LEN as u32));
+        debug_assert_eq!(
+            p.header().payload_size,
+            (real_size - BoxRef::HDR_LEN as u32)
+        );
         if crc.finish() as u32 != m.crc {
             log::error!(
                 "checksum mismatch, expect {} get {}, key {pos}",
@@ -631,7 +635,7 @@ impl DataStatCtx {
     }
 
     pub(crate) fn update_stat(&self, stat: &mut MemDataStat, junk: u64, reloc: &Reloc, tick: u64) {
-        self.active_size.fetch_sub(reloc.data_len as u64, Release);
+        self.active_size.fetch_sub(reloc.len as u64, Release);
         stat.update(tick, reloc);
         if self.should_collect_junk.load(Relaxed) {
             let mut m = self.junks.borrow_mut();

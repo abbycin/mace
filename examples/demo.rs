@@ -6,7 +6,7 @@ fn main() -> Result<(), OpCode> {
     let opt = Options::new(path).validate()?;
     let db = Mace::new(opt)?;
 
-    // start a read-write Txn
+    // start a read-write transaction
     let kv = db.begin()?;
     kv.put("foo", "bar")?;
     kv.put("fool", "+1s")?;
@@ -30,7 +30,7 @@ fn main() -> Result<(), OpCode> {
     kv.put("mo", "ha")?;
     drop(kv);
 
-    // start a read-only Txn
+    // start a read-only transaction
     let view = db.view()?;
     let r = view.get("foo")?;
     assert_eq!(r.slice(), "bar".as_bytes());

@@ -1,5 +1,4 @@
 use crc32c::Crc32cHasher;
-use io::{File, GatherIO};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
@@ -18,6 +17,7 @@ use crate::utils::ROOT_PID;
 use crate::utils::bitmap::BitMap;
 use crate::{
     OpCode,
+    io::{File, GatherIO},
     meta::{
         IMetaCodec, Manifest,
         entry::{MetaKind, Numerics, PageTable},

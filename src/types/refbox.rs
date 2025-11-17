@@ -136,16 +136,14 @@ impl BoxRef {
         h.total_size
     }
 
-    /// NOTE: the alignment is hard code to pointer's alignment, and it's true in mace
-    pub(crate) fn alloc(size: u32, addr: u64) -> BoxRef {
-        let real_size = Self::real_size(size);
-        let layout = Layout::array::<u8>(real_size as usize)
+    pub(crate) fn alloc_exact(size: u32, addr: u64) -> BoxRef {
+        let layout = Layout::array::<u8>(size as usize)
             .inspect_err(|x| panic!("bad layout {x:?}"))
             .unwrap();
         let mut this = BoxRef(unsafe { alloc(layout).cast::<_>() });
         let h = this.header_mut();
-        h.total_size = real_size;
-        h.payload_size = size;
+        h.total_size = size;
+        h.payload_size = size - Self::HDR_LEN as u32;
         h.flag = TagFlag::Normal;
         h.pid = NULL_PID;
         h.addr = addr;
@@ -154,12 +152,22 @@ impl BoxRef {
         this
     }
 
+    /// NOTE: the alignment is hard code to pointer's alignment, and it's true in mace
+    #[inline(always)]
+    pub(crate) fn alloc(size: u32, addr: u64) -> BoxRef {
+        Self::alloc_exact(Self::real_size(size), addr)
+    }
+
     /// because all fields except refcnt are immutable before flush to file, we exclude the refcnt
     /// before write to file
     pub(crate) fn dump_slice(&self) -> &[u8] {
         let p = self.0 as *const u8;
         let off = size_of::<AtomicU32>();
         unsafe { std::slice::from_raw_parts(p.add(off), self.dump_len()) }
+    }
+
+    pub(crate) fn real_size_from_dump(size: u32) -> u32 {
+        size + size_of::<AtomicU32>() as u32
     }
 
     pub(crate) fn dump_len(&self) -> usize {
@@ -184,7 +192,7 @@ impl BoxRef {
     pub(crate) fn load_slice(&mut self) -> &mut [u8] {
         let p = self.0 as *mut u8;
         let off = size_of::<AtomicU32>();
-        unsafe { std::slice::from_raw_parts_mut(p.add(off), self.total_size() as usize - off) }
+        unsafe { std::slice::from_raw_parts_mut(p.add(off), self.dump_len()) }
     }
 
     pub(crate) fn view(&self) -> BoxView {

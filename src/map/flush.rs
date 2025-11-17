@@ -39,10 +39,8 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
     let mut builder = FileBuilder::new();
     let mut map = MapBuilder::new();
 
-    let mut size: usize = 0;
     for x in msg.iter() {
         let f = x.value();
-        size += f.total_size() as usize;
         map.add(f);
         builder.add(f.clone());
     }
@@ -117,17 +115,7 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
             ctx.manifest.add_blob_stat(mem_blob_stat, blob_ivl);
         }
 
-        let nbytes = txn.commit();
-
-        log::debug!(
-            "flush to {:?} active {} frames, size {} sizes {:?} manifest {}",
-            ctx.opt.data_file(data_id),
-            builder.active_frames(),
-            size,
-            msg.sizes(),
-            nbytes
-        );
-
+        txn.commit();
         ctx.manifest.numerics.signal.fetch_add(1, Relaxed);
     }
     msg.mark_done();
