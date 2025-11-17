@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use crate::{GatherIO, IoVec, OpenOptions};
+use crate::io::{GatherIO, IoVec, OpenOptions};
 
 pub struct File {
     file: std::fs::File,

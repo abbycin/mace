@@ -1,3 +1,7 @@
+## [0.0.19] 2025-11-17
+### Bug fixes
+- Fixed compile error introduced in 0.0.18 on Windows
+
 ## [0.0.18] 2025-11-17
 ### Changes
 - Reduce `Reloc` size
