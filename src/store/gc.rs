@@ -349,7 +349,7 @@ impl GarbageCollector {
         }
     }
 
-    fn process_one_wal(opt: &Options, id: u16, beg: u64, end: u64) {
+    fn process_one_wal(opt: &Options, id: u8, beg: u64, end: u64) {
         // NOTE: not including `end`
         for seq in beg..end {
             let from = opt.wal_file(id, seq);

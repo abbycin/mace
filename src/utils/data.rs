@@ -236,19 +236,21 @@ pub(crate) struct WalDesc {
     pub checkpoint: Position,
     pub oldest_id: u64,
     pub latest_id: u64,
-    pub worker: u16,
-    padding: u16,
+    pub worker: u8,
+    padding1: u8,
+    padding2: u16,
     pub checksum: u32,
 }
 
 impl WalDesc {
-    pub(crate) fn new(wid: u16) -> Self {
+    pub(crate) fn new(wid: u8) -> Self {
         Self {
             checkpoint: Position::default(),
             oldest_id: INIT_ID,
             latest_id: INIT_ID,
             worker: wid,
-            padding: 0,
+            padding1: 0,
+            padding2: 0,
             checksum: 0,
         }
     }

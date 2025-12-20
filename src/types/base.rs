@@ -114,7 +114,7 @@ impl BaseView {
                 break;
             };
 
-            let (r, _) = v.get_record(l);
+            let (r, _) = v.get_record(l, true);
             let remote = v.get_remote();
             let Some((idx, _)) = hints.front() else {
                 builder.add_leaf(inline_size, k, &r, NULL_ADDR, remote);
@@ -211,7 +211,7 @@ impl BaseView {
 
             for _ in saved..beg {
                 let (k, v) = iter.next().unwrap();
-                let (r, _) = v.get_record(l);
+                let (r, _) = v.get_record(l, true);
                 builder.add_leaf(inline_size, &k.ver, &r, NULL_ADDR, v.get_remote());
                 *pos += 1;
             }
@@ -758,8 +758,8 @@ mod test {
             self.clone()
         }
 
-        fn load_remote(&self, addr: u64) -> Option<BoxView> {
-            self.load(addr)
+        fn load_remote(&self, addr: u64) -> Option<BoxRef> {
+            Some(self.inner.map.get(&addr).unwrap().clone())
         }
     }
 
@@ -803,11 +803,11 @@ mod test {
     #[test]
     fn builder_leaf() {
         #[allow(clippy::too_many_arguments)]
-        fn check(k: &Key, v: &Val, l: &Allocator, ks: &str, txid: u64, cmd: u32, vs: &str, w: u16) {
+        fn check(k: &Key, v: &Val, l: &Allocator, ks: &str, txid: u64, cmd: u32, vs: &str, w: u8) {
             assert_eq!(k.raw, ks.as_bytes());
             assert_eq!(k.txid, txid);
             assert_eq!(k.cmd, cmd);
-            let (r, _) = v.get_record(l);
+            let (r, _) = v.get_record(l, true);
             assert_eq!(r.data(), vs.as_bytes());
             assert_eq!(r.worker_id(), w);
         }

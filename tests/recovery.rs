@@ -270,7 +270,8 @@ fn put_update(remove_data: bool) {
             oldest_id: 0,
             latest_id: 0,
             worker: 0,
-            padding: 0,
+            padding1: 0,
+            padding2: 0,
             checksum: 0,
         };
 
@@ -450,8 +451,9 @@ struct WalDesc {
     checkpoint: Position,
     oldest_id: u64,
     latest_id: u64,
-    worker: u16,
-    padding: u16,
+    worker: u8,
+    padding1: u8,
+    padding2: u16,
     checksum: u32,
 }
 

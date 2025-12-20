@@ -29,7 +29,7 @@ pub(crate) enum TagFlag {
 
 #[derive(Debug)]
 #[repr(C, align(8))]
-pub(crate) struct BoxHeader {
+pub struct BoxHeader {
     pub(super) refs: AtomicU32,
     pub(crate) kind: TagKind,
     pub(crate) node_type: NodeType,

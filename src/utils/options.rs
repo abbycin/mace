@@ -21,7 +21,7 @@ pub struct Options {
     /// hardware concurrency count, range in [1, cores]
     ///
     /// **Once set, it cannot be modified**
-    pub workers: u16,
+    pub workers: u8,
     /// garbage collection cycle (milliseconds)
     pub gc_timeout: u64,
     /// perform compaction when garbage ratio exceed this value, range [0, 100]
@@ -119,7 +119,7 @@ impl Options {
             workers: std::thread::available_parallelism()
                 .unwrap()
                 .get()
-                .min(Self::MAX_WORKERS) as u16,
+                .min(Self::MAX_WORKERS) as u8,
             tmp_store: false,
             gc_timeout: 60 * 1000,  // 1min
             data_garbage_ratio: 20, // 20%
@@ -149,7 +149,7 @@ impl Options {
     }
 
     pub(crate) fn max_delta_len(&self) -> usize {
-        self.split_elems as usize / 100
+        self.split_elems as usize / 4
     }
 
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
@@ -235,7 +235,7 @@ impl Options {
         self.db_root.clone()
     }
 
-    pub fn wal_file(&self, wid: u16, seq: u64) -> PathBuf {
+    pub fn wal_file(&self, wid: u8, seq: u64) -> PathBuf {
         self.log_root().join(format!(
             "{}{}{}{}{}",
             Self::WAL_PREFIX,
@@ -246,7 +246,7 @@ impl Options {
         ))
     }
 
-    pub fn wal_backup(&self, wid: u16, seq: u64) -> PathBuf {
+    pub fn wal_backup(&self, wid: u8, seq: u64) -> PathBuf {
         self.log_root().join(format!(
             "{}{}{}{}{}",
             Self::WAL_STABLE,
@@ -257,7 +257,7 @@ impl Options {
         ))
     }
 
-    pub fn desc_file(&self, wid: u16) -> PathBuf {
+    pub fn desc_file(&self, wid: u8) -> PathBuf {
         self.log_root().join(format!("meta_{wid}"))
     }
 

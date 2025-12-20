@@ -225,19 +225,28 @@ fn range_simple() -> Result<(), OpCode> {
 
     let view = db.view().unwrap();
     let mut iter = view.seek("foo");
-    assert_eq!(iter.next(), Some(("foo".as_bytes(), "3".as_bytes())));
-    assert_eq!(iter.next(), Some(("fool".as_bytes(), "1".as_bytes())));
-    assert_eq!(iter.next(), None);
+    let item = iter.next().unwrap();
+    assert_eq!(item.key(), "foo".as_bytes());
+    assert_eq!(item.val(), "3".as_bytes());
+    let item = iter.next().unwrap();
+    assert_eq!(item.key(), "fool".as_bytes());
+    assert_eq!(item.val(), "1".as_bytes());
+
+    assert!(iter.next().is_none());
 
     let mut iter = view.seek("mo");
-    assert_eq!(iter.next(), Some(("mo".as_bytes(), "3".as_bytes())));
-    assert_eq!(iter.next(), None);
+    let item = iter.next().unwrap();
+    assert_eq!(item.key(), "mo".as_bytes());
+    assert_eq!(item.val(), "3".as_bytes());
+    assert!(iter.next().is_none());
 
     let kv = db.begin().unwrap();
     kv.del("foo")?;
     let mut iter = kv.seek("foo");
-    assert_eq!(iter.next(), Some(("fool".as_bytes(), "1".as_bytes())));
-    assert_eq!(iter.next(), None);
+    let item = iter.next().unwrap();
+    assert_eq!(item.key(), "fool".as_bytes());
+    assert_eq!(item.val(), "1".as_bytes());
+    assert!(iter.next().is_none());
     drop(kv);
 
     {
@@ -253,9 +262,15 @@ fn range_simple() -> Result<(), OpCode> {
 
         let view = db.view().unwrap();
         let mut iter = view.seek([0]);
-        assert_eq!(iter.next(), Some(([0].as_slice(), "bar".as_bytes())));
-        assert_eq!(iter.next(), Some(([0, 1].as_slice(), "bar".as_bytes())));
-        assert_eq!(iter.next(), Some(([0, 2].as_slice(), "bar".as_bytes())));
+        let item = iter.next().unwrap();
+        assert_eq!(item.key(), [0].as_slice());
+        assert_eq!(item.val(), "bar".as_bytes());
+        let item = iter.next().unwrap();
+        assert_eq!(item.key(), [0, 1].as_slice());
+        assert_eq!(item.val(), "bar".as_bytes());
+        let item = iter.next().unwrap();
+        assert_eq!(item.key(), [0, 2].as_slice());
+        assert_eq!(item.val(), "bar".as_bytes());
     }
     Ok(())
 }
@@ -270,8 +285,8 @@ fn range_in_one_node() -> Result<(), OpCode> {
     let check_app = || {
         let mut words = Vec::new();
         let view = db.view().unwrap();
-        for (k, v) in view.seek("app") {
-            words.push((k.to_vec(), v.to_vec()));
+        for item in view.seek("app") {
+            words.push((item.key().to_vec(), item.val().to_vec()));
         }
         assert_eq!(words.len(), 4);
         assert!(words.contains(&("app".as_bytes().to_vec(), "bar".as_bytes().to_vec())));
@@ -316,10 +331,12 @@ fn range_in_one_node() -> Result<(), OpCode> {
 
     let mut cnt = 0;
     let view = db.view().unwrap();
-    for (k, v) in view.seek("key") {
+    for item in view.seek("key") {
         cnt += 1;
+        let k = item.key();
+        let v = item.val();
         assert_eq!(k, v);
-        assert!(keys.contains(to_str(k)));
+        assert!(keys.contains(to_str(&k)));
     }
 
     assert_eq!(cnt, N);
@@ -350,10 +367,12 @@ fn range_cross_node() -> Result<(), OpCode> {
     let check_key = || {
         let mut cnt = 0;
         let view = db.view().unwrap();
-        for (k, v) in view.seek("key") {
+        for item in view.seek("key") {
             cnt += 1;
+            let k = item.key();
+            let v = item.val();
             assert_eq!(k, v);
-            assert!(h.contains(to_str(k)));
+            assert!(h.contains(to_str(&k)));
         }
         assert_eq!(cnt, h.len());
     };

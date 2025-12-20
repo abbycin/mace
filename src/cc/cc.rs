@@ -53,8 +53,8 @@ impl ConcurrencyControl {
     pub fn is_visible_to(
         &mut self,
         ctx: &Context,
-        self_wid: u16,
-        other_wid: u16,
+        self_wid: u8,
+        other_wid: u8,
         start_ts: u64,
         txid: u64,
     ) -> bool {
@@ -221,7 +221,7 @@ impl CommitTree {
         self.log.push((commit, start));
     }
 
-    pub fn compact(&mut self, ctx: &Context, this_worker: u16) {
+    pub fn compact(&mut self, ctx: &Context, this_worker: u8) {
         let rlk = self.lk.read().expect("can't lock read");
         if self.log.len() < self.cap {
             return;

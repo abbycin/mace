@@ -72,7 +72,7 @@ pub(crate) struct WalUpdate {
     pub(crate) wal_type: EntryType,
     pub(crate) sub_type: PayloadType,
     /// meaningful in txn rollback, unnecessary in recovery
-    pub(crate) worker_id: u16,
+    pub(crate) worker_id: u8,
     /// payload size
     pub(crate) size: u32,
     pub(crate) cmd_id: u32,
@@ -360,8 +360,8 @@ pub(crate) fn wal_record_sz(e: EntryType) -> usize {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Location {
     pub(crate) wid: u32,
-    pub(crate) pos: Position,
     pub(crate) len: u32,
+    pub(crate) pos: Position,
 }
 
 pub(crate) struct WalReader<'a> {
@@ -379,14 +379,14 @@ impl<'a> WalReader<'a> {
         }
     }
 
-    fn get_file(&self, id: u32, seq: u64) -> Option<(Rc<File>, u64)> {
+    fn get_file(&self, id: u8, seq: u64) -> Option<(Rc<File>, u64)> {
         const MAX_OPEN_FILES: usize = 10;
         let mut map = self.map.borrow_mut();
         while map.len() > MAX_OPEN_FILES {
             map.pop_first();
         }
         if let Entry::Vacant(e) = map.entry(seq) {
-            let path = self.ctx.opt.wal_file(id as u16, seq);
+            let path = self.ctx.opt.wal_file(id, seq);
             if !path.exists() {
                 return None;
             }
@@ -412,7 +412,7 @@ impl<'a> WalReader<'a> {
         let mut pos = addr.pos.offset;
 
         'outer: loop {
-            let (f, end) = match self.get_file(wid, addr.pos.file_id) {
+            let (f, end) = match self.get_file(wid as u8, addr.pos.file_id) {
                 None => break, // for rollback, this will not happen, but may happen in recovery
                 Some(f) => {
                     if f.1 == 0 {

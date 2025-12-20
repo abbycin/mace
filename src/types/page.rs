@@ -44,8 +44,8 @@ where
         self.inner.inner() as u64
     }
 
-    pub(crate) fn clone_node(&self) -> Node<L> {
-        self.inner.deref().clone()
+    pub(crate) fn ref_node(&self) -> Node<L> {
+        self.inner.reference()
     }
 
     pub(crate) fn is_intl(&self) -> bool {

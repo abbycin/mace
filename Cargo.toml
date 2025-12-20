@@ -1,12 +1,12 @@
 [package]
 name = "mace-kv"
-version = "0.0.19"
+version = "0.0.20"
 edition = "2024"
 authors = ["abbytsing@gmail.com"]
-readme = "README_en.md"
+readme = "README.md"
 homepage = "https://github.com/abbycin/mace"
 repository = "https://github.com/abbycin/mace"
-description = "An embedded key-value storage engine with ACID support"
+description = "An fast embedded key-value storage engine with ACID support"
 license = "MIT"
 categories = ["database"]
 keywords = ["database"]
@@ -20,6 +20,8 @@ dashmap = "6.1.0"
 rand = "0.9.2"
 log = "0.4.28"
 crossbeam-epoch = "0.9.18"
+
+[target.'cfg(not(windows))'.dependencies]
 libc = "0.2.177"
 
 [dev-dependencies]

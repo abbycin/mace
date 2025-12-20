@@ -124,7 +124,7 @@ where
         log::debug!("---------- show page {pid} {addr} elems {elems} ----------");
         for i in 0..elems {
             let (k, v) = self.kv_at::<Val>(i);
-            let (r, _) = v.get_record(l);
+            let (r, _) = v.get_record(l, true);
             log::debug!("{} => {}", k.to_string(), r);
         }
         log::debug!("---------- end ----------");

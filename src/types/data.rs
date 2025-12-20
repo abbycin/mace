@@ -1,12 +1,17 @@
-use std::{cmp::Ordering, fmt::Display, ops::Deref};
+use std::{
+    cell::RefCell,
+    cmp::Ordering,
+    fmt::{Debug, Display},
+    ops::Deref,
+};
 
 use crate::{
     number_to_slice, slice_to_number,
     types::{
-        refbox::RemoteView,
+        refbox::BoxRef,
         traits::{ICodec, IDecode, IKey, IKeyCodec, ILoader, IVal},
     },
-    utils::{ADDR_LEN, NULL_ADDR, NULL_PID, to_str, varint::Varint32},
+    utils::{ADDR_LEN, Handle, NULL_ADDR, NULL_PID, to_str, varint::Varint32},
 };
 
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
@@ -74,7 +79,7 @@ impl IKeyCodec for IntlKey<'_> {
     }
 }
 
-#[derive(Default, PartialEq, Eq, Clone, Copy)]
+#[derive(Default, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct Key<'a> {
     pub raw: &'a [u8],
     pub ver: Ver,
@@ -357,27 +362,27 @@ impl IKeyCodec for LeafSeg<'_> {
 
 /// 1. inline data
 ///```text
-/// +-----+----------+------+
-/// | HDR | DATA LEN | DATA |
-/// +-----+----------+------+
+/// +-----+-----+----------+------+
+/// | HDR | WID | DATA LEN | DATA |
+/// +-----+-----+----------+------+
 ///```
 /// 2. inline data with sibling
 ///```text
-/// +-----+----------+----------+------+
-/// | HDR | DATA LEN | SIB ADDR | DATA |
-/// +-----+----------+----------+------+
+/// +-----+-----+----------+----------+------+
+/// | HDR | WID | DATA LEN | SIB ADDR | DATA |
+/// +-----+-----+----------+----------+------+
 ///```
 /// 3. remote data
 ///```text
-/// +-----+----------+-------------+
-/// | HDR | DATA LEN | REMOTE ADDR |
-/// +-----+----------+-------------+
+/// +-----+-----+----------+-------------+
+/// | HDR | WID | DATA LEN | REMOTE ADDR |
+/// +-----+-----+----------+-------------+
 ///```
 /// 4. remote data with sibling
 ///```text
-/// +-----+----------+----------+-------------+
-/// | HDR | DATA LEN | SIB ADDR | REMOTE ADDR |
-/// +-----+----------+----------+-------------+
+/// +-----+-----+----------+----------+-------------+
+/// | HDR | WID | DATA LEN | SIB ADDR | REMOTE ADDR |
+/// +-----+-----+----------+----------+-------------+
 /// ```
 #[derive(Clone, Copy)]
 pub struct Val<'a> {
@@ -391,6 +396,7 @@ impl<'a> Val<'a> {
     const SIB_LEN: usize = ADDR_LEN;
     const DATA_LEN: usize = size_of::<u32>();
     const HDR_LEN: usize = 1;
+    const WID_LEN: usize = 1;
 
     pub fn is_tombstone(&self) -> bool {
         self.data[0] & Self::DEL_BIT != 0
@@ -405,7 +411,7 @@ impl<'a> Val<'a> {
     }
 
     fn data_offset(&self) -> usize {
-        Self::HDR_LEN + Self::DATA_LEN + self.is_sibling() as usize * Self::SIB_LEN
+        Self::HDR_LEN + Self::WID_LEN + Self::DATA_LEN + self.is_sibling() as usize * Self::SIB_LEN
     }
 
     pub fn from_raw(data: &'a [u8]) -> Self {
@@ -413,25 +419,32 @@ impl<'a> Val<'a> {
     }
 
     pub fn data_size(&self) -> usize {
-        Self::read::<u32>(self.data, Self::HDR_LEN) as usize
+        Self::read::<u32>(self.data, Self::HDR_LEN + Self::WID_LEN) as usize
     }
 
-    pub fn get_record<L: ILoader>(&self, l: &L) -> (Record, RemoteView) {
+    pub fn get_record<L: ILoader>(&self, l: &L, cache: bool) -> (Record, Option<BoxRef>) {
         let off = self.data_offset();
         let len = self.data_size();
         let (src, r) = if self.is_inline() {
-            (&self.data[off..], RemoteView::null())
+            (&self.data[off..], None)
         } else {
             let addr = Self::read::<u64>(self.data, off);
-            let r = l.load_remote_unchecked(addr).as_remote();
-            (r.raw(), r)
+            let r = if cache {
+                l.load_remote_unchecked(addr)
+            } else {
+                l.load_remote_uncached(addr)
+            };
+            (r.view().as_remote().raw(), Some(r))
         };
         (Record::decode_from(&src[..len]), r)
     }
 
     pub fn get_sibling(&self) -> Option<u64> {
         if self.is_sibling() {
-            Some(Self::read::<u64>(self.data, Self::HDR_LEN + Self::DATA_LEN))
+            Some(Self::read::<u64>(
+                self.data,
+                Self::HDR_LEN + Self::WID_LEN + Self::DATA_LEN,
+            ))
         } else {
             None
         }
@@ -448,6 +461,7 @@ impl<'a> Val<'a> {
 
     pub fn calc_size(is_sib: bool, min_blob_size: usize, val_size: usize) -> usize {
         Self::HDR_LEN
+            + Self::WID_LEN
             + Self::DATA_LEN
             + if is_sib { Self::SIB_LEN } else { 0 }
             + if min_blob_size < val_size {
@@ -459,7 +473,8 @@ impl<'a> Val<'a> {
 
     pub fn encode_inline<V: IVal>(dst: &mut [u8], sib: u64, v: &V) {
         dst[0] = v.is_tombstone() as u8;
-        let mut off = Self::HDR_LEN;
+        dst[1] = v.worker();
+        let mut off = Self::HDR_LEN + Self::WID_LEN;
         Self::write::<u32>(dst, off, v.packed_size() as u32);
         off += Self::DATA_LEN;
         if sib != NULL_ADDR {
@@ -473,7 +488,8 @@ impl<'a> Val<'a> {
     pub fn encode_remote<V: IVal>(dst: &mut [u8], sib: u64, remote: u64, v: &V) {
         dst[0] = v.is_tombstone() as u8;
         dst[0] |= Self::REMOTE_BIT;
-        let mut off = Self::HDR_LEN;
+        dst[1] = v.worker();
+        let mut off = Self::HDR_LEN + Self::WID_LEN;
         Self::write::<u32>(dst, off, v.packed_size() as u32);
         off += Self::DATA_LEN;
         if sib != NULL_ADDR {
@@ -482,6 +498,10 @@ impl<'a> Val<'a> {
             off += Self::SIB_LEN;
         }
         Self::write::<u64>(dst, off, remote);
+    }
+
+    pub fn worker(&self) -> u8 {
+        self.data[1]
     }
 
     fn write<T>(dst: &mut [u8], off: usize, data: T) {
@@ -552,28 +572,28 @@ impl Display for Index {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Copy)]
+#[derive(Clone, PartialEq, Eq, Copy, Debug)]
 pub struct Record {
-    worker_id: u16,
+    worker_id: u8,
     data: &'static [u8],
 }
 
 impl Record {
-    pub fn normal(worker_id: u16, data: &[u8]) -> Self {
+    pub fn normal(worker_id: u8, data: &[u8]) -> Self {
         Self {
             worker_id,
             data: unsafe { std::mem::transmute::<&[u8], &[u8]>(data) },
         }
     }
 
-    pub fn remove(worker_id: u16) -> Self {
+    pub fn remove(worker_id: u8) -> Self {
         Self {
             worker_id,
             data: [].as_slice(),
         }
     }
 
-    pub fn worker_id(&self) -> u16 {
+    pub fn worker_id(&self) -> u8 {
         self.worker_id
     }
 
@@ -582,15 +602,15 @@ impl Record {
     }
 
     pub fn from_slice(s: &[u8]) -> Self {
-        let (l, r) = s.split_at(size_of::<u16>());
+        let (l, r) = s.split_at(size_of::<u8>());
         Self {
-            worker_id: slice_to_number!(l, u16),
+            worker_id: slice_to_number!(l, u8),
             data: unsafe { std::mem::transmute::<&[u8], &[u8]>(r) },
         }
     }
 
     pub fn as_slice(&self, s: &mut [u8]) {
-        let (l, r) = s.split_at_mut(size_of::<u16>());
+        let (l, r) = s.split_at_mut(size_of::<u8>());
         number_to_slice!(self.worker_id, l);
         debug_assert_eq!(r.len(), self.data.len());
         debug_assert_ne!(self.data.as_ptr(), r.as_ptr());
@@ -598,7 +618,7 @@ impl Record {
     }
 
     pub fn size(&self) -> usize {
-        size_of::<u16>() + self.data.len()
+        size_of::<u8>() + self.data.len()
     }
 }
 
@@ -622,6 +642,10 @@ impl IDecode for Record {
 impl IVal for Record {
     fn is_tombstone(&self) -> bool {
         self.data.is_empty()
+    }
+
+    fn worker(&self) -> u8 {
+        self.worker_id
     }
 }
 
@@ -671,6 +695,100 @@ impl Ord for Ver {
     }
 }
 
+pub struct IterItem<'a, L: ILoader> {
+    cached_key: Handle<Vec<u8>>,
+    prefix: &'a [u8],
+    pub(crate) base: Key<'a>,
+    pub(crate) val: Val<'a>,
+    pub(crate) key_ref: BoxRef,
+    val_ref: RefCell<Option<BoxRef>>,
+    loader: &'a L,
+}
+
+impl<L> Debug for IterItem<'_, L>
+where
+    L: ILoader,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IterItem")
+            .field("prefix", &to_str(self.prefix))
+            .field("base", &self.base)
+            .finish()
+    }
+}
+
+impl<'a, L> IterItem<'a, L>
+where
+    L: ILoader,
+{
+    pub(crate) fn new(
+        cached_key: Handle<Vec<u8>>,
+        prefix: &'a [u8],
+        base: Key<'a>,
+        val: Val<'a>,
+        key_ref: BoxRef,
+        loader: &'a L,
+    ) -> Self {
+        Self {
+            cached_key,
+            prefix,
+            base,
+            val,
+            key_ref,
+            val_ref: RefCell::new(None),
+            loader,
+        }
+    }
+
+    pub(crate) fn cmp_key(&self, other: &[u8]) -> Ordering {
+        let pos = self.prefix.len().min(other.len());
+        let tmp = self.prefix.cmp(&other[..pos]);
+        match tmp {
+            Ordering::Equal => self.base.raw.cmp(&other[pos..]),
+            _ => tmp,
+        }
+    }
+
+    pub(crate) fn cmp(&self, other: &Self) -> Ordering {
+        match (self.prefix, other.prefix) {
+            (&[], _) => other.cmp_key(self.base.raw).reverse(),
+            (_, &[]) => self.cmp_key(other.base.raw),
+            (s, o) => match s.cmp(o) {
+                Ordering::Equal => self.base.raw.cmp(other.base.raw),
+                x => x,
+            },
+        }
+    }
+
+    pub(crate) fn txid(&self) -> u64 {
+        self.base.ver.txid
+    }
+
+    pub(crate) fn wid(&self) -> u8 {
+        self.val.worker()
+    }
+
+    pub(crate) fn is_tombstone(&self) -> bool {
+        self.val.is_tombstone()
+    }
+
+    /// NOTE: the return Slice is valid only in current iteration
+    pub fn key(&self) -> &[u8] {
+        let mut key = self.cached_key;
+        key.clear();
+        key.extend_from_slice(self.prefix);
+        key.extend_from_slice(self.base.raw);
+        unsafe { std::mem::transmute(key.as_slice()) }
+    }
+
+    /// NOTE: the return Slice is valid only in current iteration
+    pub fn val(&self) -> &[u8] {
+        let (r, v) = self.val.get_record(self.loader, false);
+        *self.val_ref.borrow_mut() = v;
+        r.data
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::{
@@ -684,7 +802,7 @@ mod test {
         types::{
             data::{IntlKey, Record, Val, Ver},
             refbox::{BoxRef, RemoteView},
-            traits::{IAlloc, IBoxHeader, ICodec, IDecode, IHeader, ILoader},
+            traits::{IAlloc, ICodec, IDecode, IHeader, ILoader},
         },
         utils::NULL_ADDR,
     };
@@ -764,8 +882,8 @@ mod test {
                 self.clone()
             }
 
-            fn load_remote(&self, addr: u64) -> Option<crate::types::refbox::BoxView> {
-                self.load(addr)
+            fn load_remote(&self, addr: u64) -> Option<crate::types::refbox::BoxRef> {
+                Some(self.m.borrow().get(&addr).unwrap().clone())
             }
         }
 
@@ -790,9 +908,9 @@ mod test {
             let vd = Val::from_raw(&del_buf);
             let vs = Val::from_raw(&sib_buf);
 
-            let dp = vp.get_record(&l).0;
-            let dd = vd.get_record(&l).0;
-            let ds = vs.get_record(&l).0;
+            let dp = vp.get_record(&l, true).0;
+            let dd = vd.get_record(&l, true).0;
+            let ds = vs.get_record(&l, true).0;
 
             assert!(dp.eq(&put));
             assert!(dd.eq(&del));
@@ -803,7 +921,7 @@ mod test {
             assert_eq!(vs.get_sibling(), Some(sib_addr));
         }
 
-        inline_size = 1;
+        inline_size = 0;
         {
             let mut l = L::new();
             let mut put_buf = vec![0u8; Val::calc_size(false, inline_size, put.packed_size())];
@@ -829,17 +947,20 @@ mod test {
             let vd = Val::from_raw(&del_buf);
             let vs = Val::from_raw(&sib_buf);
 
-            let (dp, rp) = vp.get_record(&l);
-            let (dd, rd) = vd.get_record(&l);
-            let (ds, rs) = vs.get_record(&l);
+            let (dp, rp) = vp.get_record(&l, true);
+            let (dd, rd) = vd.get_record(&l, true);
+            let (ds, rs) = vs.get_record(&l, true);
 
             assert!(dp.eq(&put));
             assert!(dd.eq(&del));
             assert!(ds.eq(&sib));
 
-            assert_eq!(rp.box_header().addr, pa);
-            assert_eq!(rd.box_header().addr, da);
-            assert_eq!(rs.box_header().addr, sa);
+            let rp = rp.unwrap();
+            let rd = rd.unwrap();
+            let rs = rs.unwrap();
+            assert_eq!(rp.header().addr, pa);
+            assert_eq!(rd.header().addr, da);
+            assert_eq!(rs.header().addr, sa);
 
             assert_eq!(vp.get_remote(), pa);
             assert_eq!(vd.get_remote(), da);

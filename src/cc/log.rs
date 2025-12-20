@@ -37,7 +37,7 @@ impl<'a> LogBuilder<'a> {
 }
 
 pub struct Logging {
-    pub worker: u16,
+    pub worker: u8,
     ring: Ring,
     enable_ckpt: AtomicBool,
     /// save last checkpoint position, used by gc

@@ -55,8 +55,8 @@ fn get_impl<K: AsRef<[u8]>>(
     let wid = w.id;
     let start_ts = w.start_ts;
     let key = Key::new(k.as_ref(), Ver::new(start_ts, NULL_CMD));
-    let r = tree.traverse(g, key, |txid, t| {
-        w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid)
+    let r = tree.traverse(g, key, |txid, other_wid| {
+        w.cc.is_visible_to(ctx, wid, other_wid, start_ts, txid)
     })?;
 
     Ok(r)
@@ -82,7 +82,7 @@ where
 
     tree.range(
         b..e.as_slice(),
-        move |ctx, txid, t| w.cc.is_visible_to(ctx, wid, t.worker_id(), start_ts, txid),
+        move |ctx, txid, other_wid| w.cc.is_visible_to(ctx, wid, other_wid, start_ts, txid),
         move || {
             p.destroy();
         },
@@ -130,7 +130,7 @@ impl<'a> TxnKV<'a> {
 
     fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<ValRef>, OpCode>
     where
-        F: FnMut(&Option<(Key, ValRef)>, Ver, SyncWorker) -> Result<(u16, u64), OpCode>,
+        F: FnMut(&Option<(Key, ValRef)>, Ver, SyncWorker) -> Result<(u8, u64), OpCode>,
     {
         #[cfg(feature = "extra_check")]
         assert!(!k.as_ref().is_empty(), "key must be non-empty");
@@ -151,12 +151,11 @@ impl<'a> TxnKV<'a> {
             let r = match opt {
                 None => Ok(()),
                 Some((rk, rv)) => {
-                    let t = rv.unwrap();
                     if rv.is_put()
                         || !w.cc.is_visible_to(
                             self.p.ctx,
                             self.p.w.id,
-                            t.worker_id(),
+                            rv.unwrap().worker_id(),
                             ver.txid,
                             rk.txid,
                         )

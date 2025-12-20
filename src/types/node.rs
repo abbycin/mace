@@ -7,18 +7,17 @@ use std::{
 use crate::{
     types::{
         base::BaseIter,
-        data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
+        data::{Index, IntlKey, IntlSeg, IterItem, Key, LeafSeg, Record, Val, Ver},
         header::{BoxHeader, NodeType},
         imtree::{ImTree, Iter, RangeIter},
-        refbox::{BaseView, BoxView, DeltaView, KeyRef, RemoteView},
+        refbox::{BaseView, BoxView, DeltaView, RemoteView},
         traits::{IAlloc, IAsBoxRef, IBoxHeader, IDecode, IHeader, IKey, ILoader, IVal},
     },
-    utils::{NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID},
+    utils::{Handle, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID},
 };
 
 use super::{header::TagKind, refbox::BoxRef};
 
-#[derive(Clone)]
 pub(crate) struct Node<L: ILoader> {
     /// latest address of delta chain
     pub(super) addr: u64,
@@ -92,6 +91,17 @@ where
         self.loader.pin(b);
         if let Some(x) = r {
             self.loader.pin(x);
+        }
+    }
+
+    pub(crate) fn reference(&self) -> Self {
+        Self {
+            addr: self.addr,
+            total_size: self.total_size,
+            loader: self.loader.shallow_copy(),
+            mtx: self.mtx.clone(),
+            delta: self.delta.clone(),
+            inner: self.inner,
         }
     }
 
@@ -476,13 +486,13 @@ where
             let k = K::decode_from(x.key());
             let v = x.val();
             if k.raw().cmp(key.raw()).is_eq() {
-                let (v, r) = v.get_record(&self.loader);
-                return Some((k, v, r.map_or_else(|| self.base_box(), |x| x.as_box())));
+                let (v, r) = v.get_record(&self.loader, true);
+                return Some((k, v, r.map_or_else(|| self.base_box(), |x| x)));
             }
         }
         self.search_sst(key).map(|(k, v)| {
-            let (v, r) = v.get_record(&self.loader);
-            (k, v, r.map_or_else(|| self.base_box(), |x| x.as_box()))
+            let (v, r) = v.get_record(&self.loader, true);
+            (k, v, r.map_or_else(|| self.base_box(), |x| x))
         })
     }
 
@@ -534,7 +544,7 @@ where
             for x in it {
                 let k = Key::decode_from(x.key());
                 let val = x.val();
-                let (r, _) = val.get_record(&self.loader);
+                let (r, _) = val.get_record(&self.loader, true);
                 log::debug!("{} => {}", k.to_string(), r);
             }
             let sst = self.sst::<Key>();
@@ -586,12 +596,16 @@ where
     }
 
     #[allow(clippy::iter_skip_zero)]
-    pub(crate) fn successor(&self, b: &Bound<KeyRef>) -> RawLeafIter<'_, L> {
-        fn cmp_fn(x: &DeltaView, y: &KeyRef) -> Ordering {
-            Key::decode_from(x.key()).raw.cmp(y.key())
+    pub(crate) fn successor<'a>(
+        &'a self,
+        b: &'a Bound<Vec<u8>>,
+        cached_key: Handle<Vec<u8>>,
+    ) -> RawLeafIter<'a, L> {
+        fn cmp_fn(x: &DeltaView, y: &&[u8]) -> Ordering {
+            Key::decode_from(x.key()).raw.cmp(y)
         }
 
-        fn equal_fn(_x: &DeltaView, _y: &KeyRef) -> bool {
+        fn equal_fn(_x: &DeltaView, _y: &&[u8]) -> bool {
             true
         }
 
@@ -599,26 +613,29 @@ where
         let (delta, pos) = match b {
             Bound::Unbounded => (IterAdaptor::Iter(self.delta.iter().skip(0)), 0),
             Bound::Included(b) => {
-                let r = self.delta.range_from(b.clone(), cmp_fn, equal_fn).skip(0);
+                let r = self
+                    .delta
+                    .range_from(b.as_slice(), cmp_fn, equal_fn)
+                    .skip(0);
 
                 let lo = self.lo();
 
-                let pos = if b.key() < lo {
+                let pos = if b.as_slice() < lo {
                     Err(0)
                 } else {
-                    let key = Key::new(b.key(), Ver::new(NULL_ORACLE, NULL_CMD));
+                    let key = Key::new(b, Ver::new(NULL_ORACLE, NULL_CMD));
                     self.sst::<Key>().lower_bound(&key)
                 };
 
                 (IterAdaptor::Range(r), pos.unwrap_or_else(|x| x))
             }
             Bound::Excluded(b) => {
-                let iter = self.delta.range_from(b.clone(), cmp_fn, equal_fn);
+                let iter = self.delta.range_from(b.as_slice(), cmp_fn, equal_fn);
                 let delta = if self
                     .delta
                     .find(&b, |x, y| {
                         let k = Key::decode_from(x.key());
-                        k.raw.cmp(y.key())
+                        k.raw.cmp(y)
                     })
                     .is_some()
                 {
@@ -628,10 +645,10 @@ where
                 };
 
                 let lo = self.lo();
-                let inner_pos = if b.key() < lo {
+                let inner_pos = if b.as_slice() < lo {
                     Err(0)
                 } else {
-                    let key = Key::new(b.key(), Ver::new(NULL_ORACLE, NULL_CMD));
+                    let key = Key::new(b, Ver::new(NULL_ORACLE, NULL_CMD));
                     self.sst::<Key>().lower_bound(&key)
                 };
                 let pos = match inner_pos {
@@ -646,6 +663,8 @@ where
         let len = self.header().prefix_len as usize;
 
         RawLeafIter {
+            cached_key,
+            base_box: self.base_box(),
             prefix: &lo[..len],
             next_l: None,
             next_r: None,
@@ -720,11 +739,13 @@ pub(crate) struct RawLeafIter<'a, L>
 where
     L: ILoader,
 {
+    cached_key: Handle<Vec<u8>>,
+    base_box: BoxRef,
     prefix: &'a [u8],
-    next_l: Option<(Key<'a>, Record, KeyRef, Option<BoxRef>)>,
-    next_r: Option<(Key<'a>, Record, KeyRef, Option<BoxRef>)>,
+    next_l: Option<IterItem<'a, L>>,
+    next_r: Option<IterItem<'a, L>>,
     sst_iter: BaseIter<'a, L, Key<'a>>,
-    delta_iter: IterAdaptor<'a, KeyRef>,
+    delta_iter: IterAdaptor<'a, &'a [u8]>,
 }
 
 impl<'a, L> Iterator for IntlIter<'a, L>
@@ -856,33 +877,33 @@ impl<'a, L> Iterator for RawLeafIter<'a, L>
 where
     L: ILoader,
 {
-    type Item = (Key<'a>, Record, KeyRef, Option<BoxRef>);
+    type Item = IterItem<'a, L>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_l.is_none()
             && let Some(x) = self.delta_iter.next()
         {
             let k = Key::decode_from(x.key());
-            let val = x.val();
-            let (v, r) = val.get_record(self.sst_iter.loader);
-            self.next_l = Some((
+            self.next_l = Some(IterItem::new(
+                self.cached_key,
+                &[],
                 k,
-                v,
-                KeyRef::new(k.raw, x.as_box()),
-                r.map_or(None, |x| Some(x.as_box())),
+                x.val(),
+                x.as_box(),
+                self.sst_iter.loader,
             ));
         }
 
         if self.next_r.is_none()
             && let Some((k, val)) = self.sst_iter.next()
         {
-            let kr = KeyRef::build(self.prefix, k.raw);
-            let (v, r) = val.get_record(self.sst_iter.loader);
-            self.next_r = Some((
-                Key::new(kr.key(), k.ver),
-                v,
-                kr,
-                r.map_or(None, |x| Some(x.as_box())),
+            self.next_r = Some(IterItem::new(
+                self.cached_key,
+                self.prefix,
+                k,
+                val,
+                self.base_box.clone(),
+                self.sst_iter.loader,
             ));
         }
 
@@ -890,7 +911,7 @@ where
             (None, None) => None,
             (None, Some(r)) => Some(r),
             (Some(l), None) => Some(l),
-            (Some(l), Some(r)) => match l.0.cmp(&r.0) {
+            (Some(l), Some(r)) => match l.cmp(&r) {
                 Less => {
                     self.next_r = Some(r);
                     Some(l)
@@ -1043,8 +1064,8 @@ mod test {
             self.clone()
         }
 
-        fn load_remote(&self, addr: u64) -> Option<BoxView> {
-            <Self as ILoader>::load(self, addr)
+        fn load_remote(&self, addr: u64) -> Option<BoxRef> {
+            Some(self.load(addr))
         }
     }
 

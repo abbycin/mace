@@ -1,3 +1,7 @@
+## [0.0.20] 2025-12-20
+### Changes
+- Optimize prefix scanning performance
+
 ## [0.0.19] 2025-11-17
 ### Bug fixes
 - Fixed compile error introduced in 0.0.18 on Windows

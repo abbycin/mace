@@ -131,7 +131,7 @@ impl Recovery {
     fn analyze(
         &mut self,
         g: &Guard,
-        wid: u16,
+        wid: u8,
         addr: Position,
         block: &mut Block,
         tree: &Tree,
@@ -261,7 +261,7 @@ impl Recovery {
         if let Some(f) = cache.get(&id) {
             Some(f.clone())
         } else {
-            let path = opt.wal_file(wid as u16, seq);
+            let path = opt.wal_file(wid as u8, seq);
             if !path.exists() {
                 return None;
             }

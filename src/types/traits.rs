@@ -12,13 +12,17 @@ pub trait ILoader: Clone {
 
     fn load(&self, addr: u64) -> Option<BoxView>;
 
-    fn load_remote(&self, addr: u64) -> Option<BoxView>;
+    fn load_remote(&self, addr: u64) -> Option<BoxRef>;
+
+    fn load_remote_uncached(&self, _addr: u64) -> BoxRef {
+        unimplemented!()
+    }
 
     fn load_unchecked(&self, addr: u64) -> BoxView {
         self.load(addr).expect("must exist")
     }
 
-    fn load_remote_unchecked(&self, addr: u64) -> BoxView {
+    fn load_remote_unchecked(&self, addr: u64) -> BoxRef {
         self.load_remote(addr).expect("must exist")
     }
 }
@@ -71,6 +75,10 @@ pub trait IKeyCodec: ICodec {
 
 pub trait IVal: ICodec + Clone {
     fn is_tombstone(&self) -> bool;
+
+    fn worker(&self) -> u8 {
+        unimplemented!()
+    }
 }
 
 pub trait ITree {

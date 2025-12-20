@@ -66,7 +66,7 @@ pub(crate) struct Arena {
     cap: usize,
     refs: AtomicU32,
     pub(crate) state: AtomicU16,
-    workers: u16,
+    workers: u8,
 }
 
 impl Deref for Arena {
@@ -100,7 +100,7 @@ impl Arena {
         }
     }
 
-    pub(crate) fn new(cap: usize, workers: u16) -> Self {
+    pub(crate) fn new(cap: usize, workers: u8) -> Self {
         Self {
             items: DashMap::with_capacity(16 << 10),
             flsn: Self::alloc_flsn(workers as usize),
@@ -128,8 +128,8 @@ impl Arena {
         self.cap
     }
 
-    pub(crate) fn workers(&self) -> u16 {
-        self.flsn.len() as u16
+    pub(crate) fn workers(&self) -> u8 {
+        self.flsn.len() as u8
     }
 
     fn alloc_size(&self, size: u32) -> Result<(), OpCode> {

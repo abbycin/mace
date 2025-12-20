@@ -13,47 +13,10 @@ use super::traits::{IAsBoxRef, IBoxHeader, IHeader};
 static_assert!(BoxRef::HDR_LEN == 40);
 static_assert!(align_of::<BoxHeader>() == align_of::<*const ()>());
 
-#[derive(Clone)]
-pub(crate) struct KeyRef {
-    key: &'static [u8],
-    _src: BoxRef,
-}
-
-impl KeyRef {
-    /// the `key` must be a segment in `x`
-    pub(crate) fn new(key: &[u8], x: BoxRef) -> Self {
-        Self {
-            key: unsafe { std::mem::transmute::<&[u8], &[u8]>(key) },
-            _src: x,
-        }
-    }
-
-    pub(crate) fn build(prefix: &[u8], base: &[u8]) -> Self {
-        let len = prefix.len() + base.len();
-        let mut b = BoxRef::alloc(len as u32, NULL_ADDR);
-        let (dp, db) = b.data_slice_mut()[..len].split_at_mut(prefix.len());
-        dp.copy_from_slice(prefix);
-        db.copy_from_slice(base);
-        let key = unsafe { std::mem::transmute::<&[u8], &[u8]>(&b.data_slice::<u8>()[..len]) };
-        Self { key, _src: b }
-    }
-
-    pub(crate) fn copy(x: &[u8]) -> Self {
-        let mut b = BoxRef::alloc(x.len() as u32, NULL_ADDR);
-        b.data_slice_mut()[..x.len()].copy_from_slice(x);
-        let key = unsafe { std::mem::transmute::<&[u8], &[u8]>(&b.data_slice::<u8>()[..x.len()]) };
-        Self { key, _src: b }
-    }
-
-    pub(crate) fn key<'a>(&self) -> &'a [u8] {
-        self.key
-    }
-}
-
-pub(crate) struct BoxRef(*mut BoxHeader);
+pub struct BoxRef(*mut BoxHeader);
 
 #[derive(Clone, Copy)]
-pub(crate) struct BoxView(*mut BoxHeader);
+pub struct BoxView(*mut BoxHeader);
 
 #[derive(Clone, Copy)]
 pub(crate) struct DeltaView(pub(super) *mut DeltaHeader);

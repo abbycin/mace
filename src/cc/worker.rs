@@ -27,7 +27,7 @@ pub struct Worker {
     pub tx_id: AtomicU64,
     // a copy of tx_id not shared among threads
     pub start_ts: u64,
-    pub id: u16,
+    pub id: u8,
     pub logging: Logging,
     pub modified: bool,
 }

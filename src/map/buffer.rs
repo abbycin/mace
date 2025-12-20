@@ -27,6 +27,8 @@ use super::{cache::CacheState, data::FlushData, flush::Flush};
 use crate::map::cache::NodeCache;
 use crate::map::table::PageMap;
 use crate::types::refbox::BoxRef;
+#[allow(unused_imports)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 
 struct Ids {
@@ -482,18 +484,24 @@ impl ILoader for Loader {
         }
     }
 
-    fn load_remote(&self, addr: u64) -> Option<BoxView> {
+    fn load_remote(&self, addr: u64) -> Option<BoxRef> {
         if let Some(x) = self.cache.get(addr) {
-            return Some(x.view());
+            return Some(x.clone());
         }
         if let Some(x) = self.pool.load(addr) {
             self.cache.add(CachePriority::Low, addr, x.clone());
-            return Some(x.view());
+            return Some(x.clone());
         }
 
         let b = self.ctx.manifest.load_blob(addr)?;
-        let v = b.view();
-        self.cache.add(CachePriority::Low, addr, b);
-        Some(v)
+        self.cache.add(CachePriority::Low, addr, b.clone());
+        Some(b)
+    }
+
+    fn load_remote_uncached(&self, addr: u64) -> BoxRef {
+        if let Some(x) = self.pool.load(addr) {
+            return x;
+        }
+        self.ctx.manifest.load_blob(addr).expect("must exist")
     }
 }

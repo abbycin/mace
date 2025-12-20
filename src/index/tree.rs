@@ -3,11 +3,11 @@ use super::{Node, Page, systxn::SysTxn};
 use crate::Options;
 use crate::cc::context::Context;
 use crate::map::buffer::Loader;
-use crate::types::data::{Record, Val};
+use crate::types::data::{IterItem, Record, Val};
 use crate::types::node::RawLeafIter;
-use crate::types::refbox::{DeltaView, KeyRef};
+use crate::types::refbox::DeltaView;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
-use crate::utils::{MutRef, ROOT_PID};
+use crate::utils::{Handle, MutRef, ROOT_PID};
 use crate::{
     OpCode, Store,
     types::{
@@ -482,8 +482,11 @@ impl Tree {
                 txn.commit();
             }
 
-            if !leftmost && parent_opt.is_some() && node_ptr.should_merge() {
-                self.try_merge(g, parent_opt.unwrap(), node_ptr)?;
+            if !leftmost
+                && let Some(parent) = parent_opt
+                && node_ptr.should_merge()
+            {
+                self.try_merge(g, parent, node_ptr)?;
                 return Err(OpCode::Again);
             }
 
@@ -546,7 +549,7 @@ impl Tree {
     where
         K: IKey,
         V: IVal,
-        F: FnMut(Page, &K) -> Result<(u16, u64), OpCode>,
+        F: FnMut(Page, &K) -> Result<(u8, u64), OpCode>,
     {
         let (wid, seq) = check(old, k)?;
 
@@ -610,7 +613,7 @@ impl Tree {
     ) -> Result<Option<ValRef>, OpCode>
     where
         V: IVal,
-        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u16, u64), OpCode>,
+        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, u64), OpCode>,
     {
         let page = self.find_leaf(g, key.raw)?;
         let mut r = None;
@@ -635,7 +638,7 @@ impl Tree {
     ) -> Result<Option<ValRef>, OpCode>
     where
         V: IVal,
-        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u16, u64), OpCode>,
+        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, u64), OpCode>,
     {
         let size = key.packed_size() + val.packed_size();
         if size > Options::MAX_KV_SIZE {
@@ -669,13 +672,13 @@ impl Tree {
     where
         K: AsRef<[u8]>,
         R: RangeBounds<K>,
-        F: FnMut(&Context, u64, &Record) -> bool + 'a,
+        F: FnMut(&Context, u64, u8) -> bool + 'a,
         D: Fn() + 'a,
     {
         let lo = match range.start_bound() {
-            Bound::Included(b) => Bound::Included(KeyRef::copy(b.as_ref())),
-            Bound::Excluded(b) => Bound::Excluded(KeyRef::copy(b.as_ref())),
-            Bound::Unbounded => Bound::Included(KeyRef::copy(&[])),
+            Bound::Included(b) => Bound::Included(b.as_ref().to_vec()),
+            Bound::Excluded(b) => Bound::Excluded(b.as_ref().to_vec()),
+            Bound::Unbounded => Bound::Included(Vec::new()),
         };
         let hi = match range.end_bound() {
             Bound::Included(e) => Bound::Included(e.as_ref().to_vec()),
@@ -685,9 +688,9 @@ impl Tree {
 
         Iter {
             tree: self,
+            cached_key: Handle::new(Vec::new()),
             lo,
             hi,
-            val_ref: None,
             iter: None,
             cache: None,
             checker: Box::new(visible),
@@ -708,7 +711,7 @@ impl Tree {
     ) -> Result<ValRef, OpCode>
     where
         L: ILoader,
-        F: FnMut(u64, &Record) -> bool,
+        F: FnMut(u64, u8) -> bool,
     {
         let ver = Ver::new(start_ts, NULL_CMD);
 
@@ -718,12 +721,12 @@ impl Tree {
             let pos = sst.lower_bound(&ver).unwrap_or_else(|pos| pos);
             if pos < sst.header().elems as usize {
                 let (k, v) = sst.kv_at::<Val>(pos);
-                let (v, r) = v.get_record(l);
-                if visible(k.txid, &v) {
+                if visible(k.txid, v.worker()) {
+                    let (v, r) = v.get_record(l, true);
                     if v.is_tombstone() {
                         return Err(OpCode::NotFound);
                     }
-                    return Ok(ValRef::new(v, r.map_or(ptr.as_box(), |x| x.as_box())));
+                    return Ok(ValRef::new(v, r.map_or(ptr.as_box(), |x| x)));
                 }
             }
             addr = ptr.box_header().link;
@@ -733,7 +736,7 @@ impl Tree {
 
     pub fn traverse<F>(&self, g: &Guard, key: Key, mut visible: F) -> Result<ValRef, OpCode>
     where
-        F: FnMut(u64, &Record) -> bool,
+        F: FnMut(u64, u8) -> bool,
     {
         let page = self.find_leaf(g, key.raw)?;
 
@@ -754,10 +757,10 @@ impl Tree {
             if val.is_tombstone() {
                 return Err(OpCode::NotFound);
             }
-            let (r, v) = val.get_record(page.loader());
             let k = Key::decode_from(x.key());
-            if visible(k.txid, &r) {
-                return Ok(ValRef::new(r, v.map_or_else(|| x.as_box(), |x| x.as_box())));
+            if visible(k.txid, val.worker()) {
+                let (r, v) = val.get_record(page.loader(), true);
+                return Ok(ValRef::new(r, v.map_or_else(|| x.as_box(), |x| x)));
             }
         }
 
@@ -766,11 +769,11 @@ impl Tree {
         if val.is_tombstone() {
             return Err(OpCode::NotFound);
         }
-        let (record, r) = val.get_record(page.loader());
-        if visible(k.txid, &record) {
+        if visible(k.txid, val.worker()) {
+            let (record, r) = val.get_record(page.loader(), true);
             return Ok(ValRef::new(
                 record,
-                r.map_or_else(|| page.base_box(), |x| x.as_box()),
+                r.map_or_else(|| page.base_box(), |x| x),
             ));
         }
         if let Some(addr) = val.get_sibling() {
@@ -792,18 +795,19 @@ impl ITree for Tree {
 
 pub struct Iter<'a> {
     tree: &'a Tree,
-    lo: Bound<KeyRef>,
+    cached_key: Handle<Vec<u8>>,
+    lo: Bound<Vec<u8>>,
     hi: Bound<Vec<u8>>,
-    val_ref: Option<BoxRef>,
     iter: Option<RawLeafIter<'a, Loader>>,
     cache: Option<Node>,
-    checker: Box<dyn FnMut(&Context, u64, &Record) -> bool + 'a>,
+    checker: Box<dyn FnMut(&Context, u64, u8) -> bool + 'a>,
     dtor: Box<dyn Fn() + 'a>,
     filter: Filter<'a>,
 }
 
 impl Drop for Iter<'_> {
     fn drop(&mut self) {
+        self.cached_key.reclaim();
         (self.dtor)();
     }
 }
@@ -812,27 +816,7 @@ impl Iter<'_> {
     fn low_key(&self) -> &[u8] {
         match self.lo {
             Bound::Unbounded => &[],
-            Bound::Excluded(ref x) | Bound::Included(ref x) => x.key(),
-        }
-    }
-
-    fn is_lt_upper(&self, node: &Node) -> bool {
-        if let Some(hi) = node.hi() {
-            match self.lo.as_ref() {
-                Bound::Excluded(b) if hi >= b.key() => true,
-                Bound::Included(b) if hi > b.key() => true,
-                _ => false,
-            }
-        } else {
-            true
-        }
-    }
-
-    fn is_gt_lower(&self, node: &Node) -> bool {
-        let lo = node.lo();
-        match self.lo.as_ref() {
-            Bound::Excluded(b) | Bound::Included(b) if lo <= b.key() => true,
-            _ => lo.is_empty(),
+            Bound::Excluded(ref x) | Bound::Included(ref x) => x,
         }
     }
 
@@ -841,106 +825,69 @@ impl Iter<'_> {
             (Bound::Included(b), Bound::Included(e))
             | (Bound::Excluded(b), Bound::Excluded(e))
             | (Bound::Included(b), Bound::Excluded(e))
-            | (Bound::Excluded(b), Bound::Included(e)) => b.key() > e,
+            | (Bound::Excluded(b), Bound::Included(e)) => b > e,
             _ => false,
         }
     }
 
-    fn predecessor(&self, x: &[u8]) -> Option<Vec<u8>> {
-        let mut tmp = x.to_vec();
-
-        if let Some(x) = tmp.last_mut() {
-            if *x > 0 {
-                *x -= 1;
-            } else {
-                tmp.pop();
-            }
-        } else {
-            return None;
-        }
-        Some(tmp)
-    }
-
     fn get_next(&mut self) -> Option<<Self as Iterator>::Item> {
-        let g = crossbeam_epoch::pin();
-        self.val_ref = None;
-
         while !self.collapsed() {
-            let node = if let Some(node) = self.cache.take() {
-                node
-            } else {
-                let p = self.tree.find_leaf(&g, self.low_key()).unwrap();
-                p.clone_node()
-            };
-
-            self.cache = Some(node);
-            let node = self.cache.as_ref().unwrap();
-
-            if !self.is_lt_upper(node) {
-                // merged or exhausted
-                let p = self.tree.find_leaf(&g, self.low_key()).unwrap();
-                self.cache = Some(p.clone_node());
-                self.iter.take();
-                continue;
-            } else if !self.is_gt_lower(node) {
-                // split or exhuasted
-                let lo = node.lo();
-                let next = self.predecessor(lo)?;
-                let p = self.tree.find_leaf(&g, &next).unwrap();
-                self.cache = Some(p.clone_node());
-                self.iter.take();
-                continue;
-            }
-
             if self.iter.is_none() {
-                let iter = node.successor(&self.lo);
-                // iter is always valid when node is valid
+                let g = crossbeam_epoch::pin();
+                let node = self.tree.find_leaf(&g, self.low_key()).expect("must exist");
                 self.iter = Some(unsafe {
-                    std::mem::transmute::<RawLeafIter<'_, Loader>, RawLeafIter<'_, Loader>>(iter)
+                    std::mem::transmute::<RawLeafIter<'_, Loader>, RawLeafIter<'_, Loader>>(
+                        node.successor(&self.lo, self.cached_key),
+                    )
                 });
+                self.cache = Some(node.ref_node());
             }
 
-            let iter = self.iter.as_mut().unwrap();
-            let r = iter.find(|(k, v, kr, _vr)| {
+            let iter = self.iter.as_mut().expect("must valid");
+            let r = iter.find(|item| {
                 let ok = match &self.lo {
                     Bound::Unbounded => true,
-                    Bound::Included(b) => k.raw >= b.key(),
-                    Bound::Excluded(b) => k.raw > b.key(),
+                    Bound::Included(b) => item.cmp_key(b.as_slice()).is_ge(),
+                    Bound::Excluded(b) => item.cmp_key(b.as_slice()).is_gt(),
                 };
-                if ok && (self.checker)(&self.tree.store.context, k.txid, v) {
-                    self.filter.check(k.raw, v.is_tombstone(), kr.clone())
+                if ok && (self.checker)(&self.tree.store.context, item.txid(), item.wid()) {
+                    self.filter
+                        .check(item.base.raw, item.is_tombstone(), item.key_ref.clone())
                 } else {
                     false
                 }
             });
 
-            if let Some((k, v, kr, vr)) = r.map(|(k, v, kr, vr)| (k.raw, v, kr, vr)) {
-                self.lo = Bound::Excluded(kr);
-                self.val_ref = vr;
-                // it's safe, since `b` has been saved
-                let v = unsafe { std::mem::transmute::<&[u8], &[u8]>(v.data()) };
+            if let Some(item) = r {
+                self.lo = Bound::Excluded(item.key().to_vec());
 
                 match self.hi {
-                    Bound::Unbounded => return Some((k, v)),
-                    Bound::Included(ref h) if h.as_slice() >= k => return Some((k, v)),
-                    Bound::Excluded(ref h) if h.as_slice() > k => return Some((k, v)),
+                    Bound::Unbounded => return Some(item),
+                    Bound::Included(ref h) if item.cmp_key(h.as_slice()).is_le() => {
+                        return Some(item);
+                    }
+                    Bound::Excluded(ref h) if item.cmp_key(h.as_slice()).is_lt() => {
+                        return Some(item);
+                    }
                     _ => return None,
                 }
             } else {
                 self.iter.take();
+                let node = self.cache.as_ref().expect("must valid");
                 if let Some(hi) = node.hi() {
-                    self.lo = Bound::Included(KeyRef::copy(hi));
+                    self.lo = Bound::Included(hi.to_vec());
                     continue;
                 }
-                return None;
+                break;
             }
         }
+
         None
     }
 }
 
 impl<'a> Iterator for Iter<'a> {
-    type Item = (&'a [u8], &'a [u8]);
+    type Item = IterItem<'a, Loader>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.get_next()
@@ -948,18 +895,19 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 struct Filter<'a> {
+    /// base part of key
     last: Option<&'a [u8]>,
-    holder: Option<KeyRef>,
+    holder: Option<BoxRef>,
 }
 
 impl<'a> Filter<'a> {
-    fn check(&mut self, k: &'a [u8], is_del: bool, r: KeyRef) -> bool {
+    fn check(&mut self, k: &'a [u8], is_del: bool, key_owner: BoxRef) -> bool {
         if let Some(last) = self.last
             && last == k
         {
             return false;
         }
-        self.holder = Some(r);
+        self.holder = Some(key_owner);
         self.last = Some(k);
         !is_del
     }
