@@ -450,6 +450,64 @@ fn cross_txn() {
     assert_eq!(r.slice(), "2".as_bytes());
 }
 
+#[test]
+fn smo_during_scan() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.split_elems = 128;
+
+    let db = Mace::new(opt.validate()?)?;
+    let data: Vec<String> = (0..512).map(|x| format!("key_{x}")).collect();
+    let mut target = Vec::new();
+
+    for (i, x) in data.iter().enumerate() {
+        if i % 2 == 0 {
+            let kv = db.begin()?;
+            kv.put(x, x)?;
+            kv.commit()?;
+            target.push(x.clone());
+        }
+    }
+
+    target.sort();
+
+    let view = db.view()?;
+    let mut iter = view.seek("key");
+    let mut idx = 0;
+    for (i, x) in data.iter().enumerate() {
+        if i % 2 != 0 {
+            let kv = db.begin()?;
+            kv.put(x, x)?;
+            kv.commit()?;
+        } else if let Some(item) = iter.next() {
+            assert_eq!(item.key(), target[idx].as_bytes());
+            idx += 1;
+        }
+    }
+
+    assert_eq!(idx, target.len());
+
+    drop(iter);
+
+    let mut iter = view.seek("key");
+    idx = 0;
+    // merge is hard to trigger, so we just do a simple test
+    for x in data.iter() {
+        let kv = db.begin()?;
+        kv.del(x)?;
+        kv.commit()?;
+
+        if let Some(item) = iter.next() {
+            assert_eq!(item.key(), target[idx].as_bytes());
+            idx += 1;
+        }
+    }
+    assert_eq!(idx, target.len());
+
+    Ok(())
+}
+
 fn to_str(x: &[u8]) -> &str {
     unsafe { std::str::from_utf8_unchecked(x) }
 }

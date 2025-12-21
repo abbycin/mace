@@ -21,7 +21,7 @@ use crate::{
 use crossbeam_epoch::Guard;
 use std::borrow::Cow;
 use std::cmp::Ordering::Equal;
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Deref, RangeBounds};
 #[cfg(feature = "metric")]
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -675,10 +675,17 @@ impl Tree {
         F: FnMut(&Context, u64, u8) -> bool + 'a,
         D: Fn() + 'a,
     {
+        let mut cached_key = Handle::new(Vec::new());
         let lo = match range.start_bound() {
-            Bound::Included(b) => Bound::Included(b.as_ref().to_vec()),
-            Bound::Excluded(b) => Bound::Excluded(b.as_ref().to_vec()),
-            Bound::Unbounded => Bound::Included(Vec::new()),
+            Bound::Included(b) => {
+                cached_key.extend_from_slice(b.as_ref());
+                Bound::Included(cached_key)
+            }
+            Bound::Excluded(b) => {
+                cached_key.extend_from_slice(b.as_ref());
+                Bound::Excluded(cached_key)
+            }
+            Bound::Unbounded => Bound::Included(cached_key),
         };
         let hi = match range.end_bound() {
             Bound::Included(e) => Bound::Included(e.as_ref().to_vec()),
@@ -688,7 +695,7 @@ impl Tree {
 
         Iter {
             tree: self,
-            cached_key: Handle::new(Vec::new()),
+            cached_key,
             lo,
             hi,
             iter: None,
@@ -796,7 +803,8 @@ impl ITree for Tree {
 pub struct Iter<'a> {
     tree: &'a Tree,
     cached_key: Handle<Vec<u8>>,
-    lo: Bound<Vec<u8>>,
+    /// share same handle with cached_key avoid extra allocation
+    lo: Bound<Handle<Vec<u8>>>,
     hi: Bound<Vec<u8>>,
     iter: Option<RawLeafIter<'a, Loader>>,
     cache: Option<Node>,
@@ -825,7 +833,7 @@ impl Iter<'_> {
             (Bound::Included(b), Bound::Included(e))
             | (Bound::Excluded(b), Bound::Excluded(e))
             | (Bound::Included(b), Bound::Excluded(e))
-            | (Bound::Excluded(b), Bound::Included(e)) => b > e,
+            | (Bound::Excluded(b), Bound::Included(e)) => b.deref() > e,
             _ => false,
         }
     }
@@ -859,7 +867,7 @@ impl Iter<'_> {
             });
 
             if let Some(item) = r {
-                self.lo = Bound::Excluded(item.key().to_vec());
+                self.lo = Bound::Excluded(item.assembled_key());
 
                 match self.hi {
                     Bound::Unbounded => return Some(item),
@@ -875,7 +883,9 @@ impl Iter<'_> {
                 self.iter.take();
                 let node = self.cache.as_ref().expect("must valid");
                 if let Some(hi) = node.hi() {
-                    self.lo = Bound::Included(hi.to_vec());
+                    self.cached_key.clear();
+                    self.cached_key.extend_from_slice(hi);
+                    self.lo = Bound::Included(self.cached_key);
                     continue;
                 }
                 break;

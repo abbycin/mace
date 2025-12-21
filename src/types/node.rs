@@ -598,7 +598,7 @@ where
     #[allow(clippy::iter_skip_zero)]
     pub(crate) fn successor<'a>(
         &'a self,
-        b: &'a Bound<Vec<u8>>,
+        b: &'a Bound<Handle<Vec<u8>>>,
         cached_key: Handle<Vec<u8>>,
     ) -> RawLeafIter<'a, L> {
         fn cmp_fn(x: &DeltaView, y: &&[u8]) -> Ordering {
@@ -866,6 +866,7 @@ where
                             return Some(r);
                         }
                     }
+                    // because txid is monotonically increasing, two `Key`s will never be equal
                     Equal => unreachable!("never happen"),
                 },
             }
@@ -920,7 +921,12 @@ where
                     self.next_l = Some(l);
                     Some(r)
                 }
-                Equal => unreachable!("never happen"),
+                Equal => {
+                    // old key may be updated or deleted (or both), we simply return the latest one
+                    // and do visibility check outside
+                    self.next_r = Some(r);
+                    Some(l)
+                }
             },
         };
     }

@@ -1,3 +1,10 @@
+## [0.0.21] 2025-12-21
+### Changes
+- Share cache_key with lo in Iter to avoid extra allocation
+
+### Bug fixes
+- Fixed scan crash when key in base was updated or deleted (or both), it's possible when a node was scanned and swith to another node and the key in that node was changed by other transaction
+
 ## [0.0.20] 2025-12-20
 ### Changes
 - Optimize prefix scanning performance

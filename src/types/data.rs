@@ -772,13 +772,17 @@ where
         self.val.is_tombstone()
     }
 
-    /// NOTE: the return Slice is valid only in current iteration
-    pub fn key(&self) -> &[u8] {
+    pub(crate) fn assembled_key(&self) -> Handle<Vec<u8>> {
         let mut key = self.cached_key;
         key.clear();
         key.extend_from_slice(self.prefix);
         key.extend_from_slice(self.base.raw);
-        unsafe { std::mem::transmute(key.as_slice()) }
+        key
+    }
+
+    /// NOTE: the return Slice is valid only in current iteration
+    pub fn key(&self) -> &[u8] {
+        unsafe { std::mem::transmute(self.cached_key.as_slice()) }
     }
 
     /// NOTE: the return Slice is valid only in current iteration

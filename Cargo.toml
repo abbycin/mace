@@ -1,12 +1,12 @@
 [package]
 name = "mace-kv"
-version = "0.0.20"
+version = "0.0.21"
 edition = "2024"
 authors = ["abbytsing@gmail.com"]
 readme = "README.md"
 homepage = "https://github.com/abbycin/mace"
 repository = "https://github.com/abbycin/mace"
-description = "An fast embedded key-value storage engine with ACID support"
+description = "A fast embedded key-value storage engine with ACID support"
 license = "MIT"
 categories = ["database"]
 keywords = ["database"]
