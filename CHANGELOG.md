@@ -1,3 +1,10 @@
+## [0.0.22] 2025-12-26
+### Changes
+- Stop share cache_key with lo, because it's obscure and hard to understand
+### Bug fixes
+- Fxied Iter can return wrong key-value, because when newer version of key is in delta it's not separated to prefix + base, so store base in Filter is wrong, change to store full key
+- Fxied `Node::find_latest`, the expect behavior is return latest version of data based on given key and version, the original implementation use binary search which is wrong when key + version is not exist in ImTree, use `range_from` instead
+
 ## [0.0.21] 2025-12-21
 ### Changes
 - Share cache_key with lo in Iter to avoid extra allocation

@@ -700,7 +700,6 @@ pub struct IterItem<'a, L: ILoader> {
     prefix: &'a [u8],
     pub(crate) base: Key<'a>,
     pub(crate) val: Val<'a>,
-    pub(crate) key_ref: BoxRef,
     val_ref: RefCell<Option<BoxRef>>,
     loader: &'a L,
 }
@@ -726,7 +725,6 @@ where
         prefix: &'a [u8],
         base: Key<'a>,
         val: Val<'a>,
-        key_ref: BoxRef,
         loader: &'a L,
     ) -> Self {
         Self {
@@ -734,7 +732,6 @@ where
             prefix,
             base,
             val,
-            key_ref,
             val_ref: RefCell::new(None),
             loader,
         }

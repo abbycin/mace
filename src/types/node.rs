@@ -476,20 +476,24 @@ where
 
     /// when value is inlined return node (or delta) or else retuen remote, the node (or delta) is
     /// always valid when node is valid, the returned key is valid too
-    pub(crate) fn find_latest<K, F>(&self, key: &K, f: F) -> Option<(K, Record, BoxRef)>
+    pub(crate) fn find_latest<K>(&self, key: &K) -> Option<(K, Record, BoxRef)>
     where
         K: IKey,
-        F: Fn(&K, &K) -> Ordering,
     {
-        let data = self.delta.find(key, |x, y| f(&K::decode_from(x.key()), y));
-        if let Some(x) = data {
+        debug_assert!(!self.inner.header().is_index);
+        let mut iter = self.delta.range_from(
+            *key,
+            |x, y| K::decode_from(x.key()).cmp(y),
+            |x, y| K::decode_from(x.key()).raw() == y.raw(),
+        );
+        if let Some(x) = iter.next() {
             let k = K::decode_from(x.key());
+            debug_assert_eq!(k.raw(), key.raw());
             let v = x.val();
-            if k.raw().cmp(key.raw()).is_eq() {
-                let (v, r) = v.get_record(&self.loader, true);
-                return Some((k, v, r.map_or_else(|| self.base_box(), |x| x)));
-            }
+            let (v, r) = v.get_record(&self.loader, true);
+            return Some((k, v, r.map_or_else(|| self.base_box(), |x| x)));
         }
+
         self.search_sst(key).map(|(k, v)| {
             let (v, r) = v.get_record(&self.loader, true);
             (k, v, r.map_or_else(|| self.base_box(), |x| x))
@@ -598,7 +602,7 @@ where
     #[allow(clippy::iter_skip_zero)]
     pub(crate) fn successor<'a>(
         &'a self,
-        b: &'a Bound<Handle<Vec<u8>>>,
+        b: &'a Bound<Vec<u8>>,
         cached_key: Handle<Vec<u8>>,
     ) -> RawLeafIter<'a, L> {
         fn cmp_fn(x: &DeltaView, y: &&[u8]) -> Ordering {
@@ -631,13 +635,8 @@ where
             }
             Bound::Excluded(b) => {
                 let iter = self.delta.range_from(b.as_slice(), cmp_fn, equal_fn);
-                let delta = if self
-                    .delta
-                    .find(&b, |x, y| {
-                        let k = Key::decode_from(x.key());
-                        k.raw.cmp(y)
-                    })
-                    .is_some()
+                let delta = if let Some(cur) = iter.peek()
+                    && Key::decode_from(cur.key()).raw == b
                 {
                     iter.skip(1)
                 } else {
@@ -664,7 +663,6 @@ where
 
         RawLeafIter {
             cached_key,
-            base_box: self.base_box(),
             prefix: &lo[..len],
             next_l: None,
             next_r: None,
@@ -740,7 +738,6 @@ where
     L: ILoader,
 {
     cached_key: Handle<Vec<u8>>,
-    base_box: BoxRef,
     prefix: &'a [u8],
     next_l: Option<IterItem<'a, L>>,
     next_r: Option<IterItem<'a, L>>,
@@ -890,7 +887,6 @@ where
                 &[],
                 k,
                 x.val(),
-                x.as_box(),
                 self.sst_iter.loader,
             ));
         }
@@ -903,7 +899,6 @@ where
                 self.prefix,
                 k,
                 val,
-                self.base_box.clone(),
                 self.sst_iter.loader,
             ));
         }

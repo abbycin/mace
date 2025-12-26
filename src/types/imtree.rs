@@ -9,6 +9,7 @@ use std::{
 
 use crate::types::Comparator;
 
+/// tune this value when it's necessary
 pub(crate) const NODE_SIZE: usize = 64;
 const CHILDREN_SIZE: usize = NODE_SIZE + 1;
 const MEDIAN: usize = NODE_SIZE / 2;
@@ -61,13 +62,6 @@ where
 
     pub(crate) fn len(&self) -> usize {
         self.size
-    }
-
-    pub(crate) fn find<T, F>(&self, k: &T, f: F) -> Option<&K>
-    where
-        F: Fn(&K, &T) -> Ordering,
-    {
-        self.root.as_ref().and_then(|node| node.find_by(k, f))
     }
 
     pub(crate) fn iter(&self) -> Iter<'_, K> {
@@ -167,26 +161,6 @@ impl<K: Copy> Intl<K> {
 }
 
 impl<K> Intl<K> {
-    fn find_by<T, F>(&self, k: &T, f: F) -> Option<&K>
-    where
-        F: Fn(&K, &T) -> Ordering,
-    {
-        let mut node = self;
-        loop {
-            let pos = node
-                .keys
-                .binary_search_by(|x| f(x, k))
-                .map(|pos| pos + 1) // next child
-                .unwrap_or_else(|pos| pos);
-            match &node.children {
-                Children::Intl { intl, .. } => node = &intl[pos],
-                Children::Leaf { leaf } => return leaf[pos].find_by(k, f),
-            }
-        }
-    }
-}
-
-impl<K> Intl<K> {
     fn level(&self) -> usize {
         match &self.children {
             Children::Intl { level, .. } => level.get(),
@@ -227,23 +201,6 @@ impl<K: Clone> Leaf<K> {
     }
 }
 
-impl<K> Leaf<K> {
-    fn find_by<T, F>(&self, k: &T, f: F) -> Option<&K>
-    where
-        F: Fn(&K, &T) -> Ordering,
-    {
-        // lower bound
-        let keys = &self.keys;
-        let pos = keys
-            .binary_search_by(|x| match f(x, k) {
-                Less => Less,
-                _ => Greater,
-            })
-            .unwrap_or_else(|x| x);
-        keys.get(pos)
-    }
-}
-
 impl<K> Children<K> {
     fn insert(&mut self, pos: usize, node: Node<K>) {
         match (self, node) {
@@ -281,16 +238,6 @@ where
         match self {
             Node::Intl(intl) => Arc::make_mut(intl).put(k, c),
             Node::Leaf(leaf) => Arc::make_mut(leaf).put(k, c),
-        }
-    }
-
-    fn find_by<T, F>(&self, k: &T, f: F) -> Option<&K>
-    where
-        F: Fn(&K, &T) -> Ordering,
-    {
-        match self {
-            Node::Intl(intl) => intl.find_by(k, f),
-            Node::Leaf(leaf) => leaf.find_by(k, f),
         }
     }
 
@@ -570,6 +517,14 @@ impl<'a, K, T> RangeIter<'a, K, T> {
             is_yield: false,
         }
     }
+
+    pub(crate) fn peek(&self) -> Option<&'a K> {
+        if self.runout {
+            None
+        } else {
+            self.cursor.peek()
+        }
+    }
 }
 
 struct Cursor<'a, K> {
@@ -658,7 +613,7 @@ impl<'a, K> Cursor<'a, K> {
         self.seek_to_first()
     }
 
-    fn peek(&mut self) -> Option<&'a K> {
+    fn peek(&self) -> Option<&'a K> {
         if let Some((i, leaf)) = &self.leaf {
             leaf.keys.get(*i)
         } else {
@@ -879,19 +834,15 @@ impl<'a, K, T> Iterator for RangeIter<'a, K, T> {
 #[cfg(test)]
 mod test {
     use std::fmt::Debug;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering::Relaxed;
+    use std::usize;
     use std::{cmp::Ordering::Equal, sync::atomic::AtomicU64};
-
-    use rand::seq::SliceRandom;
 
     use crate::Options;
     use crate::types::data::{Key, Record, Ver};
-    use crate::types::imtree::{ImTree, NODE_SIZE};
+    use crate::types::imtree::ImTree;
     use crate::types::refbox::{BoxRef, DeltaView};
     use crate::types::traits::IAlloc;
-
-    static G_VER: AtomicUsize = AtomicUsize::new(1);
 
     struct Allocator;
 
@@ -922,19 +873,19 @@ mod test {
     }
 
     impl Data {
-        fn kv(k: &'static str, v: &'static str) -> Self {
+        fn kv(k: &'static str, v: &'static str, ver: usize) -> Self {
             Self {
                 key: k.as_bytes(),
                 val: v.as_bytes(),
-                ver: G_VER.fetch_add(1, Relaxed),
+                ver,
             }
         }
 
-        fn key(x: &'static str) -> Self {
+        fn key(x: &'static str, ver: usize) -> Self {
             Self {
                 key: x.as_bytes(),
                 val: &[],
-                ver: usize::MAX,
+                ver,
             }
         }
     }
@@ -972,25 +923,20 @@ mod test {
     fn simple() {
         let mut m = ImTree::<Data>::new(|x, y| x.cmp(y));
 
-        let mut x = m.update(Data::kv("foo", "mo"));
-        m = x.update(Data::kv("foo", "ha"));
+        let mut x = m.update(Data::kv("foo", "mo", 1));
+        m = x.update(Data::kv("foo", "ha", 2));
         assert_eq!(x.len(), 1);
         assert_eq!(m.len(), 2);
-        x = m.update(Data::kv("elder", "+1s"));
-        m = x.update(Data::kv("young", "naive"));
+        x = m.update(Data::kv("elder", "+1s", 3));
+        m = x.update(Data::kv("young", "naive", 4));
 
         assert_eq!(x.len(), 3);
         assert_eq!(m.len(), 4);
 
-        // lower_bound
-        let r = m.find(&Data::key("foo"), |x, y| x.cmp(y));
-        assert!(r.is_some());
-        let Data { key: _, val, ver } = r.unwrap();
-        assert_eq!(val, &"ha".as_bytes());
-        assert_eq!(ver, &2);
+        assert_eq!(m.iter().count(), m.len());
 
         let mut it = m.range_from(
-            Data::key("foo"),
+            Data::key("foo", usize::MAX), // start from the latest one (ie. the smallest one)
             |x, y| x.cmp(y),
             |x, y| x.key.cmp(y.key).is_eq(),
         );
@@ -998,30 +944,6 @@ mod test {
         assert_eq!(it.next().unwrap().ver, 2);
         assert_eq!(it.next().unwrap().ver, 1);
         assert_eq!(it.next(), None);
-
-        assert_eq!(m.iter().count(), m.len());
-    }
-
-    #[test]
-    fn ordered() {
-        let mut m = ImTree::<i32>::new(|x, y| x.cmp(y));
-        let mut v: Vec<i32> = (0..NODE_SIZE as i32 * 2).collect();
-        let mut rng = rand::rng();
-        v.shuffle(&mut rng);
-
-        for &i in &v {
-            m = m.update(i);
-        }
-
-        for i in &v {
-            let x = m.find(i, |x, y| x.cmp(y));
-            assert!(x.is_some());
-            assert_eq!(x.unwrap(), i);
-        }
-
-        v.sort();
-        let c: Vec<i32> = m.iter().copied().collect();
-        assert_eq!(v, c);
     }
 
     #[test]

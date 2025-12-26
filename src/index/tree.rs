@@ -619,7 +619,7 @@ impl Tree {
         let mut r = None;
 
         self.link(g, page, key, val, |pg, k| {
-            let tmp = pg.find_latest(k, |x, y| x.raw.cmp(y.raw));
+            let tmp = pg.find_latest(k);
             // use the full key from input argument and the version from the exists latest one
             r = tmp.map(|(x, y, b)| (Key::new(k.raw, x.ver), ValRef::new(y, b)));
             visible(&r)
@@ -661,7 +661,7 @@ impl Tree {
     pub fn get<'b>(&'b self, g: &Guard, key: Key<'b>) -> Result<(Key<'b>, ValRef), OpCode> {
         let page = self.find_leaf(g, key.raw())?;
 
-        let Some((k, v, b)) = page.find_latest(&key, |x, y| x.raw().cmp(y.raw())) else {
+        let Some((k, v, b)) = page.find_latest(&key) else {
             return Err(OpCode::NotFound);
         };
 
@@ -675,17 +675,11 @@ impl Tree {
         F: FnMut(&Context, u64, u8) -> bool + 'a,
         D: Fn() + 'a,
     {
-        let mut cached_key = Handle::new(Vec::new());
+        let cached_key = Handle::new(Vec::new());
         let lo = match range.start_bound() {
-            Bound::Included(b) => {
-                cached_key.extend_from_slice(b.as_ref());
-                Bound::Included(cached_key)
-            }
-            Bound::Excluded(b) => {
-                cached_key.extend_from_slice(b.as_ref());
-                Bound::Excluded(cached_key)
-            }
-            Bound::Unbounded => Bound::Included(cached_key),
+            Bound::Included(b) => Bound::Included(b.as_ref().to_vec()),
+            Bound::Excluded(b) => Bound::Excluded(b.as_ref().to_vec()),
+            Bound::Unbounded => Bound::Included(vec![]),
         };
         let hi = match range.end_bound() {
             Bound::Included(e) => Bound::Included(e.as_ref().to_vec()),
@@ -702,10 +696,7 @@ impl Tree {
             cache: None,
             checker: Box::new(visible),
             dtor: Box::new(dtor),
-            filter: Filter {
-                last: None,
-                holder: None,
-            },
+            filter: Filter { last: None },
         }
     }
 
@@ -803,14 +794,13 @@ impl ITree for Tree {
 pub struct Iter<'a> {
     tree: &'a Tree,
     cached_key: Handle<Vec<u8>>,
-    /// share same handle with cached_key avoid extra allocation
-    lo: Bound<Handle<Vec<u8>>>,
+    lo: Bound<Vec<u8>>,
     hi: Bound<Vec<u8>>,
     iter: Option<RawLeafIter<'a, Loader>>,
     cache: Option<Node>,
     checker: Box<dyn FnMut(&Context, u64, u8) -> bool + 'a>,
     dtor: Box<dyn Fn() + 'a>,
-    filter: Filter<'a>,
+    filter: Filter,
 }
 
 impl Drop for Iter<'_> {
@@ -833,7 +823,7 @@ impl Iter<'_> {
             (Bound::Included(b), Bound::Included(e))
             | (Bound::Excluded(b), Bound::Excluded(e))
             | (Bound::Included(b), Bound::Excluded(e))
-            | (Bound::Excluded(b), Bound::Included(e)) => b.deref() > e,
+            | (Bound::Excluded(b), Bound::Included(e)) => b > e,
             _ => false,
         }
     }
@@ -859,15 +849,15 @@ impl Iter<'_> {
                     Bound::Excluded(b) => item.cmp_key(b.as_slice()).is_gt(),
                 };
                 if ok && (self.checker)(&self.tree.store.context, item.txid(), item.wid()) {
-                    self.filter
-                        .check(item.base.raw, item.is_tombstone(), item.key_ref.clone())
+                    self.filter.check(item)
                 } else {
                     false
                 }
             });
 
             if let Some(item) = r {
-                self.lo = Bound::Excluded(item.assembled_key());
+                // the key was already assembled in `iter.find`
+                self.lo = Bound::Excluded(item.key().to_vec());
 
                 match self.hi {
                     Bound::Unbounded => return Some(item),
@@ -883,9 +873,7 @@ impl Iter<'_> {
                 self.iter.take();
                 let node = self.cache.as_ref().expect("must valid");
                 if let Some(hi) = node.hi() {
-                    self.cached_key.clear();
-                    self.cached_key.extend_from_slice(hi);
-                    self.lo = Bound::Included(self.cached_key);
+                    self.lo = Bound::Included(hi.to_vec());
                     continue;
                 }
                 break;
@@ -904,22 +892,20 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-struct Filter<'a> {
-    /// base part of key
-    last: Option<&'a [u8]>,
-    holder: Option<BoxRef>,
+struct Filter {
+    last: Option<Vec<u8>>,
 }
 
-impl<'a> Filter<'a> {
-    fn check(&mut self, k: &'a [u8], is_del: bool, key_owner: BoxRef) -> bool {
-        if let Some(last) = self.last
-            && last == k
+impl Filter {
+    fn check<L: ILoader>(&mut self, item: &IterItem<L>) -> bool {
+        if let Some(last) = self.last.as_ref()
+            && item.cmp_key(last).is_eq()
         {
             return false;
         }
-        self.holder = Some(key_owner);
-        self.last = Some(k);
-        !is_del
+        let last = item.assembled_key();
+        self.last = Some(last.deref().clone());
+        !item.is_tombstone()
     }
 }
 
