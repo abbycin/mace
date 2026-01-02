@@ -5,8 +5,8 @@ use super::align_up;
 pub(crate) struct Block {
     data: *mut u8,
     refs: *mut u32,
-    len: u32,
-    align: u32,
+    len: usize,
+    align: usize,
 }
 
 impl Block {
@@ -21,8 +21,8 @@ impl Block {
         Self {
             data,
             refs,
-            len: len as u32,
-            align: align as u32,
+            len,
+            align,
         }
     }
 
@@ -31,6 +31,7 @@ impl Block {
         Self::alloc_impl(size, 0, layout)
     }
 
+    #[allow(unused)]
     pub(crate) fn aligned_alloc(size: usize, align: usize) -> Self {
         let len = align_up(size, align);
         let layout = Layout::from_size_align(len, align).expect("bad layout");
@@ -39,7 +40,7 @@ impl Block {
 
     pub(crate) fn zero(&self) {
         let len = if self.align == 0 {
-            self.len as usize
+            self.len
         } else {
             self.aligned_len()
         };
@@ -53,21 +54,21 @@ impl Block {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.len as usize
+        self.len
     }
 
     pub(crate) fn aligned_len(&self) -> usize {
-        align_up(self.len as usize, self.align as usize)
+        align_up(self.len, self.align)
     }
 
     pub(crate) fn mut_slice<'a, T>(&self, off: usize, count: usize) -> &'a mut [T] {
-        debug_assert!(count * size_of::<T>() <= self.len as usize);
+        debug_assert!(off + count * size_of::<T>() <= self.len);
 
         unsafe { std::slice::from_raw_parts_mut(self.data.add(off).cast::<T>(), count) }
     }
 
     pub(crate) fn slice<'a, T>(&self, off: usize, count: usize) -> &'a [T] {
-        debug_assert!(count * size_of::<T>() <= self.len as usize);
+        debug_assert!(off + count * size_of::<T>() <= self.len);
 
         unsafe { std::slice::from_raw_parts(self.data.add(off).cast::<T>(), count) }
     }
@@ -75,10 +76,10 @@ impl Block {
     pub(crate) fn realloc(&mut self, size: usize) {
         assert_eq!(self.align, 0);
         self.data = unsafe {
-            let layout = Layout::array::<u8>(self.len as usize).unwrap();
+            let layout = Layout::array::<u8>(self.len).unwrap();
             realloc(self.data, layout, size)
         };
-        self.len = size as u32;
+        self.len = size;
     }
 }
 
@@ -99,9 +100,9 @@ impl Drop for Block {
         *Self::get_ref(self.refs) -= 1;
         if *Self::get_ref(self.refs) == 0 {
             if self.align == 0 {
-                unsafe { dealloc(self.data, Layout::array::<u8>(self.len as usize).unwrap()) };
+                unsafe { dealloc(self.data, Layout::array::<u8>(self.len).unwrap()) };
             } else {
-                let align = self.align as usize;
+                let align = self.align;
                 unsafe {
                     dealloc(
                         self.data,
@@ -125,7 +126,7 @@ pub(crate) struct Ring {
 
 impl Ring {
     pub(crate) fn new(cap: usize) -> Self {
-        let data = Block::aligned_alloc(cap, 1);
+        let data = Block::alloc(cap);
         data.zero();
         assert!(data.len().is_power_of_two());
         Self {
@@ -143,20 +144,18 @@ impl Ring {
     pub(crate) fn prod<'a>(&mut self, size: usize) -> &'a mut [u8] {
         debug_assert!(self.avail() >= size);
         let mut b = self.tail;
-        self.tail += size;
+        self.tail = self.tail.wrapping_add(size);
 
         b &= self.mask();
         self.data.mut_slice(b, size)
     }
 
     pub(crate) fn cons(&mut self, pos: usize) {
-        self.head += pos;
+        self.head = self.head.wrapping_add(pos);
     }
 
     pub(crate) fn distance(&self) -> usize {
-        #[cfg(feature = "extra_check")]
-        assert!(self.tail >= self.head);
-        self.tail - self.head
+        self.tail.wrapping_sub(self.head)
     }
 
     pub(crate) fn head(&self) -> usize {

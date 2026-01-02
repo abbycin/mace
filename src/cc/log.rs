@@ -73,7 +73,7 @@ impl Logging {
         opt: Arc<ParsedOptions>,
     ) -> Self {
         let (worker, last_id, ckpt_pos) = {
-            let d = desc.lock().expect("can't lock");
+            let d = desc.lock();
             (d.worker, d.latest_id, d.checkpoint)
         };
         let writer = GatherWriter::append(&opt.wal_file(worker, last_id), 16);
@@ -103,12 +103,17 @@ impl Logging {
     }
 
     fn alloc<'a>(&mut self, size: usize) -> &'a mut [u8] {
-        let rest = self.ring.len() - self.ring.tail();
+        let tail = self.ring.tail();
+        let rest = self.ring.len() - tail;
+
         if rest < size {
             self.flush();
             // skip the rest data, and restart from the begining
             self.ring.prod(rest);
             self.ring.cons(rest);
+        } else if tail == 0 && self.ring.distance() > 0 {
+            // the tail is extactly euqal to the boundary, we must flush pending data
+            self.flush();
         }
         self.ring.prod(size)
     }
@@ -292,7 +297,7 @@ impl Logging {
     }
 
     fn sync_desc(&self) {
-        let mut desc = self.desc.lock().expect("can't lock");
+        let mut desc = self.desc.lock();
         desc.update_ckpt(
             self.opt.desc_file(self.worker),
             self.last_ckpt,

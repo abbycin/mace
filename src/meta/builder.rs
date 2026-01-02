@@ -367,7 +367,7 @@ impl ManifestBuilder {
                 }
                 MetaKind::BlobStat => {
                     let stat = BlobStat::decode(data);
-                    let mut b = self.inner.blob_stat.map.write().unwrap();
+                    let mut b = self.inner.blob_stat.map.write();
                     let e = b.entry(stat.file_id);
                     if blob_deleted.contains(&stat.file_id) {
                         continue;
@@ -402,7 +402,7 @@ impl ManifestBuilder {
                     }
                 }
                 MetaKind::DataDelete => {
-                    let mut lk = self.inner.obsolete_data.lock().unwrap();
+                    let mut lk = self.inner.obsolete_data.lock();
                     lk.clear();
                     let del = Delete::decode(data);
                     lk.extend_from_slice(&del);
@@ -414,7 +414,7 @@ impl ManifestBuilder {
                     }
                 }
                 MetaKind::BlobDelete => {
-                    let mut lk = self.inner.obsolete_blob.lock().unwrap();
+                    let mut lk = self.inner.obsolete_blob.lock();
                     lk.clear();
                     let del = Delete::decode(data);
                     lk.extend_from_slice(&del);
@@ -427,32 +427,17 @@ impl ManifestBuilder {
                 }
                 MetaKind::DataInterval => {
                     let ivl = IntervalPair::decode(data);
-                    let mut lk = self
-                        .inner
-                        .data_stat
-                        .interval
-                        .write()
-                        .expect("can't lock write");
+                    let mut lk = self.inner.data_stat.interval.write();
                     lk.upsert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
                 }
                 MetaKind::BlobInterval => {
                     let ivl = IntervalPair::decode(data);
-                    let mut lk = self
-                        .inner
-                        .blob_stat
-                        .interval
-                        .write()
-                        .expect("can't lock write");
+                    let mut lk = self.inner.blob_stat.interval.write();
                     lk.upsert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
                 }
                 MetaKind::DataDelInterval => {
                     let d = DelInterval::decode(data);
-                    let mut lk = self
-                        .inner
-                        .data_stat
-                        .interval
-                        .write()
-                        .expect("can't lock write");
+                    let mut lk = self.inner.data_stat.interval.write();
 
                     for lo in d.lo {
                         lk.remove(lo).expect("must exist");
@@ -460,12 +445,7 @@ impl ManifestBuilder {
                 }
                 MetaKind::BlobDelInterval => {
                     let d = DelInterval::decode(data);
-                    let mut lk = self
-                        .inner
-                        .blob_stat
-                        .interval
-                        .write()
-                        .expect("can't lock write");
+                    let mut lk = self.inner.blob_stat.interval.write();
 
                     for lo in d.lo {
                         lk.remove(lo).expect("must exist");

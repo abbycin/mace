@@ -1,3 +1,14 @@
+## [0.0.23] 2026-01-02
+### Changes
+- Separate Read-Only transaction from worker, use a pool which can dynamic allocate new ConcurrencyControl on demand
+- Share ConcurrencyControl between `Iter` and it's creator
+
+### Bug fixes
+- Crash when `extra_check` feature enabled caused by `FuseBaseIter` may return duplicated keys
+- Crash in `rollback` test. When the ring buffer was filled exactly to the boundary (modulo capacity), the subsequent allocation would start at index 0 without flushing the previous data. This caused flush to attempt to slice a contiguous range that actually wrapped around the physical buffer, leading to an out-of-bounds access.
+- Incorrect condition check in `Cache::evict` trigger assertion in evictor
+- `Tree::traverse_sibling` not walk through candidate versions
+
 ## [0.0.22] 2025-12-26
 ### Changes
 - Stop share cache_key with lo, because it's obscure and hard to understand

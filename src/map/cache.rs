@@ -109,22 +109,21 @@ impl NodeCache {
     }
 
     pub(crate) fn evict(&self) -> Vec<u64> {
-        let tgt = self.pct * self.cap / 100;
+        let mut cnt = self.pct as usize * self.map.len() / 100;
         let mut pids = HashSet::new();
-        let mut used = 0;
         let mut iter = self.map.iter();
 
-        while used < tgt
+        while cnt > 0
             && let Some(i) = iter.next()
         {
             let (&pid, v) = (i.key(), i.value());
-            if (pid == ROOT_PID
-                || rand_range(0..100) > self.pct as usize
-                || v.cool() > CacheState::Cool)
-                && pids.insert(pid)
+            if pid != ROOT_PID
+                && rand_range(0..100) > self.pct as usize
+                && v.cool() > CacheState::Cool
             {
-                used += v.size;
+                pids.insert(pid);
             }
+            cnt -= 1;
         }
         pids.into_iter().collect()
     }

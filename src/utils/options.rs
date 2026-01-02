@@ -18,10 +18,10 @@ pub struct Options {
     /// allows allocation of more arenas than a fixed value when arena exhaustion occurs, rather than
     /// waiting for arenas to become available, the default value is false
     pub over_provision: bool,
-    /// hardware concurrency count, range in [1, cores]
+    /// default is hardware concurrency count, it must be power of 2
     ///
     /// **Once set, it cannot be modified**
-    pub workers: u8,
+    pub concurrent_write: u8,
     /// garbage collection cycle (milliseconds)
     pub gc_timeout: u64,
     /// perform compaction when garbage ratio exceed this value, range [0, 100]
@@ -98,7 +98,7 @@ pub struct Options {
 
 impl Options {
     pub const DATA_FILE_SIZE: usize = 64 << 20; // 64MB
-    pub const MAX_WORKERS: usize = 128;
+    pub const MAX_CONCURRENT_WRITE: usize = 128;
     pub const MIN_CACHE_CAP: usize = Self::DATA_FILE_SIZE;
     pub const CACHE_CAP: usize = 1 << 30; // 1GB
     pub const CACHE_CNT: usize = 16384;
@@ -112,14 +112,16 @@ impl Options {
     pub(crate) const MAX_KV_SIZE: usize = 1 << 30; // 1GB
 
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
+        let cores = std::thread::available_parallelism()
+            .unwrap()
+            .get()
+            .min(Self::MAX_CONCURRENT_WRITE)
+            .next_power_of_two() as u8;
         Self {
             sync_on_write: true,
             compact_on_exit: false,
             over_provision: false,
-            workers: std::thread::available_parallelism()
-                .unwrap()
-                .get()
-                .min(Self::MAX_WORKERS) as u8,
+            concurrent_write: cores,
             tmp_store: false,
             gc_timeout: 60 * 1000,  // 1min
             data_garbage_ratio: 20, // 20%
@@ -153,6 +155,10 @@ impl Options {
     }
 
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
+        if !self.concurrent_write.is_power_of_two() {
+            eprintln!("invalid concurrent write: {}", self.concurrent_write);
+            return Err(OpCode::Invalid);
+        }
         self.split_elems = self
             .split_elems
             .clamp(Self::MIN_SPLIT_ELEMS, Self::MAX_SPLIT_ELEMS);

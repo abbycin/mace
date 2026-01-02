@@ -74,7 +74,6 @@ impl Evictor {
                 continue;
             }
             assert!(!swip.is_tagged());
-
             let mut compacted = false;
             let old = Page::<Loader>::from_swip(swip.untagged());
             let (addr, junks) = if old.delta_len() > limit {
@@ -131,13 +130,13 @@ impl Evictor {
         for &pid in pids {
             let swip = Swip::new(self.table.get(pid));
             // it's passible when a node was unmapped, but not removed from cache yet (concurrently)
-            if swip.is_null() {
+            if swip.is_null() || swip.is_tagged() {
                 continue;
             }
             assert!(!swip.is_tagged());
             let old = Page::<Loader>::from_swip(swip.untagged());
             if old.delta_len() > limit {
-                let Ok(_lk) = old.try_lock() else {
+                let Some(_lk) = old.try_lock() else {
                     continue;
                 };
                 let (mut node, junks) = old.compact(self, safe_txid);

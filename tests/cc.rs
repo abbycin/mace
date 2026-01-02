@@ -153,12 +153,12 @@ fn rollback() {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     opts.sync_on_write = false;
-    opts.workers = workers;
+    opts.concurrent_write = 16;
     let db = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10000;
 
-    // multiple threads trying to update the same key, some of them will pass the visibility check and
-    // start update the key, but only one of them may success, those failure threads will check the
+    // multiple threads are trying to update the same key, some of them will pass the visibility check
+    // and start update the key, but only one of them may success, those failure threads will check the
     // visibility again and find the new key is invisible to them, they will abort the transaction
     // and rollback what they have wrote to the log
     fn update(db: &Mace, pairs: &Vec<Vec<u8>>) {
@@ -247,6 +247,7 @@ fn range_simple() -> Result<(), OpCode> {
     assert_eq!(item.key(), "fool".as_bytes());
     assert_eq!(item.val(), "1".as_bytes());
     assert!(iter.next().is_none());
+    drop(iter);
     drop(kv);
 
     {
@@ -407,7 +408,7 @@ fn cross_txn() {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
-    opt.workers = 3;
+    opt.concurrent_write = 4;
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let tx1 = db.begin().unwrap();

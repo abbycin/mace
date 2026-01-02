@@ -108,7 +108,7 @@ impl Tree {
     }
 
     fn txid(&self) -> u64 {
-        self.store.context.numerics.safe_tixd()
+        self.store.context.safe_txid()
     }
 
     pub(crate) fn begin<'a>(&'a self, g: &'a Guard) -> SysTxn<'a> {
@@ -137,7 +137,7 @@ impl Tree {
     // 5. unmap child pid from page table
     fn merge_node(&self, parent_ptr: &Page, child_pid: u64, g: &Guard) -> Result<(), OpCode> {
         // NOTE: a big lock is necessary because the merge process must be exclusive
-        let Ok(_lk) = parent_ptr.try_lock() else {
+        let Some(_lk) = parent_ptr.try_lock() else {
             // retrun Ok let cooperative threads not retry
             return Ok(());
         };
@@ -302,7 +302,7 @@ impl Tree {
     ///    - replace root with new node
     ///
     fn split_node(&self, node: Page, parent_opt: Option<Page>, g: &Guard) -> Result<(), OpCode> {
-        let Ok(node_lock) = node.try_lock() else {
+        let Some(node_lock) = node.try_lock() else {
             return Err(OpCode::Again);
         };
         let safe_txid = self.store.context.numerics.safe_tixd();
@@ -524,7 +524,7 @@ impl Tree {
     }
 
     fn try_merge(&self, g: &Guard, parent: Page, cur: Page) -> Result<(), OpCode> {
-        let Ok(lk) = parent.try_lock() else {
+        let Some(lk) = parent.try_lock() else {
             return Err(OpCode::Again);
         };
         assert_eq!(parent.header().merging_child, NULL_PID);
@@ -668,12 +668,11 @@ impl Tree {
         Ok((k, ValRef::new(v, b)))
     }
 
-    pub fn range<'a, K, R, F, D>(&'a self, range: R, visible: F, dtor: D) -> Iter<'a>
+    pub fn range<'a, K, R, F>(&'a self, range: R, visible: F) -> Iter<'a>
     where
         K: AsRef<[u8]>,
         R: RangeBounds<K>,
         F: FnMut(&Context, u64, u8) -> bool + 'a,
-        D: Fn() + 'a,
     {
         let cached_key = Handle::new(Vec::new());
         let lo = match range.start_bound() {
@@ -695,7 +694,6 @@ impl Tree {
             iter: None,
             cache: None,
             checker: Box::new(visible),
-            dtor: Box::new(dtor),
             filter: Filter { last: None },
         }
     }
@@ -716,16 +714,17 @@ impl Tree {
         while addr != NULL_PID {
             let ptr = l.load(addr).ok_or(OpCode::NotFound)?.as_base();
             let sst = ptr.sst::<Ver>();
-            let pos = sst.lower_bound(&ver).unwrap_or_else(|pos| pos);
-            if pos < sst.header().elems as usize {
+            let mut pos = sst.lower_bound(&ver).unwrap_or_else(|pos| pos);
+            while pos < sst.header().elems as usize {
                 let (k, v) = sst.kv_at::<Val>(pos);
                 if visible(k.txid, v.worker()) {
-                    let (v, r) = v.get_record(l, true);
                     if v.is_tombstone() {
                         return Err(OpCode::NotFound);
                     }
+                    let (v, r) = v.get_record(l, true);
                     return Ok(ValRef::new(v, r.map_or(ptr.as_box(), |x| x)));
                 }
+                pos += 1;
             }
             addr = ptr.box_header().link;
         }
@@ -758,7 +757,7 @@ impl Tree {
             let k = Key::decode_from(x.key());
             if visible(k.txid, val.worker()) {
                 let (r, v) = val.get_record(page.loader(), true);
-                return Ok(ValRef::new(r, v.map_or_else(|| x.as_box(), |x| x)));
+                return Ok(ValRef::new(r, v.unwrap_or_else(|| x.as_box())));
             }
         }
 
@@ -769,10 +768,7 @@ impl Tree {
         }
         if visible(k.txid, val.worker()) {
             let (record, r) = val.get_record(page.loader(), true);
-            return Ok(ValRef::new(
-                record,
-                r.map_or_else(|| page.base_box(), |x| x),
-            ));
+            return Ok(ValRef::new(record, r.unwrap_or_else(|| page.base_box())));
         }
         if let Some(addr) = val.get_sibling() {
             return self.traverse_sibling(page.loader(), key.txid, addr, &mut visible);
@@ -799,14 +795,12 @@ pub struct Iter<'a> {
     iter: Option<RawLeafIter<'a, Loader>>,
     cache: Option<Node>,
     checker: Box<dyn FnMut(&Context, u64, u8) -> bool + 'a>,
-    dtor: Box<dyn Fn() + 'a>,
     filter: Filter,
 }
 
 impl Drop for Iter<'_> {
     fn drop(&mut self) {
         self.cached_key.reclaim();
-        (self.dtor)();
     }
 }
 

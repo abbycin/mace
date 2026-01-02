@@ -1,6 +1,6 @@
 [package]
 name = "mace-kv"
-version = "0.0.22"
+version = "0.0.23"
 edition = "2024"
 authors = ["abbytsing@gmail.com"]
 readme = "README.md"
@@ -20,6 +20,7 @@ dashmap = "6.1.0"
 rand = "0.9.2"
 log = "0.4.28"
 crossbeam-epoch = "0.9.18"
+parking_lot = "0.12.5"
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2.177"

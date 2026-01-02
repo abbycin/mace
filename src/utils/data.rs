@@ -3,12 +3,12 @@ use crate::types::traits::IAsSlice;
 use super::{INIT_ID, MutRef, rand_range};
 use crate::io::{self, GatherIO, IoVec};
 use crc32c::Crc32cHasher;
+use parking_lot::Mutex;
 use std::fmt::Debug;
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 /// packed logical id and offset
 pub(crate) const JUNK_LEN: usize = size_of::<u64>();

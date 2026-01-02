@@ -92,6 +92,7 @@ fn gc_blob() -> Result<(), OpCode> {
     opt.gc_timeout = 20;
     opt.inline_size = 1024;
     opt.max_log_size = 20480;
+    opt.over_provision = true;
     let db = Mace::new(opt.validate()?)?;
     let cap = 10000;
     let val = vec![b'x'; 10240];
@@ -164,7 +165,7 @@ fn abort_txn() {
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let kv = db.begin().unwrap();
-    for i in 0..5000 {
+    for i in 0..50000 {
         let x = format!("key_{i}");
         let _ = kv.put(&x, &x);
     }
@@ -179,7 +180,7 @@ fn gc_wal() {
     let mut opt = Options::new(&*path);
     opt.wal_file_size = 4096;
     opt.gc_timeout = 2;
-    opt.workers = 1;
+    opt.concurrent_write = 1;
     opt.max_log_size = 1024;
     opt.keep_stable_wal_file = true;
     opt.data_file_size = 100 << 10; // make sure checkpoint was taken

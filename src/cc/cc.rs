@@ -1,93 +1,88 @@
-use std::alloc::{Layout, alloc_zeroed};
+use parking_lot::RwLock;
+use std::cell::Cell;
 use std::cmp;
 use std::cmp::min;
+use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::{collections::HashSet, sync::RwLock};
 
-use crate::utils::rand_range;
+use crate::utils::{NULL_ORACLE, rand_range};
 
 use super::context::Context;
 
-#[derive(Default, Clone, Copy)]
-#[repr(align(64))]
-struct Ts(u64);
-
+#[derive(Debug)]
 pub struct ConcurrencyControl {
     pub(crate) commit_tree: CommitTree,
-    cached_sts: Vec<Ts>,
-    cached_cts: Vec<Ts>,
+    cached_sts: Vec<Cell<u64>>,
+    cached_cts: Vec<Cell<u64>>,
     /// shared local water mark, avoid performing LCB in read-only txn
     wmk_oldest_tx: AtomicU64,
     /// latest commit ts, update everytime a txn was commited
     pub(crate) latest_cts: AtomicU64,
     /// snapshot of latest_cts in gc
     pub(crate) last_latest_cts: AtomicU64,
-    /// snapshot of global water mark, for short circuit visibility checking
-    pub(crate) global_wmk_tx: AtomicU64,
+    // snapshot of global water mark, for short circuit visibility checking
+    pub(crate) global_wmk_tx: u64,
+    pub(crate) start_ts: u64,
 }
 
+unsafe impl Send for ConcurrencyControl {}
+unsafe impl Sync for ConcurrencyControl {}
+
 impl ConcurrencyControl {
-    fn alloc(count: usize) -> Vec<Ts> {
-        unsafe {
-            let layout = Layout::from_size_align(count * size_of::<Ts>(), align_of::<Ts>())
-                .expect("bad layout");
-            let raw = alloc_zeroed(layout).cast::<Ts>();
-            Vec::from_raw_parts(raw, count, count)
-        }
-    }
     pub(crate) fn new(workers: usize) -> Self {
         Self {
             commit_tree: CommitTree::new(workers),
-            cached_sts: Self::alloc(workers),
-            cached_cts: Self::alloc(workers),
+            cached_sts: (0..workers).map(|_| Cell::new(0)).collect(),
+            cached_cts: (0..workers).map(|_| Cell::new(0)).collect(),
             wmk_oldest_tx: AtomicU64::new(0),
             latest_cts: AtomicU64::new(0),
             last_latest_cts: AtomicU64::new(0),
-            global_wmk_tx: AtomicU64::new(0),
+            global_wmk_tx: 0,
+            start_ts: NULL_ORACLE, // it's required for CommitTree's log compaction
         }
     }
 
     // NOTE: it's thread-safe
     /// check `txid` is visible to worker `wid` with txn with `start_ts`
     pub fn is_visible_to(
-        &mut self,
+        &self,
         ctx: &Context,
         self_wid: u8,
-        other_wid: u8,
+        record_wid: u8,
         start_ts: u64,
         txid: u64,
     ) -> bool {
-        // if txid was created on same worker, it's visible to later txn
-        if self_wid == other_wid {
+        // if txid was created by same worker, it's visible to later txn
+        if self_wid == record_wid {
             return true;
         }
 
-        let wid = other_wid as usize;
+        let wid = record_wid as usize;
 
         // NOTE: The following applies only to SI
         if txid > start_ts {
             return false;
         }
 
-        if self.global_wmk_tx.load(Relaxed) > txid {
+        if self.global_wmk_tx > txid {
             return true;
         }
 
         // short circuit
-        if self.cached_sts[wid].0 == start_ts {
-            return self.cached_cts[wid].0 >= txid;
+        if self.cached_sts[wid].get() == start_ts {
+            return self.cached_cts[wid].get() >= txid;
         }
 
-        if self.cached_cts[wid].0 >= txid {
+        if self.cached_cts[wid].get() >= txid {
             return true;
         }
 
         // slow path
         let lcb = ctx.worker(wid).cc.commit_tree.lcb(start_ts);
         if lcb != 0 {
-            self.cached_sts[wid].0 = start_ts;
-            self.cached_cts[wid].0 = lcb;
+            self.cached_sts[wid].set(start_ts);
+            self.cached_cts[wid].set(lcb);
             return lcb >= txid;
         }
 
@@ -151,34 +146,35 @@ impl ConcurrencyControl {
         log::debug!(
             "wmk_oldest_tx {} global_wmk_tx {}",
             self.wmk_oldest_tx.load(Relaxed),
-            self.global_wmk_tx.load(Relaxed)
+            self.global_wmk_tx
         );
         for i in 0..self.cached_cts.len() {
-            let (s, c) = (self.cached_sts[i], self.cached_cts[i]);
-            log::debug!("start {} commit {}", s.0, c.0);
+            let (s, c) = (self.cached_sts[i].get(), self.cached_cts[i].get());
+            log::debug!("start {} commit {}", s, c);
         }
         log::debug!("-------------- lcb -----------");
         self.commit_tree.show();
     }
 }
 
+#[derive(Debug)]
 pub struct CommitTree {
     /// <commitTs, startTs>
-    log: Vec<(u64, u64)>,
+    log: RwLock<Vec<(u64, u64)>>,
     cap: usize,
-    lk: RwLock<()>,
 }
+unsafe impl Send for CommitTree {}
+unsafe impl Sync for CommitTree {}
 
 impl CommitTree {
     pub fn new(workers: usize) -> Self {
         Self {
-            log: Vec::new(),
-            cap: workers,
-            lk: RwLock::new(()),
+            log: RwLock::new(Vec::new()),
+            cap: workers + 1, // plus 1 for read-only txn
         }
     }
 
-    pub fn lcb_impl(log: &[(u64, u64)], start_ts: u64) -> Option<usize> {
+    fn lcb_impl(log: &[(u64, u64)], start_ts: u64) -> Option<usize> {
         let mut b = 0;
         let mut e = log.len();
 
@@ -201,9 +197,9 @@ impl CommitTree {
 
     /// return last commited `start_ts` before given `start_ts`
     pub fn lcb(&self, start_ts: u64) -> u64 {
-        let _lk = self.lk.read().expect("can't lock read");
-        if let Some(pos) = Self::lcb_impl(&self.log, start_ts) {
-            self.log[pos].1
+        let log = self.log.read();
+        if let Some(pos) = Self::lcb_impl(&log, start_ts) {
+            log[pos].1
         } else {
             0
         }
@@ -211,25 +207,32 @@ impl CommitTree {
 
     #[allow(dead_code)]
     fn show(&self) {
-        for (c, s) in &self.log {
+        let log = self.log.read();
+        for (c, s) in log.iter() {
             log::debug!("start {} commit {}", *s, *c);
         }
     }
 
-    pub fn append(&mut self, start: u64, commit: u64) {
-        let _lk = self.lk.write().expect("can't lock write");
-        self.log.push((commit, start));
+    pub fn append(&self, start: u64, commit: u64) {
+        let mut log = self.log.write();
+        log.push((commit, start));
     }
 
-    pub fn compact(&mut self, ctx: &Context, this_worker: u8) {
-        let rlk = self.lk.read().expect("can't lock read");
-        if self.log.len() < self.cap {
+    pub fn compact(&self, ctx: &Context, this_worker: u8) {
+        let log = self.log.write();
+        if log.len() < self.cap {
             return;
         }
         let mut set = HashSet::new();
 
-        set.insert(self.log[self.log.len() - 1]);
-        drop(rlk);
+        set.insert(log[log.len() - 1]);
+        // at least keep the oldest read-only txn's LCB
+        if let Some(view) = ctx.oldest_view_txid()
+            && let Some(c) = Self::lcb_impl(&log, view)
+        {
+            set.insert(log[c]);
+        }
+        drop(log);
 
         for w in ctx.workers().iter() {
             if this_worker == w.logging.worker {
@@ -242,19 +245,19 @@ impl CommitTree {
                 continue;
             }
 
-            let lk = self.lk.read().expect("can't lock read");
-            if let Some(c) = Self::lcb_impl(&self.log, txid) {
-                set.insert(self.log[c]);
+            let log = self.log.read();
+            if let Some(c) = Self::lcb_impl(&log, txid) {
+                set.insert(log[c]);
             }
-            drop(lk);
+            drop(log);
         }
 
-        let _wlk = self.lk.write().expect("can't lock write");
-        self.log.clear();
+        let mut log = self.log.write();
+        log.clear();
         for p in set {
-            self.log.push(p);
+            log.push(p);
         }
-        self.log.sort_unstable();
+        log.sort_unstable();
     }
 }
 
@@ -264,7 +267,7 @@ mod test {
 
     #[test]
     fn commit_tree() {
-        let mut t = CommitTree::new(10);
+        let t = CommitTree::new(10);
 
         t.append(1, 2);
         t.append(3, 4);

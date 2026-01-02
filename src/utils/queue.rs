@@ -69,7 +69,7 @@ pub(crate) struct Queue<T> {
 
 impl<T> Queue<T> {
     pub(crate) fn new(cap: usize) -> Self {
-        assert!(cap > 1);
+        assert!(cap >= 1);
         assert!(cap.is_power_of_two());
         let slots: Box<[Slot<T>]> = (0..cap)
             .map(|x| Slot {

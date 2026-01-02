@@ -2,69 +2,44 @@ use super::ValRef;
 use crate::{
     OpCode,
     cc::{
-        context::Context,
+        cc::ConcurrencyControl,
+        context::{CCNode, Context},
         wal::{WalDel, WalPut, WalReplace},
         worker::SyncWorker,
     },
     index::tree::{Iter, Tree},
     types::data::{Key, Record, Ver},
-    utils::{INIT_CMD, NULL_CMD},
+    utils::{Handle, INIT_CMD, NULL_CMD},
 };
-use crossbeam_epoch::Guard;
-use std::sync::{
-    Arc,
-    atomic::Ordering::{AcqRel, Relaxed},
-};
-use std::{cell::Cell, sync::atomic::AtomicU32};
-
-struct Package<'a> {
-    ctx: &'a Context,
-    w: SyncWorker,
-    refcnt: Arc<AtomicU32>,
-}
-
-impl Clone for Package<'_> {
-    fn clone(&self) -> Self {
-        self.refcnt.fetch_add(1, Relaxed);
-        Self {
-            ctx: self.ctx,
-            w: self.w,
-            refcnt: self.refcnt.clone(),
-        }
-    }
-}
-
-impl Package<'_> {
-    fn destroy(&self) {
-        if self.refcnt.fetch_sub(1, AcqRel) == 1 {
-            self.ctx.free_worker(self.w);
-        }
-    }
-}
+use std::cell::Cell;
 
 fn get_impl<K: AsRef<[u8]>>(
     ctx: &Context,
-    g: &Guard,
+    cc: &ConcurrencyControl,
     tree: &Tree,
-    mut w: SyncWorker,
+    worker_id: u8,
     k: K,
 ) -> Result<ValRef, OpCode> {
     #[cfg(feature = "extra_check")]
     assert!(!k.as_ref().is_empty(), "key must be non-empty");
 
-    let wid = w.id;
-    let start_ts = w.start_ts;
-    let key = Key::new(k.as_ref(), Ver::new(start_ts, NULL_CMD));
-    let r = tree.traverse(g, key, |txid, other_wid| {
-        w.cc.is_visible_to(ctx, wid, other_wid, start_ts, txid)
+    let g = crossbeam_epoch::pin();
+    let key = Key::new(k.as_ref(), Ver::new(cc.start_ts, NULL_CMD));
+    let r = tree.traverse(&g, key, |txid, record_wid| {
+        cc.is_visible_to(ctx, worker_id, record_wid, cc.start_ts, txid)
     })?;
 
     Ok(r)
 }
 
-fn seek_impl<'a, 'b, K>(tree: &'b Tree, mut w: SyncWorker, prefix: K, p: Package<'b>) -> Iter<'b>
+fn seek_impl<'a, K>(
+    cc: &'a ConcurrencyControl,
+    tree: &'a Tree,
+    worker_id: u8,
+    prefix: K,
+) -> Iter<'a>
 where
-    K: AsRef<[u8]> + 'a,
+    K: AsRef<[u8]>,
 {
     let b = prefix.as_ref();
     let mut e = b.to_vec();
@@ -77,20 +52,14 @@ where
         *e.last_mut().unwrap() += 1;
     }
 
-    let wid = w.id;
-    let start_ts = w.start_ts;
-
-    tree.range(
-        b..e.as_slice(),
-        move |ctx, txid, other_wid| w.cc.is_visible_to(ctx, wid, other_wid, start_ts, txid),
-        move || {
-            p.destroy();
-        },
-    )
+    tree.range(b..e.as_slice(), move |ctx, txid, record_wid| {
+        cc.is_visible_to(ctx, worker_id, record_wid, cc.start_ts, txid)
+    })
 }
 
 pub struct TxnKV<'a> {
-    p: Package<'a>,
+    ctx: &'a Context,
+    w: SyncWorker,
     tree: &'a Tree,
     seq: Cell<u32>,
     is_end: Cell<bool>,
@@ -103,11 +72,8 @@ impl<'a> TxnKV<'a> {
         w.begin(ctx);
         let limit = tree.store.opt.max_ckpt_per_txn;
         Ok(Self {
-            p: Package {
-                ctx,
-                w,
-                refcnt: Arc::new(AtomicU32::new(1)),
-            },
+            ctx,
+            w,
             tree,
             seq: Cell::new(INIT_CMD),
             is_end: Cell::new(false),
@@ -122,7 +88,7 @@ impl<'a> TxnKV<'a> {
     }
 
     fn should_abort(&self) -> Result<(), OpCode> {
-        if self.is_end.get() || self.p.w.logging.ckpt_cnt() >= self.limit {
+        if self.is_end.get() || self.w.logging.ckpt_cnt() >= self.limit {
             return Err(OpCode::AbortTx);
         }
         Ok(())
@@ -135,15 +101,15 @@ impl<'a> TxnKV<'a> {
         #[cfg(feature = "extra_check")]
         assert!(!k.as_ref().is_empty(), "key must be non-empty");
 
-        let g = crossbeam_epoch::pin();
         self.should_abort()?;
-        let start_ts = self.p.w.start_ts;
-        let (wid, cmd_id) = (self.p.w.id, self.cmd_id());
+        let g = crossbeam_epoch::pin();
+        let start_ts = self.w.cc.start_ts;
+        let (wid, cmd_id) = (self.w.id, self.cmd_id());
         let key = Key::new(k, Ver::new(start_ts, cmd_id));
         let val = Record::normal(wid, v);
 
         self.tree
-            .update(&g, key, val, |opt| f(opt, *key.ver(), self.p.w))
+            .update(&g, key, val, |opt| f(opt, *key.ver(), self.w))
     }
 
     fn put_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<(), OpCode> {
@@ -153,8 +119,8 @@ impl<'a> TxnKV<'a> {
                 Some((rk, rv)) => {
                     if rv.is_put()
                         || !w.cc.is_visible_to(
-                            self.p.ctx,
-                            self.p.w.id,
+                            self.ctx,
+                            self.w.id,
                             rv.unwrap().worker_id(),
                             ver.txid,
                             rk.txid,
@@ -187,7 +153,7 @@ impl<'a> TxnKV<'a> {
                 let t = rv.unwrap();
                 if !w
                     .cc
-                    .is_visible_to(self.p.ctx, self.p.w.id, t.worker_id(), ver.txid, rk.txid)
+                    .is_visible_to(self.ctx, self.w.id, t.worker_id(), ver.txid, rk.txid)
                 {
                     return Err(OpCode::AbortTx);
                 }
@@ -248,7 +214,7 @@ impl<'a> TxnKV<'a> {
                 let t = rv.unwrap();
                 if !w
                     .cc
-                    .is_visible_to(self.p.ctx, self.p.w.id, t.worker_id(), ver.txid, rk.txid)
+                    .is_visible_to(self.ctx, self.w.id, t.worker_id(), ver.txid, rk.txid)
                 {
                     return Err(OpCode::AbortTx);
                 }
@@ -274,8 +240,8 @@ impl<'a> TxnKV<'a> {
         T: AsRef<[u8]>,
     {
         self.should_abort()?;
-        let mut w = self.p.w;
-        let (wid, start_ts) = (w.id, w.start_ts);
+        let mut w = self.w;
+        let (wid, start_ts) = (w.id, w.cc.start_ts);
         let key = Key::new(k.as_ref(), Ver::new(start_ts, self.cmd_id()));
         let val = Record::remove(wid);
         let mut logged = false;
@@ -289,13 +255,10 @@ impl<'a> TxnKV<'a> {
                         return Err(OpCode::NotFound);
                     }
                     let t = rv.unwrap();
-                    if !w.cc.is_visible_to(
-                        self.p.ctx,
-                        self.p.w.id,
-                        t.worker_id(),
-                        start_ts,
-                        rk.txid,
-                    ) {
+                    if !w
+                        .cc
+                        .is_visible_to(self.ctx, self.w.id, t.worker_id(), start_ts, rk.txid)
+                    {
                         return Err(OpCode::AbortTx);
                     }
 
@@ -318,8 +281,8 @@ impl<'a> TxnKV<'a> {
 
     pub fn commit(self) -> Result<(), OpCode> {
         self.should_abort()?;
-        self.p.w.commit(self.p.ctx);
-        self.p.destroy();
+        self.w.commit(self.ctx);
+        self.ctx.free_worker(self.w);
         self.is_end.set(true);
         Ok(())
     }
@@ -329,8 +292,7 @@ impl<'a> TxnKV<'a> {
     where
         K: AsRef<[u8]>,
     {
-        let g = crossbeam_epoch::pin();
-        get_impl(self.p.ctx, &g, self.tree, self.p.w, k)
+        get_impl(self.ctx, &self.w.cc, self.tree, self.w.id, k)
     }
 
     /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
@@ -338,12 +300,11 @@ impl<'a> TxnKV<'a> {
     /// **NOTE:** [`Iter`] will save a clone of the resource, so do not save [`Iter`] to avoid
     /// resource shortage
     #[inline]
-    pub fn seek<'b, K>(&self, prefix: K) -> Iter<'b>
+    pub fn seek<K>(&self, prefix: K) -> Iter<'_>
     where
         K: AsRef<[u8]>,
-        'a: 'b,
     {
-        seek_impl(self.tree, self.p.w, prefix, self.p.clone())
+        seek_impl(&self.w.cc, self.tree, self.w.id, prefix)
     }
 }
 
@@ -351,36 +312,34 @@ impl Drop for TxnKV<'_> {
     fn drop(&mut self) {
         if !self.is_end.get() {
             let g = crossbeam_epoch::pin();
-            self.p.w.rollback(&g, self.p.ctx, self.tree);
-            self.p.destroy();
+            self.w.rollback(&g, self.ctx, self.tree);
+            self.ctx.free_worker(self.w);
             self.is_end.set(true);
         }
     }
 }
 
 pub struct TxnView<'a> {
-    p: Package<'a>,
+    ctx: &'a Context,
+    cc: Handle<CCNode>,
+    worker_id: u8,
     tree: &'a Tree,
 }
 
 impl<'a> TxnView<'a> {
     pub(crate) fn new(ctx: &'a Context, tree: &'a Tree) -> Result<Self, OpCode> {
-        let mut w = ctx.alloc_worker()?;
-        w.view(ctx);
+        let cc = ctx.alloc_cc();
         Ok(Self {
-            p: Package {
-                ctx,
-                w,
-                refcnt: Arc::new(AtomicU32::new(1)),
-            },
+            ctx,
+            cc,
+            worker_id: u8::MAX,
             tree,
         })
     }
 
     #[inline]
     pub fn get<K: AsRef<[u8]>>(&self, k: K) -> Result<ValRef, OpCode> {
-        let g = crossbeam_epoch::pin();
-        get_impl(self.p.ctx, &g, self.tree, self.p.w, k)
+        get_impl(self.ctx, &self.cc, self.tree, self.worker_id, k)
     }
 
     /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
@@ -388,18 +347,17 @@ impl<'a> TxnView<'a> {
     /// **NOTE:** [`Iter`] will save a clone of the resource, so do not save [`Iter`] to avoid
     /// resource shortage
     #[inline]
-    pub fn seek<'b, K>(&self, prefix: K) -> Iter<'b>
+    pub fn seek<K>(&self, prefix: K) -> Iter<'_>
     where
         K: AsRef<[u8]>,
-        'a: 'b,
     {
-        seek_impl(self.tree, self.p.w, prefix, self.p.clone())
+        seek_impl(&self.cc, self.tree, self.worker_id, prefix)
     }
 }
 
 impl Drop for TxnView<'_> {
     fn drop(&mut self) {
-        self.p.destroy();
+        self.ctx.free_cc(self.cc);
     }
 }
 
@@ -524,6 +482,42 @@ mod test {
             let view = db.view()?;
             assert_eq!(view.get("elder").unwrap().slice(), "mo".as_bytes());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cross_long_txn() -> Result<(), OpCode> {
+        let path = RandomPath::new();
+        let mut opt = Options::new(&*path);
+        let consolidate_threshold = 256;
+        opt.tmp_store = true;
+        opt.split_elems = consolidate_threshold * 2;
+        opt.consolidate_threshold = consolidate_threshold;
+        let db = Mace::new(opt.validate()?)?;
+
+        let kv = db.begin()?;
+        kv.put("foo", "bar")?;
+        kv.commit()?;
+
+        let view = db.view()?;
+        let kv = db.begin()?;
+
+        kv.update("foo", "bar1")?;
+        kv.update("foo", "bar2")?;
+
+        // trigger consolidate
+        for i in 0..consolidate_threshold {
+            let x = format!("key_{i}");
+            kv.put(&x, &x)?;
+        }
+
+        let r = kv.get("foo")?;
+        assert_eq!(r.slice(), "bar2".as_bytes());
+        kv.commit()?;
+
+        let v = view.get("foo")?;
+        assert_eq!(v.slice(), "bar".as_bytes());
+
         Ok(())
     }
 }

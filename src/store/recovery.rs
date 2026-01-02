@@ -1,10 +1,11 @@
 use core::panic;
+use parking_lot::Mutex;
 use std::cmp::max;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex};
 
 use crate::io::{File, GatherIO};
 
@@ -72,7 +73,7 @@ impl Recovery {
 
         for d in desc.iter() {
             let (worker, checkpoint) = {
-                let x = d.lock().expect("cant' lock");
+                let x = d.lock();
                 (x.worker, x.checkpoint)
             };
             // analyze and redo starts from latest checkpoint
@@ -81,14 +82,17 @@ impl Recovery {
             g.flush();
         }
 
+        let recovered = !self.dirty_table.is_empty() || !self.undo_table.is_empty();
         if !self.dirty_table.is_empty() {
             self.redo(&mut block, &g, tree);
         }
         if !self.undo_table.is_empty() {
             self.undo(&mut block, &g, tree);
         }
-        // that's why we call it oracle, or else keep using the intact oracle in numerics
-        oracle += 1;
+        if recovered {
+            // that's why we call it oracle, or else keep using the intact oracle in numerics
+            oracle += 1;
+        }
         log::trace!("oracle {oracle}");
         numerics.oracle.store(oracle, Relaxed);
         numerics.wmk_oldest.store(oracle, Relaxed);
@@ -326,12 +330,12 @@ impl Recovery {
     }
 
     fn load_desc(&self) -> Result<Vec<WalDescHandle>, OpCode> {
-        let mut desc: Vec<WalDescHandle> = (0..self.opt.workers)
+        let mut desc: Vec<WalDescHandle> = (0..self.opt.concurrent_write)
             .map(|x| WalDescHandle::new(Mutex::new(WalDesc::new(x))))
             .collect();
 
         for d in &mut desc {
-            let mut x = d.lock().expect("can't lock");
+            let mut x = d.lock();
             let path = self.opt.desc_file(x.worker);
             if !path.exists() {
                 log::trace!("no log record for worker {}", x.worker);

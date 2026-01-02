@@ -1,8 +1,5 @@
-use std::{
-    cmp::min,
-    sync::{Condvar, Mutex},
-    time::Duration,
-};
+use parking_lot::{Condvar, Mutex};
+use std::{cmp::min, time::Duration};
 
 pub struct Countblock {
     lock: Mutex<isize>,
@@ -18,20 +15,16 @@ impl Countblock {
     }
 
     pub fn post(&self) {
-        let mut c = self.lock.lock().expect("can't lock");
+        let mut c = self.lock.lock();
         *c += 1;
         self.cond.notify_one();
     }
 
     pub fn wait(&self) {
-        let mut c = self.lock.lock().expect("can't lock");
+        let mut c = self.lock.lock();
         *c -= 1;
         while *c == 0 {
-            c = self
-                .cond
-                .wait_timeout(c, Duration::from_millis(1))
-                .expect("can't wait")
-                .0;
+            self.cond.wait_for(&mut c, Duration::from_millis(1));
         }
     }
 }

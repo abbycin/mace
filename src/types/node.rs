@@ -1,7 +1,8 @@
+use parking_lot::{Mutex, MutexGuard};
 use std::{
     cmp::Ordering::{self, Equal, Greater, Less},
     ops::{Bound, Deref, DerefMut},
-    sync::{Arc, Mutex, MutexGuard, TryLockResult},
+    sync::Arc,
 };
 
 use crate::{
@@ -206,6 +207,8 @@ where
         let (rb, rj) = other.merge_to_base(a, safe_txid);
         let (lhs, rhs) = (lb.view().as_base(), rb.view().as_base());
 
+        #[cfg(feature = "extra_check")]
+        assert_ne!(self.base_addr(), other.base_addr());
         let mut node = Self::new(self.loader.clone(), lhs.merge(a, &self.loader, rhs));
         node.header_mut().split_elems = self.header().split_elems;
         (node, lj, rj)
@@ -463,10 +466,10 @@ where
     }
 
     pub(crate) fn lock(&'_ self) -> MutexGuard<'_, ()> {
-        self.mtx.lock().expect("never happen")
+        self.mtx.lock()
     }
 
-    pub(crate) fn try_lock(&'_ self) -> TryLockResult<MutexGuard<'_, ()>> {
+    pub(crate) fn try_lock(&'_ self) -> Option<MutexGuard<'_, ()>> {
         self.mtx.try_lock()
     }
 
@@ -491,12 +494,12 @@ where
             debug_assert_eq!(k.raw(), key.raw());
             let v = x.val();
             let (v, r) = v.get_record(&self.loader, true);
-            return Some((k, v, r.map_or_else(|| self.base_box(), |x| x)));
+            return Some((k, v, r.unwrap_or_else(|| self.base_box())));
         }
 
         self.search_sst(key).map(|(k, v)| {
             let (v, r) = v.get_record(&self.loader, true);
-            (k, v, r.map_or_else(|| self.base_box(), |x| x))
+            (k, v, r.unwrap_or_else(|| self.base_box()))
         })
     }
 
@@ -983,13 +986,11 @@ impl<'a> LeafFilter<'a> {
 
 #[cfg(test)]
 mod test {
+    use parking_lot::Mutex;
     use std::{
         collections::HashMap,
         rc::Rc,
-        sync::{
-            Mutex,
-            atomic::{AtomicU64, Ordering::Relaxed},
-        },
+        sync::atomic::{AtomicU64, Ordering::Relaxed},
     };
 
     use crate::{
@@ -1023,7 +1024,7 @@ mod test {
         }
 
         fn load(&self, addr: u64) -> BoxRef {
-            let lk = self.inner.map.lock().unwrap();
+            let lk = self.inner.map.lock();
             lk.get(&addr).unwrap().clone()
         }
     }
@@ -1035,7 +1036,7 @@ mod test {
                 .off
                 .fetch_add(BoxRef::real_size(size as u32) as u64, Relaxed);
             let p = BoxRef::alloc(size as u32, addr);
-            let mut lk = self.inner.map.lock().unwrap();
+            let mut lk = self.inner.map.lock();
             lk.insert(addr, p.clone());
             p
         }
@@ -1057,7 +1058,7 @@ mod test {
         }
 
         fn pin(&self, data: BoxRef) {
-            let mut lk = self.inner.map.lock().unwrap();
+            let mut lk = self.inner.map.lock();
             lk.insert(data.header().addr, data);
         }
 

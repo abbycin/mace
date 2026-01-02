@@ -331,10 +331,10 @@ impl GarbageCollector {
 
     fn process_wal(&mut self) {
         for w in self.store.context.workers().iter() {
-            let lk = w.start_ckpt.read().unwrap();
+            let lk = w.start_ckpt.read();
             let checkpoint_id = lk.file_id;
             drop(lk);
-            let lk = w.logging.desc.lock().unwrap();
+            let lk = w.logging.desc.lock();
             let oldest_id = lk.oldest_id;
             drop(lk);
 
@@ -344,7 +344,7 @@ impl GarbageCollector {
 
             // [oldest_id, checkpoint_id)
             Self::process_one_wal(&self.store.opt, w.id, oldest_id, checkpoint_id);
-            let mut desc = w.logging.desc.lock().unwrap();
+            let mut desc = w.logging.desc.lock();
             desc.update_oldest(self.ctx.opt.desc_file(w.id), checkpoint_id);
         }
     }
@@ -493,7 +493,7 @@ impl GarbageCollector {
                 let mut loader =
                     MetaReader::<BlobFooter>::new(opt.blob_file(victim_id)).expect("never happen");
                 let relocs = loader.get_reloc().unwrap();
-                let map = self.ctx.manifest.blob_stat.read().unwrap();
+                let map = self.ctx.manifest.blob_stat.read();
                 // save a copy so don't block other thread
                 let bitmap = map.get(&victim_id).unwrap().mask.clone();
                 drop(map);

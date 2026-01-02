@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::sync::{
-    Arc, RwLock,
+    Arc,
     atomic::AtomicPtr,
     mpsc::{Receiver, Sender},
 };
@@ -54,7 +55,7 @@ impl Iim {
     }
 
     fn find(&self, addr: u64) -> Option<u64> {
-        let lk = self.map.read().expect("can't lock read");
+        let lk = self.map.read();
         let pos = match lk.binary_search_by(|x| x.addr.cmp(&addr)) {
             Ok(pos) => pos,
             Err(pos) => {
@@ -76,14 +77,14 @@ impl Iim {
     /// the addr is monotonically increasing, so we can perform binary search on
     /// map
     fn push(&self, addr: u64, arena: u64) {
-        let mut lk = self.map.write().expect("can't lock write");
+        let mut lk = self.map.write();
         lk.push(Ids::new(addr, arena));
     }
 
     /// the data file flush is FIFO, so we can simply remove the first element and
     /// left-shift all rest elements
     fn pop(&self) {
-        let mut lk = self.map.write().expect("can't lock write");
+        let mut lk = self.map.write();
         lk.remove(0);
     }
 }
@@ -137,7 +138,7 @@ impl Pool {
     const INIT_ARENA: u32 = 16; // must be power of 2
 
     fn new(opt: Arc<ParsedOptions>, ctx: Handle<Context>, numerics: Arc<Numerics>) -> Self {
-        let workers = opt.workers;
+        let workers = opt.concurrent_write;
         let id = Self::get_id(&numerics);
         let q = Queue::new(Self::INIT_ARENA as usize);
         for _ in 0..Self::INIT_ARENA {
@@ -292,7 +293,7 @@ impl Buffers {
         let numerics = ctx.numerics.clone();
         Self {
             ctx,
-            max_log_size: ctx.opt.max_log_size * ctx.opt.workers as usize,
+            max_log_size: ctx.opt.max_log_size * ctx.opt.concurrent_write as usize,
             cache,
             table: pagemap,
             lru: Handle::new(ShardPriorityLru::new(

@@ -1,3 +1,4 @@
+use parking_lot::{Mutex, RwLock};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap},
@@ -6,7 +7,7 @@ use std::{
     path::PathBuf,
     ptr::null_mut,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc,
         atomic::{
             AtomicBool, AtomicU64,
             Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
@@ -107,7 +108,7 @@ impl Txn {
         T: IMetaCodec,
     {
         let hdr = GenericHdr::new(kind, self.txid);
-        let mut wctx = self.wctx.lock().expect("lock fail");
+        let mut wctx = self.wctx.lock();
         let size = x.packed_size() + hdr.len();
         if size > wctx.ring.len() {
             return self.record_large(&mut wctx, &hdr, x);
@@ -122,7 +123,7 @@ impl Txn {
     }
 
     pub(crate) fn sync(&self) {
-        let mut wctx = self.wctx.lock().expect("lock fail");
+        let mut wctx = self.wctx.lock();
         Self::flush(&mut wctx);
     }
 
@@ -306,7 +307,7 @@ impl Manifest {
     }
 
     pub(crate) fn try_clean(&mut self) {
-        let Ok(wctx) = self.wctx.try_lock() else {
+        let Some(wctx) = self.wctx.try_lock() else {
             return;
         };
         if wctx.writer.pos() < Self::CLEAN_SIZE {
@@ -372,7 +373,7 @@ impl Manifest {
             txn.record(MetaKind::DataStat, &stat);
         }
 
-        let lk = self.data_stat.interval.read().expect("can't lock read");
+        let lk = self.data_stat.interval.read();
         for (&lo, &(hi, id)) in lk.iter() {
             let ivl = IntervalPair::new(lo, hi, id);
             txn.record(MetaKind::DataInterval, &ivl);
@@ -408,7 +409,7 @@ impl Manifest {
     }
 
     fn bump_id(&mut self) -> u64 {
-        let mut wctx = self.wctx.lock().unwrap();
+        let mut wctx = self.wctx.lock();
         let old = self.numerics.next_manifest_id.fetch_add(2, Release);
         wctx.writer.reset(&self.opt.manifest(old + 2));
         old
@@ -424,20 +425,20 @@ impl Manifest {
 
     pub(crate) fn save_obsolete_data(&self, id: &[u64]) {
         if !id.is_empty() {
-            let mut lk = self.obsolete_data.lock().unwrap();
+            let mut lk = self.obsolete_data.lock();
             lk.extend_from_slice(id);
         }
     }
 
     pub(crate) fn save_obsolete_blob(&self, id: &[u64]) {
         if !id.is_empty() {
-            let mut lk = self.obsolete_blob.lock().unwrap();
+            let mut lk = self.obsolete_blob.lock();
             lk.extend_from_slice(id);
         }
     }
 
     pub(crate) fn delete_files(&self) {
-        if let Ok(mut lk) = self.obsolete_data.try_lock() {
+        if let Some(mut lk) = self.obsolete_data.try_lock() {
             while let Some(id) = lk.pop() {
                 let path = self.opt.data_file(id);
                 if path.exists() {
@@ -446,7 +447,7 @@ impl Manifest {
                 }
             }
         }
-        if let Ok(mut lk) = self.obsolete_blob.try_lock() {
+        if let Some(mut lk) = self.obsolete_blob.try_lock() {
             while let Some(id) = lk.pop() {
                 let path = self.opt.blob_file(id);
                 if path.exists() {
@@ -513,7 +514,7 @@ impl DataStatCtx {
     pub(crate) fn add_stat_interval(&self, stat: MemDataStat, ivl: IntervalPair) {
         // this lock guard protect both interval and file_stat in Manifest so that partail lookup
         // will not happen
-        let mut lk = self.interval.write().expect("can't lock write");
+        let mut lk = self.interval.write();
         lk.insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
         self.add_stat_unlocked(stat);
     }
@@ -530,7 +531,7 @@ impl DataStatCtx {
 
         // this lock guard protect both interval and file_stat in Manifest so that partail lookup
         // will not happen
-        let mut lk = self.interval.write().expect("can't lock write");
+        let mut lk = self.interval.write();
         // must be guarded by lock, or else if we are failed to lock interval, the frames deactived
         // by flush thread will be lost
         self.stop_collect_junks();
@@ -572,7 +573,7 @@ impl DataStatCtx {
     }
 
     pub(crate) fn remove_stat_interval(&self, blobs: &[u64], ivls: &[u64]) {
-        let mut lk = self.interval.write().expect("can't lock write");
+        let mut lk = self.interval.write();
         for &x in ivls {
             let r = lk.remove(x);
             assert!(r.is_some());
@@ -590,7 +591,7 @@ impl DataStatCtx {
 
     pub(crate) fn load(&self, addr: u64) -> Option<BoxRef> {
         let file_id = {
-            let lk = self.interval.read().expect("can't lock read");
+            let lk = self.interval.read();
             let Some(file_id) = lk.find(addr) else {
                 log::error!("can't find file_id in interval by {}", addr);
                 panic!("can't find file_id in interval by {}", addr);
@@ -612,7 +613,7 @@ impl DataStatCtx {
         let mut v: Vec<DataStat> = Vec::with_capacity(junks.len());
         // this lock guard protect both interval and file_stat in Manifest so that partail lookup
         // will not happen
-        let lk = self.interval.read().expect("can't lock read");
+        let lk = self.interval.read();
         for &addr in junks {
             let file_id = lk.find(addr).expect("must exist");
             if let Some(mut stat) = self.map.get_mut(&file_id) {
@@ -715,7 +716,7 @@ impl BlobStatCtx {
         file_ratio: usize,
         garbage_ratio: usize,
     ) -> (Vec<u64>, Vec<(u64, usize)>) {
-        let lk = self.map.read().unwrap();
+        let lk = self.map.read();
         let n = lk.len() * file_ratio / 100;
         let mut v = Vec::new();
         let mut o = Vec::new();
@@ -742,13 +743,13 @@ impl BlobStatCtx {
     }
 
     pub(crate) fn remove_stat_interval(&self, blobs: &[u64], ivls: &[u64]) {
-        let mut lk = self.map.write().expect("can't lock write");
+        let mut lk = self.map.write();
         for x in blobs {
             let r = lk.remove(x);
             assert!(r.is_some());
         }
         drop(lk);
-        let mut lk = self.interval.write().expect("can't lock write");
+        let mut lk = self.interval.write();
         for &x in ivls {
             lk.remove(x);
         }
@@ -771,7 +772,7 @@ impl BlobStatCtx {
         del_intervals: &[u64],
         remap_intervals: &[IntervalPair],
     ) -> BlobStat {
-        let mut lk = self.interval.write().expect("can't lock write");
+        let mut lk = self.interval.write();
         self.stop_collect_junks();
 
         let mut seqs = vec![];
@@ -808,7 +809,7 @@ impl BlobStatCtx {
 
     fn load(&self, addr: u64) -> Option<BoxRef> {
         let file_id = {
-            let lk = self.interval.read().expect("can't lock read");
+            let lk = self.interval.read();
             let Some(file_id) = lk.find(addr) else {
                 log::error!("can't find file_id in interval by {addr}");
                 panic!("can't find file_id in interval by {addr}");
@@ -844,10 +845,10 @@ impl BlobStatCtx {
 
     fn apply_junks(&self, junks: &[u64]) -> Vec<BlobStat> {
         let mut v: Vec<BlobStat> = Vec::with_capacity(junks.len());
-        let lk = self.interval.read().expect("can't lock read");
+        let lk = self.interval.read();
         for &addr in junks {
             let file_id = lk.find(addr).expect("must exist");
-            let mut map = self.map.write().expect("can't lock write");
+            let mut map = self.map.write();
             if let Some(stat) = map.get_mut(&file_id) {
                 let reloc = self.get_reloc(file_id, addr);
                 self.update_stat(stat, &reloc, addr);
@@ -879,17 +880,17 @@ impl BlobStatCtx {
     }
 
     fn add_stat_unlocked(&self, stat: MemBlobStat) {
-        let mut map = self.map.write().expect("can't lock write");
+        let mut map = self.map.write();
         map.insert(stat.file_id, stat);
     }
 
     pub(crate) fn remove_stat(&self, file_id: u64) -> Option<MemBlobStat> {
-        let mut map = self.map.write().expect("can't lock write");
+        let mut map = self.map.write();
         map.remove(&file_id)
     }
 
     fn add_stat_interval(&self, stat: MemBlobStat, ivl: IntervalPair) {
-        let mut lk = self.interval.write().expect("can't lock write");
+        let mut lk = self.interval.write();
         lk.insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
         self.add_stat_unlocked(stat);
     }

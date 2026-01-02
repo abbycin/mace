@@ -1,10 +1,10 @@
+use parking_lot::{Mutex, MutexGuard};
 use std::{
     cell::Cell,
     collections::HashMap,
     hash::Hash,
     ops::Deref,
     ptr::{self},
-    sync::{Mutex, MutexGuard},
 };
 
 use super::spooky::spooky_hash;
@@ -145,12 +145,12 @@ where
             cap,
             k,
             lru: self,
-            map: self.map.lock().unwrap(),
+            map: self.map.lock(),
         }
     }
 
     pub(crate) fn add(&self, cap: usize, k: K, v: V) {
-        let mut map = self.map.lock().unwrap();
+        let mut map = self.map.lock();
         self.add_unlocked(&mut map, cap, k, v);
     }
 
@@ -184,7 +184,7 @@ where
     }
 
     pub(crate) fn get<'a>(&'a self, k: &K) -> Option<LruGuard<'a, K, V, *mut Node<K, V>>> {
-        let map = self.map.lock().unwrap();
+        let map = self.map.lock();
         if let Some(x) = map.get(k) {
             Node::move_back(self.head, *x);
             Some(LruGuard {
@@ -197,7 +197,7 @@ where
     }
 
     pub(crate) fn del(&self, k: &K) {
-        let mut map = self.map.lock().unwrap();
+        let mut map = self.map.lock();
         if let Some(node) = map.remove(k) {
             Node::remove(node);
             unsafe {
@@ -276,7 +276,7 @@ where
     }
 
     fn add(&self, prio: CachePriority, k: K, v: V) {
-        let mut lk = self.map.lock().unwrap();
+        let mut lk = self.map.lock();
         let index = prio as usize;
         let head = self.queue[index];
         let cap = &self.cap[index];
@@ -305,7 +305,7 @@ where
     }
 
     fn get<'a>(&'a self, k: &K) -> Option<LruGuard<'a, K, V, *mut Node<K, (V, CachePriority)>>> {
-        let lk = self.map.lock().unwrap();
+        let lk = self.map.lock();
         if let Some(e) = lk.get(k) {
             let v = unsafe { (*(*e)).val.as_ref().unwrap() };
             Node::move_back(self.queue[v.1 as usize], *e);

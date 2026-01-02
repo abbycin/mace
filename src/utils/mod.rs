@@ -28,7 +28,8 @@ pub const ADDR_LEN: usize = size_of::<u64>();
 pub(crate) const INIT_ID: u64 = 0;
 pub(crate) const INIT_CMD: u32 = 1;
 pub(crate) const NULL_CMD: u32 = u32::MAX;
-/// NOTE: must larger than wmk_oldest_tx(which is 0 by default)
+pub(crate) const INIT_WMK: u64 = 0;
+/// NOTE: must larger than wmk_oldest (which is 0 by default)
 pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
 
@@ -332,6 +333,12 @@ impl<T> Deref for CachePad<T> {
 impl<T> DerefMut for CachePad<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.data
+    }
+}
+
+impl<T> From<T> for CachePad<T> {
+    fn from(value: T) -> Self {
+        CachePad { data: value }
     }
 }
 

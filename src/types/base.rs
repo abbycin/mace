@@ -296,13 +296,13 @@ impl BaseView {
             let f = || {
                 let l = self.range_iter::<L, IntlKey>(loader, 0, elems1);
                 let r = other.range_iter::<L, IntlKey>(loader, 0, elems2);
-                FuseBaseIter::new(loader, &lo1[..pl1], &lo2[..pl2], l, r)
+                FuseBaseIter::new(&lo1[..pl1], &lo2[..pl2], l, r)
             };
             Self::new_intl(a, lo1, hi, sibling, f)
         } else {
             let l = self.range_iter::<L, Key>(loader, 0, elems1);
             let r = other.range_iter::<L, Key>(loader, 0, elems2);
-            let mut iter = FuseBaseIter::new(loader, &lo1[..pl1], &lo2[..pl2], l, r);
+            let mut iter = FuseBaseIter::new(&lo1[..pl1], &lo2[..pl2], l, r);
             Self::new_leaf(a, loader, lo1, hi, sibling, &mut iter)
         }
     }
@@ -461,15 +461,10 @@ where
     L: ILoader,
     K: IKey,
 {
-    first: bool,
-    loader: &'a L,
     prefix1: &'a [u8],
     prefix2: &'a [u8],
     iter1: BaseIter<'a, L, K>,
     iter2: BaseIter<'a, L, K>,
-    sib_key: &'a [u8],
-    sibling: Option<BaseView>,
-    sibling_pos: usize,
 }
 
 impl<'a, L, K> FuseBaseIter<'a, L, K>
@@ -478,30 +473,16 @@ where
     K: IKey,
 {
     fn new(
-        loader: &'a L,
         prefix1: &'a [u8],
         prefix2: &'a [u8],
         i1: BaseIter<'a, L, K>,
         i2: BaseIter<'a, L, K>,
     ) -> Self {
         Self {
-            first: true,
-            loader,
             prefix1,
             prefix2,
             iter1: i1,
             iter2: i2,
-            sib_key: &[],
-            sibling: None,
-            sibling_pos: 0,
-        }
-    }
-
-    fn prefix(&self) -> &'a [u8] {
-        if self.first {
-            self.prefix1
-        } else {
-            self.prefix2
         }
     }
 }
@@ -513,39 +494,13 @@ where
     type Item = (LeafSeg<'a>, Val<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(p) = self.sibling.as_ref() {
-            if self.sibling_pos >= p.header().elems as usize {
-                self.sibling_pos = 0;
-                let link = p.box_header().link;
-                if link != 0 {
-                    self.sibling = Some(self.loader.load_unchecked(link).as_base());
-                    continue;
-                }
-                self.sibling = None;
-            } else {
-                let (ver, v) = p.sst::<Ver>().kv_at(self.sibling_pos);
-                self.sibling_pos += 1;
-                let k = LeafSeg::new(self.prefix(), self.sib_key, ver);
-                return Some((k, v));
-            }
+        if let Some((k, v)) = self.iter1.next() {
+            Some((LeafSeg::new(self.prefix1, k.raw, k.ver), v))
+        } else {
+            self.iter2
+                .next()
+                .map(|(k, v)| (LeafSeg::new(self.prefix2, k.raw, k.ver), v))
         }
-        let (k, v) = {
-            let mut next = self.iter1.next();
-            if next.is_none() {
-                self.first = false;
-                next = self.iter2.next();
-            }
-            next.as_ref()?;
-            next.unwrap()
-        };
-
-        if let Some(addr) = v.get_sibling() {
-            self.sib_key = k.raw;
-            self.sibling_pos = 0;
-            self.sibling = Some(self.loader.load_unchecked(addr).as_base());
-            return Some((LeafSeg::new(self.prefix(), k.raw, k.ver), v));
-        }
-        Some((LeafSeg::new(self.prefix(), k.raw, k.ver), v))
     }
 }
 
@@ -556,13 +511,13 @@ where
     type Item = (IntlSeg<'a>, Index);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut data = self.iter1.next();
-        if data.is_none() {
-            self.first = false;
-            data = self.iter2.next();
-            data.as_ref()?;
+        if let Some((k, v)) = self.iter1.next() {
+            Some((IntlSeg::new(self.prefix1, k.raw), v))
+        } else {
+            self.iter2
+                .next()
+                .map(|(k, v)| (IntlSeg::new(self.prefix2, k.raw), v))
         }
-        data.map(|(k, v)| (IntlSeg::new(self.prefix(), k.raw), v))
     }
 }
 

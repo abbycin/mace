@@ -794,8 +794,10 @@ where
 mod test {
     use std::{
         cell::RefCell,
+        cmp::Ordering,
         collections::HashMap,
         sync::{Arc, atomic::AtomicU64},
+        u32, u64,
     };
 
     use crate::{
@@ -809,6 +811,51 @@ mod test {
     };
 
     use super::{Index, Key};
+
+    #[test]
+    fn test_ver() {
+        let mut data = Vec::new();
+
+        data.push(Ver::new(1, 1));
+        data.push(Ver::new(1, 2));
+        data.push(Ver::new(2, 1));
+        data.push(Ver::new(2, 2));
+        data.push(Ver::new(3, 1));
+
+        data.sort();
+
+        fn lower_bound(data: &Vec<Ver>, tgt: Ver) -> Option<&Ver> {
+            let mut lo = 0;
+            let mut hi = data.len();
+
+            while lo < hi {
+                let mid = lo + ((hi - lo) >> 1);
+                let k = data[mid];
+                match k.cmp(&tgt) {
+                    Ordering::Less => lo = mid + 1,
+                    _ => hi = mid,
+                }
+            }
+            data.get(lo)
+        }
+        assert_eq!(
+            lower_bound(&data, Ver::new(1, u32::MAX)),
+            Some(&Ver::new(1, 2))
+        );
+        assert_eq!(
+            lower_bound(&data, Ver::new(2, u32::MAX)),
+            Some(&Ver::new(2, 2))
+        );
+        assert_eq!(
+            lower_bound(&data, Ver::new(3, u32::MAX)),
+            Some(&Ver::new(3, 1))
+        );
+
+        assert_eq!(
+            lower_bound(&data, Ver::new(u64::MAX, u32::MAX)),
+            Some(&Ver::new(3, 1))
+        );
+    }
 
     #[test]
     fn test_key_codec() {

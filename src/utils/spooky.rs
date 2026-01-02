@@ -4,7 +4,7 @@ const D_CONST: u64 = BASE_C.wrapping_add(8 << 56);
 
 #[inline]
 const fn rot64(x: u64, k: u32) -> u64 {
-    (x << k) | (x >> (64 - k))
+    x.rotate_left(k)
 }
 
 pub fn spooky_hash(key: u64) -> u64 {

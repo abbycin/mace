@@ -1,7 +1,7 @@
+use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::OpCode;
@@ -44,7 +44,7 @@ impl Default for PageMap {
 
 impl PageMap {
     pub fn map(&self, data: u64) -> Option<u64> {
-        let mut lk = self.free.lock().unwrap();
+        let mut lk = self.free.lock();
         if let Some(pid) = lk.pop_first() {
             self.index(pid)
                 .compare_exchange(NULL_ADDR, data, Ordering::AcqRel, Ordering::Relaxed)
@@ -76,7 +76,7 @@ impl PageMap {
             .compare_exchange(addr, NULL_ADDR, Ordering::AcqRel, Ordering::Relaxed)
             .map_err(|_| OpCode::Again)?;
 
-        let mut lk = self.free.lock().unwrap();
+        let mut lk = self.free.lock();
         assert!(!lk.contains(&pid));
         lk.insert(pid);
         Ok(())
@@ -91,7 +91,7 @@ impl PageMap {
     }
 
     pub fn insert_free(&self, pid: u64) {
-        let mut lk = self.free.lock().unwrap();
+        let mut lk = self.free.lock();
         assert!(!lk.contains(&pid));
         lk.insert(pid);
     }

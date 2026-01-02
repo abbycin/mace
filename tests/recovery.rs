@@ -275,7 +275,7 @@ fn put_update(remove_data: bool) {
             checksum: 0,
         };
 
-        for i in 0..save.workers {
+        for i in 0..save.concurrent_write {
             w.worker = i;
             w.write(save.desc_file(i));
         }

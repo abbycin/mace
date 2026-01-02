@@ -11,7 +11,7 @@ use crate::{
     meta::IMetaCodec,
     types::traits::IAsSlice,
     utils::{
-        INIT_ADDR, INIT_ID, INIT_ORACLE,
+        INIT_ADDR, INIT_ID, INIT_ORACLE, INIT_WMK,
         bitmap::BitMap,
         data::{MapEntry, Reloc},
     },
@@ -522,7 +522,7 @@ impl Default for Numerics {
             next_manifest_id: AtomicU64::new(INIT_ID),
             oracle: AtomicU64::new(INIT_ORACLE),
             address: AtomicU64::new(INIT_ADDR),
-            wmk_oldest: AtomicU64::new(0),
+            wmk_oldest: AtomicU64::new(INIT_WMK),
             log_size: AtomicUsize::new(0),
         }
     }
