@@ -177,7 +177,7 @@ impl Pool {
         let cur_id = cur.id();
 
         if cur_id == arena_id {
-            return Some(cur.load(addr));
+            return cur.load(addr);
         }
 
         if let Some(h) = self.wait.get(&arena_id) {
@@ -185,7 +185,7 @@ impl Pool {
                 return None;
             }
             if h.id() == arena_id {
-                return Some(h.load(addr));
+                return h.load(addr);
             }
         }
         None

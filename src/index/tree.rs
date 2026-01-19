@@ -228,6 +228,7 @@ impl Tree {
         Ok(())
     }
 
+    // NOTE: it must be protected by lock
     fn remove_node_index(
         &self,
         parent_ptr: &Page,
@@ -261,6 +262,7 @@ impl Tree {
     // 2. return if it's merging
     // 3. or else create a new node with merging set to true
     // 4. replace old child node with the new node
+    // NOTE: it must be protected by lock
     fn set_node_merging(
         &self,
         child_pid: u64,
@@ -523,6 +525,30 @@ impl Tree {
         }
     }
 
+    pub(crate) fn try_scavenge(&self, pid: u64, g: &Guard) -> Result<bool, OpCode> {
+        let page = if let Some(p) = self.load_node(g, pid)? {
+            p
+        } else {
+            return Ok(false);
+        };
+
+        let safe_txid = self.store.context.safe_txid();
+        let delta_len = page.delta_len();
+        let threshold = self.store.opt.consolidate_threshold as usize;
+
+        if delta_len >= threshold {
+            self.try_compact(g, page);
+            return Ok(true);
+        }
+
+        if page.ref_node().has_garbage(safe_txid) {
+            self.try_compact(g, page);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     fn try_merge(&self, g: &Guard, parent: Page, cur: Page) -> Result<(), OpCode> {
         let Some(lk) = parent.try_lock() else {
             return Err(OpCode::Again);
@@ -545,33 +571,32 @@ impl Tree {
         Ok(())
     }
 
-    fn link<K, V, F>(&self, g: &Guard, old: Page, k: &K, v: &V, mut check: F) -> Result<(), OpCode>
+    fn link<K, V, F>(&self, g: &Guard, page: Page, k: &K, v: &V, mut check: F) -> Result<(), OpCode>
     where
         K: IKey,
         V: IVal,
         F: FnMut(Page, &K) -> Result<(u8, u64), OpCode>,
     {
-        let (wid, seq) = check(old, k)?;
+        loop {
+            inc_cas!(link);
+            let Some(node) = page.try_lock() else {
+                inc_cas!(link_fail);
+                continue;
+            };
+            // consolidate happened, we must retry from root
+            if self.store.page.get(page.pid()) != page.swip() {
+                return Err(OpCode::Again);
+            };
 
-        let mut txn = self.begin(g);
-        let (b, r) = DeltaView::from_key_val(&mut txn, k, v);
-        let mut new = Page::new(old.insert(b.view().as_delta()));
+            let (wid, seq) = check(page, k)?;
+            let mut txn = self.begin(g);
+            let (k, v) = DeltaView::from_key_val(&mut txn, k, v);
 
-        // because each thread contains their private data, we have to load the current page by pid
-        // and retry (insert delta to the loaded page) on failure caused by both insert/compaction,
-        // meanwhile, smo may also cause update fail, we simply restart the whole insert procedure
-        // TODO: potential performance degradation
-        inc_cas!(link);
-        if txn.update(old, &mut new).is_err() {
-            inc_cas!(link_fail);
-            new.reclaim();
-            return Err(OpCode::Again);
+            node.insert(k, v);
+
+            txn.record_and_commit(wid as usize, seq);
+            return Ok(());
         }
-
-        txn.record_and_commit(wid as usize, seq);
-        new.save(b, r); // save the delta itself until page was reclaimed
-
-        Ok(())
     }
 
     fn try_put<K, V>(&self, g: &Guard, key: &K, val: &V) -> Result<(), OpCode>
@@ -737,28 +762,38 @@ impl Tree {
     {
         let page = self.find_leaf(g, key.raw)?;
 
-        let it = page.range_from(
-            key,
+        let mut result = None;
+        let search_key = Key::new(key.raw, Ver::new(u64::MAX, u32::MAX));
+        page.visit_versions(
+            search_key,
             |x, y| {
                 let k = Key::decode_from(x.key());
                 match k.raw.cmp(y.raw) {
-                    Equal => y.txid.cmp(&k.txid),
+                    Equal => y.txid.cmp(&k.txid), // compare txid is enough
                     o => o,
                 }
             },
-            |x, y| Key::decode_from(x.key()).raw.cmp(y.raw).is_eq(),
+            |x| {
+                let k = Key::decode_from(x.key());
+                if k.raw.cmp(key.raw).is_ne() {
+                    return true;
+                }
+                let val = x.val();
+                if val.is_tombstone() {
+                    result = Some(Err(OpCode::NotFound));
+                    return true;
+                }
+                if visible(k.txid, val.worker()) {
+                    let (r, v) = val.get_record(&page.loader, true);
+                    result = Some(Ok(ValRef::new(r, v.unwrap_or_else(|| x.as_box()))));
+                    return true;
+                }
+                false
+            },
         );
 
-        for x in it {
-            let val = x.val();
-            if val.is_tombstone() {
-                return Err(OpCode::NotFound);
-            }
-            let k = Key::decode_from(x.key());
-            if visible(k.txid, val.worker()) {
-                let (r, v) = val.get_record(page.loader(), true);
-                return Ok(ValRef::new(r, v.unwrap_or_else(|| x.as_box())));
-            }
+        if let Some(res) = result {
+            return res;
         }
 
         // Key::raw is unique in sst
@@ -767,11 +802,11 @@ impl Tree {
             return Err(OpCode::NotFound);
         }
         if visible(k.txid, val.worker()) {
-            let (record, r) = val.get_record(page.loader(), true);
+            let (record, r) = val.get_record(&page.loader, true);
             return Ok(ValRef::new(record, r.unwrap_or_else(|| page.base_box())));
         }
         if let Some(addr) = val.get_sibling() {
-            return self.traverse_sibling(page.loader(), key.txid, addr, &mut visible);
+            return self.traverse_sibling(&page.loader, key.txid, addr, &mut visible);
         }
         Err(OpCode::NotFound)
     }
@@ -955,4 +990,47 @@ static G_CAS: CASstatus = CASstatus {
 #[cfg(feature = "metric")]
 pub fn g_cas_status() -> &'static CASstatus {
     &G_CAS
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{Mace, Options, RandomPath};
+    use std::thread;
+
+    #[test]
+    fn concurrent_page_hit() {
+        let path = RandomPath::tmp();
+        let mut opt = Options::new(&*path);
+        opt.split_elems = 256;
+        opt.tmp_store = true;
+        let db = Mace::new(opt.validate().unwrap()).unwrap();
+
+        let num_readers = 4;
+        let num_iterations = 1000;
+
+        thread::scope(|s| {
+            for _ in 0..num_readers {
+                let db = db.clone();
+                s.spawn(move || {
+                    for _ in 0..num_iterations {
+                        let view = db.view().unwrap();
+                        let mut count = 0;
+                        for _ in view.seek("key") {
+                            count += 1;
+                        }
+                        assert!(count >= 0);
+                    }
+                });
+            }
+
+            s.spawn(|| {
+                for i in 0..num_iterations {
+                    let kv = db.begin().unwrap();
+                    let key = format!("key_{:05}", i);
+                    kv.put(&key, &key).unwrap();
+                    kv.commit().unwrap();
+                }
+            });
+        });
+    }
 }

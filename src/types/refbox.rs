@@ -10,7 +10,7 @@ use std::{
 
 use super::header::{BaseHeader, BoxHeader, DeltaHeader, RemoteHeader, TagFlag};
 use super::traits::{IAsBoxRef, IBoxHeader, IHeader};
-static_assert!(BoxRef::HDR_LEN == 40);
+static_assert!(BoxRef::HDR_LEN == 48);
 static_assert!(align_of::<BoxHeader>() == align_of::<*const ()>());
 
 pub struct BoxRef(*mut BoxHeader);
@@ -56,10 +56,6 @@ impl BoxView {
         raw_ptr_to_ref_mut(self.0).refs.fetch_sub(1, AcqRel)
     }
 
-    pub(crate) fn refcnt(&self) -> u32 {
-        raw_ptr_to_ref_mut(self.0).refs.load(Relaxed)
-    }
-
     fn cast_to<T>(&self) -> *mut T {
         unsafe { self.0.add(1).cast::<T>() }
     }
@@ -100,15 +96,18 @@ impl BoxRef {
     }
 
     pub(crate) fn alloc_exact(size: u32, addr: u64) -> BoxRef {
-        let layout = Layout::array::<u8>(size as usize)
+        let layout = Layout::from_size_align(size as usize, 8)
             .inspect_err(|x| panic!("bad layout {x:?}"))
             .unwrap();
         let mut this = BoxRef(unsafe { alloc(layout).cast::<_>() });
+        #[cfg(feature = "extra_check")]
+        assert_eq!(this.0 as usize % 8, 0);
         let h = this.header_mut();
         h.total_size = size;
         h.payload_size = size - Self::HDR_LEN as u32;
         h.flag = TagFlag::Normal;
         h.pid = NULL_PID;
+        h.txid = 0;
         h.addr = addr;
         h.link = NULL_ADDR;
         h.refs.store(1, Relaxed);

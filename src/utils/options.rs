@@ -213,7 +213,7 @@ impl Options {
     pub const BLOB_PREFIX: &'static str = "blob";
     pub const WAL_PREFIX: &'static str = "wal";
     pub const WAL_STABLE: &'static str = "stable-wal";
-    pub const MANIFEST_PREFIX: &'static str = "manifest";
+    pub const MANIFEST: &'static str = "manifest";
 
     pub fn data_root(&self) -> PathBuf {
         self.db_root().join("data")
@@ -267,18 +267,8 @@ impl Options {
         self.log_root().join(format!("meta_{wid}"))
     }
 
-    pub fn manifest(&self, seq: u64) -> PathBuf {
-        self.log_root()
-            .join(format!("{}{}{}", Self::MANIFEST_PREFIX, Self::SEP, seq))
-    }
-
-    pub fn snapshot(&self, seq: u64) -> PathBuf {
-        self.db_root.join(format!(
-            "{}{}{}.snapshot",
-            Self::MANIFEST_PREFIX,
-            Self::SEP,
-            seq
-        ))
+    pub fn manifest(&self) -> PathBuf {
+        self.log_root().join(Self::MANIFEST)
     }
 }
 

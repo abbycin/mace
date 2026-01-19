@@ -218,10 +218,6 @@ impl<T> MutRef<T> {
         unsafe { &mut (*self.inner).raw }
     }
 
-    pub fn raw_ptr(&self) -> *mut T {
-        unsafe { &mut (*self.inner).raw }
-    }
-
     fn inc(&self) {
         unsafe { (*self.inner).refcnt.fetch_add(1, Relaxed) };
     }

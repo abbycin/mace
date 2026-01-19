@@ -56,6 +56,8 @@ pub trait IAlloc {
 pub trait IKey: Default + IKeyCodec + Ord {
     fn raw(&self) -> &[u8];
 
+    fn txid(&self) -> u64;
+
     fn to_string(&self) -> String;
 }
 

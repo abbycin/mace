@@ -1,3 +1,5 @@
+use crc32c::Crc32cHasher;
+use std::hash::Hasher;
 use std::{
     cell::RefCell,
     cmp::max,
@@ -80,6 +82,7 @@ pub(crate) struct WalUpdate {
     pub(crate) txid: u64,
     pub(crate) prev_id: u64,
     pub(crate) prev_off: u64,
+    pub(crate) checksum: u32,
 }
 
 impl Debug for WalUpdate {
@@ -94,6 +97,7 @@ impl Debug for WalUpdate {
             .field("txid", &{ self.txid })
             .field("prev_addr", &{ self.prev_id })
             .field("prev_off", &{ self.prev_off })
+            .field("checksum", &{ self.checksum })
             .finish()
     }
 }
@@ -163,6 +167,29 @@ impl WalUpdate {
 
     pub(crate) fn clr(&self) -> &WalClr {
         self.cast_to::<WalClr>()
+    }
+
+    pub(crate) fn calc_checksum(&self) -> u32 {
+        let ptr = self as *const Self as *const u8;
+        let header_size = self.encoded_len();
+        let checksum_offset = header_size - size_of_val(&{ self.checksum });
+
+        let mut h = Crc32cHasher::default();
+        unsafe {
+            let header_slice = std::slice::from_raw_parts(ptr, checksum_offset);
+            h.write(header_slice);
+
+            let payload_slice =
+                std::slice::from_raw_parts(ptr.add(header_size), self.payload_len());
+            h.write(payload_slice);
+        }
+        h.finish() as u32
+    }
+
+    pub(crate) fn is_intact(&self) -> bool {
+        let expected = { self.checksum };
+        let actual = self.calc_checksum();
+        expected == actual
     }
 }
 
@@ -459,8 +486,11 @@ impl<'a> WalReader<'a> {
                         }
                         let s = block.mut_slice(sz, usz - sz);
                         f.read(s, pos + sz as u64).unwrap();
-                        let (prev_id, prev_off) =
-                            self.undo(ptr_to::<WalUpdate>(block.data()), &mut cmd, tree, worker);
+
+                        let u = ptr_to::<WalUpdate>(block.data());
+                        assert!(u.is_intact());
+
+                        let (prev_id, prev_off) = self.undo(u, &mut cmd, tree, worker);
                         pos = prev_off;
                         if prev_id != addr.pos.file_id {
                             addr.pos.file_id = prev_id;
@@ -582,6 +612,7 @@ mod test {
             klen: KEY.len() as u32,
             prev_id: 0,
             prev_off: 0,
+            checksum: 0, // Will be calculated after record is assembled
         };
         let total_len = c.encoded_len() + len;
         let mut buf = vec![0u8; total_len * 2];

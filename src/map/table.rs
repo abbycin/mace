@@ -90,12 +90,6 @@ impl PageMap {
         self.index(pid).load(Ordering::Relaxed)
     }
 
-    pub fn insert_free(&self, pid: u64) {
-        let mut lk = self.free.lock();
-        assert!(!lk.contains(&pid));
-        lk.insert(pid);
-    }
-
     pub fn index(&self, pid: u64) -> &AtomicU64 {
         if pid < L3_FANOUT {
             self.l3.index(pid)

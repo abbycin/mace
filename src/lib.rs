@@ -69,7 +69,7 @@ impl Mace {
 
         recover.phase2(ctx, &desc, &tree);
         store.start();
-        let handle = start_gc(store.clone(), store.context);
+        let handle = start_gc(store.clone(), store.context, tree.clone());
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -106,5 +106,13 @@ impl Mace {
     /// notify gc to work even when gc was disabled, block until gc has been finished
     pub fn start_gc(&self) {
         self.inner.gc.start();
+    }
+
+    pub fn data_gc_count(&self) -> u64 {
+        self.inner.gc.data_gc_count()
+    }
+
+    pub fn blob_gc_count(&self) -> u64 {
+        self.inner.gc.blob_gc_count()
     }
 }

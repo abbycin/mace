@@ -2,7 +2,6 @@ use core::panic;
 use parking_lot::Mutex;
 use std::cmp::max;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -28,7 +27,7 @@ use crate::{Options, map::table::PageMap};
 use crossbeam_epoch::Guard;
 
 /// there are some cases can't recover:
-/// 1. manifest file checksum mismatch
+/// 1. manifest file missing or corrupted
 /// 2. log desc file checksum mismatch
 /// 3. data file lost (if wal file is complete, manual recovery is possible)
 ///
@@ -116,6 +115,10 @@ impl Recovery {
             .unwrap();
 
         let u = ptr_to::<WalUpdate>(buf.as_ptr());
+
+        // TODO: stop here instead of panic
+        assert!(u.is_intact());
+
         let ver = Ver::new(u.txid, u.cmd_id);
 
         debug_assert!(!self.dirty_table.contains_key(&ver));
@@ -356,82 +359,10 @@ impl Recovery {
         Ok(desc)
     }
 
-    /// there are a few number of manifest files, we can iterate them to build latest manifest
+    /// load latest manifest from btree-store
     fn load_manifest(&self) -> Result<Manifest, OpCode> {
-        let mut nums = Vec::new();
-        let mut snap = None; // latest snapshot
-        Self::readdir(&self.opt.log_root(), |path, name| {
-            if name.ends_with("tmp") {
-                // remove imcomplete dump
-                let _ = std::fs::remove_file(path);
-                return;
-            }
-            if name.starts_with(Options::MANIFEST_PREFIX) {
-                let v: Vec<&str> = name.split(Options::SEP).collect();
-                assert_eq!(v.len(), 2);
-                let num = v[1].parse::<u64>().expect("bad manifest file name");
-                if name.ends_with("snap") {
-                    if let Some(x) = snap.as_mut() {
-                        if *x < num {
-                            *x = num;
-                        }
-                    } else {
-                        snap = Some(num);
-                    }
-                }
-                nums.push(num);
-            }
-        });
-
-        // if has snapshot, keep latest snapshot and later manifest
-        nums.retain(|x| {
-            if let Some(s) = snap.as_ref() {
-                *x >= *s
-            } else {
-                true
-            }
-        });
-
         let mut b = ManifestBuilder::new(self.opt.clone());
-        nums.sort_unstable();
-        for (idx, i) in nums.iter().enumerate() {
-            let is_last = idx == nums.len() - 1;
-            let path = if let Some(snap_id) = snap.as_ref()
-                && snap_id == i
-            {
-                assert_eq!(idx, 0);
-                self.opt.snapshot(*snap_id)
-            } else {
-                self.opt.manifest(*i)
-            };
-            let e = b.add(path, is_last);
-            match e {
-                Ok(()) => {}
-                Err(OpCode::BadData) => return Err(OpCode::BadData),
-                Err(e) => {
-                    log::error!("parse manifest fail: {e:?}");
-                    return Err(e);
-                }
-            }
-        }
-
-        // log desc is complete (we checked in the very beginning), but data file is not, in this case
-        // the wal must has records after checkpoint in log desc, so we can recover data from wal records
-        Ok(b.finish(snap))
-    }
-
-    fn readdir<F>(path: &PathBuf, mut f: F)
-    where
-        F: FnMut(PathBuf, &str),
-    {
-        let dir = std::fs::read_dir(path).expect("can't readdir");
-        for i in dir.flatten() {
-            if !i.file_type().unwrap().is_file() {
-                continue;
-            }
-            let p = i.file_name();
-            let name = p.to_str().expect("can't filename");
-            f(i.path(), name);
-        }
+        b.load()?;
+        Ok(b.finish())
     }
 }

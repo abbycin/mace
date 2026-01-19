@@ -41,6 +41,7 @@ impl BaseView {
         hi: Option<&[u8]>,
         right_sibling: u64,
         iter: &mut I,
+        txid: u64,
     ) -> BoxRef
     where
         A: IAlloc,
@@ -102,9 +103,11 @@ impl BaseView {
             elems,
             right_sibling,
             prefix_len,
+            txid,
         );
 
         let mut base = b.view().as_base();
+        let mut has_multiple_versions = false;
         let mut builder = Builder::from(base.data_mut(), elems);
         builder.setup_boundary_keys(lo, hi);
 
@@ -124,7 +127,8 @@ impl BaseView {
 
             if pos == *idx {
                 let (_, cnt) = hints.pop_front().unwrap();
-                let sib_addr = Self::save_versions(a, l, cnt as usize, &mut pos, &seekable);
+                let sib_addr = Self::save_versions(a, l, cnt as usize, &mut pos, &seekable, txid);
+                has_multiple_versions = true;
 
                 builder.add_leaf(inline_size, k, &r, sib_addr, remote);
             } else {
@@ -132,6 +136,7 @@ impl BaseView {
             }
             pos += 1;
         }
+        base.header_mut().has_multiple_versions = has_multiple_versions;
         b
     }
 
@@ -141,6 +146,7 @@ impl BaseView {
         hi: Option<&[u8]>,
         sibling: u64,
         f: F,
+        txid: u64,
     ) -> BoxRef
     where
         A: IAlloc,
@@ -159,7 +165,7 @@ impl BaseView {
             .sum();
 
         let hdr_sz = elems * SLOT_LEN + Self::HDR_LEN;
-        let b = Self::alloc::<true, _>(a, hdr_sz + sz, lo, hi, elems, sibling, prefix_len);
+        let b = Self::alloc::<true, _>(a, hdr_sz + sz, lo, hi, elems, sibling, prefix_len, txid);
         let mut base = b.view().as_base();
         let mut builder = Builder::from(base.data_mut(), elems);
         builder.setup_boundary_keys(lo, hi);
@@ -179,6 +185,7 @@ impl BaseView {
         mut cnt: usize,
         pos: &mut u32,
         iter: &SeekableIter<'a>,
+        txid: u64,
     ) -> u64 {
         let inline_size = a.inline_size();
         let arena_size = a.arena_size();
@@ -202,7 +209,7 @@ impl BaseView {
             }
             iter.seek_to(saved);
 
-            let b = Self::alloc::<false, _>(a, len, &[], None, beg - saved, NULL_PID, 0);
+            let b = Self::alloc::<false, _>(a, len, &[], None, beg - saved, NULL_PID, 0, txid);
             // NOTE: this is the only place to set flag to Sibling
             let mut base = b.view().as_base();
             base.box_header_mut().flag = TagFlag::Sibling;
@@ -231,6 +238,7 @@ impl BaseView {
         head.unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn alloc<const IS_INDEX: bool, A: IAlloc>(
         a: &mut A,
         mut size: usize,
@@ -239,6 +247,7 @@ impl BaseView {
         elems: usize,
         right_sibling: u64,
         prefix_len: usize,
+        txid: u64,
     ) -> BoxRef {
         let hi_len = hi.map_or(0, |x| x.len());
 
@@ -250,6 +259,7 @@ impl BaseView {
         let h = p.header_mut();
         h.kind = TagKind::Base;
         h.link = NULL_ADDR;
+        h.txid = txid;
         h.node_type = if IS_INDEX {
             NodeType::Intl
         } else {
@@ -278,6 +288,7 @@ impl BaseView {
         a: &mut A,
         loader: &L,
         other: Self,
+        txid: u64,
     ) -> BoxRef {
         let hdr1 = self.header();
         let hdr2 = other.header();
@@ -298,12 +309,12 @@ impl BaseView {
                 let r = other.range_iter::<L, IntlKey>(loader, 0, elems2);
                 FuseBaseIter::new(&lo1[..pl1], &lo2[..pl2], l, r)
             };
-            Self::new_intl(a, lo1, hi, sibling, f)
+            Self::new_intl(a, lo1, hi, sibling, f, txid)
         } else {
             let l = self.range_iter::<L, Key>(loader, 0, elems1);
             let r = other.range_iter::<L, Key>(loader, 0, elems2);
             let mut iter = FuseBaseIter::new(&lo1[..pl1], &lo2[..pl2], l, r);
-            Self::new_leaf(a, loader, lo1, hi, sibling, &mut iter)
+            Self::new_leaf(a, loader, lo1, hi, sibling, &mut iter, txid)
         }
     }
 
@@ -654,7 +665,7 @@ mod test {
             refbox::{BaseView, BoxRef, BoxView},
             traits::{IAlloc, ICodec, IHeader, ILoader},
         },
-        utils::{MutRef, NULL_ADDR, NULL_PID},
+        utils::{MutRef, NULL_ADDR, NULL_ORACLE, NULL_PID},
     };
     use std::{cell::Cell, collections::HashMap};
 
@@ -741,16 +752,29 @@ mod test {
     fn box_base() {
         let mut a = Allocator::new();
         let kv = [(IntlKey::new("mo".as_bytes()), Index::new(233))];
-        let b = BaseView::new_intl(&mut a, "a".as_bytes(), None, NULL_PID, || {
-            kv.iter().map(|&(k, v)| (IntlSeg::new(&[], k.raw), v))
-        });
+        let b = BaseView::new_intl(
+            &mut a,
+            "a".as_bytes(),
+            None,
+            NULL_PID,
+            || kv.iter().map(|&(k, v)| (IntlSeg::new(&[], k.raw), v)),
+            NULL_ORACLE,
+        );
 
         let th = b.header();
         assert_eq!(th.kind, TagKind::Base);
 
         let mut empty = LeafData { data: &[], pos: 0 };
         let l = a.clone();
-        let b = BaseView::new_leaf(&mut a, &l, [].as_slice(), None, NULL_PID, &mut empty);
+        let b = BaseView::new_leaf(
+            &mut a,
+            &l,
+            [].as_slice(),
+            None,
+            NULL_PID,
+            &mut empty,
+            NULL_ORACLE,
+        );
         let th = b.header();
         assert_eq!(th.kind, TagKind::Base);
     }
@@ -795,7 +819,7 @@ mod test {
         };
         let l = a.clone();
 
-        let b = BaseView::new_leaf(&mut a, &l, &[], None, NULL_PID, &mut kv);
+        let b = BaseView::new_leaf(&mut a, &l, &[], None, NULL_PID, &mut kv, NULL_ORACLE);
         let base = b.view().as_base();
         let mut iter = base.range_iter::<Allocator, Key>(&l, 0, base.header().elems as usize);
 
@@ -829,9 +853,14 @@ mod test {
         let mut a = Allocator::new();
         let l = a.clone();
 
-        let b = BaseView::new_intl(&mut a, &[], None, NULL_PID, || {
-            kv.iter().map(|&(k, v)| (IntlSeg::new(&[], k.raw), v))
-        });
+        let b = BaseView::new_intl(
+            &mut a,
+            &[],
+            None,
+            NULL_PID,
+            || kv.iter().map(|&(k, v)| (IntlSeg::new(&[], k.raw), v)),
+            NULL_ORACLE,
+        );
         let base = b.view().as_base();
         let mut iter = base.range_iter::<Allocator, IntlKey>(&l, 0, base.header().elems as usize);
 

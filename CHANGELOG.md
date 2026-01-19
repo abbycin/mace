@@ -1,3 +1,13 @@
+## [0.0.24] 2026-01-18
+### Changes
+- Refactor metadata storage with `btree-store`
+- Add checksum to `WalUpdate`
+- Add a scavenger routine to clean up stale versions
+- Optimize random insert performance
+
+### Bug fixes
+- Fixed data race in `DataStatCtx` and `BlobStatCtx`
+
 ## [0.0.23] 2026-01-02
 ### Changes
 - Separate Read-Only transaction from worker, use a pool which can dynamic allocate new ConcurrencyControl on demand

@@ -1,0 +1,82 @@
+name: Cross-platform CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Job 1: Linux, Windows, macOS (x86_64 and ARM64)
+  test-mainstream:
+    name: ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: windows-latest
+            arch: x86_64
+          - os: macos-15-intel # Intel x86_64
+            arch: x86_64
+          - os: macos-latest # Apple Silicon ARM64
+            arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run Tests
+        run: cargo test --verbose -- --nocapture
+
+  # Job 2: FreeBSD (Runs in a VM on top of Linux)
+  test-freebsd:
+    name: FreeBSD (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run tests in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y rust
+          run: |
+            cargo test --verbose -- --nocapture
+
+  # Job 3: Linux ARM64 (Cross-compile check)
+  # This verifies that the code compiles for Linux on ARM.
+  # We use 'cross' to simplify cross-compilation.
+  test-linux-arm64:
+    name: Linux (ARM64 cross-compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build for ARM64
+        run: cross build --target aarch64-unknown-linux-gnu --verbose
+      
+      # Note: Running tests for ARM64 on x86_64 requires QEMU via cross.
+      # If you want to actually run the tests:
+      - name: Run tests for ARM64
+        run: cross test --target aarch64-unknown-linux-gnu --verbose -- --nocapture

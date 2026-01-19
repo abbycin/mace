@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering::{self, Greater, Less},
+    marker::PhantomData,
     mem::MaybeUninit,
     num::NonZeroUsize,
     ops::{Deref, DerefMut, Index, IndexMut},
@@ -64,8 +65,8 @@ where
         self.size
     }
 
-    pub(crate) fn iter(&self) -> Iter<'_, K> {
-        Iter::new(self.root.as_ref())
+    pub(crate) fn iter(&self) -> Iter<'static, K> {
+        Iter::new(self.root.clone())
     }
 
     pub(crate) fn range_from<T>(
@@ -73,8 +74,19 @@ where
         k: T,
         cmp: fn(&K, &T) -> Ordering,
         equal: fn(&K, &T) -> bool,
-    ) -> RangeIter<'_, K, T> {
-        RangeIter::new(self.root.as_ref(), k, cmp, equal)
+    ) -> RangeIter<'static, K, T> {
+        RangeIter::new(self.root.clone(), k, cmp, equal)
+    }
+
+    pub(crate) fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    where
+        F: FnMut(K) -> bool,
+    {
+        if let Some(root) = &self.root {
+            root.visit_from(k, cmp, f)
+        } else {
+            false
+        }
     }
 }
 
@@ -160,16 +172,50 @@ impl<K: Copy> Intl<K> {
     }
 }
 
-impl<K> Intl<K> {
+impl<K> Intl<K>
+where
+    K: Copy,
+{
     fn level(&self) -> usize {
         match &self.children {
             Children::Intl { level, .. } => level.get(),
             Children::Leaf { .. } => 1,
         }
     }
+
+    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    where
+        F: FnMut(K) -> bool,
+    {
+        let pos = match self.keys.binary_search_by(|x| cmp(x, k)) {
+            Ok(pos) => pos + 1,
+            Err(pos) => pos,
+        };
+
+        match &self.children {
+            Children::Intl { intl, .. } => {
+                for i in pos..intl.len() {
+                    if intl[i].visit_from(k, cmp, f) {
+                        return true;
+                    }
+                }
+            }
+            Children::Leaf { leaf } => {
+                for i in pos..leaf.len() {
+                    if leaf[i].visit_from(k, cmp, f) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
-impl<K: Clone> Leaf<K> {
+impl<K> Leaf<K>
+where
+    K: Copy,
+{
     fn put<F>(&mut self, k: K, cmp: F) -> Update<K>
     where
         F: Fn(&K, &K) -> Ordering,
@@ -195,9 +241,25 @@ impl<K: Clone> Leaf<K> {
             rk.insert(pos - MEDIAN, k);
         }
         Update::Split(
-            rk.first().unwrap().clone(),
+            *rk.first().unwrap(),
             Node::Leaf(Arc::new(Leaf { keys: rk })),
         )
+    }
+
+    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    where
+        F: FnMut(K) -> bool,
+    {
+        let pos = match self.keys.binary_search_by(|x| cmp(x, k)) {
+            Ok(pos) => pos,
+            Err(pos) => pos,
+        };
+        for i in pos..self.keys.len() {
+            if f(self.keys[i]) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -241,6 +303,16 @@ where
         }
     }
 
+    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    where
+        F: FnMut(K) -> bool,
+    {
+        match self {
+            Node::Intl(intl) => intl.visit_from(k, cmp, f),
+            Node::Leaf(leaf) => leaf.visit_from(k, cmp, f),
+        }
+    }
+
     fn from_split(lhs: Self, sep: K, rhs: Self) -> Self {
         Node::Intl(Arc::new(Intl {
             keys: Chunk::with_data(sep),
@@ -258,7 +330,10 @@ where
     }
 }
 
-impl<K> Node<K> {
+impl<K> Node<K>
+where
+    K: Copy,
+{
     fn level(&self) -> usize {
         match self {
             Node::Intl(intl) => intl.level(),
@@ -473,35 +548,38 @@ impl<T, const N: usize> PodChunk<T, N> {
     }
 }
 
-pub(crate) struct Iter<'a, K> {
-    cursor: Cursor<'a, K>,
+pub(crate) struct Iter<'a, K: Copy> {
+    cursor: Cursor<K>,
     runout: bool,
     is_yield: bool,
+    _marker: PhantomData<&'a K>,
 }
 
-impl<'a, K> Iter<'a, K> {
-    fn new(node: Option<&'a Node<K>>) -> Self {
+impl<'a, K: Copy> Iter<'a, K> {
+    fn new(node: Option<Node<K>>) -> Self {
         let mut cursor = Cursor::new(node);
         cursor.seek_to_first();
         Self {
             cursor,
             runout: false,
             is_yield: false,
+            _marker: PhantomData,
         }
     }
 }
 
-pub(crate) struct RangeIter<'a, K, T> {
-    cursor: Cursor<'a, K>,
+pub(crate) struct RangeIter<'a, K: Copy, T> {
+    cursor: Cursor<K>,
     key: T,
     equal: fn(&K, &T) -> bool,
     runout: bool,
     is_yield: bool,
+    _marker: PhantomData<&'a K>,
 }
 
-impl<'a, K, T> RangeIter<'a, K, T> {
+impl<'a, K: Copy, T> RangeIter<'a, K, T> {
     fn new(
-        node: Option<&'a Node<K>>,
+        node: Option<Node<K>>,
         key: T,
         cmp: fn(&K, &T) -> Ordering,
         equal: fn(&K, &T) -> bool,
@@ -515,10 +593,11 @@ impl<'a, K, T> RangeIter<'a, K, T> {
             equal,
             runout,
             is_yield: false,
+            _marker: std::marker::PhantomData,
         }
     }
 
-    pub(crate) fn peek(&self) -> Option<&'a K> {
+    pub(crate) fn peek(&self) -> Option<K> {
         if self.runout {
             None
         } else {
@@ -527,15 +606,15 @@ impl<'a, K, T> RangeIter<'a, K, T> {
     }
 }
 
-struct Cursor<'a, K> {
+struct Cursor<K: Copy> {
     // (visited_child, path)
-    path: Vec<(usize, &'a Intl<K>)>,
+    path: Vec<(usize, Arc<Intl<K>>)>,
     // (visited_data, node)
-    leaf: Option<(usize, &'a Leaf<K>)>,
+    leaf: Option<(usize, Arc<Leaf<K>>)>,
 }
 
-impl<'a, K> Cursor<'a, K> {
-    fn new(node: Option<&'a Node<K>>) -> Self {
+impl<K: Copy> Cursor<K> {
+    fn new(node: Option<Node<K>>) -> Self {
         let mut this = Cursor {
             path: Vec::new(),
             leaf: None,
@@ -578,24 +657,24 @@ impl<'a, K> Cursor<'a, K> {
                 .binary_search_by(|x| cmp(x, k))
                 .map(|pos| pos + 1)
                 .unwrap_or_else(|pos| pos);
-            let (pos, intl) = (*pos, *intl);
+            let (pos, intl) = (*pos, intl.clone());
             self.push_child(pos, intl);
         }
     }
 
-    fn push_child(&mut self, pos: usize, intl: &'a Intl<K>) {
+    fn push_child(&mut self, pos: usize, intl: Arc<Intl<K>>) {
         match &intl.children {
-            Children::Intl { intl, .. } => self.path.push((0, &intl[pos])),
-            Children::Leaf { leaf } => self.leaf = Some((0, &leaf[pos])),
+            Children::Intl { intl, .. } => self.path.push((0, intl[pos].clone())),
+            Children::Leaf { leaf } => self.leaf = Some((0, leaf[pos].clone())),
         }
     }
 
-    fn next(&mut self) -> Option<&'a K> {
+    fn next(&mut self) -> Option<K> {
         loop {
             if let Some((pos, leaf)) = &mut self.leaf {
                 if *pos + 1 < leaf.keys.len() {
                     *pos += 1;
-                    return leaf.keys.get(*pos);
+                    return leaf.keys.get(*pos).copied();
                 }
                 self.leaf = None;
             }
@@ -604,7 +683,7 @@ impl<'a, K> Cursor<'a, K> {
             };
             if *pos + 1 < intl.children.len() {
                 *pos += 1;
-                let (pos, intl) = (*pos, *intl);
+                let (pos, intl) = (*pos, intl.clone());
                 self.push_child(pos, intl);
                 break;
             }
@@ -613,23 +692,23 @@ impl<'a, K> Cursor<'a, K> {
         self.seek_to_first()
     }
 
-    fn peek(&self) -> Option<&'a K> {
+    fn peek(&self) -> Option<K> {
         if let Some((i, leaf)) = &self.leaf {
-            leaf.keys.get(*i)
+            leaf.keys.get(*i).copied()
         } else {
             None
         }
     }
 
-    fn seek_to_first(&mut self) -> Option<&'a K> {
+    fn seek_to_first(&mut self) -> Option<K> {
         loop {
             if let Some((pos, leaf)) = &self.leaf {
                 debug_assert_eq!(*pos, 0);
-                return leaf.keys.get(*pos);
+                return leaf.keys.get(*pos).copied();
             }
-            let (pos, intl) = self.path.last()?;
-            debug_assert_eq!(*pos, 0);
-            self.push_child(*pos, *intl);
+            let (pos, intl) = self.path.last()?.clone();
+            debug_assert_eq!(pos, 0);
+            self.push_child(pos, intl);
         }
     }
 }
@@ -788,8 +867,8 @@ impl<T, const N: usize> DerefMut for PodChunk<T, N> {
     }
 }
 
-impl<'a, K> Iterator for Iter<'a, K> {
-    type Item = &'a K;
+impl<'a, K: Copy> Iterator for Iter<'a, K> {
+    type Item = K;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.runout {
@@ -805,29 +884,29 @@ impl<'a, K> Iterator for Iter<'a, K> {
     }
 }
 
-impl<'a, K, T> Iterator for RangeIter<'a, K, T> {
-    type Item = &'a K;
+impl<'a, K: Copy, T> Iterator for RangeIter<'a, K, T> {
+    type Item = K;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.runout {
             return None;
         }
 
-        let next = if self.is_yield {
+        let k = if self.is_yield {
             self.cursor.next()
         } else {
             self.is_yield = true;
             self.cursor.peek()
         };
 
-        if let Some(x) = next.as_ref()
-            && !(self.equal)(x, &self.key)
+        if let Some(k) = k
+            && (self.equal)(&k, &self.key)
         {
-            self.runout = true;
-            return None;
+            return Some(k);
         }
 
-        next
+        self.runout = true;
+        None
     }
 }
 

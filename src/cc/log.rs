@@ -5,6 +5,8 @@ use crate::utils::block::Ring;
 use crate::utils::data::Position;
 use crate::utils::{data::WalDescHandle, options::ParsedOptions};
 use crate::{cc::wal::EntryType, utils::data::GatherWriter};
+use crc32c::Crc32cHasher;
+use std::hash::Hasher;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, atomic::Ordering::Relaxed};
@@ -201,7 +203,7 @@ impl Logging {
         let payload_size = w.encoded_len() + k.len() + ov.len() + nv.len();
         let Position { file_id, offset } = self.lsn();
 
-        let u = WalUpdate {
+        let mut u = WalUpdate {
             wal_type: EntryType::Update,
             sub_type: w.sub_type(),
             worker_id: self.worker,
@@ -211,7 +213,26 @@ impl Logging {
             txid: ver.txid,
             prev_id: file_id,
             prev_off: offset,
+            checksum: 0,
         };
+
+        let mut h = Crc32cHasher::default();
+        let header_size = u.encoded_len();
+        let checksum_offset = header_size - size_of_val(&{ u.checksum });
+
+        let header_ptr = &u as *const WalUpdate as *const u8;
+        unsafe {
+            let header_slice = std::slice::from_raw_parts(header_ptr, checksum_offset);
+            h.write(header_slice);
+        }
+
+        h.write(k);
+        h.write(w.to_slice());
+        h.write(ov);
+        h.write(nv);
+
+        u.checksum = h.finish() as u32;
+
         let total_sz = payload_size + u.encoded_len();
         if total_sz < self.ring.len() {
             let a = self.alloc(total_sz);

@@ -6,7 +6,10 @@ use std::{
     ops::Deref,
     sync::{
         Arc,
-        atomic::Ordering::Relaxed,
+        atomic::{
+            AtomicU64,
+            Ordering::{AcqRel, Acquire, Relaxed},
+        },
         mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     },
     thread::JoinHandle,
@@ -16,11 +19,12 @@ use std::{
 use crate::{
     Options, Store,
     cc::context::Context,
+    index::tree::Tree,
     io::{File, GatherIO},
     map::data::{BlobFooter, DataFooter, MetaReader},
     meta::{
         BlobStatInner, DataStatInner, DelInterval, Delete, FileId, IntervalPair, MemBlobStat,
-        MemDataStat, MetaKind, Numerics, TxnKind,
+        MemDataStat, MetaKind, Numerics,
     },
     types::traits::IAsSlice,
     utils::{
@@ -82,6 +86,8 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
 pub(crate) struct GCHandle {
     tx: Arc<Sender<i32>>,
     sem: Arc<Countblock>,
+    data_runs: Arc<AtomicU64>,
+    blob_runs: Arc<AtomicU64>,
 }
 
 impl GCHandle {
@@ -102,20 +108,35 @@ impl GCHandle {
         self.tx.send(GC_START).unwrap();
         self.sem.wait();
     }
+
+    pub(crate) fn data_gc_count(&self) -> u64 {
+        self.data_runs.load(Acquire)
+    }
+
+    pub(crate) fn blob_gc_count(&self) -> u64 {
+        self.blob_runs.load(Acquire)
+    }
 }
 
-pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
+pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>, tree: Tree) -> GCHandle {
     let (tx, rx) = channel();
     let sem = Arc::new(Countblock::new(1));
+    let data_runs = Arc::new(AtomicU64::new(0));
+    let blob_runs = Arc::new(AtomicU64::new(0));
     let gc = GarbageCollector {
         numerics: ctx.numerics.clone(),
         ctx,
         store,
+        tree,
+        data_runs: data_runs.clone(),
+        blob_runs: blob_runs.clone(),
     };
     gc_thread(gc, rx, sem.clone());
     GCHandle {
         tx: Arc::new(tx),
         sem,
+        data_runs,
+        blob_runs,
     }
 }
 
@@ -178,6 +199,9 @@ struct GarbageCollector {
     numerics: Arc<Numerics>,
     ctx: Handle<Context>,
     store: MutRef<Store>,
+    tree: Tree,
+    data_runs: Arc<AtomicU64>,
+    blob_runs: Arc<AtomicU64>,
 }
 
 impl GarbageCollector {
@@ -185,14 +209,46 @@ impl GarbageCollector {
 
     fn run(&mut self) {
         self.process_wal();
-        self.process_manifest();
         self.process_data();
         self.process_blob();
+        self.scavenge_step();
     }
 
-    /// with SSD support, for TB level data, directly write manifest snapshot is acceptable
-    fn process_manifest(&mut self) {
-        self.ctx.manifest.try_clean();
+    fn scavenge_step(&mut self) {
+        let max_pid = self.store.page.len();
+        if max_pid == 0 {
+            return;
+        }
+
+        // strategy: scan the entire page table approximately every 500 ticks (e.g., ~8 hours if tick=1min)
+        // but keep the batch size within a reasonable range [128, 10000].
+        let batch_size = (max_pid / 500).max(128).min(10000);
+        let mut compact_count = 0;
+        let max_compact_per_tick = 64; // limit I/O impact
+
+        let g = crossbeam_epoch::pin();
+        for _ in 0..batch_size {
+            let mut cursor = self.numerics.scavenge_cursor.load(Relaxed);
+            if cursor >= max_pid {
+                cursor = 0;
+            }
+
+            match self.tree.try_scavenge(cursor, &g) {
+                Ok(true) => {
+                    compact_count += 1;
+                }
+                _ => {
+                    // page is locked or busy or something else, just skip it this time
+                }
+            }
+
+            self.numerics.scavenge_cursor.store(cursor + 1, Relaxed);
+
+            // if we reached the I/O quota, stop this batch early
+            if compact_count >= max_compact_per_tick {
+                break;
+            }
+        }
     }
 
     fn process_obsoleted_blob(&self, obsoleted: Vec<u64>) {
@@ -208,7 +264,7 @@ impl GarbageCollector {
                 }
                 unlinked.push(x);
             });
-            let mut txn = self.ctx.manifest.begin(TxnKind::BlobGC);
+            let mut txn = self.ctx.manifest.begin();
             txn.record(MetaKind::BlobDelete, &unlinked);
             txn.record(MetaKind::BlobDelInterval, &del_intervals);
             txn.commit();
@@ -235,7 +291,7 @@ impl GarbageCollector {
                 }
                 unlinked.push(x);
             });
-            let mut txn = self.ctx.manifest.begin(TxnKind::DataGC);
+            let mut txn = self.ctx.manifest.begin();
             txn.record(MetaKind::DataDelete, &unlinked);
             txn.record(MetaKind::DataDelInterval, &del_intervals);
             txn.commit();
@@ -266,9 +322,11 @@ impl GarbageCollector {
                 self.rewrite_blob(&dst);
                 dst.clear();
                 dst_size = 0;
-            } else {
-                break;
             }
+        }
+
+        if self.store.opt.gc_eager && dst.len() >= 2 {
+            self.rewrite_blob(&dst);
         }
     }
 
@@ -433,7 +491,7 @@ impl GarbageCollector {
         // it's also possible that frames in all candidate were obsoleted, in this case one data id
         // is wasted, and a footer will be flush to data file, it will be removed in the future
 
-        let mut txn = self.ctx.manifest.begin(TxnKind::DataGC);
+        let mut txn = self.ctx.manifest.begin();
 
         txn.record(MetaKind::FileId, &FileId::data(file_id));
         txn.sync(); // necessary, before data file was flushed
@@ -476,6 +534,7 @@ impl GarbageCollector {
         // 3. it's safe to clean obsolete files, becuase they are not referenced
         self.ctx.manifest.save_obsolete_data(&tmp);
         self.ctx.manifest.delete_files();
+        self.data_runs.fetch_add(1, AcqRel);
     }
 
     fn rewrite_blob(&mut self, candidate: &[u64]) {
@@ -538,7 +597,7 @@ impl GarbageCollector {
         // it's also possible that frames in all candidate were obsoleted, in this case one blob id
         // is wasted, and a footer will be flush to blob file, it will be removed in the future
 
-        let mut txn = self.ctx.manifest.begin(TxnKind::BlobGC);
+        let mut txn = self.ctx.manifest.begin();
 
         txn.record(MetaKind::FileId, &FileId::blob(blob_id));
         txn.sync(); // necessary, before blob file was flushed
@@ -573,6 +632,7 @@ impl GarbageCollector {
 
         self.ctx.manifest.save_obsolete_blob(&tmp);
         self.ctx.manifest.delete_files();
+        self.blob_runs.fetch_add(1, AcqRel);
     }
 }
 

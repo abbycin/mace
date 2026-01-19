@@ -123,6 +123,7 @@ impl<'a> SysTxn<'a> {
             })
     }
 
+    #[allow(dead_code)]
     pub fn update(&mut self, old: Page, new: &mut Page) -> Result<(), OpCode> {
         let pid = old.pid();
         new.set_pid(pid);

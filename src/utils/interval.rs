@@ -1,7 +1,4 @@
-use std::collections::{
-    BTreeMap,
-    btree_map::{Entry, Iter},
-};
+use std::collections::{BTreeMap, btree_map::Entry};
 
 pub struct IntervalMap {
     map: BTreeMap<u64, (u64, u64)>,
@@ -62,10 +59,6 @@ impl IntervalMap {
             return Some(*val);
         }
         None
-    }
-
-    pub fn iter(&self) -> Iter<'_, u64, (u64, u64)> {
-        self.map.iter()
     }
 }
 

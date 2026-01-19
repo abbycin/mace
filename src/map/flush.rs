@@ -1,6 +1,6 @@
 use crate::cc::context::Context;
 use crate::map::data::{Arena, FileBuilder};
-use crate::meta::{FileId, IntervalPair, MetaKind, TxnKind};
+use crate::meta::{FileId, IntervalPair, MetaKind};
 use crate::utils::Handle;
 use crate::utils::countblock::Countblock;
 use crate::utils::data::Interval;
@@ -65,7 +65,7 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
             ctx.manifest.apply_blob_junks(&builder.blob_junks)
         };
 
-        let mut txn = ctx.manifest.begin(TxnKind::FLush);
+        let mut txn = ctx.manifest.begin();
 
         txn.record(MetaKind::FileId, &FileId::data(data_id));
         txn.sync(); // necessary, before data file was flushed

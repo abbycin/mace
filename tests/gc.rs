@@ -11,7 +11,6 @@ fn gc_data() -> Result<(), OpCode> {
     opt.data_garbage_ratio = 1;
     opt.data_file_size = 512 << 10;
     opt.gc_compacted_size = opt.data_file_size;
-    let saved = opt.clone();
     let db = Mace::new(opt.validate().unwrap()).unwrap();
 
     let cap = 20000;
@@ -46,8 +45,6 @@ fn gc_data() -> Result<(), OpCode> {
     kv.commit()?;
 
     drop(db);
-
-    break_meta(&saved);
 
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
@@ -133,25 +130,25 @@ fn gc_blob() -> Result<(), OpCode> {
     }
 
     let mut opt = db.options().clone();
-
-    drop(db);
-
-    opt.tmp_store = true;
-    let mut count = 0;
-    let mut max_id = 0;
-    let dir = std::fs::read_dir(opt.data_root()).unwrap();
-    for d in dir {
-        let x = d.unwrap();
-        let f = x.file_name();
-        let name = f.to_str().unwrap();
-        if name.starts_with(Options::BLOB_PREFIX) {
-            let v: Vec<&str> = name.split(Options::SEP).collect();
-            let id = v[1].parse::<u32>().expect("invalid number");
-            count += 1;
-            max_id = max_id.max(id);
+    if db.blob_gc_count() > 0 {
+        drop(db);
+        opt.tmp_store = true;
+        let mut count = 0;
+        let mut max_id = 0;
+        let dir = std::fs::read_dir(opt.data_root()).unwrap();
+        for d in dir {
+            let x = d.unwrap();
+            let f = x.file_name();
+            let name = f.to_str().unwrap();
+            if name.starts_with(Options::BLOB_PREFIX) {
+                let v: Vec<&str> = name.split(Options::SEP).collect();
+                let id = v[1].parse::<u32>().expect("invalid number");
+                count += 1;
+                max_id = max_id.max(id);
+            }
         }
+        assert!(count < max_id);
     }
-    assert!(count < max_id);
 
     Ok(())
 }
@@ -205,29 +202,4 @@ fn gc_wal() {
 
     let backup = db.options().wal_backup(0, 1);
     assert!(backup.exists());
-}
-
-#[allow(unused)]
-fn break_meta(opt: &Options) {
-    use std::fs::File;
-    use std::io::Write;
-
-    let d = std::fs::read_dir(opt.db_root()).unwrap();
-    let mut last = 0;
-    for f in d.flatten() {
-        let tmp = f.file_name();
-        let name = tmp.to_str().unwrap();
-        if name.starts_with(Options::MANIFEST_PREFIX) {
-            let v: Vec<&str> = name.split(Options::SEP).collect();
-            let seq = v[1].parse::<u64>().unwrap();
-            last = last.max(seq);
-        }
-    }
-    let mut f = File::options()
-        .truncate(false)
-        .append(true)
-        .open(opt.manifest(last))
-        .unwrap();
-    // append a Begin
-    f.write_all(&[1]).unwrap();
 }

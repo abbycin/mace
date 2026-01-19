@@ -1,5 +1,3 @@
-use std::{fs::File, io::Write};
-
 use mace::{Mace, Options, RandomPath};
 use rand::Rng;
 
@@ -83,16 +81,6 @@ fn big_kv() {
 
     drop(db);
 
-    // test recover from imcomplete manifest
-
-    let mut f = File::options()
-        .truncate(false)
-        .append(true)
-        .open(saved.manifest(0))
-        .unwrap();
-    // append a Begin
-    f.write_all(&[1]).unwrap();
-
     saved.tmp_store = true;
     let db = Mace::new(saved.validate().unwrap()).unwrap();
     let view = db.view().unwrap();
@@ -130,16 +118,6 @@ fn big_kv2() {
     drop(r);
     drop(view);
     drop(db);
-
-    // test recover from imcomplete manifest
-
-    let mut f = File::options()
-        .truncate(false)
-        .append(true)
-        .open(saved.manifest(0))
-        .unwrap();
-    // append a Begin
-    f.write_all(&[1]).unwrap();
 
     saved.tmp_store = true;
     let db = Mace::new(saved.validate().unwrap()).unwrap();

@@ -1,11 +1,10 @@
+use btree_store::BTree;
 use parking_lot::{Mutex, RwLock};
 use std::{
-    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap},
     hash::Hasher,
     ops::Deref,
     path::PathBuf,
-    ptr::null_mut,
     sync::{
         Arc,
         atomic::{
@@ -20,38 +19,38 @@ use crc32c::Crc32cHasher;
 use dashmap::DashMap;
 
 use crate::{
-    Options,
     io::{File, GatherIO},
     map::{
         IFooter,
-        buffer::Loader,
         data::{BlobFooter, DataFooter, MetaReader},
-        table::{PageMap, Swip},
+        table::PageMap,
     },
-    meta::entry::{BlobStat, Commit, GenericHdr},
-    types::{
-        page::Page,
-        refbox::BoxRef,
-        traits::{IAsSlice, IHeader},
-    },
+    meta::entry::BlobStat,
+    types::refbox::BoxRef,
     utils::{
-        Handle, MutRef, ROOT_PID,
-        block::{Block, Ring},
-        data::{GatherWriter, LenSeq, Reloc},
+        data::{LenSeq, Reloc},
         interval::IntervalMap,
         lru::ShardLru,
         options::ParsedOptions,
     },
 };
 
+pub(crate) const BUCKET_NUMERICS: &str = "numerics";
+pub(crate) const NUMERICS_KEY: &str = "numeric";
+pub(crate) const BUCKET_PAGE_TABLE: &str = "page_table";
+pub(crate) const BUCKET_DATA_STAT: &str = "data_stat";
+pub(crate) const BUCKET_BLOB_STAT: &str = "blob_stat";
+pub(crate) const BUCKET_DATA_INTERVAL: &str = "data_interval";
+pub(crate) const BUCKET_BLOB_INTERVAL: &str = "blob_interval";
+pub(crate) const BUCKET_OBSOLETE_DATA: &str = "obsolete_data";
+pub(crate) const BUCKET_OBSOLETE_BLOB: &str = "obsolete_blob";
+
 pub(crate) mod builder;
 mod entry;
 pub use entry::{
-    Begin, BlobStatInner, DataStat, DataStatInner, DelInterval, Delete, FileId, IntervalPair,
-    MemBlobStat, MemDataStat, MetaKind, Numerics, PageTable, TxnKind,
+    BlobStatInner, DataStat, DataStatInner, DelInterval, Delete, FileId, IntervalPair, MemBlobStat,
+    MemDataStat, MetaKind, Numerics, PageTable,
 };
-
-const LOG_BUF_SZ: usize = 64 << 20;
 
 pub(crate) trait IMetaCodec {
     fn packed_size(&self) -> usize;
@@ -61,9 +60,127 @@ pub(crate) trait IMetaCodec {
     fn decode(src: &[u8]) -> Self;
 }
 
-struct WriteCtx {
-    ring: Ring,
-    writer: GatherWriter,
+pub(crate) trait MetaRecord: IMetaCodec {
+    fn record(&self, kind: MetaKind, ops: &mut HashMap<&str, Vec<MetaOp>>);
+}
+
+impl MetaRecord for Numerics {
+    fn record(&self, _kind: MetaKind, ops: &mut HashMap<&str, Vec<MetaOp>>) {
+        let mut buf = vec![0u8; self.packed_size()];
+        self.encode(&mut buf);
+        ops.entry(BUCKET_NUMERICS)
+            .or_default()
+            .push(MetaOp::Put(NUMERICS_KEY.as_bytes().to_vec(), buf));
+    }
+}
+
+impl MetaRecord for PageTable {
+    fn record(&self, _kind: MetaKind, ops: &mut HashMap<&str, Vec<MetaOp>>) {
+        let bucket_ops = ops.entry(BUCKET_PAGE_TABLE).or_default();
+        for (&pid, &addr) in self.iter() {
+            bucket_ops.push(MetaOp::Put(
+                pid.to_be_bytes().to_vec(),
+                addr.to_be_bytes().to_vec(),
+            ));
+        }
+    }
+}
+
+impl MetaRecord for DataStat {
+    fn record(&self, kind: MetaKind, ops: &mut HashMap<&str, Vec<MetaOp>>) {
+        let mut buf = vec![0u8; self.packed_size()];
+        self.encode(&mut buf);
+        let bucket = if kind == MetaKind::DataStat {
+            BUCKET_DATA_STAT
+        } else {
+            BUCKET_BLOB_STAT
+        };
+        ops.entry(bucket)
+            .or_default()
+            .push(MetaOp::Put(self.file_id.to_be_bytes().to_vec(), buf));
+    }
+}
+
+impl MetaRecord for BlobStat {
+    fn record(&self, _kind: MetaKind, ops: &mut HashMap<&str, Vec<MetaOp>>) {
+        let mut buf = vec![0u8; self.packed_size()];
+        self.encode(&mut buf);
+        ops.entry(BUCKET_BLOB_STAT)
+            .or_default()
+            .push(MetaOp::Put(self.file_id.to_be_bytes().to_vec(), buf));
+    }
+}
+
+impl MetaRecord for IntervalPair {
+    fn record(&self, kind: MetaKind, ops: &mut HashMap<&str, Vec<MetaOp>>) {
+        let mut buf = vec![0u8; self.packed_size()];
+        self.encode(&mut buf);
+        let bucket = if kind == MetaKind::DataInterval {
+            BUCKET_DATA_INTERVAL
+        } else {
+            BUCKET_BLOB_INTERVAL
+        };
+        ops.entry(bucket)
+            .or_default()
+            .push(MetaOp::Put(self.lo_addr.to_be_bytes().to_vec(), buf));
+    }
+}
+
+impl MetaRecord for Delete {
+    fn record(&self, kind: MetaKind, ops: &mut HashMap<&str, Vec<MetaOp>>) {
+        match kind {
+            MetaKind::DataDelete | MetaKind::BlobDelete => {
+                let (obs_bucket, stat_bucket) = if kind == MetaKind::DataDelete {
+                    (BUCKET_OBSOLETE_DATA, BUCKET_DATA_STAT)
+                } else {
+                    (BUCKET_OBSOLETE_BLOB, BUCKET_BLOB_STAT)
+                };
+                for &id in self.iter() {
+                    let key = id.to_be_bytes().to_vec();
+                    ops.entry(obs_bucket)
+                        .or_default()
+                        .push(MetaOp::Put(key.clone(), vec![]));
+                    ops.entry(stat_bucket).or_default().push(MetaOp::Del(key));
+                }
+            }
+            MetaKind::DataDeleteDone | MetaKind::BlobDeleteDone => {
+                let bucket = if kind == MetaKind::DataDeleteDone {
+                    BUCKET_OBSOLETE_DATA
+                } else {
+                    BUCKET_OBSOLETE_BLOB
+                };
+                let bucket_ops = ops.entry(bucket).or_default();
+                for &id in self.iter() {
+                    bucket_ops.push(MetaOp::Del(id.to_be_bytes().to_vec()));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl MetaRecord for DelInterval {
+    fn record(&self, kind: MetaKind, ops: &mut HashMap<&str, Vec<MetaOp>>) {
+        let bucket = if kind == MetaKind::DataDelInterval {
+            BUCKET_DATA_INTERVAL
+        } else {
+            BUCKET_BLOB_INTERVAL
+        };
+        let bucket_ops = ops.entry(bucket).or_default();
+        for &lo in self.iter() {
+            bucket_ops.push(MetaOp::Del(lo.to_be_bytes().to_vec()));
+        }
+    }
+}
+
+impl MetaRecord for FileId {
+    fn record(&self, _kind: MetaKind, _ops: &mut HashMap<&str, Vec<MetaOp>>) {}
+}
+
+#[derive(Clone)]
+pub(crate) enum MetaOp {
+    Put(Vec<u8>, Vec<u8>),
+    Del(Vec<u8>),
 }
 
 pub(crate) struct Manifest {
@@ -71,94 +188,78 @@ pub(crate) struct Manifest {
     pub(crate) map: Arc<PageMap>,
     pub(crate) data_stat: DataStatCtx,
     pub(crate) blob_stat: BlobStatCtx,
-    pub(crate) is_cleaning: AtomicBool,
-    txid: AtomicU64,
     obsolete_data: Mutex<Vec<u64>>,
     obsolete_blob: Mutex<Vec<u64>>,
     opt: Arc<ParsedOptions>,
-    wctx: Handle<Mutex<WriteCtx>>,
+    pub(crate) btree: BTree,
 }
 
-impl Drop for Manifest {
-    fn drop(&mut self) {
-        self.wctx.reclaim();
-    }
+pub(crate) struct Txn<'a> {
+    manifest: &'a Manifest,
+    btree: BTree,
+    // bucket_name -> operations
+    ops: HashMap<&'a str, Vec<MetaOp>>,
 }
 
-pub(crate) struct Txn {
-    wctx: Handle<Mutex<WriteCtx>>,
-    txid: u64,
-    h: Crc32cHasher,
-    nbytes: Cell<u64>,
-}
-
-impl Txn {
+impl<'a> Txn<'a> {
     pub(crate) fn commit(mut self) -> u64 {
-        let c = Commit {
-            txid: self.txid,
-            checksum: self.h.finish() as u32,
-        };
-        self.record(MetaKind::Commit, &c);
-        self.sync();
-        self.nbytes.get()
+        self.internal_commit();
+        0
+    }
+
+    pub(crate) fn sync(&mut self) {
+        self.internal_commit();
+    }
+
+    fn internal_commit(&mut self) -> u64 {
+        if self.ops.is_empty() {
+            return 0;
+        }
+        loop {
+            // btree-store supports SI. Refresh handle to start a fresh session.
+            self.btree = self.manifest.btree.clone();
+
+            // Perform an atomic multi-bucket commit.
+            // All updates across different buckets are applied and flushed to disk
+            // in a single SuperBlock write, significantly reducing I/O overhead.
+            let res = self.btree.exec_multi(|multi_txn| {
+                for (bucket, bucket_ops) in &self.ops {
+                    multi_txn.execute(bucket, |tree_txn| {
+                        for op in bucket_ops {
+                            match op {
+                                MetaOp::Put(k, v) => tree_txn.put(k, v)?,
+                                MetaOp::Del(k) => tree_txn.del(k)?,
+                            }
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            });
+
+            match res {
+                Ok(_) => {
+                    self.ops.clear();
+                    break;
+                }
+                Err(btree_store::Error::Conflict) => {
+                    // Retry with a refreshed session handle
+                    continue;
+                }
+                Err(e) => {
+                    log::error!("Metadata multi-bucket commit fail: {:?}", e);
+                    panic!("Metadata multi-bucket commit fail: {:?}", e)
+                }
+            }
+        }
+        0
     }
 
     pub(crate) fn record<T>(&mut self, kind: MetaKind, x: &T)
     where
-        T: IMetaCodec,
+        T: MetaRecord,
     {
-        let hdr = GenericHdr::new(kind, self.txid);
-        let mut wctx = self.wctx.lock();
-        let size = x.packed_size() + hdr.len();
-        if size > wctx.ring.len() {
-            return self.record_large(&mut wctx, &hdr, x);
-        }
-
-        let buf = Self::alloc(&mut wctx, size);
-        let hdr_dst = &mut buf[0..hdr.len()];
-        hdr_dst.copy_from_slice(hdr.as_slice());
-        x.encode(&mut buf[hdr.len()..]);
-        self.nbytes.set(self.nbytes.get() + buf.len() as u64);
-        self.h.write(buf);
-    }
-
-    pub(crate) fn sync(&self) {
-        let mut wctx = self.wctx.lock();
-        Self::flush(&mut wctx);
-    }
-
-    fn record_large<T>(&self, wctx: &mut WriteCtx, hdr: &GenericHdr, x: &T)
-    where
-        T: IMetaCodec,
-    {
-        let buf = Block::alloc(x.packed_size());
-        let s = buf.mut_slice(0, buf.len());
-        let hdr_dst = &mut s[0..hdr.len()];
-        hdr_dst.copy_from_slice(hdr.as_slice());
-        x.encode(&mut s[hdr.len()..]);
-        self.nbytes.set(self.nbytes.get() + buf.len() as u64);
-        Self::flush(wctx);
-        wctx.writer.write(s);
-    }
-
-    fn alloc<'a>(wctx: &mut WriteCtx, size: usize) -> &'a mut [u8] {
-        let rest = wctx.ring.len() - wctx.ring.tail();
-        if rest < size {
-            Self::flush(wctx);
-            wctx.ring.prod(rest);
-            wctx.ring.cons(rest);
-        }
-        wctx.ring.prod(size)
-    }
-
-    fn flush(wctx: &mut WriteCtx) {
-        let len = wctx.ring.distance();
-        if len > 0 {
-            wctx.writer.write(wctx.ring.slice(wctx.ring.head(), len));
-            wctx.ring.cons(len);
-
-            wctx.writer.sync();
-        }
+        x.record(kind, &mut self.ops);
     }
 }
 
@@ -189,18 +290,12 @@ impl FileReader {
         let dst = p.load_slice();
         self.file.read(dst, m.off as u64).expect("can't read");
         crc.write(dst);
-        debug_assert_eq!(p.view().refcnt(), 1);
-        debug_assert_eq!(
-            p.header().payload_size,
-            (real_size - BoxRef::HDR_LEN as u32)
-        );
         if crc.finish() as u32 != m.crc {
             log::error!(
                 "checksum mismatch, expect {} get {}, key {pos}",
                 { m.crc },
                 crc.finish()
             );
-            log::error!("hdr {:?}", p.header());
             panic!(
                 "checksum mismatch, expect {} get {}",
                 { m.crc },
@@ -213,33 +308,41 @@ impl FileReader {
 }
 
 impl Manifest {
-    const CLEAN_SIZE: u64 = 1 << 30;
-
     fn new(opt: Arc<ParsedOptions>) -> Self {
+        let path = opt.manifest();
+        let btree = BTree::open(path).expect("can't open btree-store");
+        let buckets = [
+            BUCKET_NUMERICS,
+            BUCKET_PAGE_TABLE,
+            BUCKET_DATA_STAT,
+            BUCKET_BLOB_STAT,
+            BUCKET_DATA_INTERVAL,
+            BUCKET_BLOB_INTERVAL,
+            BUCKET_OBSOLETE_DATA,
+            BUCKET_OBSOLETE_BLOB,
+        ];
+
+        for name in buckets {
+            btree
+                .exec(name, |_| Ok(()))
+                .expect("can't ensure bucket exists");
+        }
+
         Self {
             numerics: Arc::new(Numerics::default()),
             map: Arc::new(PageMap::default()),
             data_stat: DataStatCtx::new(opt.clone()),
             blob_stat: BlobStatCtx::new(opt.clone()),
-            is_cleaning: AtomicBool::new(false),
-            txid: AtomicU64::new(0),
             obsolete_data: Mutex::new(Vec::new()),
             obsolete_blob: Mutex::new(Vec::new()),
             opt,
-            wctx: null_mut::<Mutex<WriteCtx>>().into(),
+            btree,
         }
     }
 
-    pub(crate) fn init(&mut self, data_id: u64, blob_id: u64, txid: u64) {
-        let id = self.numerics.next_manifest_id.load(Relaxed);
-        self.wctx = Handle::new(Mutex::new(WriteCtx {
-            ring: Ring::new(LOG_BUF_SZ),
-            writer: GatherWriter::append(&self.opt.manifest(id), 32),
-        }));
-
+    pub(crate) fn init(&mut self, data_id: u64, blob_id: u64) {
         self.numerics.next_data_id.store(data_id + 1, Relaxed);
         self.numerics.next_blob_id.store(blob_id + 1, Relaxed);
-        self.txid.store(txid + 1, Relaxed);
     }
 
     pub(crate) fn add_data_stat(&self, stat: MemDataStat, ivl: IntervalPair) {
@@ -294,125 +397,13 @@ impl Manifest {
         self.blob_stat.apply_junks(junks)
     }
 
-    pub(crate) fn begin(&self, kind: TxnKind) -> Txn {
-        let txid = self.txid.fetch_add(1, Relaxed);
-        let mut txn = Txn {
-            wctx: self.wctx,
-            txid,
-            h: Crc32cHasher::default(),
-            nbytes: Cell::new(0),
-        };
-        txn.record(MetaKind::Begin, &Begin(kind));
-        txn
-    }
-
-    pub(crate) fn try_clean(&mut self) {
-        let Some(wctx) = self.wctx.try_lock() else {
-            return;
-        };
-        if wctx.writer.pos() < Self::CLEAN_SIZE {
-            return;
+    pub(crate) fn begin(&self) -> Txn<'_> {
+        let btree = self.btree.clone();
+        Txn {
+            manifest: self,
+            btree,
+            ops: HashMap::new(),
         }
-        drop(wctx);
-        if self
-            .is_cleaning
-            .compare_exchange(false, true, Relaxed, Relaxed)
-            .is_err()
-        {
-            return;
-        }
-
-        let prev_id = self.bump_id();
-        let snap_id = prev_id + 1;
-        let tmp_path = self.opt.snapshot(snap_id).with_extension("tmp");
-        let last_pid = self.map.len();
-        let mut table = PageTable::default();
-        const LIMIT: usize = 8192; // estimate 128KB
-        // automatically reclaim
-        let b = MutRef::new(Mutex::new(WriteCtx {
-            ring: Ring::new(LOG_BUF_SZ),
-            writer: GatherWriter::append(&tmp_path, 32),
-        }));
-
-        let txid = self.txid.fetch_add(1, Relaxed);
-
-        let mut txn = Txn {
-            wctx: b.raw_ptr().into(),
-            txid,
-            h: Crc32cHasher::default(),
-            nbytes: Cell::new(0),
-        };
-
-        txn.record(MetaKind::Begin, &Begin(TxnKind::Dump));
-
-        let numerics = self.numerics.deref().clone();
-        txn.record(MetaKind::Numerics, &numerics);
-
-        let g = crossbeam_epoch::pin(); // guard page
-        for pid in ROOT_PID..last_pid {
-            let swip = Swip::new(self.map.get(pid));
-            if swip.is_null() {
-                continue;
-            }
-            let addr = if swip.is_tagged() {
-                swip.untagged()
-            } else {
-                let p = Page::<Loader>::from_swip(swip.raw());
-                p.latest_addr()
-            };
-            table.add(pid, addr);
-            if table.len() == LIMIT {
-                txn.record(MetaKind::Map, &table);
-                table.clear();
-            }
-        }
-        drop(g);
-
-        for fstat in self.data_stat.iter() {
-            let stat = fstat.copy();
-            txn.record(MetaKind::DataStat, &stat);
-        }
-
-        let lk = self.data_stat.interval.read();
-        for (&lo, &(hi, id)) in lk.iter() {
-            let ivl = IntervalPair::new(lo, hi, id);
-            txn.record(MetaKind::DataInterval, &ivl);
-        }
-        drop(lk);
-
-        let nbytes = txn.commit();
-        log::info!("write manifest snapshot: {nbytes} bytes");
-
-        std::fs::rename(tmp_path, self.opt.snapshot(snap_id)).expect("can't fail");
-
-        self.unlink_old(snap_id);
-        self.is_cleaning.store(false, Release);
-    }
-
-    // unlink all manifest files smaller than snap_id
-    pub(crate) fn unlink_old(&self, snap_id: u64) {
-        let dir = std::fs::read_dir(self.opt.db_root()).expect("can't read dir");
-
-        for d in dir.flatten() {
-            let name = d.file_name();
-            let s = name.to_str().unwrap();
-            if !s.starts_with(Options::MANIFEST_PREFIX) {
-                continue;
-            }
-            let v: Vec<&str> = s.split(Options::SEP).collect();
-            assert_eq!(v.len(), 2);
-            let id = v[1].parse::<u64>().unwrap();
-            if id < snap_id {
-                let _ = std::fs::remove_file(d.path());
-            }
-        }
-    }
-
-    fn bump_id(&mut self) -> u64 {
-        let mut wctx = self.wctx.lock();
-        let old = self.numerics.next_manifest_id.fetch_add(2, Release);
-        wctx.writer.reset(&self.opt.manifest(old + 2));
-        old
     }
 
     pub(crate) fn load_data(&self, addr: u64) -> Option<BoxRef> {
@@ -438,35 +429,59 @@ impl Manifest {
     }
 
     pub(crate) fn delete_files(&self) {
-        if let Some(mut lk) = self.obsolete_data.try_lock() {
-            while let Some(id) = lk.pop() {
+        let mut data_ids = Vec::new();
+        {
+            let mut lk = self.obsolete_data.lock();
+            lk.retain(|&id| {
                 let path = self.opt.data_file(id);
-                if path.exists() {
-                    log::info!("unlink {path:?}");
-                    let _ = std::fs::remove_file(path);
+                if !path.exists() || std::fs::remove_file(&path).is_ok() {
+                    data_ids.push(id);
+                    false
+                } else {
+                    true
                 }
-            }
+            });
         }
-        if let Some(mut lk) = self.obsolete_blob.try_lock() {
-            while let Some(id) = lk.pop() {
+        let mut blob_ids = Vec::new();
+        {
+            let mut lk = self.obsolete_blob.lock();
+            lk.retain(|&id| {
                 let path = self.opt.blob_file(id);
-                if path.exists() {
-                    log::info!("unlink {path:?}");
-                    let _ = std::fs::remove_file(path);
+                if !path.exists() || std::fs::remove_file(&path).is_ok() {
+                    blob_ids.push(id);
+                    false
+                } else {
+                    true
                 }
+            });
+        }
+
+        if !data_ids.is_empty() || !blob_ids.is_empty() {
+            #[cfg(unix)]
+            if let Ok(f) = std::fs::File::open(self.opt.data_root()) {
+                let _ = f.sync_all();
             }
+
+            let mut txn = self.begin();
+            if !data_ids.is_empty() {
+                txn.record(MetaKind::DataDeleteDone, &Delete::from(data_ids));
+            }
+            if !blob_ids.is_empty() {
+                txn.record(MetaKind::BlobDeleteDone, &Delete::from(blob_ids));
+            }
+            txn.commit();
         }
     }
 }
 
 pub(crate) struct DataStatCtx {
     /// interval to file_id map, multiple intervals may point to same file_id after compaction
-    interval: RwLock<IntervalMap>,
+    pub(crate) interval: RwLock<IntervalMap>,
     map: DashMap<u64, MemDataStat>,
-    junks: RefCell<HashMap<u64, Vec<u64>>>,
+    junks: Mutex<HashMap<u64, Vec<u64>>>,
     cache: ShardLru<FileReader>,
     opt: Arc<ParsedOptions>,
-    should_collect_junk: AtomicBool,
+    pub(crate) should_collect_junk: AtomicBool,
     total_size: AtomicU64,
     active_size: AtomicU64,
 }
@@ -483,7 +498,7 @@ impl DataStatCtx {
         Self {
             interval: RwLock::new(IntervalMap::new()),
             map: DashMap::new(),
-            junks: RefCell::new(HashMap::new()),
+            junks: Mutex::new(HashMap::new()),
             cache: ShardLru::new(opt.data_handle_cache_capacity),
             opt,
             should_collect_junk: AtomicBool::new(false),
@@ -538,10 +553,10 @@ impl DataStatCtx {
 
         // apply deactived frames while we are performing compaction
         let mut seqs = vec![];
-        let mut junks = self.junks.borrow_mut();
+        let mut junks = std::mem::take(&mut *self.junks.lock());
         for (_, q) in junks.iter_mut() {
-            for addr in q.iter() {
-                if let Some(ls) = relocs.get(addr) {
+            for &addr in q.iter() {
+                if let Some(ls) = relocs.get(&addr) {
                     fstat.active_size -= ls.len as usize;
                     fstat.active_elems -= 1;
                     fstat.mask.set(ls.seq);
@@ -549,7 +564,6 @@ impl DataStatCtx {
                 }
             }
         }
-        junks.clear();
 
         for &lo in del_intervals {
             let r = lk.remove(lo);
@@ -559,15 +573,19 @@ impl DataStatCtx {
             lk.update(i.lo_addr, i.hi_addr, i.file_id);
         }
 
+        let stat = DataStat {
+            inner: fstat.inner,
+            inactive_elems: seqs,
+        };
+
+        // drop lock before performing heavy map/cache operations
+        drop(lk);
+
         for &id in obsoleted {
             self.remove_stat(id);
             self.cache.del(id);
         }
 
-        let stat = DataStat {
-            inner: fstat.inner,
-            inactive_elems: seqs,
-        };
         self.add_stat_unlocked(fstat);
         stat
     }
@@ -610,17 +628,26 @@ impl DataStatCtx {
     }
 
     pub(crate) fn apply_junks(&self, tick: u64, junks: &[u64]) -> Vec<DataStat> {
+        // optimization: resolve file_ids under read lock, then process outside lock
+        // to avoid blocking update_stat_interval (which needs write lock) during IO
+        let candidates: Vec<(u64, u64)> = {
+            let lk = self.interval.read();
+            junks
+                .iter()
+                .map(|&addr| {
+                    let file_id = lk.find(addr).expect("must exist");
+                    (addr, file_id)
+                })
+                .collect()
+        };
+
         let mut v: Vec<DataStat> = Vec::with_capacity(junks.len());
-        // this lock guard protect both interval and file_stat in Manifest so that partail lookup
-        // will not happen
-        let lk = self.interval.read();
-        for &addr in junks {
-            let file_id = lk.find(addr).expect("must exist");
+        for (addr, file_id) in candidates {
             if let Some(mut stat) = self.map.get_mut(&file_id) {
                 let reloc = self.get_reloc(file_id, addr);
                 self.update_stat(&mut stat, addr, &reloc, tick);
                 if let Some(b) = v.last_mut()
-                    && b.file_id == file_id
+                    && b.inner.file_id == file_id
                 {
                     b.inner = stat.inner;
                     b.inactive_elems.push(reloc.seq);
@@ -639,7 +666,7 @@ impl DataStatCtx {
         self.active_size.fetch_sub(reloc.len as u64, Release);
         stat.update(tick, reloc);
         if self.should_collect_junk.load(Relaxed) {
-            let mut m = self.junks.borrow_mut();
+            let mut m = self.junks.lock();
             if let Some(q) = m.get_mut(&stat.file_id) {
                 q.push(junk);
             }
@@ -682,12 +709,12 @@ impl DataStatCtx {
 }
 
 pub(crate) struct BlobStatCtx {
-    interval: RwLock<IntervalMap>,
+    pub(crate) interval: RwLock<IntervalMap>,
     /// use BTreeMap so that blob files are sorted by blob id
     map: RwLock<BTreeMap<u64, MemBlobStat>>,
     cache: ShardLru<FileReader>,
-    should_collect_junk: AtomicBool,
-    junks: RefCell<HashMap<u64, Vec<u64>>>,
+    pub(crate) should_collect_junk: AtomicBool,
+    junks: Mutex<HashMap<u64, Vec<u64>>>,
     opt: Arc<ParsedOptions>,
 }
 
@@ -706,9 +733,17 @@ impl BlobStatCtx {
             map: RwLock::new(BTreeMap::new()),
             cache: ShardLru::new(opt.blob_handle_cache_capacity),
             should_collect_junk: AtomicBool::new(false),
-            junks: RefCell::new(HashMap::new()),
+            junks: Mutex::new(HashMap::new()),
             opt,
         }
+    }
+
+    pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, BTreeMap<u64, MemBlobStat>> {
+        self.map.read()
+    }
+
+    pub(crate) fn write(&self) -> parking_lot::RwLockWriteGuard<'_, BTreeMap<u64, MemBlobStat>> {
+        self.map.write()
     }
 
     pub(crate) fn get_victims(
@@ -776,17 +811,16 @@ impl BlobStatCtx {
         self.stop_collect_junks();
 
         let mut seqs = vec![];
-        let mut junks = self.junks.borrow_mut();
+        let mut junks = std::mem::take(&mut *self.junks.lock());
         for (_, q) in junks.iter_mut() {
-            for addr in q.iter() {
-                if let Some(ls) = reloc.get(addr) {
+            for &addr in q.iter() {
+                if let Some(ls) = reloc.get(&addr) {
                     bstat.active_size -= ls.len as usize;
                     bstat.nr_active -= 1;
                     seqs.push(ls.seq);
                 }
             }
         }
-        junks.clear();
 
         for &lo in del_intervals {
             let r = lk.remove(lo);
@@ -796,15 +830,20 @@ impl BlobStatCtx {
             lk.update(i.lo_addr, i.hi_addr, i.file_id);
         }
 
+        let ret = BlobStat {
+            inner: bstat.inner,
+            inactive_elems: seqs,
+        };
+
+        // drop lock before performing heavy map/cache operations
+        drop(lk);
+
         for &id in obsoleted {
             self.remove_stat(id);
             self.cache.del(id);
         }
-        self.add_stat_unlocked(bstat.clone());
-        BlobStat {
-            inner: bstat.inner,
-            inactive_elems: seqs,
-        }
+        self.add_stat_unlocked(bstat);
+        ret
     }
 
     fn load(&self, addr: u64) -> Option<BoxRef> {
@@ -853,7 +892,7 @@ impl BlobStatCtx {
                 let reloc = self.get_reloc(file_id, addr);
                 self.update_stat(stat, &reloc, addr);
                 if let Some(b) = v.last_mut()
-                    && b.file_id == file_id
+                    && b.inner.file_id == file_id
                 {
                     b.inner = stat.inner;
                     b.inactive_elems.push(reloc.seq);
@@ -872,7 +911,7 @@ impl BlobStatCtx {
         stat.update(reloc);
 
         if self.should_collect_junk.load(Relaxed) {
-            let mut m = self.junks.borrow_mut();
+            let mut m = self.junks.lock();
             if let Some(q) = m.get_mut(&stat.file_id) {
                 q.push(addr);
             }

@@ -42,6 +42,10 @@ impl IKey for IntlKey<'_> {
         self.raw
     }
 
+    fn txid(&self) -> u64 {
+        unimplemented!("internal node has no txid");
+    }
+
     fn to_string(&self) -> String {
         format!("raw {}", to_str(self.raw))
     }
@@ -166,6 +170,10 @@ impl IKey for Key<'_> {
         self.raw
     }
 
+    fn txid(&self) -> u64 {
+        self.txid
+    }
+
     fn to_string(&self) -> String {
         format!(
             "<{} {}, {}-{}>",
@@ -183,6 +191,10 @@ impl IKey for Ver {
             let ptr = self as *const Self as *const u8;
             std::slice::from_raw_parts(ptr, Self::len())
         }
+    }
+
+    fn txid(&self) -> u64 {
+        unimplemented!("Ver has no txid");
     }
 
     fn to_string(&self) -> String {

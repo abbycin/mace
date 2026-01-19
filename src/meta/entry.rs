@@ -20,9 +20,7 @@ use crate::{
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum MetaKind {
-    Begin,
     FileId,
-    Commit,
     Numerics,
     DataInterval,
     BlobInterval,
@@ -31,6 +29,8 @@ pub enum MetaKind {
     Map,
     DataDelete,
     BlobDelete,
+    DataDeleteDone,
+    BlobDeleteDone,
     DataDelInterval,
     BlobDelInterval,
     KindEnd,
@@ -46,56 +46,6 @@ impl TryFrom<u8> for MetaKind {
         } else {
             Ok(unsafe { std::mem::transmute::<u8, MetaKind>(value) })
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-#[repr(u8)]
-pub enum TxnKind {
-    FLush = 3,
-    DataGC,
-    BlobGC,
-    Dump,
-}
-
-#[repr(C, packed(1))]
-pub(crate) struct GenericHdr {
-    pub(crate) kind: MetaKind,
-    pub(crate) txid: u64,
-}
-
-impl GenericHdr {
-    pub(crate) const SIZE: usize = size_of::<Self>();
-
-    pub(crate) const fn new(kind: MetaKind, txid: u64) -> Self {
-        Self { kind, txid }
-    }
-
-    pub(crate) fn decode(src: &[u8]) -> Result<Self, OpCode> {
-        debug_assert!(src.len() >= Self::SIZE);
-        let _kind: MetaKind = src[0].try_into()?;
-        Ok(GenericHdr::from_slice(src))
-    }
-}
-
-impl IAsSlice for GenericHdr {}
-
-#[derive(Clone, Copy)]
-pub struct Begin(pub TxnKind);
-
-impl IMetaCodec for Begin {
-    fn packed_size(&self) -> usize {
-        size_of::<Self>()
-    }
-
-    fn encode(&self, to: &mut [u8]) {
-        to[0] = self.0 as u8;
-    }
-
-    fn decode(src: &[u8]) -> Self {
-        assert!(src[0] <= TxnKind::Dump as u8);
-        assert!(src[0] >= TxnKind::FLush as u8);
-        Begin(unsafe { std::mem::transmute::<u8, TxnKind>(src[0]) })
     }
 }
 
@@ -135,30 +85,6 @@ impl IMetaCodec for FileId {
 
     fn decode(src: &[u8]) -> Self {
         FileId::from_slice(src)
-    }
-}
-
-#[derive(Debug)]
-#[repr(C, packed(1))]
-pub(super) struct Commit {
-    pub(crate) txid: u64,
-    pub(crate) checksum: u32,
-}
-
-impl IAsSlice for Commit {}
-
-impl IMetaCodec for Commit {
-    fn packed_size(&self) -> usize {
-        size_of::<Self>()
-    }
-
-    fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
-        to.copy_from_slice(self.as_slice());
-    }
-
-    fn decode(src: &[u8]) -> Self {
-        Commit::from_slice(src)
     }
 }
 
@@ -313,6 +239,7 @@ impl MemBlobStat {
         self.mask.set(reloc.seq);
     }
 
+    #[allow(dead_code)]
     pub fn copy(&self) -> BlobStat {
         BlobStat {
             inner: self.inner,
@@ -493,7 +420,7 @@ impl IMetaCodec for PageTable {
 }
 
 #[derive(Debug)]
-#[repr(C, align(64))]
+#[repr(C)]
 pub struct Numerics {
     /// notify log data has been flushed
     pub signal: AtomicU64,
@@ -505,9 +432,11 @@ pub struct Numerics {
     pub address: AtomicU64,
     pub wmk_oldest: AtomicU64,
     pub log_size: AtomicUsize,
+    pub scavenge_cursor: AtomicU64,
 }
 
 impl Numerics {
+    #[allow(dead_code)]
     pub(crate) fn safe_tixd(&self) -> u64 {
         self.wmk_oldest.load(Relaxed)
     }
@@ -524,6 +453,7 @@ impl Default for Numerics {
             address: AtomicU64::new(INIT_ADDR),
             wmk_oldest: AtomicU64::new(INIT_WMK),
             log_size: AtomicUsize::new(0),
+            scavenge_cursor: AtomicU64::new(0),
         }
     }
 }
@@ -582,12 +512,6 @@ impl DerefMut for Delete {
 #[repr(C, packed(1))]
 pub(crate) struct DeleteHdr {
     nr_id: u32,
-}
-
-impl DeleteHdr {
-    pub(crate) fn size(&self) -> usize {
-        self.nr_id as usize * size_of::<u64>()
-    }
 }
 
 impl IAsSlice for DeleteHdr {}
@@ -690,12 +614,6 @@ pub(crate) struct DelIntervalStartHdr {
     nr_lo: u16,
 }
 
-impl DelIntervalStartHdr {
-    pub(crate) fn size(&self) -> usize {
-        self.nr_lo as usize * size_of::<u64>()
-    }
-}
-
 impl IAsSlice for DelIntervalStartHdr {}
 
 impl IMetaCodec for DelInterval {
@@ -704,6 +622,7 @@ impl IMetaCodec for DelInterval {
     }
 
     fn encode(&self, to: &mut [u8]) {
+        assert_eq!(to.len(), self.packed_size());
         let hdr = DelIntervalStartHdr {
             nr_lo: self.lo.len() as u16,
         };
@@ -724,25 +643,5 @@ impl IMetaCodec for DelInterval {
             r.lo.push(id);
         }
         r
-    }
-}
-
-pub(crate) fn get_record_size(h: MetaKind, size: usize) -> Result<usize, OpCode> {
-    let sz = match h {
-        MetaKind::Begin => size_of::<Begin>(),
-        MetaKind::Commit => size_of::<Commit>(),
-        MetaKind::Numerics => size_of::<Numerics>(),
-        MetaKind::DataInterval | MetaKind::BlobInterval => size_of::<IntervalPair>(),
-        MetaKind::DataDelete | MetaKind::BlobDelete => size_of::<DeleteHdr>(),
-        MetaKind::Map => size_of::<PageTableHdr>(),
-        MetaKind::DataStat | MetaKind::BlobStat => size_of::<StatHdr>(),
-        MetaKind::DataDelInterval | MetaKind::BlobDelInterval => size_of::<DelIntervalStartHdr>(),
-        MetaKind::FileId => size_of::<FileId>(),
-        _ => unreachable!("invalid kind {h:?}"),
-    } + GenericHdr::SIZE;
-    if size >= sz {
-        Ok(sz)
-    } else {
-        Err(OpCode::NeedMore)
     }
 }

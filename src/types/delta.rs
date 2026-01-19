@@ -24,7 +24,9 @@ impl DeltaView {
         let sz = Val::calc_size(false, inline_size, vsz);
         let d = a.allocate(ksz + sz + Self::HDR_LEN);
         let mut view = d.view();
-        view.header_mut().kind = TagKind::Delta;
+        let h = view.header_mut();
+        h.kind = TagKind::Delta;
+        h.txid = k.txid();
         let mut delta = view.as_delta();
         *delta.header_mut() = DeltaHeader {
             klen: ksz as u32,
@@ -43,11 +45,18 @@ impl DeltaView {
         }
     }
 
-    pub(crate) fn from_key_index<A: IAlloc, K: ICodec, V: ICodec>(a: &mut A, k: K, v: V) -> BoxRef {
+    pub(crate) fn from_key_index<A: IAlloc, K: ICodec, V: ICodec>(
+        a: &mut A,
+        k: K,
+        v: V,
+        txid: u64,
+    ) -> BoxRef {
         let sz = k.packed_size() + v.packed_size() + Self::HDR_LEN;
         let d = a.allocate(sz);
         let mut view = d.view();
-        view.header_mut().kind = TagKind::Delta;
+        let h = view.header_mut();
+        h.kind = TagKind::Delta;
+        h.txid = txid;
         let mut delta = view.as_delta();
 
         *delta.header_mut() = DeltaHeader {

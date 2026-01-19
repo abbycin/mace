@@ -37,6 +37,7 @@ pub struct BoxHeader {
     pub(crate) total_size: u32,
     pub(crate) payload_size: u32,
     pub(crate) pid: u64,
+    pub(crate) txid: u64,
     /// current BoxRef's logical address which is monotonically increasing
     pub(crate) addr: u64,
     /// logical address link to next BoxRef
@@ -69,7 +70,8 @@ pub(crate) struct BaseHeader {
     pub(crate) prefix_len: u32,
     pub(crate) merging: bool,
     pub(crate) is_index: bool,
-    pub(crate) padding: u16,
+    pub(crate) has_multiple_versions: bool,
+    pub(crate) padding: u8,
 } // sst
 
 #[repr(C, align(8))]

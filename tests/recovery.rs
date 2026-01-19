@@ -51,27 +51,6 @@ fn intact_meta() {
     }
 }
 
-fn imcomplete_manifest(opt: &Options) {
-    let d = std::fs::read_dir(opt.db_root()).unwrap();
-    let mut last = 0;
-    for f in d.flatten() {
-        let tmp = f.file_name();
-        let name = tmp.to_str().unwrap();
-        if name.starts_with(Options::MANIFEST_PREFIX) {
-            let v: Vec<&str> = name.split(Options::SEP).collect();
-            let seq = v[1].parse::<u64>().unwrap();
-            last = last.max(seq);
-        }
-    }
-    let mut f = File::options()
-        .truncate(false)
-        .append(true)
-        .open(opt.manifest(last))
-        .unwrap();
-    // append a Begin EntryKind
-    f.write_all(&[1]).unwrap();
-}
-
 #[test]
 fn bad_meta() {
     let path = RandomPath::new();
@@ -88,8 +67,6 @@ fn bad_meta() {
     drop(kv);
 
     drop(db);
-
-    imcomplete_manifest(&save);
 
     save.tmp_store = true;
     let db = Mace::new(save.validate().unwrap()).unwrap();
@@ -118,8 +95,6 @@ fn crash_again() {
         // implicitly rollback
     }
 
-    imcomplete_manifest(&save);
-
     {
         let db = Mace::new(save.clone().validate().unwrap()).unwrap();
 
@@ -132,8 +107,6 @@ fn crash_again() {
         kv.put("114", "514").unwrap();
         // implicitly rollback
     }
-
-    imcomplete_manifest(&save);
 
     {
         save.tmp_store = true;
@@ -169,8 +142,6 @@ fn recover_after_insert() {
     kv.commit().unwrap();
 
     drop(db);
-
-    imcomplete_manifest(&save);
 
     save.tmp_store = true;
     let db = Mace::new(save.validate().unwrap()).unwrap();
@@ -226,11 +197,15 @@ fn put_update(remove_data: bool) {
 
     drop(view);
     drop(db);
-    imcomplete_manifest(&save);
+
     if remove_data {
+        let manifest_path = save.manifest();
+        if manifest_path.exists() {
+            let _ = std::fs::remove_file(manifest_path);
+        }
+
         let entries = std::fs::read_dir(save.data_root()).unwrap();
         let mut data_seq = 0;
-        let mut seq = 0;
         for e in entries {
             let e = e.unwrap();
             let name = e.file_name();
@@ -241,24 +216,11 @@ fn put_update(remove_data: bool) {
                 let x = v[1].parse::<u64>().unwrap();
                 data_seq = data_seq.max(x);
             }
-            if s.starts_with(Options::MANIFEST_PREFIX) {
-                let v: Vec<&str> = s.split(Options::SEP).collect();
-                let x = v[1].parse::<u64>().unwrap();
-                seq = seq.max(x);
-            }
         }
         // remove the last data file
         log::debug!("unlink {:?}", save.data_file(data_seq));
         let _ = std::fs::remove_file(save.data_file(data_seq));
-        // break the last manifest
-        {
-            let f = File::options()
-                .write(true)
-                .open(save.manifest(seq))
-                .unwrap();
-            let size = f.metadata().unwrap().len();
-            f.set_len(size - 10).unwrap();
-        }
+
         // NOTE: this is a copy of real WalDesc
         // by the way, we assume log files are not cleaned, and we modify desc file to force it recover
         // from log file
@@ -316,7 +278,6 @@ fn recover_after_remove() {
     }
 
     drop(db);
-    imcomplete_manifest(&save);
 
     save.tmp_store = true;
     let db = Mace::new(save.validate().unwrap()).unwrap();
@@ -354,8 +315,6 @@ fn ckpt_wal(keys: usize, wal_len: u32) {
     }
 
     drop(db);
-
-    imcomplete_manifest(&save);
 
     save.tmp_store = true;
     let db = Mace::new(save.validate().unwrap()).unwrap();
@@ -417,7 +376,6 @@ fn long_txn_impl(before: bool) {
     t.join().unwrap();
 
     drop(db);
-    imcomplete_manifest(&save);
 
     save.tmp_store = true;
     let db = Mace::new(save.validate().unwrap()).unwrap();

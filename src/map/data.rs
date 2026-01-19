@@ -181,8 +181,8 @@ impl Arena {
     }
 
     #[inline]
-    pub(crate) fn load(&self, addr: u64) -> BoxRef {
-        self.items.get(&addr).unwrap().value().clone()
+    pub(crate) fn load(&self, addr: u64) -> Option<BoxRef> {
+        self.items.get(&addr).map(|x| x.value().clone())
     }
 
     pub(crate) fn set_state(&self, cur: u16, new: u16) -> u16 {
