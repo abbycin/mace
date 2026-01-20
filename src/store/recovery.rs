@@ -71,12 +71,12 @@ impl Recovery {
         let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
 
         for d in desc.iter() {
-            let (worker, checkpoint) = {
+            let (group, checkpoint) = {
                 let x = d.lock();
-                (x.worker, x.checkpoint)
+                (x.group, x.checkpoint)
             };
             // analyze and redo starts from latest checkpoint
-            let cur_oracle = self.analyze(&g, worker, checkpoint, &mut block, tree);
+            let cur_oracle = self.analyze(&g, group, checkpoint, &mut block, tree);
             oracle = max(oracle, cur_oracle);
             g.flush();
         }
@@ -138,7 +138,7 @@ impl Recovery {
     fn analyze(
         &mut self,
         g: &Guard,
-        wid: u8,
+        group_id: u8,
         addr: Position,
         block: &mut Block,
         tree: &Tree,
@@ -150,13 +150,13 @@ impl Recovery {
         let mut pos;
         let mut oracle = 0;
         let mut loc = Location {
-            wid: wid as u32,
+            group_id: group_id as u32,
             pos: Position::default(),
             len: 0,
         };
 
         for i in file_id.. {
-            let path = self.opt.wal_file(wid, i);
+            let path = self.opt.wal_file(group_id, i);
             if !path.exists() {
                 break; // no more wal file
             }
@@ -208,7 +208,7 @@ impl Recovery {
                         self.undo_table.insert(
                             b.txid,
                             Location {
-                                wid: wid as u32,
+                                group_id: group_id as u32,
                                 pos: Position {
                                     file_id: i,
                                     offset: pos - sz as u64,
@@ -261,14 +261,14 @@ impl Recovery {
         cache: &Lru<(u32, u64), Rc<File>>,
         cap: usize,
         opt: &Options,
-        wid: u32,
+        group_id: u32,
         seq: u64,
     ) -> Option<Rc<File>> {
-        let id = (wid, seq);
+        let id = (group_id, seq);
         if let Some(f) = cache.get(&id) {
             Some(f.clone())
         } else {
-            let path = opt.wal_file(wid as u8, seq);
+            let path = opt.wal_file(group_id as u8, seq);
             if !path.exists() {
                 return None;
             }
@@ -285,8 +285,8 @@ impl Recovery {
         // NOTE: because the `Ver` is descending ordered by txid first, we call `rev` here to make
         //  smaller txid to apply first
         for (_, table) in self.dirty_table.iter().rev() {
-            let Location { wid, pos, len } = *table;
-            let Some(f) = Self::get_file(&cache, cap, &self.opt, wid, pos.file_id) else {
+            let Location { group_id, pos, len } = *table;
+            let Some(f) = Self::get_file(&cache, cap, &self.opt, group_id, pos.file_id) else {
                 break;
             };
             assert!(len as usize <= block.len());
@@ -299,24 +299,24 @@ impl Recovery {
             let r = match c.sub_type() {
                 PayloadType::Insert => {
                     let i = c.put();
-                    let val = Record::normal(c.worker_id, i.val());
+                    let val = Record::normal(c.group_id, i.val());
                     tree.put(g, key, val)
                 }
                 PayloadType::Update => {
                     let u = c.update();
-                    let val = Record::normal(c.worker_id, u.new_val());
+                    let val = Record::normal(c.group_id, u.new_val());
                     tree.put(g, key, val)
                 }
                 PayloadType::Delete => {
-                    let val = Record::remove(c.worker_id);
+                    let val = Record::remove(c.group_id);
                     tree.put(g, key, val)
                 }
                 PayloadType::Clr => {
                     let r = c.clr();
                     let val = if r.is_tombstone() {
-                        Record::remove(c.worker_id)
+                        Record::remove(c.group_id)
                     } else {
-                        Record::normal(c.worker_id, r.val())
+                        Record::normal(c.group_id, r.val())
                     };
                     tree.put(g, key, val)
                 }
@@ -328,7 +328,7 @@ impl Recovery {
     fn undo(&self, block: &mut Block, g: &Guard, tree: &Tree) {
         let reader = WalReader::new(&tree.store.context, g);
         for (txid, addr) in &self.undo_table {
-            reader.rollback(block, *txid, *addr, tree, None);
+            reader.rollback(block, *txid, *addr, tree);
         }
     }
 
@@ -339,9 +339,9 @@ impl Recovery {
 
         for d in &mut desc {
             let mut x = d.lock();
-            let path = self.opt.desc_file(x.worker);
+            let path = self.opt.desc_file(x.group);
             if !path.exists() {
-                log::trace!("no log record for worker {}", x.worker);
+                log::trace!("no log record for group {}", x.group);
                 continue;
             }
             let f = File::options()

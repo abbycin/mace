@@ -2,6 +2,7 @@ use crate::io::{File, GatherIO};
 use crc32c::Crc32cHasher;
 use dashmap::DashMap;
 
+use crate::OpCode;
 use crate::map::IFooter;
 use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, Numerics, PageTable};
 use crate::types::header::{TagFlag, TagKind};
@@ -12,16 +13,14 @@ use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
 use crate::utils::data::{AddrPair, GatherWriter, Interval, Position};
 use crate::utils::{CachePad, Handle, INIT_ID, NULL_PID};
-use crate::{OpCode, static_assert};
-use std::alloc::{Layout, alloc_zeroed};
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::hash::Hasher;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 
 pub(crate) struct FlushData {
@@ -59,14 +58,53 @@ pub(crate) struct Arena {
     id: Cell<u64>,
     items: DashMap<u64, BoxRef>,
     /// flush LSN
-    pub(crate) flsn: Box<[CachePad<AtomicU64>]>,
+    pub(crate) flsn: Box<[CachePad<Flsn>]>,
     pub(crate) real_size: AtomicU64,
     // pack file_id and seq
     offset: AtomicU64,
     cap: usize,
     refs: AtomicU32,
     pub(crate) state: AtomicU16,
-    workers: u8,
+    groups: u8,
+}
+
+pub(crate) struct Flsn {
+    seq: AtomicU64,
+    pos: UnsafeCell<Position>,
+}
+
+unsafe impl Send for Flsn {}
+unsafe impl Sync for Flsn {}
+
+impl Flsn {
+    fn new() -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            pos: UnsafeCell::new(Position::default()),
+        }
+    }
+
+    pub(crate) fn store(&self, pos: Position) {
+        self.seq.fetch_add(1, AcqRel);
+        unsafe {
+            *self.pos.get() = pos;
+        }
+        self.seq.fetch_add(1, Release);
+    }
+
+    pub(crate) fn load(&self) -> Position {
+        loop {
+            let v1 = self.seq.load(Acquire);
+            if v1 & 1 == 1 {
+                continue;
+            }
+            let pos = unsafe { *self.pos.get() };
+            let v2 = self.seq.load(Acquire);
+            if v1 == v2 {
+                return pos;
+            }
+        }
+    }
 }
 
 impl Deref for Arena {
@@ -87,30 +125,25 @@ impl Arena {
     /// flushed to disk
     pub(crate) const FLUSH: u16 = 1;
 
-    fn alloc_flsn(n: usize) -> Box<[CachePad<AtomicU64>]> {
-        static_assert!(size_of::<CachePad<Position>>() == 64);
-        static_assert!(align_of::<CachePad<Position>>() == 64);
-        let layout = Layout::from_size_align(64 * n, 64).unwrap();
-        unsafe {
-            let p = alloc_zeroed(layout);
-            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                p.cast::<CachePad<AtomicU64>>(),
-                n,
-            ))
+    fn alloc_flsn(n: usize) -> Box<[CachePad<Flsn>]> {
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(CachePad::from(Flsn::new()));
         }
+        v.into_boxed_slice()
     }
 
-    pub(crate) fn new(cap: usize, workers: u8) -> Self {
+    pub(crate) fn new(cap: usize, groups: u8) -> Self {
         Self {
             items: DashMap::with_capacity(16 << 10),
-            flsn: Self::alloc_flsn(workers as usize),
+            flsn: Self::alloc_flsn(groups as usize),
             id: Cell::new(INIT_ID),
             refs: AtomicU32::new(0),
             offset: AtomicU64::new(0),
             real_size: AtomicU64::new(0),
             cap,
             state: AtomicU16::new(Self::FLUSH),
-            workers,
+            groups,
         }
     }
 
@@ -128,7 +161,7 @@ impl Arena {
         self.cap
     }
 
-    pub(crate) fn workers(&self) -> u8 {
+    pub(crate) fn groups(&self) -> u8 {
         self.flsn.len() as u8
     }
 
@@ -214,8 +247,8 @@ impl Arena {
         }
     }
 
-    pub(crate) fn record_lsn(&mut self, worker_id: usize, seq: u64) {
-        self.flsn[worker_id].store(seq, Relaxed);
+    pub(crate) fn record_lsn(&self, group_id: usize, pos: Position) {
+        self.flsn[group_id].store(pos);
     }
 
     pub(crate) fn inc_ref(&self) {

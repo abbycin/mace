@@ -10,7 +10,6 @@ use std::{
 };
 
 use crate::{
-    cc::worker::SyncWorker,
     io::{self, File, GatherIO},
     static_assert,
     types::{
@@ -74,7 +73,7 @@ pub(crate) struct WalUpdate {
     pub(crate) wal_type: EntryType,
     pub(crate) sub_type: PayloadType,
     /// meaningful in txn rollback, unnecessary in recovery
-    pub(crate) worker_id: u8,
+    pub(crate) group_id: u8,
     /// payload size
     pub(crate) size: u32,
     pub(crate) cmd_id: u32,
@@ -90,7 +89,7 @@ impl Debug for WalUpdate {
         f.debug_struct("WalUpdate")
             .field("wal_type", &self.wal_type)
             .field("sub_type", &self.sub_type)
-            .field("woker_id", &{ self.worker_id })
+            .field("woker_id", &{ self.group_id })
             .field("size", &{ self.size })
             .field("cmd_id", &{ self.cmd_id })
             .field("klen", &{ self.klen })
@@ -386,13 +385,13 @@ pub(crate) fn wal_record_sz(e: EntryType) -> usize {
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Location {
-    pub(crate) wid: u32,
+    pub(crate) group_id: u32,
     pub(crate) len: u32,
     pub(crate) pos: Position,
 }
 
 pub(crate) struct WalReader<'a> {
-    map: RefCell<BTreeMap<u64, (Rc<File>, u64)>>,
+    map: RefCell<BTreeMap<(u8, u64), (Rc<File>, u64)>>,
     ctx: &'a Context,
     guard: &'a Guard,
 }
@@ -407,12 +406,13 @@ impl<'a> WalReader<'a> {
     }
 
     fn get_file(&self, id: u8, seq: u64) -> Option<(Rc<File>, u64)> {
-        const MAX_OPEN_FILES: usize = 10;
+        const MAX_OPEN_FILES: usize = 64; // Increased from 10
         let mut map = self.map.borrow_mut();
         while map.len() > MAX_OPEN_FILES {
             map.pop_first();
         }
-        if let Entry::Vacant(e) = map.entry(seq) {
+        let key = (id, seq);
+        if let Entry::Vacant(e) = map.entry(key) {
             let path = self.ctx.opt.wal_file(id, seq);
             if !path.exists() {
                 return None;
@@ -421,25 +421,23 @@ impl<'a> WalReader<'a> {
             let len = f.size().unwrap();
             e.insert((Rc::new(f), len));
         }
-        map.get(&seq).map(|(x, y)| (x.clone(), *y))
+        map.get(&key).map(|(x, y)| (x.clone(), *y))
     }
 
-    // for rollback, the worker should be same to caller, but can be arbitrary for recovery
+    // for rollback, the group should be same to caller, but can be arbitrary for recovery
     pub(crate) fn rollback<T: ITree>(
         &self,
         block: &mut Block,
         txid: u64,
         mut addr: Location,
         tree: &T,
-        worker: Option<SyncWorker>,
     ) {
-        let wid = addr.wid;
+        let group_id = addr.group_id;
         let mut cmd = INIT_CMD;
-        let mut last_worker = 0;
         let mut pos = addr.pos.offset;
 
         'outer: loop {
-            let (f, end) = match self.get_file(wid as u8, addr.pos.file_id) {
+            let (f, end) = match self.get_file(group_id as u8, addr.pos.file_id) {
                 None => break, // for rollback, this will not happen, but may happen in recovery
                 Some(f) => {
                     if f.1 == 0 {
@@ -463,15 +461,11 @@ impl<'a> WalReader<'a> {
                         break 'outer;
                     }
                     EntryType::Begin => {
-                        // we use the same worker in the UPDATE record or else any worker is ok, so
+                        // we use the same group in the UPDATE record or else any group is ok, so
                         // that we can make sure these records will be flushed with the same order
                         // as they were queued
-                        let mut w = if let Some(w) = worker {
-                            w
-                        } else {
-                            self.ctx.worker(last_worker)
-                        };
-                        w.logging.record_abort(txid);
+                        let g = self.ctx.group(group_id as usize);
+                        g.logging.lock().record_abort(txid);
                         break 'outer;
                     }
                     EntryType::Update => {
@@ -479,8 +473,6 @@ impl<'a> WalReader<'a> {
                         let usz = sz + u.payload_len();
                         assert_eq!({ u.txid }, txid);
                         assert!(pos + usz as u64 <= end);
-                        last_worker = u.worker_id as usize;
-                        assert_eq!(last_worker, wid as usize);
                         if block.len() < usz {
                             block.realloc(usz);
                         }
@@ -490,7 +482,8 @@ impl<'a> WalReader<'a> {
                         let u = ptr_to::<WalUpdate>(block.data());
                         assert!(u.is_intact());
 
-                        let (prev_id, prev_off) = self.undo(u, &mut cmd, tree, worker);
+                        let (prev_id, prev_off) =
+                            self.undo(u, &mut cmd, tree, group_id as usize, addr.pos);
                         pos = prev_off;
                         if prev_id != addr.pos.file_id {
                             addr.pos.file_id = prev_id;
@@ -508,7 +501,8 @@ impl<'a> WalReader<'a> {
         c: &WalUpdate,
         cmd: &mut u32,
         tree: &T,
-        worker: Option<SyncWorker>,
+        group_id: usize,
+        current_pos: Position,
     ) -> (u64, u64) {
         let (tombstone, data) = match c.sub_type() {
             PayloadType::Insert => {
@@ -533,22 +527,19 @@ impl<'a> WalReader<'a> {
         *cmd += 1; // make sure that cmd is increasing in same txn
         let raw = c.key();
         let val = if tombstone {
-            Record::remove(c.worker_id)
+            Record::remove(c.group_id)
         } else {
-            Record::normal(c.worker_id, data)
+            Record::normal(c.group_id, data)
         };
 
-        let mut w = if let Some(w) = worker {
-            w
-        } else {
-            self.ctx.worker(c.worker_id as usize)
-        };
-        w.logging.record_update(
+        let g = self.ctx.group(group_id);
+        g.logging.lock().record_update(
             Ver::new(c.txid, *cmd),
             WalClr::new(tombstone, data.len(), c.prev_id, c.prev_off),
             raw,
             [].as_slice(),
             data,
+            current_pos,
         );
 
         tree.put(self.guard, Key::new(raw, Ver::new(c.txid, *cmd)), val);
@@ -605,7 +596,7 @@ mod test {
         let c = WalUpdate {
             wal_type: EntryType::Update,
             sub_type: PayloadType::Insert,
-            worker_id: 19,
+            group_id: 19,
             cmd_id: 8,
             txid: 26,
             size: len as u32,
@@ -646,7 +637,7 @@ mod test {
             let a = &s[off..off + total_len];
             let nc = ptr_to::<WalUpdate>(a.as_ptr());
 
-            assert_eq!({ nc.worker_id }, 19);
+            assert_eq!({ nc.group_id }, 19);
             assert_eq!({ nc.txid }, 26);
             assert_eq!({ nc.cmd_id }, 8);
             assert_eq!({ nc.size }, len as u32);

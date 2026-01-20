@@ -1,5 +1,4 @@
 use parking_lot::RwLock;
-use std::cell::Cell;
 use std::cmp;
 use std::cmp::min;
 use std::collections::HashSet;
@@ -11,18 +10,54 @@ use crate::utils::{NULL_ORACLE, rand_range};
 use super::context::Context;
 
 #[derive(Debug)]
+struct CacheEntry {
+    seq: AtomicU64,
+    sts: AtomicU64,
+    cts: AtomicU64,
+}
+
+impl CacheEntry {
+    fn new() -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            sts: AtomicU64::new(0),
+            cts: AtomicU64::new(0),
+        }
+    }
+
+    fn load(&self) -> (u64, u64) {
+        loop {
+            let v1 = self.seq.load(Acquire);
+            if v1 & 1 == 1 {
+                continue;
+            }
+            let s = self.sts.load(Relaxed);
+            let c = self.cts.load(Relaxed);
+            let v2 = self.seq.load(Acquire);
+            if v1 == v2 {
+                return (s, c);
+            }
+        }
+    }
+
+    fn store(&self, s: u64, c: u64) {
+        self.seq.fetch_add(1, Release);
+        self.sts.store(s, Relaxed);
+        self.cts.store(c, Relaxed);
+        self.seq.fetch_add(1, Release);
+    }
+}
+
+#[derive(Debug)]
 pub struct ConcurrencyControl {
     pub(crate) commit_tree: CommitTree,
-    cached_sts: Vec<Cell<u64>>,
-    cached_cts: Vec<Cell<u64>>,
+    cached: Vec<CacheEntry>,
     /// shared local water mark, avoid performing LCB in read-only txn
     wmk_oldest_tx: AtomicU64,
     /// latest commit ts, update everytime a txn was commited
     pub(crate) latest_cts: AtomicU64,
     /// snapshot of latest_cts in gc
     pub(crate) last_latest_cts: AtomicU64,
-    // snapshot of global water mark, for short circuit visibility checking
-    pub(crate) global_wmk_tx: u64,
     pub(crate) start_ts: u64,
 }
 
@@ -30,60 +65,52 @@ unsafe impl Send for ConcurrencyControl {}
 unsafe impl Sync for ConcurrencyControl {}
 
 impl ConcurrencyControl {
-    pub(crate) fn new(workers: usize) -> Self {
+    pub(crate) fn new(groups: usize) -> Self {
         Self {
-            commit_tree: CommitTree::new(workers),
-            cached_sts: (0..workers).map(|_| Cell::new(0)).collect(),
-            cached_cts: (0..workers).map(|_| Cell::new(0)).collect(),
+            commit_tree: CommitTree::new(groups),
+            cached: (0..groups).map(|_| CacheEntry::new()).collect(),
             wmk_oldest_tx: AtomicU64::new(0),
             latest_cts: AtomicU64::new(0),
             last_latest_cts: AtomicU64::new(0),
-            global_wmk_tx: 0,
             start_ts: NULL_ORACLE, // it's required for CommitTree's log compaction
         }
     }
 
     // NOTE: it's thread-safe
-    /// check `txid` is visible to worker `wid` with txn with `start_ts`
     pub fn is_visible_to(
         &self,
         ctx: &Context,
-        self_wid: u8,
-        record_wid: u8,
+        self_gid: u8,
+        record_gid: u8,
         start_ts: u64,
-        txid: u64,
+        record_txid: u64,
     ) -> bool {
-        // if txid was created by same worker, it's visible to later txn
-        if self_wid == record_wid {
-            return true;
-        }
-
-        let wid = record_wid as usize;
+        let gid = record_gid as usize;
 
         // NOTE: The following applies only to SI
-        if txid > start_ts {
+        if record_txid == start_ts {
+            return self_gid == record_gid;
+        }
+
+        if record_txid > start_ts {
             return false;
         }
 
-        if self.global_wmk_tx > txid {
+        if ctx.safe_txid() > record_txid {
             return true;
         }
 
         // short circuit
-        if self.cached_sts[wid].get() == start_ts {
-            return self.cached_cts[wid].get() >= txid;
-        }
-
-        if self.cached_cts[wid].get() >= txid {
+        let (s, c) = self.cached[gid].load();
+        if s <= start_ts && c >= record_txid {
             return true;
         }
 
         // slow path
-        let lcb = ctx.worker(wid).cc.commit_tree.lcb(start_ts);
+        let lcb = ctx.group(gid).cc.commit_tree.lcb(start_ts);
         if lcb != 0 {
-            self.cached_sts[wid].set(start_ts);
-            self.cached_cts[wid].set(lcb);
-            return lcb >= txid;
+            self.cached[gid].store(start_ts, lcb);
+            return lcb >= record_txid;
         }
 
         false
@@ -92,26 +119,23 @@ impl ConcurrencyControl {
     /// collect water mark for safe consolidation, currently only [`WmkInfo::wmk_of_old`] is used
     pub fn collect_wmk(&self, ctx: &Context) {
         // 1/n probability, balance overhead
-        let workers = ctx.workers();
+        let groups = ctx.groups();
 
-        if rand_range(0..workers.len()) != 0 {
+        if rand_range(0..groups.len()) != 0 {
             return;
         }
 
         let mut oldest_tx = u64::MAX;
 
-        for w in workers.iter() {
-            let cur_tx = w.tx_id.load(Acquire);
-            if cur_tx == 0 {
-                continue;
+        for g in groups.iter() {
+            if let Some(min_tx) = g.active_txns.min_txid() {
+                oldest_tx = min(min_tx, oldest_tx);
             }
-
-            oldest_tx = min(cur_tx, oldest_tx);
         }
 
         let mut g_old = u64::MAX;
 
-        for w in workers.iter() {
+        for w in groups.iter() {
             let cc = &w.cc;
 
             // no gc happened before
@@ -143,13 +167,9 @@ impl ConcurrencyControl {
     #[allow(dead_code)]
     pub fn show(&self) {
         log::debug!("------------ cache ----------");
-        log::debug!(
-            "wmk_oldest_tx {} global_wmk_tx {}",
-            self.wmk_oldest_tx.load(Relaxed),
-            self.global_wmk_tx
-        );
-        for i in 0..self.cached_cts.len() {
-            let (s, c) = (self.cached_sts[i].get(), self.cached_cts[i].get());
+        log::debug!("wmk_oldest_tx {} ", self.wmk_oldest_tx.load(Relaxed),);
+        for i in 0..self.cached.len() {
+            let (s, c) = self.cached[i].load();
             log::debug!("start {} commit {}", s, c);
         }
         log::debug!("-------------- lcb -----------");
@@ -167,10 +187,10 @@ unsafe impl Send for CommitTree {}
 unsafe impl Sync for CommitTree {}
 
 impl CommitTree {
-    pub fn new(workers: usize) -> Self {
+    pub fn new(groups: usize) -> Self {
         Self {
             log: RwLock::new(Vec::new()),
-            cap: workers + 1, // plus 1 for read-only txn
+            cap: groups + 1, // plus 1 for read-only txn
         }
     }
 
@@ -218,39 +238,35 @@ impl CommitTree {
         log.push((commit, start));
     }
 
-    pub fn compact(&self, ctx: &Context, this_worker: u8) {
-        let log = self.log.write();
-        if log.len() < self.cap {
+    pub fn compact(&self, ctx: &Context, _this_group: u8) {
+        if self.log.read().len() < self.cap {
+            return;
+        }
+        let log_read = self.log.read();
+        if log_read.len() < self.cap {
             return;
         }
         let mut set = HashSet::new();
 
-        set.insert(log[log.len() - 1]);
+        set.insert(log_read[log_read.len() - 1]);
         // at least keep the oldest read-only txn's LCB
         if let Some(view) = ctx.oldest_view_txid()
-            && let Some(c) = Self::lcb_impl(&log, view)
+            && let Some(c) = Self::lcb_impl(&log_read, view)
         {
-            set.insert(log[c]);
+            set.insert(log_read[c]);
         }
-        drop(log);
 
-        for w in ctx.workers().iter() {
-            if this_worker == w.logging.worker {
+        for w in ctx.groups().iter() {
+            if w.active_txns.is_empty() {
                 continue;
             }
-
-            let txid = w.tx_id.load(Relaxed);
-            if txid == 0 {
-                // already commited
-                continue;
-            }
-
-            let log = self.log.read();
-            if let Some(c) = Self::lcb_impl(&log, txid) {
-                set.insert(log[c]);
-            }
-            drop(log);
+            w.active_txns.for_each_txid(|txid| {
+                if let Some(c) = Self::lcb_impl(&log_read, txid) {
+                    set.insert(log_read[c]);
+                }
+            });
         }
+        drop(log_read);
 
         let mut log = self.log.write();
         log.clear();

@@ -788,7 +788,7 @@ mod test {
             assert_eq!(k.cmd, cmd);
             let (r, _) = v.get_record(l, true);
             assert_eq!(r.data(), vs.as_bytes());
-            assert_eq!(r.worker_id(), w);
+            assert_eq!(r.group_id(), w);
         }
 
         fn gen_val(a: &mut Allocator, r: Record) -> Val<'static> {

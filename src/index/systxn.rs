@@ -5,7 +5,7 @@ use crate::types::header::TagFlag;
 use crate::types::refbox::{BoxRef, BoxView};
 use crate::types::traits::{IAlloc, IHeader};
 use crate::utils::Handle;
-use crate::utils::data::JUNK_LEN;
+use crate::utils::data::{JUNK_LEN, Position};
 use crate::{Store, index::Page};
 use crossbeam_epoch::Guard;
 #[cfg(feature = "metric")]
@@ -32,8 +32,8 @@ impl<'a> SysTxn<'a> {
         }
     }
 
-    pub fn record_and_commit(&mut self, worker_id: usize, seq: u64) {
-        self.store.buffer.record_lsn(worker_id, seq);
+    pub fn record_and_commit(&mut self, group_id: usize, pos: Position) {
+        self.store.buffer.record_lsn(group_id, pos);
         self.commit();
     }
 

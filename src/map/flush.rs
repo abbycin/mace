@@ -80,7 +80,6 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
         });
 
         blob_stats.iter().for_each(|x| {
-            assert_ne!(data_id, x.file_id);
             txn.record(MetaKind::BlobStat, x);
         });
 
@@ -116,6 +115,10 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
         }
 
         txn.commit();
+        for (i, g) in ctx.groups().iter().enumerate() {
+            let pos = msg.flsn[i].load();
+            g.logging.lock().update_last_ckpt(pos);
+        }
         ctx.manifest.numerics.signal.fetch_add(1, Relaxed);
     }
     msg.mark_done();
@@ -125,11 +128,15 @@ fn safe_to_flush(data: &FlushData, ctx: Handle<Context>) -> bool {
     if data.refcnt() != 0 {
         return false;
     }
-    let workers = ctx.workers();
-    debug_assert_eq!(data.flsn.len(), workers.len());
-    for (i, w) in workers.iter().enumerate() {
+    let groups = ctx.groups();
+    debug_assert_eq!(data.flsn.len(), groups.len());
+    for (i, g) in groups.iter().enumerate() {
         // first update dirty page, and later update flsn on flush
-        if data.flsn[i].load(Relaxed) > w.logging.flsn() {
+        let pos = data.flsn[i].load();
+        let flushed = g.logging.lock().flushed_pos();
+        if pos.file_id > flushed.file_id
+            || (pos.file_id == flushed.file_id && pos.offset > flushed.offset)
+        {
             return false;
         }
     }

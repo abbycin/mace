@@ -17,6 +17,7 @@ use crate::{
     },
     utils::{
         Handle, MutRef,
+        data::Position,
         lru::{CachePriority, ShardPriorityLru},
         options::ParsedOptions,
         queue::Queue,
@@ -138,11 +139,11 @@ impl Pool {
     const INIT_ARENA: u32 = 16; // must be power of 2
 
     fn new(opt: Arc<ParsedOptions>, ctx: Handle<Context>, numerics: Arc<Numerics>) -> Self {
-        let workers = opt.concurrent_write;
+        let groups = ctx.groups().len() as u8;
         let id = Self::get_id(&numerics);
         let q = Queue::new(Self::INIT_ARENA as usize);
         for _ in 0..Self::INIT_ARENA {
-            let h = Handle::new(Arena::new(opt.data_file_size, workers));
+            let h = Handle::new(Arena::new(opt.data_file_size, groups));
             q.push(h).unwrap();
         }
 
@@ -208,7 +209,7 @@ impl Pool {
                 break p;
             }
             if self.allow_over_provision {
-                break Handle::new(Arena::new(cur.cap(), cur.workers()));
+                break Handle::new(Arena::new(cur.cap(), cur.groups()));
             } else {
                 if !is_spin {
                     is_spin = true;
@@ -331,8 +332,8 @@ impl Buffers {
         }
     }
 
-    pub(crate) fn record_lsn(&self, worker_id: usize, seq: u64) {
-        self.pool.current().record_lsn(worker_id, seq);
+    pub(crate) fn record_lsn(&self, group_id: usize, pos: Position) {
+        self.pool.current().record_lsn(group_id, pos);
     }
 
     pub(crate) fn recycle<F>(&self, addr: &[u64], mut gc: F)

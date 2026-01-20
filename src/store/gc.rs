@@ -222,7 +222,7 @@ impl GarbageCollector {
 
         // strategy: scan the entire page table approximately every 500 ticks (e.g., ~8 hours if tick=1min)
         // but keep the batch size within a reasonable range [128, 10000].
-        let batch_size = (max_pid / 500).max(128).min(10000);
+        let batch_size = (max_pid / 500).clamp(128, 10000);
         let mut compact_count = 0;
         let max_compact_per_tick = 64; // limit I/O impact
 
@@ -388,22 +388,28 @@ impl GarbageCollector {
     }
 
     fn process_wal(&mut self) {
-        for w in self.store.context.workers().iter() {
-            let lk = w.start_ckpt.read();
-            let checkpoint_id = lk.file_id;
-            drop(lk);
-            let lk = w.logging.desc.lock();
+        for g in self.store.context.groups().iter() {
+            let mut checkpoint_id = g.active_txns.min_position_file_id();
+
+            let logging = g.logging.lock();
+            checkpoint_id = std::cmp::min(checkpoint_id, logging.last_ckpt().file_id);
+
+            let desc_clone = logging.desc.clone();
+            let lk = desc_clone.lock();
             let oldest_id = lk.oldest_id;
             drop(lk);
+
+            // drop logging lock to avoid blocking writes during IO
+            drop(logging);
 
             if oldest_id == checkpoint_id {
                 continue;
             }
 
             // [oldest_id, checkpoint_id)
-            Self::process_one_wal(&self.store.opt, w.id, oldest_id, checkpoint_id);
-            let mut desc = w.logging.desc.lock();
-            desc.update_oldest(self.ctx.opt.desc_file(w.id), checkpoint_id);
+            Self::process_one_wal(&self.store.opt, g.id as u8, oldest_id, checkpoint_id);
+            let mut desc = desc_clone.lock();
+            desc.update_oldest(self.ctx.opt.desc_file(g.id as u8), checkpoint_id);
         }
     }
 

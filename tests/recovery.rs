@@ -231,14 +231,14 @@ fn put_update(remove_data: bool) {
             },
             oldest_id: 0,
             latest_id: 0,
-            worker: 0,
+            group: 0,
             padding1: 0,
             padding2: 0,
             checksum: 0,
         };
 
         for i in 0..save.concurrent_write {
-            w.worker = i;
+            w.group = i;
             w.write(save.desc_file(i));
         }
     }
@@ -409,7 +409,7 @@ struct WalDesc {
     checkpoint: Position,
     oldest_id: u64,
     latest_id: u64,
-    worker: u8,
+    group: u8,
     padding1: u8,
     padding2: u16,
     checksum: u32,

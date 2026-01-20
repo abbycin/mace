@@ -78,7 +78,7 @@ pub trait IKeyCodec: ICodec {
 pub trait IVal: ICodec + Clone {
     fn is_tombstone(&self) -> bool;
 
-    fn worker(&self) -> u8 {
+    fn group_id(&self) -> u8 {
         unimplemented!()
     }
 }
