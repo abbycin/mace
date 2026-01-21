@@ -37,6 +37,8 @@ use crate::{
 
 pub(crate) const BUCKET_NUMERICS: &str = "numerics";
 pub(crate) const NUMERICS_KEY: &str = "numeric";
+pub(crate) const ORPHAN_DATA: &str = "orphan_data";
+pub(crate) const ORPHAN_BLOB: &str = "orphan_blob";
 pub(crate) const BUCKET_PAGE_TABLE: &str = "page_table";
 pub(crate) const BUCKET_DATA_STAT: &str = "data_stat";
 pub(crate) const BUCKET_BLOB_STAT: &str = "blob_stat";
@@ -48,7 +50,7 @@ pub(crate) const BUCKET_OBSOLETE_BLOB: &str = "obsolete_blob";
 pub(crate) mod builder;
 mod entry;
 pub use entry::{
-    BlobStatInner, DataStat, DataStatInner, DelInterval, Delete, FileId, IntervalPair, MemBlobStat,
+    BlobStatInner, DataStat, DataStatInner, DelInterval, Delete, IntervalPair, MemBlobStat,
     MemDataStat, MetaKind, Numerics, PageTable,
 };
 
@@ -173,10 +175,6 @@ impl MetaRecord for DelInterval {
     }
 }
 
-impl MetaRecord for FileId {
-    fn record(&self, _kind: MetaKind, _ops: &mut HashMap<&str, Vec<MetaOp>>) {}
-}
-
 #[derive(Clone)]
 pub(crate) enum MetaOp {
     Put(Vec<u8>, Vec<u8>),
@@ -205,10 +203,6 @@ impl<'a> Txn<'a> {
     pub(crate) fn commit(mut self) -> u64 {
         self.internal_commit();
         0
-    }
-
-    pub(crate) fn sync(&mut self) {
-        self.internal_commit();
     }
 
     fn internal_commit(&mut self) -> u64 {

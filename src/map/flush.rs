@@ -1,6 +1,6 @@
 use crate::cc::context::Context;
 use crate::map::data::{Arena, FileBuilder};
-use crate::meta::{FileId, IntervalPair, MetaKind};
+use crate::meta::{IntervalPair, MetaKind};
 use crate::utils::Handle;
 use crate::utils::countblock::Countblock;
 use crate::utils::data::Interval;
@@ -53,6 +53,22 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
         }
 
         let tick = ctx.manifest.numerics.next_data_id.load(Relaxed);
+
+        // 1. Perform Disk I/O (Write Data and Blob files first)
+        let Interval { lo, hi } = builder.build_data(tick, data_path);
+        let data_ivl = IntervalPair::new(lo, hi, data_id);
+
+        let mut blob_result = None;
+        if builder.has_blob() {
+            let blob_id = ctx.manifest.numerics.next_blob_id.fetch_add(1, Relaxed);
+            let blob_path = ctx.opt.blob_file(blob_id);
+            let Interval { lo, hi } = builder.build_blob(blob_path);
+            let blob_ivl = IntervalPair::new(lo, hi, blob_id);
+            let mem_blob_stat = builder.blob_stat(blob_id);
+            blob_result = Some((blob_id, blob_ivl, mem_blob_stat));
+        }
+
+        // 2. Prepare Statistics
         let mem_data_stat = builder.data_stat(data_id, tick);
         let data_stat = mem_data_stat.copy();
 
@@ -65,14 +81,13 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
             ctx.manifest.apply_blob_junks(&builder.blob_junks)
         };
 
+        // 3. Commit Metadata Transaction
         let mut txn = ctx.manifest.begin();
 
-        txn.record(MetaKind::FileId, &FileId::data(data_id));
-        txn.sync(); // necessary, before data file was flushed
-
         txn.record(MetaKind::Numerics, ctx.manifest.numerics.deref());
-        txn.record(MetaKind::DataStat, &data_stat); // new entry
+        txn.record(MetaKind::DataStat, &data_stat);
         txn.record(MetaKind::Map, &map.table());
+        txn.record(MetaKind::DataInterval, &data_ivl);
 
         data_stats.iter().for_each(|x| {
             assert_ne!(data_id, x.file_id);
@@ -83,38 +98,20 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
             txn.record(MetaKind::BlobStat, x);
         });
 
-        // data file must be flushed after FileId flushed and before txn commit
-        let Interval { lo, hi } = builder.build_data(tick, data_path);
-        let data_ivl = IntervalPair::new(lo, hi, data_id);
-        txn.record(MetaKind::DataInterval, &data_ivl);
-
-        // create a new mapping must after data has been flushed, so that GC can read fully flushed
-        // data file
-        ctx.manifest.add_data_stat(mem_data_stat, data_ivl);
-
-        // although the blob file is usually less than blob_max_size, and may larger than it in some
-        // case, we simply flush blobs into a single file, the blob files will be processed by gc
-        // runtime so that most of their size will finally near to blob_max_size
-        if builder.has_blob() {
-            let blob_id = ctx.manifest.numerics.next_blob_id.fetch_add(1, Relaxed);
-            txn.record(MetaKind::Numerics, ctx.manifest.numerics.deref());
-
-            let blob_path = ctx.opt.blob_file(blob_id);
-            let mem_blob_stat = builder.blob_stat(blob_id);
+        if let Some((_, blob_ivl, mem_blob_stat)) = blob_result {
             let blob_stat = mem_blob_stat.copy();
-
-            txn.record(MetaKind::FileId, &FileId::blob(blob_id));
-            txn.sync();
-
             txn.record(MetaKind::BlobStat, &blob_stat);
-            let Interval { lo, hi } = builder.build_blob(blob_path);
-            let blob_ivl = IntervalPair::new(lo, hi, blob_id);
             txn.record(MetaKind::BlobInterval, &blob_ivl);
 
+            // Update memory for blob
             ctx.manifest.add_blob_stat(mem_blob_stat, blob_ivl);
         }
 
         txn.commit();
+
+        // 4. Update Memory and Checkpoints
+        ctx.manifest.add_data_stat(mem_data_stat, data_ivl);
+
         for (i, g) in ctx.groups().iter().enumerate() {
             let pos = msg.flsn[i].load();
             g.logging.lock().update_last_ckpt(pos);

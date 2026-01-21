@@ -23,8 +23,8 @@ use crate::{
     io::{File, GatherIO},
     map::data::{BlobFooter, DataFooter, MetaReader},
     meta::{
-        BlobStatInner, DataStatInner, DelInterval, Delete, FileId, IntervalPair, MemBlobStat,
-        MemDataStat, MetaKind, Numerics,
+        BlobStatInner, DataStatInner, DelInterval, Delete, IntervalPair, MemBlobStat, MemDataStat,
+        MetaKind, Numerics,
     },
     types::traits::IAsSlice,
     utils::{
@@ -494,23 +494,18 @@ impl GarbageCollector {
 
         // it's possible that other thread deactived all data in data file while we are procesing
         self.process_obsoleted_data(obsoleted);
-        // it's also possible that frames in all candidate were obsoleted, in this case one data id
-        // is wasted, and a footer will be flush to data file, it will be removed in the future
 
-        let mut txn = self.ctx.manifest.begin();
-
-        txn.record(MetaKind::FileId, &FileId::data(file_id));
-        txn.sync(); // necessary, before data file was flushed
-
-        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
-
-        // data file must be flushed after FileId flushed and before txn commit
+        // 1. Perform Disk I/O (Build data file)
         let (fstat, relocs) = builder
             .build()
             .inspect_err(|e| {
                 log::error!("error {e}");
             })
             .unwrap();
+
+        // 2. Commit Metadata Transaction
+        let mut txn = self.ctx.manifest.begin();
+        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
 
         // the only problem is junks collected by flush thread maybe too many
         let stat = self.ctx.manifest.update_data_stat_interval(
@@ -600,21 +595,19 @@ impl GarbageCollector {
 
         // it's possible that other thread deactived all data in blob file while we are procesing
         self.process_obsoleted_blob(obsoleted);
-        // it's also possible that frames in all candidate were obsoleted, in this case one blob id
-        // is wasted, and a footer will be flush to blob file, it will be removed in the future
 
-        let mut txn = self.ctx.manifest.begin();
-
-        txn.record(MetaKind::FileId, &FileId::blob(blob_id));
-        txn.sync(); // necessary, before blob file was flushed
-
-        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
+        // 1. Perform Disk I/O (Build blob file)
         let (bstat, reloc) = builder
             .build(blob_id)
             .inspect_err(|e| {
                 log::error!("error {e:?}");
             })
             .unwrap();
+
+        // 2. Commit Metadata Transaction
+        let mut txn = self.ctx.manifest.begin();
+        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
+
         let stat = self.ctx.manifest.update_blob_stat_interval(
             bstat,
             reloc,
