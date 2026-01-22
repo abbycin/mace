@@ -48,7 +48,7 @@ impl BoxView {
         BoxRef(self.0)
     }
 
-    fn inc_ref(&self) {
+    pub(crate) fn inc_ref(&self) {
         raw_ptr_to_ref_mut(self.0).refs.fetch_add(1, Relaxed);
     }
 
@@ -95,6 +95,25 @@ impl BoxRef {
         h.total_size
     }
 
+    #[inline(always)]
+    #[cfg(test)]
+    pub(crate) fn alloc(size: u32, addr: u64) -> BoxRef {
+        Self::alloc_exact(Self::real_size(size), addr)
+    }
+
+    pub(crate) fn init(&mut self, total_size: u32, addr: u64, is_chunk: bool) {
+        let h = self.header_mut();
+        h.total_size = total_size;
+        h.payload_size = total_size - Self::HDR_LEN as u32;
+        h.flag = TagFlag::Normal;
+        h.pid = NULL_PID;
+        h.txid = 0;
+        h.addr = addr;
+        h.link = NULL_ADDR;
+        let refs = if is_chunk { 1 | 0x80000000 } else { 1 };
+        h.refs.store(refs, Relaxed);
+    }
+
     pub(crate) fn alloc_exact(size: u32, addr: u64) -> BoxRef {
         let layout = Layout::from_size_align(size as usize, 8)
             .inspect_err(|x| panic!("bad layout {x:?}"))
@@ -102,22 +121,12 @@ impl BoxRef {
         let mut this = BoxRef(unsafe { alloc(layout).cast::<_>() });
         #[cfg(feature = "extra_check")]
         assert_eq!(this.0 as usize % 8, 0);
-        let h = this.header_mut();
-        h.total_size = size;
-        h.payload_size = size - Self::HDR_LEN as u32;
-        h.flag = TagFlag::Normal;
-        h.pid = NULL_PID;
-        h.txid = 0;
-        h.addr = addr;
-        h.link = NULL_ADDR;
-        h.refs.store(1, Relaxed);
+        this.init(size, addr, false);
         this
     }
 
-    /// NOTE: the alignment is hard code to pointer's alignment, and it's true in mace
-    #[inline(always)]
-    pub(crate) fn alloc(size: u32, addr: u64) -> BoxRef {
-        Self::alloc_exact(Self::real_size(size), addr)
+    pub(crate) unsafe fn from_raw(ptr: *mut u8) -> Self {
+        Self(ptr as *mut BoxHeader)
     }
 
     /// because all fields except refcnt are immutable before flush to file, we exclude the refcnt
@@ -174,10 +183,20 @@ impl Drop for BoxRef {
     fn drop(&mut self) {
         debug_assert!(!self.0.is_null());
         let view = self.view();
-        if view.dec_ref() == 1 {
-            let layout = Layout::array::<u8>(self.total_size() as usize).unwrap();
-            let p = self.0 as *mut u8;
-            unsafe { dealloc(p, layout) };
+        let old_refs = view.dec_ref();
+
+        // mask out the MSB (Chunk Flag) to get actual count
+        let count = old_refs & 0x7FFFFFFF;
+
+        if count == 1 {
+            if (old_refs & 0x80000000) != 0 {
+                // in chunk
+                unsafe { crate::map::chunk::dec_ref(self.0 as *mut u8) };
+            } else {
+                let layout = Layout::from_size_align(self.total_size() as usize, 8).unwrap();
+                let p = self.0 as *mut u8;
+                unsafe { dealloc(p, layout) };
+            }
         }
     }
 }

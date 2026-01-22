@@ -1,9 +1,13 @@
 use crate::io::{File, GatherIO};
 use crc32c::Crc32cHasher;
 use dashmap::DashMap;
+use parking_lot::Mutex;
+use rustc_hash::FxHasher;
+use std::hash::BuildHasherDefault;
 
 use crate::OpCode;
 use crate::map::IFooter;
+use crate::map::chunk::Chunk;
 use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, Numerics, PageTable};
 use crate::types::header::{TagFlag, TagKind};
 use crate::types::refbox::{BoxRef, RemoteView};
@@ -21,7 +25,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64};
 
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
@@ -52,11 +56,11 @@ impl Deref for FlushData {
     }
 }
 
-// use C repr to fix the layout
-#[repr(C)]
 pub(crate) struct Arena {
     id: Cell<u64>,
-    items: DashMap<u64, BoxRef>,
+    pub(crate) items: DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>,
+    pub(crate) chunks: Mutex<Vec<Box<Chunk>>>,
+    pub(crate) active_chunk: AtomicPtr<Chunk>,
     /// flush LSN
     pub(crate) flsn: Box<[CachePad<Flsn>]>,
     pub(crate) real_size: AtomicU64,
@@ -65,7 +69,6 @@ pub(crate) struct Arena {
     cap: usize,
     refs: AtomicU32,
     pub(crate) state: AtomicU16,
-    groups: u8,
 }
 
 pub(crate) struct Flsn {
@@ -108,7 +111,7 @@ impl Flsn {
 }
 
 impl Deref for Arena {
-    type Target = DashMap<u64, BoxRef>;
+    type Target = DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>;
 
     fn deref(&self) -> &Self::Target {
         &self.items
@@ -134,8 +137,9 @@ impl Arena {
     }
 
     pub(crate) fn new(cap: usize, groups: u8) -> Self {
+        let items = DashMap::with_capacity_and_hasher(16 << 10, BuildHasherDefault::default());
         Self {
-            items: DashMap::with_capacity(16 << 10),
+            items,
             flsn: Self::alloc_flsn(groups as usize),
             id: Cell::new(INIT_ID),
             refs: AtomicU32::new(0),
@@ -143,7 +147,20 @@ impl Arena {
             real_size: AtomicU64::new(0),
             cap,
             state: AtomicU16::new(Self::FLUSH),
-            groups,
+            chunks: Mutex::new(Vec::new()),
+            active_chunk: AtomicPtr::new(Box::into_raw(Box::new(Chunk::new()))),
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.items.clear();
+        self.chunks.lock().clear();
+
+        let old_ptr = self
+            .active_chunk
+            .swap(Box::into_raw(Box::new(Chunk::new())), Relaxed);
+        if !old_ptr.is_null() {
+            unsafe { drop(Box::from_raw(old_ptr)) };
         }
     }
 
@@ -154,7 +171,7 @@ impl Arena {
         self.offset.store(0, Relaxed);
         self.real_size.store(0, Relaxed);
         assert!(self.unref());
-        assert!(self.items.is_empty());
+        self.clear();
     }
 
     pub(crate) fn cap(&self) -> usize {
@@ -193,9 +210,38 @@ impl Arena {
         }
     }
 
-    fn alloc_at(&self, numerics: &Numerics, size: u32) -> BoxRef {
+    fn alloc_at(&self, numerics: &Numerics, real_size: u32) -> BoxRef {
         let addr = numerics.address.fetch_add(1, Relaxed);
-        let p = BoxRef::alloc(size, addr);
+
+        let p = if real_size >= 4096 {
+            BoxRef::alloc_exact(real_size, addr)
+        } else {
+            loop {
+                let chunk_ptr = self.active_chunk.load(Acquire);
+                let chunk = unsafe { &*chunk_ptr };
+
+                let ptr = chunk.alloc(real_size);
+                if !ptr.is_null() {
+                    let mut p = unsafe { BoxRef::from_raw(ptr) };
+                    p.init(real_size, addr, true);
+                    break p;
+                }
+
+                let mut chunks = self.chunks.lock();
+                if self.active_chunk.load(Acquire) != chunk_ptr {
+                    continue;
+                }
+                let new_chunk_ptr = Box::into_raw(Box::new(Chunk::new()));
+                let _ok = self
+                    .active_chunk
+                    .compare_exchange(chunk_ptr, new_chunk_ptr, AcqRel, Acquire)
+                    .is_ok();
+                #[cfg(feature = "extra_check")]
+                assert!(_ok);
+                chunks.push(unsafe { Box::from_raw(chunk_ptr) });
+            }
+        };
+
         self.items.insert(addr, p.clone());
         p
     }
@@ -204,7 +250,7 @@ impl Arena {
         let real_size = BoxRef::real_size(size);
         self.inc_ref();
         self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
-        Ok(self.alloc_at(numerics, size))
+        Ok(self.alloc_at(numerics, real_size))
     }
 
     pub(crate) fn dealloc(&self, addr: u64, len: usize) {

@@ -1,7 +1,9 @@
 pub(crate) mod buffer;
 pub(crate) mod cache;
+pub(crate) mod chunk;
 pub(crate) mod data;
-mod evictor;
+pub(crate) mod evictor;
+
 mod flush;
 pub mod table;
 use std::sync::{Arc, mpsc::channel};
