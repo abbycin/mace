@@ -264,10 +264,13 @@ impl Logging {
 
     pub fn record_begin(&mut self, txid: u64) -> Position {
         let pos = self.current_pos();
-        self.add_entry(WalBegin {
+        let mut w = WalBegin {
             wal_type: EntryType::Begin,
             txid,
-        });
+            checksum: 0,
+        };
+        w.checksum = w.calc_checksum();
+        self.add_entry(w);
         pos
     }
 
@@ -276,17 +279,23 @@ impl Logging {
         {
             self.last_id = txid;
         }
-        self.add_entry(WalCommit {
+        let mut w = WalCommit {
             wal_type: EntryType::Commit,
             txid,
-        });
+            checksum: 0,
+        };
+        w.checksum = w.calc_checksum();
+        self.add_entry(w);
     }
 
     pub fn record_abort(&mut self, txid: u64) {
-        self.add_entry(WalAbort {
+        let mut w = WalAbort {
             wal_type: EntryType::Abort,
             txid,
-        });
+            checksum: 0,
+        };
+        w.checksum = w.calc_checksum();
+        self.add_entry(w);
     }
 
     fn checkpoint(&mut self) {
@@ -309,9 +318,11 @@ impl Logging {
         );
         self.last_data = cur;
 
-        let ckpt = WalCheckpoint {
+        let mut ckpt = WalCheckpoint {
             wal_type: EntryType::CheckPoint,
+            checksum: 0,
         };
+        ckpt.checksum = ckpt.calc_checksum();
 
         // we must flush buffer in ring to make sure they are stabilized before flush checkpoint
         self.flush();

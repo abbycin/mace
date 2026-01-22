@@ -94,6 +94,9 @@ pub struct Options {
     ///
     /// **Once set, it cannot be modified**
     pub split_elems: u16,
+    /// if true, corrupted WAL will be truncated during recovery, otherwise it will panic
+    /// default is true
+    pub truncate_corrupted_wal: bool,
 }
 
 impl Options {
@@ -147,6 +150,7 @@ impl Options {
             wal_file_size: Self::WAL_FILE_SZ as u32,
             keep_stable_wal_file: false,
             split_elems: Self::MAX_SPLIT_ELEMS,
+            truncate_corrupted_wal: true,
         }
     }
 
@@ -192,7 +196,6 @@ impl Options {
     }
 }
 
-#[derive(Clone)]
 pub struct ParsedOptions {
     pub(crate) inner: Options,
 }
@@ -269,11 +272,11 @@ impl Options {
     }
 }
 
-impl Drop for Options {
+impl Drop for ParsedOptions {
     fn drop(&mut self) {
-        if self.tmp_store {
-            log::info!("remove db_root {:?}", self.db_root);
-            let _ = std::fs::remove_dir_all(&self.db_root);
+        if self.inner.tmp_store {
+            log::info!("remove db_root {:?}", self.inner.db_root);
+            let _ = std::fs::remove_dir_all(&self.inner.db_root);
         }
     }
 }

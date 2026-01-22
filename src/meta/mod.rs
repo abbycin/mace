@@ -46,6 +46,10 @@ pub(crate) const BUCKET_DATA_INTERVAL: &str = "data_interval";
 pub(crate) const BUCKET_BLOB_INTERVAL: &str = "blob_interval";
 pub(crate) const BUCKET_OBSOLETE_DATA: &str = "obsolete_data";
 pub(crate) const BUCKET_OBSOLETE_BLOB: &str = "obsolete_blob";
+pub(crate) const BUCKET_VERSION: &str = "version";
+pub(crate) const VERSION_KEY: &str = "current_version";
+/// storage format version
+pub(crate) const CURRENT_VERSION: u64 = 1;
 
 pub(crate) mod builder;
 mod entry;
@@ -314,6 +318,7 @@ impl Manifest {
             BUCKET_BLOB_INTERVAL,
             BUCKET_OBSOLETE_DATA,
             BUCKET_OBSOLETE_BLOB,
+            BUCKET_VERSION,
         ];
 
         for name in buckets {

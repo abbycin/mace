@@ -109,15 +109,16 @@ impl Recovery {
         loc: &mut Location,
         buf: &mut [u8],
         tree: &Tree,
-    ) {
+    ) -> bool {
         assert!((loc.len as usize) < buf.len());
         f.read(&mut buf[0..loc.len as usize], loc.pos.offset)
             .unwrap();
 
         let u = ptr_to::<WalUpdate>(buf.as_ptr());
 
-        // TODO: stop here instead of panic
-        assert!(u.is_intact());
+        if !u.is_intact() {
+            return false;
+        }
 
         let ver = Ver::new(u.txid, u.cmd_id);
 
@@ -133,6 +134,7 @@ impl Recovery {
         if lost {
             self.dirty_table.insert(ver, *loc);
         }
+        true
     }
 
     fn analyze(
@@ -174,6 +176,7 @@ impl Recovery {
 
             log::trace!("{path:?} pos {pos} end {end}");
             while pos < end {
+                let start_pos = pos;
                 let hdr = {
                     let hdr = &mut buf[0..1];
                     f.read(hdr, pos).unwrap();
@@ -182,6 +185,7 @@ impl Recovery {
                 let et: EntryType = hdr.into();
 
                 let Some(sz) = Self::get_size(et, (end - pos) as usize) else {
+                    pos = start_pos;
                     break;
                 };
                 debug_assert!(sz < Self::INIT_BLOCK_SIZE);
@@ -194,16 +198,28 @@ impl Recovery {
                 match et {
                     EntryType::Commit => {
                         let a = ptr_to::<WalCommit>(ptr);
+                        if !a.is_intact() {
+                            pos = start_pos;
+                            break;
+                        }
                         log::trace!("{a:?}");
                         self.undo_table.remove(&{ a.txid });
                     }
                     EntryType::Abort => {
                         let a = ptr_to::<WalAbort>(ptr);
+                        if !a.is_intact() {
+                            pos = start_pos;
+                            break;
+                        }
                         log::trace!("{a:?}");
                         self.undo_table.remove(&{ a.txid });
                     }
                     EntryType::Begin => {
                         let b = ptr_to::<WalBegin>(ptr);
+                        if !b.is_intact() {
+                            pos = start_pos;
+                            break;
+                        }
                         log::trace!("{b:?}");
                         self.undo_table.insert(
                             b.txid,
@@ -219,11 +235,17 @@ impl Recovery {
                         oracle = max(b.txid, oracle);
                     }
                     EntryType::CheckPoint => {
-                        // do nothing
+                        use crate::cc::wal::WalCheckpoint;
+                        let c = ptr_to::<WalCheckpoint>(ptr);
+                        if !c.is_intact() {
+                            pos = start_pos;
+                            break;
+                        }
                     }
                     EntryType::Update => {
                         let u = ptr_to::<WalUpdate>(ptr);
                         if pos + u.payload_len() as u64 > end {
+                            pos = start_pos;
                             break;
                         }
                         loc.len = (sz + u.payload_len()) as u32;
@@ -238,7 +260,10 @@ impl Recovery {
                             l.pos.file_id = i;
                             l.pos.offset = loc.pos.offset;
                         }
-                        self.handle_update(g, &mut f, &mut loc, buf, tree);
+                        if !self.handle_update(g, &mut f, &mut loc, buf, tree) {
+                            pos = start_pos;
+                            break;
+                        }
                         pos += u.payload_len() as u64;
                     }
                     _ => {
@@ -248,9 +273,14 @@ impl Recovery {
             }
 
             if pos < end {
+                if !self.opt.truncate_corrupted_wal {
+                    panic!("WAL corrupted at {pos} in {path:?}, truncation disabled");
+                }
                 // truncate the WAL if it's imcomplete
                 log::trace!("truncate {path:?} from {end} to {pos}");
                 f.truncate(pos).expect("can't truncate file");
+                // if we truncated the file, we must stop here
+                break;
             }
         }
 
@@ -293,6 +323,7 @@ impl Recovery {
             f.read(block.mut_slice(0, len as usize), pos.offset)
                 .unwrap();
             let c = ptr_to::<WalUpdate>(block.data());
+            assert!(c.is_intact(), "WAL update record corrupted during redo");
             let ok = c.key();
             let key = Key::new(ok, Ver::new(c.txid, c.cmd_id));
 

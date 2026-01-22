@@ -45,6 +45,7 @@ pub enum OpCode {
     IoError,
     AbortTx,
     Duplicated,
+    BadVersion,
     Unknown,
 }
 

@@ -3,8 +3,8 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use crate::map::table::Swip;
 use crate::meta::{
-    DataStat, Delete, IMetaCodec, IntervalPair, MemBlobStat, MemDataStat, NUMERICS_KEY,
-    ORPHAN_BLOB, ORPHAN_DATA,
+    BUCKET_VERSION, CURRENT_VERSION, DataStat, Delete, IMetaCodec, IntervalPair, MemBlobStat,
+    MemDataStat, NUMERICS_KEY, ORPHAN_BLOB, ORPHAN_DATA, VERSION_KEY,
 };
 use crate::utils::ROOT_PID;
 use crate::utils::bitmap::BitMap;
@@ -48,12 +48,34 @@ impl ManifestBuilder {
 
         let mut next_pid = ROOT_PID;
 
+        // 0. Check Version
+        let mut has_version = false;
+        if let Ok(val) = self
+            .inner
+            .btree
+            .view(BUCKET_VERSION, |txn| txn.get(VERSION_KEY))
+        {
+            // version is stored as big endian u64
+            let ver = u64::from_be_bytes(val[..8].try_into().map_err(|_| OpCode::BadData)?);
+            if ver != CURRENT_VERSION {
+                log::error!("Version mismatch, expect {} get {}", CURRENT_VERSION, ver);
+                return Err(OpCode::BadData);
+            }
+            has_version = true;
+        }
+
         // 1. Load Numerics
         if let Ok(val) = self
             .inner
             .btree
             .view(BUCKET_NUMERICS, |txn| txn.get(NUMERICS_KEY))
         {
+            // if we have found numerics, it means the database is not empty
+            // so we must have version, otherwise it's a legacy database
+            if !has_version {
+                log::error!("Version mismatch, please use migration tool");
+                return Err(OpCode::BadData);
+            }
             let src = Numerics::decode(&val);
             macro_rules! set {
                 ($dst:expr, $src:expr; $($field:ident),*) => {
@@ -226,6 +248,15 @@ impl ManifestBuilder {
             .map_err(|_| OpCode::IoError)?;
 
         self.inner.map.set_next(next_pid);
+
+        if !has_version {
+            self.inner
+                .btree
+                .exec(BUCKET_VERSION, |txn| {
+                    txn.put(VERSION_KEY, CURRENT_VERSION.to_be_bytes())
+                })
+                .map_err(|_| OpCode::IoError)?;
+        }
 
         Ok(())
     }

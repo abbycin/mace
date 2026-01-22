@@ -59,7 +59,7 @@ impl Deref for FlushData {
 pub(crate) struct Arena {
     id: Cell<u64>,
     pub(crate) items: DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>,
-    pub(crate) chunks: Mutex<Vec<Box<Chunk>>>,
+    pub(crate) chunks: Mutex<Vec<Chunk>>,
     pub(crate) active_chunk: AtomicPtr<Chunk>,
     /// flush LSN
     pub(crate) flsn: Box<[CachePad<Flsn>]>,
@@ -238,7 +238,7 @@ impl Arena {
                     .is_ok();
                 #[cfg(feature = "extra_check")]
                 assert!(_ok);
-                chunks.push(unsafe { Box::from_raw(chunk_ptr) });
+                chunks.push(unsafe { *Box::from_raw(chunk_ptr) });
             }
         };
 

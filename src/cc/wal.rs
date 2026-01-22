@@ -5,12 +5,11 @@ use std::{
     cmp::max,
     collections::{BTreeMap, btree_map::Entry},
     fmt::Debug,
-    path::PathBuf,
     rc::Rc,
 };
 
 use crate::{
-    io::{self, File, GatherIO},
+    io::{File, GatherIO},
     static_assert,
     types::{
         data::{Key, Record, Ver},
@@ -106,6 +105,7 @@ impl Debug for WalUpdate {
 pub(crate) struct WalBegin {
     pub(crate) wal_type: EntryType,
     pub(crate) txid: u64,
+    pub(crate) checksum: u32,
 }
 
 #[repr(C, packed(1))]
@@ -113,6 +113,7 @@ pub(crate) struct WalBegin {
 pub(crate) struct WalAbort {
     pub(crate) wal_type: EntryType,
     pub(crate) txid: u64,
+    pub(crate) checksum: u32,
 }
 
 #[repr(C, packed(1))]
@@ -120,6 +121,7 @@ pub(crate) struct WalAbort {
 pub(crate) struct WalCommit {
     pub(crate) wal_type: EntryType,
     pub(crate) txid: u64,
+    pub(crate) checksum: u32,
 }
 
 static_assert!(size_of::<WalCommit>() == size_of::<WalAbort>());
@@ -131,7 +133,36 @@ static_assert!(size_of::<WalCommit>() == size_of::<WalBegin>());
 #[derive(Debug)]
 pub(crate) struct WalCheckpoint {
     pub(crate) wal_type: EntryType,
+    pub(crate) checksum: u32,
 }
+
+macro_rules! impl_checksum {
+    ($t:ty) => {
+        impl $t {
+            pub(crate) fn calc_checksum(&self) -> u32 {
+                let ptr = self as *const Self as *const u8;
+                let len = self.encoded_len();
+                let checksum_offset = len - size_of_val(&{ self.checksum });
+
+                let mut h = Crc32cHasher::default();
+                unsafe {
+                    let slice = std::slice::from_raw_parts(ptr, checksum_offset);
+                    h.write(slice);
+                }
+                h.finish() as u32
+            }
+
+            pub(crate) fn is_intact(&self) -> bool {
+                self.checksum == self.calc_checksum()
+            }
+        }
+    };
+}
+
+impl_checksum!(WalBegin);
+impl_checksum!(WalCommit);
+impl_checksum!(WalAbort);
+impl_checksum!(WalCheckpoint);
 
 impl WalUpdate {
     pub(crate) fn sub_type(&self) -> PayloadType {
@@ -458,9 +489,13 @@ impl<'a> WalReader<'a> {
                 f.read(&mut s[0..sz], pos).unwrap();
                 match h {
                     EntryType::Abort | EntryType::Commit => {
+                        let r = ptr_to::<WalCommit>(s.as_ptr());
+                        assert!(r.is_intact());
                         break 'outer;
                     }
                     EntryType::Begin => {
+                        let r = ptr_to::<WalBegin>(s.as_ptr());
+                        assert!(r.is_intact());
                         // we use the same group in the UPDATE record or else any group is ok, so
                         // that we can make sure these records will be flushed with the same order
                         // as they were queued
@@ -545,37 +580,6 @@ impl<'a> WalReader<'a> {
         tree.put(self.guard, Key::new(raw, Ver::new(c.txid, *cmd)), val);
         (c.prev_id, c.prev_off)
     }
-
-    #[allow(unused)]
-    fn check_wal(&self, path: &PathBuf) -> Result<(), u64> {
-        let f = io::File::options().read(true).open(path).unwrap();
-
-        let mut buf = vec![0u8; 8192];
-        let end = f.size().unwrap();
-        let mut pos = 0;
-        while pos < end {
-            let h = &mut buf[..1];
-            f.read(h, pos).unwrap();
-            if h[0] >= EntryType::Unknown as u8 {
-                return Err(pos);
-            }
-
-            let ty: EntryType = h[0].into();
-            let sz = wal_record_sz(ty);
-
-            assert!(pos + sz as u64 <= end);
-
-            f.read(&mut buf[0..sz], pos).unwrap();
-            let old = pos;
-            pos += sz as u64;
-            if ty == EntryType::Update {
-                let u = ptr_to::<WalUpdate>(buf.as_ptr());
-                pos += u.size as u64;
-            }
-            log::debug!("pos {old} {ty:?} data_len {}", pos - old);
-        }
-        Ok(())
-    }
 }
 
 pub(crate) fn ptr_to<T>(x: *const u8) -> &'static T {
@@ -646,5 +650,49 @@ mod test {
             let np = nc.put();
             assert_eq!(np.val(), VAL);
         }
+    }
+
+    #[test]
+    fn test_wal_entry_checksums() {
+        use crate::cc::wal::{WalAbort, WalBegin, WalCheckpoint, WalCommit};
+
+        let mut begin = WalBegin {
+            wal_type: EntryType::Begin,
+            txid: 12345,
+            checksum: 0,
+        };
+        begin.checksum = begin.calc_checksum();
+        assert!(begin.is_intact());
+
+        // Corrupt it
+        begin.txid = 54321;
+        assert!(!begin.is_intact());
+
+        // Restore
+        begin.txid = 12345;
+        assert!(begin.is_intact());
+
+        // Commit
+        let mut commit = WalCommit {
+            wal_type: EntryType::Commit,
+            txid: 12345,
+            checksum: 0,
+        };
+        commit.checksum = commit.calc_checksum();
+        assert!(commit.is_intact());
+
+        commit.wal_type = EntryType::Abort; // Corrupt type
+        assert!(!commit.is_intact());
+
+        // Checkpoint
+        let mut ckpt = WalCheckpoint {
+            wal_type: EntryType::CheckPoint,
+            checksum: 0,
+        };
+        ckpt.checksum = ckpt.calc_checksum();
+        assert!(ckpt.is_intact());
+
+        ckpt.wal_type = EntryType::Unknown;
+        assert!(!ckpt.is_intact());
     }
 }
