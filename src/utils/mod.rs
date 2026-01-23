@@ -17,7 +17,36 @@ pub(crate) mod lru;
 pub(crate) mod options;
 pub(crate) mod queue;
 pub(crate) mod spooky;
+pub(crate) mod status;
 pub(crate) mod varint;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OpCode {
+    NotFound,
+    Corruption,
+    IoError,
+    BadData,
+    BadVersion,
+    TooLarge,
+    NeedMore,
+    AbortTx,
+    Again,
+}
+
+impl std::fmt::Display for OpCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::error::Error for OpCode {}
+
+impl From<std::io::Error> for OpCode {
+    fn from(_: std::io::Error) -> Self {
+        OpCode::IoError
+    }
+}
 
 pub(crate) const NULL_PID: u64 = 0;
 pub(crate) const ROOT_PID: u64 = 1;
@@ -32,27 +61,6 @@ pub(crate) const INIT_WMK: u64 = 0;
 /// NOTE: must larger than wmk_oldest (which is 0 by default)
 pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
-
-#[derive(Debug, PartialEq)]
-pub enum OpCode {
-    NotFound,
-    BadData,
-    TooLarge,
-    NeedMore,
-    Again,
-    Invalid,
-    NoSpace,
-    IoError,
-    AbortTx,
-    Duplicated,
-    Unknown,
-}
-
-impl std::fmt::Display for OpCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{self:?}"))
-    }
-}
 
 pub(crate) const fn align_up(n: usize, align: usize) -> usize {
     (n + (align - 1)) & !(align - 1)

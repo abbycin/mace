@@ -1,14 +1,12 @@
 use parking_lot::RwLock;
 
-use crate::OpCode;
 use crate::cc::cc::ConcurrencyControl;
 use crate::meta::{Manifest, Numerics};
 use crate::utils::data::WalDescHandle;
 use crate::utils::options::ParsedOptions;
-use crate::utils::queue::Queue;
 use crate::utils::{CachePad, Handle, INIT_WMK, NULL_ORACLE, rand_range};
 
-use super::worker::SyncWorker;
+use super::group::WriterGroup;
 use std::ops::{Deref, DerefMut};
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -24,9 +22,9 @@ pub struct Context {
     pub(crate) numerics: Arc<Numerics>,
     pub(crate) manifest: Manifest,
     pool: Arc<CCPool>,
-    workers: Arc<Vec<SyncWorker>>,
-    active_workers: Queue<SyncWorker>,
+    groups: Arc<Vec<WriterGroup>>,
     nr_view: CachePad<AtomicUsize>,
+    group_rr: CachePad<AtomicUsize>,
     min_view_txid: Arc<AtomicU64>,
     tx: Sender<()>,
 }
@@ -34,18 +32,15 @@ pub struct Context {
 impl Context {
     pub fn new(opt: Arc<ParsedOptions>, manifest: Manifest, desc: &[WalDescHandle]) -> Self {
         let cores = opt.concurrent_write as usize;
-        assert_eq!(cores, desc.len());
-        let mut w = Vec::with_capacity(cores);
-        let active_workers = Queue::new(cores);
+        let mut groups = Vec::with_capacity(cores);
         let numerics = manifest.numerics.clone();
-        for d in desc.iter() {
-            let x = SyncWorker::new(d.clone(), numerics.clone(), opt.clone());
-            active_workers.push(x).unwrap();
-            w.push(x);
+        for (i, d) in desc.iter().enumerate() {
+            let g = WriterGroup::new(i, d.clone(), numerics.clone(), opt.clone());
+            groups.push(g);
         }
 
         let pool = Arc::new(CCPool::new(cores));
-        let workers = Arc::new(w);
+        let groups = Arc::new(groups);
         let min_view_txid = Arc::new(AtomicU64::new(INIT_WMK));
         let (tx, rx) = channel();
         collect_thread(rx, min_view_txid.clone(), pool.clone());
@@ -55,9 +50,9 @@ impl Context {
             numerics,
             manifest,
             pool,
-            workers,
-            active_workers,
+            groups,
             nr_view: CachePad::default(),
+            group_rr: CachePad::default(),
             min_view_txid,
             tx,
         }
@@ -71,14 +66,6 @@ impl Context {
         }
     }
 
-    pub fn alloc_worker(&self) -> Result<SyncWorker, OpCode> {
-        self.active_workers.pop().ok_or(OpCode::Again)
-    }
-
-    pub fn free_worker(&self, w: SyncWorker) {
-        self.active_workers.push(w).unwrap();
-    }
-
     pub fn alloc_cc(&self) -> Handle<CCNode> {
         let start_ts = self.load_oracle();
         self.nr_view.fetch_add(1, Relaxed);
@@ -86,7 +73,7 @@ impl Context {
         let _ = self
             .min_view_txid
             .compare_exchange(INIT_WMK, start_ts, Relaxed, Relaxed);
-        self.pool.alloc(start_ts, self.safe_txid())
+        self.pool.alloc(start_ts)
     }
 
     pub fn free_cc(&self, cc: Handle<CCNode>) {
@@ -95,12 +82,16 @@ impl Context {
     }
 
     #[inline]
-    pub fn worker(&self, wid: usize) -> SyncWorker {
-        self.workers[wid]
+    pub fn group(&self, gid: usize) -> &WriterGroup {
+        &self.groups[gid]
     }
 
-    pub fn workers(&self) -> &Vec<SyncWorker> {
-        &self.workers
+    pub fn groups(&self) -> &Vec<WriterGroup> {
+        &self.groups
+    }
+
+    pub(crate) fn next_group_id(&self) -> usize {
+        self.group_rr.fetch_add(1, Relaxed) % self.groups.len()
     }
 
     #[inline]
@@ -128,17 +119,20 @@ impl Context {
     }
 
     pub(crate) fn start(&self) {
-        self.workers
+        self.groups
             .iter()
-            .for_each(|w| w.logging.enable_checkpoint())
+            .for_each(|w| w.logging.lock().enable_checkpoint())
     }
 
     pub(crate) fn quit(&self) {
-        self.workers.iter().for_each(|x| {
-            // we are the last one, so use mutable copy is ok
-            let mut h = *x;
-            h.logging.stabilize();
-            x.reclaim()
+        self.groups.iter().for_each(|x| {
+            x.logging
+                .lock()
+                .stabilize()
+                .inspect_err(|e| {
+                    log::error!("can't stabilize WAL, {:?}", e);
+                })
+                .expect("can't fail");
         });
         self.tx
             .send(())
@@ -235,7 +229,7 @@ impl CCPool {
         self.shard_index.fetch_add(1, Relaxed) & CCPOOL_SHARD_MASK
     }
 
-    fn alloc(&self, start_ts: u64, safe_txid: u64) -> Handle<CCNode> {
+    fn alloc(&self, start_ts: u64) -> Handle<CCNode> {
         let mut shard = self.get_shard_idx();
 
         let mut h = 'outer: loop {
@@ -269,7 +263,6 @@ impl CCPool {
             break cc;
         };
         h.start_ts = start_ts;
-        h.global_wmk_tx = safe_txid;
         h
     }
 

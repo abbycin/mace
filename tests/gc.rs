@@ -32,7 +32,7 @@ fn gc_data() -> Result<(), OpCode> {
         kv.commit()?;
     }
 
-    let kv = db.begin()?;
+    let kv = db.begin().unwrap();
     let mut rest = vec![];
     #[allow(clippy::needless_range_loop)]
     for i in 0..cap {
@@ -100,18 +100,18 @@ fn gc_blob() -> Result<(), OpCode> {
     }
 
     for k in &pair {
-        let kv = db.begin()?;
+        let kv = db.begin().unwrap();
         kv.put(k, &val)?;
         kv.commit()?;
     }
 
     for k in &pair {
-        let kv = db.begin()?;
+        let kv = db.begin().unwrap();
         kv.update(k, &val)?;
         kv.commit()?;
     }
 
-    let kv = db.begin()?;
+    let kv = db.begin().unwrap();
     let mut rest = vec![];
     #[allow(clippy::needless_range_loop)]
     for i in 0..cap {
@@ -133,6 +133,7 @@ fn gc_blob() -> Result<(), OpCode> {
     if db.blob_gc_count() > 0 {
         drop(db);
         opt.tmp_store = true;
+        let opt = opt.validate().unwrap();
         let mut count = 0;
         let mut max_id = 0;
         let dir = std::fs::read_dir(opt.data_root()).unwrap();

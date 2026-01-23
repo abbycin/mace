@@ -6,3 +6,6 @@
 .vscode
 .cache
 Cargo.lock
+*.md
+!README.md
+!CHANGELOG.md

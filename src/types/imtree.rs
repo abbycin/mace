@@ -914,7 +914,6 @@ impl<'a, K: Copy, T> Iterator for RangeIter<'a, K, T> {
 mod test {
     use std::fmt::Debug;
     use std::sync::atomic::Ordering::Relaxed;
-    use std::usize;
     use std::{cmp::Ordering::Equal, sync::atomic::AtomicU64};
 
     use crate::Options;

@@ -1,3 +1,15 @@
+## [0.0.25] 2026-01-23 (AI-Assisted)
+### Changes
+  - Enhanced error handling across the system
+  - Optimized Arena to avoid allocating small objects via alloc; integrated FxHash for DashMap
+  - Added version validation for metadata
+  - Simplified transaction recording for Flush and GC operations
+  - Removed TxnKV concurrency limits and decoupled Logging from TxnKV, allowing multiple TxnKV instances to share the same Logging component.
+  - Implemented full checksum support for every WAL entry to ensure data integrity
+
+### Bug Fixes
+  - Fixed an incorrect assertion in flush.rs:flush_data
+
 ## [0.0.24] 2026-01-18
 ### Changes
 - Refactor metadata storage with `btree-store`

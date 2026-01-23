@@ -538,7 +538,7 @@ impl Notifier {
 
     fn wait(&self) {
         while self.local.swap(Self::WAIT, AcqRel) == Self::WAIT {
-            std::hint::spin_loop();
+            std::thread::yield_now();
         }
     }
 

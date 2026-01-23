@@ -1,3 +1,4 @@
+use crate::OpCode;
 use crate::types::traits::IAsSlice;
 
 use super::{INIT_ID, MutRef, rand_range};
@@ -173,7 +174,12 @@ impl GatherWriter {
     }
 
     pub fn write(&mut self, data: &[u8]) {
-        self.file.write(data).unwrap();
+        self.file
+            .write(data)
+            .inspect_err(|e| {
+                log::error!("can't write: {:?}", e);
+            })
+            .expect("can't fail");
     }
 
     pub fn flush(&mut self) {
@@ -189,8 +195,10 @@ impl GatherWriter {
     pub fn sync(&mut self) {
         self.file
             .sync()
-            .inspect_err(|x| log::error!("can't sync {:?}, {}", self.path, x))
-            .unwrap();
+            .inspect_err(|x| {
+                log::error!("can't sync {:?}, {}", self.path, x);
+            })
+            .expect("can't fail");
     }
 }
 
@@ -236,19 +244,19 @@ pub(crate) struct WalDesc {
     pub checkpoint: Position,
     pub oldest_id: u64,
     pub latest_id: u64,
-    pub worker: u8,
+    pub group: u8,
     padding1: u8,
     padding2: u16,
     pub checksum: u32,
 }
 
 impl WalDesc {
-    pub(crate) fn new(wid: u8) -> Self {
+    pub(crate) fn new(group_id: u8) -> Self {
         Self {
             checkpoint: Position::default(),
             oldest_id: INIT_ID,
             latest_id: INIT_ID,
-            worker: wid,
+            group: group_id,
             padding1: 0,
             padding2: 0,
             checksum: 0,
@@ -281,18 +289,23 @@ impl WalDesc {
         self.crc32() == self.checksum
     }
 
-    pub fn update_oldest<P: AsRef<Path>>(&mut self, path: P, oldest_id: u64) {
+    pub fn update_oldest<P: AsRef<Path>>(&mut self, path: P, oldest_id: u64) -> Result<(), OpCode> {
         self.oldest_id = oldest_id;
-        self.sync(path);
+        self.sync(path)
     }
 
-    pub fn update_ckpt<P: AsRef<Path>>(&mut self, path: P, ckpt: Position, latest_id: u64) {
+    pub fn update_ckpt<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        ckpt: Position,
+        latest_id: u64,
+    ) -> Result<(), OpCode> {
         self.checkpoint = ckpt;
         self.latest_id = latest_id;
-        self.sync(path);
+        self.sync(path)
     }
 
-    fn sync<P>(&mut self, path: P)
+    fn sync<P>(&mut self, path: P) -> Result<(), OpCode>
     where
         P: AsRef<Path>,
     {
@@ -308,14 +321,18 @@ impl WalDesc {
             .create(true)
             .open(tmp)
             .inspect_err(|e| log::error!("can't open, {e:?}"))
-            .expect("can't open desc file");
+            .map_err(|_| OpCode::IoError)?;
 
         self.checksum = self.crc32();
         f.write_all(self.as_slice()).expect("can't write desc file");
         f.sync_all().expect("can't sync desc file");
         drop(f);
 
-        std::fs::rename(tmp, path).expect("can't fail");
+        let p = path.as_ref();
+        std::fs::rename(tmp, p).map_err(|_| {
+            log::error!("can't rename from {:?} to {:?}", tmp, p);
+            OpCode::IoError
+        })
     }
 }
 

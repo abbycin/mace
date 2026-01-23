@@ -1,11 +1,11 @@
-pub(crate) use crate::OpCode;
+use crate::OpCode;
 use crate::index::Node;
 use crate::map::data::Arena;
 use crate::types::header::TagFlag;
 use crate::types::refbox::{BoxRef, BoxView};
 use crate::types::traits::{IAlloc, IHeader};
 use crate::utils::Handle;
-use crate::utils::data::JUNK_LEN;
+use crate::utils::data::{JUNK_LEN, Position};
 use crate::{Store, index::Page};
 use crossbeam_epoch::Guard;
 #[cfg(feature = "metric")]
@@ -32,8 +32,8 @@ impl<'a> SysTxn<'a> {
         }
     }
 
-    pub fn record_and_commit(&mut self, worker_id: usize, seq: u64) {
-        self.store.buffer.record_lsn(worker_id, seq);
+    pub fn record_and_commit(&mut self, group_id: usize, pos: Position) {
+        self.store.buffer.record_lsn(group_id, pos);
         self.commit();
     }
 
@@ -79,11 +79,15 @@ impl<'a> SysTxn<'a> {
         h.flag = TagFlag::Unmap;
         h.pid = pid;
 
-        self.store.page.unmap(pid, p.swip()).map(|_| {
-            p.garbage_collect(self, old_junks);
-            self.store.buffer.evict(pid);
-            self.g.defer(move || p.reclaim());
-        })
+        self.store
+            .page
+            .unmap(pid, p.swip())
+            .map(|_| {
+                p.garbage_collect(self, old_junks);
+                self.store.buffer.evict(pid);
+                self.g.defer(move || p.reclaim());
+            })
+            .map_err(|_| OpCode::Again)
     }
 
     fn apply_junk(&mut self) {

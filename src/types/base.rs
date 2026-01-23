@@ -712,8 +712,8 @@ mod test {
     }
 
     impl ILoader for Allocator {
-        fn load(&self, addr: u64) -> Option<BoxView> {
-            Some(self.inner.map.get(&addr).unwrap().view())
+        fn load(&self, addr: u64) -> Result<BoxView, crate::OpCode> {
+            Ok(self.inner.map.get(&addr).unwrap().view())
         }
 
         fn pin(&self, data: BoxRef) {
@@ -724,8 +724,8 @@ mod test {
             self.clone()
         }
 
-        fn load_remote(&self, addr: u64) -> Option<BoxRef> {
-            Some(self.inner.map.get(&addr).unwrap().clone())
+        fn load_remote(&self, addr: u64) -> Result<BoxRef, crate::OpCode> {
+            Ok(self.inner.map.get(&addr).unwrap().clone())
         }
     }
 
@@ -788,7 +788,7 @@ mod test {
             assert_eq!(k.cmd, cmd);
             let (r, _) = v.get_record(l, true);
             assert_eq!(r.data(), vs.as_bytes());
-            assert_eq!(r.worker_id(), w);
+            assert_eq!(r.group_id(), w);
         }
 
         fn gen_val(a: &mut Allocator, r: Record) -> Val<'static> {

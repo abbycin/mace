@@ -1,8 +1,12 @@
 use crate::io::{File, GatherIO};
 use crc32c::Crc32cHasher;
 use dashmap::DashMap;
+use parking_lot::Mutex;
+use rustc_hash::FxHasher;
+use std::hash::BuildHasherDefault;
 
 use crate::map::IFooter;
+use crate::map::chunk::Chunk;
 use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, Numerics, PageTable};
 use crate::types::header::{TagFlag, TagKind};
 use crate::types::refbox::{BoxRef, RemoteView};
@@ -11,18 +15,16 @@ use crate::utils::NULL_ADDR;
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
 use crate::utils::data::{AddrPair, GatherWriter, Interval, Position};
-use crate::utils::{CachePad, Handle, INIT_ID, NULL_PID};
-use crate::{OpCode, static_assert};
-use std::alloc::{Layout, alloc_zeroed};
-use std::cell::Cell;
+use crate::utils::{CachePad, Handle, INIT_ID, NULL_PID, OpCode};
+use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::hash::Hasher;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64};
 
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
@@ -53,24 +55,63 @@ impl Deref for FlushData {
     }
 }
 
-// use C repr to fix the layout
-#[repr(C)]
 pub(crate) struct Arena {
     id: Cell<u64>,
-    items: DashMap<u64, BoxRef>,
+    pub(crate) items: DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>,
+    #[allow(clippy::vec_box)]
+    pub(crate) chunks: Mutex<Vec<Box<Chunk>>>,
+    pub(crate) active_chunk: AtomicPtr<Chunk>,
     /// flush LSN
-    pub(crate) flsn: Box<[CachePad<AtomicU64>]>,
+    pub(crate) flsn: Box<[CachePad<Flsn>]>,
     pub(crate) real_size: AtomicU64,
     // pack file_id and seq
     offset: AtomicU64,
     cap: usize,
     refs: AtomicU32,
     pub(crate) state: AtomicU16,
-    workers: u8,
+}
+
+pub(crate) struct Flsn {
+    seq: AtomicU64,
+    pos: UnsafeCell<Position>,
+}
+
+unsafe impl Send for Flsn {}
+unsafe impl Sync for Flsn {}
+
+impl Flsn {
+    fn new() -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            pos: UnsafeCell::new(Position::default()),
+        }
+    }
+
+    pub(crate) fn store(&self, pos: Position) {
+        self.seq.fetch_add(1, AcqRel);
+        unsafe {
+            *self.pos.get() = pos;
+        }
+        self.seq.fetch_add(1, Release);
+    }
+
+    pub(crate) fn load(&self) -> Position {
+        loop {
+            let v1 = self.seq.load(Acquire);
+            if v1 & 1 == 1 {
+                continue;
+            }
+            let pos = unsafe { *self.pos.get() };
+            let v2 = self.seq.load(Acquire);
+            if v1 == v2 {
+                return pos;
+            }
+        }
+    }
 }
 
 impl Deref for Arena {
-    type Target = DashMap<u64, BoxRef>;
+    type Target = DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>;
 
     fn deref(&self) -> &Self::Target {
         &self.items
@@ -87,30 +128,39 @@ impl Arena {
     /// flushed to disk
     pub(crate) const FLUSH: u16 = 1;
 
-    fn alloc_flsn(n: usize) -> Box<[CachePad<AtomicU64>]> {
-        static_assert!(size_of::<CachePad<Position>>() == 64);
-        static_assert!(align_of::<CachePad<Position>>() == 64);
-        let layout = Layout::from_size_align(64 * n, 64).unwrap();
-        unsafe {
-            let p = alloc_zeroed(layout);
-            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                p.cast::<CachePad<AtomicU64>>(),
-                n,
-            ))
+    fn alloc_flsn(n: usize) -> Box<[CachePad<Flsn>]> {
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(CachePad::from(Flsn::new()));
         }
+        v.into_boxed_slice()
     }
 
-    pub(crate) fn new(cap: usize, workers: u8) -> Self {
+    pub(crate) fn new(cap: usize, groups: u8) -> Self {
+        let items = DashMap::with_capacity_and_hasher(16 << 10, BuildHasherDefault::default());
         Self {
-            items: DashMap::with_capacity(16 << 10),
-            flsn: Self::alloc_flsn(workers as usize),
+            items,
+            flsn: Self::alloc_flsn(groups as usize),
             id: Cell::new(INIT_ID),
             refs: AtomicU32::new(0),
             offset: AtomicU64::new(0),
             real_size: AtomicU64::new(0),
             cap,
             state: AtomicU16::new(Self::FLUSH),
-            workers,
+            chunks: Mutex::new(Vec::new()),
+            active_chunk: AtomicPtr::new(Box::into_raw(Box::new(Chunk::new()))),
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.items.clear();
+        self.chunks.lock().clear();
+
+        let old_ptr = self
+            .active_chunk
+            .swap(Box::into_raw(Box::new(Chunk::new())), Relaxed);
+        if !old_ptr.is_null() {
+            unsafe { drop(Box::from_raw(old_ptr)) };
         }
     }
 
@@ -121,14 +171,14 @@ impl Arena {
         self.offset.store(0, Relaxed);
         self.real_size.store(0, Relaxed);
         assert!(self.unref());
-        assert!(self.items.is_empty());
+        self.clear();
     }
 
     pub(crate) fn cap(&self) -> usize {
         self.cap
     }
 
-    pub(crate) fn workers(&self) -> u8 {
+    pub(crate) fn groups(&self) -> u8 {
         self.flsn.len() as u8
     }
 
@@ -160,9 +210,38 @@ impl Arena {
         }
     }
 
-    fn alloc_at(&self, numerics: &Numerics, size: u32) -> BoxRef {
+    fn alloc_at(&self, numerics: &Numerics, real_size: u32) -> BoxRef {
         let addr = numerics.address.fetch_add(1, Relaxed);
-        let p = BoxRef::alloc(size, addr);
+
+        let p = if real_size >= 4096 {
+            BoxRef::alloc_exact(real_size, addr)
+        } else {
+            loop {
+                let chunk_ptr = self.active_chunk.load(Acquire);
+                let chunk = unsafe { &*chunk_ptr };
+
+                let ptr = chunk.alloc(real_size);
+                if !ptr.is_null() {
+                    let mut p = unsafe { BoxRef::from_raw(ptr) };
+                    p.init(real_size, addr, true);
+                    break p;
+                }
+
+                let mut chunks = self.chunks.lock();
+                if self.active_chunk.load(Acquire) != chunk_ptr {
+                    continue;
+                }
+                let new_chunk_ptr = Box::into_raw(Box::new(Chunk::new()));
+                let _ok = self
+                    .active_chunk
+                    .compare_exchange(chunk_ptr, new_chunk_ptr, AcqRel, Acquire)
+                    .is_ok();
+                #[cfg(feature = "extra_check")]
+                assert!(_ok);
+                chunks.push(unsafe { Box::from_raw(chunk_ptr) });
+            }
+        };
+
         self.items.insert(addr, p.clone());
         p
     }
@@ -171,7 +250,7 @@ impl Arena {
         let real_size = BoxRef::real_size(size);
         self.inc_ref();
         self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
-        Ok(self.alloc_at(numerics, size))
+        Ok(self.alloc_at(numerics, real_size))
     }
 
     pub(crate) fn dealloc(&self, addr: u64, len: usize) {
@@ -214,8 +293,8 @@ impl Arena {
         }
     }
 
-    pub(crate) fn record_lsn(&mut self, worker_id: usize, seq: u64) {
-        self.flsn[worker_id].store(seq, Relaxed);
+    pub(crate) fn record_lsn(&self, group_id: usize, pos: Position) {
+        self.flsn[group_id].store(pos);
     }
 
     pub(crate) fn inc_ref(&self) {
@@ -247,6 +326,15 @@ impl Debug for Arena {
             .field("offset", &self.offset)
             .field("id", &self.id.get())
             .finish()
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        let ptr = self.active_chunk.load(Relaxed);
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr)) };
+        }
     }
 }
 
@@ -503,7 +591,6 @@ impl FileBuilder {
         w.queue(hdr.as_slice());
         w.flush();
         w.sync();
-
         self.blob_interval
     }
 }
@@ -590,9 +677,10 @@ where
         self.file.read(dst, off).map_err(|_| OpCode::IoError)?;
         let mut h = Crc32cHasher::default();
         h.write(dst);
-        if h.finish() as u32 != crc {
-            log::error!("checksum mismatch, expect {} get {}", crc, h.finish());
-            panic!("checksum mismatch, expect {} get {}", crc, h.finish());
+        let actual_crc = h.finish() as u32;
+        if actual_crc != crc {
+            log::error!("checksum mismatch, expect {} get {}", crc, actual_crc);
+            return Err(OpCode::Corruption);
         }
         Ok(unsafe { std::slice::from_raw_parts(dst.as_ptr().cast::<U>(), count) })
     }
@@ -658,6 +746,7 @@ mod test {
         let path = RandomPath::new();
         let mut opt = Options::new(&*path);
         opt.tmp_store = true;
+        let opt = opt.validate().unwrap();
 
         let _ = opt.create_dir();
 

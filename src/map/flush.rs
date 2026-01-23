@@ -1,6 +1,6 @@
 use crate::cc::context::Context;
 use crate::map::data::{Arena, FileBuilder};
-use crate::meta::{FileId, IntervalPair, MetaKind};
+use crate::meta::{IntervalPair, MetaKind};
 use crate::utils::Handle;
 use crate::utils::countblock::Countblock;
 use crate::utils::data::Interval;
@@ -53,6 +53,22 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
         }
 
         let tick = ctx.manifest.numerics.next_data_id.load(Relaxed);
+
+        // 1. perform disk I/O (write daata and blob files first)
+        let Interval { lo, hi } = builder.build_data(tick, data_path);
+        let data_ivl = IntervalPair::new(lo, hi, data_id);
+
+        let mut blob_result = None;
+        if builder.has_blob() {
+            let blob_id = ctx.manifest.numerics.next_blob_id.fetch_add(1, Relaxed);
+            let blob_path = ctx.opt.blob_file(blob_id);
+            let Interval { lo, hi } = builder.build_blob(blob_path);
+            let blob_ivl = IntervalPair::new(lo, hi, blob_id);
+            let mem_blob_stat = builder.blob_stat(blob_id);
+            blob_result = Some((blob_id, blob_ivl, mem_blob_stat));
+        }
+
+        // 2. prepare statistics
         let mem_data_stat = builder.data_stat(data_id, tick);
         let data_stat = mem_data_stat.copy();
 
@@ -65,14 +81,13 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
             ctx.manifest.apply_blob_junks(&builder.blob_junks)
         };
 
+        // 3. commit metadata transaction
         let mut txn = ctx.manifest.begin();
 
-        txn.record(MetaKind::FileId, &FileId::data(data_id));
-        txn.sync(); // necessary, before data file was flushed
-
         txn.record(MetaKind::Numerics, ctx.manifest.numerics.deref());
-        txn.record(MetaKind::DataStat, &data_stat); // new entry
+        txn.record(MetaKind::DataStat, &data_stat);
         txn.record(MetaKind::Map, &map.table());
+        txn.record(MetaKind::DataInterval, &data_ivl);
 
         data_stats.iter().for_each(|x| {
             assert_ne!(data_id, x.file_id);
@@ -80,42 +95,32 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
         });
 
         blob_stats.iter().for_each(|x| {
-            assert_ne!(data_id, x.file_id);
             txn.record(MetaKind::BlobStat, x);
         });
 
-        // data file must be flushed after FileId flushed and before txn commit
-        let Interval { lo, hi } = builder.build_data(tick, data_path);
-        let data_ivl = IntervalPair::new(lo, hi, data_id);
-        txn.record(MetaKind::DataInterval, &data_ivl);
-
-        // create a new mapping must after data has been flushed, so that GC can read fully flushed
-        // data file
-        ctx.manifest.add_data_stat(mem_data_stat, data_ivl);
-
-        // although the blob file is usually less than blob_max_size, and may larger than it in some
-        // case, we simply flush blobs into a single file, the blob files will be processed by gc
-        // runtime so that most of their size will finally near to blob_max_size
-        if builder.has_blob() {
-            let blob_id = ctx.manifest.numerics.next_blob_id.fetch_add(1, Relaxed);
-            txn.record(MetaKind::Numerics, ctx.manifest.numerics.deref());
-
-            let blob_path = ctx.opt.blob_file(blob_id);
-            let mem_blob_stat = builder.blob_stat(blob_id);
+        if let Some((_, blob_ivl, mem_blob_stat)) = blob_result {
             let blob_stat = mem_blob_stat.copy();
-
-            txn.record(MetaKind::FileId, &FileId::blob(blob_id));
-            txn.sync();
-
             txn.record(MetaKind::BlobStat, &blob_stat);
-            let Interval { lo, hi } = builder.build_blob(blob_path);
-            let blob_ivl = IntervalPair::new(lo, hi, blob_id);
             txn.record(MetaKind::BlobInterval, &blob_ivl);
 
+            // update memory for blob
             ctx.manifest.add_blob_stat(mem_blob_stat, blob_ivl);
         }
 
         txn.commit();
+
+        // 4. update memory and checkpoints
+        ctx.manifest.add_data_stat(mem_data_stat, data_ivl);
+
+        for (i, g) in ctx.groups().iter().enumerate() {
+            let mut pos = msg.flsn[i].load();
+            if let Some(min) = g.active_txns.min_lsn()
+                && min < pos
+            {
+                pos = min;
+            }
+            g.logging.lock().update_last_ckpt(pos);
+        }
         ctx.manifest.numerics.signal.fetch_add(1, Relaxed);
     }
     msg.mark_done();
@@ -125,11 +130,15 @@ fn safe_to_flush(data: &FlushData, ctx: Handle<Context>) -> bool {
     if data.refcnt() != 0 {
         return false;
     }
-    let workers = ctx.workers();
-    debug_assert_eq!(data.flsn.len(), workers.len());
-    for (i, w) in workers.iter().enumerate() {
+    let groups = ctx.groups();
+    debug_assert_eq!(data.flsn.len(), groups.len());
+    for (i, g) in groups.iter().enumerate() {
         // first update dirty page, and later update flsn on flush
-        if data.flsn[i].load(Relaxed) > w.logging.flsn() {
+        let pos = data.flsn[i].load();
+        let flushed = g.logging.lock().flushed_pos();
+        if pos.file_id > flushed.file_id
+            || (pos.file_id == flushed.file_id && pos.offset > flushed.offset)
+        {
             return false;
         }
     }

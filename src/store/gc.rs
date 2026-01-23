@@ -17,14 +17,14 @@ use std::{
 };
 
 use crate::{
-    Options, Store,
+    OpCode, Options, Store,
     cc::context::Context,
     index::tree::Tree,
     io::{File, GatherIO},
     map::data::{BlobFooter, DataFooter, MetaReader},
     meta::{
-        BlobStatInner, DataStatInner, DelInterval, Delete, FileId, IntervalPair, MemBlobStat,
-        MemDataStat, MetaKind, Numerics,
+        BlobStatInner, DataStatInner, DelInterval, Delete, IntervalPair, MemBlobStat, MemDataStat,
+        MetaKind, Numerics,
     },
     types::traits::IAsSlice,
     utils::{
@@ -221,8 +221,8 @@ impl GarbageCollector {
         }
 
         // strategy: scan the entire page table approximately every 500 ticks (e.g., ~8 hours if tick=1min)
-        // but keep the batch size within a reasonable range [128, 10000].
-        let batch_size = (max_pid / 500).max(128).min(10000);
+        // but keep the batch size within a reasonable range [128, 10000]
+        let batch_size = (max_pid / 500).clamp(128, 10000);
         let mut compact_count = 0;
         let max_compact_per_tick = 64; // limit I/O impact
 
@@ -388,22 +388,30 @@ impl GarbageCollector {
     }
 
     fn process_wal(&mut self) {
-        for w in self.store.context.workers().iter() {
-            let lk = w.start_ckpt.read();
-            let checkpoint_id = lk.file_id;
-            drop(lk);
-            let lk = w.logging.desc.lock();
+        for g in self.store.context.groups().iter() {
+            let mut checkpoint_id = g.active_txns.min_position_file_id();
+
+            let logging = g.logging.lock();
+            checkpoint_id = std::cmp::min(checkpoint_id, logging.last_ckpt().file_id);
+
+            let desc_clone = logging.desc.clone();
+            let lk = desc_clone.lock();
             let oldest_id = lk.oldest_id;
             drop(lk);
+
+            // drop logging lock to avoid blocking writes during IO
+            drop(logging);
 
             if oldest_id == checkpoint_id {
                 continue;
             }
 
             // [oldest_id, checkpoint_id)
-            Self::process_one_wal(&self.store.opt, w.id, oldest_id, checkpoint_id);
-            let mut desc = w.logging.desc.lock();
-            desc.update_oldest(self.ctx.opt.desc_file(w.id), checkpoint_id);
+            Self::process_one_wal(&self.store.opt, g.id as u8, oldest_id, checkpoint_id);
+            let mut desc = desc_clone.lock();
+            desc.update_oldest(self.ctx.opt.desc_file(g.id as u8), checkpoint_id)
+                .inspect_err(|e| log::error!("can't update oldest, {:?}", e))
+                .expect("can't fail");
         }
     }
 
@@ -488,23 +496,18 @@ impl GarbageCollector {
 
         // it's possible that other thread deactived all data in data file while we are procesing
         self.process_obsoleted_data(obsoleted);
-        // it's also possible that frames in all candidate were obsoleted, in this case one data id
-        // is wasted, and a footer will be flush to data file, it will be removed in the future
 
-        let mut txn = self.ctx.manifest.begin();
-
-        txn.record(MetaKind::FileId, &FileId::data(file_id));
-        txn.sync(); // necessary, before data file was flushed
-
-        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
-
-        // data file must be flushed after FileId flushed and before txn commit
+        // 1. perform disk I/O (build data file)
         let (fstat, relocs) = builder
             .build()
             .inspect_err(|e| {
                 log::error!("error {e}");
             })
             .unwrap();
+
+        // 2. commit metadata transaction
+        let mut txn = self.ctx.manifest.begin();
+        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
 
         // the only problem is junks collected by flush thread maybe too many
         let stat = self.ctx.manifest.update_data_stat_interval(
@@ -594,21 +597,19 @@ impl GarbageCollector {
 
         // it's possible that other thread deactived all data in blob file while we are procesing
         self.process_obsoleted_blob(obsoleted);
-        // it's also possible that frames in all candidate were obsoleted, in this case one blob id
-        // is wasted, and a footer will be flush to blob file, it will be removed in the future
 
-        let mut txn = self.ctx.manifest.begin();
-
-        txn.record(MetaKind::FileId, &FileId::blob(blob_id));
-        txn.sync(); // necessary, before blob file was flushed
-
-        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
+        // 1. perform disk I/O (build blob file)
         let (bstat, reloc) = builder
             .build(blob_id)
             .inspect_err(|e| {
                 log::error!("error {e:?}");
             })
             .unwrap();
+
+        // 2. commit metadata transaction
+        let mut txn = self.ctx.manifest.begin();
+        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
+
         let stat = self.ctx.manifest.update_blob_stat_interval(
             bstat,
             reloc,
@@ -670,7 +671,7 @@ impl<'a> DataReWriter<'a> {
         self.nr_interval += 1;
     }
 
-    fn build(&mut self) -> Result<(MemDataStat, HashMap<u64, LenSeq>), std::io::Error> {
+    fn build(&mut self) -> Result<(MemDataStat, HashMap<u64, LenSeq>), OpCode> {
         let up2 = self.sum_up2 / self.total;
         let block = Block::alloc(1 << 20);
         let mut seq = 0;
@@ -767,10 +768,7 @@ impl<'a> BlobRewriter<'a> {
         self.nr_interval += 1;
     }
 
-    fn build(
-        &mut self,
-        file_id: u64,
-    ) -> Result<(MemBlobStat, HashMap<u64, LenSeq>), std::io::Error> {
+    fn build(&mut self, file_id: u64) -> Result<(MemBlobStat, HashMap<u64, LenSeq>), OpCode> {
         let path = self.opt.blob_file(file_id);
         let mut w = GatherWriter::trunc(&path, 8);
         let mut off = 0;
@@ -826,7 +824,7 @@ impl<'a> BlobRewriter<'a> {
         w.queue(footer.as_slice());
         w.flush();
         w.sync();
-        log::error!("compacted [{beg}, {end}] to {path:?} {footer:?}");
+        log::info!("compacted [{beg}, {end}] to {path:?} {footer:?}");
         let stat = MemBlobStat {
             inner: BlobStatInner {
                 file_id,
@@ -923,7 +921,7 @@ fn copy<R>(
     buf: &mut [u8],
     len: usize,
     mut off: u64,
-) -> Result<u32, std::io::Error>
+) -> Result<u32, OpCode>
 where
     R: GatherIO,
 {
@@ -934,7 +932,10 @@ where
     while n < len {
         let cnt = buf_sz.min(len - n);
         let s = &mut buf[0..cnt];
-        r.read(s, off)?;
+        r.read(s, off).map_err(|e| {
+            log::error!("can't read, {:?}", e);
+            OpCode::IoError
+        })?;
         crc.write(s);
         // the data will be reused next time, so we write data to file instead of queue it
         w.write(s);

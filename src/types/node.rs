@@ -14,7 +14,7 @@ use crate::{
         refbox::{BaseView, BoxView, DeltaView, RemoteView},
         traits::{IAlloc, IAsBoxRef, IBoxHeader, IDecode, IHeader, IKey, ILoader, IVal},
     },
-    utils::{Handle, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID},
+    utils::{Handle, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, OpCode},
 };
 
 use super::{header::TagKind, refbox::BoxRef};
@@ -166,7 +166,7 @@ where
         a.collect(&[self.base_addr()]);
     }
 
-    pub(crate) fn load(addr: u64, loader: L) -> Option<Self> {
+    pub(crate) fn load(addr: u64, loader: L) -> Result<Self, OpCode> {
         let d = loader.load(addr)?;
         let mut l = Self {
             loader,
@@ -180,7 +180,7 @@ where
             inner: BaseView::null(),
         };
         Self::load_inner(&mut l, d)?;
-        Some(l)
+        Ok(l)
     }
 
     fn set_comparator(&mut self, nt: NodeType) {
@@ -671,7 +671,7 @@ where
         self.state.read().delta.len()
     }
 
-    fn load_inner(l: &mut Node<L>, mut d: BoxView) -> Option<()> {
+    fn load_inner(l: &mut Node<L>, mut d: BoxView) -> Result<(), OpCode> {
         let mut one_base = true;
         let mut last_type = None;
 
@@ -705,7 +705,7 @@ where
             d = l.loader.load(d.link)?;
         }
         assert!(!l.inner.is_null());
-        Some(())
+        Ok(())
     }
 
     #[allow(clippy::iter_skip_zero)]
@@ -1122,6 +1122,7 @@ mod test {
             refbox::{BoxRef, BoxView, DeltaView},
             traits::{IAlloc, IHeader, ILoader},
         },
+        utils::OpCode,
     };
 
     struct AInner {
@@ -1174,8 +1175,8 @@ mod test {
     }
 
     impl ILoader for A {
-        fn load(&self, addr: u64) -> Option<BoxView> {
-            Some(self.load(addr).view())
+        fn load(&self, addr: u64) -> Result<BoxView, OpCode> {
+            Ok(self.load(addr).view())
         }
 
         fn pin(&self, data: BoxRef) {
@@ -1187,8 +1188,8 @@ mod test {
             self.clone()
         }
 
-        fn load_remote(&self, addr: u64) -> Option<BoxRef> {
-            Some(self.load(addr))
+        fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
+            Ok(self.load(addr))
         }
     }
 

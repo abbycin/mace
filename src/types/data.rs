@@ -408,7 +408,7 @@ impl<'a> Val<'a> {
     const SIB_LEN: usize = ADDR_LEN;
     const DATA_LEN: usize = size_of::<u32>();
     const HDR_LEN: usize = 1;
-    const WID_LEN: usize = 1;
+    const GID_LEN: usize = 1;
 
     pub fn is_tombstone(&self) -> bool {
         self.data[0] & Self::DEL_BIT != 0
@@ -423,7 +423,7 @@ impl<'a> Val<'a> {
     }
 
     fn data_offset(&self) -> usize {
-        Self::HDR_LEN + Self::WID_LEN + Self::DATA_LEN + self.is_sibling() as usize * Self::SIB_LEN
+        Self::HDR_LEN + Self::GID_LEN + Self::DATA_LEN + self.is_sibling() as usize * Self::SIB_LEN
     }
 
     pub fn from_raw(data: &'a [u8]) -> Self {
@@ -431,7 +431,7 @@ impl<'a> Val<'a> {
     }
 
     pub fn data_size(&self) -> usize {
-        Self::read::<u32>(self.data, Self::HDR_LEN + Self::WID_LEN) as usize
+        Self::read::<u32>(self.data, Self::HDR_LEN + Self::GID_LEN) as usize
     }
 
     pub fn get_record<L: ILoader>(&self, l: &L, cache: bool) -> (Record, Option<BoxRef>) {
@@ -455,7 +455,7 @@ impl<'a> Val<'a> {
         if self.is_sibling() {
             Some(Self::read::<u64>(
                 self.data,
-                Self::HDR_LEN + Self::WID_LEN + Self::DATA_LEN,
+                Self::HDR_LEN + Self::GID_LEN + Self::DATA_LEN,
             ))
         } else {
             None
@@ -473,7 +473,7 @@ impl<'a> Val<'a> {
 
     pub fn calc_size(is_sib: bool, min_blob_size: usize, val_size: usize) -> usize {
         Self::HDR_LEN
-            + Self::WID_LEN
+            + Self::GID_LEN
             + Self::DATA_LEN
             + if is_sib { Self::SIB_LEN } else { 0 }
             + if min_blob_size < val_size {
@@ -485,8 +485,8 @@ impl<'a> Val<'a> {
 
     pub fn encode_inline<V: IVal>(dst: &mut [u8], sib: u64, v: &V) {
         dst[0] = v.is_tombstone() as u8;
-        dst[1] = v.worker();
-        let mut off = Self::HDR_LEN + Self::WID_LEN;
+        dst[1] = v.group_id();
+        let mut off = Self::HDR_LEN + Self::GID_LEN;
         Self::write::<u32>(dst, off, v.packed_size() as u32);
         off += Self::DATA_LEN;
         if sib != NULL_ADDR {
@@ -500,8 +500,8 @@ impl<'a> Val<'a> {
     pub fn encode_remote<V: IVal>(dst: &mut [u8], sib: u64, remote: u64, v: &V) {
         dst[0] = v.is_tombstone() as u8;
         dst[0] |= Self::REMOTE_BIT;
-        dst[1] = v.worker();
-        let mut off = Self::HDR_LEN + Self::WID_LEN;
+        dst[1] = v.group_id();
+        let mut off = Self::HDR_LEN + Self::GID_LEN;
         Self::write::<u32>(dst, off, v.packed_size() as u32);
         off += Self::DATA_LEN;
         if sib != NULL_ADDR {
@@ -512,7 +512,7 @@ impl<'a> Val<'a> {
         Self::write::<u64>(dst, off, remote);
     }
 
-    pub fn worker(&self) -> u8 {
+    pub fn group_id(&self) -> u8 {
         self.data[1]
     }
 
@@ -586,27 +586,27 @@ impl Display for Index {
 
 #[derive(Clone, PartialEq, Eq, Copy, Debug)]
 pub struct Record {
-    worker_id: u8,
+    group_id: u8,
     data: &'static [u8],
 }
 
 impl Record {
-    pub fn normal(worker_id: u8, data: &[u8]) -> Self {
+    pub fn normal(group_id: u8, data: &[u8]) -> Self {
         Self {
-            worker_id,
+            group_id,
             data: unsafe { std::mem::transmute::<&[u8], &[u8]>(data) },
         }
     }
 
-    pub fn remove(worker_id: u8) -> Self {
+    pub fn remove(group_id: u8) -> Self {
         Self {
-            worker_id,
+            group_id,
             data: [].as_slice(),
         }
     }
 
-    pub fn worker_id(&self) -> u8 {
-        self.worker_id
+    pub fn group_id(&self) -> u8 {
+        self.group_id
     }
 
     pub fn data(&self) -> &[u8] {
@@ -616,14 +616,14 @@ impl Record {
     pub fn from_slice(s: &[u8]) -> Self {
         let (l, r) = s.split_at(size_of::<u8>());
         Self {
-            worker_id: slice_to_number!(l, u8),
+            group_id: slice_to_number!(l, u8),
             data: unsafe { std::mem::transmute::<&[u8], &[u8]>(r) },
         }
     }
 
     pub fn as_slice(&self, s: &mut [u8]) {
         let (l, r) = s.split_at_mut(size_of::<u8>());
-        number_to_slice!(self.worker_id, l);
+        number_to_slice!(self.group_id, l);
         debug_assert_eq!(r.len(), self.data.len());
         debug_assert_ne!(self.data.as_ptr(), r.as_ptr());
         r.copy_from_slice(self.data);
@@ -656,19 +656,19 @@ impl IVal for Record {
         self.data.is_empty()
     }
 
-    fn worker(&self) -> u8 {
-        self.worker_id
+    fn group_id(&self) -> u8 {
+        self.group_id
     }
 }
 
 impl Display for Record {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_tombstone() {
-            f.write_fmt(format_args!("<del-{}>", self.worker_id))
+            f.write_fmt(format_args!("<del-{}>", self.group_id))
         } else {
             f.write_fmt(format_args!(
                 "<normal-{}> {}",
-                self.worker_id,
+                self.group_id,
                 to_str(self.data)
             ))
         }
@@ -773,8 +773,8 @@ where
         self.base.ver.txid
     }
 
-    pub(crate) fn wid(&self) -> u8 {
-        self.val.worker()
+    pub(crate) fn group_id(&self) -> u8 {
+        self.val.group_id()
     }
 
     pub(crate) fn is_tombstone(&self) -> bool {
@@ -809,14 +809,13 @@ mod test {
         cmp::Ordering,
         collections::HashMap,
         sync::{Arc, atomic::AtomicU64},
-        u32, u64,
     };
 
     use crate::{
-        Options,
+        OpCode, Options,
         types::{
             data::{IntlKey, Record, Val, Ver},
-            refbox::{BoxRef, RemoteView},
+            refbox::{BoxRef, BoxView, RemoteView},
             traits::{IAlloc, ICodec, IDecode, IHeader, ILoader},
         },
         utils::NULL_ADDR,
@@ -826,17 +825,17 @@ mod test {
 
     #[test]
     fn test_ver() {
-        let mut data = Vec::new();
-
-        data.push(Ver::new(1, 1));
-        data.push(Ver::new(1, 2));
-        data.push(Ver::new(2, 1));
-        data.push(Ver::new(2, 2));
-        data.push(Ver::new(3, 1));
+        let mut data = vec![
+            Ver::new(1, 1),
+            Ver::new(1, 2),
+            Ver::new(2, 1),
+            Ver::new(2, 2),
+            Ver::new(3, 1),
+        ];
 
         data.sort();
 
-        fn lower_bound(data: &Vec<Ver>, tgt: Ver) -> Option<&Ver> {
+        fn lower_bound(data: &[Ver], tgt: Ver) -> Option<&Ver> {
             let mut lo = 0;
             let mut hi = data.len();
 
@@ -926,11 +925,15 @@ mod test {
         }
 
         impl ILoader for L {
-            fn load(&self, addr: u64) -> Option<crate::types::refbox::BoxView> {
-                self.m.borrow().get(&addr).map(|x| x.view())
+            fn load(&self, addr: u64) -> Result<BoxView, OpCode> {
+                self.m
+                    .borrow()
+                    .get(&addr)
+                    .map(|x| x.view())
+                    .ok_or(OpCode::NotFound)
             }
 
-            fn load_unchecked(&self, addr: u64) -> crate::types::refbox::BoxView {
+            fn load_unchecked(&self, addr: u64) -> BoxView {
                 self.load(addr).unwrap()
             }
 
@@ -942,8 +945,8 @@ mod test {
                 self.clone()
             }
 
-            fn load_remote(&self, addr: u64) -> Option<crate::types::refbox::BoxRef> {
-                Some(self.m.borrow().get(&addr).unwrap().clone())
+            fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
+                self.m.borrow().get(&addr).cloned().ok_or(OpCode::NotFound)
             }
         }
 

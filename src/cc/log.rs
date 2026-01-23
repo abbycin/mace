@@ -1,4 +1,5 @@
 use super::wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate};
+use crate::OpCode;
 use crate::meta::Numerics;
 use crate::types::data::Ver;
 use crate::utils::block::Ring;
@@ -8,7 +9,6 @@ use crate::{cc::wal::EntryType, utils::data::GatherWriter};
 use crc32c::Crc32cHasher;
 use std::hash::Hasher;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, atomic::Ordering::Relaxed};
 
 pub struct LogBuilder<'a> {
@@ -33,13 +33,13 @@ impl<'a> LogBuilder<'a> {
         self
     }
 
-    pub fn build(&self, log: &mut Logging) {
-        log.advance(self.buf.len());
+    pub fn build(&self, log: &mut Logging) -> Result<(), OpCode> {
+        log.advance(self.buf.len())
     }
 }
 
 pub struct Logging {
-    pub worker: u8,
+    pub group: u8,
     ring: Ring,
     enable_ckpt: AtomicBool,
     /// save last checkpoint position, used by gc
@@ -47,19 +47,13 @@ pub struct Logging {
     ckpt_cnt: usize,
     /// used for building traverse chain (lsn)
     log_pos: Position,
-    lsn: Position,
-    /// what we want is happen before sequentail
-    seq: u64,
-    /// so use a number rather than real Position
-    flushed_lsn: AtomicU64,
+    flushed_pos: Position,
     ops: usize,
-    last_data: u64,
+    last_signal: u64,
     writer: GatherWriter,
     opt: Arc<ParsedOptions>,
     pub desc: WalDescHandle,
     numerics: Arc<Numerics>,
-    #[cfg(feature = "extra_check")]
-    last_id: u64,
 }
 
 unsafe impl Sync for Logging {}
@@ -74,11 +68,11 @@ impl Logging {
         numerics: Arc<Numerics>,
         opt: Arc<ParsedOptions>,
     ) -> Self {
-        let (worker, last_id, ckpt_pos) = {
+        let (group, last_id, ckpt_pos) = {
             let d = desc.lock();
-            (d.worker, d.latest_id, d.checkpoint)
+            (d.group, d.latest_id, d.checkpoint)
         };
-        let writer = GatherWriter::append(&opt.wal_file(worker, last_id), 16);
+        let writer = GatherWriter::append(&opt.wal_file(group, last_id), 16);
         let pos = Position {
             file_id: last_id,
             offset: writer.pos(),
@@ -89,89 +83,82 @@ impl Logging {
             last_ckpt: ckpt_pos,
             ckpt_cnt: 0,
             log_pos: pos,
-            lsn: pos,
-            seq: 0,
-            flushed_lsn: AtomicU64::new(0),
+            flushed_pos: pos,
             ops: 0,
-            last_data: numerics.signal.load(Relaxed),
-            worker,
+            last_signal: numerics.signal.load(Relaxed),
+            group,
             writer,
             opt,
             desc,
             numerics,
-            #[cfg(feature = "extra_check")]
-            last_id: 0,
         }
     }
 
-    fn alloc<'a>(&mut self, size: usize) -> &'a mut [u8] {
+    fn alloc<'a>(&mut self, size: usize) -> Result<&'a mut [u8], OpCode> {
         let tail = self.ring.tail();
         let rest = self.ring.len() - tail;
 
         if rest < size {
-            self.flush();
+            self.flush()?;
             // skip the rest data, and restart from the begining
             self.ring.prod(rest);
             self.ring.cons(rest);
         } else if tail == 0 && self.ring.distance() > 0 {
             // the tail is extactly euqal to the boundary, we must flush pending data
-            self.flush();
+            self.flush()?;
         }
-        self.ring.prod(size)
+        Ok(self.ring.prod(size))
     }
 
-    fn advance(&mut self, data_len: usize) {
-        self.lsn = self.log_pos;
-        self.seq += 1;
-
+    fn advance(&mut self, data_len: usize) -> Result<(), OpCode> {
         // maybe switch wal file
         self.log_pos.offset += data_len as u64;
         if self.log_pos.offset >= self.opt.wal_file_size as u64 {
             self.log_pos.file_id += 1;
             self.log_pos.offset = 0;
 
-            self.flush();
+            self.flush()?;
             self.writer
-                .reset(&self.opt.wal_file(self.worker, self.log_pos.file_id));
-            self.sync_desc();
+                .reset(&self.opt.wal_file(self.group, self.log_pos.file_id));
+            self.sync_desc()?;
         }
 
         self.ops = self.ops.wrapping_add(1);
         if self.ops.trailing_zeros() >= Self::AUTO_STABLE_OPS
             || self.ring.distance() >= Self::AUTO_STABLE_SIZE
         {
-            self.flush();
+            self.flush()?;
         }
 
-        self.checkpoint();
+        self.checkpoint()
     }
 
     pub fn enable_checkpoint(&self) {
         self.enable_ckpt.store(true, Relaxed);
     }
 
-    pub fn lsn(&self) -> Position {
-        self.lsn
+    pub fn current_pos(&self) -> Position {
+        self.log_pos
     }
 
-    pub fn flsn(&self) -> u64 {
-        self.flushed_lsn.load(Relaxed)
-    }
-
-    pub fn seq(&self) -> u64 {
-        self.seq
+    pub fn flushed_pos(&self) -> Position {
+        self.flushed_pos
     }
 
     pub fn ckpt_cnt(&self) -> usize {
         self.ckpt_cnt
     }
 
-    pub fn reset_ckpt_cnt(&mut self) {
-        self.ckpt_cnt = 0;
-    }
-
     pub fn last_ckpt(&self) -> Position {
         self.last_ckpt
+    }
+
+    pub fn update_last_ckpt(&mut self, pos: Position) {
+        if pos.file_id > self.last_ckpt.file_id
+            || (pos.file_id == self.last_ckpt.file_id && pos.offset > self.last_ckpt.offset)
+        {
+            self.last_ckpt = pos;
+        }
     }
 
     #[cold]
@@ -183,8 +170,8 @@ impl Logging {
         ov: &[u8],
         nv: &[u8],
         size: usize,
-    ) {
-        self.flush(); // flush queued first, make sure log record is sequentail
+    ) -> Result<(), OpCode> {
+        self.flush()?; // flush queued first, make sure log record is sequentail
         {
             self.writer.queue(u.to_slice());
             self.writer.queue(k);
@@ -192,27 +179,42 @@ impl Logging {
             self.writer.queue(ov);
             self.writer.queue(nv);
             self.writer.flush();
+            if self.opt.sync_on_write {
+                self.writer.sync();
+            }
         }
-        self.advance(size);
+        self.advance(size)?;
+        self.flushed_pos = self.log_pos;
+        self.numerics.log_size.fetch_add(size, Relaxed);
+        Ok(())
     }
 
-    pub fn record_update<T>(&mut self, ver: Ver, w: T, k: &[u8], ov: &[u8], nv: &[u8])
+    /// since multiple transaction may use same Logging, they must provide their own LSN
+    pub fn record_update<T>(
+        &mut self,
+        ver: Ver,
+        w: T,
+        k: &[u8],
+        ov: &[u8],
+        nv: &[u8],
+        prev_lsn: Position,
+    ) -> Result<Position, OpCode>
     where
         T: IWalCodec + IWalPayload,
     {
         let payload_size = w.encoded_len() + k.len() + ov.len() + nv.len();
-        let Position { file_id, offset } = self.lsn();
+        let current_pos = self.current_pos();
 
         let mut u = WalUpdate {
             wal_type: EntryType::Update,
             sub_type: w.sub_type(),
-            worker_id: self.worker,
+            group_id: self.group,
             size: payload_size as u32,
             cmd_id: ver.cmd,
             klen: k.len() as u32,
             txid: ver.txid,
-            prev_id: file_id,
-            prev_off: offset,
+            prev_id: prev_lsn.file_id,
+            prev_off: prev_lsn.offset,
             checksum: 0,
         };
 
@@ -235,98 +237,106 @@ impl Logging {
 
         let total_sz = payload_size + u.encoded_len();
         if total_sz < self.ring.len() {
-            let a = self.alloc(total_sz);
+            let a = self.alloc(total_sz)?;
             let mut b = LogBuilder::new(a);
-            b.add(u).add(k).add(w).add(ov).add(nv).build(self);
+            b.add(u).add(k).add(w).add(ov).add(nv).build(self)?;
         } else {
-            self.record_large(&u, k, w.to_slice(), ov, nv, total_sz);
+            self.record_large(&u, k, w.to_slice(), ov, nv, total_sz)?;
         }
+        Ok(current_pos)
     }
 
-    fn add_entry<T: IWalCodec>(&mut self, w: T) {
+    fn add_entry<T: IWalCodec>(&mut self, w: T) -> Result<(), OpCode> {
         let size = w.encoded_len();
-        let a = self.alloc(size);
+        let a = self.alloc(size)?;
         let mut b = LogBuilder::new(a);
-        b.add(w).build(self);
+        b.add(w).build(self)
     }
 
-    pub fn record_begin(&mut self, txid: u64) {
-        self.add_entry(WalBegin {
+    pub fn record_begin(&mut self, txid: u64) -> Result<Position, OpCode> {
+        let pos = self.current_pos();
+        let mut w = WalBegin {
             wal_type: EntryType::Begin,
             txid,
-        });
+            checksum: 0,
+        };
+        w.checksum = w.calc_checksum();
+        self.add_entry(w)?;
+        Ok(pos)
     }
 
-    pub fn record_commit(&mut self, txid: u64) {
-        #[cfg(feature = "extra_check")]
-        {
-            if self.last_id >= txid {
-                log::error!("invalid txid old {} curr {}", self.last_id, txid);
-                panic!("invalid txid old {} curr {}", self.last_id, txid);
-            }
-            self.last_id = txid;
-        }
-        self.add_entry(WalCommit {
+    pub fn record_commit(&mut self, txid: u64) -> Result<(), OpCode> {
+        let mut w = WalCommit {
             wal_type: EntryType::Commit,
             txid,
-        });
+            checksum: 0,
+        };
+        w.checksum = w.calc_checksum();
+        self.add_entry(w)
     }
 
-    pub fn record_abort(&mut self, txid: u64) {
-        self.add_entry(WalAbort {
+    pub fn record_abort(&mut self, txid: u64) -> Result<(), OpCode> {
+        let mut w = WalAbort {
             wal_type: EntryType::Abort,
             txid,
-        });
+            checksum: 0,
+        };
+        w.checksum = w.calc_checksum();
+        self.add_entry(w)
     }
 
-    fn checkpoint(&mut self) {
+    fn checkpoint(&mut self) -> Result<(), OpCode> {
         if !self.enable_ckpt.load(Relaxed) {
-            return;
+            return Ok(());
         }
         let cur = self.numerics.signal.load(Relaxed);
 
-        if cur == self.last_data {
-            return;
+        if cur == self.last_signal {
+            return Ok(());
         }
         let last_ckpt = self.last_ckpt;
 
         log::trace!(
-            "worker {} checkpoint {:?} curr {} last {}",
-            self.worker,
+            "group {} checkpoint {:?} curr {} last {}",
+            self.group,
             last_ckpt,
             cur,
-            self.last_data
+            self.last_signal
         );
-        self.last_data = cur;
+        self.last_signal = cur;
 
-        let ckpt = WalCheckpoint {
+        let mut ckpt = WalCheckpoint {
             wal_type: EntryType::CheckPoint,
+            checksum: 0,
         };
+        ckpt.checksum = ckpt.calc_checksum();
 
         // we must flush buffer in ring to make sure they are stabilized before flush checkpoint
-        self.flush();
+        self.flush()?;
         self.writer.write(ckpt.to_slice());
         if self.opt.sync_on_write {
             self.writer.sync();
         }
 
-        self.last_ckpt = self.log_pos;
-
         self.log_pos.offset += ckpt.encoded_len() as u64;
         self.ckpt_cnt += 1;
-        self.sync_desc();
+        self.flushed_pos = self.log_pos;
+        self.numerics
+            .log_size
+            .fetch_add(ckpt.encoded_len(), Relaxed);
+        self.sync_desc()
     }
 
-    fn sync_desc(&self) {
+    fn sync_desc(&self) -> Result<(), OpCode> {
         let mut desc = self.desc.lock();
         desc.update_ckpt(
-            self.opt.desc_file(self.worker),
+            self.opt.desc_file(self.group),
             self.last_ckpt,
-            self.log_pos.file_id,
-        );
+            self.flushed_pos.file_id,
+        )
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self) -> Result<(), OpCode> {
         let len = self.ring.distance();
         if len != 0 {
             self.writer.write(self.ring.slice(self.ring.head(), len));
@@ -336,13 +346,14 @@ impl Logging {
                 self.writer.sync();
             }
 
-            self.flushed_lsn.store(self.seq, Relaxed);
+            self.flushed_pos = self.log_pos;
             self.numerics.log_size.fetch_add(len, Relaxed);
         }
+        Ok(())
     }
 
-    pub fn stabilize(&mut self) {
-        self.flush();
+    pub fn stabilize(&mut self) -> Result<(), OpCode> {
+        self.flush()?;
         self.checkpoint()
     }
 }

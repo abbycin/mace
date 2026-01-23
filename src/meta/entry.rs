@@ -20,7 +20,6 @@ use crate::{
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum MetaKind {
-    FileId,
     Numerics,
     DataInterval,
     BlobInterval,
@@ -46,45 +45,6 @@ impl TryFrom<u8> for MetaKind {
         } else {
             Ok(unsafe { std::mem::transmute::<u8, MetaKind>(value) })
         }
-    }
-}
-
-#[repr(C, packed(1))]
-pub struct FileId {
-    pub is_blob: bool,
-    pub file_id: u64,
-}
-
-impl FileId {
-    pub fn blob(file_id: u64) -> Self {
-        Self {
-            is_blob: true,
-            file_id,
-        }
-    }
-
-    pub fn data(file_id: u64) -> Self {
-        Self {
-            is_blob: false,
-            file_id,
-        }
-    }
-}
-
-impl IAsSlice for FileId {}
-
-impl IMetaCodec for FileId {
-    fn packed_size(&self) -> usize {
-        size_of::<Self>()
-    }
-
-    fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
-        to.copy_from_slice(self.as_slice());
-    }
-
-    fn decode(src: &[u8]) -> Self {
-        FileId::from_slice(src)
     }
 }
 

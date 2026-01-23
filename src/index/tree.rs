@@ -7,9 +7,10 @@ use crate::types::data::{IterItem, Record, Val};
 use crate::types::node::RawLeafIter;
 use crate::types::refbox::DeltaView;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
-use crate::utils::{Handle, MutRef, ROOT_PID};
+use crate::utils::data::Position;
+use crate::utils::{Handle, MutRef, OpCode, ROOT_PID};
 use crate::{
-    OpCode, Store,
+    Store,
     types::{
         data::{Index, IntlKey, Key, Ver},
         node::MergeOp,
@@ -401,7 +402,6 @@ impl Tree {
         loop {
             match self.try_find_leaf(g, k) {
                 Err(OpCode::Again) => continue,
-                Err(OpCode::NotFound) => return Err(OpCode::NotFound),
                 Err(e) => unreachable!("invalid opcode {:?}", e),
                 o => return o,
             }
@@ -575,7 +575,7 @@ impl Tree {
     where
         K: IKey,
         V: IVal,
-        F: FnMut(Page, &K) -> Result<(u8, u64), OpCode>,
+        F: FnMut(Page, &K) -> Result<(u8, Position), OpCode>,
     {
         loop {
             inc_cas!(link);
@@ -588,13 +588,13 @@ impl Tree {
                 return Err(OpCode::Again);
             };
 
-            let (wid, seq) = check(page, k)?;
+            let (group_id, pos) = check(page, k)?;
             let mut txn = self.begin(g);
             let (k, v) = DeltaView::from_key_val(&mut txn, k, v);
 
             node.insert(k, v);
 
-            txn.record_and_commit(wid as usize, seq);
+            txn.record_and_commit(group_id as usize, pos);
             return Ok(());
         }
     }
@@ -607,7 +607,7 @@ impl Tree {
         let page = self.find_leaf(g, key.raw())?;
 
         // it never write log, so use default value is always OK
-        self.link(g, page, key, val, |_, _| Ok((0, 0)))?;
+        self.link(g, page, key, val, |_, _| Ok((0, Position::default())))?;
         Ok(())
     }
 
@@ -638,7 +638,7 @@ impl Tree {
     ) -> Result<Option<ValRef>, OpCode>
     where
         V: IVal,
-        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, u64), OpCode>,
+        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, Position), OpCode>,
     {
         let page = self.find_leaf(g, key.raw)?;
         let mut r = None;
@@ -663,7 +663,7 @@ impl Tree {
     ) -> Result<Option<ValRef>, OpCode>
     where
         V: IVal,
-        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, u64), OpCode>,
+        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, Position), OpCode>,
     {
         let size = key.packed_size() + val.packed_size();
         if size > Options::MAX_KV_SIZE {
@@ -737,12 +737,12 @@ impl Tree {
         let ver = Ver::new(start_ts, NULL_CMD);
 
         while addr != NULL_PID {
-            let ptr = l.load(addr).ok_or(OpCode::NotFound)?.as_base();
+            let ptr = l.load(addr)?.as_base();
             let sst = ptr.sst::<Ver>();
             let mut pos = sst.lower_bound(&ver).unwrap_or_else(|pos| pos);
             while pos < sst.header().elems as usize {
                 let (k, v) = sst.kv_at::<Val>(pos);
-                if visible(k.txid, v.worker()) {
+                if visible(k.txid, v.group_id()) {
                     if v.is_tombstone() {
                         return Err(OpCode::NotFound);
                     }
@@ -783,7 +783,7 @@ impl Tree {
                     result = Some(Err(OpCode::NotFound));
                     return true;
                 }
-                if visible(k.txid, val.worker()) {
+                if visible(k.txid, val.group_id()) {
                     let (r, v) = val.get_record(&page.loader, true);
                     result = Some(Ok(ValRef::new(r, v.unwrap_or_else(|| x.as_box()))));
                     return true;
@@ -801,7 +801,7 @@ impl Tree {
         if val.is_tombstone() {
             return Err(OpCode::NotFound);
         }
-        if visible(k.txid, val.worker()) {
+        if visible(k.txid, val.group_id()) {
             let (record, r) = val.get_record(&page.loader, true);
             return Ok(ValRef::new(record, r.unwrap_or_else(|| page.base_box())));
         }
@@ -877,7 +877,7 @@ impl Iter<'_> {
                     Bound::Included(b) => item.cmp_key(b.as_slice()).is_ge(),
                     Bound::Excluded(b) => item.cmp_key(b.as_slice()).is_gt(),
                 };
-                if ok && (self.checker)(&self.tree.store.context, item.txid(), item.wid()) {
+                if ok && (self.checker)(&self.tree.store.context, item.txid(), item.group_id()) {
                     self.filter.check(item)
                 } else {
                     false

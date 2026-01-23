@@ -4,29 +4,31 @@ use crate::{
     cc::{
         cc::ConcurrencyControl,
         context::{CCNode, Context},
+        group::TxnState,
         wal::{WalDel, WalPut, WalReplace},
-        worker::SyncWorker,
     },
     index::tree::{Iter, Tree},
     types::data::{Key, Record, Ver},
-    utils::{Handle, INIT_CMD, NULL_CMD},
+    utils::{Handle, NULL_CMD, data::Position},
 };
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
+use std::sync::atomic::Ordering::Relaxed;
 
 fn get_impl<K: AsRef<[u8]>>(
     ctx: &Context,
     cc: &ConcurrencyControl,
     tree: &Tree,
-    worker_id: u8,
+    group_id: u8,
+    start_ts: u64,
     k: K,
 ) -> Result<ValRef, OpCode> {
     #[cfg(feature = "extra_check")]
     assert!(!k.as_ref().is_empty(), "key must be non-empty");
 
     let g = crossbeam_epoch::pin();
-    let key = Key::new(k.as_ref(), Ver::new(cc.start_ts, NULL_CMD));
-    let r = tree.traverse(&g, key, |txid, record_wid| {
-        cc.is_visible_to(ctx, worker_id, record_wid, cc.start_ts, txid)
+    let key = Key::new(k.as_ref(), Ver::new(start_ts, NULL_CMD));
+    let r = tree.traverse(&g, key, |txid, record_gid| {
+        cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
     })?;
 
     Ok(r)
@@ -35,7 +37,8 @@ fn get_impl<K: AsRef<[u8]>>(
 fn seek_impl<'a, K>(
     cc: &'a ConcurrencyControl,
     tree: &'a Tree,
-    worker_id: u8,
+    group_id: u8,
+    start_ts: u64,
     prefix: K,
 ) -> Iter<'a>
 where
@@ -52,77 +55,100 @@ where
         *e.last_mut().unwrap() += 1;
     }
 
-    tree.range(b..e.as_slice(), move |ctx, txid, record_wid| {
-        cc.is_visible_to(ctx, worker_id, record_wid, cc.start_ts, txid)
+    tree.range(b..e.as_slice(), move |ctx, txid, record_gid| {
+        cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
     })
 }
 
 pub struct TxnKV<'a> {
     ctx: &'a Context,
-    w: SyncWorker,
+    state: UnsafeCell<TxnState>,
     tree: &'a Tree,
-    seq: Cell<u32>,
     is_end: Cell<bool>,
     limit: usize,
 }
 
 impl<'a> TxnKV<'a> {
     pub(crate) fn new(ctx: &'a Context, tree: &'a Tree) -> Result<Self, OpCode> {
-        let mut w = ctx.alloc_worker()?;
-        w.begin(ctx);
-        let limit = tree.store.opt.max_ckpt_per_txn;
+        let start_ts = ctx.alloc_oracle();
+        let gid = ctx.next_group_id();
+        let mut state = TxnState::new(gid, start_ts);
+
+        let g = ctx.group(gid);
+
+        {
+            let mut log = g.logging.lock();
+            state.prev_lsn = log.record_begin(start_ts)?;
+            g.active_txns.insert(start_ts, state.prev_lsn);
+        }
+
+        g.cc.commit_tree.compact(ctx, gid as u8);
+
         Ok(Self {
             ctx,
-            w,
+            state: UnsafeCell::new(state),
             tree,
-            seq: Cell::new(INIT_CMD),
             is_end: Cell::new(false),
-            limit,
+            limit: tree.store.opt.max_ckpt_per_txn,
         })
     }
 
-    fn cmd_id(&self) -> u32 {
-        let r = self.seq.get();
-        self.seq.set(r + 1);
-        r
-    }
-
     fn should_abort(&self) -> Result<(), OpCode> {
-        if self.is_end.get() || self.w.logging.ckpt_cnt() >= self.limit {
+        let state = self.state_ref();
+        let g = self.ctx.group(state.group_id);
+        if self.is_end.get() || g.logging.lock().ckpt_cnt() >= self.limit {
             return Err(OpCode::AbortTx);
         }
         Ok(())
     }
 
+    #[inline]
+    fn state_ref(&self) -> &TxnState {
+        unsafe { &*self.state.get() }
+    }
+
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    fn state_mut(&self) -> &mut TxnState {
+        unsafe { &mut *self.state.get() }
+    }
+
     fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<ValRef>, OpCode>
     where
-        F: FnMut(&Option<(Key, ValRef)>, Ver, SyncWorker) -> Result<(u8, u64), OpCode>,
+        F: FnMut(&Option<(Key, ValRef)>, Ver, &mut TxnState) -> Result<(u8, Position), OpCode>,
     {
         #[cfg(feature = "extra_check")]
         assert!(!k.as_ref().is_empty(), "key must be non-empty");
 
         self.should_abort()?;
         let g = crossbeam_epoch::pin();
-        let start_ts = self.w.cc.start_ts;
-        let (wid, cmd_id) = (self.w.id, self.cmd_id());
-        let key = Key::new(k, Ver::new(start_ts, cmd_id));
-        let val = Record::normal(wid, v);
+        let state = self.state_mut();
+        let start_ts = state.start_ts;
+        let gid = state.group_id;
+
+        let cmd_id_val = state.cmd_id;
+        state.cmd_id += 1;
+        let key = Key::new(k, Ver::new(start_ts, cmd_id_val));
+        let val = Record::normal(gid as u8, v);
 
         self.tree
-            .update(&g, key, val, |opt| f(opt, *key.ver(), self.w))
+            .update(&g, key, val, |opt| f(opt, *key.ver(), state))
     }
 
     fn put_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<(), OpCode> {
-        self.modify(k, v, |opt, ver, mut w| {
+        self.modify(k, v, |opt, ver, state| {
+            let gid = state.group_id;
+            let g = self.ctx.group(gid);
+
             let r = match opt {
                 None => Ok(()),
                 Some((rk, rv)) => {
                     if rv.is_put()
-                        || !w.cc.is_visible_to(
+                        || !g.cc.is_visible_to(
                             self.ctx,
-                            self.w.id,
-                            rv.unwrap().worker_id(),
-                            ver.txid,
+                            gid as u8,
+                            rv.unwrap().group_id(),
+                            state.start_ts,
                             rk.txid,
                         )
                     {
@@ -132,44 +158,63 @@ impl<'a> TxnKV<'a> {
                     }
                 }
             };
+
             if r.is_ok() && !*logged {
                 *logged = true;
-                w.modified = true;
-                w.logging
-                    .record_update(ver, WalPut::new(v.len()), k, [].as_slice(), v);
+                state.modified = true;
+                let mut log = g.logging.lock();
+                let new_pos = log.record_update(
+                    ver,
+                    WalPut::new(v.len()),
+                    k,
+                    [].as_slice(),
+                    v,
+                    state.prev_lsn,
+                )?;
+                state.prev_lsn = new_pos;
             }
-            r.map(|_| (w.id, w.logging.seq()))
+            r.map(|_| (gid as u8, state.prev_lsn))
         })
         .map(|_| ())
     }
 
     fn update_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<ValRef, OpCode> {
-        self.modify(k, v, |opt, ver, mut w| match opt {
-            None => Err(OpCode::NotFound),
-            Some((rk, rv)) => {
-                if rv.is_del() {
-                    return Err(OpCode::NotFound);
-                }
-                let t = rv.unwrap();
-                if !w
-                    .cc
-                    .is_visible_to(self.ctx, self.w.id, t.worker_id(), ver.txid, rk.txid)
-                {
-                    return Err(OpCode::AbortTx);
-                }
+        self.modify(k, v, |opt, ver, state| {
+            let gid = state.group_id;
+            let g = self.ctx.group(gid);
+            match opt {
+                None => Err(OpCode::NotFound),
+                Some((rk, rv)) => {
+                    if rv.is_del() {
+                        return Err(OpCode::NotFound);
+                    }
+                    let t = rv.unwrap();
+                    if !g.cc.is_visible_to(
+                        self.ctx,
+                        gid as u8,
+                        t.group_id(),
+                        state.start_ts,
+                        rk.txid,
+                    ) {
+                        return Err(OpCode::AbortTx);
+                    }
 
-                if !*logged {
-                    w.modified = true;
-                    *logged = true;
-                    w.logging.record_update(
-                        ver,
-                        WalReplace::new(t.data().len(), v.len()),
-                        rk.raw,
-                        t.data(),
-                        v,
-                    );
+                    if !*logged {
+                        state.modified = true;
+                        *logged = true;
+                        let mut log = g.logging.lock();
+                        let new_pos = log.record_update(
+                            ver,
+                            WalReplace::new(t.data().len(), v.len()),
+                            rk.raw,
+                            t.data(),
+                            v,
+                            state.prev_lsn,
+                        )?;
+                        state.prev_lsn = new_pos;
+                    }
+                    Ok((gid as u8, state.prev_lsn))
                 }
-                Ok((w.id, w.logging.seq()))
             }
         })
         .map(|x| x.unwrap())
@@ -200,37 +245,55 @@ impl<'a> TxnKV<'a> {
     {
         let mut logged = false;
         let (k, v) = (k.as_ref(), v.as_ref());
-        self.modify(k, v, |opt, ver, mut w| match opt {
-            None => {
-                if !logged {
-                    w.modified = true;
-                    logged = true;
-                    w.logging
-                        .record_update(ver, WalPut::new(v.len()), k, &[], v);
+        self.modify(k, v, |opt, ver, state| {
+            let gid = state.group_id;
+            let g = self.ctx.group(gid);
+            match opt {
+                None => {
+                    if !logged {
+                        state.modified = true;
+                        logged = true;
+                        let mut log = g.logging.lock();
+                        let new_pos = log.record_update(
+                            ver,
+                            WalPut::new(v.len()),
+                            k,
+                            &[],
+                            v,
+                            state.prev_lsn,
+                        )?;
+                        state.prev_lsn = new_pos;
+                    }
+                    Ok((gid as u8, state.prev_lsn))
                 }
-                Ok((w.id, w.logging.seq()))
-            }
-            Some((rk, rv)) => {
-                let t = rv.unwrap();
-                if !w
-                    .cc
-                    .is_visible_to(self.ctx, self.w.id, t.worker_id(), ver.txid, rk.txid)
-                {
-                    return Err(OpCode::AbortTx);
-                }
+                Some((rk, rv)) => {
+                    let t = rv.unwrap();
+                    if !g.cc.is_visible_to(
+                        self.ctx,
+                        gid as u8,
+                        t.group_id(),
+                        state.start_ts,
+                        rk.txid,
+                    ) {
+                        return Err(OpCode::AbortTx);
+                    }
 
-                if !logged {
-                    w.modified = true;
-                    logged = true;
-                    w.logging.record_update(
-                        ver,
-                        WalReplace::new(t.data().len(), v.len()),
-                        rk.raw,
-                        t.data(),
-                        v,
-                    );
+                    if !logged {
+                        state.modified = true;
+                        logged = true;
+                        let mut log = g.logging.lock();
+                        let new_pos = log.record_update(
+                            ver,
+                            WalReplace::new(t.data().len(), v.len()),
+                            rk.raw,
+                            t.data(),
+                            v,
+                            state.prev_lsn,
+                        )?;
+                        state.prev_lsn = new_pos;
+                    }
+                    Ok((gid as u8, state.prev_lsn))
                 }
-                Ok((w.id, w.logging.seq()))
             }
         })
     }
@@ -240,49 +303,80 @@ impl<'a> TxnKV<'a> {
         T: AsRef<[u8]>,
     {
         self.should_abort()?;
-        let mut w = self.w;
-        let (wid, start_ts) = (w.id, w.cc.start_ts);
-        let key = Key::new(k.as_ref(), Ver::new(start_ts, self.cmd_id()));
-        let val = Record::remove(wid);
-        let mut logged = false;
-        let g = crossbeam_epoch::pin();
+        let state = self.state_mut();
+        let (gid, start_ts) = (state.group_id, state.start_ts);
 
-        self.tree
-            .update(&g, key, val, |opt| match opt {
+        let cmd_id_val = state.cmd_id;
+        state.cmd_id += 1;
+
+        let key = Key::new(k.as_ref(), Ver::new(start_ts, cmd_id_val));
+        let val = Record::remove(gid as u8);
+        let mut logged = false;
+        let guard = crossbeam_epoch::pin();
+
+        let res = self.tree.update(&guard, key, val, |opt| {
+            let g = self.ctx.group(gid);
+            match opt {
                 None => Err(OpCode::NotFound),
                 Some((rk, rv)) => {
                     if rv.is_del() {
                         return Err(OpCode::NotFound);
                     }
                     let t = rv.unwrap();
-                    if !w
+                    if !g
                         .cc
-                        .is_visible_to(self.ctx, self.w.id, t.worker_id(), start_ts, rk.txid)
+                        .is_visible_to(self.ctx, gid as u8, t.group_id(), start_ts, rk.txid)
                     {
                         return Err(OpCode::AbortTx);
                     }
 
                     if !logged {
                         logged = true;
-                        w.modified = true;
-                        w.logging.record_update(
+                        state.modified = true;
+                        let mut log = g.logging.lock();
+                        let new_pos = log.record_update(
                             *key.ver(),
                             WalDel::new(t.data().len()),
                             rk.raw,
                             t.data(),
                             [].as_slice(),
-                        );
+                            state.prev_lsn,
+                        )?;
+                        state.prev_lsn = new_pos;
                     }
-                    Ok((w.id, w.logging.seq()))
+                    Ok((gid as u8, state.prev_lsn))
                 }
-            })
-            .map(|x| x.unwrap())
+            }
+        });
+
+        res.map(|x| x.unwrap())
     }
 
     pub fn commit(self) -> Result<(), OpCode> {
         self.should_abort()?;
-        self.w.commit(self.ctx);
-        self.ctx.free_worker(self.w);
+        let state = self.state_ref();
+        let g = self.ctx.group(state.group_id);
+
+        if !state.modified {
+            g.logging.lock().record_commit(state.start_ts)?;
+            g.active_txns.remove(&state.start_ts);
+            self.is_end.set(true);
+            return Ok(());
+        }
+
+        let commit_ts = self.ctx.alloc_oracle();
+
+        {
+            let mut log = g.logging.lock();
+            log.record_commit(state.start_ts)?;
+            log.stabilize()?;
+        }
+
+        g.cc.commit_tree.append(state.start_ts, commit_ts);
+        g.cc.latest_cts.store(commit_ts, Relaxed);
+        g.cc.collect_wmk(self.ctx);
+
+        g.active_txns.remove(&state.start_ts);
         self.is_end.set(true);
         Ok(())
     }
@@ -292,7 +386,23 @@ impl<'a> TxnKV<'a> {
     where
         K: AsRef<[u8]>,
     {
-        get_impl(self.ctx, &self.w.cc, self.tree, self.w.id, k)
+        let state = self.state_ref();
+        #[cfg(feature = "extra_check")]
+        assert!(!k.as_ref().is_empty(), "key must be non-empty");
+
+        let g = crossbeam_epoch::pin();
+        let key = Key::new(k.as_ref(), Ver::new(state.start_ts, NULL_CMD));
+        let cc = &self.ctx.group(state.group_id).cc;
+        let r = self.tree.traverse(&g, key, |txid, record_gid| {
+            cc.is_visible_to(
+                self.ctx,
+                state.group_id as u8,
+                record_gid,
+                state.start_ts,
+                txid,
+            )
+        })?;
+        Ok(r)
     }
 
     /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
@@ -304,7 +414,29 @@ impl<'a> TxnKV<'a> {
     where
         K: AsRef<[u8]>,
     {
-        seek_impl(&self.w.cc, self.tree, self.w.id, prefix)
+        let state = self.state_ref();
+        let b = prefix.as_ref();
+        let mut e = b.to_vec();
+        #[cfg(feature = "extra_check")]
+        assert!(!e.is_empty(), "prefix can't be empty");
+
+        if *e.last().unwrap() == u8::MAX {
+            e.push(0);
+        } else {
+            *e.last_mut().unwrap() += 1;
+        }
+
+        let cc = &self.ctx.group(state.group_id).cc;
+        self.tree
+            .range(b..e.as_slice(), move |_, txid, record_gid| {
+                cc.is_visible_to(
+                    self.ctx,
+                    state.group_id as u8,
+                    record_gid,
+                    state.start_ts,
+                    txid,
+                )
+            })
     }
 }
 
@@ -312,8 +444,51 @@ impl Drop for TxnKV<'_> {
     fn drop(&mut self) {
         if !self.is_end.get() {
             let g = crossbeam_epoch::pin();
-            self.w.rollback(&g, self.ctx, self.tree);
-            self.ctx.free_worker(self.w);
+            let state = self.state_ref();
+            let grp = self.ctx.group(state.group_id);
+
+            if !state.modified {
+                grp.logging
+                    .lock()
+                    .record_abort(state.start_ts)
+                    .inspect_err(|e| {
+                        log::error!("can't record abort, {:?}", e);
+                    })
+                    .expect("can't fail");
+            } else {
+                grp.logging
+                    .lock()
+                    .stabilize()
+                    .map_err(|e| {
+                        log::error!("can't stabilize WAL, {:?}", e);
+                    })
+                    .expect("can't fail");
+
+                use crate::cc::wal::{Location, WalReader};
+                use crate::utils::block::Block;
+
+                const SMALL_SIZE: usize = 256;
+                let mut block = Block::alloc(SMALL_SIZE);
+                let reader = WalReader::new(self.ctx, &g);
+                let location = Location {
+                    group_id: state.group_id as u32,
+                    pos: state.prev_lsn,
+                    len: 0,
+                };
+
+                reader
+                    .rollback(&mut block, state.start_ts, location, self.tree)
+                    .inspect_err(|e| {
+                        log::error!("can't rollback, {:?}", e);
+                    })
+                    .expect("can't fail");
+
+                let commit_ts = self.ctx.alloc_oracle();
+                grp.cc.commit_tree.append(state.start_ts, commit_ts);
+                grp.cc.latest_cts.store(commit_ts, Relaxed);
+                grp.cc.collect_wmk(self.ctx);
+            }
+            grp.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
         }
     }
@@ -322,7 +497,7 @@ impl Drop for TxnKV<'_> {
 pub struct TxnView<'a> {
     ctx: &'a Context,
     cc: Handle<CCNode>,
-    worker_id: u8,
+    group_id: u8,
     tree: &'a Tree,
 }
 
@@ -332,14 +507,21 @@ impl<'a> TxnView<'a> {
         Ok(Self {
             ctx,
             cc,
-            worker_id: u8::MAX,
+            group_id: u8::MAX,
             tree,
         })
     }
 
     #[inline]
     pub fn get<K: AsRef<[u8]>>(&self, k: K) -> Result<ValRef, OpCode> {
-        get_impl(self.ctx, &self.cc, self.tree, self.worker_id, k)
+        get_impl(
+            self.ctx,
+            &self.cc,
+            self.tree,
+            self.group_id,
+            self.cc.start_ts,
+            k,
+        )
     }
 
     /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
@@ -351,7 +533,7 @@ impl<'a> TxnView<'a> {
     where
         K: AsRef<[u8]>,
     {
-        seek_impl(&self.cc, self.tree, self.worker_id, prefix)
+        seek_impl(&self.cc, self.tree, self.group_id, self.cc.start_ts, prefix)
     }
 }
 
@@ -366,7 +548,11 @@ mod test {
     use crate::{Mace, OpCode, Options, RandomPath};
 
     #[test]
-    fn txnkv() -> Result<(), OpCode> {
+    fn txnkv() {
+        txnkv_impl().unwrap();
+    }
+
+    fn txnkv_impl() -> Result<(), OpCode> {
         let path = RandomPath::tmp();
         let _ = std::fs::remove_dir_all(&*path);
         let opt = Options::new(&*path).validate().unwrap();
@@ -486,14 +672,18 @@ mod test {
     }
 
     #[test]
-    fn cross_long_txn() -> Result<(), OpCode> {
+    fn cross_long_txn() {
+        cross_long_txn_impl().unwrap();
+    }
+
+    fn cross_long_txn_impl() -> Result<(), OpCode> {
         let path = RandomPath::new();
         let mut opt = Options::new(&*path);
         let consolidate_threshold = 256;
         opt.tmp_store = true;
         opt.split_elems = consolidate_threshold * 2;
         opt.consolidate_threshold = consolidate_threshold;
-        let db = Mace::new(opt.validate()?)?;
+        let db = Mace::new(opt.validate().unwrap())?;
 
         let kv = db.begin()?;
         kv.put("foo", "bar")?;

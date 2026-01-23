@@ -65,9 +65,9 @@ pub struct Options {
     /// - too large a file size will cause the flushing to be slow
     /// - this option will be affected by [`Self::max_log_size`], a checkpoint will cause unfull data buffer to be flushed
     pub data_file_size: usize,
-    /// if wal log file size large than this value times [`Self::workers`], a checkpoint will be created
+    /// if wal log file size large than this value times [`Self::concurrent_write`], a checkpoint will be created
     ///
-    /// for example: set [`Self::max_log_size`] to 10MB and there are 10 workers, then a checkpoint
+    /// for example: set [`Self::max_log_size`] to 10MB and there are 10 concurrent writers, then a checkpoint
     /// will be created when log size are exceed 100MB
     ///
     /// this value should be larger than [`Self::data_file_size`]
@@ -94,11 +94,14 @@ pub struct Options {
     ///
     /// **Once set, it cannot be modified**
     pub split_elems: u16,
+    /// if true, corrupted WAL will be truncated during recovery, otherwise it will panic
+    /// default is true
+    pub truncate_corrupted_wal: bool,
 }
 
 impl Options {
     pub const DATA_FILE_SIZE: usize = 64 << 20; // 64MB
-    pub const MAX_CONCURRENT_WRITE: usize = 128;
+    pub const MAX_CONCURRENT_WRITE: u8 = 128;
     pub const MIN_CACHE_CAP: usize = Self::DATA_FILE_SIZE;
     pub const CACHE_CAP: usize = 1 << 30; // 1GB
     pub const CACHE_CNT: usize = 16384;
@@ -115,7 +118,7 @@ impl Options {
         let cores = std::thread::available_parallelism()
             .unwrap()
             .get()
-            .min(Self::MAX_CONCURRENT_WRITE)
+            .min(Self::MAX_CONCURRENT_WRITE as usize)
             .next_power_of_two() as u8;
         Self {
             sync_on_write: true,
@@ -147,6 +150,7 @@ impl Options {
             wal_file_size: Self::WAL_FILE_SZ as u32,
             keep_stable_wal_file: false,
             split_elems: Self::MAX_SPLIT_ELEMS,
+            truncate_corrupted_wal: true,
         }
     }
 
@@ -155,10 +159,7 @@ impl Options {
     }
 
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
-        if !self.concurrent_write.is_power_of_two() {
-            eprintln!("invalid concurrent write: {}", self.concurrent_write);
-            return Err(OpCode::Invalid);
-        }
+        self.concurrent_write = self.concurrent_write.clamp(1, Self::MAX_CONCURRENT_WRITE);
         self.split_elems = self
             .split_elems
             .clamp(Self::MIN_SPLIT_ELEMS, Self::MAX_SPLIT_ELEMS);
@@ -195,7 +196,6 @@ impl Options {
     }
 }
 
-#[derive(Clone)]
 pub struct ParsedOptions {
     pub(crate) inner: Options,
 }
@@ -241,30 +241,30 @@ impl Options {
         self.db_root.clone()
     }
 
-    pub fn wal_file(&self, wid: u8, seq: u64) -> PathBuf {
+    pub fn wal_file(&self, group_id: u8, seq: u64) -> PathBuf {
         self.log_root().join(format!(
             "{}{}{}{}{}",
             Self::WAL_PREFIX,
             Self::SEP,
-            wid,
+            group_id,
             Self::SEP,
             seq
         ))
     }
 
-    pub fn wal_backup(&self, wid: u8, seq: u64) -> PathBuf {
+    pub fn wal_backup(&self, group_id: u8, seq: u64) -> PathBuf {
         self.log_root().join(format!(
             "{}{}{}{}{}",
             Self::WAL_STABLE,
             Self::SEP,
-            wid,
+            group_id,
             Self::SEP,
             seq
         ))
     }
 
-    pub fn desc_file(&self, wid: u8) -> PathBuf {
-        self.log_root().join(format!("meta_{wid}"))
+    pub fn desc_file(&self, group_id: u8) -> PathBuf {
+        self.log_root().join(format!("meta_{group_id}"))
     }
 
     pub fn manifest(&self) -> PathBuf {
@@ -272,11 +272,11 @@ impl Options {
     }
 }
 
-impl Drop for Options {
+impl Drop for ParsedOptions {
     fn drop(&mut self) {
-        if self.tmp_store {
-            log::info!("remove db_root {:?}", self.db_root);
-            let _ = std::fs::remove_dir_all(&self.db_root);
+        if self.inner.tmp_store {
+            log::info!("remove db_root {:?}", self.inner.db_root);
+            let _ = std::fs::remove_dir_all(&self.inner.db_root);
         }
     }
 }
