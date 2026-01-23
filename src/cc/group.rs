@@ -95,6 +95,11 @@ impl ActiveTxns {
         min
     }
 
+    pub fn min_lsn(&self) -> Option<Position> {
+        let map = self.map.read();
+        map.values().min().cloned()
+    }
+
     pub fn for_each_txid<F>(&self, mut f: F)
     where
         F: FnMut(u64),
@@ -133,7 +138,7 @@ impl WriterGroup {
 pub struct TxnState {
     pub start_ts: u64,
     pub modified: bool,
-    pub last_lsn: Position,
+    pub prev_lsn: Position,
     pub group_id: usize,
     pub cmd_id: u32,
 }
@@ -143,7 +148,7 @@ impl TxnState {
         Self {
             start_ts,
             modified: false,
-            last_lsn: Position::default(),
+            prev_lsn: Position::default(),
             group_id,
             cmd_id: 0,
         }

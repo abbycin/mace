@@ -464,7 +464,7 @@ fn smo_during_scan() -> Result<(), OpCode> {
 
     for (i, x) in data.iter().enumerate() {
         if i % 2 == 0 {
-            let kv = db.begin()?;
+            let kv = db.begin().unwrap();
             kv.put(x, x)?;
             kv.commit()?;
             target.push(x.clone());
@@ -473,12 +473,12 @@ fn smo_during_scan() -> Result<(), OpCode> {
 
     target.sort();
 
-    let view = db.view()?;
+    let view = db.view().unwrap();
     let mut iter = view.seek("key");
     let mut idx = 0;
     for (i, x) in data.iter().enumerate() {
         if i % 2 != 0 {
-            let kv = db.begin()?;
+            let kv = db.begin().unwrap();
             kv.put(x, x)?;
             kv.commit()?;
         } else if let Some(item) = iter.next() {
@@ -495,7 +495,7 @@ fn smo_during_scan() -> Result<(), OpCode> {
     idx = 0;
     // merge is hard to trigger, so we just do a simple test
     for x in data.iter() {
-        let kv = db.begin()?;
+        let kv = db.begin().unwrap();
         kv.del(x)?;
         kv.commit()?;
 

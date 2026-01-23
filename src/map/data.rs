@@ -5,7 +5,6 @@ use parking_lot::Mutex;
 use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
 
-use crate::OpCode;
 use crate::map::IFooter;
 use crate::map::chunk::Chunk;
 use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, Numerics, PageTable};
@@ -16,7 +15,7 @@ use crate::utils::NULL_ADDR;
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
 use crate::utils::data::{AddrPair, GatherWriter, Interval, Position};
-use crate::utils::{CachePad, Handle, INIT_ID, NULL_PID};
+use crate::utils::{CachePad, Handle, INIT_ID, NULL_PID, OpCode};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::fmt::Debug;
@@ -59,7 +58,8 @@ impl Deref for FlushData {
 pub(crate) struct Arena {
     id: Cell<u64>,
     pub(crate) items: DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>,
-    pub(crate) chunks: Mutex<Vec<Chunk>>,
+    #[allow(clippy::vec_box)]
+    pub(crate) chunks: Mutex<Vec<Box<Chunk>>>,
     pub(crate) active_chunk: AtomicPtr<Chunk>,
     /// flush LSN
     pub(crate) flsn: Box<[CachePad<Flsn>]>,
@@ -238,7 +238,7 @@ impl Arena {
                     .is_ok();
                 #[cfg(feature = "extra_check")]
                 assert!(_ok);
-                chunks.push(unsafe { *Box::from_raw(chunk_ptr) });
+                chunks.push(unsafe { Box::from_raw(chunk_ptr) });
             }
         };
 
@@ -326,6 +326,15 @@ impl Debug for Arena {
             .field("offset", &self.offset)
             .field("id", &self.id.get())
             .finish()
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        let ptr = self.active_chunk.load(Relaxed);
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr)) };
+        }
     }
 }
 
@@ -582,7 +591,6 @@ impl FileBuilder {
         w.queue(hdr.as_slice());
         w.flush();
         w.sync();
-
         self.blob_interval
     }
 }
@@ -669,9 +677,10 @@ where
         self.file.read(dst, off).map_err(|_| OpCode::IoError)?;
         let mut h = Crc32cHasher::default();
         h.write(dst);
-        if h.finish() as u32 != crc {
-            log::error!("checksum mismatch, expect {} get {}", crc, h.finish());
-            panic!("checksum mismatch, expect {} get {}", crc, h.finish());
+        let actual_crc = h.finish() as u32;
+        if actual_crc != crc {
+            log::error!("checksum mismatch, expect {} get {}", crc, actual_crc);
+            return Err(OpCode::Corruption);
         }
         Ok(unsafe { std::slice::from_raw_parts(dst.as_ptr().cast::<U>(), count) })
     }
@@ -737,6 +746,7 @@ mod test {
         let path = RandomPath::new();
         let mut opt = Options::new(&*path);
         opt.tmp_store = true;
+        let opt = opt.validate().unwrap();
 
         let _ = opt.create_dir();
 

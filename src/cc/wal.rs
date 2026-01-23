@@ -15,7 +15,7 @@ use crate::{
         data::{Key, Record, Ver},
         traits::ITree,
     },
-    utils::{INIT_CMD, block::Block, data::Position},
+    utils::{INIT_CMD, OpCode, block::Block, data::Position},
 };
 use crossbeam_epoch::Guard;
 
@@ -44,10 +44,14 @@ pub(crate) enum EntryType {
     Unknown,
 }
 
-impl From<u8> for EntryType {
-    fn from(value: u8) -> Self {
-        assert!(value < EntryType::Unknown as u8);
-        unsafe { std::mem::transmute(value) }
+impl TryFrom<u8> for EntryType {
+    type Error = OpCode;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value < EntryType::Unknown as u8 {
+            unsafe { Ok(std::mem::transmute::<u8, EntryType>(value)) }
+        } else {
+            Err(OpCode::Corruption)
+        }
     }
 }
 
@@ -60,10 +64,14 @@ pub(crate) enum PayloadType {
     Clr,
 }
 
-impl From<u8> for PayloadType {
-    fn from(value: u8) -> Self {
-        assert!(value <= PayloadType::Delete as u8);
-        unsafe { std::mem::transmute(value) }
+impl TryFrom<u8> for PayloadType {
+    type Error = OpCode;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value <= PayloadType::Clr as u8 {
+            unsafe { Ok(std::mem::transmute::<u8, PayloadType>(value)) }
+        } else {
+            Err(OpCode::Corruption)
+        }
     }
 }
 
@@ -127,8 +135,9 @@ pub(crate) struct WalCommit {
 static_assert!(size_of::<WalCommit>() == size_of::<WalAbort>());
 static_assert!(size_of::<WalCommit>() == size_of::<WalBegin>());
 
-// NOTE: the wal is not shared among txns, and there's no active txn while create checkpoint, the
-//  checkpoint is only used for identify the log was stabilized or not
+// NOTE: the wal is shared among txns in the same group
+// the checkpoint is used to identify that the log buffer was flushed and stabilized
+// it does not imply that all transactions are committed; active transactions may exist
 #[repr(C, packed(1))]
 #[derive(Debug)]
 pub(crate) struct WalCheckpoint {
@@ -405,12 +414,12 @@ impl IWalCodec for &[u8] {
     }
 }
 
-pub(crate) fn wal_record_sz(e: EntryType) -> usize {
+pub(crate) fn wal_record_sz(e: EntryType) -> Result<usize, OpCode> {
     match e {
-        EntryType::Abort | EntryType::Begin | EntryType::Commit => WalAbort::size(),
-        EntryType::Update => WalUpdate::size(),
-        EntryType::CheckPoint => WalCheckpoint::size(),
-        _ => unreachable!("invalid type {}", e as u8),
+        EntryType::Abort | EntryType::Begin | EntryType::Commit => Ok(WalAbort::size()),
+        EntryType::Update => Ok(WalUpdate::size()),
+        EntryType::CheckPoint => Ok(WalCheckpoint::size()),
+        _ => Err(OpCode::Corruption),
     }
 }
 
@@ -437,7 +446,7 @@ impl<'a> WalReader<'a> {
     }
 
     fn get_file(&self, id: u8, seq: u64) -> Option<(Rc<File>, u64)> {
-        const MAX_OPEN_FILES: usize = 64; // Increased from 10
+        const MAX_OPEN_FILES: usize = 10;
         let mut map = self.map.borrow_mut();
         while map.len() > MAX_OPEN_FILES {
             map.pop_first();
@@ -462,7 +471,7 @@ impl<'a> WalReader<'a> {
         txid: u64,
         mut addr: Location,
         tree: &T,
-    ) {
+    ) -> Result<(), OpCode> {
         let group_id = addr.group_id;
         let mut cmd = INIT_CMD;
         let mut pos = addr.pos.offset;
@@ -481,8 +490,8 @@ impl<'a> WalReader<'a> {
             loop {
                 let s = block.mut_slice(0, block.len());
                 f.read(&mut s[0..1], pos).unwrap();
-                let h: EntryType = s[0].into();
-                let sz = wal_record_sz(h);
+                let h: EntryType = s[0].try_into()?;
+                let sz = wal_record_sz(h)?;
                 assert!(pos + sz as u64 <= end);
                 assert!(sz <= block.len());
 
@@ -490,17 +499,21 @@ impl<'a> WalReader<'a> {
                 match h {
                     EntryType::Abort | EntryType::Commit => {
                         let r = ptr_to::<WalCommit>(s.as_ptr());
-                        assert!(r.is_intact());
+                        if !r.is_intact() {
+                            return Err(OpCode::Corruption);
+                        }
                         break 'outer;
                     }
                     EntryType::Begin => {
                         let r = ptr_to::<WalBegin>(s.as_ptr());
-                        assert!(r.is_intact());
+                        if !r.is_intact() {
+                            return Err(OpCode::Corruption);
+                        }
                         // we use the same group in the UPDATE record or else any group is ok, so
                         // that we can make sure these records will be flushed with the same order
                         // as they were queued
                         let g = self.ctx.group(group_id as usize);
-                        g.logging.lock().record_abort(txid);
+                        g.logging.lock().record_abort(txid)?;
                         break 'outer;
                     }
                     EntryType::Update => {
@@ -515,20 +528,23 @@ impl<'a> WalReader<'a> {
                         f.read(s, pos + sz as u64).unwrap();
 
                         let u = ptr_to::<WalUpdate>(block.data());
-                        assert!(u.is_intact());
+                        if !u.is_intact() {
+                            return Err(OpCode::Corruption);
+                        }
 
                         let (prev_id, prev_off) =
-                            self.undo(u, &mut cmd, tree, group_id as usize, addr.pos);
+                            self.undo(u, &mut cmd, tree, group_id as usize, addr.pos)?;
                         pos = prev_off;
                         if prev_id != addr.pos.file_id {
                             addr.pos.file_id = prev_id;
                             break;
                         }
                     }
-                    _ => unreachable!("the chain will never point to {:?}", h),
+                    _ => return Err(OpCode::Corruption),
                 }
             }
         }
+        Ok(())
     }
 
     fn undo<T: ITree>(
@@ -538,7 +554,7 @@ impl<'a> WalReader<'a> {
         tree: &T,
         group_id: usize,
         current_pos: Position,
-    ) -> (u64, u64) {
+    ) -> Result<(u64, u64), OpCode> {
         let (tombstone, data) = match c.sub_type() {
             PayloadType::Insert => {
                 let i = c.put();
@@ -554,7 +570,7 @@ impl<'a> WalReader<'a> {
             }
             PayloadType::Clr => {
                 let x = c.clr();
-                return (x.undo_id, x.undo_off);
+                return Ok((x.undo_id, x.undo_off));
             }
         };
 
@@ -575,10 +591,10 @@ impl<'a> WalReader<'a> {
             [].as_slice(),
             data,
             current_pos,
-        );
+        )?;
 
         tree.put(self.guard, Key::new(raw, Ver::new(c.txid, *cmd)), val);
-        (c.prev_id, c.prev_off)
+        Ok((c.prev_id, c.prev_off))
     }
 }
 
@@ -654,7 +670,7 @@ mod test {
 
     #[test]
     fn test_wal_entry_checksums() {
-        use crate::cc::wal::{WalAbort, WalBegin, WalCheckpoint, WalCommit};
+        use crate::cc::wal::{WalBegin, WalCheckpoint, WalCommit};
 
         let mut begin = WalBegin {
             wal_type: EntryType::Begin,

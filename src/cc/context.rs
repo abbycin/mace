@@ -126,7 +126,13 @@ impl Context {
 
     pub(crate) fn quit(&self) {
         self.groups.iter().for_each(|x| {
-            x.logging.lock().stabilize();
+            x.logging
+                .lock()
+                .stabilize()
+                .inspect_err(|e| {
+                    log::error!("can't stabilize WAL, {:?}", e);
+                })
+                .expect("can't fail");
         });
         self.tx
             .send(())

@@ -812,10 +812,10 @@ mod test {
     };
 
     use crate::{
-        Options,
+        OpCode, Options,
         types::{
             data::{IntlKey, Record, Val, Ver},
-            refbox::{BoxRef, RemoteView},
+            refbox::{BoxRef, BoxView, RemoteView},
             traits::{IAlloc, ICodec, IDecode, IHeader, ILoader},
         },
         utils::NULL_ADDR,
@@ -925,11 +925,15 @@ mod test {
         }
 
         impl ILoader for L {
-            fn load(&self, addr: u64) -> Option<crate::types::refbox::BoxView> {
-                self.m.borrow().get(&addr).map(|x| x.view())
+            fn load(&self, addr: u64) -> Result<BoxView, OpCode> {
+                self.m
+                    .borrow()
+                    .get(&addr)
+                    .map(|x| x.view())
+                    .ok_or(OpCode::NotFound)
             }
 
-            fn load_unchecked(&self, addr: u64) -> crate::types::refbox::BoxView {
+            fn load_unchecked(&self, addr: u64) -> BoxView {
                 self.load(addr).unwrap()
             }
 
@@ -941,8 +945,8 @@ mod test {
                 self.clone()
             }
 
-            fn load_remote(&self, addr: u64) -> Option<crate::types::refbox::BoxRef> {
-                Some(self.m.borrow().get(&addr).unwrap().clone())
+            fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
+                self.m.borrow().get(&addr).cloned().ok_or(OpCode::NotFound)
             }
         }
 

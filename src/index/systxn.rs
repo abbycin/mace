@@ -1,4 +1,4 @@
-pub(crate) use crate::OpCode;
+use crate::OpCode;
 use crate::index::Node;
 use crate::map::data::Arena;
 use crate::types::header::TagFlag;
@@ -79,11 +79,15 @@ impl<'a> SysTxn<'a> {
         h.flag = TagFlag::Unmap;
         h.pid = pid;
 
-        self.store.page.unmap(pid, p.swip()).map(|_| {
-            p.garbage_collect(self, old_junks);
-            self.store.buffer.evict(pid);
-            self.g.defer(move || p.reclaim());
-        })
+        self.store
+            .page
+            .unmap(pid, p.swip())
+            .map(|_| {
+                p.garbage_collect(self, old_junks);
+                self.store.buffer.evict(pid);
+                self.g.defer(move || p.reclaim());
+            })
+            .map_err(|_| OpCode::Again)
     }
 
     fn apply_junk(&mut self) {

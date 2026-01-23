@@ -54,7 +54,7 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
 
         let tick = ctx.manifest.numerics.next_data_id.load(Relaxed);
 
-        // 1. Perform Disk I/O (Write Data and Blob files first)
+        // 1. perform disk I/O (write daata and blob files first)
         let Interval { lo, hi } = builder.build_data(tick, data_path);
         let data_ivl = IntervalPair::new(lo, hi, data_id);
 
@@ -68,7 +68,7 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
             blob_result = Some((blob_id, blob_ivl, mem_blob_stat));
         }
 
-        // 2. Prepare Statistics
+        // 2. prepare statistics
         let mem_data_stat = builder.data_stat(data_id, tick);
         let data_stat = mem_data_stat.copy();
 
@@ -81,7 +81,7 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
             ctx.manifest.apply_blob_junks(&builder.blob_junks)
         };
 
-        // 3. Commit Metadata Transaction
+        // 3. commit metadata transaction
         let mut txn = ctx.manifest.begin();
 
         txn.record(MetaKind::Numerics, ctx.manifest.numerics.deref());
@@ -103,17 +103,22 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) {
             txn.record(MetaKind::BlobStat, &blob_stat);
             txn.record(MetaKind::BlobInterval, &blob_ivl);
 
-            // Update memory for blob
+            // update memory for blob
             ctx.manifest.add_blob_stat(mem_blob_stat, blob_ivl);
         }
 
         txn.commit();
 
-        // 4. Update Memory and Checkpoints
+        // 4. update memory and checkpoints
         ctx.manifest.add_data_stat(mem_data_stat, data_ivl);
 
         for (i, g) in ctx.groups().iter().enumerate() {
-            let pos = msg.flsn[i].load();
+            let mut pos = msg.flsn[i].load();
+            if let Some(min) = g.active_txns.min_lsn()
+                && min < pos
+            {
+                pos = min;
+            }
             g.logging.lock().update_last_ckpt(pos);
         }
         ctx.manifest.numerics.signal.fetch_add(1, Relaxed);

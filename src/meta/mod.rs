@@ -28,6 +28,7 @@ use crate::{
     meta::entry::BlobStat,
     types::refbox::BoxRef,
     utils::{
+        OpCode,
         data::{LenSeq, Reloc},
         interval::IntervalMap,
         lru::ShardLru,
@@ -214,12 +215,12 @@ impl<'a> Txn<'a> {
             return 0;
         }
         loop {
-            // btree-store supports SI. Refresh handle to start a fresh session.
+            // btree-store supports SI. refresh handle to start a fresh session
             self.btree = self.manifest.btree.clone();
 
-            // Perform an atomic multi-bucket commit.
-            // All updates across different buckets are applied and flushed to disk
-            // in a single SuperBlock write, significantly reducing I/O overhead.
+            // perform an atomic multi-bucket commit
+            // all updates across different buckets are applied and flushed to disk
+            // in a single SuperBlock write, significantly reducing I/O overhead
             let res = self.btree.exec_multi(|multi_txn| {
                 for (bucket, bucket_ops) in &self.ops {
                     multi_txn.execute(bucket, |tree_txn| {
@@ -241,7 +242,7 @@ impl<'a> Txn<'a> {
                     break;
                 }
                 Err(btree_store::Error::Conflict) => {
-                    // Retry with a refreshed session handle
+                    // retry with a refreshed session handle
                     continue;
                 }
                 Err(e) => {
@@ -266,42 +267,39 @@ struct FileReader {
     map: HashMap<u64, Reloc>,
 }
 
-fn new_reader<T: IFooter>(path: PathBuf) -> Option<FileReader> {
-    let mut loader = MetaReader::<T>::new(&path).ok()?;
-    let relocs = loader.get_reloc().expect("never happen");
+fn new_reader<T: IFooter>(path: PathBuf) -> Result<FileReader, OpCode> {
+    let mut loader = MetaReader::<T>::new(&path)?;
+    let relocs = loader.get_reloc()?;
     let mut map = HashMap::with_capacity(relocs.len());
     for x in relocs {
         map.insert(x.key, x.val);
     }
 
     let file = loader.take();
-    Some(FileReader { file, map })
+    Ok(FileReader { file, map })
 }
 
 impl FileReader {
-    fn read_at(&self, pos: u64) -> BoxRef {
+    fn read_at(&self, pos: u64) -> Result<BoxRef, OpCode> {
         let m = self.map.get(&pos).expect("never happen");
         let real_size = BoxRef::real_size_from_dump(m.len);
         let mut p = BoxRef::alloc_exact(real_size, pos);
         let mut crc = Crc32cHasher::default();
 
         let dst = p.load_slice();
-        self.file.read(dst, m.off as u64).expect("can't read");
+        self.file.read(dst, m.off as u64).map_err(OpCode::from)?;
         crc.write(dst);
-        if crc.finish() as u32 != m.crc {
+        let actual_crc = crc.finish() as u32;
+        if actual_crc != m.crc {
             log::error!(
                 "checksum mismatch, expect {} get {}, key {pos}",
                 { m.crc },
-                crc.finish()
+                actual_crc
             );
-            panic!(
-                "checksum mismatch, expect {} get {}",
-                { m.crc },
-                crc.finish()
-            );
+            return Err(OpCode::Corruption);
         }
 
-        p
+        Ok(p)
     }
 }
 
@@ -405,11 +403,11 @@ impl Manifest {
         }
     }
 
-    pub(crate) fn load_data(&self, addr: u64) -> Option<BoxRef> {
+    pub(crate) fn load_data(&self, addr: u64) -> Result<BoxRef, OpCode> {
         self.data_stat.load(addr)
     }
 
-    pub(crate) fn load_blob(&self, addr: u64) -> Option<BoxRef> {
+    pub(crate) fn load_blob(&self, addr: u64) -> Result<BoxRef, OpCode> {
         self.blob_stat.load(addr)
     }
 
@@ -606,19 +604,19 @@ impl DataStatCtx {
         }
     }
 
-    pub(crate) fn load(&self, addr: u64) -> Option<BoxRef> {
+    pub(crate) fn load(&self, addr: u64) -> Result<BoxRef, OpCode> {
         let file_id = {
             let lk = self.interval.read();
             let Some(file_id) = lk.find(addr) else {
                 log::error!("can't find file_id in interval by {}", addr);
-                panic!("can't find file_id in interval by {}", addr);
+                unreachable!("can't find file_id in interval by {}", addr);
             };
             file_id
         };
 
         loop {
             if let Some(r) = self.cache.get(file_id as u64) {
-                return Some(r.read_at(addr));
+                return r.read_at(addr);
             }
 
             let lk = self.cache.lock_shard(file_id);
@@ -695,7 +693,7 @@ impl DataStatCtx {
             if let Some(x) = self.cache.get(file_id) {
                 let Some(&tmp) = x.map.get(&pos) else {
                     log::error!("can't find reloc, file_id {file_id} key {pos}");
-                    panic!("can't find reloc, file_id {file_id} key {pos}");
+                    unreachable!("can't find reloc, file_id {file_id} key {pos}");
                 };
                 return tmp;
             }
@@ -845,23 +843,23 @@ impl BlobStatCtx {
         ret
     }
 
-    fn load(&self, addr: u64) -> Option<BoxRef> {
+    fn load(&self, addr: u64) -> Result<BoxRef, OpCode> {
         let file_id = {
             let lk = self.interval.read();
             let Some(file_id) = lk.find(addr) else {
                 log::error!("can't find file_id in interval by {addr}");
-                panic!("can't find file_id in interval by {addr}");
+                unreachable!("can't find file_id in interval by {addr}");
             };
             file_id
         };
 
         loop {
             if let Some(r) = self.cache.get(file_id as u64) {
-                return Some(r.read_at(addr));
+                return r.read_at(addr);
             }
 
             let lk = self.cache.lock_shard(file_id);
-            lk.add_if_missing(|| new_reader::<BlobFooter>(self.opt.blob_file(file_id)))?
+            lk.add_if_missing(|| new_reader::<BlobFooter>(self.opt.blob_file(file_id)))?;
         }
     }
 
@@ -870,14 +868,14 @@ impl BlobStatCtx {
             if let Some(x) = self.cache.get(file_id) {
                 let Some(&tmp) = x.map.get(&addr) else {
                     log::error!("can't find reloc, blob_id {file_id} key {addr}");
-                    panic!("can't find reloc, blob_id {file_id} key {addr}");
+                    unreachable!("can't find reloc, blob_id {file_id} key {addr}");
                 };
                 return tmp;
             }
 
             let lk = self.cache.lock_shard(file_id);
             lk.add_if_missing(|| new_reader::<BlobFooter>(self.opt.blob_file(file_id)))
-                .expect("can't fail")
+                .expect("can't fail");
         }
     }
 

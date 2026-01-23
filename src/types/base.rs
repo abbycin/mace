@@ -712,8 +712,8 @@ mod test {
     }
 
     impl ILoader for Allocator {
-        fn load(&self, addr: u64) -> Option<BoxView> {
-            Some(self.inner.map.get(&addr).unwrap().view())
+        fn load(&self, addr: u64) -> Result<BoxView, crate::OpCode> {
+            Ok(self.inner.map.get(&addr).unwrap().view())
         }
 
         fn pin(&self, data: BoxRef) {
@@ -724,8 +724,8 @@ mod test {
             self.clone()
         }
 
-        fn load_remote(&self, addr: u64) -> Option<BoxRef> {
-            Some(self.inner.map.get(&addr).unwrap().clone())
+        fn load_remote(&self, addr: u64) -> Result<BoxRef, crate::OpCode> {
+            Ok(self.inner.map.get(&addr).unwrap().clone())
         }
     }
 

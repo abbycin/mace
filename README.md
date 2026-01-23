@@ -31,9 +31,9 @@ cargo add mace-kv
 The following example demonstrates basic transaction management and data retrieval:
 
 ```rust
-use mace::{Mace, OpCode, Options};
+use mace::{Mace, Options, Status};
 
-fn main() -> Result<(), OpCode> {
+fn main() -> Result<(), Status> {
     // 1. Initialize the storage
     let opts = Options::new("./data_dir");
     let db = Mace::new(opts.validate().unwrap())?;

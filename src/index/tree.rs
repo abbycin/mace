@@ -8,9 +8,9 @@ use crate::types::node::RawLeafIter;
 use crate::types::refbox::DeltaView;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::data::Position;
-use crate::utils::{Handle, MutRef, ROOT_PID};
+use crate::utils::{Handle, MutRef, OpCode, ROOT_PID};
 use crate::{
-    OpCode, Store,
+    Store,
     types::{
         data::{Index, IntlKey, Key, Ver},
         node::MergeOp,
@@ -402,7 +402,6 @@ impl Tree {
         loop {
             match self.try_find_leaf(g, k) {
                 Err(OpCode::Again) => continue,
-                Err(OpCode::NotFound) => return Err(OpCode::NotFound),
                 Err(e) => unreachable!("invalid opcode {:?}", e),
                 o => return o,
             }
@@ -738,7 +737,7 @@ impl Tree {
         let ver = Ver::new(start_ts, NULL_CMD);
 
         while addr != NULL_PID {
-            let ptr = l.load(addr).ok_or(OpCode::NotFound)?.as_base();
+            let ptr = l.load(addr)?.as_base();
             let sst = ptr.sst::<Ver>();
             let mut pos = sst.lower_bound(&ver).unwrap_or_else(|pos| pos);
             while pos < sst.header().elems as usize {

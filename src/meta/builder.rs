@@ -22,7 +22,7 @@ pub(crate) struct ManifestBuilder {
     inner: Manifest,
     max_data_id: u64,
     max_blob_id: u64,
-    // Accumulated sizes for DataStat to avoid re-iteration in finish()
+    // accumulated sizes for DataStat to avoid re-iteration in finish()
     data_active_size: u64,
     data_total_size: u64,
 }
@@ -48,7 +48,7 @@ impl ManifestBuilder {
 
         let mut next_pid = ROOT_PID;
 
-        // 0. Check Version
+        // 0. check version
         let mut has_version = false;
         if let Ok(val) = self
             .inner
@@ -59,12 +59,12 @@ impl ManifestBuilder {
             let ver = u64::from_be_bytes(val[..8].try_into().map_err(|_| OpCode::BadData)?);
             if ver != CURRENT_VERSION {
                 log::error!("Version mismatch, expect {} get {}", CURRENT_VERSION, ver);
-                return Err(OpCode::BadData);
+                return Err(OpCode::BadVersion);
             }
             has_version = true;
         }
 
-        // 1. Load Numerics
+        // 1. load numerics
         if let Ok(val) = self
             .inner
             .btree
@@ -74,7 +74,7 @@ impl ManifestBuilder {
             // so we must have version, otherwise it's a legacy database
             if !has_version {
                 log::error!("Version mismatch, please use migration tool");
-                return Err(OpCode::BadData);
+                return Err(OpCode::BadVersion);
             }
             let src = Numerics::decode(&val);
             macro_rules! set {
@@ -100,7 +100,7 @@ impl ManifestBuilder {
             self.max_blob_id = src.next_blob_id.load(Relaxed).saturating_sub(1);
         }
 
-        // 2. Load PageTable
+        // 2. load page table
         self.inner
             .btree
             .view(BUCKET_PAGE_TABLE, |txn| {
@@ -125,7 +125,7 @@ impl ManifestBuilder {
             })
             .map_err(|_| OpCode::IoError)?;
 
-        // 3. Load DataStat
+        // 3. load DataStat
         let mut active_size = 0;
         let mut total_size = 0;
         self.inner
@@ -153,7 +153,7 @@ impl ManifestBuilder {
         self.data_active_size = active_size;
         self.data_total_size = total_size;
 
-        // 4. Load BlobStat
+        // 4. load BlobStat
         self.inner
             .btree
             .view(BUCKET_BLOB_STAT, |txn| {
@@ -175,7 +175,7 @@ impl ManifestBuilder {
             })
             .map_err(|_| OpCode::IoError)?;
 
-        // 5. Load Intervals
+        // 5. load DataIntervals
         self.inner
             .btree
             .view(BUCKET_DATA_INTERVAL, |txn| {
@@ -210,7 +210,7 @@ impl ManifestBuilder {
             })
             .map_err(|_| OpCode::IoError)?;
 
-        // 6. Load Obsolete
+        // 6. load Obsolete
         self.inner
             .btree
             .view(BUCKET_OBSOLETE_DATA, |txn| {
@@ -278,7 +278,7 @@ impl ManifestBuilder {
         let mut pending_data = Vec::new();
         let mut pending_blob = Vec::new();
 
-        // 1. Check for persisted orphan list from a previous crash during recovery
+        // 1. check for persisted orphan list from a previous crash during recovery
         let _ = self.inner.btree.view(BUCKET_NUMERICS, |txn| {
             if let Ok(val) = txn.get(b"orphan_data") {
                 pending_data = Delete::decode(&val).id;
@@ -289,8 +289,8 @@ impl ManifestBuilder {
             Ok(())
         });
 
-        // 2. If no persisted list, find them via linear probing starting from max_id + 1.
-        // If max_id + 1 doesn't exist, there are no orphans (or they were already cleared).
+        // 2. if no persisted list, find them via linear probing starting from max_id + 1
+        // if max_id + 1 doesn't exist, there are no orphans (or they were already cleared)
         if pending_data.is_empty() && pending_blob.is_empty() {
             let mut id = self.max_data_id + 1;
             while self.inner.opt.data_file(id).exists() {
@@ -308,7 +308,7 @@ impl ManifestBuilder {
                 return;
             }
 
-            // Record the orphan list in btree-store for crash safety before deletion.
+            // record the orphan list in btree-store for crash safety before deletion
             let mut txn = self.inner.begin();
             if !pending_data.is_empty() {
                 let d = Delete {
@@ -335,7 +335,7 @@ impl ManifestBuilder {
             txn.commit();
         }
 
-        // 3. Perform immediate deletion. SAFE because flushes haven't started.
+        // 3. perform immediate deletion. SAFE because flushes haven't started
         log::info!(
             "removing orphans: data {:?}, blob {:?}",
             pending_data,
@@ -348,7 +348,7 @@ impl ManifestBuilder {
             let _ = std::fs::remove_file(self.inner.opt.blob_file(id));
         }
 
-        // 4. Clear the persisted record once deletion is complete.
+        // 4. clear the persisted record once deletion is complete
         let mut txn = self.inner.begin();
         txn.ops
             .entry(BUCKET_NUMERICS)

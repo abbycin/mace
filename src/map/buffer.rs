@@ -6,7 +6,6 @@ use std::sync::{
 };
 
 use crate::{
-    OpCode,
     cc::context::Context,
     map::{SharedState, data::Arena, table::Swip},
     meta::Numerics,
@@ -16,7 +15,7 @@ use crate::{
         traits::{IHeader, ILoader},
     },
     utils::{
-        Handle, MutRef,
+        Handle, MutRef, OpCode,
         data::Position,
         lru::{CachePriority, ShardPriorityLru},
         options::ParsedOptions,
@@ -320,7 +319,6 @@ impl Buffers {
 
             match a.alloc(&self.pool.numerics, size) {
                 Ok(x) => return Ok((a, x)),
-                Err(e @ OpCode::TooLarge) => return Err(e),
                 Err(OpCode::Again) => continue,
                 Err(OpCode::NeedMore) => {
                     if a.set_state(Arena::HOT, Arena::WARM) == Arena::HOT {
@@ -402,7 +400,8 @@ impl Buffers {
                 // we delay cache warm up when the value of page map entry was updated
                 return Ok(Some(Page::<Loader>::from_swip(swip.raw())));
             }
-            let new = Page::load(self.loader(), swip.untagged()).ok_or(OpCode::NotFound)?;
+            let new = Page::load(self.loader(), swip.untagged())?;
+
             if self.table.cas(pid, swip.raw(), new.swip()).is_ok() {
                 self.cache(new);
                 return Ok(Some(new));
@@ -423,17 +422,17 @@ pub struct Loader {
 }
 
 impl Loader {
-    fn find(&self, addr: u64) -> Option<BoxRef> {
+    fn find(&self, addr: u64) -> Result<BoxRef, OpCode> {
         if let Some(x) = self.cache.get(addr) {
-            return Some(x.clone());
+            return Ok(x.clone());
         }
         if let Some(x) = self.pool.load(addr) {
             self.cache.add(CachePriority::High, addr, x.clone());
-            return Some(x);
+            return Ok(x);
         }
         let x = self.ctx.manifest.load_data(addr)?;
         self.cache.add(CachePriority::High, addr, x.clone());
-        Some(x)
+        Ok(x)
     }
 }
 
@@ -467,37 +466,37 @@ impl ILoader for Loader {
         debug_assert!(r.is_none());
     }
 
-    fn load(&self, addr: u64) -> Option<BoxView> {
+    fn load(&self, addr: u64) -> Result<BoxView, OpCode> {
         if let Some(p) = self.pinned.get(&addr) {
             let v = p.view();
-            return Some(v);
+            return Ok(v);
         }
         let x = self.find(addr)?;
 
         // concurrent load may happen, we have to make sure that all the load get the same view
         let e = self.pinned.entry(addr);
         match e {
-            Entry::Occupied(o) => Some(o.get().view()),
+            Entry::Occupied(o) => Ok(o.get().view()),
             Entry::Vacant(v) => {
                 let r = x.view();
                 v.insert(x);
-                Some(r)
+                Ok(r)
             }
         }
     }
 
-    fn load_remote(&self, addr: u64) -> Option<BoxRef> {
+    fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
         if let Some(x) = self.cache.get(addr) {
-            return Some(x.clone());
+            return Ok(x.clone());
         }
         if let Some(x) = self.pool.load(addr) {
             self.cache.add(CachePriority::Low, addr, x.clone());
-            return Some(x.clone());
+            return Ok(x.clone());
         }
 
         let b = self.ctx.manifest.load_blob(addr)?;
         self.cache.add(CachePriority::Low, addr, b.clone());
-        Some(b)
+        Ok(b)
     }
 
     fn load_remote_uncached(&self, addr: u64) -> BoxRef {

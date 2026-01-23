@@ -4,15 +4,16 @@ use crate::types::{
     header::BoxHeader,
     refbox::{BoxRef, BoxView},
 };
+use crate::utils::OpCode;
 
 pub trait ILoader: Clone {
     fn shallow_copy(&self) -> Self;
 
     fn pin(&self, data: BoxRef);
 
-    fn load(&self, addr: u64) -> Option<BoxView>;
+    fn load(&self, addr: u64) -> Result<BoxView, OpCode>;
 
-    fn load_remote(&self, addr: u64) -> Option<BoxRef>;
+    fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode>;
 
     fn load_remote_uncached(&self, _addr: u64) -> BoxRef {
         unimplemented!()

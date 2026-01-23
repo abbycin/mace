@@ -67,7 +67,7 @@ impl Mace {
         let store = MutRef::new(Store::new(table, opt.clone(), ctx));
         let tree = Self::open(store.clone());
 
-        recover.phase2(ctx, &desc, &tree);
+        recover.phase2(ctx, &desc, &tree)?;
         store.start();
         let handle = start_gc(store.clone(), store.context, tree.clone());
 

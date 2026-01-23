@@ -78,9 +78,8 @@ impl<'a> TxnKV<'a> {
 
         {
             let mut log = g.logging.lock();
-            let pos = log.record_begin(start_ts);
-            state.last_lsn = pos;
-            g.active_txns.insert(start_ts, pos);
+            state.prev_lsn = log.record_begin(start_ts)?;
+            g.active_txns.insert(start_ts, state.prev_lsn);
         }
 
         g.cc.commit_tree.compact(ctx, gid as u8);
@@ -129,9 +128,6 @@ impl<'a> TxnKV<'a> {
 
         let cmd_id_val = state.cmd_id;
         state.cmd_id += 1;
-        // Update state in Cell?
-        // We will update it at end of modify.
-
         let key = Key::new(k, Ver::new(start_ts, cmd_id_val));
         let val = Record::normal(gid as u8, v);
 
@@ -167,21 +163,17 @@ impl<'a> TxnKV<'a> {
                 *logged = true;
                 state.modified = true;
                 let mut log = g.logging.lock();
-                let pos = log.record_update(
+                let new_pos = log.record_update(
                     ver,
                     WalPut::new(v.len()),
                     k,
                     [].as_slice(),
                     v,
-                    state.last_lsn,
-                );
-                state.last_lsn = pos;
+                    state.prev_lsn,
+                )?;
+                state.prev_lsn = new_pos;
             }
-            // Return value (u8, u64) was (wid, seq).
-            // seq was logging.seq().
-            // logging.seq() is accessible via lock.
-            // let seq = g.logging.lock().seq();
-            r.map(|_| (gid as u8, state.last_lsn))
+            r.map(|_| (gid as u8, state.prev_lsn))
         })
         .map(|_| ())
     }
@@ -211,18 +203,17 @@ impl<'a> TxnKV<'a> {
                         state.modified = true;
                         *logged = true;
                         let mut log = g.logging.lock();
-                        let pos = log.record_update(
+                        let new_pos = log.record_update(
                             ver,
                             WalReplace::new(t.data().len(), v.len()),
                             rk.raw,
                             t.data(),
                             v,
-                            state.last_lsn,
-                        );
-                        state.last_lsn = pos;
+                            state.prev_lsn,
+                        )?;
+                        state.prev_lsn = new_pos;
                     }
-                    // let seq = g.logging.lock().seq();
-                    Ok((gid as u8, state.last_lsn))
+                    Ok((gid as u8, state.prev_lsn))
                 }
             }
         })
@@ -263,12 +254,17 @@ impl<'a> TxnKV<'a> {
                         state.modified = true;
                         logged = true;
                         let mut log = g.logging.lock();
-                        let pos =
-                            log.record_update(ver, WalPut::new(v.len()), k, &[], v, state.last_lsn);
-                        state.last_lsn = pos;
+                        let new_pos = log.record_update(
+                            ver,
+                            WalPut::new(v.len()),
+                            k,
+                            &[],
+                            v,
+                            state.prev_lsn,
+                        )?;
+                        state.prev_lsn = new_pos;
                     }
-                    // let seq = g.logging.lock().seq();
-                    Ok((gid as u8, state.last_lsn))
+                    Ok((gid as u8, state.prev_lsn))
                 }
                 Some((rk, rv)) => {
                     let t = rv.unwrap();
@@ -286,18 +282,17 @@ impl<'a> TxnKV<'a> {
                         state.modified = true;
                         logged = true;
                         let mut log = g.logging.lock();
-                        let pos = log.record_update(
+                        let new_pos = log.record_update(
                             ver,
                             WalReplace::new(t.data().len(), v.len()),
                             rk.raw,
                             t.data(),
                             v,
-                            state.last_lsn,
-                        );
-                        state.last_lsn = pos;
+                            state.prev_lsn,
+                        )?;
+                        state.prev_lsn = new_pos;
                     }
-                    // let seq = g.logging.lock().seq();
-                    Ok((gid as u8, state.last_lsn))
+                    Ok((gid as u8, state.prev_lsn))
                 }
             }
         })
@@ -339,18 +334,17 @@ impl<'a> TxnKV<'a> {
                         logged = true;
                         state.modified = true;
                         let mut log = g.logging.lock();
-                        let pos = log.record_update(
+                        let new_pos = log.record_update(
                             *key.ver(),
                             WalDel::new(t.data().len()),
                             rk.raw,
                             t.data(),
                             [].as_slice(),
-                            state.last_lsn,
-                        );
-                        state.last_lsn = pos;
+                            state.prev_lsn,
+                        )?;
+                        state.prev_lsn = new_pos;
                     }
-                    // let seq = g.logging.lock().seq();
-                    Ok((gid as u8, state.last_lsn))
+                    Ok((gid as u8, state.prev_lsn))
                 }
             }
         });
@@ -364,7 +358,7 @@ impl<'a> TxnKV<'a> {
         let g = self.ctx.group(state.group_id);
 
         if !state.modified {
-            g.logging.lock().record_commit(state.start_ts);
+            g.logging.lock().record_commit(state.start_ts)?;
             g.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
             return Ok(());
@@ -374,8 +368,8 @@ impl<'a> TxnKV<'a> {
 
         {
             let mut log = g.logging.lock();
-            log.record_commit(state.start_ts);
-            log.stabilize();
+            log.record_commit(state.start_ts)?;
+            log.stabilize()?;
         }
 
         g.cc.commit_tree.append(state.start_ts, commit_ts);
@@ -453,11 +447,22 @@ impl Drop for TxnKV<'_> {
             let state = self.state_ref();
             let grp = self.ctx.group(state.group_id);
 
-            // Rollback
             if !state.modified {
-                grp.logging.lock().record_abort(state.start_ts);
+                grp.logging
+                    .lock()
+                    .record_abort(state.start_ts)
+                    .inspect_err(|e| {
+                        log::error!("can't record abort, {:?}", e);
+                    })
+                    .expect("can't fail");
             } else {
-                grp.logging.lock().stabilize();
+                grp.logging
+                    .lock()
+                    .stabilize()
+                    .map_err(|e| {
+                        log::error!("can't stabilize WAL, {:?}", e);
+                    })
+                    .expect("can't fail");
 
                 use crate::cc::wal::{Location, WalReader};
                 use crate::utils::block::Block;
@@ -467,13 +472,17 @@ impl Drop for TxnKV<'_> {
                 let reader = WalReader::new(self.ctx, &g);
                 let location = Location {
                     group_id: state.group_id as u32,
-                    pos: state.last_lsn,
+                    pos: state.prev_lsn,
                     len: 0,
                 };
 
-                reader.rollback(&mut block, state.start_ts, location, self.tree);
+                reader
+                    .rollback(&mut block, state.start_ts, location, self.tree)
+                    .inspect_err(|e| {
+                        log::error!("can't rollback, {:?}", e);
+                    })
+                    .expect("can't fail");
 
-                // Mark as committed in CommitTree so the restored values are visible and safe from GC
                 let commit_ts = self.ctx.alloc_oracle();
                 grp.cc.commit_tree.append(state.start_ts, commit_ts);
                 grp.cc.latest_cts.store(commit_ts, Relaxed);
@@ -539,7 +548,11 @@ mod test {
     use crate::{Mace, OpCode, Options, RandomPath};
 
     #[test]
-    fn txnkv() -> Result<(), OpCode> {
+    fn txnkv() {
+        txnkv_impl().unwrap();
+    }
+
+    fn txnkv_impl() -> Result<(), OpCode> {
         let path = RandomPath::tmp();
         let _ = std::fs::remove_dir_all(&*path);
         let opt = Options::new(&*path).validate().unwrap();
@@ -659,14 +672,18 @@ mod test {
     }
 
     #[test]
-    fn cross_long_txn() -> Result<(), OpCode> {
+    fn cross_long_txn() {
+        cross_long_txn_impl().unwrap();
+    }
+
+    fn cross_long_txn_impl() -> Result<(), OpCode> {
         let path = RandomPath::new();
         let mut opt = Options::new(&*path);
         let consolidate_threshold = 256;
         opt.tmp_store = true;
         opt.split_elems = consolidate_threshold * 2;
         opt.consolidate_threshold = consolidate_threshold;
-        let db = Mace::new(opt.validate()?)?;
+        let db = Mace::new(opt.validate().unwrap())?;
 
         let kv = db.begin()?;
         kv.put("foo", "bar")?;

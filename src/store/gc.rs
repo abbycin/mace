@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    Options, Store,
+    OpCode, Options, Store,
     cc::context::Context,
     index::tree::Tree,
     io::{File, GatherIO},
@@ -221,7 +221,7 @@ impl GarbageCollector {
         }
 
         // strategy: scan the entire page table approximately every 500 ticks (e.g., ~8 hours if tick=1min)
-        // but keep the batch size within a reasonable range [128, 10000].
+        // but keep the batch size within a reasonable range [128, 10000]
         let batch_size = (max_pid / 500).clamp(128, 10000);
         let mut compact_count = 0;
         let max_compact_per_tick = 64; // limit I/O impact
@@ -409,7 +409,9 @@ impl GarbageCollector {
             // [oldest_id, checkpoint_id)
             Self::process_one_wal(&self.store.opt, g.id as u8, oldest_id, checkpoint_id);
             let mut desc = desc_clone.lock();
-            desc.update_oldest(self.ctx.opt.desc_file(g.id as u8), checkpoint_id);
+            desc.update_oldest(self.ctx.opt.desc_file(g.id as u8), checkpoint_id)
+                .inspect_err(|e| log::error!("can't update oldest, {:?}", e))
+                .expect("can't fail");
         }
     }
 
@@ -495,7 +497,7 @@ impl GarbageCollector {
         // it's possible that other thread deactived all data in data file while we are procesing
         self.process_obsoleted_data(obsoleted);
 
-        // 1. Perform Disk I/O (Build data file)
+        // 1. perform disk I/O (build data file)
         let (fstat, relocs) = builder
             .build()
             .inspect_err(|e| {
@@ -503,7 +505,7 @@ impl GarbageCollector {
             })
             .unwrap();
 
-        // 2. Commit Metadata Transaction
+        // 2. commit metadata transaction
         let mut txn = self.ctx.manifest.begin();
         txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
 
@@ -596,7 +598,7 @@ impl GarbageCollector {
         // it's possible that other thread deactived all data in blob file while we are procesing
         self.process_obsoleted_blob(obsoleted);
 
-        // 1. Perform Disk I/O (Build blob file)
+        // 1. perform disk I/O (build blob file)
         let (bstat, reloc) = builder
             .build(blob_id)
             .inspect_err(|e| {
@@ -604,7 +606,7 @@ impl GarbageCollector {
             })
             .unwrap();
 
-        // 2. Commit Metadata Transaction
+        // 2. commit metadata transaction
         let mut txn = self.ctx.manifest.begin();
         txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
 
@@ -669,7 +671,7 @@ impl<'a> DataReWriter<'a> {
         self.nr_interval += 1;
     }
 
-    fn build(&mut self) -> Result<(MemDataStat, HashMap<u64, LenSeq>), std::io::Error> {
+    fn build(&mut self) -> Result<(MemDataStat, HashMap<u64, LenSeq>), OpCode> {
         let up2 = self.sum_up2 / self.total;
         let block = Block::alloc(1 << 20);
         let mut seq = 0;
@@ -766,10 +768,7 @@ impl<'a> BlobRewriter<'a> {
         self.nr_interval += 1;
     }
 
-    fn build(
-        &mut self,
-        file_id: u64,
-    ) -> Result<(MemBlobStat, HashMap<u64, LenSeq>), std::io::Error> {
+    fn build(&mut self, file_id: u64) -> Result<(MemBlobStat, HashMap<u64, LenSeq>), OpCode> {
         let path = self.opt.blob_file(file_id);
         let mut w = GatherWriter::trunc(&path, 8);
         let mut off = 0;
@@ -825,7 +824,7 @@ impl<'a> BlobRewriter<'a> {
         w.queue(footer.as_slice());
         w.flush();
         w.sync();
-        log::error!("compacted [{beg}, {end}] to {path:?} {footer:?}");
+        log::info!("compacted [{beg}, {end}] to {path:?} {footer:?}");
         let stat = MemBlobStat {
             inner: BlobStatInner {
                 file_id,
@@ -922,7 +921,7 @@ fn copy<R>(
     buf: &mut [u8],
     len: usize,
     mut off: u64,
-) -> Result<u32, std::io::Error>
+) -> Result<u32, OpCode>
 where
     R: GatherIO,
 {
@@ -933,7 +932,10 @@ where
     while n < len {
         let cnt = buf_sz.min(len - n);
         let s = &mut buf[0..cnt];
-        r.read(s, off)?;
+        r.read(s, off).map_err(|e| {
+            log::error!("can't read, {:?}", e);
+            OpCode::IoError
+        })?;
         crc.write(s);
         // the data will be reused next time, so we write data to file instead of queue it
         w.write(s);
