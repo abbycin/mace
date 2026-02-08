@@ -26,6 +26,10 @@ Add mace-kv to your Cargo.toml:
 cargo add mace-kv
 ```
 
+## Design
+
+See `docs/design.md` for the current architecture and crash-safety notes.
+
 ## Quick Start
 
 The following example demonstrates basic transaction management and data retrieval:

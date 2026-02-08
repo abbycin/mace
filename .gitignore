@@ -7,5 +7,6 @@
 .cache
 Cargo.lock
 *.md
+!docs/design.md
 !README.md
 !CHANGELOG.md
