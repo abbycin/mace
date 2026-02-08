@@ -64,6 +64,22 @@ impl From<std::io::Error> for OpCode {
     }
 }
 
+impl From<btree_store::Error> for OpCode {
+    fn from(err: btree_store::Error) -> Self {
+        match err {
+            btree_store::Error::NotFound => OpCode::NotFound,
+            btree_store::Error::Corruption => OpCode::Corruption,
+            btree_store::Error::TooLarge => OpCode::TooLarge,
+            btree_store::Error::Internal => OpCode::Invalid,
+            btree_store::Error::NoSpace => OpCode::NoSpace,
+            btree_store::Error::IoError => OpCode::IoError,
+            btree_store::Error::Invalid => OpCode::Invalid,
+            btree_store::Error::Duplicate => OpCode::Exist,
+            btree_store::Error::Conflict => OpCode::Again,
+        }
+    }
+}
+
 pub(crate) const NULL_PID: u64 = 0;
 /// it's same to DEFAULT_BUCKET_ID
 pub(crate) const ROOT_PID: u64 = 1;
