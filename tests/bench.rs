@@ -9,7 +9,8 @@ fn bench() {
     let mut opt = Options::new(&*path);
     opt.sync_on_write = false;
     let mut copy = opt.clone();
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
 
     let cap = 100000;
     let mut pair = Vec::with_capacity(cap);
@@ -39,8 +40,11 @@ fn bench() {
     let e2 = b.elapsed();
 
     drop(db);
+    drop(mace);
+
     copy.tmp_store = true;
-    let db = Mace::new(copy.validate().unwrap()).unwrap();
+    let mace = Mace::new(copy.validate().unwrap()).unwrap();
+    let db = mace.get_bucket("x").unwrap();
 
     let b = Instant::now();
     for k in &pair {

@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::OpCode;
 use crate::utils::{NULL_ADDR, ROOT_PID};
@@ -14,6 +14,7 @@ pub struct PageMap {
     l2: Box<Layer2>,
     l3: Box<Layer3>,
     next: AtomicU64,
+    pub scavenge_cursor: AtomicU64,
     free: Mutex<BTreeSet<u64>>,
 }
 
@@ -37,6 +38,7 @@ impl Default for PageMap {
             l2: box_new(),
             l3: box_new(),
             next: AtomicU64::new(ROOT_PID),
+            scavenge_cursor: AtomicU64::new(ROOT_PID),
             free: Mutex::new(BTreeSet::new()),
         }
     }
@@ -71,6 +73,16 @@ impl PageMap {
         None
     }
 
+    pub fn map_to(&self, pid: u64, data: u64) {
+        // pid may have been placed in free list by a rollback; ensure it is not reused concurrently
+        let mut lk = self.free.lock();
+        lk.remove(&pid);
+        drop(lk);
+
+        self.index(pid).store(data, Ordering::Release);
+        self.next.fetch_max(pid + 1, Ordering::AcqRel);
+    }
+
     pub fn unmap(&self, pid: u64, addr: u64) -> Result<(), OpCode> {
         self.index(pid)
             .compare_exchange(addr, NULL_ADDR, Ordering::AcqRel, Ordering::Relaxed)
@@ -82,12 +94,50 @@ impl PageMap {
         Ok(())
     }
 
-    pub fn set_next(&self, pid: u64) {
-        self.next.store(pid, Ordering::Relaxed);
-    }
-
     pub fn get(&self, pid: u64) -> u64 {
         self.index(pid).load(Ordering::Relaxed)
+    }
+
+    pub fn recover(&self, bucket_id: u64, btree: Option<&btree_store::BTree>) {
+        let mut next_pid = ROOT_PID + 1;
+
+        if let Some(btree) = btree {
+            let bucket_table = crate::meta::page_table_name(bucket_id);
+            let _ = btree.view(&bucket_table, |txn| {
+                let mut iter = txn.iter();
+                let mut k = Vec::new();
+                let mut v = Vec::new();
+                while iter.next_ref(&mut k, &mut v) {
+                    let pid_bytes: [u8; 8] = k[..8]
+                        .try_into()
+                        .map_err(|_| btree_store::Error::Corruption)?;
+                    let addr_bytes: [u8; 8] = v[..8]
+                        .try_into()
+                        .map_err(|_| btree_store::Error::Corruption)?;
+                    let pid = <u64>::from_be_bytes(pid_bytes);
+                    let addr = <u64>::from_be_bytes(addr_bytes);
+
+                    self.index(pid)
+                        .fetch_max(Swip::tagged(addr), Ordering::Relaxed);
+                    next_pid = next_pid.max(pid + 1);
+                }
+                Ok(())
+            });
+        }
+
+        self.next.fetch_max(next_pid, Ordering::Relaxed);
+        self.scavenge_cursor.store(
+            rand::random_range(ROOT_PID..self.next.load(Ordering::Relaxed).max(ROOT_PID + 1)),
+            Ordering::Relaxed,
+        );
+
+        let mut lk = self.free.lock();
+        let max_pid = next_pid;
+        for pid in ROOT_PID..max_pid {
+            if self.index(pid).load(Ordering::Relaxed) == NULL_ADDR {
+                lk.insert(pid);
+            }
+        }
     }
 
     pub fn index(&self, pid: u64) -> &AtomicU64 {
@@ -113,6 +163,10 @@ impl PageMap {
     pub fn len(&self) -> u64 {
         self.next.load(Ordering::Acquire)
     }
+}
+
+impl Drop for PageMap {
+    fn drop(&mut self) {}
 }
 
 struct Layer3([AtomicU64; SLOT_SIZE as usize]);
@@ -216,6 +270,56 @@ impl Swip {
 
     pub(crate) fn tagged(x: u64) -> u64 {
         x | Self::TAG
+    }
+}
+
+pub(crate) struct BucketState {
+    pub(crate) txn_ref: AtomicUsize,
+    pub(crate) next_addr: AtomicU64,
+    pub(crate) is_deleting: AtomicBool,
+    pub(crate) is_drop: AtomicBool,
+}
+
+impl BucketState {
+    pub(crate) fn new() -> Self {
+        Self {
+            txn_ref: AtomicUsize::new(0),
+            is_deleting: AtomicBool::new(false),
+            is_drop: AtomicBool::new(false),
+            next_addr: AtomicU64::new(crate::utils::INIT_ADDR),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn inc_txn_ref(&self) {
+        self.txn_ref.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn dec_txn_ref(&self) {
+        self.txn_ref.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn set_deleting(&self) {
+        self.is_deleting.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_drop(&self) {
+        self.is_drop.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn is_deleting(&self) -> bool {
+        self.is_deleting.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_drop(&self) -> bool {
+        self.is_drop.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.txn_ref.load(Ordering::Relaxed) > 0
     }
 }
 

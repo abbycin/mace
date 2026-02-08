@@ -2,13 +2,13 @@ use super::{Node, Page, systxn::SysTxn};
 
 use crate::Options;
 use crate::cc::context::Context;
-use crate::map::buffer::Loader;
+use crate::map::buffer::{BucketContext, Loader};
 use crate::types::data::{IterItem, Record, Val};
 use crate::types::node::RawLeafIter;
 use crate::types::refbox::DeltaView;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::data::Position;
-use crate::utils::{Handle, MutRef, OpCode, ROOT_PID};
+use crate::utils::{Handle, MutRef, NULL_ADDR, OpCode};
 use crate::{
     Store,
     types::{
@@ -23,6 +23,8 @@ use crossbeam_epoch::Guard;
 use std::borrow::Cow;
 use std::cmp::Ordering::Equal;
 use std::ops::{Bound, Deref, RangeBounds};
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Acquire;
 #[cfg(feature = "metric")]
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -38,6 +40,7 @@ macro_rules! inc_cas {
     ($filed: ident) => {};
 }
 
+/// A reference to a value in the storage engine.
 #[derive(Clone)]
 pub struct ValRef {
     raw: Record,
@@ -49,10 +52,12 @@ impl ValRef {
         Self { raw, _owner: f }
     }
 
+    /// Returns the data as a byte slice.
     pub fn slice(&self) -> &[u8] {
         self.raw.data()
     }
 
+    /// Converts the reference into a owned Vec<u8>.
     pub fn to_vec(self) -> Vec<u8> {
         self.raw.data().to_vec()
     }
@@ -79,32 +84,32 @@ impl Drop for ValRef {
 #[derive(Clone)]
 pub struct Tree {
     pub(crate) store: MutRef<Store>,
-    root_index: Index,
+    pub(crate) root_index: Index,
+    pub(crate) bucket: Arc<BucketContext>,
 }
 
 impl Tree {
-    pub fn load(store: MutRef<Store>) -> Self {
-        Self {
-            store: store.clone(),
-            root_index: Index::new(ROOT_PID),
+    pub fn new(store: MutRef<Store>, root_pid: u64, bucket: Arc<BucketContext>) -> Self {
+        let this = Self {
+            store,
+            root_index: Index::new(root_pid),
+            bucket,
+        };
+
+        let addr = this.bucket.table.index(root_pid).load(Acquire);
+        if addr == NULL_ADDR {
+            this.init(root_pid);
         }
-    }
-
-    pub fn new(store: MutRef<Store>) -> Self {
-        let this = Self::load(store);
-        this.init();
-
         this
     }
 
-    fn init(&self) {
+    fn init(&self, root_pid: u64) {
         let g = crossbeam_epoch::pin();
         let mut txn = self.begin(&g);
-        let node = Node::new_leaf(&mut txn, self.store.buffer.loader());
-        let mut new_page = Page::new(node);
-        let root_pid = txn.map(&mut new_page);
-        self.store.buffer.cache(new_page);
-        assert_eq!(root_pid, self.root_index.pid);
+        let node = Node::new_leaf(&mut txn, self.bucket.loader(self.store.context));
+        let mut page = Page::new(node);
+        txn.map_to(&mut page, root_pid);
+        self.bucket.cache(page);
         txn.commit();
     }
 
@@ -112,13 +117,17 @@ impl Tree {
         self.store.context.safe_txid()
     }
 
+    pub(crate) fn bucket_id(&self) -> u64 {
+        self.bucket.bucket_id
+    }
+
     pub(crate) fn begin<'a>(&'a self, g: &'a Guard) -> SysTxn<'a> {
-        SysTxn::new(&self.store, g)
+        SysTxn::new(&self.bucket.table, &self.store.opt, g, &self.bucket)
     }
 
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
         loop {
-            if let Some(p) = self.store.buffer.load(pid)? {
+            if let Some(p) = self.bucket.load(pid)? {
                 let child_pid = p.header().merging_child;
                 if child_pid != NULL_PID {
                     self.merge_node(&p, child_pid, g)?;
@@ -139,7 +148,7 @@ impl Tree {
     fn merge_node(&self, parent_ptr: &Page, child_pid: u64, g: &Guard) -> Result<(), OpCode> {
         // NOTE: a big lock is necessary because the merge process must be exclusive
         let Some(_lk) = parent_ptr.try_lock() else {
-            // retrun Ok let cooperative threads not retry
+            // return Ok let cooperative threads not retry
             return Ok(());
         };
         let safe_txid = self.txid();
@@ -324,7 +333,7 @@ impl Tree {
         let lpage = txn.replace(node, lnode, junks).inspect_err(|_| {
             inc_cas!(split_fail1);
         })?;
-        self.store.buffer.cache(rpage);
+        self.bucket.cache(rpage);
         // drop lock early let cooperative threads have chance to make progress
         drop(node_lock);
         // publish rpage to global
@@ -334,7 +343,7 @@ impl Tree {
         if let Some(parent) = parent_opt {
             // multiple threads (cooperative) may concurrently update parent
             let _lk = parent.lock();
-            if self.store.page.get(parent.pid()) != parent.swip() {
+            if self.bucket.table.get(parent.pid()) != parent.swip() {
                 // other thread has finished same job
                 return Ok(());
             }
@@ -366,7 +375,7 @@ impl Tree {
         safe_txid: u64,
     ) -> Result<(), OpCode> {
         let _lk = root.lock();
-        if self.store.page.get(root.pid()) != root.swip() {
+        if self.bucket.table.get(root.pid()) != root.swip() {
             return Err(OpCode::Again);
         };
         let mut txn = self.begin(g);
@@ -380,7 +389,7 @@ impl Tree {
 
         let new_root_node = Node::new_root(
             &mut txn,
-            self.store.buffer.loader(),
+            self.bucket.loader(self.store.context),
             &[
                 (IntlKey::new([].as_slice()), Index::new(lpid)),
                 (IntlKey::new(lo), Index::new(rpid)),
@@ -391,10 +400,10 @@ impl Tree {
         let n = txn.replace(root, new_root_node, &j).inspect_err(|_| {
             inc_cas!(split_root_fail);
         })?;
-        assert_eq!(n.box_header().pid, ROOT_PID);
+        assert_eq!(n.box_header().pid, self.root_index.pid);
         // publish new root to global
         txn.commit();
-        self.store.buffer.cache(lpage);
+        self.bucket.cache(lpage);
         Ok(())
     }
 
@@ -466,7 +475,7 @@ impl Tree {
             if let Some(unsplit) = unsplit_parent_opt.take() {
                 let mut txn = self.begin(g);
                 let _lk = unsplit.lock();
-                if self.store.page.get(unsplit.pid()) != unsplit.swip() {
+                if self.bucket.table.get(unsplit.pid()) != unsplit.swip() {
                     // other thread has finished same job
                     return Err(OpCode::Again);
                 }
@@ -510,7 +519,7 @@ impl Tree {
 
     fn try_compact(&self, g: &Guard, page: Page) {
         let _lk = page.lock();
-        if self.store.page.get(page.pid()) != page.swip() {
+        if self.bucket.table.get(page.pid()) != page.swip() {
             return;
         };
 
@@ -584,7 +593,7 @@ impl Tree {
                 continue;
             };
             // consolidate happened, we must retry from root
-            if self.store.page.get(page.pid()) != page.swip() {
+            if self.bucket.table.get(page.pid()) != page.swip() {
                 return Err(OpCode::Again);
             };
 
@@ -719,7 +728,10 @@ impl Tree {
             iter: None,
             cache: None,
             checker: Box::new(visible),
-            filter: Filter { last: None },
+            filter: Filter {
+                last: Vec::new(),
+                has_last: false,
+            },
         }
     }
 
@@ -822,6 +834,7 @@ impl ITree for Tree {
     }
 }
 
+/// An iterator over key-value pairs in a bucket.
 pub struct Iter<'a> {
     tree: &'a Tree,
     cached_key: Handle<Vec<u8>>,
@@ -885,8 +898,19 @@ impl Iter<'_> {
             });
 
             if let Some(item) = r {
-                // the key was already assembled in `iter.find`
-                self.lo = Bound::Excluded(item.key().to_vec());
+                // reuse existing lower-bound buffer to avoid realloc per item
+                let key = item.key();
+                match &mut self.lo {
+                    Bound::Included(v) | Bound::Excluded(v) => {
+                        v.clear();
+                        v.extend_from_slice(key);
+                        // keep the variant as Excluded for next search step
+                        self.lo = Bound::Excluded(std::mem::take(v));
+                    }
+                    Bound::Unbounded => {
+                        self.lo = Bound::Excluded(key.to_vec());
+                    }
+                }
 
                 match self.hi {
                     Bound::Unbounded => return Some(item),
@@ -922,18 +946,19 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 struct Filter {
-    last: Option<Vec<u8>>,
+    last: Vec<u8>,
+    has_last: bool,
 }
 
 impl Filter {
     fn check<L: ILoader>(&mut self, item: &IterItem<L>) -> bool {
-        if let Some(last) = self.last.as_ref()
-            && item.cmp_key(last).is_eq()
-        {
+        if self.has_last && item.cmp_key(&self.last).is_eq() {
             return false;
         }
         let last = item.assembled_key();
-        self.last = Some(last.deref().clone());
+        self.last.clear();
+        self.last.extend_from_slice(last.deref());
+        self.has_last = true;
         !item.is_tombstone()
     }
 }
@@ -1003,7 +1028,8 @@ mod test {
         let mut opt = Options::new(&*path);
         opt.split_elems = 256;
         opt.tmp_store = true;
-        let db = Mace::new(opt.validate().unwrap()).unwrap();
+        let mace = Mace::new(opt.validate().unwrap()).unwrap();
+        let db = mace.new_bucket("default").unwrap();
 
         let num_readers = 4;
         let num_iterations = 1000;

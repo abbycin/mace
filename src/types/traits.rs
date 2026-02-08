@@ -6,7 +6,9 @@ use crate::types::{
 };
 use crate::utils::OpCode;
 
-pub trait ILoader: Clone {
+pub trait ILoader {
+    fn deep_copy(&self) -> Self;
+
     fn shallow_copy(&self) -> Self;
 
     fn pin(&self, data: BoxRef);

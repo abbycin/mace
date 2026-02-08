@@ -1,4 +1,4 @@
-use mace::{Mace, OpCode, Options, RandomPath};
+use mace::{Bucket, Mace, OpCode, Options, RandomPath};
 use rand::seq::SliceRandom;
 use std::{
     collections::HashSet,
@@ -11,8 +11,8 @@ use std::{
 fn put_get() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
-    let db = Mace::new(opt.validate().unwrap())?;
-
+    let mace = Mace::new(opt.validate().unwrap())?;
+    let db = mace.new_bucket("default").unwrap();
     let n = 1000;
     let mut elems = Vec::with_capacity(n);
     for i in 0..n {
@@ -63,11 +63,13 @@ fn put_get() -> Result<(), OpCode> {
     kv.put("foo", "bar").unwrap();
     kv.commit()?;
 
+    drop(db);
+    drop(mace);
     Ok(())
 }
 
 fn check(
-    db: &Mace,
+    db: &Bucket,
     elems: &[String],
     del1: &RwLock<HashSet<Vec<u8>>>,
     del2: &RwLock<HashSet<Vec<u8>>>,
@@ -102,8 +104,8 @@ fn check(
 fn get_del() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
-    let db = Mace::new(opt.validate().unwrap())?;
-
+    let mace = Mace::new(opt.validate().unwrap())?;
+    let db = mace.new_bucket("default").unwrap();
     let n = 1000;
     let mut v = Vec::with_capacity(n);
 
@@ -144,6 +146,8 @@ fn get_del() -> Result<(), OpCode> {
         assert!(r.is_err());
     }
 
+    drop(db);
+    drop(mace);
     Ok(())
 }
 
@@ -154,14 +158,14 @@ fn rollback() {
     opts.tmp_store = true;
     opts.sync_on_write = false;
     opts.concurrent_write = 16;
-    let db = Mace::new(opts.validate().unwrap()).unwrap();
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10000;
-
+    let db = mace.new_bucket("x").unwrap();
     // multiple threads are trying to update the same key, some of them will pass the visibility check
-    // and start update the key, but only one of them may success, those failure threads will check the
+    // and start updating the key, but only one of them may succeed, those failure threads will check the
     // visibility again and find the new key is invisible to them, they will abort the transaction
-    // and rollback what they have wrote to the log
-    fn update(db: &Mace, pairs: &Vec<Vec<u8>>) {
+    // and rollback what they have written to the log
+    fn update(db: &Bucket, pairs: &Vec<Vec<u8>>) {
         for x in pairs {
             let kv = db.begin().unwrap();
             if kv.update(x, x).is_ok() {
@@ -190,8 +194,8 @@ fn rollback() {
             }
             let h: Vec<JoinHandle<()>> = (0..t)
                 .map(|_| {
-                    let db = db.clone();
                     let pairs = pairs.clone();
+                    let db = db.clone();
                     std::thread::spawn(move || update(&db, &pairs))
                 })
                 .collect();
@@ -201,13 +205,16 @@ fn rollback() {
             }
         }
     }
+    drop(db);
+    drop(mace);
 }
 
 #[test]
 fn range_simple() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
-    let db = Mace::new(opts.validate().unwrap()).unwrap();
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
 
     let kv = db.begin().unwrap();
     kv.put("foo", "1")?;
@@ -223,37 +230,47 @@ fn range_simple() -> Result<(), OpCode> {
     kv.put("fool", "1")?;
     kv.commit()?;
 
-    let view = db.view().unwrap();
-    let mut iter = view.seek("foo");
-    let item = iter.next().unwrap();
-    assert_eq!(item.key(), "foo".as_bytes());
-    assert_eq!(item.val(), "3".as_bytes());
-    let item = iter.next().unwrap();
-    assert_eq!(item.key(), "fool".as_bytes());
-    assert_eq!(item.val(), "1".as_bytes());
+    {
+        let view = db.view().unwrap();
+        let mut iter = view.seek("foo");
+        let item = iter.next().unwrap();
+        assert_eq!(item.key(), "foo".as_bytes());
+        assert_eq!(item.val(), "3".as_bytes());
+        let item = iter.next().unwrap();
+        assert_eq!(item.key(), "fool".as_bytes());
+        assert_eq!(item.val(), "1".as_bytes());
 
-    assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+        drop(item);
+        drop(iter);
 
-    let mut iter = view.seek("mo");
-    let item = iter.next().unwrap();
-    assert_eq!(item.key(), "mo".as_bytes());
-    assert_eq!(item.val(), "3".as_bytes());
-    assert!(iter.next().is_none());
+        let mut iter = view.seek("mo");
+        let item = iter.next().unwrap();
+        assert_eq!(item.key(), "mo".as_bytes());
+        assert_eq!(item.val(), "3".as_bytes());
+        assert!(iter.next().is_none());
+        drop(item);
+        drop(iter);
+    }
 
     let kv = db.begin().unwrap();
     kv.del("foo")?;
-    let mut iter = kv.seek("foo");
-    let item = iter.next().unwrap();
-    assert_eq!(item.key(), "fool".as_bytes());
-    assert_eq!(item.val(), "1".as_bytes());
-    assert!(iter.next().is_none());
-    drop(iter);
+    {
+        let mut iter = kv.seek("foo");
+        let item = iter.next().unwrap();
+        assert_eq!(item.key(), "fool".as_bytes());
+        assert_eq!(item.val(), "1".as_bytes());
+        assert!(iter.next().is_none());
+    }
     drop(kv);
+    drop(db);
+    drop(mace);
 
     {
         let mut opts = Options::new(&*RandomPath::new());
         opts.tmp_store = true;
-        let db = Mace::new(opts.validate().unwrap()).unwrap();
+        let mace = Mace::new(opts.validate().unwrap()).unwrap();
+        let db = mace.new_bucket("x").unwrap();
 
         let kv = db.begin().unwrap();
         kv.put([0], "bar")?;
@@ -272,6 +289,12 @@ fn range_simple() -> Result<(), OpCode> {
         let item = iter.next().unwrap();
         assert_eq!(item.key(), [0, 2].as_slice());
         assert_eq!(item.val(), "bar".as_bytes());
+
+        drop(item);
+        drop(iter);
+        drop(view);
+        drop(db);
+        drop(mace);
     }
     Ok(())
 }
@@ -280,8 +303,9 @@ fn range_simple() -> Result<(), OpCode> {
 fn range_in_one_node() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
-    let db = Mace::new(opts.validate().unwrap()).unwrap();
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10;
+    let db = mace.new_bucket("x").unwrap();
 
     let check_app = || {
         let mut words = Vec::new();
@@ -330,20 +354,23 @@ fn range_in_one_node() -> Result<(), OpCode> {
         keys.insert(x);
     }
 
-    let mut cnt = 0;
-    let view = db.view().unwrap();
-    for item in view.seek("key") {
-        cnt += 1;
-        let k = item.key();
-        let v = item.val();
-        assert_eq!(k, v);
-        assert!(keys.contains(to_str(k)));
+    {
+        let mut cnt = 0;
+        let view = db.view().unwrap();
+        for item in view.seek("key") {
+            cnt += 1;
+            let k = item.key();
+            let v = item.val();
+            assert_eq!(k, v);
+            assert!(keys.contains(to_str(k)));
+        }
+        assert_eq!(cnt, N);
     }
-
-    assert_eq!(cnt, N);
     // check again
     check_app();
 
+    drop(db);
+    drop(mace);
     Ok(())
 }
 
@@ -353,7 +380,8 @@ fn range_cross_node() -> Result<(), OpCode> {
     opts.split_elems = 128; // force split
     opts.sync_on_write = false;
     opts.tmp_store = true;
-    let db = Mace::new(opts.validate().unwrap()).unwrap();
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
     const N: usize = 500;
     let mut h = HashSet::with_capacity(N);
 
@@ -400,6 +428,8 @@ fn range_cross_node() -> Result<(), OpCode> {
     // check again
     check_key();
 
+    drop(db);
+    drop(mace);
     Ok(())
 }
 
@@ -409,7 +439,8 @@ fn cross_txn() {
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
     opt.concurrent_write = 4;
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
 
     let tx1 = db.begin().unwrap();
     let tx2 = db.begin().unwrap();
@@ -426,29 +457,40 @@ fn cross_txn() {
     assert_eq!(iter.count(), 0);
     let _ = tx2.commit();
 
-    let tx2 = db.view().unwrap();
-    let iter = tx2.seek("fo");
-    assert_eq!(iter.count(), 2);
+    {
+        let tx2 = db.view().unwrap();
+        let iter = tx2.seek("fo");
+        assert_eq!(iter.count(), 2);
+    }
 
     let tx1 = db.begin().unwrap();
     tx1.del("foo").unwrap();
 
-    let iter = tx1.seek("fo");
-    assert_eq!(iter.count(), 1);
+    {
+        let iter = tx1.seek("fo");
+        assert_eq!(iter.count(), 1);
+    }
 
-    let view = db.view().unwrap();
-    let iter = view.seek("fo");
-    assert_eq!(iter.count(), 2);
+    {
+        let view = db.view().unwrap();
+        let iter = view.seek("fo");
+        assert_eq!(iter.count(), 2);
 
-    let _ = tx1.commit();
-    let iter = view.seek("fo");
-    assert_eq!(iter.count(), 2);
+        let _ = tx1.commit();
+        let iter = view.seek("fo");
+        assert_eq!(iter.count(), 2);
+    }
 
-    let view = db.view().unwrap();
-    let iter = view.seek("fo");
-    assert_eq!(iter.count(), 1);
-    let r = view.get("fool").unwrap();
-    assert_eq!(r.slice(), "2".as_bytes());
+    {
+        let view = db.view().unwrap();
+        let iter = view.seek("fo");
+        assert_eq!(iter.count(), 1);
+        let r = view.get("fool").unwrap();
+        assert_eq!(r.slice(), "2".as_bytes());
+    }
+
+    drop(db);
+    drop(mace);
 }
 
 #[test]
@@ -458,7 +500,8 @@ fn smo_during_scan() -> Result<(), OpCode> {
     opt.tmp_store = true;
     opt.split_elems = 128;
 
-    let db = Mace::new(opt.validate()?)?;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
     let data: Vec<String> = (0..512).map(|x| format!("key_{x}")).collect();
     let mut target = Vec::new();
 
@@ -473,39 +516,43 @@ fn smo_during_scan() -> Result<(), OpCode> {
 
     target.sort();
 
-    let view = db.view().unwrap();
-    let mut iter = view.seek("key");
-    let mut idx = 0;
-    for (i, x) in data.iter().enumerate() {
-        if i % 2 != 0 {
+    {
+        let view = db.view().unwrap();
+        let mut iter = view.seek("key");
+        let mut idx = 0;
+        for (i, x) in data.iter().enumerate() {
+            if i % 2 != 0 {
+                let kv = db.begin().unwrap();
+                kv.put(x, x)?;
+                kv.commit()?;
+            } else if let Some(item) = iter.next() {
+                assert_eq!(item.key(), target[idx].as_bytes());
+                idx += 1;
+            }
+        }
+
+        assert_eq!(idx, target.len());
+
+        drop(iter);
+
+        let mut iter = view.seek("key");
+        idx = 0;
+        // merge is hard to trigger, so we just do a simple test
+        for x in data.iter() {
             let kv = db.begin().unwrap();
-            kv.put(x, x)?;
+            kv.del(x)?;
             kv.commit()?;
-        } else if let Some(item) = iter.next() {
-            assert_eq!(item.key(), target[idx].as_bytes());
-            idx += 1;
+
+            if let Some(item) = iter.next() {
+                assert_eq!(item.key(), target[idx].as_bytes());
+                idx += 1;
+            }
         }
+        assert_eq!(idx, target.len());
     }
 
-    assert_eq!(idx, target.len());
-
-    drop(iter);
-
-    let mut iter = view.seek("key");
-    idx = 0;
-    // merge is hard to trigger, so we just do a simple test
-    for x in data.iter() {
-        let kv = db.begin().unwrap();
-        kv.del(x)?;
-        kv.commit()?;
-
-        if let Some(item) = iter.next() {
-            assert_eq!(item.key(), target[idx].as_bytes());
-            idx += 1;
-        }
-    }
-    assert_eq!(idx, target.len());
-
+    drop(db);
+    drop(mace);
     Ok(())
 }
 

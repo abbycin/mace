@@ -11,8 +11,8 @@ fn gc_data() -> Result<(), OpCode> {
     opt.data_garbage_ratio = 1;
     opt.data_file_size = 512 << 10;
     opt.gc_compacted_size = opt.data_file_size;
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
-
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
     let cap = 20000;
     let mut pair = Vec::with_capacity(cap);
 
@@ -45,10 +45,12 @@ fn gc_data() -> Result<(), OpCode> {
     kv.commit()?;
 
     drop(db);
+    drop(mace);
 
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.get_bucket("x").unwrap();
 
     for i in rest {
         let k = &pair[i];
@@ -90,7 +92,8 @@ fn gc_blob() -> Result<(), OpCode> {
     opt.inline_size = 1024;
     opt.max_log_size = 20480;
     opt.over_provision = true;
-    let db = Mace::new(opt.validate()?)?;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
     let cap = 10000;
     let val = vec![b'x'; 10240];
     let mut pair = Vec::with_capacity(cap);
@@ -130,8 +133,9 @@ fn gc_blob() -> Result<(), OpCode> {
     }
 
     let mut opt = db.options().clone();
-    if db.blob_gc_count() > 0 {
+    if mace.blob_gc_count() > 0 {
         drop(db);
+        drop(mace);
         opt.tmp_store = true;
         let opt = opt.validate().unwrap();
         let mut count = 0;
@@ -160,7 +164,8 @@ fn abort_txn() {
     let mut opt = Options::new(&*path);
     opt.max_ckpt_per_txn = 1;
     opt.data_file_size = 50 << 10; // make sure checkpoint was taken
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
 
     let kv = db.begin().unwrap();
     for i in 0..50000 {
@@ -182,7 +187,8 @@ fn gc_wal() {
     opt.max_log_size = 1024;
     opt.keep_stable_wal_file = true;
     opt.data_file_size = 100 << 10; // make sure checkpoint was taken
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
     let mut data = Vec::new();
 
     for i in 0..1000 {

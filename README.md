@@ -37,20 +37,21 @@ fn main() -> Result<(), OpCode> {
     // 1. Initialize the storage
     let opts = Options::new("./data_dir");
     let db = Mace::new(opts.validate().unwrap())?;
+    let bkt = db.new_bucket("tmp")?;
 
     // 2. Perform a write transaction
-    let txn = db.begin()?;
+    let txn = bkt.begin()?;
     txn.put("user:1", "alice")?;
     txn.put("user:2", "bob")?;
     txn.commit()?;
 
     // 3. Read data using a consistent view
-    let view = db.view()?;
+    let view = bkt.view()?;
     let value = view.get("user:1")?;
     println!("Value for user:1: {:?}", std::str::from_utf8(value.slice()));
 
     // 4. Remove data
-    let txn = db.begin()?;
+    let txn = bkt.begin()?;
     txn.del("user:2")?;
     txn.commit()?;
 

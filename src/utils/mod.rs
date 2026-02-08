@@ -1,7 +1,9 @@
 use std::{
+    cmp::Ordering,
     fmt::Debug,
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
+    ptr::null_mut,
     sync::atomic::{
         AtomicI64, AtomicU32,
         Ordering::{AcqRel, Relaxed},
@@ -12,26 +14,40 @@ pub(crate) mod bitmap;
 pub(crate) mod block;
 pub(crate) mod countblock;
 pub(crate) mod data;
+pub(crate) mod imtree;
 pub(crate) mod interval;
 pub(crate) mod lru;
 pub(crate) mod options;
 pub(crate) mod queue;
 pub(crate) mod spooky;
-pub(crate) mod status;
 pub(crate) mod varint;
 
+type Comparator<T> = fn(&T, &T) -> Ordering;
+
+/// Error codes for storage operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OpCode {
+    /// The key was not found.
     NotFound,
+    /// Data corruption detected.
     Corruption,
+    /// I/O error occurred.
     IoError,
-    BadData,
+    /// Version mismatch.
     BadVersion,
+    /// Value or key too large.
     TooLarge,
-    NeedMore,
+    /// Storage is full.
+    NoSpace,
+    /// Transaction aborted.
     AbortTx,
+    /// Try again later.
     Again,
+    /// Invalid operation.
+    Invalid,
+    /// already exists
+    Exist,
 }
 
 impl std::fmt::Display for OpCode {
@@ -49,6 +65,7 @@ impl From<std::io::Error> for OpCode {
 }
 
 pub(crate) const NULL_PID: u64 = 0;
+/// it's same to DEFAULT_BUCKET_ID
 pub(crate) const ROOT_PID: u64 = 1;
 pub(crate) const NULL_ADDR: u64 = 0;
 /// starts from 1 make sure remapped addr will always greater than NULL_ADDR
@@ -98,20 +115,21 @@ macro_rules! static_assert {
 #[macro_export]
 macro_rules! number_to_slice {
     ($num: expr, $slice:expr) => {
-        $slice.copy_from_slice(&$num.to_le_bytes());
+        $slice.copy_from_slice(&$num.to_be_bytes());
     };
 }
 #[macro_export]
 macro_rules! slice_to_number {
-    ($slice:expr, $num:ty) => {{ <$num>::from_le_bytes($slice.try_into().unwrap()) }};
+    ($slice:expr, $num:ty) => {{ <$num>::from_be_bytes($slice.try_into().unwrap()) }};
 }
 
 pub fn rand_range(range: Range<usize>) -> usize {
     rand::random_range(range)
 }
 
-static_assert!(size_of::<usize>() == 8, "exepct 64 bits pointer width");
+static_assert!(size_of::<usize>() == 8, "expect 64 bits pointer width");
 
+/// A utility for managing temporary paths that are deleted on drop.
 pub struct RandomPath {
     path: PathBuf,
     del: bool,
@@ -144,6 +162,7 @@ impl RandomPath {
         }
     }
 
+    /// Creates a new temporary path that will be deleted on drop.
     pub fn tmp() -> Self {
         Self {
             path: Self::gen_path(&std::env::temp_dir()),
@@ -151,6 +170,7 @@ impl RandomPath {
         }
     }
 
+    /// Creates a new temporary path that will NOT be deleted on drop by default.
     pub fn new() -> Self {
         Self {
             path: Self::gen_path(&std::env::temp_dir()),
@@ -158,6 +178,7 @@ impl RandomPath {
         }
     }
 
+    /// Creates a new temporary path under the given root.
     pub fn from_root<P: AsRef<Path>>(root: P) -> Self {
         Self {
             path: Self::gen_path(&root.as_ref().to_path_buf()),
@@ -165,6 +186,7 @@ impl RandomPath {
         }
     }
 
+    /// Explicitly deletes the file or directory at this path.
     pub fn unlink(&self) {
         if self.path.exists() {
             let _ = if self.path.is_file() {
@@ -206,6 +228,10 @@ impl<T> MutRefInner<T> {
     }
 }
 
+impl<T> Drop for MutRefInner<T> {
+    fn drop(&mut self) {}
+}
+
 pub struct MutRef<T> {
     inner: *mut MutRefInner<T>,
 }
@@ -224,6 +250,10 @@ impl<T> MutRef<T> {
     #[allow(clippy::mut_from_ref)]
     pub fn raw_ref(&self) -> &mut T {
         unsafe { &mut (*self.inner).raw }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.inner.is_null()
     }
 
     fn inc(&self) {
@@ -245,11 +275,19 @@ impl<T> Clone for MutRef<T> {
 impl<T> Drop for MutRef<T> {
     fn drop(&mut self) {
         unsafe {
-            let old = self.dec();
-            if old == 1 {
-                drop(Box::from_raw(self.inner));
+            if !self.is_null() {
+                let old = self.dec();
+                if old == 1 {
+                    drop(Box::from_raw(self.inner));
+                }
             }
         }
+    }
+}
+
+impl<T> Default for MutRef<T> {
+    fn default() -> Self {
+        Self { inner: null_mut() }
     }
 }
 
@@ -284,6 +322,10 @@ impl<T> Handle<T> {
     }
 
     pub(crate) fn reclaim(&self) {
+        debug_assert!(
+            !self.raw.is_null(),
+            "Double reclaim detected or reclaiming null handle"
+        );
         if !self.raw.is_null() {
             unsafe { drop(Box::from_raw(self.raw)) };
         }
@@ -421,14 +463,14 @@ mod test {
         static_assert!(true, "damn");
 
         let mut num = 233u64;
-        let mut s = &mut num.to_le_bytes()[0..size_of::<u64>()];
+        let mut s = &mut num.to_be_bytes()[0..size_of::<u64>()];
         let new_num = slice_to_number!(s, u64);
         assert_eq!(new_num, num);
 
         s[0] = 1;
         num = 114514;
         number_to_slice!(num, &mut s);
-        let new_num = u64::from_le_bytes(s.try_into().unwrap());
+        let new_num = u64::from_be_bytes(s.try_into().unwrap());
 
         assert_eq!(new_num, num);
     }

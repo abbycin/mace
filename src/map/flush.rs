@@ -1,11 +1,11 @@
 use crate::cc::context::Context;
 use crate::map::data::{Arena, FileBuilder};
-use crate::meta::{IntervalPair, MetaKind};
+use crate::meta::{BlobStat, DataStat, IntervalPair, MemBlobStat, MemDataStat, PageTable};
 use crate::utils::Handle;
+use crate::utils::OpCode;
 use crate::utils::countblock::Countblock;
-use crate::utils::data::Interval;
+use crate::utils::data::{Interval, Position};
 use std::collections::VecDeque;
-use std::ops::Deref;
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "metric")]
 use std::sync::atomic::AtomicUsize;
@@ -22,6 +22,33 @@ use std::{
 
 use super::data::{FlushData, MapBuilder};
 
+pub enum FlushDirective {
+    Skip,
+    Normal,
+}
+
+pub struct FlushResult {
+    pub bucket_id: u64,
+    pub data_id: u64,
+    pub tick: u64,
+    pub map_table: PageTable,
+    pub data_ivl: IntervalPair,
+    pub data_stat: DataStat,
+    pub mem_data_stat: MemDataStat,
+    pub data_junks: Vec<u64>,
+    pub blob_ivl: Option<IntervalPair>,
+    pub mem_blob_stat: Option<MemBlobStat>,
+    pub blob_stat: Option<BlobStat>,
+    pub blob_junks: Vec<u64>,
+    pub flsn: Vec<Position>,
+    pub done: FlushData,
+}
+
+pub trait FlushObserver: Send + Sync {
+    fn flush_directive(&self, bucket_id: u64) -> FlushDirective;
+    fn on_flush(&self, result: FlushResult) -> Result<(), OpCode>;
+}
+
 #[cfg(feature = "metric")]
 macro_rules! record {
     ($x: ident) => {
@@ -34,102 +61,88 @@ macro_rules! record {
     ($x: ident) => {};
 }
 
-fn flush_data(msg: FlushData, ctx: Handle<Context>) {
-    let data_id = msg.id();
-    let mut builder = FileBuilder::new();
-    let mut map = MapBuilder::new();
+fn flush_data(msg: FlushData, ctx: Handle<Context>) -> Option<FlushResult> {
+    let bucket_id = msg.bucket_id();
+    let mut builder = FileBuilder::new(bucket_id);
+    let mut map = MapBuilder::new(bucket_id);
 
     for x in msg.iter() {
         let f = x.value();
+        #[cfg(feature = "extra_check")]
+        {
+            // bucket id is tracked by FlushData; BoxHeader no longer stores it
+        }
         map.add(f);
         builder.add(f.clone());
     }
 
-    if !builder.is_empty() {
-        let data_path = ctx.opt.data_file(data_id);
-        if !ctx.opt.db_root.exists() {
-            log::error!("db_root {:?} not exist", ctx.opt.db_root);
-            panic!("db_root {:?} not exist", ctx.opt.db_root);
-        }
-
-        let tick = ctx.manifest.numerics.next_data_id.load(Relaxed);
-
-        // 1. perform disk I/O (write daata and blob files first)
-        let Interval { lo, hi } = builder.build_data(tick, data_path);
-        let data_ivl = IntervalPair::new(lo, hi, data_id);
-
-        let mut blob_result = None;
-        if builder.has_blob() {
-            let blob_id = ctx.manifest.numerics.next_blob_id.fetch_add(1, Relaxed);
-            let blob_path = ctx.opt.blob_file(blob_id);
-            let Interval { lo, hi } = builder.build_blob(blob_path);
-            let blob_ivl = IntervalPair::new(lo, hi, blob_id);
-            let mem_blob_stat = builder.blob_stat(blob_id);
-            blob_result = Some((blob_id, blob_ivl, mem_blob_stat));
-        }
-
-        // 2. prepare statistics
-        let mem_data_stat = builder.data_stat(data_id, tick);
-        let data_stat = mem_data_stat.copy();
-
-        let data_stats = {
-            builder.data_junks.sort_unstable();
-            ctx.manifest.apply_data_junks(tick, &builder.data_junks)
-        };
-        let blob_stats = {
-            builder.blob_junks.sort_unstable();
-            ctx.manifest.apply_blob_junks(&builder.blob_junks)
-        };
-
-        // 3. commit metadata transaction
-        let mut txn = ctx.manifest.begin();
-
-        txn.record(MetaKind::Numerics, ctx.manifest.numerics.deref());
-        txn.record(MetaKind::DataStat, &data_stat);
-        txn.record(MetaKind::Map, &map.table());
-        txn.record(MetaKind::DataInterval, &data_ivl);
-
-        data_stats.iter().for_each(|x| {
-            assert_ne!(data_id, x.file_id);
-            txn.record(MetaKind::DataStat, x)
-        });
-
-        blob_stats.iter().for_each(|x| {
-            txn.record(MetaKind::BlobStat, x);
-        });
-
-        if let Some((_, blob_ivl, mem_blob_stat)) = blob_result {
-            let blob_stat = mem_blob_stat.copy();
-            txn.record(MetaKind::BlobStat, &blob_stat);
-            txn.record(MetaKind::BlobInterval, &blob_ivl);
-
-            // update memory for blob
-            ctx.manifest.add_blob_stat(mem_blob_stat, blob_ivl);
-        }
-
-        txn.commit();
-
-        // 4. update memory and checkpoints
-        ctx.manifest.add_data_stat(mem_data_stat, data_ivl);
-
-        for (i, g) in ctx.groups().iter().enumerate() {
-            let mut pos = msg.flsn[i].load();
-            if let Some(min) = g.active_txns.min_lsn()
-                && min < pos
-            {
-                pos = min;
-            }
-            g.logging.lock().update_last_ckpt(pos);
-        }
-        ctx.manifest.numerics.signal.fetch_add(1, Relaxed);
+    if builder.is_empty() {
+        msg.mark_done();
+        return None;
     }
-    msg.mark_done();
+
+    if !ctx.opt.db_root.exists() {
+        log::error!("db_root {:?} not exist", ctx.opt.db_root);
+        panic!("db_root {:?} not exist", ctx.opt.db_root);
+    }
+
+    let data_id = msg.id();
+    let tick = data_id;
+    let data_path = ctx.opt.data_file(data_id);
+
+    // 1. perform disk I/O
+    let Interval { lo, hi } = builder.build_data(tick, data_path);
+    let data_ivl = IntervalPair::new(lo, hi, data_id, bucket_id);
+
+    let mut blob_ivl = None;
+    let mut mem_blob_stat = None;
+    let mut blob_stat = None;
+    if builder.has_blob() {
+        let blob_id = ctx.numerics.next_blob_id.fetch_add(1, Relaxed);
+        let blob_path = ctx.opt.blob_file(blob_id);
+        let Interval { lo, hi } = builder.build_blob(blob_path);
+        let new_blob_ivl = IntervalPair::new(lo, hi, blob_id, bucket_id);
+        let mut new_mem_blob_stat = builder.blob_stat(blob_id);
+        new_mem_blob_stat.inner.bucket_id = bucket_id;
+        blob_ivl = Some(new_blob_ivl);
+        blob_stat = Some(new_mem_blob_stat.copy());
+        mem_blob_stat = Some(new_mem_blob_stat);
+    }
+
+    // 2. prepare statistics
+    let mut mem_data_stat = builder.data_stat(data_id, tick);
+    mem_data_stat.inner.bucket_id = bucket_id;
+    let data_stat = mem_data_stat.copy();
+    builder.data_junks.sort_unstable();
+    builder.blob_junks.sort_unstable();
+
+    let flsn = msg.flsn.iter().map(|x| x.load()).collect();
+    Some(FlushResult {
+        bucket_id,
+        data_id,
+        tick,
+        map_table: map.table(),
+        data_ivl,
+        data_stat,
+        mem_data_stat,
+        data_junks: builder.data_junks,
+        blob_ivl,
+        mem_blob_stat,
+        blob_stat,
+        blob_junks: builder.blob_junks,
+        flsn,
+        done: msg,
+    })
 }
 
 fn safe_to_flush(data: &FlushData, ctx: Handle<Context>) -> bool {
     if data.refcnt() != 0 {
         return false;
     }
+    safe_to_flush_force(data, ctx)
+}
+
+fn safe_to_flush_force(data: &FlushData, ctx: Handle<Context>) -> bool {
     let groups = ctx.groups();
     debug_assert_eq!(data.flsn.len(), groups.len());
     for (i, g) in groups.iter().enumerate() {
@@ -145,11 +158,26 @@ fn safe_to_flush(data: &FlushData, ctx: Handle<Context>) -> bool {
     true
 }
 
-fn try_flush(q: &mut VecDeque<FlushData>, ctx: Handle<Context>) -> bool {
+fn try_flush(
+    q: &mut VecDeque<FlushData>,
+    ctx: Handle<Context>,
+    observer: &dyn FlushObserver,
+) -> bool {
     while let Some(data) = q.pop_front() {
         record!(total);
-        if safe_to_flush(&data, ctx) && data.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
-            flush_data(data, ctx)
+        let directive = observer.flush_directive(data.bucket_id());
+        if let FlushDirective::Skip = directive {
+            data.set_state(Arena::WARM, Arena::COLD);
+            data.mark_done();
+            continue;
+        }
+
+        let can_flush = safe_to_flush(&data, ctx);
+
+        if can_flush && data.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
+            if let Some(result) = flush_data(data, ctx) {
+                observer.on_flush(result).unwrap();
+            }
         } else {
             q.push_front(data);
             record!(retry);
@@ -162,6 +190,7 @@ fn try_flush(q: &mut VecDeque<FlushData>, ctx: Handle<Context>) -> bool {
 fn flush_thread(
     rx: Receiver<FlushData>,
     ctx: Handle<Context>,
+    observer: Arc<dyn FlushObserver>,
     sync: Arc<Notifier>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
@@ -176,15 +205,15 @@ fn flush_thread(
                     Err(RecvTimeoutError::Disconnected) => break,
                     _ => {}
                 }
-                try_flush(&mut q, ctx);
+                try_flush(&mut q, ctx, observer.as_ref());
             }
 
             while let Ok(data) = rx.try_recv() {
                 q.push_back(data);
             }
 
-            while !try_flush(&mut q, ctx) {
-                std::hint::spin_loop();
+            while !try_flush(&mut q, ctx, observer.as_ref()) {
+                std::thread::yield_now();
             }
             drop(rx);
             sync.notify_done();
@@ -223,16 +252,17 @@ impl Notifier {
     }
 }
 
+#[derive(Clone)]
 pub struct Flush {
     pub tx: Sender<FlushData>,
     sync: Arc<Notifier>,
 }
 
 impl Flush {
-    pub fn new(ctx: Handle<Context>) -> Self {
+    pub fn new(ctx: Handle<Context>, observer: Arc<dyn FlushObserver>) -> Self {
         let (tx, rx) = channel();
         let sync = Arc::new(Notifier::new());
-        flush_thread(rx, ctx, sync.clone());
+        flush_thread(rx, ctx, observer, sync.clone());
         Self { tx, sync }
     }
 

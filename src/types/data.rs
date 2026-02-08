@@ -945,6 +945,10 @@ mod test {
                 self.clone()
             }
 
+            fn deep_copy(&self) -> Self {
+                self.clone()
+            }
+
             fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
                 self.m.borrow().get(&addr).cloned().ok_or(OpCode::NotFound)
             }

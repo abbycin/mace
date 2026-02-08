@@ -55,7 +55,7 @@ impl OpenOptions {
         self
     }
 
-    // when truc is enabled, append will be ignored
+    // when trunc is enabled, append will be ignored
     pub fn append(&mut self, on: bool) -> &mut Self {
         if !self.trunc {
             self.append = on;

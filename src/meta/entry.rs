@@ -11,7 +11,7 @@ use crate::{
     meta::IMetaCodec,
     types::traits::IAsSlice,
     utils::{
-        INIT_ADDR, INIT_ID, INIT_ORACLE, INIT_WMK,
+        INIT_ID, INIT_ORACLE, INIT_WMK,
         bitmap::BitMap,
         data::{MapEntry, Reloc},
     },
@@ -41,7 +41,7 @@ impl TryFrom<u8> for MetaKind {
     type Error = OpCode;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         if value > Self::KindEnd as u8 {
-            Err(OpCode::BadData)
+            Err(OpCode::Corruption)
         } else {
             Ok(unsafe { std::mem::transmute::<u8, MetaKind>(value) })
         }
@@ -59,6 +59,7 @@ pub struct DataStatInner {
     pub total_elems: u32,
     pub active_size: usize,
     pub total_size: usize,
+    pub bucket_id: u64,
 }
 
 impl IAsSlice for DataStatInner {}
@@ -79,10 +80,32 @@ impl Deref for DataStat {
 
 pub struct MemDataStat {
     pub inner: DataStatInner,
-    pub mask: BitMap,
+    pub mask: Option<BitMap>,
 }
 
 impl DataStat {
+    pub(crate) fn decode_inner_only(src: &[u8]) -> DataStatInner {
+        let hdr = StatHdr::from_slice(src);
+        DataStatInner::from_slice(&src[hdr.len()..])
+    }
+
+    pub(crate) fn decode_mask_only(src: &[u8], total_elems: u32) -> BitMap {
+        let hdr = StatHdr::from_slice(src);
+        let mut mask = BitMap::new(total_elems);
+        let seq = unsafe {
+            src.as_ptr()
+                .add(hdr.len() + size_of::<DataStatInner>())
+                .cast::<u32>()
+        };
+        for i in 0..hdr.elems as usize {
+            unsafe {
+                let x = seq.add(i).read_unaligned();
+                mask.set(x);
+            }
+        }
+        mask
+    }
+
     fn len(&self) -> usize {
         size_of::<DataStatInner>() + self.inactive_elems.len() * size_of::<u32>()
     }
@@ -106,7 +129,7 @@ impl MemDataStat {
     pub(super) fn update(&mut self, tick: u64, reloc: &Reloc) {
         self.active_elems -= 1;
         self.active_size -= reloc.len as usize;
-        self.mask.set(reloc.seq);
+        self.mask.as_mut().expect("mask loaded").set(reloc.seq);
 
         if self.up1 < tick {
             self.up2 = self.up1;
@@ -182,6 +205,7 @@ pub struct BlobStatInner {
     pub active_size: usize,
     pub nr_active: u32,
     pub nr_total: u32,
+    pub bucket_id: u64,
 }
 
 impl IAsSlice for BlobStatInner {}
@@ -189,14 +213,14 @@ impl IAsSlice for BlobStatInner {}
 #[derive(Clone)]
 pub struct MemBlobStat {
     pub inner: BlobStatInner,
-    pub mask: BitMap,
+    pub mask: Option<BitMap>,
 }
 
 impl MemBlobStat {
     pub(super) fn update(&mut self, reloc: &Reloc) {
         self.nr_active -= 1;
         self.active_size -= reloc.len as usize;
-        self.mask.set(reloc.seq);
+        self.mask.as_mut().expect("mask loaded").set(reloc.seq);
     }
 
     #[allow(dead_code)]
@@ -214,6 +238,28 @@ pub struct BlobStat {
 }
 
 impl BlobStat {
+    pub(crate) fn decode_inner_only(src: &[u8]) -> BlobStatInner {
+        let hdr = StatHdr::from_slice(src);
+        BlobStatInner::from_slice(&src[hdr.len()..])
+    }
+
+    pub(crate) fn decode_mask_only(src: &[u8], total_elems: u32) -> BitMap {
+        let hdr = StatHdr::from_slice(src);
+        let mut mask = BitMap::new(total_elems);
+        let seq = unsafe {
+            src.as_ptr()
+                .add(hdr.len() + size_of::<BlobStatInner>())
+                .cast::<u32>()
+        };
+        for i in 0..hdr.elems as usize {
+            unsafe {
+                let x = seq.add(i).read_unaligned();
+                mask.set(x);
+            }
+        }
+        mask
+    }
+
     fn len(&self) -> usize {
         size_of::<BlobStatInner>() + self.inactive_elems.len() * size_of::<u32>()
     }
@@ -294,6 +340,7 @@ impl IMetaCodec for BlobStat {
 
 #[derive(Default)]
 pub struct PageTable {
+    pub bucket_id: u64,
     // pid, addr, len(offset + len)
     data: BTreeMap<u64, u64>,
 }
@@ -387,12 +434,10 @@ pub struct Numerics {
     pub next_data_id: AtomicU64,
     pub next_blob_id: AtomicU64,
     pub next_manifest_id: AtomicU64,
+    pub next_bucket_id: AtomicU64,
     pub oracle: AtomicU64,
-    /// it's the logical address to a frame
-    pub address: AtomicU64,
     pub wmk_oldest: AtomicU64,
     pub log_size: AtomicUsize,
-    pub scavenge_cursor: AtomicU64,
 }
 
 impl Numerics {
@@ -409,11 +454,10 @@ impl Default for Numerics {
             next_data_id: AtomicU64::new(INIT_ID),
             next_blob_id: AtomicU64::new(INIT_ID),
             next_manifest_id: AtomicU64::new(INIT_ID),
+            next_bucket_id: AtomicU64::new(INIT_ID),
             oracle: AtomicU64::new(INIT_ORACLE),
-            address: AtomicU64::new(INIT_ADDR),
             wmk_oldest: AtomicU64::new(INIT_WMK),
             log_size: AtomicUsize::new(0),
-            scavenge_cursor: AtomicU64::new(0),
         }
     }
 }
@@ -511,14 +555,16 @@ pub struct IntervalPair {
     pub lo_addr: u64,
     pub hi_addr: u64,
     pub file_id: u64,
+    pub bucket_id: u64,
 }
 
 impl IntervalPair {
-    pub const fn new(lo: u64, hi: u64, file_id: u64) -> Self {
+    pub const fn new(lo: u64, hi: u64, file_id: u64, bucket_id: u64) -> Self {
         Self {
             lo_addr: lo,
             hi_addr: hi,
             file_id,
+            bucket_id,
         }
     }
 }
@@ -526,8 +572,8 @@ impl IntervalPair {
 impl Debug for IntervalPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "[{}, {}] => {}",
-            self.lo_addr, self.hi_addr, self.file_id
+            "bucket {} [{}, {}] => {}",
+            self.bucket_id, self.lo_addr, self.hi_addr, self.file_id
         ))
     }
 }
@@ -552,6 +598,7 @@ impl IMetaCodec for IntervalPair {
 #[derive(Default)]
 pub struct DelInterval {
     pub lo: Vec<u64>,
+    pub bucket_id: u64,
 }
 
 impl Deref for DelInterval {
@@ -572,6 +619,7 @@ impl DerefMut for DelInterval {
 #[repr(C, packed(1))]
 pub(crate) struct DelIntervalStartHdr {
     nr_lo: u16,
+    bucket_id: u64,
 }
 
 impl IAsSlice for DelIntervalStartHdr {}
@@ -585,6 +633,7 @@ impl IMetaCodec for DelInterval {
         assert_eq!(to.len(), self.packed_size());
         let hdr = DelIntervalStartHdr {
             nr_lo: self.lo.len() as u16,
+            bucket_id: self.bucket_id,
         };
         to[0..hdr.len()].copy_from_slice(hdr.as_slice());
         let src = unsafe {
@@ -597,11 +646,47 @@ impl IMetaCodec for DelInterval {
     fn decode(src: &[u8]) -> Self {
         let hdr = DelIntervalStartHdr::from_slice(src);
         let p = unsafe { src.as_ptr().add(hdr.len()).cast::<u64>() };
-        let mut r = DelInterval::default();
+        let mut r = DelInterval {
+            lo: Vec::new(),
+            bucket_id: hdr.bucket_id,
+        };
         for i in 0..hdr.nr_lo as usize {
             let id = unsafe { p.add(i).read_unaligned() };
-            r.lo.push(id);
+            r.push(id);
         }
         r
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct BucketMeta {
+    /// because root pid will be unmapped and reused, so we use an extra bucket_id to filter-out reused root_pid in
+    /// flush thread
+    pub bucket_id: u64,
+}
+
+impl Clone for BucketMeta {
+    fn clone(&self) -> Self {
+        Self {
+            bucket_id: self.bucket_id,
+        }
+    }
+}
+
+impl IAsSlice for BucketMeta {}
+
+impl IMetaCodec for BucketMeta {
+    fn packed_size(&self) -> usize {
+        size_of::<Self>()
+    }
+
+    fn encode(&self, to: &mut [u8]) {
+        assert_eq!(to.len(), self.packed_size());
+        to.copy_from_slice(self.as_slice());
+    }
+
+    fn decode(src: &[u8]) -> Self {
+        unsafe { std::ptr::read(src.as_ptr() as *const Self) }
     }
 }

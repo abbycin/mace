@@ -1,9 +1,11 @@
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::cmp::max;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+
+use parking_lot::Mutex;
 
 use crate::io::{File, GatherIO};
 
@@ -13,65 +15,126 @@ use crate::cc::wal::{
     wal_record_sz,
 };
 use crate::index::tree::Tree;
-use crate::map::table::PageMap;
-use crate::meta::Manifest;
-use crate::meta::builder::ManifestBuilder;
 use crate::types::data::{Key, Record, Ver};
+use crate::types::traits::{IKey, ITree, IVal};
 use crate::utils::block::Block;
 use crate::utils::data::{Position, WalDesc, WalDescHandle};
 use crate::utils::lru::Lru;
 use crate::utils::options::ParsedOptions;
-use crate::utils::{Handle, NULL_CMD, NULL_ORACLE, OpCode};
-use crate::{Options, static_assert};
+use crate::utils::{Handle, MutRef, NULL_CMD, NULL_ORACLE, OpCode, ROOT_PID};
+use crate::{Options, Store, static_assert};
 use crossbeam_epoch::Guard;
+
+struct RecoveryTree(Option<Tree>);
+
+impl ITree for RecoveryTree {
+    fn put<K, V>(&self, g: &Guard, k: K, v: V)
+    where
+        K: IKey,
+        V: IVal,
+    {
+        if let Some(tree) = &self.0 {
+            tree.put(g, k, v).unwrap();
+        }
+    }
+}
 
 /// there are some cases can't recover:
 /// 1. manifest file missing or corrupted
 /// 2. log desc file checksum mismatch
-/// 3. data file lost (if wal file is complete, manual recovery is possible)
+/// 3. data file lost
 ///
-/// and there is only one case can recover:
-/// - abnormal shutdown happened before transaction commit
-///
-/// in this case we can parse the log and perform necessary redo/undo to bring data back to consistent
+/// for the last point, if wal file and manifest file are intact, manually recover is possible, we can parse the log and
+/// perform necessary redo/undo to bring data back to consistent, and this only apply to the lost of latest data file
 pub(crate) struct Recovery {
     opt: Arc<ParsedOptions>,
     dirty_table: BTreeMap<Ver, Location>,
     /// txid, last lsn
     undo_table: BTreeMap<u64, Location>,
+    bucket_cache_cap: usize,
+    trees: Lru<u64, Tree>,
+    loaded_buckets: RefCell<HashSet<u64>>,
 }
 
 impl Recovery {
     const INIT_BLOCK_SIZE: usize = 1 << 20;
+    const BUCKET_CACHE_CAP: usize = 16;
 
     pub(crate) fn new(opt: Arc<ParsedOptions>) -> Self {
         Self {
             opt,
             dirty_table: BTreeMap::new(),
             undo_table: BTreeMap::new(),
+            bucket_cache_cap: Self::BUCKET_CACHE_CAP,
+            trees: Lru::new(),
+            loaded_buckets: RefCell::new(HashSet::new()),
+        }
+    }
+
+    fn get_tree(&self, bucket_id: u64, store: MutRef<Store>) -> RecoveryTree {
+        if let Some(tree) = self.trees.get(&bucket_id) {
+            return RecoveryTree(Some(tree.clone()));
+        }
+
+        // it's possible that bucket has been logically removed, we simply skip process wal entry in redo/undo for that
+        // bucket
+        if let Some(meta) = store
+            .manifest
+            .bucket_metas_by_id
+            .get(&bucket_id)
+            .map(|m| m.clone())
+        {
+            assert_eq!(meta.bucket_id, bucket_id);
+            let bucket_ctx = store
+                .manifest
+                .load_bucket_context(bucket_id)
+                .expect("must exist");
+            let tree = Tree::new(store.clone(), ROOT_PID, bucket_ctx);
+            if let Some((evicted_id, evicted_tree)) =
+                self.trees
+                    .add_with_evict(self.bucket_cache_cap, bucket_id, tree.clone())
+            {
+                drop(evicted_tree);
+                self.loaded_buckets.borrow_mut().remove(&evicted_id);
+                self.evict_bucket(evicted_id, store.clone());
+            }
+            self.loaded_buckets.borrow_mut().insert(bucket_id);
+            RecoveryTree(Some(tree))
+        } else {
+            RecoveryTree(None)
+        }
+    }
+
+    fn evict_bucket(&self, bucket_id: u64, store: MutRef<Store>) {
+        store.manifest.buckets.del_bucket(bucket_id);
+    }
+
+    fn evict_all(&self, store: MutRef<Store>) {
+        let mut loaded = self.loaded_buckets.borrow_mut();
+        for bucket_id in loaded.drain() {
+            self.trees.del(&bucket_id);
+            self.evict_bucket(bucket_id, store.clone());
         }
     }
 
     pub(crate) fn phase1(
         &mut self,
-    ) -> Result<(Arc<PageMap>, Vec<WalDescHandle>, Handle<Context>), OpCode> {
+        numerics: Arc<crate::meta::Numerics>,
+    ) -> Result<(Vec<WalDescHandle>, Handle<Context>), OpCode> {
         let desc = self.load_desc()?;
-        let manifest = self.load_manifest()?;
-
-        let ctx = Handle::new(Context::new(self.opt.clone(), manifest, &desc));
-        Ok((ctx.manifest.map.clone(), desc, ctx))
+        let ctx = Handle::new(Context::new(self.opt.clone(), numerics, &desc));
+        Ok((desc, ctx))
     }
 
     /// we must perform phase2, in case crash happened before data flush and log checkpoint
     pub(crate) fn phase2(
         &mut self,
-        ctx: Handle<Context>,
+        _ctx: Handle<Context>,
         desc: &[WalDescHandle],
-        tree: &Tree,
+        store: MutRef<Store>,
     ) -> Result<(), OpCode> {
         let g = crossbeam_epoch::pin();
-        let numerics = &ctx.manifest.numerics;
-        let mut oracle = numerics.oracle.load(Relaxed);
+        let mut oracle = store.manifest.numerics.oracle.load(Relaxed);
         let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
 
         for d in desc.iter() {
@@ -80,25 +143,26 @@ impl Recovery {
                 (x.group, x.checkpoint)
             };
             // analyze and redo starts from latest checkpoint
-            let cur_oracle = self.analyze(&g, group, checkpoint, &mut block, tree)?;
+            let cur_oracle = self.analyze(&g, group, checkpoint, &mut block, store.clone())?;
             oracle = max(oracle, cur_oracle);
             g.flush();
         }
 
         let recovered = !self.dirty_table.is_empty() || !self.undo_table.is_empty();
         if !self.dirty_table.is_empty() {
-            self.redo(&mut block, &g, tree)?;
+            self.redo(&mut block, &g, store.clone())?;
         }
         if !self.undo_table.is_empty() {
-            self.undo(&mut block, &g, tree)?;
+            self.undo(&mut block, &g, store.clone())?;
         }
         if recovered {
             // that's why we call it oracle, or else keep using the intact oracle in numerics
             oracle += 1;
         }
         log::trace!("oracle {oracle}");
-        numerics.oracle.store(oracle, Relaxed);
-        numerics.wmk_oldest.store(oracle, Relaxed);
+        store.manifest.numerics.oracle.store(oracle, Relaxed);
+        store.manifest.numerics.wmk_oldest.store(oracle, Relaxed);
+        self.evict_all(store);
         Ok(())
     }
 
@@ -113,7 +177,7 @@ impl Recovery {
         f: &mut File,
         loc: &mut Location,
         buf: &mut [u8],
-        tree: &Tree,
+        store: MutRef<Store>,
     ) -> Result<bool, OpCode> {
         assert!((loc.len as usize) < buf.len());
         f.read(&mut buf[0..loc.len as usize], loc.pos.offset)?;
@@ -129,14 +193,17 @@ impl Recovery {
         debug_assert!(!self.dirty_table.contains_key(&ver));
 
         let raw = u.key();
-        let r = tree
-            .get(g, Key::new(raw, Ver::new(NULL_ORACLE, NULL_CMD)))
-            .map(|(k, _)| *k.ver());
+        let target_tree = self.get_tree(u.bucket_id, store);
+        if let Some(target_tree) = &target_tree.0 {
+            let r = target_tree
+                .get(g, Key::new(raw, Ver::new(NULL_ORACLE, NULL_CMD)))
+                .map(|(k, _)| *k.ver());
 
-        // check whether the key is exits in data or is latest
-        let lost = r.map(|v| v > ver).map_err(|_| true).unwrap_or_else(|x| x);
-        if lost {
-            self.dirty_table.insert(ver, *loc);
+            // check whether the key exists in data or is latest
+            let lost = r.map(|v| v > ver).map_err(|_| true).unwrap_or_else(|x| x);
+            if lost {
+                self.dirty_table.insert(ver, *loc);
+            }
         }
         Ok(true)
     }
@@ -147,7 +214,7 @@ impl Recovery {
         group_id: u8,
         addr: Position,
         block: &mut Block,
-        tree: &Tree,
+        store: MutRef<Store>,
     ) -> Result<u64, OpCode> {
         let Position {
             file_id,
@@ -264,7 +331,7 @@ impl Recovery {
                             l.pos.file_id = i;
                             l.pos.offset = loc.pos.offset;
                         }
-                        if !self.handle_update(g, &mut f, &mut loc, buf, tree)? {
+                        if !self.handle_update(g, &mut f, &mut loc, buf, store.clone())? {
                             pos = start_pos;
                             break;
                         }
@@ -280,7 +347,7 @@ impl Recovery {
                 if !self.opt.truncate_corrupted_wal {
                     return Err(OpCode::Corruption);
                 }
-                // truncate the WAL if it's imcomplete
+                // truncate the WAL if it's incomplete
                 log::trace!("truncate {path:?} from {end} to {pos}");
                 f.truncate(pos)?;
                 // if we truncated the file, we must stop here
@@ -312,7 +379,7 @@ impl Recovery {
         }
     }
 
-    fn redo(&mut self, block: &mut Block, g: &Guard, tree: &Tree) -> Result<(), OpCode> {
+    fn redo(&mut self, block: &mut Block, g: &Guard, store: MutRef<Store>) -> Result<(), OpCode> {
         let cache = Lru::new();
         let cap = 32;
 
@@ -332,20 +399,22 @@ impl Recovery {
             let ok = c.key();
             let key = Key::new(ok, Ver::new(c.txid, c.cmd_id));
 
-            let r = match c.sub_type() {
+            let target_tree = self.get_tree(c.bucket_id, store.clone());
+
+            match c.sub_type() {
                 PayloadType::Insert => {
                     let i = c.put();
                     let val = Record::normal(c.group_id, i.val());
-                    tree.put(g, key, val)
+                    target_tree.put(g, key, val)
                 }
                 PayloadType::Update => {
                     let u = c.update();
                     let val = Record::normal(c.group_id, u.new_val());
-                    tree.put(g, key, val)
+                    target_tree.put(g, key, val)
                 }
                 PayloadType::Delete => {
                     let val = Record::remove(c.group_id);
-                    tree.put(g, key, val)
+                    target_tree.put(g, key, val)
                 }
                 PayloadType::Clr => {
                     let r = c.clr();
@@ -354,18 +423,19 @@ impl Recovery {
                     } else {
                         Record::normal(c.group_id, r.val())
                     };
-                    tree.put(g, key, val)
+                    target_tree.put(g, key, val)
                 }
             };
-            assert!(r.is_ok());
         }
         Ok(())
     }
 
-    fn undo(&self, block: &mut Block, g: &Guard, tree: &Tree) -> Result<(), OpCode> {
-        let reader = WalReader::new(&tree.store.context, g);
+    fn undo(&self, block: &mut Block, g: &Guard, store: MutRef<Store>) -> Result<(), OpCode> {
+        let reader = WalReader::new(&store.context, g);
         for (txid, addr) in &self.undo_table {
-            reader.rollback(block, *txid, *addr, tree)?;
+            reader.rollback(block, *txid, *addr, |bucket_id| {
+                self.get_tree(bucket_id, store.clone())
+            })?;
         }
         Ok(())
     }
@@ -390,17 +460,10 @@ impl Recovery {
             f.read(dst, 0)?;
             if !x.is_valid() {
                 log::error!("{path:?} was corrupted");
-                return Err(crate::utils::OpCode::BadData);
+                return Err(crate::utils::OpCode::Corruption);
             }
         }
 
         Ok(desc)
-    }
-
-    /// load latest manifest from btree-store
-    fn load_manifest(&self) -> Result<Manifest, OpCode> {
-        let mut b = ManifestBuilder::new(self.opt.clone());
-        b.load()?;
-        Ok(b.finish())
     }
 }

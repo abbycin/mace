@@ -10,11 +10,13 @@ use crate::{
         base::BaseIter,
         data::{Index, IntlKey, IntlSeg, IterItem, Key, LeafSeg, Record, Val, Ver},
         header::{BoxHeader, NodeType},
-        imtree::{ImTree, Iter, RangeIter},
         refbox::{BaseView, BoxView, DeltaView, RemoteView},
         traits::{IAlloc, IAsBoxRef, IBoxHeader, IDecode, IHeader, IKey, ILoader, IVal},
     },
-    utils::{Handle, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, OpCode},
+    utils::{
+        Handle, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, OpCode,
+        imtree::{ImTree, Iter, RangeIter},
+    },
 };
 
 use super::{header::TagKind, refbox::BoxRef};
@@ -60,11 +62,15 @@ pub(crate) enum MergeOp {
     MarkParent(u64),
 }
 
+impl<L: ILoader> Drop for Node<L> {
+    fn drop(&mut self) {}
+}
+
 impl<L> Node<L>
 where
     L: ILoader,
 {
-    fn new(loader: L, b: BoxRef) -> Self {
+    pub(crate) fn new(loader: L, b: BoxRef) -> Self {
         Self::new_with_mtx(loader, b, Arc::new(Mutex::new(())))
     }
 
@@ -230,7 +236,7 @@ where
         #[cfg(feature = "extra_check")]
         assert_ne!(self.base_addr(), other.base_addr());
         let mut node = Self::new(
-            self.loader.clone(),
+            self.loader.deep_copy(),
             lhs.merge(a, &self.loader, rhs, safe_txid),
         );
         node.header_mut().split_elems = self.header().split_elems;
@@ -384,8 +390,8 @@ where
         };
 
         let (mut lhs, mut rhs) = (
-            Self::new(self.loader.clone(), l),
-            Self::new(self.loader.clone(), r),
+            Self::new(self.loader.deep_copy(), l),
+            Self::new(self.loader.deep_copy(), r),
         );
         lhs.header_mut().split_elems = sep as u16;
         rhs.header_mut().split_elems = (elems - sep) as u16;
@@ -437,7 +443,7 @@ where
         let new_h = base.header_mut();
         new_h.merging = old_h.merging;
         new_h.merging_child = old_h.merging_child;
-        (Self::new(self.loader.clone(), b), j)
+        (Self::new(self.loader.deep_copy(), b), j)
     }
 
     fn merge_to_base<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> (BoxRef, Junks) {
@@ -1185,6 +1191,10 @@ mod test {
         }
 
         fn shallow_copy(&self) -> Self {
+            self.clone()
+        }
+
+        fn deep_copy(&self) -> Self {
             self.clone()
         }
 

@@ -60,10 +60,12 @@ where
     })
 }
 
+/// A read-write transaction.
 pub struct TxnKV<'a> {
     ctx: &'a Context,
     state: UnsafeCell<TxnState>,
     tree: &'a Tree,
+    bucket_id: u64,
     is_end: Cell<bool>,
     limit: usize,
 }
@@ -72,9 +74,13 @@ impl<'a> TxnKV<'a> {
     pub(crate) fn new(ctx: &'a Context, tree: &'a Tree) -> Result<Self, OpCode> {
         let start_ts = ctx.alloc_oracle();
         let gid = ctx.next_group_id();
-        let mut state = TxnState::new(gid, start_ts);
-
         let g = ctx.group(gid);
+        let start_ckpt = g.ckpt_cnt.load(Relaxed);
+        let mut state = TxnState::new(gid, start_ts, start_ckpt);
+        let bucket_id = tree.bucket_id();
+        let max_ckpt_per_txn = tree.store.opt.max_ckpt_per_txn;
+
+        tree.bucket.state.inc_txn_ref();
 
         {
             let mut log = g.logging.lock();
@@ -88,15 +94,16 @@ impl<'a> TxnKV<'a> {
             ctx,
             state: UnsafeCell::new(state),
             tree,
+            bucket_id,
             is_end: Cell::new(false),
-            limit: tree.store.opt.max_ckpt_per_txn,
+            limit: max_ckpt_per_txn,
         })
     }
 
     fn should_abort(&self) -> Result<(), OpCode> {
         let state = self.state_ref();
         let g = self.ctx.group(state.group_id);
-        if self.is_end.get() || g.logging.lock().ckpt_cnt() >= self.limit {
+        if self.is_end.get() || g.ckpt_cnt.load(Relaxed) - state.start_ckpt >= self.limit {
             return Err(OpCode::AbortTx);
         }
         Ok(())
@@ -164,12 +171,12 @@ impl<'a> TxnKV<'a> {
                 state.modified = true;
                 let mut log = g.logging.lock();
                 let new_pos = log.record_update(
-                    ver,
+                    &Key::new(k, ver),
                     WalPut::new(v.len()),
-                    k,
                     [].as_slice(),
                     v,
                     state.prev_lsn,
+                    self.bucket_id,
                 )?;
                 state.prev_lsn = new_pos;
             }
@@ -204,12 +211,12 @@ impl<'a> TxnKV<'a> {
                         *logged = true;
                         let mut log = g.logging.lock();
                         let new_pos = log.record_update(
-                            ver,
+                            &Key::new(rk.raw, ver),
                             WalReplace::new(t.data().len(), v.len()),
-                            rk.raw,
                             t.data(),
                             v,
                             state.prev_lsn,
+                            self.bucket_id,
                         )?;
                         state.prev_lsn = new_pos;
                     }
@@ -220,6 +227,7 @@ impl<'a> TxnKV<'a> {
         .map(|x| x.unwrap())
     }
 
+    /// Puts a key-value pair into the bucket.
     pub fn put<K, V>(&self, k: K, v: V) -> Result<(), OpCode>
     where
         K: AsRef<[u8]>,
@@ -229,6 +237,7 @@ impl<'a> TxnKV<'a> {
         self.put_impl(k.as_ref(), v.as_ref(), &mut logged)
     }
 
+    /// Updates existing key-value pair in the bucket.
     pub fn update<K, V>(&self, k: K, v: V) -> Result<ValRef, OpCode>
     where
         K: AsRef<[u8]>,
@@ -238,6 +247,7 @@ impl<'a> TxnKV<'a> {
         self.update_impl(k.as_ref(), v.as_ref(), &mut logged)
     }
 
+    /// Upserts a key-value pair into the bucket.
     pub fn upsert<K, V>(&self, k: K, v: V) -> Result<Option<ValRef>, OpCode>
     where
         K: AsRef<[u8]>,
@@ -255,12 +265,12 @@ impl<'a> TxnKV<'a> {
                         logged = true;
                         let mut log = g.logging.lock();
                         let new_pos = log.record_update(
-                            ver,
+                            &Key::new(k, ver),
                             WalPut::new(v.len()),
-                            k,
                             &[],
                             v,
                             state.prev_lsn,
+                            self.bucket_id,
                         )?;
                         state.prev_lsn = new_pos;
                     }
@@ -283,12 +293,12 @@ impl<'a> TxnKV<'a> {
                         logged = true;
                         let mut log = g.logging.lock();
                         let new_pos = log.record_update(
-                            ver,
+                            &Key::new(rk.raw, ver),
                             WalReplace::new(t.data().len(), v.len()),
-                            rk.raw,
                             t.data(),
                             v,
                             state.prev_lsn,
+                            self.bucket_id,
                         )?;
                         state.prev_lsn = new_pos;
                     }
@@ -298,6 +308,7 @@ impl<'a> TxnKV<'a> {
         })
     }
 
+    /// Deletes a key-value pair from the bucket.
     pub fn del<T>(&self, k: T) -> Result<ValRef, OpCode>
     where
         T: AsRef<[u8]>,
@@ -335,12 +346,12 @@ impl<'a> TxnKV<'a> {
                         state.modified = true;
                         let mut log = g.logging.lock();
                         let new_pos = log.record_update(
-                            *key.ver(),
+                            &key,
                             WalDel::new(t.data().len()),
-                            rk.raw,
                             t.data(),
                             [].as_slice(),
                             state.prev_lsn,
+                            self.bucket_id,
                         )?;
                         state.prev_lsn = new_pos;
                     }
@@ -352,6 +363,7 @@ impl<'a> TxnKV<'a> {
         res.map(|x| x.unwrap())
     }
 
+    /// Commits the transaction.
     pub fn commit(self) -> Result<(), OpCode> {
         self.should_abort()?;
         let state = self.state_ref();
@@ -381,62 +393,43 @@ impl<'a> TxnKV<'a> {
         Ok(())
     }
 
+    /// Gets the value associated with a key.
     #[inline]
     pub fn get<K>(&self, k: K) -> Result<ValRef, OpCode>
     where
         K: AsRef<[u8]>,
     {
         let state = self.state_ref();
-        #[cfg(feature = "extra_check")]
-        assert!(!k.as_ref().is_empty(), "key must be non-empty");
-
-        let g = crossbeam_epoch::pin();
-        let key = Key::new(k.as_ref(), Ver::new(state.start_ts, NULL_CMD));
-        let cc = &self.ctx.group(state.group_id).cc;
-        let r = self.tree.traverse(&g, key, |txid, record_gid| {
-            cc.is_visible_to(
-                self.ctx,
-                state.group_id as u8,
-                record_gid,
-                state.start_ts,
-                txid,
-            )
-        })?;
-        Ok(r)
+        let group_id = state.group_id;
+        get_impl(
+            self.ctx,
+            &self.ctx.group(group_id).cc,
+            self.tree,
+            group_id as u8,
+            state.start_ts,
+            k,
+        )
     }
 
-    /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
+    /// Seeks an iterator to a key prefix.
+    /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration.
     ///
     /// **NOTE:** [`Iter`] will save a clone of the resource, so do not save [`Iter`] to avoid
-    /// resource shortage
+    /// resource shortage.
     #[inline]
     pub fn seek<K>(&self, prefix: K) -> Iter<'_>
     where
         K: AsRef<[u8]>,
     {
         let state = self.state_ref();
-        let b = prefix.as_ref();
-        let mut e = b.to_vec();
-        #[cfg(feature = "extra_check")]
-        assert!(!e.is_empty(), "prefix can't be empty");
-
-        if *e.last().unwrap() == u8::MAX {
-            e.push(0);
-        } else {
-            *e.last_mut().unwrap() += 1;
-        }
-
-        let cc = &self.ctx.group(state.group_id).cc;
-        self.tree
-            .range(b..e.as_slice(), move |_, txid, record_gid| {
-                cc.is_visible_to(
-                    self.ctx,
-                    state.group_id as u8,
-                    record_gid,
-                    state.start_ts,
-                    txid,
-                )
-            })
+        let group_id = state.group_id;
+        seek_impl(
+            &self.ctx.group(group_id).cc,
+            self.tree,
+            group_id as u8,
+            state.start_ts,
+            prefix,
+        )
     }
 }
 
@@ -477,7 +470,7 @@ impl Drop for TxnKV<'_> {
                 };
 
                 reader
-                    .rollback(&mut block, state.start_ts, location, self.tree)
+                    .rollback(&mut block, state.start_ts, location, |_| self.tree.clone())
                     .inspect_err(|e| {
                         log::error!("can't rollback, {:?}", e);
                     })
@@ -491,9 +484,11 @@ impl Drop for TxnKV<'_> {
             grp.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
         }
+        self.tree.bucket.state.dec_txn_ref();
     }
 }
 
+/// A read-only transaction (consistent view).
 pub struct TxnView<'a> {
     ctx: &'a Context,
     cc: Handle<CCNode>,
@@ -512,6 +507,7 @@ impl<'a> TxnView<'a> {
         })
     }
 
+    /// Gets the value associated with a key in this view.
     #[inline]
     pub fn get<K: AsRef<[u8]>>(&self, k: K) -> Result<ValRef, OpCode> {
         get_impl(
@@ -524,10 +520,11 @@ impl<'a> TxnView<'a> {
         )
     }
 
-    /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration
+    /// Seeks an iterator to a key prefix in this view.
+    /// prefix can't be empty and the [`Iter::Item`] is only valid in current iteration.
     ///
     /// **NOTE:** [`Iter`] will save a clone of the resource, so do not save [`Iter`] to avoid
-    /// resource shortage
+    /// resource shortage.
     #[inline]
     pub fn seek<K>(&self, prefix: K) -> Iter<'_>
     where
@@ -556,9 +553,10 @@ mod test {
         let path = RandomPath::tmp();
         let _ = std::fs::remove_dir_all(&*path);
         let opt = Options::new(&*path).validate().unwrap();
-        let db = Mace::new(opt)?;
+        let mace = Mace::new(opt)?;
         let (k1, k2) = ("beast".as_bytes(), "senpai".as_bytes());
         let (v1, v2) = ("114514".as_bytes(), "1919810".as_bytes());
+        let db = mace.new_bucket("default")?;
 
         let kv = db.begin()?;
         kv.put(k1, v1).expect("can't put");
@@ -668,6 +666,8 @@ mod test {
             let view = db.view()?;
             assert_eq!(view.get("elder").unwrap().slice(), "mo".as_bytes());
         }
+        drop(db);
+        drop(mace);
         Ok(())
     }
 
@@ -683,7 +683,8 @@ mod test {
         opt.tmp_store = true;
         opt.split_elems = consolidate_threshold * 2;
         opt.consolidate_threshold = consolidate_threshold;
-        let db = Mace::new(opt.validate().unwrap())?;
+        let mace = Mace::new(opt.validate().unwrap())?;
+        let db = mace.new_bucket("default")?;
 
         let kv = db.begin()?;
         kv.put("foo", "bar")?;
@@ -708,6 +709,9 @@ mod test {
         let v = view.get("foo")?;
         assert_eq!(v.slice(), "bar".as_bytes());
 
+        drop(view);
+        drop(db);
+        drop(mace);
         Ok(())
     }
 }

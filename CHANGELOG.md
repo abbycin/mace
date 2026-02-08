@@ -1,3 +1,10 @@
+## [0.0.26] 2026-02-06 (AI-Assisted)
+### Changes
+  - Bucket-centric lifecycle and runtime/metadata separation: Store owns bucket state, flush results are routed through Store to update Manifest, and runtime components no longer write metadata directly
+  - Metadata and interval structure refactor: ImTree moved to `src/utils`, interval/stat paths updated, and per-bucket file indexes added for faster deletion
+  - Manifest bucket tables migrated to `DashMap` with a structural lock to reduce contention on create/delete
+  - Store API reorganization plus test/bench expansion, including new `src/store/store.rs`, `tests/bucket.rs`, and `benches/perf.rs`
+
 ## [0.0.25] 2026-01-23 (AI-Assisted)
 ### Changes
   - Enhanced error handling across the system

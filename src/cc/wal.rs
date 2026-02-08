@@ -79,6 +79,7 @@ impl TryFrom<u8> for PayloadType {
 pub(crate) struct WalUpdate {
     pub(crate) wal_type: EntryType,
     pub(crate) sub_type: PayloadType,
+    pub(crate) bucket_id: u64,
     /// meaningful in txn rollback, unnecessary in recovery
     pub(crate) group_id: u8,
     /// payload size
@@ -96,6 +97,7 @@ impl Debug for WalUpdate {
         f.debug_struct("WalUpdate")
             .field("wal_type", &self.wal_type)
             .field("sub_type", &self.sub_type)
+            .field("bucket_id", &{ self.bucket_id })
             .field("woker_id", &{ self.group_id })
             .field("size", &{ self.size })
             .field("cmd_id", &{ self.cmd_id })
@@ -465,13 +467,16 @@ impl<'a> WalReader<'a> {
     }
 
     // for rollback, the group should be same to caller, but can be arbitrary for recovery
-    pub(crate) fn rollback<T: ITree>(
+    pub(crate) fn rollback<T: ITree, F>(
         &self,
         block: &mut Block,
         txid: u64,
         mut addr: Location,
-        tree: &T,
-    ) -> Result<(), OpCode> {
+        get_tree: F,
+    ) -> Result<(), OpCode>
+    where
+        F: Fn(u64) -> T,
+    {
         let group_id = addr.group_id;
         let mut cmd = INIT_CMD;
         let mut pos = addr.pos.offset;
@@ -533,7 +538,7 @@ impl<'a> WalReader<'a> {
                         }
 
                         let (prev_id, prev_off) =
-                            self.undo(u, &mut cmd, tree, group_id as usize, addr.pos)?;
+                            self.undo(u, &mut cmd, &get_tree, group_id as usize, addr.pos)?;
                         pos = prev_off;
                         if prev_id != addr.pos.file_id {
                             addr.pos.file_id = prev_id;
@@ -547,14 +552,17 @@ impl<'a> WalReader<'a> {
         Ok(())
     }
 
-    fn undo<T: ITree>(
+    fn undo<T: ITree, F>(
         &self,
         c: &WalUpdate,
         cmd: &mut u32,
-        tree: &T,
+        get_tree: F,
         group_id: usize,
         current_pos: Position,
-    ) -> Result<(u64, u64), OpCode> {
+    ) -> Result<(u64, u64), OpCode>
+    where
+        F: Fn(u64) -> T,
+    {
         let (tombstone, data) = match c.sub_type() {
             PayloadType::Insert => {
                 let i = c.put();
@@ -584,16 +592,18 @@ impl<'a> WalReader<'a> {
         };
 
         let g = self.ctx.group(group_id);
+        let key = Key::new(raw, Ver::new(c.txid, *cmd));
         g.logging.lock().record_update(
-            Ver::new(c.txid, *cmd),
+            &key,
             WalClr::new(tombstone, data.len(), c.prev_id, c.prev_off),
-            raw,
             [].as_slice(),
             data,
             current_pos,
+            c.bucket_id,
         )?;
 
-        tree.put(self.guard, Key::new(raw, Ver::new(c.txid, *cmd)), val);
+        let tree = get_tree(c.bucket_id);
+        tree.put(self.guard, key, val);
         Ok((c.prev_id, c.prev_off))
     }
 }
@@ -616,6 +626,7 @@ mod test {
         let c = WalUpdate {
             wal_type: EntryType::Update,
             sub_type: PayloadType::Insert,
+            bucket_id: 0,
             group_id: 19,
             cmd_id: 8,
             txid: 26,
@@ -623,7 +634,7 @@ mod test {
             klen: KEY.len() as u32,
             prev_id: 0,
             prev_off: 0,
-            checksum: 0, // Will be calculated after record is assembled
+            checksum: 0, // will be calculated after record is assembled
         };
         let total_len = c.encoded_len() + len;
         let mut buf = vec![0u8; total_len * 2];
@@ -680,15 +691,15 @@ mod test {
         begin.checksum = begin.calc_checksum();
         assert!(begin.is_intact());
 
-        // Corrupt it
+        // corrupt it
         begin.txid = 54321;
         assert!(!begin.is_intact());
 
-        // Restore
+        // restore
         begin.txid = 12345;
         assert!(begin.is_intact());
 
-        // Commit
+        // commit
         let mut commit = WalCommit {
             wal_type: EntryType::Commit,
             txid: 12345,
@@ -697,10 +708,10 @@ mod test {
         commit.checksum = commit.calc_checksum();
         assert!(commit.is_intact());
 
-        commit.wal_type = EntryType::Abort; // Corrupt type
+        commit.wal_type = EntryType::Abort; // corrupt type
         assert!(!commit.is_intact());
 
-        // Checkpoint
+        // checkpoint
         let mut ckpt = WalCheckpoint {
             wal_type: EntryType::CheckPoint,
             checksum: 0,

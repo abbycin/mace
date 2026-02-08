@@ -7,7 +7,7 @@ use std::hash::BuildHasherDefault;
 
 use crate::map::IFooter;
 use crate::map::chunk::Chunk;
-use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, Numerics, PageTable};
+use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, PageTable};
 use crate::types::header::{TagFlag, TagKind};
 use crate::types::refbox::{BoxRef, RemoteView};
 use crate::types::traits::{IAsSlice, IHeader};
@@ -28,14 +28,23 @@ use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64};
 
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
+    bucket_id: u64,
     cb: Box<dyn FnOnce()>,
 }
 
 unsafe impl Send for FlushData {}
 
 impl FlushData {
-    pub fn new(arena: Handle<Arena>, cb: Box<dyn FnOnce()>) -> Self {
-        Self { arena, cb }
+    pub fn new(arena: Handle<Arena>, bucket_id: u64, cb: Box<dyn FnOnce()>) -> Self {
+        Self {
+            arena,
+            bucket_id,
+            cb,
+        }
+    }
+
+    pub fn bucket_id(&self) -> u64 {
+        self.bucket_id
     }
 
     pub fn id(&self) -> u64 {
@@ -182,7 +191,7 @@ impl Arena {
         self.flsn.len() as u8
     }
 
-    fn alloc_size(&self, size: u32) -> Result<(), OpCode> {
+    fn alloc_size(&self, size: u32) -> Result<u64, OpCode> {
         let mut cur = self.real_size.load(Relaxed);
 
         loop {
@@ -193,7 +202,7 @@ impl Arena {
 
             // this allow us over alloc once
             if cur > self.cap as u64 {
-                return Err(OpCode::NeedMore);
+                return Err(OpCode::NoSpace);
             }
 
             let new = cur + size as u64;
@@ -201,17 +210,17 @@ impl Arena {
                 Ok(_) => {
                     let off = self.offset.fetch_add(1_u64, Relaxed);
                     if off >= u32::MAX as u64 {
-                        return Err(OpCode::NeedMore);
+                        return Err(OpCode::NoSpace);
                     }
-                    return Ok(());
+                    return Ok(off);
                 }
                 Err(e) => cur = e,
             }
         }
     }
 
-    fn alloc_at(&self, numerics: &Numerics, real_size: u32) -> BoxRef {
-        let addr = numerics.address.fetch_add(1, Relaxed);
+    fn alloc_at(&self, next_addr: &AtomicU64, real_size: u32, _bucket_id: u64) -> BoxRef {
+        let addr = next_addr.fetch_add(1, Relaxed);
 
         let p = if real_size >= 4096 {
             BoxRef::alloc_exact(real_size, addr)
@@ -246,11 +255,16 @@ impl Arena {
         p
     }
 
-    pub fn alloc(&self, numerics: &Numerics, size: u32) -> Result<BoxRef, OpCode> {
+    pub fn alloc(
+        &self,
+        next_addr: &AtomicU64,
+        size: u32,
+        bucket_id: u64,
+    ) -> Result<BoxRef, OpCode> {
         let real_size = BoxRef::real_size(size);
         self.inc_ref();
-        self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
-        Ok(self.alloc_at(numerics, real_size))
+        let _ = self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
+        Ok(self.alloc_at(next_addr, real_size, bucket_id))
     }
 
     pub(crate) fn dealloc(&self, addr: u64, len: usize) {
@@ -333,7 +347,9 @@ impl Drop for Arena {
     fn drop(&mut self) {
         let ptr = self.active_chunk.load(Relaxed);
         if !ptr.is_null() {
-            unsafe { drop(Box::from_raw(ptr)) };
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
         }
     }
 }
@@ -416,6 +432,7 @@ impl IFooter for BlobFooter {
 /// NOTE: the blob data may be not ordered by key especially after compaction, this is absolutely ok
 /// for SSD, because it's good at random read
 pub(crate) struct FileBuilder {
+    bucket_id: u64,
     data_active_size: usize,
     blob_active_size: usize,
     /// never flush to file
@@ -433,8 +450,9 @@ impl FileBuilder {
         ivl.hi = ivl.hi.max(addr);
     }
 
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(bucket_id: u64) -> Self {
         Self {
+            bucket_id,
             data_active_size: 0,
             blob_active_size: 0,
             data_junks: Vec::new(),
@@ -495,8 +513,9 @@ impl FileBuilder {
                 total_elems: n,
                 active_size: self.data_active_size,
                 total_size: self.data_active_size,
+                bucket_id: self.bucket_id,
             },
-            mask: BitMap::new(n),
+            mask: Some(BitMap::new(n)),
         }
     }
 
@@ -508,8 +527,9 @@ impl FileBuilder {
                 active_size: self.blob_active_size,
                 nr_active: n,
                 nr_total: n,
+                bucket_id: self.bucket_id,
             },
-            mask: BitMap::new(n),
+            mask: Some(BitMap::new(n)),
         }
     }
 
@@ -618,7 +638,7 @@ where
             })?;
         let end = file.size().expect("can't get file size");
         if end < T::LEN as u64 {
-            return Err(OpCode::NeedMore);
+            return Err(OpCode::NoSpace);
         }
         let mut footer = T::default();
         let tmp = unsafe {
@@ -695,10 +715,10 @@ pub(crate) struct MapBuilder {
 }
 
 impl MapBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
-            table: PageTable::default(),
-        }
+    pub(crate) fn new(bucket_id: u64) -> Self {
+        let mut table = PageTable::default();
+        table.bucket_id = bucket_id;
+        Self { table }
     }
 
     fn add_impl(&mut self, pid: u64, addr: u64, is_unmap: bool) {
@@ -757,7 +777,7 @@ mod test {
         let mut p1 = BoxRef::alloc(666, addr1);
         p1.header_mut().pid = pid1;
 
-        let mut builder = FileBuilder::new();
+        let mut builder = FileBuilder::new(0);
 
         builder.add(p.clone());
         builder.add(p1.clone());

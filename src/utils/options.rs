@@ -7,14 +7,12 @@ use crate::utils::lru::LRU_SHARD;
 
 use super::OpCode;
 
+/// Configuration options for the Mace storage engine.
 #[derive(Clone)]
 pub struct Options {
     /// force sync data to disk for every log write, the default value is `true`, turning it off may
     /// result in data loss, while turning it on may result in performance degradation
     pub sync_on_write: bool,
-    /// compact all cached node on exit. default value is false, it only compact cached nodes that
-    /// must be compacted
-    pub compact_on_exit: bool,
     /// allows allocation of more arenas than a fixed value when arena exhaustion occurs, rather than
     /// waiting for arenas to become available, the default value is false
     pub over_provision: bool,
@@ -50,6 +48,8 @@ pub struct Options {
     /// delta cache count, shard into 32 slots, which act as a secondary cache to node cache
     /// which has two priority: High and Low, the Low priority is used for big value only
     pub cache_count: usize,
+    /// stat bitmap cache count for data and blob
+    pub stat_mask_cache_count: usize,
     /// the High priority cache ratio of [`Self::cache_count`], range from [0, 100]
     pub high_priority_ratio: usize,
     /// max cache count for open data file concurrently, which is used for load pages from data file
@@ -105,6 +105,8 @@ impl Options {
     pub const MIN_CACHE_CAP: usize = Self::DATA_FILE_SIZE;
     pub const CACHE_CAP: usize = 1 << 30; // 1GB
     pub const CACHE_CNT: usize = 16384;
+    // Assuming a MemData/BlobStat is 32 KB, 16,384 stats will use 512 MB of memory, which is a reasonable value
+    pub const STAT_MASK_CACHE_CNT: usize = 16384;
     pub const FILE_CACHE: usize = 512;
     pub const WAL_BUF_SZ: usize = 8 << 20; // 8MB
     pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
@@ -114,6 +116,7 @@ impl Options {
     const MIN_SPLIT_ELEMS: u16 = 64;
     pub(crate) const MAX_KV_SIZE: usize = 1 << 30; // 1GB
 
+    /// Creates a new Options instance with default values and the given database root.
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
         let cores = std::thread::available_parallelism()
             .unwrap()
@@ -122,7 +125,6 @@ impl Options {
             .next_power_of_two() as u8;
         Self {
             sync_on_write: true,
-            compact_on_exit: false,
             over_provision: false,
             concurrent_write: cores,
             tmp_store: false,
@@ -138,6 +140,7 @@ impl Options {
             cache_capacity: Self::CACHE_CAP,
             cache_evict_pct: 10, // 10%
             cache_count: Self::CACHE_CNT,
+            stat_mask_cache_count: Self::STAT_MASK_CACHE_CNT,
             high_priority_ratio: 80, // 80%
             data_handle_cache_capacity: 128,
             blob_handle_cache_capacity: 128,
@@ -158,6 +161,7 @@ impl Options {
         self.split_elems as usize / 4
     }
 
+    /// Validates the options and returns a ParsedOptions instance.
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
         self.concurrent_write = self.concurrent_write.clamp(1, Self::MAX_CONCURRENT_WRITE);
         self.split_elems = self
@@ -168,6 +172,9 @@ impl Options {
         }
         if self.cache_count / LRU_SHARD < 10 {
             self.cache_count = Self::CACHE_CNT;
+        }
+        if self.stat_mask_cache_count == 0 {
+            self.stat_mask_cache_count = Self::STAT_MASK_CACHE_CNT;
         }
         if self.cache_capacity < Self::MIN_CACHE_CAP {
             self.cache_capacity = Self::CACHE_CAP;
@@ -180,6 +187,7 @@ impl Options {
         Ok(ParsedOptions { inner: self })
     }
 
+    /// Creates the directory structure for the database.
     pub fn create_dir(&self) -> std::io::Result<()> {
         let (db_root, data_root, log_root) = (self.db_root(), self.data_root(), self.log_root());
 

@@ -1,7 +1,8 @@
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
+use crate::OpCode;
 use crate::cc::cc::ConcurrencyControl;
-use crate::meta::{Manifest, Numerics};
+use crate::meta::Numerics;
 use crate::utils::data::WalDescHandle;
 use crate::utils::options::ParsedOptions;
 use crate::utils::{CachePad, Handle, INIT_WMK, NULL_ORACLE, rand_range};
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 pub struct Context {
@@ -20,20 +22,19 @@ pub struct Context {
     /// maybe a bottleneck
     /// contains oldest, txid less than or equal to it can be purged
     pub(crate) numerics: Arc<Numerics>,
-    pub(crate) manifest: Manifest,
     pool: Arc<CCPool>,
     groups: Arc<Vec<WriterGroup>>,
     nr_view: CachePad<AtomicUsize>,
     group_rr: CachePad<AtomicUsize>,
     min_view_txid: Arc<AtomicU64>,
     tx: Sender<()>,
+    collector: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Context {
-    pub fn new(opt: Arc<ParsedOptions>, manifest: Manifest, desc: &[WalDescHandle]) -> Self {
+    pub fn new(opt: Arc<ParsedOptions>, numerics: Arc<Numerics>, desc: &[WalDescHandle]) -> Self {
         let cores = opt.concurrent_write as usize;
         let mut groups = Vec::with_capacity(cores);
-        let numerics = manifest.numerics.clone();
         for (i, d) in desc.iter().enumerate() {
             let g = WriterGroup::new(i, d.clone(), numerics.clone(), opt.clone());
             groups.push(g);
@@ -43,18 +44,18 @@ impl Context {
         let groups = Arc::new(groups);
         let min_view_txid = Arc::new(AtomicU64::new(INIT_WMK));
         let (tx, rx) = channel();
-        collect_thread(rx, min_view_txid.clone(), pool.clone());
+        let collector = collect_thread(rx, min_view_txid.clone(), pool.clone());
 
         Self {
             opt: opt.clone(),
             numerics,
-            manifest,
             pool,
             groups,
             nr_view: CachePad::default(),
             group_rr: CachePad::default(),
             min_view_txid,
             tx,
+            collector: Mutex::new(Some(collector)),
         }
     }
 
@@ -137,10 +138,25 @@ impl Context {
         self.tx
             .send(())
             .expect("notify collector thread quit failed");
+
+        if let Some(h) = self.collector.lock().take() {
+            let _ = h.join();
+        }
+    }
+
+    pub fn sync(&self) -> Result<(), OpCode> {
+        for group in self.groups.iter() {
+            group.logging.lock().sync()?;
+        }
+        Ok(())
     }
 }
 
-fn collect_thread(reader: Receiver<()>, min_view_txid: Arc<AtomicU64>, pool: Arc<CCPool>) {
+fn collect_thread(
+    reader: Receiver<()>,
+    min_view_txid: Arc<AtomicU64>,
+    pool: Arc<CCPool>,
+) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("collector".into())
         .spawn(move || {
@@ -162,7 +178,7 @@ fn collect_thread(reader: Receiver<()>, min_view_txid: Arc<AtomicU64>, pool: Arc
                 }
             }
         })
-        .expect("can't start collector thread");
+        .expect("can't start collector thread")
 }
 
 const CCPOOL_SHARD: usize = 32;

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 
+#[derive(Default)]
 pub struct IntervalMap {
     map: BTreeMap<u64, (u64, u64)>,
 }
@@ -7,7 +8,7 @@ pub struct IntervalMap {
 impl IntervalMap {
     pub fn new() -> Self {
         Self {
-            map: BTreeMap::new(),
+            map: Default::default(),
         }
     }
 

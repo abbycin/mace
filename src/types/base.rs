@@ -724,6 +724,10 @@ mod test {
             self.clone()
         }
 
+        fn deep_copy(&self) -> Self {
+            self.clone()
+        }
+
         fn load_remote(&self, addr: u64) -> Result<BoxRef, crate::OpCode> {
             Ok(self.inner.map.get(&addr).unwrap().clone())
         }

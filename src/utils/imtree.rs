@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::types::Comparator;
+use crate::utils::Comparator;
 
 /// tune this value when it's necessary
 pub(crate) const NODE_SIZE: usize = 64;
@@ -918,9 +918,9 @@ mod test {
 
     use crate::Options;
     use crate::types::data::{Key, Record, Ver};
-    use crate::types::imtree::ImTree;
     use crate::types::refbox::{BoxRef, DeltaView};
     use crate::types::traits::IAlloc;
+    use crate::utils::imtree::ImTree;
 
     struct Allocator;
 

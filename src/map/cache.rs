@@ -1,16 +1,32 @@
-use dashmap::{DashMap, Entry};
-use std::collections::HashSet;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
-use std::sync::atomic::{AtomicIsize, AtomicU32};
-
-use crate::utils::{ROOT_PID, rand_range};
+use dashmap::DashMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize};
 
 #[derive(PartialEq, Eq, Copy, Clone, PartialOrd, Ord, Debug)]
 #[repr(u32)]
 pub(crate) enum CacheState {
     Hot = 3,
     Warm = 2,
-    Cool = 1,
+    Cold = 1,
+}
+
+impl CacheState {
+    fn cool(self) -> CacheState {
+        match self {
+            CacheState::Hot => CacheState::Warm,
+            CacheState::Warm => CacheState::Cold,
+            CacheState::Cold => CacheState::Cold,
+        }
+    }
+
+    fn warm(self) -> CacheState {
+        match self {
+            CacheState::Cold => CacheState::Warm,
+            CacheState::Warm => CacheState::Hot,
+            CacheState::Hot => CacheState::Hot,
+        }
+    }
 }
 
 impl From<u32> for CacheState {
@@ -25,122 +41,152 @@ struct CacheItem {
 }
 
 impl CacheItem {
-    fn warm(&self) {
-        let cur = self.state.load(Relaxed);
-        let _ = self.state.compare_exchange(
-            cur,
-            (cur + 1).min(CacheState::Hot as u32),
-            Relaxed,
-            Relaxed,
-        );
-    }
-
-    fn cool(&self) -> CacheState {
-        let cur = self.state.load(Relaxed);
-        self.state
-            .compare_exchange(cur, cur.saturating_sub(1), Relaxed, Relaxed)
-            .unwrap_or_else(|x| x)
-            .into()
-    }
-
-    fn status(&self) -> CacheState {
-        self.state.load(Relaxed).into()
-    }
-}
-pub(crate) struct NodeCache {
-    map: DashMap<u64, CacheItem>,
-    used: AtomicIsize,
-    cap: isize,
-    pct: isize,
-}
-
-impl NodeCache {
-    pub(crate) fn new(cap: usize, pct: usize) -> Self {
-        Self {
-            map: DashMap::new(),
-            used: AtomicIsize::new(0),
-            cap: cap as isize,
-            pct: pct as isize,
+    fn warm(&self) -> CacheState {
+        let mut cur = self.state.load(Relaxed);
+        loop {
+            let next = CacheState::from(cur).warm() as u32;
+            match self.state.compare_exchange(cur, next, Relaxed, Relaxed) {
+                Ok(_) => return next.into(),
+                Err(v) => cur = v,
+            }
         }
     }
 
-    pub(crate) fn full(&self) -> bool {
-        self.used.load(Acquire) >= self.cap
+    fn cool(&self) -> CacheState {
+        let mut cur = self.state.load(Relaxed);
+        loop {
+            let next = CacheState::from(cur).cool() as u32;
+            match self.state.compare_exchange(cur, next, Relaxed, Relaxed) {
+                Ok(_) => return next.into(),
+                Err(v) => cur = v,
+            }
+        }
+    }
+}
+
+pub(crate) struct NodeCache {
+    map: DashMap<u64, CacheItem>,
+    used: Arc<AtomicIsize>,
+}
+
+impl NodeCache {
+    pub(crate) fn new(used: Arc<AtomicIsize>) -> Self {
+        Self {
+            map: DashMap::new(),
+            used,
+        }
     }
 
-    pub(crate) fn almost_full(&self) -> bool {
-        self.used.load(Acquire) >= self.cap * 100 / 80
-    }
-
-    pub(crate) fn cap(&self) -> usize {
-        self.cap as usize
-    }
-
-    pub(crate) fn put(&self, pid: u64, state: u32, size: isize) {
+    pub(crate) fn insert(&self, pid: u64, state: CacheState, size: isize) {
         let e = self.map.entry(pid);
         match e {
-            Entry::Occupied(mut o) => {
+            dashmap::Entry::Occupied(mut o) => {
                 let old = o.get_mut();
                 self.used.fetch_add(size - old.size, AcqRel);
                 old.size = size;
-                old.warm();
+                old.state.store(state as u32, Relaxed);
             }
-            Entry::Vacant(v) => {
+            dashmap::Entry::Vacant(v) => {
                 self.used.fetch_add(size, AcqRel);
                 v.insert(CacheItem {
-                    state: AtomicU32::new(state),
+                    state: AtomicU32::new(state as u32),
                     size,
                 });
             }
         }
     }
 
-    /// it's possible that evictor has removed the pid from cache, but not replace page table yet
-    /// and other threads finished replace that cause eviction fail, so we add it back to cache with
-    /// Cool state
-    pub(crate) fn warm(&self, pid: u64, size: usize) {
-        self.put(pid, CacheState::Cool as u32, size as isize);
+    pub(crate) fn touch(&self, pid: u64, size: isize) {
+        let e = self.map.entry(pid);
+        match e {
+            dashmap::Entry::Occupied(mut o) => {
+                let old = o.get_mut();
+                self.used.fetch_add(size - old.size, AcqRel);
+                old.size = size;
+                old.warm();
+            }
+            dashmap::Entry::Vacant(v) => {
+                self.used.fetch_add(size, AcqRel);
+                v.insert(CacheItem {
+                    state: AtomicU32::new(CacheState::Warm as u32),
+                    size,
+                });
+            }
+        }
     }
 
-    pub(crate) fn evict_one(&self, pid: u64) {
+    pub(crate) fn cool(&self, pid: u64) -> Option<CacheState> {
+        let e = self.map.get(&pid)?;
+        Some(e.cool())
+    }
+
+    pub(crate) fn state(&self, pid: u64) -> Option<CacheState> {
+        let e = self.map.get(&pid)?;
+        Some(CacheState::from(e.state.load(Relaxed)))
+    }
+
+    pub(crate) fn evict(&self, pid: u64) -> bool {
         if let Some((_, i)) = self.map.remove(&pid) {
             self.used.fetch_sub(i.size, AcqRel);
+            true
+        } else {
+            false
         }
     }
 
-    pub(crate) fn evict(&self) -> Vec<u64> {
-        let mut cnt = self.pct as usize * self.map.len() / 100;
-        let mut pids = HashSet::new();
-        let mut iter = self.map.iter();
-
-        while cnt > 0
-            && let Some(i) = iter.next()
-        {
-            let (&pid, v) = (i.key(), i.value());
-            if pid != ROOT_PID
-                && rand_range(0..100) > self.pct as usize
-                && v.cool() > CacheState::Cool
-            {
-                pids.insert(pid);
-            }
-            cnt -= 1;
+    pub(crate) fn update_size(&self, pid: u64, size: isize) -> bool {
+        if let Some(mut item) = self.map.get_mut(&pid) {
+            self.used.fetch_add(size - item.size, AcqRel);
+            item.size = size;
+            true
+        } else {
+            false
         }
-        pids.into_iter().collect()
     }
 
-    pub(crate) fn compact(&self) -> Vec<u64> {
-        let mut pids = Vec::new();
-        let mut cnt = self.pct as usize * self.map.len() / 100;
+    pub(crate) fn used(&self) -> isize {
+        self.used.load(Relaxed)
+    }
+}
 
-        for i in self.map.iter() {
-            if cnt == 0 {
-                break;
-            }
-            cnt -= 1;
-            if rand_range(0..100) > self.pct as usize && i.status() > CacheState::Cool {
-                pids.push(*i.key());
+pub(crate) struct CandidateRing {
+    buf: Vec<AtomicU64>,
+    idx: AtomicUsize,
+}
+
+pub(crate) const CANDIDATE_RING_SIZE: usize = 1024;
+pub(crate) const CANDIDATE_SAMPLE_RATE: u64 = 4;
+pub(crate) const EVICT_SAMPLE_MAX_ROUNDS: usize = 4;
+
+impl CandidateRing {
+    pub(crate) fn new(cap: usize) -> Self {
+        let mut buf = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            buf.push(AtomicU64::new(0));
+        }
+        Self {
+            buf,
+            idx: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn push(&self, pid: u64) {
+        let len = self.buf.len();
+        if len == 0 {
+            return;
+        }
+        let pos = self.idx.fetch_add(1, Relaxed) % len;
+        self.buf[pos].store(pid + 1, Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for slot in &self.buf {
+            let v = slot.load(Relaxed);
+            if v > 0 {
+                out.push(v - 1);
             }
         }
-        pids
+        out
     }
 }

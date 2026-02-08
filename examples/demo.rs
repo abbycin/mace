@@ -5,9 +5,10 @@ fn main() -> Result<(), OpCode> {
     let _ = std::fs::remove_dir_all(&path);
     let opt = Options::new(path).validate()?;
     let db = Mace::new(opt)?;
+    let bucket = db.new_bucket("test")?;
 
     // start a read-write transaction
-    let kv = db.begin()?;
+    let kv = bucket.begin()?;
     kv.put("foo", "bar")?;
     kv.put("fool", "+1s")?;
     kv.put("foolish", "elder")?;
@@ -26,12 +27,12 @@ fn main() -> Result<(), OpCode> {
     kv.commit()?;
 
     // rollback
-    let kv = db.begin()?;
+    let kv = bucket.begin()?;
     kv.put("mo", "ha")?;
     drop(kv);
 
     // start a read-only transaction
-    let view = db.view()?;
+    let view = bucket.view()?;
     let r = view.get("foo")?;
     assert_eq!(r.slice(), "bar".as_bytes());
     let r = view.get("mo");

@@ -12,7 +12,8 @@ fn upsert_delete() {
     opt.data_garbage_ratio = 10;
     opt.wal_file_size = 32 << 20;
 
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
     let mut rng = rand::rng();
 
     const N: usize = 1200;
@@ -46,8 +47,11 @@ fn upsert_delete() {
     }
 
     drop(db);
+    drop(mace);
+
     saved.tmp_store = true;
-    let db = Mace::new(saved.validate().unwrap()).unwrap();
+    let mace = Mace::new(saved.validate().unwrap()).unwrap();
+    let db = mace.get_bucket("x").unwrap();
 
     for (k, _) in &kvs {
         let view = db.view().unwrap();
@@ -60,8 +64,9 @@ fn big_kv() {
     let path = RandomPath::new();
     let opt = Options::new(&*path);
     let mut saved = opt.clone();
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
     const N: usize = 200;
+    let db = mace.new_bucket("x").unwrap();
     let kv = db.begin().unwrap();
     let val = vec![233; 56 << 10];
     let keys: Vec<String> = (0..N).map(|x| format!("key_{x}")).collect();
@@ -80,9 +85,11 @@ fn big_kv() {
     kv.commit().unwrap();
 
     drop(db);
+    drop(mace);
 
     saved.tmp_store = true;
-    let db = Mace::new(saved.validate().unwrap()).unwrap();
+    let mace = Mace::new(saved.validate().unwrap()).unwrap();
+    let db = mace.get_bucket("x").unwrap();
     let view = db.view().unwrap();
 
     for k in &keys {
@@ -99,7 +106,8 @@ fn big_kv2() {
     opt.wal_buffer_size = 1024;
     opt.data_file_size = 4096;
     let mut saved = opt.clone();
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
 
     let kv = db.begin().unwrap();
 
@@ -118,9 +126,11 @@ fn big_kv2() {
     drop(r);
     drop(view);
     drop(db);
+    drop(mace);
 
     saved.tmp_store = true;
-    let db = Mace::new(saved.validate().unwrap()).unwrap();
+    let mace = Mace::new(saved.validate().unwrap()).unwrap();
+    let db = mace.get_bucket("x").unwrap();
     let view = db.view().unwrap();
 
     let r = view.get("key1").unwrap();
@@ -135,7 +145,8 @@ fn big_kv3() {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
-    let db = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
     let val = vec![b'0'; 10240];
     let ksz = 1024;
     let count = 10000;

@@ -7,7 +7,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 pub struct ActiveTxns {
     // bottleneck
@@ -116,6 +116,7 @@ pub struct WriterGroup {
     pub cc: ConcurrencyControl,
     pub logging: Mutex<Logging>,
     pub active_txns: ActiveTxns,
+    pub ckpt_cnt: Arc<AtomicUsize>,
 }
 
 impl WriterGroup {
@@ -125,32 +126,36 @@ impl WriterGroup {
         numerics: Arc<Numerics>,
         opt: Arc<ParsedOptions>,
     ) -> Self {
+        let ckpt_cnt = Arc::new(AtomicUsize::new(0));
         Self {
             id,
             cc: ConcurrencyControl::new(opt.concurrent_write as usize),
-            logging: Mutex::new(Logging::new(desc, numerics, opt)),
+            logging: Mutex::new(Logging::new(desc, numerics, opt, ckpt_cnt.clone())),
             active_txns: ActiveTxns::new(),
+            ckpt_cnt,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct TxnState {
     pub start_ts: u64,
     pub modified: bool,
     pub prev_lsn: Position,
     pub group_id: usize,
     pub cmd_id: u32,
+    pub start_ckpt: usize,
 }
 
 impl TxnState {
-    pub fn new(group_id: usize, start_ts: u64) -> Self {
+    pub fn new(group_id: usize, start_ts: u64, start_ckpt: usize) -> Self {
         Self {
             start_ts,
             modified: false,
             prev_lsn: Position::default(),
             group_id,
             cmd_id: 0,
+            start_ckpt,
         }
     }
 }

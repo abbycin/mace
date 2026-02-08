@@ -1,18 +1,23 @@
 use crate::OpCode;
 use crate::index::Node;
+use crate::index::Page;
+use crate::map::buffer::BucketContext;
 use crate::map::data::Arena;
+use crate::map::table::PageMap;
 use crate::types::header::TagFlag;
 use crate::types::refbox::{BoxRef, BoxView};
 use crate::types::traits::{IAlloc, IHeader};
 use crate::utils::Handle;
 use crate::utils::data::{JUNK_LEN, Position};
-use crate::{Store, index::Page};
+use crate::utils::options::ParsedOptions;
 use crossbeam_epoch::Guard;
 #[cfg(feature = "metric")]
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 pub struct SysTxn<'a> {
-    pub store: &'a Store,
+    pub table: &'a PageMap,
+    pub(crate) buffer: &'a BucketContext,
+    opt: &'a ParsedOptions,
     g: &'a Guard,
     maps: Vec<(u64, u64)>,
     /// garbage and allocs may overlap, garbage will be set to Junk on success, while allocs will be
@@ -22,9 +27,16 @@ pub struct SysTxn<'a> {
 }
 
 impl<'a> SysTxn<'a> {
-    pub fn new(store: &'a Store, g: &'a Guard) -> Self {
+    pub fn new(
+        table: &'a PageMap,
+        opt: &'a ParsedOptions,
+        g: &'a Guard,
+        buffer: &'a BucketContext,
+    ) -> Self {
         Self {
-            store,
+            table,
+            buffer,
+            opt,
             g,
             maps: Vec::new(),
             garbage: Vec::new(),
@@ -33,7 +45,7 @@ impl<'a> SysTxn<'a> {
     }
 
     pub fn record_and_commit(&mut self, group_id: usize, pos: Position) {
-        self.store.buffer.record_lsn(group_id, pos);
+        self.buffer.record_lsn(group_id, pos);
         self.commit();
     }
 
@@ -57,17 +69,24 @@ impl<'a> SysTxn<'a> {
             G_ALLOC_STATUS.total_alloc_size.fetch_add(size, Relaxed);
             G_ALLOC_STATUS.total_allocs.fetch_add(1, Relaxed);
         }
-        let (h, t) = self.store.buffer.alloc(size as u32).expect("never happen");
-        self.allocs.push((h, t.view()));
+        let (h, t) = self.buffer.alloc(size as u32).expect("never happen");
+        let view: BoxView = t.view();
+        self.allocs.push((h, view));
         t
     }
 
     /// map pid to page table and assign pid to page
     pub fn map(&mut self, p: &mut Page) -> u64 {
-        let pid = self.store.page.map(p.swip()).expect("no page slot");
+        let pid = self.table.map(p.swip()).expect("no page slot");
         p.set_pid(pid);
         self.maps.push((pid, p.swip()));
         pid
+    }
+
+    pub fn map_to(&mut self, p: &mut Page, pid: u64) {
+        p.set_pid(pid);
+        self.table.map_to(pid, p.swip());
+        self.maps.push((pid, p.swip()));
     }
 
     /// unmap pid from page table then recycle space
@@ -79,12 +98,10 @@ impl<'a> SysTxn<'a> {
         h.flag = TagFlag::Unmap;
         h.pid = pid;
 
-        self.store
-            .page
+        self.table
             .unmap(pid, p.swip())
             .map(|_| {
                 p.garbage_collect(self, old_junks);
-                self.store.buffer.evict(pid);
                 self.g.defer(move || p.reclaim());
             })
             .map_err(|_| OpCode::Again)
@@ -99,7 +116,7 @@ impl<'a> SysTxn<'a> {
             assert_eq!(old, self.garbage.len());
         }
         let sz = self.garbage.len() * JUNK_LEN;
-        let (h, mut junk) = self.store.buffer.alloc(sz as u32).unwrap();
+        let (h, mut junk) = self.buffer.alloc(sz as u32).unwrap();
         junk.header_mut().flag = TagFlag::Junk;
         let dst = junk.data_slice_mut::<u64>();
         dst.copy_from_slice(&self.garbage);
@@ -107,17 +124,16 @@ impl<'a> SysTxn<'a> {
         h.dec_ref();
     }
 
-    /// return new page on success,the old page will be reclaimed
+    /// return new page on success, the old page will be reclaimed
     pub fn replace(&mut self, old: Page, node: Node, old_junks: &[u64]) -> Result<Page, OpCode> {
         let pid = old.pid();
         let mut new = Page::new(node);
         new.set_pid(pid);
-        self.store
-            .page
+        self.table
             .cas(pid, old.swip(), new.swip())
             .map(|_| {
                 old.garbage_collect(self, old_junks);
-                self.store.buffer.warm(pid, new.size());
+                self.buffer.warm(pid, new.size());
                 self.g.defer(move || old.reclaim());
                 new
             })
@@ -131,11 +147,10 @@ impl<'a> SysTxn<'a> {
     pub fn update(&mut self, old: Page, new: &mut Page) -> Result<(), OpCode> {
         let pid = old.pid();
         new.set_pid(pid);
-        self.store
-            .page
+        self.table
             .cas(pid, old.swip(), new.swip())
             .map(|_| {
-                self.store.buffer.warm(pid, new.size());
+                self.buffer.warm(pid, new.size());
                 self.g.defer(move || old.reclaim())
             })
             .map_err(|_| OpCode::Again)
@@ -147,7 +162,7 @@ impl<'a> SysTxn<'a> {
     ///
     /// this can significantly reduce data file size
     fn recycle(&mut self, addr: &[u64]) {
-        self.store.buffer.recycle(addr, |addr| {
+        self.buffer.recycle(addr, |addr| {
             self.garbage.push(addr);
         });
     }
@@ -156,8 +171,10 @@ impl<'a> SysTxn<'a> {
 impl Drop for SysTxn<'_> {
     fn drop(&mut self) {
         while let Some((pid, swip)) = self.maps.pop() {
-            // the pid is not publish yet, so the unmap here will always succeed
-            self.store.page.unmap(pid, swip).expect("never happen");
+            // rollback: pid should still point to the swip we installed; failure indicates fatal corruption
+            self.table
+                .unmap(pid, swip)
+                .unwrap_or_else(|_| panic!("page map slot changed before rollback, pid {pid}"));
             let p = Page::from_swip(swip);
             p.reclaim();
         }
@@ -187,11 +204,11 @@ impl IAlloc for SysTxn<'_> {
     }
 
     fn arena_size(&mut self) -> usize {
-        self.store.opt.data_file_size
+        self.opt.data_file_size
     }
 
     fn inline_size(&self) -> usize {
-        self.store.opt.inline_size
+        self.opt.inline_size
     }
 }
 

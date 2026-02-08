@@ -12,7 +12,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use mace::{Mace, OpCode, Options, RandomPath, TxnKV};
+use mace::{Bucket, Mace, OpCode, Options, RandomPath, TxnKV};
 
 macro_rules! prelude {
     ($($core:expr),+) => {
@@ -140,7 +140,7 @@ fn no_g1_b() {
     s2.commit();
 }
 
-// cirular information flow
+// circular information flow
 #[test]
 fn no_g1_c() {
     let (mut s1, mut s2, _e) = prelude!(1, 2);
@@ -403,6 +403,7 @@ impl Executor {
         opt.tmp_store = tmp;
         opt.concurrent_write = workers.len().next_power_of_two() as u8;
         let db = Arc::new(Mace::new(opt.validate().unwrap()).unwrap());
+        db.new_bucket("xx").unwrap();
 
         let mut map = HashMap::new();
         let mut handle = Vec::new();
@@ -436,10 +437,10 @@ impl Executor {
 
     fn session(&self, worker: usize) -> Session {
         let (cond, _) = self.map.get(&worker).expect("invalid core");
-        let db = self.db.clone();
+        let db = Arc::new(self.db.get_bucket("xx").unwrap());
         Session {
-            db,
             kv: None,
+            db,
             cond: cond.clone(),
         }
     }
@@ -462,8 +463,10 @@ impl Drop for Executor {
 }
 
 struct Session {
-    db: Arc<Mace>,
+    // NOTE: field order matters! kv must be dropped before db
+    // TxnKV::drop accesses Context, which is held alive by db
     kv: Option<TxnKV<'static>>,
+    db: Arc<Bucket>,
     cond: Arc<SyncClosure>,
 }
 

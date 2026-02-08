@@ -154,6 +154,33 @@ where
         self.add_unlocked(&mut map, cap, k, v);
     }
 
+    pub(crate) fn add_with_evict(&self, cap: usize, k: K, v: V) -> Option<(K, V)> {
+        let mut map = self.map.lock();
+        if let Some(e) = map.get(&k) {
+            unsafe { (*(*e)).set_val(v) };
+            Node::move_back(self.head, *e);
+            return None;
+        }
+
+        let node = Box::new(Node::new(k.clone(), v));
+        let p = Box::into_raw(node);
+        map.insert(k, p);
+        Node::push_back(self.head, p);
+
+        if map.len() > cap {
+            let node = Node::front(self.head);
+            unsafe {
+                let key = (*node).key.take().unwrap();
+                let val = (*node).val.take().unwrap();
+                map.remove(&key);
+                Node::remove(node);
+                let _ = Box::from_raw(node);
+                return Some((key, val));
+            }
+        }
+        None
+    }
+
     fn add_unlocked(
         &self,
         map: &mut MutexGuard<'_, HashMap<K, *mut Node<K, V>>>,
@@ -211,12 +238,12 @@ impl<K, V> Drop for Lru<K, V> {
     fn drop(&mut self) {
         unsafe {
             let mut p = (*self.head).next;
-            (*self.head).next = ptr::null_mut();
-            while !p.is_null() {
+            while p != self.head {
                 let next = (*p).next;
                 drop(Box::from_raw(p));
                 p = next;
             }
+            drop(Box::from_raw(self.head));
         }
     }
 }
@@ -324,12 +351,12 @@ impl<K, V> Drop for PriorityLru<K, V> {
         unsafe {
             for head in self.queue {
                 let mut p = (*head).next;
-                (*head).next = ptr::null_mut();
-                while !p.is_null() {
+                while p != head {
                     let next = (*p).next;
                     drop(Box::from_raw(p));
                     p = next;
                 }
+                drop(Box::from_raw(head));
             }
         }
     }

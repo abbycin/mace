@@ -21,14 +21,18 @@ use crate::{
     cc::context::Context,
     index::tree::Tree,
     io::{File, GatherIO},
-    map::data::{BlobFooter, DataFooter, MetaReader},
+    map::{
+        data::{BlobFooter, DataFooter, MetaReader},
+        table::Swip,
+    },
     meta::{
-        BlobStatInner, DataStatInner, DelInterval, Delete, IntervalPair, MemBlobStat, MemDataStat,
-        MetaKind, Numerics,
+        BUCKET_PENDING_DEL, BlobStatInner, DataStatInner, DelInterval, Delete, IntervalPair,
+        MemBlobStat, MemDataStat, MetaKind, MetaOp, Numerics, blob_interval_name,
+        data_interval_name, page_table_name,
     },
     types::traits::IAsSlice,
     utils::{
-        Handle, MutRef,
+        Handle, MutRef, ROOT_PID,
         bitmap::BitMap,
         block::Block,
         countblock::Countblock,
@@ -118,7 +122,7 @@ impl GCHandle {
     }
 }
 
-pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>, tree: Tree) -> GCHandle {
+pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
     let (tx, rx) = channel();
     let sem = Arc::new(Countblock::new(1));
     let data_runs = Arc::new(AtomicU64::new(0));
@@ -127,7 +131,6 @@ pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>, tree: Tree) -
         numerics: ctx.numerics.clone(),
         ctx,
         store,
-        tree,
         data_runs: data_runs.clone(),
         blob_runs: blob_runs.clone(),
     };
@@ -149,7 +152,7 @@ struct Score {
 }
 
 impl Score {
-    fn from(stat: &MemDataStat, now: u64) -> Self {
+    fn from(stat: DataStatInner, now: u64) -> Self {
         Self {
             id: stat.file_id,
             size: stat.active_size,
@@ -158,7 +161,7 @@ impl Score {
         }
     }
 
-    fn calc_decline_rate(stat: &MemDataStat, now: u64) -> f64 {
+    fn calc_decline_rate(stat: DataStatInner, now: u64) -> f64 {
         let free = stat.total_size.saturating_sub(stat.active_size);
         // no junk has been applied yet, or
         // it's possible gc and flush thread get same tick
@@ -199,7 +202,6 @@ struct GarbageCollector {
     numerics: Arc<Numerics>,
     ctx: Handle<Context>,
     store: MutRef<Store>,
-    tree: Tree,
     data_runs: Arc<AtomicU64>,
     blob_runs: Arc<AtomicU64>,
 }
@@ -211,50 +213,143 @@ impl GarbageCollector {
         self.process_wal();
         self.process_data();
         self.process_blob();
-        self.scavenge_step();
+        self.process_pending_buckets();
+        self.scavenge();
+        self.store.manifest.delete_files();
     }
 
-    fn scavenge_step(&mut self) {
-        let max_pid = self.store.page.len();
-        if max_pid == 0 {
-            return;
+    fn process_pending_buckets(&mut self) {
+        let mut bucket_id = None;
+        let _ = self.store.manifest.btree.view(BUCKET_PENDING_DEL, |txn| {
+            let mut iter = txn.iter();
+            let mut k = Vec::new();
+            let mut v = Vec::new();
+            if iter.next_ref(&mut k, &mut v) {
+                bucket_id = Some(<u64>::from_be_bytes(k[..8].try_into().unwrap()));
+            }
+            Ok(())
+        });
+
+        if let Some(bucket_id) = bucket_id {
+            self.clean_one_bucket(bucket_id);
         }
+    }
 
-        // strategy: scan the entire page table approximately every 500 ticks (e.g., ~8 hours if tick=1min)
-        // but keep the batch size within a reasonable range [128, 10000]
-        let batch_size = (max_pid / 500).clamp(128, 10000);
-        let mut compact_count = 0;
-        let max_compact_per_tick = 64; // limit I/O impact
+    fn clean_one_bucket(&mut self, bucket_id: u64) {
+        let bucket_table = page_table_name(bucket_id);
+        let data_interval_table = data_interval_name(bucket_id);
+        let blob_interval_table = blob_interval_name(bucket_id);
+        const PID_PER_ROUND: usize = 100000;
 
-        let g = crossbeam_epoch::pin();
-        for _ in 0..batch_size {
-            let mut cursor = self.numerics.scavenge_cursor.load(Relaxed);
-            if cursor >= max_pid {
-                cursor = 0;
-            }
-
-            match self.tree.try_scavenge(cursor, &g) {
-                Ok(true) => {
-                    compact_count += 1;
+        loop {
+            let mut pids = Vec::with_capacity(PID_PER_ROUND);
+            let _ = self.store.manifest.btree.view(&bucket_table, |txn| {
+                let mut iter = txn.iter();
+                let mut k = Vec::new();
+                let mut v = Vec::new();
+                while iter.next_ref(&mut k, &mut v) && pids.len() < PID_PER_ROUND {
+                    let pid = <u64>::from_be_bytes(k[..8].try_into().unwrap());
+                    let addr = <u64>::from_be_bytes(v[..8].try_into().unwrap());
+                    pids.push((pid, addr));
                 }
-                _ => {
-                    // page is locked or busy or something else, just skip it this time
-                }
-            }
+                Ok(())
+            });
 
-            self.numerics.scavenge_cursor.store(cursor + 1, Relaxed);
-
-            // if we reached the I/O quota, stop this batch early
-            if compact_count >= max_compact_per_tick {
+            if pids.is_empty() {
                 break;
             }
+
+            let mut txn = self.store.manifest.begin();
+            let ops = txn.ops_mut().entry(bucket_table.clone()).or_default();
+            for (pid, _) in &pids {
+                ops.push(MetaOp::Del(pid.to_be_bytes().to_vec()));
+            }
+            txn.commit();
+        }
+
+        // table is now empty, destroy the btree bucket and remove pending record
+        let _ = self.store.manifest.btree.del_bucket(&bucket_table);
+        let _ = self.store.manifest.btree.del_bucket(&data_interval_table);
+        let _ = self.store.manifest.btree.del_bucket(&blob_interval_table);
+        let mut txn = self.store.manifest.begin();
+        txn.ops_mut()
+            .entry(BUCKET_PENDING_DEL.to_string())
+            .or_default()
+            .push(MetaOp::Del(bucket_id.to_be_bytes().to_vec()));
+        self.store.manifest.nr_buckets.fetch_sub(1, Relaxed);
+        txn.commit();
+    }
+
+    fn scavenge(&mut self) {
+        let g = crossbeam_epoch::pin();
+
+        let bucket_ctxs = self.store.manifest.buckets.active_contexts();
+
+        for ctx in bucket_ctxs {
+            let bucket_id = ctx.bucket_id;
+            let state = ctx.state.clone();
+            let table = ctx.table.clone();
+            let max_pid = table.len();
+            if max_pid == 0 {
+                continue;
+            }
+            // strategy: scan the entire page table approximately every 500 ticks (e.g., ~8 hours if tick=1min)
+            // but keep the batch size within a reasonable range [128, 10000]
+            let batch_size = (max_pid / 500).clamp(128, 10000);
+            let mut compact_count = 0;
+            let max_compact_per_tick = 64; // limit I/O impact
+
+            for _ in 0..batch_size {
+                if state.is_deleting() || state.is_drop() {
+                    break;
+                }
+
+                let mut cursor = table.scavenge_cursor.load(Relaxed);
+
+                if cursor >= max_pid {
+                    cursor = 0;
+                }
+                table.scavenge_cursor.store(cursor + 1, Relaxed);
+
+                let root_pid =
+                    if let Some(_meta) = self.store.manifest.bucket_metas_by_id.get(&bucket_id) {
+                        ROOT_PID
+                    } else {
+                        break; // bucket removed
+                    };
+
+                let swip = Swip::new(table.get(cursor));
+                if swip.is_null() {
+                    continue;
+                }
+
+                let bucket_ctx = self.store.manifest.get_bucket_context_must_exist(bucket_id);
+                let tree = Tree::new(self.store.clone(), root_pid, bucket_ctx);
+
+                match tree.try_scavenge(cursor, &g) {
+                    Ok(true) => {
+                        compact_count += 1;
+                    }
+                    _ => {
+                        // page is locked or busy or something else, just skip it this time
+                    }
+                }
+
+                // if we reached the I/O quota, stop this batch early
+                if compact_count >= max_compact_per_tick {
+                    break;
+                }
+            }
         }
     }
 
-    fn process_obsoleted_blob(&self, obsoleted: Vec<u64>) {
+    fn process_obsoleted_blob(&self, obsoleted: &[u64], bucket_id: u64) {
         if !obsoleted.is_empty() {
             let mut unlinked = Delete::default();
-            let mut del_intervals = DelInterval::default();
+            let mut del_intervals = DelInterval {
+                lo: Vec::new(),
+                bucket_id,
+            };
             obsoleted.iter().for_each(|&x| {
                 let mut loader = MetaReader::<BlobFooter>::new(self.store.opt.blob_file(x))
                     .expect("never happen");
@@ -264,24 +359,27 @@ impl GarbageCollector {
                 }
                 unlinked.push(x);
             });
-            let mut txn = self.ctx.manifest.begin();
+            let mut txn = self.store.manifest.begin();
             txn.record(MetaKind::BlobDelete, &unlinked);
             txn.record(MetaKind::BlobDelInterval, &del_intervals);
             txn.commit();
 
-            self.ctx
+            self.store
                 .manifest
                 .blob_stat
-                .remove_stat_interval(&obsoleted, &del_intervals);
-            self.ctx.manifest.save_obsolete_blob(&obsoleted);
-            self.ctx.manifest.delete_files();
+                .remove_stat_interval(obsoleted);
+            self.store.manifest.save_obsolete_blob(obsoleted);
+            self.store.manifest.delete_files();
         }
     }
 
-    fn process_obsoleted_data(&self, obsoleted: Vec<u64>) {
+    fn process_obsoleted_data(&self, obsoleted: Vec<u64>, bucket_id: u64) {
         if !obsoleted.is_empty() {
             let mut unlinked = Delete::default();
-            let mut del_intervals = DelInterval::default();
+            let mut del_intervals = DelInterval {
+                lo: Vec::new(),
+                bucket_id,
+            };
             obsoleted.iter().for_each(|&x| {
                 let mut loader = MetaReader::<DataFooter>::new(self.store.opt.data_file(x))
                     .expect("never happen");
@@ -291,42 +389,63 @@ impl GarbageCollector {
                 }
                 unlinked.push(x);
             });
-            let mut txn = self.ctx.manifest.begin();
+            let mut txn = self.store.manifest.begin();
             txn.record(MetaKind::DataDelete, &unlinked);
             txn.record(MetaKind::DataDelInterval, &del_intervals);
             txn.commit();
 
-            self.ctx
+            self.store
                 .manifest
                 .data_stat
-                .remove_stat_interval(&obsoleted, &del_intervals);
-            self.ctx.manifest.save_obsolete_data(&obsoleted);
-            self.ctx.manifest.delete_files();
+                .remove_stat_interval(&obsoleted);
+            self.store.manifest.save_obsolete_data(&obsoleted);
+            self.store.manifest.delete_files();
         }
     }
 
     fn process_blob(&mut self) {
-        let (obsoleted, victims) = self.ctx.manifest.blob_stat.get_victims(
+        let (obsoleted, victims) = self.store.manifest.blob_stat.get_victims(
             self.store.opt.blob_gc_ratio,
             self.store.opt.blob_garbage_ratio,
         );
 
-        self.process_obsoleted_blob(obsoleted);
-
-        let mut dst_size = 0;
-        let mut dst = Vec::new();
-        for (file_id, size) in victims {
-            dst_size += size;
-            dst.push(file_id);
-            if dst_size >= self.store.opt.blob_max_size && dst.len() >= 2 {
-                self.rewrite_blob(&dst);
-                dst.clear();
-                dst_size = 0;
+        // NOTE: obsoleted blobs may come from different buckets,
+        // but get_victims returns file_ids. We need to find their bucket_ids.
+        for fid in obsoleted {
+            // drop read-lock here, avoid dead-lock
+            let bucket_id = self
+                .store
+                .manifest
+                .blob_stat
+                .read()
+                .get(&fid)
+                .map(|s| s.bucket_id);
+            if let Some(bid) = bucket_id {
+                self.process_obsoleted_blob(&[fid], bid);
             }
         }
 
-        if self.store.opt.gc_eager && dst.len() >= 2 {
-            self.rewrite_blob(&dst);
+        let mut groups: HashMap<u64, Vec<(u64, usize)>> = HashMap::new();
+        for (fid, sz, bid) in victims {
+            groups.entry(bid).or_default().push((fid, sz));
+        }
+
+        for (bucket_id, list) in groups {
+            let mut dst_size = 0;
+            let mut dst = Vec::new();
+            for (file_id, size) in list {
+                dst_size += size;
+                dst.push(file_id);
+                if dst_size >= self.store.opt.blob_max_size && dst.len() >= 2 {
+                    self.rewrite_blob(&dst, bucket_id);
+                    dst.clear();
+                    dst_size = 0;
+                }
+            }
+
+            if self.store.opt.gc_eager && dst.len() >= 2 {
+                self.rewrite_blob(&dst, bucket_id);
+            }
         }
     }
 
@@ -335,55 +454,84 @@ impl GarbageCollector {
         let tgt_size = self.store.opt.gc_compacted_size;
         let eager = self.store.opt.gc_eager;
 
-        let (total, active) = self.ctx.manifest.data_stat.total_active();
-        if total == 0 {
-            return;
-        }
-        let ratio = (total - active) * 100 / total;
-        // log::trace!("ratio {ratio} tgt_ratio {tgt_ratio} total {total} active {active}");
-        if ratio < tgt_ratio {
-            return;
-        }
-
+        let buckets: Vec<u64> = self
+            .store
+            .manifest
+            .data_stat
+            .bucket_files()
+            .iter()
+            .map(|x: dashmap::mapref::multiple::RefMulti<'_, u64, Vec<u64>>| *x.key())
+            .collect();
         let tick = self.numerics.next_data_id.load(Relaxed);
-        let mut heap = BinaryHeap::new();
-        let mut obsoleted = Vec::new();
-        self.ctx.manifest.data_stat.iter().for_each(|x| {
-            let s = x.value();
-            // a data file has no active frame will be unlinked directly
-            if s.active_elems == 0 {
-                obsoleted.push(s.file_id);
-            } else {
+
+        for bucket_id in buckets {
+            let files = match self.store.manifest.data_stat.bucket_files().get(&bucket_id) {
+                Some(f) => f,
+                None => continue,
+            };
+
+            let mut total = 0;
+            let mut active = 0;
+            let mut obsoleted = Vec::new();
+            let mut candidates = Vec::new();
+
+            for &fid in files.value() {
+                if let Some(s) = self.store.manifest.data_stat.get(&fid) {
+                    total += s.total_size as u64;
+                    active += s.active_size as u64;
+                    if s.active_elems == 0 {
+                        obsoleted.push(fid);
+                    } else {
+                        // copy the inner value (DataStatInner is Copy)
+                        candidates.push(s.inner);
+                    }
+                }
+            }
+
+            // drop the lock on bucket_files before calling rewrite_data to avoid borrow conflicts
+            drop(files);
+
+            if total == 0 {
+                continue;
+            }
+            let ratio = (total - active) * 100 / total;
+            if ratio < tgt_ratio {
+                continue;
+            }
+
+            let mut heap = BinaryHeap::new();
+            for s in candidates {
                 let score = Score::from(s, tick);
                 if heap.len() < Self::MAX_ELEMS {
                     heap.push(score);
                 } else {
                     let top = heap.peek().unwrap();
-                    // use is_gt here, see Score's Ord impl
                     if top.cmp(&score).is_gt() {
                         heap.pop();
                         heap.push(score);
                     }
                 }
             }
-        });
 
-        self.process_obsoleted_data(obsoleted);
+            self.process_obsoleted_data(obsoleted, bucket_id);
 
-        let mut victims = vec![];
-        let mut sum = 0;
-        let mut tmp = Vec::from_iter(heap); // reclaim max rate first
-        while let Some(x) = tmp.pop() {
-            sum += x.size;
-            victims.push(x);
+            let mut victims = vec![];
+            let mut sum = 0;
+            let mut tmp = Vec::from_iter(heap);
+            let mut rewritten = false;
+            while let Some(x) = tmp.pop() {
+                sum += x.size;
+                victims.push(x);
 
-            if sum >= tgt_size && victims.len() > 1 {
-                self.rewrite_data(victims);
-                return;
+                if sum >= tgt_size && victims.len() > 1 {
+                    self.rewrite_data(victims.clone(), bucket_id);
+                    rewritten = true;
+                    break;
+                }
             }
-        }
-        if eager && victims.len() > 1 {
-            self.rewrite_data(victims);
+            if !rewritten && eager && victims.len() > 1 {
+                self.rewrite_data(victims, bucket_id);
+            }
         }
     }
 
@@ -439,15 +587,15 @@ impl GarbageCollector {
         }
     }
 
-    fn rewrite_data(&mut self, candidate: Vec<Score>) {
+    fn rewrite_data(&mut self, candidate: Vec<Score>, bucket_id: u64) {
         let opt = &self.store.opt;
         let file_id = self.numerics.next_data_id.fetch_add(1, Relaxed);
-        let mut builder = DataReWriter::new(file_id, opt, candidate.len());
+        let mut builder = DataReWriter::new(file_id, opt, candidate.len(), bucket_id);
         let mut remap_intervals = Vec::with_capacity(candidate.len());
         let mut del_intervals = DelInterval::default();
         let mut obsoleted = Vec::new();
 
-        self.ctx.manifest.data_stat.start_collect_junks(); // stop in update_stat_interval
+        self.store.manifest.data_stat.start_collect_junks(); // stop in update_stat_interval
         let victims: Vec<u64> = candidate
             .iter()
             .filter_map(|x| {
@@ -456,9 +604,12 @@ impl GarbageCollector {
                 let relocs = loader.get_reloc().unwrap();
                 let ivls = loader.get_interval().unwrap();
                 let mut im = InactiveMap::new(ivls);
-                let stat = self.ctx.manifest.data_stat.get(&x.id).expect("must exist");
-                let bitmap = stat.mask.clone();
-                drop(stat);
+                let bitmap = self
+                    .store
+                    .manifest
+                    .data_stat
+                    .load_mask_clone(x.id, &self.store.manifest.btree)
+                    .expect("must exist");
 
                 // collect active frames
                 let active: Vec<Entry> = relocs
@@ -485,7 +636,7 @@ impl GarbageCollector {
                     if unref {
                         del_intervals.push(lo);
                     } else {
-                        remap_intervals.push(IntervalPair::new(lo, hi, file_id));
+                        remap_intervals.push(IntervalPair::new(lo, hi, file_id, bucket_id));
                         builder.add_interval(lo, hi);
                     }
                 });
@@ -495,22 +646,23 @@ impl GarbageCollector {
             .collect();
 
         // it's possible that other thread deactived all data in data file while we are procesing
-        self.process_obsoleted_data(obsoleted);
+        self.process_obsoleted_data(obsoleted, bucket_id);
 
         // 1. perform disk I/O (build data file)
-        let (fstat, relocs) = builder
+        let (mut fstat, relocs) = builder
             .build()
             .inspect_err(|e| {
                 log::error!("error {e}");
             })
             .unwrap();
+        fstat.inner.bucket_id = bucket_id;
 
         // 2. commit metadata transaction
-        let mut txn = self.ctx.manifest.begin();
-        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
+        let mut txn = self.store.manifest.begin();
+        txn.record(MetaKind::Numerics, self.store.manifest.numerics.deref());
 
         // the only problem is junks collected by flush thread maybe too many
-        let stat = self.ctx.manifest.update_data_stat_interval(
+        let stat = self.store.manifest.update_data_stat_interval(
             fstat,
             relocs,
             &victims,
@@ -534,31 +686,33 @@ impl GarbageCollector {
 
         txn.commit();
 
-        // 3. it's safe to clean obsolete files, becuase they are not referenced
-        self.ctx.manifest.save_obsolete_data(&tmp);
-        self.ctx.manifest.delete_files();
+        // 3. it's safe to clean obsolete files, because they are not referenced
+        self.store.manifest.save_obsolete_data(&tmp);
+        self.store.manifest.delete_files();
         self.data_runs.fetch_add(1, AcqRel);
     }
 
-    fn rewrite_blob(&mut self, candidate: &[u64]) {
+    fn rewrite_blob(&mut self, candidate: &[u64], bucket_id: u64) {
         let opt = &self.ctx.opt;
         let mut remap_intervals = Vec::new();
         let mut del_intervals = DelInterval::default();
-        let mut builder = BlobRewriter::new(opt);
+        let mut builder = BlobRewriter::new(opt, bucket_id);
         let blob_id = self.numerics.next_blob_id.fetch_add(1, Relaxed);
         let mut obsoleted = Vec::new();
 
-        self.ctx.manifest.blob_stat.start_collect_junks();
+        self.store.manifest.blob_stat.start_collect_junks();
         let victims: Vec<u64> = candidate
             .iter()
             .filter_map(|&victim_id| {
                 let mut loader =
                     MetaReader::<BlobFooter>::new(opt.blob_file(victim_id)).expect("never happen");
                 let relocs = loader.get_reloc().unwrap();
-                let map = self.ctx.manifest.blob_stat.read();
-                // save a copy so don't block other thread
-                let bitmap = map.get(&victim_id).unwrap().mask.clone();
-                drop(map);
+                let bitmap = self
+                    .store
+                    .manifest
+                    .blob_stat
+                    .load_mask_clone(victim_id, &self.store.manifest.btree)
+                    .expect("must exist");
                 let ivls = loader.get_interval().unwrap();
                 let mut im = InactiveMap::new(ivls);
 
@@ -586,7 +740,7 @@ impl GarbageCollector {
                     if unref {
                         del_intervals.push(lo);
                     } else {
-                        remap_intervals.push(IntervalPair::new(lo, hi, blob_id));
+                        remap_intervals.push(IntervalPair::new(lo, hi, blob_id, bucket_id));
                         builder.add_interval(lo, hi);
                     }
                 });
@@ -595,22 +749,23 @@ impl GarbageCollector {
             })
             .collect();
 
-        // it's possible that other thread deactived all data in blob file while we are procesing
-        self.process_obsoleted_blob(obsoleted);
+        // it's possible that other thread deactivated all data in blob file while we are processing
+        self.process_obsoleted_blob(&obsoleted, bucket_id);
 
         // 1. perform disk I/O (build blob file)
-        let (bstat, reloc) = builder
+        let (mut bstat, reloc) = builder
             .build(blob_id)
             .inspect_err(|e| {
                 log::error!("error {e:?}");
             })
             .unwrap();
+        bstat.inner.bucket_id = bucket_id;
 
         // 2. commit metadata transaction
-        let mut txn = self.ctx.manifest.begin();
-        txn.record(MetaKind::Numerics, self.ctx.manifest.numerics.deref());
+        let mut txn = self.store.manifest.begin();
+        txn.record(MetaKind::Numerics, self.store.manifest.numerics.deref());
 
-        let stat = self.ctx.manifest.update_blob_stat_interval(
+        let stat = self.store.manifest.update_blob_stat_interval(
             bstat,
             reloc,
             &victims,
@@ -631,8 +786,8 @@ impl GarbageCollector {
         txn.record(MetaKind::BlobDelete, &tmp);
         txn.commit();
 
-        self.ctx.manifest.save_obsolete_blob(&tmp);
-        self.ctx.manifest.delete_files();
+        self.store.manifest.save_obsolete_blob(&tmp);
+        self.store.manifest.delete_files();
         self.blob_runs.fetch_add(1, AcqRel);
     }
 }
@@ -645,10 +800,11 @@ struct DataReWriter<'a> {
     sum_up2: u64,
     total: u64,
     opt: &'a Options,
+    bucket_id: u64,
 }
 
 impl<'a> DataReWriter<'a> {
-    fn new(file_id: u64, opt: &'a Options, cap: usize) -> Self {
+    fn new(file_id: u64, opt: &'a Options, cap: usize, bucket_id: u64) -> Self {
         Self {
             file_id,
             items: Vec::with_capacity(cap),
@@ -657,6 +813,7 @@ impl<'a> DataReWriter<'a> {
             sum_up2: 0,
             total: cap as u64,
             opt,
+            bucket_id,
         }
     }
 
@@ -734,8 +891,9 @@ impl<'a> DataReWriter<'a> {
                 total_elems: seq,
                 active_size: off,
                 total_size: off,
+                bucket_id: self.bucket_id,
             },
-            mask: BitMap::new(seq),
+            mask: Some(BitMap::new(seq)),
         };
         Ok((stat, reloc_map))
     }
@@ -746,15 +904,17 @@ struct BlobRewriter<'a> {
     items: Vec<BlobItem>,
     intervals: Vec<u8>,
     nr_interval: u32,
+    bucket_id: u64,
 }
 
 impl<'a> BlobRewriter<'a> {
-    fn new(opt: &'a Options) -> Self {
+    fn new(opt: &'a Options, bucket_id: u64) -> Self {
         Self {
             opt,
             items: Vec::new(),
             intervals: Vec::new(),
             nr_interval: 0,
+            bucket_id,
         }
     }
 
@@ -831,8 +991,9 @@ impl<'a> BlobRewriter<'a> {
                 active_size: off,
                 nr_active: seq,
                 nr_total: seq,
+                bucket_id: self.bucket_id,
             },
-            mask: BitMap::new(seq),
+            mask: Some(BitMap::new(seq)),
         };
         Ok((stat, map))
     }

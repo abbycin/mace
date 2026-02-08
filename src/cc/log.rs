@@ -1,14 +1,14 @@
 use super::wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate};
 use crate::OpCode;
 use crate::meta::Numerics;
-use crate::types::data::Ver;
+use crate::types::data::Key;
 use crate::utils::block::Ring;
 use crate::utils::data::Position;
 use crate::utils::{data::WalDescHandle, options::ParsedOptions};
 use crate::{cc::wal::EntryType, utils::data::GatherWriter};
 use crc32c::Crc32cHasher;
 use std::hash::Hasher;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, atomic::Ordering::Relaxed};
 
 pub struct LogBuilder<'a> {
@@ -44,7 +44,7 @@ pub struct Logging {
     enable_ckpt: AtomicBool,
     /// save last checkpoint position, used by gc
     last_ckpt: Position,
-    ckpt_cnt: usize,
+    ckpt_cnt: Arc<AtomicUsize>,
     /// used for building traverse chain (lsn)
     log_pos: Position,
     flushed_pos: Position,
@@ -67,6 +67,7 @@ impl Logging {
         desc: WalDescHandle,
         numerics: Arc<Numerics>,
         opt: Arc<ParsedOptions>,
+        ckpt_cnt: Arc<AtomicUsize>,
     ) -> Self {
         let (group, last_id, ckpt_pos) = {
             let d = desc.lock();
@@ -81,7 +82,7 @@ impl Logging {
             ring: Ring::new(opt.wal_buffer_size),
             enable_ckpt: AtomicBool::new(false),
             last_ckpt: ckpt_pos,
-            ckpt_cnt: 0,
+            ckpt_cnt,
             log_pos: pos,
             flushed_pos: pos,
             ops: 0,
@@ -99,13 +100,13 @@ impl Logging {
         let rest = self.ring.len() - tail;
 
         if rest < size {
-            self.flush()?;
+            self.flush(false)?;
             // skip the rest data, and restart from the begining
             self.ring.prod(rest);
             self.ring.cons(rest);
         } else if tail == 0 && self.ring.distance() > 0 {
             // the tail is extactly euqal to the boundary, we must flush pending data
-            self.flush()?;
+            self.flush(false)?;
         }
         Ok(self.ring.prod(size))
     }
@@ -117,7 +118,7 @@ impl Logging {
             self.log_pos.file_id += 1;
             self.log_pos.offset = 0;
 
-            self.flush()?;
+            self.flush(false)?;
             self.writer
                 .reset(&self.opt.wal_file(self.group, self.log_pos.file_id));
             self.sync_desc()?;
@@ -127,7 +128,7 @@ impl Logging {
         if self.ops.trailing_zeros() >= Self::AUTO_STABLE_OPS
             || self.ring.distance() >= Self::AUTO_STABLE_SIZE
         {
-            self.flush()?;
+            self.flush(false)?;
         }
 
         self.checkpoint()
@@ -143,10 +144,6 @@ impl Logging {
 
     pub fn flushed_pos(&self) -> Position {
         self.flushed_pos
-    }
-
-    pub fn ckpt_cnt(&self) -> usize {
-        self.ckpt_cnt
     }
 
     pub fn last_ckpt(&self) -> Position {
@@ -171,7 +168,7 @@ impl Logging {
         nv: &[u8],
         size: usize,
     ) -> Result<(), OpCode> {
-        self.flush()?; // flush queued first, make sure log record is sequentail
+        self.flush(false)?; // flush queued first, make sure log record is sequentail
         {
             self.writer.queue(u.to_slice());
             self.writer.queue(k);
@@ -192,27 +189,28 @@ impl Logging {
     /// since multiple transaction may use same Logging, they must provide their own LSN
     pub fn record_update<T>(
         &mut self,
-        ver: Ver,
+        k: &Key,
         w: T,
-        k: &[u8],
         ov: &[u8],
         nv: &[u8],
         prev_lsn: Position,
+        bucket_id: u64,
     ) -> Result<Position, OpCode>
     where
         T: IWalCodec + IWalPayload,
     {
-        let payload_size = w.encoded_len() + k.len() + ov.len() + nv.len();
+        let payload_size = w.encoded_len() + k.raw.len() + ov.len() + nv.len();
         let current_pos = self.current_pos();
 
         let mut u = WalUpdate {
             wal_type: EntryType::Update,
             sub_type: w.sub_type(),
+            bucket_id,
             group_id: self.group,
             size: payload_size as u32,
-            cmd_id: ver.cmd,
-            klen: k.len() as u32,
-            txid: ver.txid,
+            cmd_id: k.ver.cmd,
+            klen: k.raw.len() as u32,
+            txid: k.ver.txid,
             prev_id: prev_lsn.file_id,
             prev_off: prev_lsn.offset,
             checksum: 0,
@@ -228,7 +226,7 @@ impl Logging {
             h.write(header_slice);
         }
 
-        h.write(k);
+        h.write(k.raw);
         h.write(w.to_slice());
         h.write(ov);
         h.write(nv);
@@ -239,9 +237,9 @@ impl Logging {
         if total_sz < self.ring.len() {
             let a = self.alloc(total_sz)?;
             let mut b = LogBuilder::new(a);
-            b.add(u).add(k).add(w).add(ov).add(nv).build(self)?;
+            b.add(u).add(k.raw).add(w).add(ov).add(nv).build(self)?;
         } else {
-            self.record_large(&u, k, w.to_slice(), ov, nv, total_sz)?;
+            self.record_large(&u, k.raw, w.to_slice(), ov, nv, total_sz)?;
         }
         Ok(current_pos)
     }
@@ -312,14 +310,14 @@ impl Logging {
         ckpt.checksum = ckpt.calc_checksum();
 
         // we must flush buffer in ring to make sure they are stabilized before flush checkpoint
-        self.flush()?;
+        self.flush(false)?;
         self.writer.write(ckpt.to_slice());
         if self.opt.sync_on_write {
             self.writer.sync();
         }
 
         self.log_pos.offset += ckpt.encoded_len() as u64;
-        self.ckpt_cnt += 1;
+        self.ckpt_cnt.fetch_add(1, Relaxed);
         self.flushed_pos = self.log_pos;
         self.numerics
             .log_size
@@ -336,24 +334,28 @@ impl Logging {
         )
     }
 
-    fn flush(&mut self) -> Result<(), OpCode> {
+    fn flush(&mut self, force: bool) -> Result<(), OpCode> {
         let len = self.ring.distance();
         if len != 0 {
             self.writer.write(self.ring.slice(self.ring.head(), len));
             self.ring.cons(len);
 
-            if self.opt.sync_on_write {
-                self.writer.sync();
-            }
-
             self.flushed_pos = self.log_pos;
             self.numerics.log_size.fetch_add(len, Relaxed);
+        }
+        if force || self.opt.sync_on_write {
+            self.writer.sync();
         }
         Ok(())
     }
 
     pub fn stabilize(&mut self) -> Result<(), OpCode> {
-        self.flush()?;
+        self.flush(false)?;
         self.checkpoint()
+    }
+
+    pub fn sync(&mut self) -> Result<(), OpCode> {
+        self.flush(true)?;
+        Ok(())
     }
 }

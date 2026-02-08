@@ -33,7 +33,7 @@ pub struct Reloc {
     pub(crate) off: usize,
     /// frame length including header (excluding refcnt)
     pub(crate) len: u32,
-    /// index in reclocation table
+    /// index in relocation table
     pub(crate) seq: u32,
     /// checksum of page
     pub(crate) crc: u32,
