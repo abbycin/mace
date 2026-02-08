@@ -6,9 +6,9 @@ use crate::map::evictor::Evictor;
 use crate::map::flush::{FlushDirective, FlushObserver, FlushResult};
 use crate::meta::builder::ManifestBuilder;
 use crate::meta::{BucketMeta, Manifest, MetaKind};
-use crate::store::VacuumStats;
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
+use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats, VacuumStats};
 use crate::types::refbox::BoxRef;
 use crate::utils::Handle;
 use crate::utils::MutRef;
@@ -244,6 +244,10 @@ impl Inner {
         let bucket_ctx = self.store.manifest.load_bucket_context(meta.bucket_id)?;
         crate::store::gc::vacuum_bucket(self.store.clone(), bucket_ctx)
     }
+
+    fn vacuum_meta(self: &Inner) -> Result<MetaVacuumStats, OpCode> {
+        self.store.manifest.vacuum_meta(META_VACUUM_TARGET_BYTES)
+    }
 }
 
 impl Drop for Inner {
@@ -378,6 +382,11 @@ impl Mace {
     /// vacuums a bucket by scavenging and compacting its pages
     pub fn vacuum_bucket<S: AsRef<str>>(&self, name: S) -> Result<VacuumStats, OpCode> {
         Inner::vacuum_bucket(&self.inner, name.as_ref())
+    }
+
+    /// vacuums metadata by compacting the manifest btree
+    pub fn vacuum_meta(&self) -> Result<MetaVacuumStats, OpCode> {
+        Inner::vacuum_meta(&self.inner)
     }
 
     /// Disables garbage collection.

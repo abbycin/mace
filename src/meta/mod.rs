@@ -781,6 +781,13 @@ impl Manifest {
         }
     }
 
+    pub(crate) fn vacuum_meta(
+        &self,
+        target_bytes: u64,
+    ) -> Result<btree_store::CompactStats, OpCode> {
+        self.btree.compact(target_bytes).map_err(OpCode::from)
+    }
+
     pub(crate) fn load_data<C>(&self, bucket_id: u64, addr: u64, cache: C) -> Result<BoxRef, OpCode>
     where
         C: Fn(BoxRef),

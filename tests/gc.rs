@@ -343,3 +343,25 @@ fn vacuum_bucket_effect() -> Result<(), OpCode> {
     assert!(stats.compacted > 0);
     Ok(())
 }
+
+#[test]
+fn vacuum_meta_effect() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+
+    let total = 256;
+    for i in 0..total {
+        let name = format!("b{i:04}");
+        let db = mace.new_bucket(&name).unwrap();
+        let kv = db.begin().unwrap();
+        kv.put("k", "v")?;
+        kv.commit()?;
+    }
+
+    let stats = mace.vacuum_meta()?;
+    assert!(stats.moved_pages > 0);
+    Ok(())
+}
