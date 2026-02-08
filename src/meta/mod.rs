@@ -575,7 +575,7 @@ impl Manifest {
         self.bucket_metas_by_id.remove(&bucket_id);
 
         let state = self.get_bucket_state(bucket_id);
-        let mut busy = Arc::strong_count(&meta) > 1 || state.is_busy();
+        let mut busy = Arc::strong_count(&meta) > 1 || state.is_busy() || state.is_vacuuming();
         if matches!(mode, BucketRemoveMode::Delete) && state.is_drop() {
             busy = true;
         }

@@ -1,4 +1,5 @@
 pub use index::txn::{TxnKV, TxnView};
+pub use store::VacuumStats;
 pub(crate) use store::store::Store;
 pub use store::store::{Bucket, Mace};
 pub use utils::{OpCode, RandomPath, options::Options};

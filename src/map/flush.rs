@@ -231,7 +231,7 @@ impl Notifier {
     fn new() -> Self {
         Self {
             quit: AtomicBool::new(false),
-            sem: Countblock::new(1),
+            sem: Countblock::new(0),
         }
     }
 

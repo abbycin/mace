@@ -22,14 +22,16 @@ use crate::{
     index::tree::Tree,
     io::{File, GatherIO},
     map::{
+        buffer::BucketContext,
         data::{BlobFooter, DataFooter, MetaReader},
-        table::Swip,
+        table::{BucketState, Swip},
     },
     meta::{
         BUCKET_PENDING_DEL, BlobStatInner, DataStatInner, DelInterval, Delete, IntervalPair,
         MemBlobStat, MemDataStat, MetaKind, MetaOp, Numerics, blob_interval_name,
         data_interval_name, page_table_name,
     },
+    store::VacuumStats,
     types::traits::IAsSlice,
     utils::{
         Handle, MutRef, ROOT_PID,
@@ -124,7 +126,7 @@ impl GCHandle {
 
 pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
     let (tx, rx) = channel();
-    let sem = Arc::new(Countblock::new(1));
+    let sem = Arc::new(Countblock::new(0));
     let data_runs = Arc::new(AtomicU64::new(0));
     let blob_runs = Arc::new(AtomicU64::new(0));
     let gc = GarbageCollector {
@@ -293,6 +295,9 @@ impl GarbageCollector {
             if max_pid == 0 {
                 continue;
             }
+            if state.is_vacuuming() {
+                continue;
+            }
             // strategy: scan the entire page table approximately every 500 ticks (e.g., ~8 hours if tick=1min)
             // but keep the batch size within a reasonable range [128, 10000]
             let batch_size = (max_pid / 500).clamp(128, 10000);
@@ -301,6 +306,9 @@ impl GarbageCollector {
 
             for _ in 0..batch_size {
                 if state.is_deleting() || state.is_drop() {
+                    break;
+                }
+                if state.is_vacuuming() {
                     break;
                 }
 
@@ -789,6 +797,83 @@ impl GarbageCollector {
         self.store.manifest.save_obsolete_blob(&tmp);
         self.store.manifest.delete_files();
         self.blob_runs.fetch_add(1, AcqRel);
+    }
+}
+
+pub(crate) fn vacuum_bucket(
+    store: MutRef<Store>,
+    bucket_ctx: Arc<BucketContext>,
+) -> Result<VacuumStats, OpCode> {
+    let state = bucket_ctx.state.clone();
+    let start_epoch = state.vacuum_epoch();
+    let mut stats = VacuumStats::default();
+
+    loop {
+        if state.is_deleting() || state.is_drop() {
+            return Err(OpCode::Again);
+        }
+        if state.try_begin_vacuum() {
+            break;
+        }
+        if state.vacuum_epoch() != start_epoch {
+            return Ok(stats);
+        }
+        state.wait_vacuum(start_epoch);
+        if state.vacuum_epoch() != start_epoch {
+            return Ok(stats);
+        }
+    }
+
+    let _guard = VacuumGuard::new(state.clone());
+    if state.is_deleting() || state.is_drop() {
+        return Err(OpCode::Again);
+    }
+
+    let g = crossbeam_epoch::pin();
+    let bucket_id = bucket_ctx.bucket_id;
+    let table = bucket_ctx.table.clone();
+    let max_pid = table.len();
+    if max_pid == 0 {
+        return Ok(stats);
+    }
+
+    let tree = Tree::new(store.clone(), ROOT_PID, bucket_ctx);
+
+    for pid in ROOT_PID..max_pid {
+        if state.is_deleting() || state.is_drop() {
+            break;
+        }
+        if store.manifest.bucket_metas_by_id.get(&bucket_id).is_none() {
+            break;
+        }
+
+        let swip = Swip::new(table.get(pid));
+        if swip.is_null() {
+            continue;
+        }
+
+        stats.scanned += 1;
+        if matches!(tree.try_scavenge(pid, &g), Ok(true)) {
+            stats.compacted += 1;
+        }
+    }
+
+    Ok(stats)
+}
+
+struct VacuumGuard {
+    state: MutRef<BucketState>,
+}
+
+impl VacuumGuard {
+    fn new(state: MutRef<BucketState>) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for VacuumGuard {
+    fn drop(&mut self) {
+        self.state.end_vacuum();
     }
 }
 

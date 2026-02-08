@@ -6,6 +6,7 @@ use crate::map::evictor::Evictor;
 use crate::map::flush::{FlushDirective, FlushObserver, FlushResult};
 use crate::meta::builder::ManifestBuilder;
 use crate::meta::{BucketMeta, Manifest, MetaKind};
+use crate::store::VacuumStats;
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
 use crate::types::refbox::BoxRef;
@@ -234,6 +235,15 @@ impl Inner {
     fn del_bucket(self: &Inner, name: &str) -> Result<(), OpCode> {
         self.store.manifest.delete_bucket(name)
     }
+
+    fn vacuum_bucket(self: &Inner, name: &str) -> Result<VacuumStats, OpCode> {
+        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
+            return Err(OpCode::TooLarge);
+        }
+        let meta = self.store.manifest.load_bucket_meta(name)?;
+        let bucket_ctx = self.store.manifest.load_bucket_context(meta.bucket_id)?;
+        crate::store::gc::vacuum_bucket(self.store.clone(), bucket_ctx)
+    }
 }
 
 impl Drop for Inner {
@@ -363,6 +373,11 @@ impl Mace {
     /// Deletes a bucket and all its data.
     pub fn del_bucket<S: AsRef<str>>(&self, name: S) -> Result<(), OpCode> {
         Inner::del_bucket(&self.inner, name.as_ref())
+    }
+
+    /// vacuums a bucket by scavenging and compacting its pages
+    pub fn vacuum_bucket<S: AsRef<str>>(&self, name: S) -> Result<VacuumStats, OpCode> {
+        Inner::vacuum_bucket(&self.inner, name.as_ref())
     }
 
     /// Disables garbage collection.
