@@ -319,20 +319,21 @@ impl GarbageCollector {
                 }
                 table.scavenge_cursor.store(cursor + 1, Relaxed);
 
-                let root_pid =
-                    if let Some(_meta) = self.store.manifest.bucket_metas_by_id.get(&bucket_id) {
-                        ROOT_PID
-                    } else {
-                        break; // bucket removed
-                    };
+                if !self
+                    .store
+                    .manifest
+                    .bucket_metas_by_id
+                    .contains_key(&bucket_id)
+                {
+                    break; // bucket removed
+                }
 
                 let swip = Swip::new(table.get(cursor));
                 if swip.is_null() {
                     continue;
                 }
 
-                let bucket_ctx = self.store.manifest.get_bucket_context_must_exist(bucket_id);
-                let tree = Tree::new(self.store.clone(), root_pid, bucket_ctx);
+                let tree = Tree::new(self.store.clone(), ROOT_PID, ctx.clone());
 
                 match tree.try_scavenge(cursor, &g) {
                     Ok(true) => {
@@ -600,7 +601,10 @@ impl GarbageCollector {
         let file_id = self.numerics.next_data_id.fetch_add(1, Relaxed);
         let mut builder = DataReWriter::new(file_id, opt, candidate.len(), bucket_id);
         let mut remap_intervals = Vec::with_capacity(candidate.len());
-        let mut del_intervals = DelInterval::default();
+        let mut del_intervals = DelInterval {
+            lo: Vec::new(),
+            bucket_id,
+        };
         let mut obsoleted = Vec::new();
 
         self.store.manifest.data_stat.start_collect_junks(); // stop in update_stat_interval
@@ -691,7 +695,6 @@ impl GarbageCollector {
         // in case crash happens before/during deleting files
         let tmp: Delete = victims.into();
         txn.record(MetaKind::DataDelete, &tmp);
-
         txn.commit();
 
         // 3. it's safe to clean obsolete files, because they are not referenced
@@ -703,7 +706,10 @@ impl GarbageCollector {
     fn rewrite_blob(&mut self, candidate: &[u64], bucket_id: u64) {
         let opt = &self.ctx.opt;
         let mut remap_intervals = Vec::new();
-        let mut del_intervals = DelInterval::default();
+        let mut del_intervals = DelInterval {
+            lo: Vec::new(),
+            bucket_id,
+        };
         let mut builder = BlobRewriter::new(opt, bucket_id);
         let blob_id = self.numerics.next_blob_id.fetch_add(1, Relaxed);
         let mut obsoleted = Vec::new();
@@ -792,6 +798,7 @@ impl GarbageCollector {
 
         let tmp: Delete = victims.into();
         txn.record(MetaKind::BlobDelete, &tmp);
+
         txn.commit();
 
         self.store.manifest.save_obsolete_blob(&tmp);

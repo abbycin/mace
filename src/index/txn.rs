@@ -449,16 +449,16 @@ impl Drop for TxnKV<'_> {
                     })
                     .expect("can't fail");
             } else {
+                use crate::cc::wal::{Location, WalReader};
+                use crate::utils::block::Block;
+
                 grp.logging
                     .lock()
                     .stabilize()
                     .map_err(|e| {
-                        log::error!("can't stabilize WAL, {:?}", e);
+                        log::error!("can't stabilize rollback WAL, {:?}", e);
                     })
                     .expect("can't fail");
-
-                use crate::cc::wal::{Location, WalReader};
-                use crate::utils::block::Block;
 
                 const SMALL_SIZE: usize = 256;
                 let mut block = Block::alloc(SMALL_SIZE);
