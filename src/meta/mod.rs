@@ -51,8 +51,9 @@ pub(crate) const BUCKET_PENDING_DEL: &str = "pending_del";
 pub(crate) const BUCKET_VERSION: &str = "version";
 pub(crate) const MAX_BUCKETS: u64 = 1024;
 pub(crate) const VERSION_KEY: &str = "current_version";
-pub(crate) const ORPHAN_DATA: &str = "orphan_data";
-pub(crate) const ORPHAN_BLOB: &str = "orphan_blob";
+// keep marker keys short to reduce numerics bucket write amplification
+pub(crate) const ORPHAN_DATA_MARKER_PREFIX: &str = "odf_";
+pub(crate) const ORPHAN_BLOB_MARKER_PREFIX: &str = "obf_";
 /// storage format version
 pub(crate) const CURRENT_VERSION: u64 = 1;
 
@@ -73,6 +74,14 @@ pub(crate) fn data_interval_name(bucket_id: u64) -> String {
 
 pub(crate) fn blob_interval_name(bucket_id: u64) -> String {
     format!("blob_interval_{}", bucket_id)
+}
+
+pub(crate) fn orphan_data_marker_key(file_id: u64) -> Vec<u8> {
+    format!("{}{}", ORPHAN_DATA_MARKER_PREFIX, file_id).into_bytes()
+}
+
+pub(crate) fn orphan_blob_marker_key(file_id: u64) -> Vec<u8> {
+    format!("{}{}", ORPHAN_BLOB_MARKER_PREFIX, file_id).into_bytes()
 }
 
 pub(crate) trait IMetaCodec {
@@ -779,6 +788,39 @@ impl Manifest {
             btree,
             ops: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn stage_orphan_data_file(&self, file_id: u64) {
+        self.stage_orphan_marker(orphan_data_marker_key(file_id), "data", file_id);
+    }
+
+    pub(crate) fn stage_orphan_blob_file(&self, file_id: u64) {
+        self.stage_orphan_marker(orphan_blob_marker_key(file_id), "blob", file_id);
+    }
+
+    pub(crate) fn clear_orphan_data_file(&self, txn: &mut Txn<'_>, file_id: u64) {
+        txn.ops_mut()
+            .entry(BUCKET_NUMERICS.to_string())
+            .or_default()
+            .push(MetaOp::Del(orphan_data_marker_key(file_id)));
+    }
+
+    pub(crate) fn clear_orphan_blob_file(&self, txn: &mut Txn<'_>, file_id: u64) {
+        txn.ops_mut()
+            .entry(BUCKET_NUMERICS.to_string())
+            .or_default()
+            .push(MetaOp::Del(orphan_blob_marker_key(file_id)));
+    }
+
+    fn stage_orphan_marker(&self, key: Vec<u8>, kind: &str, file_id: u64) {
+        self.btree
+            .exec(BUCKET_NUMERICS, |txn| txn.put(&key, Vec::<u8>::new()))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to stage {} orphan marker for file {}: {:?}",
+                    kind, file_id, e
+                )
+            });
     }
 
     pub(crate) fn vacuum_meta(

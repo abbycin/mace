@@ -599,6 +599,9 @@ impl GarbageCollector {
     fn rewrite_data(&mut self, candidate: Vec<Score>, bucket_id: u64) {
         let opt = &self.store.opt;
         let file_id = self.numerics.next_data_id.fetch_add(1, Relaxed);
+        // stage orphan intent before rewrite output is flushed
+        // crash can happen after file sync but before manifest commit
+        self.store.manifest.stage_orphan_data_file(file_id);
         let mut builder = DataReWriter::new(file_id, opt, candidate.len(), bucket_id);
         let mut remap_intervals = Vec::with_capacity(candidate.len());
         let mut del_intervals = DelInterval {
@@ -695,6 +698,10 @@ impl GarbageCollector {
         // in case crash happens before/during deleting files
         let tmp: Delete = victims.into();
         txn.record(MetaKind::DataDelete, &tmp);
+        // clear intent in the same metadata txn that publishes the new file
+        self.store
+            .manifest
+            .clear_orphan_data_file(&mut txn, file_id);
         txn.commit();
 
         // 3. it's safe to clean obsolete files, because they are not referenced
@@ -712,6 +719,9 @@ impl GarbageCollector {
         };
         let mut builder = BlobRewriter::new(opt, bucket_id);
         let blob_id = self.numerics.next_blob_id.fetch_add(1, Relaxed);
+        // stage orphan intent before rewrite output is flushed
+        // crash can happen after file sync but before manifest commit
+        self.store.manifest.stage_orphan_blob_file(blob_id);
         let mut obsoleted = Vec::new();
 
         self.store.manifest.blob_stat.start_collect_junks();
@@ -798,6 +808,10 @@ impl GarbageCollector {
 
         let tmp: Delete = victims.into();
         txn.record(MetaKind::BlobDelete, &tmp);
+        // clear intent in the same metadata txn that publishes the new file
+        self.store
+            .manifest
+            .clear_orphan_blob_file(&mut txn, blob_id);
 
         txn.commit();
 
