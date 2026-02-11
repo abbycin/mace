@@ -1,8 +1,8 @@
 use crate::{
     types::{
         data::Val,
-        header::{DeltaHeader, NodeType, TagKind},
-        refbox::{BoxRef, DeltaView, RemoteView},
+        header::{DeltaHeader, NodeType, RemoteHeader, TagKind},
+        refbox::{BoxRef, DeltaView},
         traits::{IAlloc, IBoxHeader, ICodec, IHeader, IKey, IVal},
     },
     utils::NULL_ADDR,
@@ -22,7 +22,15 @@ impl DeltaView {
         let is_remote = vsz > inline_size;
 
         let sz = Val::calc_size(false, inline_size, vsz);
-        let d = a.allocate(ksz + sz + Self::HDR_LEN);
+        let (d, remote) = if is_remote {
+            let (d, r) = a.allocate_pair(
+                (ksz + sz + Self::HDR_LEN) as u32,
+                (vsz + size_of::<RemoteHeader>()) as u32,
+            );
+            (d, Some(r))
+        } else {
+            (a.allocate((ksz + sz + Self::HDR_LEN) as u32), None)
+        };
         let mut view = d.view();
         let h = view.header_mut();
         h.kind = TagKind::Delta;
@@ -37,8 +45,10 @@ impl DeltaView {
             Val::encode_inline(delta.val_mut(), NULL_ADDR, v);
             (d, None)
         } else {
-            let r = RemoteView::alloc(a, vsz);
+            let mut r = remote.expect("remote allocation must exist");
+            r.header_mut().kind = TagKind::Remote;
             let mut view = r.view().as_remote();
+            view.header_mut().size = vsz;
             v.encode_to(view.raw_mut());
             Val::encode_remote(delta.val_mut(), NULL_ADDR, view.addr(), v);
             (d, Some(r))
@@ -52,7 +62,7 @@ impl DeltaView {
         txid: u64,
     ) -> BoxRef {
         let sz = k.packed_size() + v.packed_size() + Self::HDR_LEN;
-        let d = a.allocate(sz);
+        let d = a.allocate(sz as u32);
         let mut view = d.view();
         let h = view.header_mut();
         h.kind = TagKind::Delta;

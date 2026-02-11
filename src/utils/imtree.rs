@@ -927,9 +927,9 @@ mod test {
     static G_OFF: AtomicU64 = AtomicU64::new(0);
 
     impl IAlloc for Allocator {
-        fn allocate(&mut self, size: usize) -> BoxRef {
+        fn allocate(&mut self, size: u32) -> BoxRef {
             let addr = G_OFF.fetch_add(size as u64, Relaxed);
-            BoxRef::alloc(size as u32, addr)
+            BoxRef::alloc(size, addr)
         }
 
         fn collect(&mut self, _addr: &[u64]) {}

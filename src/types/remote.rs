@@ -1,16 +1,21 @@
 use crate::{
     types::{
-        header::{RemoteHeader, TagKind},
-        refbox::{BoxRef, RemoteView},
-        traits::{IAlloc, IBoxHeader, IHeader},
+        refbox::RemoteView,
+        traits::{IBoxHeader, IHeader},
     },
     utils::NULL_ADDR,
 };
 
 impl RemoteView {
     const TAG: u64 = 1 << 63;
-    pub fn alloc<A: IAlloc>(a: &mut A, size: usize) -> BoxRef {
-        let mut p = a.allocate(size + size_of::<RemoteHeader>());
+    #[cfg(test)]
+    pub fn alloc<A: crate::types::traits::IAlloc>(
+        a: &mut A,
+        size: usize,
+    ) -> crate::types::refbox::BoxRef {
+        use crate::types::header::{RemoteHeader, TagKind};
+
+        let mut p = a.allocate((size + size_of::<RemoteHeader>()) as u32);
         p.header_mut().kind = TagKind::Remote;
         p.view().as_remote().header_mut().size = size;
         p

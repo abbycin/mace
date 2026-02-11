@@ -906,9 +906,9 @@ mod test {
         }
 
         impl IAlloc for L {
-            fn allocate(&mut self, size: usize) -> BoxRef {
+            fn allocate(&mut self, size: u32) -> BoxRef {
                 let addr = self.addr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let b = BoxRef::alloc(size as u32, addr);
+                let b = BoxRef::alloc(size, addr);
                 self.m.borrow_mut().insert(addr, b.clone());
                 b
             }

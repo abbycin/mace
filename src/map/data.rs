@@ -219,9 +219,68 @@ impl Arena {
         }
     }
 
+    pub(crate) fn reserve_batch(&self, total_real_size: u32, nr_frames: u32) -> Result<(), OpCode> {
+        if nr_frames == 0 {
+            return Err(OpCode::Again);
+        }
+
+        self.refs.fetch_add(nr_frames, Relaxed);
+
+        let mut cur = self.real_size.load(Relaxed);
+        loop {
+            if self.state() != Self::HOT {
+                self.refs.fetch_sub(nr_frames, AcqRel);
+                return Err(OpCode::Again);
+            }
+
+            // this allow us over alloc once
+            if cur > self.cap as u64 {
+                self.refs.fetch_sub(nr_frames, AcqRel);
+                return Err(OpCode::NoSpace);
+            }
+
+            let new = cur + total_real_size as u64;
+            match self.real_size.compare_exchange(cur, new, AcqRel, Acquire) {
+                Ok(_) => break,
+                Err(e) => cur = e,
+            }
+        }
+
+        let need = nr_frames as u64;
+        let mut off = self.offset.load(Relaxed);
+        loop {
+            let Some(end) = off.checked_add(need) else {
+                self.real_size.fetch_sub(total_real_size as u64, AcqRel);
+                self.refs.fetch_sub(nr_frames, AcqRel);
+                return Err(OpCode::NoSpace);
+            };
+            if end >= u32::MAX as u64 {
+                unreachable!("we assume that base + sibling chain will less than 4GB");
+            }
+
+            match self.offset.compare_exchange(off, end, AcqRel, Acquire) {
+                Ok(_) => return Ok(()),
+                Err(e) => off = e,
+            }
+        }
+    }
+
+    // we are not rollback offset in case of ABA problem
+    pub(crate) fn rollback_batch(&self, total_real_size: u32, nr_frames: u32) {
+        if total_real_size > 0 {
+            self.real_size.fetch_sub(total_real_size as u64, AcqRel);
+        }
+        if nr_frames > 0 {
+            self.refs.fetch_sub(nr_frames, AcqRel);
+        }
+    }
+
     fn alloc_at(&self, next_addr: &AtomicU64, real_size: u32, _bucket_id: u64) -> BoxRef {
         let addr = next_addr.fetch_add(1, Relaxed);
+        self.alloc_at_addr(addr, real_size)
+    }
 
+    pub(crate) fn alloc_at_addr(&self, addr: u64, real_size: u32) -> BoxRef {
         let p = if real_size >= 4096 {
             BoxRef::alloc_exact(real_size, addr)
         } else {
@@ -271,6 +330,10 @@ impl Arena {
         if self.items.remove(&addr).is_some() {
             self.real_size.fetch_sub(len as u64, AcqRel);
         }
+    }
+
+    pub(crate) fn remove_item_only(&self, addr: u64) -> bool {
+        self.items.remove(&addr).is_some()
     }
 
     #[inline]

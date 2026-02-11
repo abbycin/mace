@@ -360,6 +360,10 @@ impl BucketState {
     pub(crate) fn is_busy(&self) -> bool {
         self.txn_ref.load(Ordering::Relaxed) > 0
     }
+
+    pub(crate) fn reserve_addr_span(&self, span: u64) -> u64 {
+        self.next_addr.fetch_add(span, Ordering::AcqRel)
+    }
 }
 
 #[cfg(test)]

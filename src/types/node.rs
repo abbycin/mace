@@ -1158,12 +1158,12 @@ mod test {
     }
 
     impl IAlloc for A {
-        fn allocate(&mut self, size: usize) -> BoxRef {
+        fn allocate(&mut self, size: u32) -> BoxRef {
             let addr = self
                 .inner
                 .off
-                .fetch_add(BoxRef::real_size(size as u32) as u64, Relaxed);
-            let p = BoxRef::alloc(size as u32, addr);
+                .fetch_add(BoxRef::real_size(size) as u64, Relaxed);
+            let p = BoxRef::alloc(size, addr);
             let mut lk = self.inner.map.lock();
             lk.insert(addr, p.clone());
             p

@@ -106,6 +106,18 @@ This replaces the old logical/physical id mapping: the logical address is stable
 - `safe_to_flush` ensures WAL is flushed past arena `flsn` before flush
 - `over_provision` allows extra arenas if all are busy
 
+### Packed allocation crash-closure
+
+To keep crash consistency for dependent frames (for example base+sibling and delta+remote), MACE uses a packed allocation lifecycle:
+
+- `IAlloc` uses `u32` sizes for `allocate`, `allocate_pair`, and `begin_packed_alloc`
+- `begin_packed_alloc` reserves `real_size + frames` in one arena and reserves one contiguous logical address span
+- allocations inside the packed scope always use the pre-selected arena and sequential addresses from that span
+- `end_packed_alloc` verifies plan/usage equality (`frames`, address cursor, and bytes) and fails fast on mismatch
+- rollback removes packed entries from arena visibility first, then rolls back batch counters (`real_size`/`refs`)
+
+The default trait methods are fallback-only for compatibility and tests; production allocators (`SysTxn`, `Evictor`) override them to enforce the closure guarantees.
+
 ### Loader and caches
 
 - `Loader` resolves data from:
@@ -120,6 +132,7 @@ This replaces the old logical/physical id mapping: the logical address is stable
 - Evictor runs when cache usage reaches ~80% of capacity
 - It samples candidate pids, cools to `Cold`, then evicts by tagging SWIPs
 - If delta chains are long or contain garbage, eviction triggers compaction
+- Leaf rebuild during compaction uses the same packed allocation hooks as foreground transactions
 - Compaction writes junk frames into arenas for later GC
 
 ## Index (Bw-Tree variant)
@@ -265,5 +278,7 @@ This makes file deletion idempotent across crashes.
 
 - Data must be flushed before manifest commits
 - PageMap entries must be consistent with map tables written in the same flush txn
+- Dependent allocations must be closed in one packed scope (same arena + contiguous address span)
+- Packed plan mismatch must fail fast (`error` + panic), never silently downgrade to split allocation
 - Bucket deletion must be two-phase; do not decrement `nr_buckets` early
 - WAL files can only be deleted up to the safe checkpoint boundary
