@@ -334,10 +334,8 @@ impl BaseView {
         h.elems = elems as u16;
         h.size = size as u32;
         h.right_sibling = right_sibling;
-        h.merging_child = NULL_PID;
         h.lo_len = lo.len() as u32;
         h.hi_len = hi_len as u32;
-        h.merging = false;
         h.split_elems = 0;
         h.prefix_len = prefix_len as u32;
         h.is_index = IS_INDEX;
