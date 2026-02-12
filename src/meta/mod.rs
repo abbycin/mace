@@ -253,6 +253,9 @@ impl<'a> Txn<'a> {
             return;
         }
         loop {
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_manifest_before_multi_commit");
+
             // btree-store supports SI. refresh handle to start a fresh session
             self.btree = self.manifest.btree.clone();
 
@@ -616,9 +619,8 @@ impl Manifest {
             .map(|x| x.value().clone())
         {
             ctx.flush_and_wait();
-            let _ = self.buckets.buckets.remove(&bucket_id);
-            ctx.reclaim();
         }
+        let _ = self.buckets.buckets.remove(&bucket_id);
 
         self.bucket_states.remove(&bucket_id);
         Ok(())

@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
     atomic::{
         AtomicBool, AtomicIsize, AtomicPtr, AtomicU64,
-        Ordering::{Acquire, Relaxed, Release},
+        Ordering::{AcqRel, Acquire, Relaxed},
     },
     mpsc::{Receiver, Sender},
 };
@@ -690,18 +690,23 @@ impl BucketContext {
     }
 
     pub(crate) fn reclaim(&self) {
-        assert!(!self.reclaimed.load(Acquire));
-        self.reclaimed.store(true, Release);
+        if self
+            .reclaimed
+            .compare_exchange(false, true, AcqRel, Acquire)
+            .is_err()
+        {
+            return;
+        }
         // this is necessary, because the bucket maybe dropped/deleted without exit the process
         self.flush_and_wait();
         self.reclaim_pages();
         Handle::reclaim(&self.pool);
+    }
+}
 
-        let s = self as *const Self as *mut Self;
-        unsafe {
-            std::mem::take(&mut (*s).table);
-            std::mem::take(&mut (*s).state);
-        }
+impl Drop for BucketContext {
+    fn drop(&mut self) {
+        self.reclaim();
     }
 }
 
@@ -769,10 +774,8 @@ impl BucketMgr {
             f.quit();
         }
 
-        // 4) reclaim bucket contexts after flushers are gone to avoid races
-        for b in self.buckets.iter() {
-            b.reclaim();
-        }
+        // 4) release bucket contexts after flushers are gone to avoid races
+        // reclaim is deferred to BucketContext::drop when the last Arc goes away
         self.buckets.clear();
 
         // 5) release shared lru
@@ -783,9 +786,7 @@ impl BucketMgr {
         if let Some(ctx) = self.buckets.get(&bucket_id).map(|x| x.value().clone()) {
             ctx.flush_and_wait();
         }
-        if let Some((_, b)) = self.buckets.remove(&bucket_id) {
-            b.reclaim();
-        }
+        let _ = self.buckets.remove(&bucket_id);
     }
 
     pub(crate) fn active_contexts(&self) -> Vec<Arc<BucketContext>> {

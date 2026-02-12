@@ -102,6 +102,9 @@ impl Evictor {
     }
 
     fn evict_once(&mut self, g: &Guard, limit: usize, safe_txid: u64) {
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_evictor_before_evict_once");
+
         let bucket_ctxs = self.buckets.active_contexts();
         let mut candidates: Vec<(Arc<BucketContext>, u64)> = Vec::new();
 

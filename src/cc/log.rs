@@ -312,6 +312,8 @@ impl Logging {
         // we must flush buffer in ring to make sure they are stabilized before flush checkpoint
         self.flush(false)?;
         self.writer.write(ckpt.to_slice());
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_wal_after_checkpoint_write");
         if self.opt.sync_on_write {
             self.writer.sync();
         }

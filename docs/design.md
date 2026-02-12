@@ -47,7 +47,7 @@ This ensures data is durable before metadata points to it.
 
 - **Create**: `Manifest::create_bucket` uses `structural_lock`, checks `MAX_BUCKETS`, allocates id, initializes state and page map, and persists `BucketMeta`
 - **Load**: contexts are lazy-loaded; repeated loads reuse cached `BucketContext`
-- **Unload**: `unload_bucket` drops in-memory state and page map without deleting on-disk data
+- **Unload**: `unload_bucket` unpublishes bucket context from runtime maps and flushes pending data; actual memory release is deferred to `Arc` drop without touching on-disk data
 - **Delete**: two-phase
   - Logical delete: remove meta, record in `pending_del`, mark obsolete files
   - Physical delete: GC cleans page table/interval tables and decrements `nr_buckets`
@@ -63,6 +63,8 @@ Each bucket has its own runtime context:
 - `IntervalMap` for data and blob
 - `NodeCache` and `ShardPriorityLru` caches
 - eviction candidate ring and per-bucket loaders
+
+`BucketContext::reclaim` is idempotent (CAS-guarded). Runtime remove paths only unpublish and flush; final reclaim is deferred to `Drop` of the last `Arc<BucketContext>` so GC/evictor snapshots cannot observe nulled shared refs.
 
 `BucketState` is in-memory only and includes:
 
@@ -209,20 +211,37 @@ This prevents deleting WAL still needed for recovery or active transactions.
 
 #### Orphan data/blob cleanup
 
-Orphans are data/blob files that were written to disk but never recorded in manifest metadata (e.g., crash between data flush and manifest commit).
+Orphans are data/blob files that were written to disk but never published by manifest metadata
+(for example, crash between rewrite output sync and metadata commit).
 
-Cleanup is performed during manifest build (`ManifestBuilder::finish`):
+`clean_orphans` is intentionally scoped to **file-level orphan closure only**. It does not repair
+runtime references.
 
-1. If `ORPHAN_DATA` / `ORPHAN_BLOB` exist in `numerics`, load those lists.
-2. Otherwise, scan from `max_data_id + 1` / `max_blob_id + 1` and collect **contiguous tail files** that exist.
-3. Persist the lists into `ORPHAN_DATA` / `ORPHAN_BLOB` (so cleanup is crash-resumable).
-4. Delete the files on disk.
-5. Remove `ORPHAN_*` keys from `numerics`.
+Current protocol:
+
+1. GC rewrite stages per-file orphan intent markers in `numerics` before writing new output files.
+   - data marker key: `odf_{file_id}`
+   - blob marker key: `obf_{file_id}`
+2. Rewrite output is written and synced.
+3. In the same metadata txn that publishes the new file, GC clears the corresponding marker.
+4. During startup, `clean_orphans` scans marker keys in `numerics`, removes corresponding files,
+   then removes cleaned markers.
+
+Important boundaries:
+
+- Recovery uses marker scan only.
+  - no data directory traversal
+  - no max-id tail probing
+- file ids can be sparse; cleanup is marker-driven and idempotent.
+- orphan marker update failure is fatal (`expect("orphan marker update failed")`), because a
+  partial marker cleanup makes recovery boundary ambiguous.
 
 Crash safety:
 
-- Crash after step 3 but before deletion: next startup sees `ORPHAN_*` and continues deleting.
-- Crash after deletion but before removing `ORPHAN_*`: next startup will try to delete again (idempotent) and then clear the keys.
+- Crash after marker stage but before metadata publish: marker survives, startup cleanup removes
+  uncommitted output file.
+- Crash after metadata publish and marker clear commit: file is already part of durable metadata
+  state and is not treated as orphan.
 
 #### Obsolete file deletion (crash-safe)
 
@@ -271,7 +290,8 @@ This makes file deletion idempotent across crashes.
 ## Memory safety model
 
 - `BoxRef` uses a refcount whose MSB marks chunk-allocated memory
-- `Handle<T>` and `MutRef<T>` are manual ownership helpers; they require explicit `reclaim()`
+- `Handle<T>` is a manual owner and requires explicit `reclaim()`
+- `MutRef<T>` is intrusive refcounted and reclaimed by clone/drop lifecycle (not manual `reclaim()`)
 - Bucket shutdown order ensures background threads stop before reclaiming arenas and page maps
 
 ## Key invariants to preserve
@@ -282,3 +302,30 @@ This makes file deletion idempotent across crashes.
 - Packed plan mismatch must fail fast (`error` + panic), never silently downgrade to split allocation
 - Bucket deletion must be two-phase; do not decrement `nr_buckets` early
 - WAL files can only be deleted up to the safe checkpoint boundary
+
+## Operational validation pipeline
+
+To keep production behavior aligned with crash-safety and performance invariants:
+
+- `scripts/prod_test.sh`
+  - `fast` for quick correctness checks
+  - `stress` for long-run pressure
+  - `chaos` for failpoint crash/fault windows
+  - `all` for full matrix (`fast + stress + chaos`)
+- `scripts/perf_gate.sh`
+  - `snapshot` captures current benchmark summary
+  - `compare` gates regressions against a baseline ref (`MACE_PERF_BASE_REF`)
+- `scripts/prod_soak.sh`
+  - loops stress/chaos with periodic perf snapshots
+  - writes trend data into `target/prod_soak/perf_cycles.csv`
+- `scripts/perf_thresholds.env`
+  - central threshold/profile knobs for local runs and CI
+
+CI integration:
+
+- `.github/workflows/ci.yml`
+  - `test-prod-all` runs `prod_test.sh all`
+  - `perf-regression` runs `perf_gate.sh compare`
+- `.github/workflows/prod-soak.yml`
+  - scheduled + manual soak workflow with artifact upload
+

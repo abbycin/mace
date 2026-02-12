@@ -109,6 +109,9 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) -> Option<FlushResult> {
         mem_blob_stat = Some(new_mem_blob_stat);
     }
 
+    #[cfg(feature = "failpoints")]
+    crate::utils::failpoint::crash("mace_flush_after_data_sync");
+
     // 2. prepare statistics
     let mut mem_data_stat = builder.data_stat(data_id, tick);
     mem_data_stat.inner.bucket_id = bucket_id;

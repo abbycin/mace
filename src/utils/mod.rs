@@ -14,6 +14,8 @@ pub(crate) mod bitmap;
 pub(crate) mod block;
 pub(crate) mod countblock;
 pub(crate) mod data;
+#[cfg(feature = "failpoints")]
+pub(crate) mod failpoint;
 pub(crate) mod imtree;
 pub(crate) mod interval;
 pub(crate) mod lru;

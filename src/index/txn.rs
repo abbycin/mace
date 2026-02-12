@@ -103,6 +103,7 @@ impl<'a> TxnKV<'a> {
     fn should_abort(&self) -> Result<(), OpCode> {
         let state = self.state_ref();
         let g = self.ctx.group(state.group_id);
+
         if self.is_end.get() || g.ckpt_cnt.load(Relaxed) - state.start_ckpt >= self.limit {
             return Err(OpCode::AbortTx);
         }
@@ -369,6 +370,9 @@ impl<'a> TxnKV<'a> {
         let state = self.state_ref();
         let g = self.ctx.group(state.group_id);
 
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_txn_commit_begin")?;
+
         if !state.modified {
             g.logging.lock().record_commit(state.start_ts)?;
             g.active_txns.remove(&state.start_ts);
@@ -381,7 +385,11 @@ impl<'a> TxnKV<'a> {
         {
             let mut log = g.logging.lock();
             log.record_commit(state.start_ts)?;
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::check("mace_txn_commit_after_record_commit")?;
             log.stabilize()?;
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::check("mace_txn_commit_after_wal_sync")?;
         }
 
         g.cc.commit_tree.append(state.start_ts, commit_ts);
@@ -456,7 +464,7 @@ impl Drop for TxnKV<'_> {
                     .lock()
                     .stabilize()
                     .map_err(|e| {
-                        log::error!("can't stabilize rollback WAL, {:?}", e);
+                        log::error!("can't stabilize rollback source WAL, {:?}", e);
                     })
                     .expect("can't fail");
 
@@ -473,6 +481,14 @@ impl Drop for TxnKV<'_> {
                     .rollback(&mut block, state.start_ts, location, |_| self.tree.clone())
                     .inspect_err(|e| {
                         log::error!("can't rollback, {:?}", e);
+                    })
+                    .expect("can't fail");
+
+                grp.logging
+                    .lock()
+                    .stabilize()
+                    .map_err(|e| {
+                        log::error!("can't stabilize rollback WAL, {:?}", e);
                     })
                     .expect("can't fail");
 

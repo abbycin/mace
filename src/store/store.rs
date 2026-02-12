@@ -131,7 +131,11 @@ impl FlushObserver for StoreFlushObserver {
         }
 
         txn.record(MetaKind::Numerics, self.manifest.numerics.deref());
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_flush_before_manifest_commit")?;
         txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_flush_after_manifest_commit")?;
 
         self.manifest
             .add_data_stat(result.mem_data_stat, result.data_ivl);
@@ -287,7 +291,7 @@ impl Bucket {
 
     /// Returns the unique identifier of this bucket.
     pub fn id(&self) -> u64 {
-        self.tree.bucket.bucket_id
+        self.tree.bucket_id()
     }
 
     /// Returns the options used by this bucket.

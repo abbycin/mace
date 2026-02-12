@@ -602,6 +602,8 @@ impl GarbageCollector {
         // stage orphan intent before rewrite output is flushed
         // crash can happen after file sync but before manifest commit
         self.store.manifest.stage_orphan_data_file(file_id);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_data_rewrite_after_stage_marker");
         let mut builder = DataReWriter::new(file_id, opt, candidate.len(), bucket_id);
         let mut remap_intervals = Vec::with_capacity(candidate.len());
         let mut del_intervals = DelInterval {
@@ -702,7 +704,11 @@ impl GarbageCollector {
         self.store
             .manifest
             .clear_orphan_data_file(&mut txn, file_id);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_data_rewrite_before_meta_commit");
         txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_data_rewrite_after_meta_commit");
 
         // 3. it's safe to clean obsolete files, because they are not referenced
         self.store.manifest.save_obsolete_data(&tmp);
@@ -722,6 +728,8 @@ impl GarbageCollector {
         // stage orphan intent before rewrite output is flushed
         // crash can happen after file sync but before manifest commit
         self.store.manifest.stage_orphan_blob_file(blob_id);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_blob_rewrite_after_stage_marker");
         let mut obsoleted = Vec::new();
 
         self.store.manifest.blob_stat.start_collect_junks();
@@ -812,8 +820,12 @@ impl GarbageCollector {
         self.store
             .manifest
             .clear_orphan_blob_file(&mut txn, blob_id);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_blob_rewrite_before_meta_commit");
 
         txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_blob_rewrite_after_meta_commit");
 
         self.store.manifest.save_obsolete_blob(&tmp);
         self.store.manifest.delete_files();
