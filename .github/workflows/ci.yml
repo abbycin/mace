@@ -61,7 +61,7 @@ jobs:
           MACE_PROD_BUCKET_CHURN_ROUNDS: "128"
           MACE_PROD_BUCKET_CHURN_WORKERS: "2"
           MACE_PROD_EVICTOR_STRESS_ROUNDS: "512"
-        run: ./scripts/prod_test.sh all 8
+        run: bash ./scripts/prod_test.sh all 8
 
   perf-regression:
     name: Perf Regression Gate
@@ -79,7 +79,7 @@ jobs:
         env:
           MACE_PERF_THRESHOLD_FILE: scripts/perf_thresholds.env
           MACE_PERF_BASE_REF: origin/master
-        run: ./scripts/perf_gate.sh compare
+        run: bash ./scripts/perf_gate.sh compare
 
       - name: Upload perf artifacts
         if: always()

@@ -34,7 +34,7 @@ jobs:
           SOAK_CHAOS_EVERY: "2"
           SOAK_PERF_EVERY: "1"
           MACE_PERF_THRESHOLD_FILE: scripts/perf_thresholds.env
-        run: ./scripts/prod_soak.sh
+        run: bash ./scripts/prod_soak.sh
 
       - name: Upload soak artifacts
         if: always()
