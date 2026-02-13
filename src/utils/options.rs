@@ -45,12 +45,9 @@ pub struct Options {
     pub cache_capacity: usize,
     /// percent of items will be evicted at once, default is 10%
     pub cache_evict_pct: usize,
-    /// delta cache count, shard into 32 slots, which act as a secondary cache to node cache
-    /// which has two priority: High and Low, the Low priority is used for big value only
-    pub cache_count: usize,
     /// stat bitmap cache count for data and blob
     pub stat_mask_cache_count: usize,
-    /// the High priority cache ratio of [`Self::cache_count`], range from [0, 100]
+    /// the High priority cache ratio of derived cache count, range from [0, 100]
     pub high_priority_ratio: usize,
     /// max cache count for open data file concurrently, which is used for load pages from data file
     pub data_handle_cache_capacity: usize,
@@ -139,7 +136,6 @@ impl Options {
             log_root: db_root.as_ref().to_path_buf(),
             cache_capacity: Self::CACHE_CAP,
             cache_evict_pct: 10, // 10%
-            cache_count: Self::CACHE_CNT,
             stat_mask_cache_count: Self::STAT_MASK_CACHE_CNT,
             high_priority_ratio: 80, // 80%
             data_handle_cache_capacity: 128,
@@ -161,6 +157,20 @@ impl Options {
         self.split_elems as usize / 4
     }
 
+    fn derive_cache_count(cache_capacity: usize) -> usize {
+        let scale = (cache_capacity / Self::CACHE_CAP).clamp(1, 8);
+        let cache_count = Self::CACHE_CNT.saturating_mul(scale);
+        if cache_count / LRU_SHARD < 10 {
+            Self::CACHE_CNT
+        } else {
+            cache_count
+        }
+    }
+
+    pub(crate) fn cache_count(&self) -> usize {
+        Self::derive_cache_count(self.cache_capacity)
+    }
+
     /// Validates the options and returns a ParsedOptions instance.
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
         self.concurrent_write = self.concurrent_write.clamp(1, Self::MAX_CONCURRENT_WRITE);
@@ -169,9 +179,6 @@ impl Options {
             .clamp(Self::MIN_SPLIT_ELEMS, Self::MAX_SPLIT_ELEMS);
         if self.consolidate_threshold > self.split_elems / 2 {
             self.consolidate_threshold = self.split_elems / 2;
-        }
-        if self.cache_count / LRU_SHARD < 10 {
-            self.cache_count = Self::CACHE_CNT;
         }
         if self.stat_mask_cache_count == 0 {
             self.stat_mask_cache_count = Self::STAT_MASK_CACHE_CNT;

@@ -640,6 +640,7 @@ impl Tree {
             let (k, v) = DeltaView::from_key_val(&mut txn, k, v);
 
             node.insert(k, v);
+            drop(node);
 
             txn.record_and_commit(group_id as usize, pos);
             return Ok(());

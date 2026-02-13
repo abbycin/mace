@@ -1,7 +1,9 @@
 use parking_lot::{Mutex, MutexGuard};
+use rustc_hash::FxHasher;
 use std::{
     cell::Cell,
     collections::HashMap,
+    hash::BuildHasherDefault,
     hash::Hash,
     ops::Deref,
     ptr::{self},
@@ -17,6 +19,8 @@ fn init_head<K, V>() -> *mut Node<K, V> {
     }
     p
 }
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 pub(crate) struct Node<K, V> {
     key: Option<K>,
@@ -83,7 +87,7 @@ impl<K, V> Default for Node<K, V> {
 
 pub(crate) struct LruGuard<'a, K, V, N> {
     data: &'a V,
-    _guard: MutexGuard<'a, HashMap<K, N>>,
+    _guard: MutexGuard<'a, FastMap<K, N>>,
 }
 
 impl<K, V, N> Deref for LruGuard<'_, K, V, N> {
@@ -98,7 +102,7 @@ pub(crate) struct LruShardGuard<'a, K, V> {
     cap: usize,
     k: K,
     lru: &'a Lru<K, V>,
-    map: MutexGuard<'a, HashMap<K, *mut Node<K, V>>>,
+    map: MutexGuard<'a, FastMap<K, *mut Node<K, V>>>,
 }
 
 impl<'a, K, V> LruShardGuard<'a, K, V>
@@ -119,12 +123,12 @@ where
 
 pub(crate) struct Lru<K, V> {
     head: *mut Node<K, V>,
-    map: Mutex<HashMap<K, *mut Node<K, V>>>,
+    map: Mutex<FastMap<K, *mut Node<K, V>>>,
 }
 
 // it's larger than 64 on macOS
 #[cfg(not(target_os = "macos"))]
-crate::static_assert!(size_of::<Lru<u32, crate::io::File>>() == 64);
+crate::static_assert!(size_of::<Lru<u32, crate::io::File>>() <= 96);
 
 unsafe impl<K, V> Send for Lru<K, V> {}
 unsafe impl<K, V> Sync for Lru<K, V> {}
@@ -136,7 +140,7 @@ where
     pub(crate) fn new() -> Self {
         Self {
             head: init_head(),
-            map: Mutex::new(HashMap::new()),
+            map: Mutex::new(FastMap::with_hasher(Default::default())),
         }
     }
 
@@ -183,7 +187,7 @@ where
 
     fn add_unlocked(
         &self,
-        map: &mut MutexGuard<'_, HashMap<K, *mut Node<K, V>>>,
+        map: &mut MutexGuard<'_, FastMap<K, *mut Node<K, V>>>,
         cap: usize,
         k: K,
         v: V,
@@ -284,7 +288,7 @@ impl Cap {
 struct PriorityLru<K, V> {
     cap: [Cap; 2],
     queue: [*mut Node<K, (V, CachePriority)>; 2],
-    map: Mutex<HashMap<K, *mut Node<K, (V, CachePriority)>>>,
+    map: Mutex<FastMap<K, *mut Node<K, (V, CachePriority)>>>,
 }
 
 impl<K, V> PriorityLru<K, V>
@@ -298,7 +302,7 @@ where
         Self {
             cap: [Cap::new(lo_cap), Cap::new(hi_cap)],
             queue: [init_head(), init_head()],
-            map: Mutex::new(HashMap::new()),
+            map: Mutex::new(FastMap::with_hasher(Default::default())),
         }
     }
 
@@ -362,7 +366,7 @@ impl<K, V> Drop for PriorityLru<K, V> {
     }
 }
 
-pub const LRU_SHARD: usize = 32;
+pub const LRU_SHARD: usize = 64;
 const LRU_SHARD_MASK: usize = LRU_SHARD - 1;
 
 pub(crate) struct ShardLru<V> {

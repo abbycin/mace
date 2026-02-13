@@ -732,7 +732,7 @@ impl BucketMgr {
         Self {
             buckets: DashMap::new(),
             lru: Handle::new(ShardPriorityLru::new(
-                opt.cache_count,
+                opt.cache_count(),
                 opt.high_priority_ratio,
             )),
             used: Arc::new(AtomicIsize::new(0)),

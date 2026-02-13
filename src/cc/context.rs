@@ -219,6 +219,7 @@ impl DerefMut for CCNode {
 struct CCPool {
     shards: [AtomicPtr<CCNode>; CCPOOL_SHARD],
     shard_index: CachePad<AtomicUsize>,
+    registry_len: CachePad<AtomicUsize>,
     // TODO: maybe change to seqlock ?
     registry: RwLock<Vec<Handle<CCNode>>>,
     concurrent_write: usize,
@@ -236,6 +237,7 @@ impl CCPool {
         Self {
             shards,
             shard_index: CachePad::default(),
+            registry_len: AtomicUsize::new(registry.len()).into(),
             registry: RwLock::new(registry),
             concurrent_write,
         }
@@ -276,6 +278,7 @@ impl CCPool {
             let mut r = self.registry.write();
             cc.registry_index = r.len();
             r.push(cc);
+            self.registry_len.store(r.len(), Relaxed);
             break cc;
         };
         h.start_ts = start_ts;
@@ -283,7 +286,7 @@ impl CCPool {
     }
 
     fn free(&self, mut cc: Handle<CCNode>) {
-        if self.registry.read().len() > CCPOOL_SHARD
+        if self.registry_len.load(Relaxed) > CCPOOL_SHARD
             && rand_range(0..CCPOOL_SHARD) == 0
             && let Some(mut r) = self.registry.try_write()
             && r.len() > CCPOOL_SHARD
@@ -293,10 +296,10 @@ impl CCPool {
             if cc.registry_index < r.len() {
                 r[cc.registry_index].registry_index = cc.registry_index;
             }
+            self.registry_len.store(r.len(), Relaxed);
             cc.reclaim();
             return;
         }
-
         cc.start_ts = NULL_ORACLE;
         let ptr = cc.inner();
         let index = cc.shard_index;

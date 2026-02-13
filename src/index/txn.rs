@@ -462,7 +462,7 @@ impl Drop for TxnKV<'_> {
 
                 grp.logging
                     .lock()
-                    .stabilize()
+                    .sync()
                     .map_err(|e| {
                         log::error!("can't stabilize rollback source WAL, {:?}", e);
                     })
@@ -486,7 +486,7 @@ impl Drop for TxnKV<'_> {
 
                 grp.logging
                     .lock()
-                    .stabilize()
+                    .sync()
                     .map_err(|e| {
                         log::error!("can't stabilize rollback WAL, {:?}", e);
                     })
