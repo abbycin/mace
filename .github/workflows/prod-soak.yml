@@ -13,7 +13,7 @@ jobs:
   prod-soak-nightly:
     name: Prod Soak Nightly
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
