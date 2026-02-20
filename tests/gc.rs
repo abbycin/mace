@@ -1,4 +1,5 @@
 use mace::{Mace, OpCode, Options, RandomPath};
+use std::time::{Duration, Instant};
 
 #[test]
 fn gc_data() -> Result<(), OpCode> {
@@ -209,4 +210,165 @@ fn gc_wal() {
 
     let backup = db.options().wal_backup(0, 1);
     assert!(backup.exists());
+}
+
+#[test]
+fn vacuum_bucket_blocks_delete() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 1000;
+    opt.split_elems = 64;
+    opt.consolidate_threshold = 2;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    mace.disable_gc();
+    let db = mace.new_bucket("x").unwrap();
+    let cap = 30000;
+    let mut keys = Vec::with_capacity(cap);
+
+    for i in 0..cap {
+        keys.push(format!("{i:08}"));
+    }
+
+    let kv = db.begin().unwrap();
+    for k in &keys {
+        kv.put(k, k)?;
+    }
+    kv.commit()?;
+
+    for _ in 0..3 {
+        let kv = db.begin().unwrap();
+        for k in &keys {
+            kv.update(k, k)?;
+        }
+        kv.commit()?;
+    }
+
+    drop(db);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let mace_vac = mace.clone();
+    let handle = std::thread::spawn(move || {
+        let res = mace_vac.vacuum_bucket("x");
+        let _ = done_tx.send(());
+        res
+    });
+
+    let start_wait = Instant::now();
+    let mut started = false;
+    while start_wait.elapsed() < Duration::from_millis(2000) {
+        if mace.is_bucket_vacuuming("x")? {
+            started = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(started, "vacuum did not enter inflight state");
+
+    let mut blocked = false;
+    let mut deleted = false;
+    let mut last_err = None;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(2000) {
+        if done_rx.try_recv().is_ok() {
+            break;
+        }
+        match mace.del_bucket("x") {
+            Err(OpCode::Again) => {
+                blocked = true;
+                break;
+            }
+            Ok(()) => {
+                deleted = true;
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    if deleted {
+        panic!("bucket deletion succeeded while vacuum was running");
+    }
+    if let Some(e) = last_err {
+        panic!("unexpected delete error {e}");
+    }
+    assert!(blocked, "bucket deletion was not blocked by vacuum");
+
+    let stats = handle.join().unwrap()?;
+    assert!(stats.scanned > 0);
+
+    assert!(mace.del_bucket("x").is_ok());
+    Ok(())
+}
+
+#[test]
+fn vacuum_bucket_effect() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 1000;
+    opt.split_elems = 64;
+    opt.consolidate_threshold = 2;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    mace.disable_gc();
+    let db = mace.new_bucket("x").unwrap();
+    let cap = 20000;
+    let mut keys = Vec::with_capacity(cap);
+
+    for i in 0..cap {
+        keys.push(format!("{i:08}"));
+    }
+
+    let kv = db.begin().unwrap();
+    for k in &keys {
+        kv.put(k, k)?;
+    }
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    for _ in 0..3 {
+        let kv = db.begin().unwrap();
+        for k in &keys {
+            kv.update(k, k)?;
+        }
+        kv.commit()?;
+    }
+    let kv = db.begin().unwrap();
+    for (i, k) in keys.iter().enumerate() {
+        if i % 3 == 0 {
+            kv.del(k)?;
+        }
+    }
+    kv.commit()?;
+    drop(view);
+
+    let stats = mace.vacuum_bucket("x")?;
+    assert!(stats.scanned > 0);
+    assert!(stats.compacted > 0);
+    Ok(())
+}
+
+#[test]
+fn vacuum_meta_effect() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+
+    let total = 256;
+    for i in 0..total {
+        let name = format!("b{i:04}");
+        let db = mace.new_bucket(&name).unwrap();
+        let kv = db.begin().unwrap();
+        kv.put("k", "v")?;
+        kv.commit()?;
+    }
+
+    let stats = mace.vacuum_meta()?;
+    assert!(stats.moved_pages > 0);
+    Ok(())
 }

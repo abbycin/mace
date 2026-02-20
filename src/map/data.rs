@@ -1,12 +1,8 @@
 use crate::io::{File, GatherIO};
 use crc32c::Crc32cHasher;
 use dashmap::DashMap;
-use parking_lot::Mutex;
-use rustc_hash::FxHasher;
-use std::hash::BuildHasherDefault;
 
 use crate::map::IFooter;
-use crate::map::chunk::Chunk;
 use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, PageTable};
 use crate::types::header::{TagFlag, TagKind};
 use crate::types::refbox::{BoxRef, RemoteView};
@@ -24,7 +20,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
@@ -66,10 +62,7 @@ impl Deref for FlushData {
 
 pub(crate) struct Arena {
     id: Cell<u64>,
-    pub(crate) items: DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>,
-    #[allow(clippy::vec_box)]
-    pub(crate) chunks: Mutex<Vec<Box<Chunk>>>,
-    pub(crate) active_chunk: AtomicPtr<Chunk>,
+    pub(crate) items: DashMap<u64, BoxRef>,
     /// flush LSN
     pub(crate) flsn: Box<[CachePad<Flsn>]>,
     pub(crate) real_size: AtomicU64,
@@ -120,7 +113,7 @@ impl Flsn {
 }
 
 impl Deref for Arena {
-    type Target = DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>;
+    type Target = DashMap<u64, BoxRef>;
 
     fn deref(&self) -> &Self::Target {
         &self.items
@@ -146,9 +139,8 @@ impl Arena {
     }
 
     pub(crate) fn new(cap: usize, groups: u8) -> Self {
-        let items = DashMap::with_capacity_and_hasher(16 << 10, BuildHasherDefault::default());
         Self {
-            items,
+            items: DashMap::with_capacity(16 << 10),
             flsn: Self::alloc_flsn(groups as usize),
             id: Cell::new(INIT_ID),
             refs: AtomicU32::new(0),
@@ -156,21 +148,11 @@ impl Arena {
             real_size: AtomicU64::new(0),
             cap,
             state: AtomicU16::new(Self::FLUSH),
-            chunks: Mutex::new(Vec::new()),
-            active_chunk: AtomicPtr::new(Box::into_raw(Box::new(Chunk::new()))),
         }
     }
 
     pub(crate) fn clear(&self) {
         self.items.clear();
-        self.chunks.lock().clear();
-
-        let old_ptr = self
-            .active_chunk
-            .swap(Box::into_raw(Box::new(Chunk::new())), Relaxed);
-        if !old_ptr.is_null() {
-            unsafe { drop(Box::from_raw(old_ptr)) };
-        }
     }
 
     pub(crate) fn reset(&self, id: u64) {
@@ -219,58 +201,77 @@ impl Arena {
         }
     }
 
-    fn alloc_at(&self, next_addr: &AtomicU64, real_size: u32, _bucket_id: u64) -> BoxRef {
-        let addr = next_addr.fetch_add(1, Relaxed);
+    pub(crate) fn reserve_batch(&self, total_real_size: u32, nr_frames: u32) -> Result<(), OpCode> {
+        if nr_frames == 0 {
+            return Err(OpCode::Again);
+        }
 
-        let p = if real_size >= 4096 {
-            BoxRef::alloc_exact(real_size, addr)
-        } else {
-            loop {
-                let chunk_ptr = self.active_chunk.load(Acquire);
-                let chunk = unsafe { &*chunk_ptr };
+        self.refs.fetch_add(nr_frames, Relaxed);
+        if self.state() != Self::HOT {
+            self.refs.fetch_sub(nr_frames, AcqRel);
+            return Err(OpCode::Again);
+        }
 
-                let ptr = chunk.alloc(real_size);
-                if !ptr.is_null() {
-                    let mut p = unsafe { BoxRef::from_raw(ptr) };
-                    p.init(real_size, addr, true);
-                    break p;
-                }
+        let need = nr_frames as u64;
+        let total_real_size = total_real_size as u64;
 
-                let mut chunks = self.chunks.lock();
-                if self.active_chunk.load(Acquire) != chunk_ptr {
-                    continue;
-                }
-                let new_chunk_ptr = Box::into_raw(Box::new(Chunk::new()));
-                let _ok = self
-                    .active_chunk
-                    .compare_exchange(chunk_ptr, new_chunk_ptr, AcqRel, Acquire)
-                    .is_ok();
-                #[cfg(feature = "extra_check")]
-                assert!(_ok);
-                chunks.push(unsafe { Box::from_raw(chunk_ptr) });
-            }
+        // this allow us over alloc once
+        let cur = self.real_size.fetch_add(total_real_size, AcqRel);
+        if cur > self.cap as u64 {
+            self.real_size.fetch_sub(total_real_size, AcqRel);
+            self.refs.fetch_sub(nr_frames, AcqRel);
+            return Err(OpCode::NoSpace);
+        }
+
+        let off = self.offset.fetch_add(need, AcqRel);
+        let Some(end) = off.checked_add(need) else {
+            self.real_size.fetch_sub(total_real_size, AcqRel);
+            self.refs.fetch_sub(nr_frames, AcqRel);
+            return Err(OpCode::NoSpace);
         };
+        if end >= u32::MAX as u64 {
+            unreachable!("we assume that base + sibling chain will less than 4GB");
+        }
 
+        Ok(())
+    }
+
+    // we are not rollback offset in case of ABA problem
+    pub(crate) fn rollback_batch(&self, total_real_size: u32, nr_frames: u32) {
+        if total_real_size > 0 {
+            self.real_size.fetch_sub(total_real_size as u64, AcqRel);
+        }
+        if nr_frames > 0 {
+            self.refs.fetch_sub(nr_frames, AcqRel);
+        }
+    }
+
+    fn alloc_at(&self, next_addr: &AtomicU64, real_size: u32) -> BoxRef {
+        let addr = next_addr.fetch_add(1, Relaxed);
+        self.alloc_at_addr(addr, real_size)
+    }
+
+    pub(crate) fn alloc_at_addr(&self, addr: u64, real_size: u32) -> BoxRef {
+        let p = BoxRef::alloc_exact(real_size, addr);
         self.items.insert(addr, p.clone());
         p
     }
 
-    pub fn alloc(
-        &self,
-        next_addr: &AtomicU64,
-        size: u32,
-        bucket_id: u64,
-    ) -> Result<BoxRef, OpCode> {
+    pub fn alloc(&self, next_addr: &AtomicU64, size: u32) -> Result<BoxRef, OpCode> {
         let real_size = BoxRef::real_size(size);
         self.inc_ref();
         let _ = self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
-        Ok(self.alloc_at(next_addr, real_size, bucket_id))
+        Ok(self.alloc_at(next_addr, real_size))
     }
 
     pub(crate) fn dealloc(&self, addr: u64, len: usize) {
         if self.items.remove(&addr).is_some() {
             self.real_size.fetch_sub(len as u64, AcqRel);
         }
+    }
+
+    pub(crate) fn remove_item_only(&self, addr: u64) -> bool {
+        self.items.remove(&addr).is_some()
     }
 
     #[inline]
@@ -340,17 +341,6 @@ impl Debug for Arena {
             .field("offset", &self.offset)
             .field("id", &self.id.get())
             .finish()
-    }
-}
-
-impl Drop for Arena {
-    fn drop(&mut self) {
-        let ptr = self.active_chunk.load(Relaxed);
-        if !ptr.is_null() {
-            unsafe {
-                drop(Box::from_raw(ptr));
-            }
-        }
     }
 }
 

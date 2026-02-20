@@ -22,14 +22,16 @@ use crate::{
     index::tree::Tree,
     io::{File, GatherIO},
     map::{
+        buffer::BucketContext,
         data::{BlobFooter, DataFooter, MetaReader},
-        table::Swip,
+        table::{BucketState, Swip},
     },
     meta::{
         BUCKET_PENDING_DEL, BlobStatInner, DataStatInner, DelInterval, Delete, IntervalPair,
         MemBlobStat, MemDataStat, MetaKind, MetaOp, Numerics, blob_interval_name,
         data_interval_name, page_table_name,
     },
+    store::VacuumStats,
     types::traits::IAsSlice,
     utils::{
         Handle, MutRef, ROOT_PID,
@@ -124,7 +126,7 @@ impl GCHandle {
 
 pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
     let (tx, rx) = channel();
-    let sem = Arc::new(Countblock::new(1));
+    let sem = Arc::new(Countblock::new(0));
     let data_runs = Arc::new(AtomicU64::new(0));
     let blob_runs = Arc::new(AtomicU64::new(0));
     let gc = GarbageCollector {
@@ -293,6 +295,9 @@ impl GarbageCollector {
             if max_pid == 0 {
                 continue;
             }
+            if state.is_vacuuming() {
+                continue;
+            }
             // strategy: scan the entire page table approximately every 500 ticks (e.g., ~8 hours if tick=1min)
             // but keep the batch size within a reasonable range [128, 10000]
             let batch_size = (max_pid / 500).clamp(128, 10000);
@@ -303,6 +308,9 @@ impl GarbageCollector {
                 if state.is_deleting() || state.is_drop() {
                     break;
                 }
+                if state.is_vacuuming() {
+                    break;
+                }
 
                 let mut cursor = table.scavenge_cursor.load(Relaxed);
 
@@ -311,20 +319,21 @@ impl GarbageCollector {
                 }
                 table.scavenge_cursor.store(cursor + 1, Relaxed);
 
-                let root_pid =
-                    if let Some(_meta) = self.store.manifest.bucket_metas_by_id.get(&bucket_id) {
-                        ROOT_PID
-                    } else {
-                        break; // bucket removed
-                    };
+                if !self
+                    .store
+                    .manifest
+                    .bucket_metas_by_id
+                    .contains_key(&bucket_id)
+                {
+                    break; // bucket removed
+                }
 
                 let swip = Swip::new(table.get(cursor));
                 if swip.is_null() {
                     continue;
                 }
 
-                let bucket_ctx = self.store.manifest.get_bucket_context_must_exist(bucket_id);
-                let tree = Tree::new(self.store.clone(), root_pid, bucket_ctx);
+                let tree = Tree::new(self.store.clone(), ROOT_PID, ctx.clone());
 
                 match tree.try_scavenge(cursor, &g) {
                     Ok(true) => {
@@ -538,28 +547,19 @@ impl GarbageCollector {
     fn process_wal(&mut self) {
         for g in self.store.context.groups().iter() {
             let mut checkpoint_id = g.active_txns.min_position_file_id();
+            let (oldest_id, last_ckpt_file) = {
+                let logging = g.logging.lock();
+                (logging.oldest_wal_id(), logging.last_ckpt().file_id)
+            };
+            checkpoint_id = std::cmp::min(checkpoint_id, last_ckpt_file);
 
-            let logging = g.logging.lock();
-            checkpoint_id = std::cmp::min(checkpoint_id, logging.last_ckpt().file_id);
-
-            let desc_clone = logging.desc.clone();
-            let lk = desc_clone.lock();
-            let oldest_id = lk.oldest_id;
-            drop(lk);
-
-            // drop logging lock to avoid blocking writes during IO
-            drop(logging);
-
-            if oldest_id == checkpoint_id {
+            if oldest_id >= checkpoint_id {
                 continue;
             }
 
             // [oldest_id, checkpoint_id)
             Self::process_one_wal(&self.store.opt, g.id as u8, oldest_id, checkpoint_id);
-            let mut desc = desc_clone.lock();
-            desc.update_oldest(self.ctx.opt.desc_file(g.id as u8), checkpoint_id)
-                .inspect_err(|e| log::error!("can't update oldest, {:?}", e))
-                .expect("can't fail");
+            g.logging.lock().advance_oldest_wal_id(checkpoint_id);
         }
     }
 
@@ -590,9 +590,17 @@ impl GarbageCollector {
     fn rewrite_data(&mut self, candidate: Vec<Score>, bucket_id: u64) {
         let opt = &self.store.opt;
         let file_id = self.numerics.next_data_id.fetch_add(1, Relaxed);
+        // stage orphan intent before rewrite output is flushed
+        // crash can happen after file sync but before manifest commit
+        self.store.manifest.stage_orphan_data_file(file_id);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_data_rewrite_after_stage_marker");
         let mut builder = DataReWriter::new(file_id, opt, candidate.len(), bucket_id);
         let mut remap_intervals = Vec::with_capacity(candidate.len());
-        let mut del_intervals = DelInterval::default();
+        let mut del_intervals = DelInterval {
+            lo: Vec::new(),
+            bucket_id,
+        };
         let mut obsoleted = Vec::new();
 
         self.store.manifest.data_stat.start_collect_junks(); // stop in update_stat_interval
@@ -683,8 +691,15 @@ impl GarbageCollector {
         // in case crash happens before/during deleting files
         let tmp: Delete = victims.into();
         txn.record(MetaKind::DataDelete, &tmp);
-
+        // clear intent in the same metadata txn that publishes the new file
+        self.store
+            .manifest
+            .clear_orphan_data_file(&mut txn, file_id);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_data_rewrite_before_meta_commit");
         txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_data_rewrite_after_meta_commit");
 
         // 3. it's safe to clean obsolete files, because they are not referenced
         self.store.manifest.save_obsolete_data(&tmp);
@@ -695,9 +710,17 @@ impl GarbageCollector {
     fn rewrite_blob(&mut self, candidate: &[u64], bucket_id: u64) {
         let opt = &self.ctx.opt;
         let mut remap_intervals = Vec::new();
-        let mut del_intervals = DelInterval::default();
+        let mut del_intervals = DelInterval {
+            lo: Vec::new(),
+            bucket_id,
+        };
         let mut builder = BlobRewriter::new(opt, bucket_id);
         let blob_id = self.numerics.next_blob_id.fetch_add(1, Relaxed);
+        // stage orphan intent before rewrite output is flushed
+        // crash can happen after file sync but before manifest commit
+        self.store.manifest.stage_orphan_blob_file(blob_id);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_blob_rewrite_after_stage_marker");
         let mut obsoleted = Vec::new();
 
         self.store.manifest.blob_stat.start_collect_junks();
@@ -784,11 +807,97 @@ impl GarbageCollector {
 
         let tmp: Delete = victims.into();
         txn.record(MetaKind::BlobDelete, &tmp);
+        // clear intent in the same metadata txn that publishes the new file
+        self.store
+            .manifest
+            .clear_orphan_blob_file(&mut txn, blob_id);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_blob_rewrite_before_meta_commit");
+
         txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_blob_rewrite_after_meta_commit");
 
         self.store.manifest.save_obsolete_blob(&tmp);
         self.store.manifest.delete_files();
         self.blob_runs.fetch_add(1, AcqRel);
+    }
+}
+
+pub(crate) fn vacuum_bucket(
+    store: MutRef<Store>,
+    bucket_ctx: Arc<BucketContext>,
+) -> Result<VacuumStats, OpCode> {
+    let state = bucket_ctx.state.clone();
+    let start_epoch = state.vacuum_epoch();
+    let mut stats = VacuumStats::default();
+
+    loop {
+        if state.is_deleting() || state.is_drop() {
+            return Err(OpCode::Again);
+        }
+        if state.try_begin_vacuum() {
+            break;
+        }
+        if state.vacuum_epoch() != start_epoch {
+            return Ok(stats);
+        }
+        state.wait_vacuum(start_epoch);
+        if state.vacuum_epoch() != start_epoch {
+            return Ok(stats);
+        }
+    }
+
+    let _guard = VacuumGuard::new(state.clone());
+    if state.is_deleting() || state.is_drop() {
+        return Err(OpCode::Again);
+    }
+
+    let g = crossbeam_epoch::pin();
+    let bucket_id = bucket_ctx.bucket_id;
+    let table = bucket_ctx.table.clone();
+    let max_pid = table.len();
+    if max_pid == 0 {
+        return Ok(stats);
+    }
+
+    let tree = Tree::new(store.clone(), ROOT_PID, bucket_ctx);
+
+    for pid in ROOT_PID..max_pid {
+        if state.is_deleting() || state.is_drop() {
+            break;
+        }
+        if store.manifest.bucket_metas_by_id.get(&bucket_id).is_none() {
+            break;
+        }
+
+        let swip = Swip::new(table.get(pid));
+        if swip.is_null() {
+            continue;
+        }
+
+        stats.scanned += 1;
+        if matches!(tree.try_scavenge(pid, &g), Ok(true)) {
+            stats.compacted += 1;
+        }
+    }
+
+    Ok(stats)
+}
+
+struct VacuumGuard {
+    state: MutRef<BucketState>,
+}
+
+impl VacuumGuard {
+    fn new(state: MutRef<BucketState>) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for VacuumGuard {
+    fn drop(&mut self) {
+        self.state.end_vacuum();
     }
 }
 

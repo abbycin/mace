@@ -2,9 +2,10 @@ use super::wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalC
 use crate::OpCode;
 use crate::meta::Numerics;
 use crate::types::data::Key;
+use crate::utils::MutRef;
 use crate::utils::block::Ring;
 use crate::utils::data::Position;
-use crate::utils::{data::WalDescHandle, options::ParsedOptions};
+use crate::utils::options::ParsedOptions;
 use crate::{cc::wal::EntryType, utils::data::GatherWriter};
 use crc32c::Crc32cHasher;
 use std::hash::Hasher;
@@ -40,19 +41,22 @@ impl<'a> LogBuilder<'a> {
 
 pub struct Logging {
     pub group: u8,
+    oldest_wal_id: u64,
     ring: Ring,
     enable_ckpt: AtomicBool,
     /// save last checkpoint position, used by gc
     last_ckpt: Position,
+    /// log position after last durable checkpoint
+    last_ckpt_log_pos: Position,
+    /// last durable wal position
+    durable_pos: Position,
     ckpt_cnt: Arc<AtomicUsize>,
     /// used for building traverse chain (lsn)
     log_pos: Position,
     flushed_pos: Position,
     ops: usize,
-    last_signal: u64,
-    writer: GatherWriter,
+    pub(crate) writer: MutRef<GatherWriter>,
     opt: Arc<ParsedOptions>,
-    pub desc: WalDescHandle,
     numerics: Arc<Numerics>,
 }
 
@@ -64,33 +68,33 @@ impl Logging {
     const AUTO_STABLE_OPS: u32 = <usize>::trailing_zeros(32);
 
     pub(crate) fn new(
-        desc: WalDescHandle,
+        group: u8,
+        latest_id: u64,
+        oldest_id: u64,
+        checkpoint: Position,
         numerics: Arc<Numerics>,
         opt: Arc<ParsedOptions>,
         ckpt_cnt: Arc<AtomicUsize>,
     ) -> Self {
-        let (group, last_id, ckpt_pos) = {
-            let d = desc.lock();
-            (d.group, d.latest_id, d.checkpoint)
-        };
-        let writer = GatherWriter::append(&opt.wal_file(group, last_id), 16);
+        let writer = GatherWriter::append(&opt.wal_file(group, latest_id), 16);
         let pos = Position {
-            file_id: last_id,
+            file_id: latest_id,
             offset: writer.pos(),
         };
         Self {
+            oldest_wal_id: oldest_id.min(latest_id),
             ring: Ring::new(opt.wal_buffer_size),
             enable_ckpt: AtomicBool::new(false),
-            last_ckpt: ckpt_pos,
+            last_ckpt: checkpoint,
+            last_ckpt_log_pos: pos,
+            durable_pos: pos,
             ckpt_cnt,
             log_pos: pos,
             flushed_pos: pos,
             ops: 0,
-            last_signal: numerics.signal.load(Relaxed),
             group,
-            writer,
+            writer: MutRef::new(writer),
             opt,
-            desc,
             numerics,
         }
     }
@@ -100,13 +104,13 @@ impl Logging {
         let rest = self.ring.len() - tail;
 
         if rest < size {
-            self.flush(false)?;
+            self.sync(false)?;
             // skip the rest data, and restart from the begining
             self.ring.prod(rest);
             self.ring.cons(rest);
         } else if tail == 0 && self.ring.distance() > 0 {
             // the tail is extactly euqal to the boundary, we must flush pending data
-            self.flush(false)?;
+            self.sync(false)?;
         }
         Ok(self.ring.prod(size))
     }
@@ -118,20 +122,21 @@ impl Logging {
             self.log_pos.file_id += 1;
             self.log_pos.offset = 0;
 
-            self.flush(false)?;
-            self.writer
-                .reset(&self.opt.wal_file(self.group, self.log_pos.file_id));
-            self.sync_desc()?;
+            self.sync(false)?;
+            self.writer.reset(GatherWriter::append(
+                &self.opt.wal_file(self.group, self.log_pos.file_id),
+                16,
+            ));
         }
 
         self.ops = self.ops.wrapping_add(1);
-        if self.ops.trailing_zeros() >= Self::AUTO_STABLE_OPS
-            || self.ring.distance() >= Self::AUTO_STABLE_SIZE
-        {
-            self.flush(false)?;
+        let flush_by_ops = self.ops.trailing_zeros() >= Self::AUTO_STABLE_OPS;
+        let flush_by_size = self.ring.distance() >= Self::AUTO_STABLE_SIZE;
+        if flush_by_ops || flush_by_size {
+            self.sync(false)?;
         }
 
-        self.checkpoint()
+        Ok(())
     }
 
     pub fn enable_checkpoint(&self) {
@@ -150,12 +155,25 @@ impl Logging {
         self.last_ckpt
     }
 
-    pub fn update_last_ckpt(&mut self, pos: Position) {
-        if pos.file_id > self.last_ckpt.file_id
-            || (pos.file_id == self.last_ckpt.file_id && pos.offset > self.last_ckpt.offset)
-        {
+    pub fn oldest_wal_id(&self) -> u64 {
+        self.oldest_wal_id
+    }
+
+    pub fn advance_oldest_wal_id(&mut self, next: u64) {
+        if next > self.oldest_wal_id {
+            self.oldest_wal_id = next;
+        }
+    }
+
+    pub fn update_checkpoint(&mut self, pos: Position) -> bool {
+        if pos > self.last_ckpt {
             self.last_ckpt = pos;
         }
+        self.checkpoint()
+    }
+
+    pub fn should_durable(&mut self, target: Position) -> bool {
+        target > self.durable_pos
     }
 
     #[cold]
@@ -166,9 +184,9 @@ impl Logging {
         w: &[u8],
         ov: &[u8],
         nv: &[u8],
-        size: usize,
     ) -> Result<(), OpCode> {
-        self.flush(false)?; // flush queued first, make sure log record is sequentail
+        let size = u.encoded_len() + k.len() + w.len() + ov.len() + nv.len();
+        self.sync(false)?; // flush queued first, make sure log record is sequentail
         {
             self.writer.queue(u.to_slice());
             self.writer.queue(k);
@@ -182,6 +200,9 @@ impl Logging {
         }
         self.advance(size)?;
         self.flushed_pos = self.log_pos;
+        if self.opt.sync_on_write {
+            self.durable_pos = self.flushed_pos;
+        }
         self.numerics.log_size.fetch_add(size, Relaxed);
         Ok(())
     }
@@ -236,10 +257,11 @@ impl Logging {
         let total_sz = payload_size + u.encoded_len();
         if total_sz < self.ring.len() {
             let a = self.alloc(total_sz)?;
+
             let mut b = LogBuilder::new(a);
             b.add(u).add(k.raw).add(w).add(ov).add(nv).build(self)?;
         } else {
-            self.record_large(&u, k.raw, w.to_slice(), ov, nv, total_sz)?;
+            self.record_large(&u, k.raw, w.to_slice(), ov, nv)?;
         }
         Ok(current_pos)
     }
@@ -283,58 +305,42 @@ impl Logging {
         self.add_entry(w)
     }
 
-    fn checkpoint(&mut self) -> Result<(), OpCode> {
+    fn checkpoint(&mut self) -> bool {
         if !self.enable_ckpt.load(Relaxed) {
-            return Ok(());
+            return false;
         }
-        let cur = self.numerics.signal.load(Relaxed);
-
-        if cur == self.last_signal {
-            return Ok(());
+        if self.log_pos <= self.last_ckpt_log_pos {
+            return false;
         }
-        let last_ckpt = self.last_ckpt;
-
-        log::trace!(
-            "group {} checkpoint {:?} curr {} last {}",
-            self.group,
-            last_ckpt,
-            cur,
-            self.last_signal
-        );
-        self.last_signal = cur;
 
         let mut ckpt = WalCheckpoint {
             wal_type: EntryType::CheckPoint,
+            checkpoint: self.last_ckpt,
             checksum: 0,
         };
         ckpt.checksum = ckpt.calc_checksum();
 
         // we must flush buffer in ring to make sure they are stabilized before flush checkpoint
-        self.flush(false)?;
-        self.writer.write(ckpt.to_slice());
-        if self.opt.sync_on_write {
-            self.writer.sync();
+        if let Err(e) = self.sync(false) {
+            log::warn!("checkpoint fail, {:?}", e);
+            return false;
         }
+        self.writer.write(ckpt.to_slice());
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_wal_after_checkpoint_write");
 
         self.log_pos.offset += ckpt.encoded_len() as u64;
+        self.last_ckpt_log_pos = self.log_pos;
         self.ckpt_cnt.fetch_add(1, Relaxed);
         self.flushed_pos = self.log_pos;
+        self.durable_pos = self.flushed_pos;
         self.numerics
             .log_size
             .fetch_add(ckpt.encoded_len(), Relaxed);
-        self.sync_desc()
+        true
     }
 
-    fn sync_desc(&self) -> Result<(), OpCode> {
-        let mut desc = self.desc.lock();
-        desc.update_ckpt(
-            self.opt.desc_file(self.group),
-            self.last_ckpt,
-            self.flushed_pos.file_id,
-        )
-    }
-
-    fn flush(&mut self, force: bool) -> Result<(), OpCode> {
+    pub fn sync(&mut self, force: bool) -> Result<(), OpCode> {
         let len = self.ring.distance();
         if len != 0 {
             self.writer.write(self.ring.slice(self.ring.head(), len));
@@ -345,17 +351,8 @@ impl Logging {
         }
         if force || self.opt.sync_on_write {
             self.writer.sync();
+            self.durable_pos = self.flushed_pos;
         }
-        Ok(())
-    }
-
-    pub fn stabilize(&mut self) -> Result<(), OpCode> {
-        self.flush(false)?;
-        self.checkpoint()
-    }
-
-    pub fn sync(&mut self) -> Result<(), OpCode> {
-        self.flush(true)?;
         Ok(())
     }
 }

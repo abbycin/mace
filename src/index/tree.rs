@@ -13,7 +13,6 @@ use crate::{
     Store,
     types::{
         data::{Index, IntlKey, Key, Ver},
-        node::MergeOp,
         refbox::BoxRef,
         traits::{ICodec, IKey, ITree, IVal},
     },
@@ -25,20 +24,6 @@ use std::cmp::Ordering::Equal;
 use std::ops::{Bound, Deref, RangeBounds};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Acquire;
-#[cfg(feature = "metric")]
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-
-#[cfg(feature = "metric")]
-macro_rules! inc_cas {
-    ($field: ident) => {
-        G_CAS.$field.fetch_add(1, Relaxed)
-    };
-}
-
-#[cfg(not(feature = "metric"))]
-macro_rules! inc_cas {
-    ($filed: ident) => {};
-}
 
 /// A reference to a value in the storage engine.
 #[derive(Clone)]
@@ -128,7 +113,7 @@ impl Tree {
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
         loop {
             if let Some(p) = self.bucket.load(pid)? {
-                let child_pid = p.header().merging_child;
+                let child_pid = p.runtime_merging_child();
                 if child_pid != NULL_PID {
                     self.merge_node(&p, child_pid, g)?;
                     continue;
@@ -140,85 +125,125 @@ impl Tree {
         }
     }
 
-    // 1. mark child node as `merging`
-    // 2. find it's left sibling, to merge child into it
-    // 3. replace old left sibling with merged node
-    // 4. remove index to child from it's parent
+    // merge flow:
+    // 1. mark child as runtime merging
+    // 2. find a live left sibling that still links to child
+    // 3. replace that sibling with merged content
+    // 4. remove child index from parent
     // 5. unmap child pid from page table
     fn merge_node(&self, parent_ptr: &Page, child_pid: u64, g: &Guard) -> Result<(), OpCode> {
-        // NOTE: a big lock is necessary because the merge process must be exclusive
+        struct MergeMarkGuard {
+            parent: Page,
+            child: Page,
+            child_pid: u64,
+            armed: bool,
+        }
+
+        impl MergeMarkGuard {
+            fn new(parent: Page, child: Page, child_pid: u64) -> Self {
+                Self {
+                    parent,
+                    child,
+                    child_pid,
+                    armed: true,
+                }
+            }
+
+            fn clear(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                self.child.clear_runtime_merging();
+                let _ = self.parent.clear_runtime_merging_child(self.child_pid);
+                self.armed = false;
+            }
+        }
+
+        impl Drop for MergeMarkGuard {
+            fn drop(&mut self) {
+                self.clear();
+            }
+        }
+
+        // parent lock serializes merge on this parent
         let Some(_lk) = parent_ptr.try_lock() else {
-            // return Ok let cooperative threads not retry
+            // return ok so cooperative callers avoid retry storms
             return Ok(());
         };
-        let safe_txid = self.txid();
+
+        if self.bucket.table.get(parent_ptr.pid()) != parent_ptr.swip() {
+            return Ok(());
+        }
+
         assert_ne!(child_pid, NULL_PID);
         // 1.
-        let child_ptr = if let Some(x) = self.set_node_merging(child_pid, g, safe_txid)? {
+        let child_ptr = if let Some(x) = self.set_node_merging(child_pid, g)? {
             x
         } else {
             return Ok(());
         };
+        let mut merge_mark = MergeMarkGuard::new(*parent_ptr, child_ptr, child_pid);
         assert!(parent_ptr.is_intl());
-        let child_index = parent_ptr
+        let Some(child_index) = parent_ptr
             .intl_iter()
             .position(|(_, idx)| idx.pid == child_pid)
-            .unwrap();
-        assert_ne!(child_index, 0, "we can't handle merge the leftmost node");
+        else {
+            return Ok(());
+        };
+        if child_index == 0 {
+            return Ok(());
+        }
 
         // 2.
         let mut merge_index = child_index - 1;
-        let mut cursor_pid = parent_ptr
-            .intl_iter()
-            .nth(merge_index)
-            .map(|(_, x)| x.pid)
-            .unwrap();
+        let Some(mut cursor_pid) = parent_ptr.intl_iter().nth(merge_index).map(|(_, x)| x.pid)
+        else {
+            return Ok(());
+        };
 
+        let safe_txid = self.txid();
         loop {
             let cursor_ptr = if let Some(x) = self.load_node(g, cursor_pid)? {
                 x
             } else {
-                // the pid has been merged
+                // the cursor pid may already be merged away
                 if merge_index == 0 {
                     return Ok(());
                 }
 
                 merge_index -= 1;
-                cursor_pid = parent_ptr
-                    .intl_iter()
-                    .nth(merge_index)
-                    .map(|(_, x)| x.pid)
-                    .unwrap();
+                let Some(pid) = parent_ptr.intl_iter().nth(merge_index).map(|(_, x)| x.pid) else {
+                    return Ok(());
+                };
+                cursor_pid = pid;
                 continue;
             };
 
             // 3.
             let next_pid = cursor_ptr.header().right_sibling;
             let mut txn = self.begin(g);
-            // further check if it's really the left sibling of child
+            // verify this candidate still points to child as its right sibling
             if next_pid == child_pid {
                 let (new_node, lj, rj) = cursor_ptr.merge_node(&mut txn, &child_ptr, safe_txid);
-                inc_cas!(merge);
                 if txn.replace(cursor_ptr, new_node, &lj).is_ok() {
                     child_ptr.garbage_collect(&mut txn, &rj);
                     txn.commit();
                     break;
                 }
-                inc_cas!(merge_fail);
-                // retry merge
+                // retry merge on replace race
                 continue;
             }
             let hi = cursor_ptr.hi();
             let lo = child_ptr.lo();
             if hi >= Some(lo) {
-                // another thread has installed the merged node after we get the cursor
+                // another thread installed merged content after we loaded cursor
                 break;
             } else {
-                // another thread has installed the splitted left sibling after we get the cursor
+                // another thread split cursor after we loaded it
                 if next_pid != NULL_PID {
                     cursor_pid = next_pid
                 } else {
-                    // another thread has finished `merge_node`, the child_pid has been unmapped
+                    // child may already be unmapped by another completed merge
                     break;
                 }
             }
@@ -231,6 +256,7 @@ impl Tree {
 
         // 5.
         debug_assert_eq!(child_ptr.box_header().pid, child_pid);
+        merge_mark.clear();
         let mut txn = self.begin(g);
         txn.unmap(child_ptr, &[])?; // child's junks were already collected
         txn.commit();
@@ -238,7 +264,7 @@ impl Tree {
         Ok(())
     }
 
-    // NOTE: it must be protected by lock
+    // caller must hold parent lock
     fn remove_node_index(
         &self,
         parent_ptr: &Page,
@@ -249,36 +275,35 @@ impl Tree {
         let mut parent = Cow::Borrowed(parent_ptr);
         loop {
             let mut txn = self.begin(g);
-            let (new_ptr, j) = parent_ptr.process_merge(&mut txn, MergeOp::Merged, safe_txid);
-            inc_cas!(remove_node);
-            if txn.replace(*parent, new_ptr, &j).is_ok() {
+            let (new_ptr, j) = {
+                let Some(x) = parent.remove_index(&mut txn, child_pid, safe_txid) else {
+                    return Ok(false);
+                };
+                x
+            };
+            if let Ok(new_parent) = txn.replace(*parent, new_ptr, &j) {
                 txn.commit();
+                let _ = parent_ptr.clear_runtime_merging_child(child_pid);
+                let _ = new_parent.clear_runtime_merging_child(child_pid);
                 return Ok(true);
             }
-            inc_cas!(remove_node_fail);
             let new_ptr = if let Some(x) = self.load_node(g, parent_ptr.box_header().pid)? {
                 x
             } else {
                 return Ok(false);
             };
-            if new_ptr.header().merging_child != child_pid {
+            if new_ptr.runtime_merging_child() != child_pid {
                 return Ok(false);
             }
             parent = Cow::Owned(new_ptr);
         }
     }
 
-    // 1. load child node and check if it's merging
-    // 2. return if it's merging
-    // 3. or else create a new node with merging set to true
-    // 4. replace old child node with the new node
-    // NOTE: it must be protected by lock
-    fn set_node_merging(
-        &self,
-        child_pid: u64,
-        g: &Guard,
-        safe_txid: u64,
-    ) -> Result<Option<Page>, OpCode> {
+    // 1. load child
+    // 2. return immediately if child is already marked merging
+    // 3. otherwise set runtime merging flag with cas and retry on race
+    // caller must hold parent lock so parent and child markers stay paired
+    fn set_node_merging(&self, child_pid: u64, g: &Guard) -> Result<Option<Page>, OpCode> {
         loop {
             let page = if let Some(x) = self.load_node(g, child_pid)? {
                 x
@@ -286,33 +311,23 @@ impl Tree {
                 return Ok(None);
             };
 
-            if page.header().merging {
+            if page.runtime_merging() {
                 return Ok(Some(page));
             }
-
-            let mut txn = self.begin(g);
-            let (new_node, j) = page.process_merge(&mut txn, MergeOp::MarkChild, safe_txid);
-            inc_cas!(mark_merge);
-            if let Ok(new_page) = txn.replace(page, new_node, &j) {
-                txn.commit();
-                return Ok(Some(new_page));
+            if page.try_mark_runtime_merging() {
+                return Ok(Some(page));
             }
-            inc_cas!(mark_merge_fail);
         }
     }
 
-    /// 1. split node into two parts
-    /// 2. map rhs to page table, link lhs's right_sibling to rhs
-    /// 3. replace node with left, so that other thread can notice splitting
-    /// 4. if node is not root (parent_opt is not None)
-    ///    - insert rhs to parent index, return new node
-    ///    - replace parent with new node
-    /// 5. or else
-    ///    - create a new copy of left page (which just replaced current node)
-    ///    - map left page to page table
-    ///    - create a new node with lhs and rhs in it's index
-    ///    - replace root with new node
-    ///
+    /// split flow:
+    /// 1. build lhs/rhs from `split_overlay`
+    ///    - no delta: split base directly
+    ///    - has delta: compact first then split
+    /// 2. map rhs and wire `lhs.right_sibling = rhs.pid`
+    /// 3. publish lhs at old pid so readers can follow sibling chain
+    /// 4. if parent exists, install rhs separator into parent
+    /// 5. if current node is root, build and publish a new root
     fn split_node(&self, node: Page, parent_opt: Option<Page>, g: &Guard) -> Result<(), OpCode> {
         let Some(node_lock) = node.try_lock() else {
             return Err(OpCode::Again);
@@ -320,7 +335,7 @@ impl Tree {
         let safe_txid = self.store.context.numerics.safe_tixd();
         let mut txn = self.begin(g);
         // 1.
-        let (mut lnode, rnode) = node.split(&mut txn);
+        let (mut lnode, rnode, split_junks) = node.split_overlay(&mut txn, safe_txid);
         let mut rpage = Page::new(rnode);
 
         // 2.
@@ -328,38 +343,31 @@ impl Tree {
         lnode.header_mut().right_sibling = rpid;
 
         // 3.
-        inc_cas!(split1);
-        let junks = &[]; // split is always happen after node was consolidated, it has no junks
-        let lpage = txn.replace(node, lnode, junks).inspect_err(|_| {
-            inc_cas!(split_fail1);
-        })?;
+        let lpage = txn.replace(node, lnode, &split_junks).inspect_err(|_| {})?;
         self.bucket.cache(rpage);
-        // drop lock early let cooperative threads have chance to make progress
+        // drop lock early so cooperative threads can make progress
         drop(node_lock);
-        // publish rpage to global
+        // publish rpage to page table
         txn.commit();
 
         let lo = rpage.lo();
         if let Some(parent) = parent_opt {
-            // multiple threads (cooperative) may concurrently update parent
+            // cooperative threads may race to install the same separator
             let _lk = parent.lock();
             if self.bucket.table.get(parent.pid()) != parent.swip() {
-                // other thread has finished same job
+                // another thread already finished this parent update
                 return Ok(());
             }
             // 4.
             let Some((new_node, j)) = parent.insert_index(&mut txn, lo, rpid, safe_txid) else {
-                // may conflict with other thread
+                // parent update raced with other structural change
                 return Ok(());
             };
-            inc_cas!(split2);
-            txn.replace(parent, new_node, &j).inspect_err(|_| {
-                inc_cas!(split_fail2);
-            })?;
-            // publish new parent to global
+            txn.replace(parent, new_node, &j).inspect_err(|_| {})?;
+            // publish new parent to page table
             txn.commit();
         } else {
-            // 4.
+            // 5.
             self.split_root(g, lpage, rpid, lo, safe_txid)?;
         }
 
@@ -380,7 +388,7 @@ impl Tree {
         };
         let mut txn = self.begin(g);
 
-        // compact is required, since other thread may already insert new data after step 3
+        // compact root before building new root because step-3 publication can race with new writes
         let (mut lnode, j) = root.compact(&mut txn, safe_txid);
         lnode.header_mut().right_sibling = rpid;
         let mut lpage = Page::new(lnode);
@@ -395,11 +403,7 @@ impl Tree {
                 (IntlKey::new(lo), Index::new(rpid)),
             ],
         );
-
-        inc_cas!(split_root);
-        let n = txn.replace(root, new_root_node, &j).inspect_err(|_| {
-            inc_cas!(split_root_fail);
-        })?;
+        let n = txn.replace(root, new_root_node, &j).inspect_err(|_| {})?;
         assert_eq!(n.box_header().pid, self.root_index.pid);
         // publish new root to global
         txn.commit();
@@ -430,11 +434,11 @@ impl Tree {
                 return Err(OpCode::Again);
             };
 
-            if node_ptr.header().merging {
+            if node_ptr.is_smo_busy() {
                 return Err(OpCode::Again);
             }
 
-            // the node it self may be obsoleted by smo, we must make sure key is in [lo, hi)
+            // node may already be replaced by smo, ensure key is still in [lo, hi)
             let lo = node_ptr.lo();
             if key < lo {
                 return Err(OpCode::Again);
@@ -445,8 +449,7 @@ impl Tree {
                 return Err(OpCode::Again);
             }
 
-            // another thread replace the old node which the cursor pointed to with a new node just
-            // splitted
+            // another thread may already split this node, detect by key >= hi and follow sibling
             let hi = node_ptr.hi();
             let is_splitting = if let Some(hi) = hi { key >= hi } else { false };
 
@@ -458,9 +461,9 @@ impl Tree {
                 if unsplit_parent_opt.is_none() && parent_opt.is_some() {
                     unsplit_parent_opt = parent_opt;
                 } else if parent_opt.is_none() && lo.is_empty() {
-                    // the paritially-split root, node_ptr itself is root and it's already broken
-                    // into two parts and the lhs part is current node_ptr but not install the new
-                    // root yet, here we complete the new root install phase
+                    // root may be in partial split state:
+                    // current page is lhs and rhs is already mapped but new root is not installed yet
+                    // complete root installation cooperatively
                     assert_eq!(cursor, self.root_index.pid);
                     let safe_txid = self.store.context.numerics.safe_tixd();
                     let _ = self.split_root(g, node_ptr, rpid, hi.unwrap(), safe_txid);
@@ -471,12 +474,12 @@ impl Tree {
                 continue;
             }
 
-            // cooperative the split
+            // complete pending parent separator installation cooperatively
             if let Some(unsplit) = unsplit_parent_opt.take() {
                 let mut txn = self.begin(g);
                 let _lk = unsplit.lock();
                 if self.bucket.table.get(unsplit.pid()) != unsplit.swip() {
-                    // other thread has finished same job
+                    // another thread already finished this parent update
                     return Err(OpCode::Again);
                 }
 
@@ -485,11 +488,7 @@ impl Tree {
                 else {
                     return Err(OpCode::Again);
                 };
-
-                inc_cas!(coop);
-                txn.replace(unsplit, split_node, &j).inspect_err(|_| {
-                    inc_cas!(coop_fail);
-                })?;
+                txn.replace(unsplit, split_node, &j).inspect_err(|_| {})?;
                 txn.commit();
             }
 
@@ -502,6 +501,7 @@ impl Tree {
             }
 
             if node_ptr.is_intl() {
+                assert_eq!(node_ptr.delta_len(), 0);
                 let (is_leftmost, pid) = node_ptr.child_index(key);
                 leftmost = is_leftmost;
                 parent_opt = Some(node_ptr);
@@ -526,11 +526,8 @@ impl Tree {
         // consolidation never retry
         let mut txn = self.begin(g);
         let (new_node, j) = page.compact(&mut txn, self.txid());
-        inc_cas!(compact);
         if txn.replace(page, new_node, &j).is_ok() {
             txn.commit();
-        } else {
-            inc_cas!(compact_fail);
         }
     }
 
@@ -540,6 +537,10 @@ impl Tree {
         } else {
             return Ok(false);
         };
+
+        if page.is_smo_busy() {
+            return Ok(false);
+        }
 
         let safe_txid = self.store.context.safe_txid();
         let delta_len = page.delta_len();
@@ -562,20 +563,16 @@ impl Tree {
         let Some(lk) = parent.try_lock() else {
             return Err(OpCode::Again);
         };
-        assert_eq!(parent.header().merging_child, NULL_PID);
-        let mut txn = self.begin(g);
+        if parent.runtime_merging_child() != NULL_PID {
+            return Err(OpCode::Again);
+        }
         let pid = cur.pid();
 
-        if parent.can_merge_child(pid) {
-            let (new_parent, j) =
-                parent.process_merge(&mut txn, MergeOp::MarkParent(pid), self.txid());
-            inc_cas!(try_merge);
-            let new_page = txn.replace(parent, new_parent, &j).inspect_err(|_| {
-                inc_cas!(try_merge_fail);
-            })?;
-            txn.commit();
+        if parent.can_merge_child_runtime(cur.lo(), pid)
+            && parent.try_mark_runtime_merging_child(pid)
+        {
             drop(lk);
-            self.merge_node(&new_page, pid, g)?;
+            self.merge_node(&parent, pid, g)?;
         }
         Ok(())
     }
@@ -587,9 +584,7 @@ impl Tree {
         F: FnMut(Page, &K) -> Result<(u8, Position), OpCode>,
     {
         loop {
-            inc_cas!(link);
             let Some(node) = page.try_lock() else {
-                inc_cas!(link_fail);
                 continue;
             };
             // consolidate happened, we must retry from root
@@ -602,7 +597,7 @@ impl Tree {
             let (k, v) = DeltaView::from_key_val(&mut txn, k, v);
 
             node.insert(k, v);
-
+            drop(node);
             txn.record_and_commit(group_id as usize, pos);
             return Ok(());
         }
@@ -727,6 +722,7 @@ impl Tree {
             hi,
             iter: None,
             cache: None,
+            iter_bound: None,
             checker: Box::new(visible),
             filter: Filter {
                 last: Vec::new(),
@@ -841,7 +837,8 @@ pub struct Iter<'a> {
     lo: Bound<Vec<u8>>,
     hi: Bound<Vec<u8>>,
     iter: Option<RawLeafIter<'a, Loader>>,
-    cache: Option<Node>,
+    cache: Option<Box<Node>>,
+    iter_bound: Option<Box<Bound<Vec<u8>>>>,
     checker: Box<dyn FnMut(&Context, u64, u8) -> bool + 'a>,
     filter: Filter,
 }
@@ -875,12 +872,28 @@ impl Iter<'_> {
             if self.iter.is_none() {
                 let g = crossbeam_epoch::pin();
                 let node = self.tree.find_leaf(&g, self.low_key()).expect("must exist");
+                let next_node = node.ref_node();
+                let next_bound = self.lo.clone();
+
+                if let Some(cache) = self.cache.as_mut() {
+                    **cache = next_node;
+                } else {
+                    self.cache = Some(Box::new(next_node));
+                }
+
+                if let Some(bound) = self.iter_bound.as_mut() {
+                    **bound = next_bound;
+                } else {
+                    self.iter_bound = Some(Box::new(next_bound));
+                }
+
+                let cache = self.cache.as_ref().expect("must valid");
+                let bound = self.iter_bound.as_ref().expect("must valid");
                 self.iter = Some(unsafe {
                     std::mem::transmute::<RawLeafIter<'_, Loader>, RawLeafIter<'_, Loader>>(
-                        node.successor(&self.lo, self.cached_key),
+                        cache.successor(bound.as_ref(), self.cached_key),
                     )
                 });
-                self.cache = Some(node.ref_node());
             }
 
             let iter = self.iter.as_mut().expect("must valid");
@@ -963,63 +976,13 @@ impl Filter {
     }
 }
 
-#[cfg(feature = "metric")]
-#[derive(Debug)]
-pub struct CASstatus {
-    merge: AtomicUsize,
-    merge_fail: AtomicUsize,
-    remove_node: AtomicUsize,
-    remove_node_fail: AtomicUsize,
-    mark_merge: AtomicUsize,
-    mark_merge_fail: AtomicUsize,
-    split1: AtomicUsize,
-    split_fail1: AtomicUsize,
-    split2: AtomicUsize,
-    split_fail2: AtomicUsize,
-    split_root: AtomicUsize,
-    split_root_fail: AtomicUsize,
-    coop: AtomicUsize,
-    coop_fail: AtomicUsize,
-    try_merge: AtomicUsize,
-    try_merge_fail: AtomicUsize,
-    link: AtomicUsize,
-    link_fail: AtomicUsize,
-    compact: AtomicUsize,
-    compact_fail: AtomicUsize,
-}
-
-#[cfg(feature = "metric")]
-static G_CAS: CASstatus = CASstatus {
-    merge: AtomicUsize::new(0),
-    merge_fail: AtomicUsize::new(0),
-    remove_node: AtomicUsize::new(0),
-    remove_node_fail: AtomicUsize::new(0),
-    mark_merge: AtomicUsize::new(0),
-    mark_merge_fail: AtomicUsize::new(0),
-    split1: AtomicUsize::new(0),
-    split_fail1: AtomicUsize::new(0),
-    split2: AtomicUsize::new(0),
-    split_fail2: AtomicUsize::new(0),
-    split_root: AtomicUsize::new(0),
-    split_root_fail: AtomicUsize::new(0),
-    coop: AtomicUsize::new(0),
-    coop_fail: AtomicUsize::new(0),
-    try_merge: AtomicUsize::new(0),
-    try_merge_fail: AtomicUsize::new(0),
-    link: AtomicUsize::new(0),
-    link_fail: AtomicUsize::new(0),
-    compact: AtomicUsize::new(0),
-    compact_fail: AtomicUsize::new(0),
-};
-
-#[cfg(feature = "metric")]
-pub fn g_cas_status() -> &'static CASstatus {
-    &G_CAS
-}
-
 #[cfg(test)]
 mod test {
     use crate::{Mace, Options, RandomPath};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    };
     use std::thread;
 
     #[test]
@@ -1058,5 +1021,132 @@ mod test {
                 }
             });
         });
+    }
+
+    #[test]
+    fn concurrent_page_hit_runtime_smo() {
+        let path = RandomPath::tmp();
+        let mut opt = Options::new(&*path);
+        opt.split_elems = 128;
+        opt.consolidate_threshold = 32;
+        opt.tmp_store = true;
+        let mace = Mace::new(opt.validate().unwrap()).unwrap();
+        let db = mace.new_bucket("default").unwrap();
+
+        let num_readers = 4;
+        let num_iterations = 1500;
+
+        thread::scope(|s| {
+            for _ in 0..num_readers {
+                let db = db.clone();
+                s.spawn(move || {
+                    for _ in 0..num_iterations {
+                        let view = db.view().unwrap();
+                        let mut count = 0;
+                        for _ in view.seek("key") {
+                            count += 1;
+                        }
+                        assert!(count >= 0);
+                    }
+                });
+            }
+
+            s.spawn(|| {
+                for i in 0..num_iterations {
+                    let kv = db.begin().unwrap();
+                    let key = format!("key_{:05}", i);
+                    kv.put(&key, &key).unwrap();
+                    if i > 256 {
+                        let old = format!("key_{:05}", i - 256);
+                        let _ = kv.del(&old);
+                    }
+                    kv.commit().unwrap();
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn runtime_smo_merge_retry_idempotence_stress() {
+        let path = RandomPath::tmp();
+        let mut opt = Options::new(&*path);
+        opt.split_elems = 64;
+        opt.consolidate_threshold = 16;
+        opt.tmp_store = true;
+        let mace = Mace::new(opt.validate().unwrap()).unwrap();
+        let db = mace.new_bucket("default").unwrap();
+        let init_keys = 1024;
+
+        for i in 0..init_keys {
+            let kv = db.begin().unwrap();
+            let key = format!("k_{:04}", i);
+            kv.put(&key, &key).unwrap();
+            kv.commit().unwrap();
+        }
+
+        let write_threads = 4;
+        let read_threads = 2;
+        let write_iterations = 1500;
+        let read_iterations = 1200;
+        let success = Arc::new(AtomicUsize::new(0));
+
+        thread::scope(|s| {
+            for tid in 0..write_threads {
+                let db = db.clone();
+                let success = success.clone();
+                s.spawn(move || {
+                    for i in 0..write_iterations {
+                        let idx = (i * 37 + tid * 17) % init_keys;
+                        let key = format!("k_{:04}", idx);
+                        let do_del = (i + tid) % 3 == 0;
+
+                        for _ in 0..16 {
+                            let kv = db.begin().unwrap();
+                            let res = if do_del {
+                                kv.del(&key).map(|_| ())
+                            } else {
+                                kv.put(&key, &key)
+                            };
+
+                            match res {
+                                Ok(_) => match kv.commit() {
+                                    Ok(_) => {
+                                        success.fetch_add(1, Relaxed);
+                                        break;
+                                    }
+                                    Err(crate::OpCode::AbortTx | crate::OpCode::Again) => continue,
+                                    Err(e) => panic!("commit fail: {e:?}"),
+                                },
+                                Err(crate::OpCode::NotFound) if do_del => {
+                                    success.fetch_add(1, Relaxed);
+                                    break;
+                                }
+                                Err(crate::OpCode::AbortTx | crate::OpCode::Again) => continue,
+                                Err(e) => panic!("modify fail: {e:?}"),
+                            }
+                        }
+                    }
+                });
+            }
+
+            for _ in 0..read_threads {
+                let db = db.clone();
+                s.spawn(move || {
+                    for _ in 0..read_iterations {
+                        let view = db.view().unwrap();
+                        let mut seen = 0usize;
+                        for _ in view.seek("k_") {
+                            seen += 1;
+                            if seen > init_keys {
+                                break;
+                            }
+                        }
+                        assert!(seen <= init_keys);
+                    }
+                });
+            }
+        });
+
+        assert!(success.load(Relaxed) > write_threads * write_iterations / 8);
     }
 }

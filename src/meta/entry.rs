@@ -429,8 +429,6 @@ impl IMetaCodec for PageTable {
 #[derive(Debug)]
 #[repr(C)]
 pub struct Numerics {
-    /// notify log data has been flushed
-    pub signal: AtomicU64,
     pub next_data_id: AtomicU64,
     pub next_blob_id: AtomicU64,
     pub next_manifest_id: AtomicU64,
@@ -450,7 +448,6 @@ impl Numerics {
 impl Default for Numerics {
     fn default() -> Self {
         Self {
-            signal: AtomicU64::new(INIT_ID),
             next_data_id: AtomicU64::new(INIT_ID),
             next_blob_id: AtomicU64::new(INIT_ID),
             next_manifest_id: AtomicU64::new(INIT_ID),

@@ -14,6 +14,8 @@ pub(crate) mod bitmap;
 pub(crate) mod block;
 pub(crate) mod countblock;
 pub(crate) mod data;
+#[cfg(feature = "failpoints")]
+pub(crate) mod failpoint;
 pub(crate) mod imtree;
 pub(crate) mod interval;
 pub(crate) mod lru;
@@ -61,6 +63,22 @@ impl std::error::Error for OpCode {}
 impl From<std::io::Error> for OpCode {
     fn from(_: std::io::Error) -> Self {
         OpCode::IoError
+    }
+}
+
+impl From<btree_store::Error> for OpCode {
+    fn from(err: btree_store::Error) -> Self {
+        match err {
+            btree_store::Error::NotFound => OpCode::NotFound,
+            btree_store::Error::Corruption => OpCode::Corruption,
+            btree_store::Error::TooLarge => OpCode::TooLarge,
+            btree_store::Error::Internal => OpCode::Invalid,
+            btree_store::Error::NoSpace => OpCode::NoSpace,
+            btree_store::Error::IoError => OpCode::IoError,
+            btree_store::Error::Invalid => OpCode::Invalid,
+            btree_store::Error::Duplicate => OpCode::Exist,
+            btree_store::Error::Conflict => OpCode::Again,
+        }
     }
 }
 
@@ -254,6 +272,11 @@ impl<T> MutRef<T> {
 
     pub fn is_null(&self) -> bool {
         self.inner.is_null()
+    }
+
+    pub fn reset(&mut self, x: T) {
+        let mut new_ref = MutRef::new(x);
+        std::mem::swap(self, &mut new_ref);
     }
 
     fn inc(&self) {

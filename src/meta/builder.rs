@@ -4,14 +4,14 @@ use std::sync::atomic::Ordering::Relaxed;
 use crate::map::SharedState;
 use crate::meta::entry::BlobStat;
 use crate::meta::{
-    BUCKET_VERSION, CURRENT_VERSION, DataStat, Delete, IMetaCodec, MemBlobStat, MemDataStat,
-    NUMERICS_KEY, ORPHAN_BLOB, ORPHAN_DATA, VERSION_KEY, entry::BucketMeta,
+    BUCKET_VERSION, CURRENT_VERSION, DataStat, IMetaCodec, MemBlobStat, MemDataStat, NUMERICS_KEY,
+    ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, VERSION_KEY, entry::BucketMeta,
 };
 use crate::{
     OpCode,
     meta::{
         BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_METAS, BUCKET_NUMERICS, BUCKET_OBSOLETE_BLOB,
-        BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, Manifest, MetaOp, entry::Numerics,
+        BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, Manifest, entry::Numerics,
     },
     utils::options::ParsedOptions,
 };
@@ -82,7 +82,6 @@ impl ManifestBuilder {
             set!(
                 numerics_ref,
                 src;
-                signal,
                 next_data_id,
                 next_blob_id,
                 next_manifest_id,
@@ -247,78 +246,66 @@ impl ManifestBuilder {
     }
 
     fn clean_orphans(&mut self) {
-        let mut pending_data = Vec::new();
-        let mut pending_blob = Vec::new();
+        let mut data_markers = Vec::new();
+        let mut blob_markers = Vec::new();
 
         let _ = self.inner.btree.view(BUCKET_NUMERICS, |txn| {
-            if let Ok(val) = txn.get(ORPHAN_DATA) {
-                pending_data = Delete::decode(&val).id;
-            }
-            if let Ok(val) = txn.get(ORPHAN_BLOB) {
-                pending_blob = Delete::decode(&val).id;
+            // file ids can be sparse because some ids are reserved before any file is flushed
+            // rely on explicit per-file markers instead of max_id tail probing or directory scan
+            let mut iter = txn.iter();
+            let mut k = Vec::new();
+            let mut v = Vec::new();
+            while iter.next_ref(&mut k, &mut v) {
+                if let Some(id) = Self::parse_orphan_marker_id(&k, ORPHAN_DATA_MARKER_PREFIX) {
+                    data_markers.push((id, k.clone()));
+                } else if let Some(id) = Self::parse_orphan_marker_id(&k, ORPHAN_BLOB_MARKER_PREFIX)
+                {
+                    blob_markers.push((id, k.clone()));
+                }
             }
             Ok(())
         });
 
-        if pending_data.is_empty() && pending_blob.is_empty() {
-            let mut id = self.max_data_id + 1;
-            while self.inner.opt.data_file(id).exists() {
-                pending_data.push(id);
-                id += 1;
+        let mut cleaned_data_marker_keys = Vec::new();
+        for (id, key) in data_markers {
+            let path = self.inner.opt.data_file(id);
+            if !path.exists() || std::fs::remove_file(&path).is_ok() {
+                cleaned_data_marker_keys.push(key);
             }
-
-            let mut id = self.max_blob_id + 1;
-            while self.inner.opt.blob_file(id).exists() {
-                pending_blob.push(id);
-                id += 1;
-            }
-
-            if pending_data.is_empty() && pending_blob.is_empty() {
-                return;
-            }
-
-            let mut txn = self.inner.begin();
-            if !pending_data.is_empty() {
-                let d = Delete {
-                    id: pending_data.clone(),
-                };
-                let mut buf = vec![0u8; d.packed_size()];
-                d.encode(&mut buf);
-                txn.ops_mut()
-                    .entry(BUCKET_NUMERICS.to_string())
-                    .or_default()
-                    .push(MetaOp::Put(ORPHAN_DATA.as_bytes().to_vec(), buf));
-            }
-            if !pending_blob.is_empty() {
-                let d = Delete {
-                    id: pending_blob.clone(),
-                };
-                let mut buf = vec![0u8; d.packed_size()];
-                d.encode(&mut buf);
-                txn.ops_mut()
-                    .entry(BUCKET_NUMERICS.to_string())
-                    .or_default()
-                    .push(MetaOp::Put(ORPHAN_BLOB.as_bytes().to_vec(), buf));
-            }
-            txn.commit();
         }
 
-        for &id in &pending_data {
-            let _ = std::fs::remove_file(self.inner.opt.data_file(id));
-        }
-        for &id in &pending_blob {
-            let _ = std::fs::remove_file(self.inner.opt.blob_file(id));
+        let mut cleaned_blob_marker_keys = Vec::new();
+        for (id, key) in blob_markers {
+            let path = self.inner.opt.blob_file(id);
+            if !path.exists() || std::fs::remove_file(&path).is_ok() {
+                cleaned_blob_marker_keys.push(key);
+            }
         }
 
-        let mut txn = self.inner.begin();
-        txn.ops_mut()
-            .entry(BUCKET_NUMERICS.to_string())
-            .or_default()
-            .push(MetaOp::Del(ORPHAN_DATA.as_bytes().to_vec()));
-        txn.ops_mut()
-            .entry(BUCKET_NUMERICS.to_string())
-            .or_default()
-            .push(MetaOp::Del(ORPHAN_BLOB.as_bytes().to_vec()));
-        txn.commit();
+        if cleaned_data_marker_keys.is_empty() && cleaned_blob_marker_keys.is_empty() {
+            return;
+        }
+
+        self.inner
+            .btree
+            .exec(BUCKET_NUMERICS, |txn| {
+                for key in &cleaned_data_marker_keys {
+                    let _ = txn.del(key);
+                }
+                for key in &cleaned_blob_marker_keys {
+                    let _ = txn.del(key);
+                }
+                Ok(())
+            })
+            .expect("orphan marker update failed");
+    }
+
+    fn parse_orphan_marker_id(raw: &[u8], prefix: &str) -> Option<u64> {
+        let prefix = prefix.as_bytes();
+        if !raw.starts_with(prefix) {
+            return None;
+        }
+        let raw_id = std::str::from_utf8(&raw[prefix.len()..]).ok()?;
+        raw_id.parse::<u64>().ok()
     }
 }

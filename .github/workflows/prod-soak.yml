@@ -1,0 +1,46 @@
+name: Prod Soak
+
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  prod-soak-nightly:
+    name: Prod Soak Nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run soak loop
+        env:
+          FEATURES: failpoints
+          CHAOS_RETRY: "1"
+          SOAK_DURATION_SECS: "7200"
+          SOAK_THREADS: "8"
+          SOAK_STRESS_TIMEOUT: "900"
+          SOAK_CHAOS_TIMEOUT: "600"
+          SOAK_FAST_TIMEOUT: "300"
+          SOAK_CHAOS_EVERY: "2"
+          SOAK_PERF_EVERY: "1"
+          MACE_PERF_THRESHOLD_FILE: scripts/perf_thresholds.env
+        run: bash ./scripts/prod_soak.sh
+
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-soak-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/prod_soak
+            target/perf_gate

@@ -40,6 +40,63 @@ jobs:
       - name: Run Tests
         run: cargo test --verbose -- --nocapture
 
+  test-prod-all:
+    name: Prod Test Flow (all) (${{ matrix.os }} ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify runner arch is x86_64
+        run: |
+          test "$(uname -m)" = "x86_64"
+
+      - name: Run prod all suite
+        env:
+          FEATURES: failpoints
+          FAST_TIMEOUT: "300"
+          STRESS_TIMEOUT: "600"
+          CHAOS_TIMEOUT: "300"
+          CHAOS_RETRY: "1"
+          MACE_PROD_BUCKET_STRESS_ROUNDS: "512"
+          MACE_PROD_BUCKET_CHURN_ROUNDS: "128"
+          MACE_PROD_BUCKET_CHURN_WORKERS: "2"
+          MACE_PROD_EVICTOR_STRESS_ROUNDS: "512"
+        run: bash ./scripts/prod_test.sh all 8
+
+  perf-regression:
+    name: Perf Regression Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run perf compare gate
+        env:
+          MACE_PERF_THRESHOLD_FILE: scripts/perf_thresholds.env
+          MACE_PERF_BASE_REF: origin/master
+        run: bash ./scripts/perf_gate.sh compare
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-regression-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/perf_gate
+
   # Job 2: FreeBSD (Runs in a VM on top of Linux)
   test-freebsd:
     name: FreeBSD (x86_64)

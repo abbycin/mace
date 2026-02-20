@@ -2,7 +2,13 @@ use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::{
     cmp::Ordering::{self, Equal, Greater, Less},
     ops::{Bound, Deref, DerefMut},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{
+            AtomicU8, AtomicU64,
+            Ordering::{AcqRel, Acquire, Relaxed},
+        },
+    },
 };
 
 use crate::{
@@ -28,10 +34,28 @@ pub(crate) struct NodeState {
     delta: ImTree<DeltaView>,
 }
 
+pub(crate) struct NodeSmoState {
+    merge_state: AtomicU8,
+    merging_child: AtomicU64,
+}
+
+impl NodeSmoState {
+    const MERGE_IDLE: u8 = 0;
+    const MERGE_ACTIVE: u8 = 1;
+
+    fn new() -> Self {
+        Self {
+            merge_state: AtomicU8::new(Self::MERGE_IDLE),
+            merging_child: AtomicU64::new(NULL_PID),
+        }
+    }
+}
+
 pub(crate) struct Node<L: ILoader> {
     /// the loader is remote/sibling loader, not node loader
     pub(crate) loader: L,
     mtx: Arc<Mutex<()>>,
+    smo: Arc<NodeSmoState>,
     pub(crate) state: RwLock<NodeState>,
     inner: BaseView,
 }
@@ -56,12 +80,6 @@ fn null_cmp(_x: &DeltaView, _y: &DeltaView) -> Ordering {
 
 pub type Junks = Vec<u64>;
 
-pub(crate) enum MergeOp {
-    Merged,
-    MarkChild,
-    MarkParent(u64),
-}
-
 impl<L: ILoader> Drop for Node<L> {
     fn drop(&mut self) {}
 }
@@ -82,6 +100,7 @@ where
         Self {
             loader,
             mtx,
+            smo: Arc::new(NodeSmoState::new()),
             state: RwLock::new(NodeState {
                 addr,
                 total_size,
@@ -109,6 +128,7 @@ where
         Self {
             loader: self.loader.shallow_copy(),
             mtx: self.mtx.clone(),
+            smo: self.smo.clone(),
             state: RwLock::new(NodeState {
                 addr: state.addr,
                 total_size: state.total_size,
@@ -177,6 +197,7 @@ where
         let mut l = Self {
             loader,
             mtx: Arc::new(Mutex::new(())),
+            smo: Arc::new(NodeSmoState::new()),
             state: RwLock::new(NodeState {
                 addr: d.addr,
                 total_size: d.total_size as usize,
@@ -201,26 +222,97 @@ where
     pub(crate) fn should_split(&self, split_elem: u16) -> bool {
         let h = self.header();
         let size_limited = h.elems >= split_elem;
-        let no_conflict = !h.merging && h.merging_child == NULL_PID && h.elems >= 2;
+        let no_conflict = !self.is_smo_busy() && h.elems >= 2;
 
         size_limited && no_conflict
     }
 
     pub(crate) fn should_merge(&self) -> bool {
         let h = self.header();
-        // current elems is less or equal than original elems
+        // `split_elems` is the post-split size snapshot, <= 25% means merge candidate
         let size_limited = h.split_elems >= h.elems * 4;
-        let no_conflict = !h.merging && h.merging_child == NULL_PID;
-        size_limited && no_conflict
+        size_limited && !self.is_smo_busy()
     }
 
-    pub(crate) fn can_merge_child(&self, child_pid: u64) -> bool {
+    pub(crate) fn can_merge_child_runtime(&self, child_lo: &[u8], child_pid: u64) -> bool {
         debug_assert_eq!(self.box_header().node_type, NodeType::Intl);
+        if self.runtime_merging_child() != NULL_PID || self.runtime_merging() {
+            return false;
+        }
+        if self.delta_len() > 0 {
+            // runtime merge precheck relies on compacted parent routing
+            return false;
+        }
         let h = self.header();
-        // TODO: inefficient
-        h.merging_child == NULL_PID
-            && !h.merging
-            && self.intl_iter().any(|(_, idx)| idx.pid == child_pid)
+        if h.elems == 0 || child_lo < self.lo() {
+            return false;
+        }
+        if let Some(hi) = self.hi()
+            && child_lo >= hi
+        {
+            return false;
+        }
+
+        let (_, pid) = self.child_index(child_lo);
+        pid == child_pid
+    }
+
+    pub(crate) fn runtime_merging(&self) -> bool {
+        self.smo.merge_state.load(Acquire) == NodeSmoState::MERGE_ACTIVE
+    }
+
+    pub(crate) fn runtime_merging_child(&self) -> u64 {
+        self.smo.merging_child.load(Acquire)
+    }
+
+    pub(crate) fn try_mark_runtime_merging(&self) -> bool {
+        let cur = self.smo.merge_state.load(Acquire);
+        if cur == NodeSmoState::MERGE_ACTIVE {
+            return true;
+        }
+        if cur != NodeSmoState::MERGE_IDLE {
+            return false;
+        }
+        self.smo
+            .merge_state
+            .compare_exchange(
+                NodeSmoState::MERGE_IDLE,
+                NodeSmoState::MERGE_ACTIVE,
+                AcqRel,
+                Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn clear_runtime_merging(&self) {
+        self.smo
+            .merge_state
+            .store(NodeSmoState::MERGE_IDLE, Relaxed);
+    }
+
+    pub(crate) fn try_mark_runtime_merging_child(&self, pid: u64) -> bool {
+        let cur = self.smo.merging_child.load(Acquire);
+        if cur == pid {
+            return true;
+        }
+        if cur != NULL_PID {
+            return false;
+        }
+        self.smo
+            .merging_child
+            .compare_exchange(NULL_PID, pid, AcqRel, Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn clear_runtime_merging_child(&self, pid: u64) -> bool {
+        self.smo
+            .merging_child
+            .compare_exchange(pid, NULL_PID, AcqRel, Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn is_smo_busy(&self) -> bool {
+        self.runtime_merging() || self.runtime_merging_child() != NULL_PID
     }
 
     pub(crate) fn merge_node<A: IAlloc>(
@@ -309,8 +401,8 @@ where
         (sep, new_prefix_len)
     }
 
-    /// NOTE: no need to compact, since we check `should_split` is not use the delta size, i.e, when
-    /// `should_split`, the node must have been compacted, and any insert to node will check first
+    /// split base entries only
+    /// callers should use `split_overlay` when delta may be present
     pub(crate) fn split<A: IAlloc>(&self, a: &mut A) -> (Node<L>, Node<L>) {
         let h = self.inner.header();
         let prefix_len = h.prefix_len as usize;
@@ -318,7 +410,7 @@ where
         let sep = elems / 2;
         let lo = self.lo();
         let hi = self.hi();
-        // both lhs and rhs node are set to current's sibling, update lhs' after rhs being mapped
+        // both lhs and rhs keep current sibling, caller rewires lhs after rhs is mapped
         let sibling = self.header().right_sibling;
         let txid = self.box_header().txid;
 
@@ -326,7 +418,7 @@ where
             let (sep_key, (llen, rlen)) = self.decode_pefix::<IntlKey>(sep, prefix_len, lo, &hi);
             let lhs_prefix = &lo[..llen];
             let rhs_prefix = &sep_key[..rlen];
-            // NOTE: the prefix will never shrink in split
+            // prefix never shrinks in split
             let (ld, rd) = (lhs_prefix.len() - prefix_len, rhs_prefix.len() - prefix_len);
             (
                 BaseView::new_intl(
@@ -357,7 +449,7 @@ where
         } else {
             let (sep_key, (llen, rlen)) = self.decode_pefix::<Key>(sep, prefix_len, lo, &hi);
             let lhs_prefix = &lo[..llen];
-            // NOTE: the prefix will never shrink in split
+            // prefix never shrinks in split
             let (ld, rd) = (lhs_prefix.len() - prefix_len, rlen - prefix_len);
             let mut liter = self
                 .inner
@@ -396,6 +488,22 @@ where
         lhs.header_mut().split_elems = sep as u16;
         rhs.header_mut().split_elems = (elems - sep) as u16;
         (lhs, rhs)
+    }
+
+    pub(crate) fn split_overlay<A: IAlloc>(
+        &self,
+        a: &mut A,
+        safe_txid: u64,
+    ) -> (Node<L>, Node<L>, Junks) {
+        // fast path: split base directly when there is no overlay delta
+        if self.delta_len() == 0 {
+            let (lhs, rhs) = self.split(a);
+            return (lhs, rhs, Junks::new());
+        }
+        // slow path: compact overlay into base first so split sees a stable ordered view
+        let (node, junks) = self.compact(a, safe_txid);
+        let (lhs, rhs) = node.split(a);
+        (lhs, rhs, junks)
     }
 
     #[allow(clippy::iter_skip_zero)]
@@ -438,12 +546,14 @@ where
 
     pub(crate) fn compact<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> (Node<L>, Junks) {
         let (b, j) = self.merge_to_base(a, safe_txid);
-        let old_h = self.header();
-        let mut base = b.view().as_base();
-        let new_h = base.header_mut();
-        new_h.merging = old_h.merging;
-        new_h.merging_child = old_h.merging_child;
-        (Self::new(self.loader.deep_copy(), b), j)
+        let node = Self::new(self.loader.deep_copy(), b);
+        node.smo
+            .merge_state
+            .store(self.smo.merge_state.load(Acquire), Relaxed);
+        node.smo
+            .merging_child
+            .store(self.smo.merging_child.load(Acquire), Relaxed);
+        (node, j)
     }
 
     fn merge_to_base<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> (BoxRef, Junks) {
@@ -471,44 +581,22 @@ where
         }
     }
 
-    pub(crate) fn process_merge<A: IAlloc>(
+    pub(crate) fn remove_index<A: IAlloc>(
         &self,
         a: &mut A,
-        op: MergeOp,
+        child_pid: u64,
         safe_txid: u64,
-    ) -> (Node<L>, Junks) {
-        match op {
-            MergeOp::Merged => {
-                assert_eq!(self.box_header().node_type, NodeType::Intl);
-                let mut key = None;
-                let h = self.header();
-                let merging_child = h.merging_child;
-                for (k, v) in self.intl_iter() {
-                    if v.pid == merging_child {
-                        key = Some(k);
-                        break;
-                    }
-                }
-                let b = DeltaView::from_key_index(a, key.unwrap(), Index::null(), safe_txid);
-                let tmp = self.insert(b.view().as_delta());
-                let (mut p, j) = tmp.compact(a, safe_txid);
-                p.header_mut().merging_child = NULL_PID;
-                p.header_mut().split_elems = h.split_elems + 1;
-                (p, j)
-            }
-            MergeOp::MarkParent(pid) => {
-                assert_eq!(self.box_header().node_type, NodeType::Intl);
-                let (mut p, j) = self.compact(a, safe_txid);
-                p.header_mut().merging_child = pid;
-                (p, j)
-            }
-            MergeOp::MarkChild => {
-                assert_eq!(self.box_header().node_type, NodeType::Leaf);
-                let (mut p, j) = self.compact(a, safe_txid);
-                p.header_mut().merging = true;
-                (p, j)
-            }
-        }
+    ) -> Option<(Node<L>, Junks)> {
+        assert_eq!(self.box_header().node_type, NodeType::Intl);
+        let key = self
+            .intl_iter()
+            .find(|(_, idx)| idx.pid == child_pid)
+            .map(|(k, _)| k)?;
+        let b = DeltaView::from_key_index(a, key, Index::null(), safe_txid);
+        let tmp = self.insert(b.view().as_delta());
+        let (mut p, j) = tmp.compact(a, safe_txid);
+        p.header_mut().split_elems = self.header().split_elems + 1;
+        Some((p, j))
     }
 
     pub(crate) fn insert(&self, mut k: DeltaView) -> Node<L> {
@@ -523,6 +611,7 @@ where
         Node {
             loader: self.loader.shallow_copy(),
             mtx: self.mtx.clone(),
+            smo: self.smo.clone(),
             state: RwLock::new(NodeState {
                 addr: h.addr,
                 total_size: state.total_size + h.total_size as usize,
@@ -1158,12 +1247,12 @@ mod test {
     }
 
     impl IAlloc for A {
-        fn allocate(&mut self, size: usize) -> BoxRef {
+        fn allocate(&mut self, size: u32) -> BoxRef {
             let addr = self
                 .inner
                 .off
-                .fetch_add(BoxRef::real_size(size as u32) as u64, Relaxed);
-            let p = BoxRef::alloc(size as u32, addr);
+                .fetch_add(BoxRef::real_size(size) as u64, Relaxed);
+            let p = BoxRef::alloc(size, addr);
             let mut lk = self.inner.map.lock();
             lk.insert(addr, p.clone());
             p
@@ -1201,6 +1290,73 @@ mod test {
         fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
             Ok(self.load(addr))
         }
+    }
+
+    #[test]
+    fn split_overlay_keeps_delta_changes() {
+        let mut a = A::new();
+        let txid = AtomicU64::new(1);
+        let l = a.clone();
+        let mut node = Node::new_leaf(&mut a, l);
+
+        for raw in ["a", "b", "c", "d"] {
+            let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
+            let v = Record::normal(1, raw.as_bytes());
+            let (d, r) = DeltaView::from_key_val(&mut a, &k, &v);
+            node.insert_inplace(d.view().as_delta());
+            node.save(d, r);
+        }
+
+        (node, _) = node.compact(&mut a, u64::MAX);
+
+        let k = Key::new("zz".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
+        let v = Record::normal(1, "zz".as_bytes());
+        let (d, r) = DeltaView::from_key_val(&mut a, &k, &v);
+        node.insert_inplace(d.view().as_delta());
+        node.save(d, r);
+
+        let probe = Key::new("zz".as_bytes(), Ver::new(u64::MAX, 0));
+        let (l_new, r_new, _) = node.split_overlay(&mut a, u64::MAX);
+        let (l_old, r_old) = node.split(&mut a);
+        assert!(l_old.find_latest(&probe).is_none());
+        assert!(r_old.find_latest(&probe).is_none());
+        assert!(l_new.find_latest(&probe).is_some() || r_new.find_latest(&probe).is_some());
+    }
+
+    #[test]
+    fn merge_overlay_keeps_delta_changes() {
+        let mut a = A::new();
+        let txid = AtomicU64::new(1);
+        let l = a.clone();
+        let mut node = Node::new_leaf(&mut a, l);
+
+        for raw in ["a", "b", "c", "d"] {
+            let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
+            let v = Record::normal(1, raw.as_bytes());
+            let (d, r) = DeltaView::from_key_val(&mut a, &k, &v);
+            node.insert_inplace(d.view().as_delta());
+            node.save(d, r);
+        }
+        (node, _) = node.compact(&mut a, u64::MAX);
+        let (left, right) = node.split(&mut a);
+
+        let kl = Key::new("aa".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
+        let vl = Record::normal(1, "aa".as_bytes());
+        let (dl, rl) = DeltaView::from_key_val(&mut a, &kl, &vl);
+        left.insert_inplace(dl.view().as_delta());
+        left.save(dl, rl);
+
+        let kr = Key::new("zz".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
+        let vr = Record::normal(1, "zz".as_bytes());
+        let (dr, rr) = DeltaView::from_key_val(&mut a, &kr, &vr);
+        right.insert_inplace(dr.view().as_delta());
+        right.save(dr, rr);
+
+        let (merged, _, _) = left.merge_node(&mut a, &right, u64::MAX);
+        let probe_l = Key::new("aa".as_bytes(), Ver::new(u64::MAX, 0));
+        let probe_r = Key::new("zz".as_bytes(), Ver::new(u64::MAX, 0));
+        assert!(merged.find_latest(&probe_l).is_some());
+        assert!(merged.find_latest(&probe_r).is_some());
     }
 
     #[test]

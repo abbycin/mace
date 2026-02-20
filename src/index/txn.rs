@@ -82,14 +82,20 @@ impl<'a> TxnKV<'a> {
 
         tree.bucket.state.inc_txn_ref();
 
-        {
+        let begin_res = {
             let mut log = g.logging.lock();
-            state.prev_lsn = log.record_begin(start_ts)?;
-            g.active_txns.insert(start_ts, state.prev_lsn);
+            log.record_begin(start_ts).map(|lsn| {
+                state.prev_lsn = lsn;
+                g.active_txns.insert(start_ts, state.prev_lsn);
+            })
+        };
+        if let Err(e) = begin_res {
+            g.leave_inflight();
+            tree.bucket.state.dec_txn_ref();
+            return Err(e);
         }
 
         g.cc.commit_tree.compact(ctx, gid as u8);
-
         Ok(Self {
             ctx,
             state: UnsafeCell::new(state),
@@ -103,6 +109,7 @@ impl<'a> TxnKV<'a> {
     fn should_abort(&self) -> Result<(), OpCode> {
         let state = self.state_ref();
         let g = self.ctx.group(state.group_id);
+
         if self.is_end.get() || g.ckpt_cnt.load(Relaxed) - state.start_ckpt >= self.limit {
             return Err(OpCode::AbortTx);
         }
@@ -369,8 +376,14 @@ impl<'a> TxnKV<'a> {
         let state = self.state_ref();
         let g = self.ctx.group(state.group_id);
 
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_txn_commit_begin")?;
+
         if !state.modified {
-            g.logging.lock().record_commit(state.start_ts)?;
+            {
+                let mut log = g.logging.lock();
+                log.record_commit(state.start_ts)?;
+            }
             g.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
             return Ok(());
@@ -381,7 +394,11 @@ impl<'a> TxnKV<'a> {
         {
             let mut log = g.logging.lock();
             log.record_commit(state.start_ts)?;
-            log.stabilize()?;
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::check("mace_txn_commit_after_record_commit")?;
+            log.sync(false)?;
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::check("mace_txn_commit_after_wal_sync")?;
         }
 
         g.cc.commit_tree.append(state.start_ts, commit_ts);
@@ -435,30 +452,30 @@ impl<'a> TxnKV<'a> {
 
 impl Drop for TxnKV<'_> {
     fn drop(&mut self) {
+        let group_id = self.state_ref().group_id;
         if !self.is_end.get() {
             let g = crossbeam_epoch::pin();
             let state = self.state_ref();
             let grp = self.ctx.group(state.group_id);
 
             if !state.modified {
-                grp.logging
-                    .lock()
-                    .record_abort(state.start_ts)
+                let mut log = grp.logging.lock();
+                log.record_abort(state.start_ts)
                     .inspect_err(|e| {
                         log::error!("can't record abort, {:?}", e);
                     })
                     .expect("can't fail");
             } else {
-                grp.logging
-                    .lock()
-                    .stabilize()
-                    .map_err(|e| {
-                        log::error!("can't stabilize WAL, {:?}", e);
-                    })
-                    .expect("can't fail");
-
                 use crate::cc::wal::{Location, WalReader};
                 use crate::utils::block::Block;
+
+                let mut log = grp.logging.lock();
+                log.sync(false)
+                    .map_err(|e| {
+                        log::error!("can't stabilize rollback source WAL, {:?}", e);
+                    })
+                    .expect("can't fail");
+                drop(log);
 
                 const SMALL_SIZE: usize = 256;
                 let mut block = Block::alloc(SMALL_SIZE);
@@ -476,6 +493,14 @@ impl Drop for TxnKV<'_> {
                     })
                     .expect("can't fail");
 
+                let mut log = grp.logging.lock();
+                log.sync(false)
+                    .map_err(|e| {
+                        log::error!("can't stabilize rollback WAL, {:?}", e);
+                    })
+                    .expect("can't fail");
+                drop(log);
+
                 let commit_ts = self.ctx.alloc_oracle();
                 grp.cc.commit_tree.append(state.start_ts, commit_ts);
                 grp.cc.latest_cts.store(commit_ts, Relaxed);
@@ -484,6 +509,7 @@ impl Drop for TxnKV<'_> {
             grp.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
         }
+        self.ctx.group(group_id).leave_inflight();
         self.tree.bucket.state.dec_txn_ref();
     }
 }

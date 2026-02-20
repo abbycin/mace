@@ -1,6 +1,7 @@
 # Mace
 
 [![CI](https://github.com/abbycin/mace/actions/workflows/ci.yml/badge.svg)](https://github.com/abbycin/mace/actions)
+[![Prod Soak](https://github.com/abbycin/mace/actions/workflows/prod-soak.yml/badge.svg)](https://github.com/abbycin/mace/actions/workflows/prod-soak.yml)
 [![Crates.io](https://img.shields.io/crates/v/mace-kv.svg)](https://crates.io/crates/mace-kv)
 [![License](https://img.shields.io/crates/l/mace-kv.svg)](./LICENSE)
 
@@ -25,6 +26,11 @@ Add mace-kv to your Cargo.toml:
 ```bash
 cargo add mace-kv
 ```
+
+## Design
+
+See `docs/design.md` for the current architecture and crash-safety notes.
+Operational scripts are documented in `scripts/README.md`.
 
 ## Quick Start
 
@@ -64,6 +70,22 @@ Detailed usage can be found in [examples/demo.rs](./examples/demo.rs).
 ## Benchmarks
 
 Mace is engineered for heavy workloads. For detailed performance analysis and comparison with other engines, refer to the [kv_bench](https://github.com/abbycin/kv_bench) repository.
+
+## Production Validation
+
+- Run correctness + crash matrix: `./scripts/prod_test.sh all 8`
+- Run perf regression gate (baseline vs head): `./scripts/perf_gate.sh compare`
+- Run long soak with periodic perf sampling: `./scripts/prod_soak.sh`
+- Tune thresholds/profile knobs in `scripts/perf_thresholds.env`
+- See script-level details and metric definitions in `scripts/README.md`
+
+Current CI coverage:
+
+- `.github/workflows/ci.yml`
+  - `test-prod-all`
+  - `perf-regression`
+- `.github/workflows/prod-soak.yml`
+  - scheduled + manual soak validation
 
 ## Status and Caveats
 

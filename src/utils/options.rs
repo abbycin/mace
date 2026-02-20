@@ -271,10 +271,6 @@ impl Options {
         ))
     }
 
-    pub fn desc_file(&self, group_id: u8) -> PathBuf {
-        self.log_root().join(format!("meta_{group_id}"))
-    }
-
     pub fn manifest(&self) -> PathBuf {
         self.log_root().join(Self::MANIFEST)
     }

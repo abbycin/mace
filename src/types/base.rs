@@ -49,9 +49,13 @@ impl BaseView {
         I: Iterator<Item = (LeafSeg<'a>, Val<'a>)>,
     {
         let inline_size = a.inline_size();
+        let arena_size = a.arena_size();
         let mut elems = 0;
         let mut hints = VecDeque::new();
         let mut is_new_sibling = false;
+        let mut sibling_frame_len = 0;
+        let mut sib_frames = 0;
+        let mut sib_real_size = 0;
         let mut last_raw: Option<LeafSeg<'a>> = None;
         let mut pos = 0;
         let mut payload_sz = 0;
@@ -76,13 +80,52 @@ impl BaseView {
             {
                 if !is_new_sibling {
                     is_new_sibling = true;
+                    sibling_frame_len = Self::HDR_LEN;
                     payload_sz += Val::calc_size(true, inline_size, v.data_size());
                     hints.push_back((pos - 1, 0));
                 }
+                let item_len =
+                    Ver::len() + Val::calc_size(false, inline_size, v.data_size()) + SLOT_LEN;
+                if sibling_frame_len + item_len > arena_size {
+                    if sibling_frame_len == Self::HDR_LEN {
+                        log::error!(
+                            "sibling frame planning failed, arena_size {}, item_len {}",
+                            arena_size,
+                            item_len
+                        );
+                        panic!("sibling frame planning failed");
+                    }
+                    sib_frames += 1;
+                    sib_real_size += BoxRef::real_size(sibling_frame_len as u32) as usize;
+                    sibling_frame_len = Self::HDR_LEN;
+                }
+                if sibling_frame_len + item_len > arena_size {
+                    log::error!(
+                        "sibling frame planning failed after split, arena_size {}, item_len {}",
+                        arena_size,
+                        item_len
+                    );
+                    panic!("sibling frame planning failed");
+                }
+                sibling_frame_len += item_len;
+
                 let (_, cnt) = hints.back_mut().unwrap();
                 *cnt += 1;
                 pos += 1;
                 continue;
+            }
+
+            if is_new_sibling {
+                if sibling_frame_len <= Self::HDR_LEN {
+                    log::error!(
+                        "sibling frame planning empty frame, arena_size {}",
+                        arena_size
+                    );
+                    panic!("sibling frame planning failed");
+                }
+                sib_frames += 1;
+                sib_real_size += BoxRef::real_size(sibling_frame_len as u32) as usize;
+                sibling_frame_len = 0;
             }
 
             pos += 1;
@@ -94,7 +137,26 @@ impl BaseView {
             elems += 1;
         }
 
+        if is_new_sibling {
+            if sibling_frame_len <= Self::HDR_LEN {
+                log::error!(
+                    "sibling frame planning empty tail frame, arena_size {}",
+                    arena_size
+                );
+                panic!("sibling frame planning failed");
+            }
+            sib_frames += 1;
+            sib_real_size += BoxRef::real_size(sibling_frame_len as u32) as usize;
+        }
+
         let hdr_sz = elems * SLOT_LEN + Self::HDR_LEN;
+        let boundary = lo.len() + hi.map_or(0, |x| x.len());
+        let base_real_size = BoxRef::real_size((hdr_sz + payload_sz + boundary) as u32) as usize;
+        let total_frames = 1 + sib_frames;
+        let total_real_size = base_real_size + sib_real_size;
+
+        a.begin_packed_alloc(total_real_size as u32, total_frames as u32);
+
         let b = Self::alloc::<false, _>(
             a,
             hdr_sz + payload_sz,
@@ -137,6 +199,7 @@ impl BaseView {
             pos += 1;
         }
         base.header_mut().has_multiple_versions = has_multiple_versions;
+        a.end_packed_alloc();
         b
     }
 
@@ -255,7 +318,7 @@ impl BaseView {
         // and the lo/hi keys are both stored in sst directly discard it's length
         size += lo.len() + hi.map_or(0, |x| x.len());
 
-        let mut p = a.allocate(size);
+        let mut p = a.allocate(size as u32);
         let h = p.header_mut();
         h.kind = TagKind::Base;
         h.link = NULL_ADDR;
@@ -271,10 +334,8 @@ impl BaseView {
         h.elems = elems as u16;
         h.size = size as u32;
         h.right_sibling = right_sibling;
-        h.merging_child = NULL_PID;
         h.lo_len = lo.len() as u32;
         h.hi_len = hi_len as u32;
-        h.merging = false;
         h.split_elems = 0;
         h.prefix_len = prefix_len as u32;
         h.is_index = IS_INDEX;
@@ -691,11 +752,11 @@ mod test {
     }
 
     impl IAlloc for Allocator {
-        fn allocate(&mut self, size: usize) -> BoxRef {
+        fn allocate(&mut self, size: u32) -> BoxRef {
             let r = &mut self.inner;
             let old = r.off.get();
             r.off.set(old + size as u64);
-            let b = BoxRef::alloc(size as u32, old);
+            let b = BoxRef::alloc(size, old);
             r.map.insert(old, b.clone());
             b
         }
@@ -797,7 +858,7 @@ mod test {
 
         fn gen_val(a: &mut Allocator, r: Record) -> Val<'static> {
             let sz = Val::calc_size(false, a.inline_size(), r.packed_size());
-            let mut b = a.allocate(sz);
+            let mut b = a.allocate(sz as u32);
             Val::encode_inline(b.data_slice_mut::<u8>(), NULL_ADDR, &r);
             Val::from_raw(unsafe { std::mem::transmute::<&[u8], &[u8]>(b.data_slice::<u8>()) })
         }

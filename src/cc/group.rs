@@ -1,7 +1,7 @@
 use crate::cc::cc::ConcurrencyControl;
 use crate::cc::log::Logging;
 use crate::meta::Numerics;
-use crate::utils::data::{Position, WalDescHandle};
+use crate::utils::data::Position;
 use crate::utils::options::ParsedOptions;
 use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
@@ -117,12 +117,15 @@ pub struct WriterGroup {
     pub logging: Mutex<Logging>,
     pub active_txns: ActiveTxns,
     pub ckpt_cnt: Arc<AtomicUsize>,
+    inflight: AtomicUsize,
 }
 
 impl WriterGroup {
     pub fn new(
         id: usize,
-        desc: WalDescHandle,
+        checkpoint: Position,
+        latest_id: u64,
+        oldest_id: u64,
         numerics: Arc<Numerics>,
         opt: Arc<ParsedOptions>,
     ) -> Self {
@@ -130,10 +133,42 @@ impl WriterGroup {
         Self {
             id,
             cc: ConcurrencyControl::new(opt.concurrent_write as usize),
-            logging: Mutex::new(Logging::new(desc, numerics, opt, ckpt_cnt.clone())),
+            logging: Mutex::new(Logging::new(
+                id as u8,
+                latest_id,
+                oldest_id,
+                checkpoint,
+                numerics,
+                opt,
+                ckpt_cnt.clone(),
+            )),
             active_txns: ActiveTxns::new(),
             ckpt_cnt,
+            inflight: AtomicUsize::new(0),
         }
+    }
+
+    #[inline]
+    pub fn enter_inflight(&self) {
+        self.inflight.fetch_add(1, Relaxed);
+    }
+
+    #[inline]
+    pub fn try_enter_inflight_if_free(&self) -> bool {
+        self.inflight
+            .compare_exchange(0, 1, Relaxed, Relaxed)
+            .is_ok()
+    }
+
+    #[inline]
+    pub fn leave_inflight(&self) {
+        let prev = self.inflight.fetch_sub(1, Relaxed);
+        debug_assert!(prev > 0);
+    }
+
+    #[inline]
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Relaxed)
     }
 }
 

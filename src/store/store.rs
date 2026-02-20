@@ -8,6 +8,7 @@ use crate::meta::builder::ManifestBuilder;
 use crate::meta::{BucketMeta, Manifest, MetaKind};
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
+use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats, VacuumStats};
 use crate::types::refbox::BoxRef;
 use crate::utils::Handle;
 use crate::utils::MutRef;
@@ -17,7 +18,6 @@ pub use crate::utils::options::Options;
 use crate::utils::options::ParsedOptions;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::channel;
 
 struct StoreFlushObserver {
@@ -129,8 +129,24 @@ impl FlushObserver for StoreFlushObserver {
             txn.record(MetaKind::BlobInterval, blob_ivl);
         }
 
+        // make wal durable before publishing flush metadata
+        for (i, g) in self.ctx.groups().iter().enumerate() {
+            let mut lk = g.logging.lock();
+            let ok = lk.should_durable(result.flsn[i]);
+            if ok {
+                let mut f = lk.writer.clone();
+                drop(lk);
+                // it's safe because we make sure wal entry has been written before
+                f.sync();
+            }
+        }
+
         txn.record(MetaKind::Numerics, self.manifest.numerics.deref());
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_flush_before_manifest_commit")?;
         txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_flush_after_manifest_commit")?;
 
         self.manifest
             .add_data_stat(result.mem_data_stat, result.data_ivl);
@@ -138,6 +154,9 @@ impl FlushObserver for StoreFlushObserver {
             self.manifest.add_blob_stat(mem_blob_stat, blob_ivl);
         }
 
+        done.mark_done();
+        // checkpoint update is a post-flush step and must run after mark_done
+        // wal durability barrier is handled before manifest commit in the first loop
         for (i, g) in self.ctx.groups().iter().enumerate() {
             let mut pos = result.flsn[i];
             if let Some(min) = g.active_txns.min_lsn()
@@ -145,10 +164,14 @@ impl FlushObserver for StoreFlushObserver {
             {
                 pos = min;
             }
-            g.logging.lock().update_last_ckpt(pos);
+            let mut lk = g.logging.lock();
+            if lk.update_checkpoint(pos) {
+                let mut f = lk.writer.clone();
+                drop(lk);
+                // checkpoint must be synced
+                f.sync();
+            }
         }
-        self.manifest.numerics.signal.fetch_add(1, Relaxed);
-        done.mark_done();
         Ok(())
     }
 }
@@ -234,19 +257,32 @@ impl Inner {
     fn del_bucket(self: &Inner, name: &str) -> Result<(), OpCode> {
         self.store.manifest.delete_bucket(name)
     }
+
+    fn vacuum_bucket(self: &Inner, name: &str) -> Result<VacuumStats, OpCode> {
+        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
+            return Err(OpCode::TooLarge);
+        }
+        let meta = self.store.manifest.load_bucket_meta(name)?;
+        let bucket_ctx = self.store.manifest.load_bucket_context(meta.bucket_id)?;
+        crate::store::gc::vacuum_bucket(self.store.clone(), bucket_ctx)
+    }
+
+    fn is_bucket_vacuuming(self: &Inner, name: &str) -> Result<bool, OpCode> {
+        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
+            return Err(OpCode::TooLarge);
+        }
+        let meta = self.store.manifest.load_bucket_meta(name)?;
+        let bucket_ctx = self.store.manifest.load_bucket_context(meta.bucket_id)?;
+        Ok(bucket_ctx.state.is_vacuuming())
+    }
+
+    fn vacuum_meta(self: &Inner) -> Result<MetaVacuumStats, OpCode> {
+        self.store.manifest.vacuum_meta(META_VACUUM_TARGET_BYTES)
+    }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        #[cfg(feature = "metric")]
-        {
-            use crate::index::{g_alloc_status, g_cas_status};
-            use crate::map::g_flush_status;
-
-            log::info!("\n{:#?}", g_alloc_status());
-            log::info!("\n{:#?}", g_cas_status());
-            log::info!("\n{:#?}", g_flush_status());
-        }
         self.gc.quit();
         self.store.quit();
     }
@@ -273,7 +309,7 @@ impl Bucket {
 
     /// Returns the unique identifier of this bucket.
     pub fn id(&self) -> u64 {
-        self.tree.bucket.bucket_id
+        self.tree.bucket_id()
     }
 
     /// Returns the options used by this bucket.
@@ -308,14 +344,14 @@ impl Mace {
         let manifest = Handle::new(builder.finish());
 
         let mut recover = Recovery::new(opt.clone());
-        let (desc, ctx) = recover.phase1(manifest.numerics.clone())?;
+        let (wal_boot, ctx) = recover.phase1(manifest.numerics.clone())?;
         let observer = Arc::new(StoreFlushObserver::new(manifest, ctx));
         let reader = Arc::new(StoreDataReader::new(manifest));
         manifest.set_context(ctx, reader, observer);
 
         let store = MutRef::new(Store::new(opt.clone(), manifest, ctx));
 
-        recover.phase2(ctx, &desc, store.clone())?;
+        recover.phase2(&wal_boot, store.clone())?;
         store.start();
         let handle = start_gc(store.clone(), store.context);
         let evictor = Evictor::new(
@@ -363,6 +399,21 @@ impl Mace {
     /// Deletes a bucket and all its data.
     pub fn del_bucket<S: AsRef<str>>(&self, name: S) -> Result<(), OpCode> {
         Inner::del_bucket(&self.inner, name.as_ref())
+    }
+
+    /// Vacuums a bucket by scavenging and compacting its pages
+    pub fn vacuum_bucket<S: AsRef<str>>(&self, name: S) -> Result<VacuumStats, OpCode> {
+        Inner::vacuum_bucket(&self.inner, name.as_ref())
+    }
+
+    /// Returns whether bucket vacuum is currently running
+    pub fn is_bucket_vacuuming<S: AsRef<str>>(&self, name: S) -> Result<bool, OpCode> {
+        Inner::is_bucket_vacuuming(&self.inner, name.as_ref())
+    }
+
+    /// Vacuums metadata by compacting the manifest btree
+    pub fn vacuum_meta(&self) -> Result<MetaVacuumStats, OpCode> {
+        Inner::vacuum_meta(&self.inner)
     }
 
     /// Disables garbage collection.

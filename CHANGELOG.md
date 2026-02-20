@@ -1,3 +1,34 @@
+## [0.0.27] 2026-02-20 (AI-Assisted)
+### New Features
+- Added `Mace::vacuum_bucket` and `VacuumStats` (`scanned`, `compacted`) to support explicit per-bucket vacuuming
+- Added `Mace::vacuum_meta` and `MetaVacuumStats` to compact manifest metadata btree
+- Added `Mace::is_bucket_vacuuming` to expose bucket vacuum inflight state
+- Added production validation suites and scripts: `scripts/prod_test.sh` (`fast|stress|chaos|all`), `scripts/prod_soak.sh`, `scripts/perf_gate.sh`
+
+### Changes
+- Removed WAL descriptor side files (`meta_{group}`) and rebuilt WAL bootstrap from WAL file scanning during recovery
+- Extended checkpoint records to carry checkpoint position in WAL and used latest valid checkpoint discovery during recovery
+- Added explicit WAL durability barrier before manifest flush commit, then moved checkpoint advancement to post-`mark_done` phase
+- Reworked WAL recycle boundary tracking from descriptor persistence to logging in-memory oldest-id propagation
+- Added production integration tests across bucket/concurrency/evictor/gc/recovery/workload with failpoint chaos coverage
+- Added failpoint runtime (`MACE_FAILPOINT`) and injected crash/io/abort points across flush/wal/manifest/gc/evictor/txn commit boundaries
+
+### Performance
+- Switched SMO flow to runtime markers and aligned split/merge execution paths to reduce structural race amplification
+- Removed arena chunk allocator and reverted to direct allocation path
+- Optimized rollback log sync path and `Tree::link` locking behavior
+- Simplified hot-path alloc API by removing redundant `bucket_id` argument
+- Consolidated WAL/group optimization series for 16B/10K scale goals, including inflight-aware group selection, logging/checkpoint flow cleanup, in-memory oldest WAL boundary propagation, and reduced lock-held read contention in stat cache paths
+
+### Bug Fixes
+- Fixed packed-allocation crash-closure correctness: dependent frames now stay in one packed allocation scope (same arena + contiguous address span), and plan/usage mismatch fails fast instead of silently degrading
+- Fixed iterator lifetime UB in `Tree::iter` and stabilized leaf iterator state to avoid intermittent crashes
+- Fixed orphan-file crash-recovery boundary by switching to marker-driven cleanup (`odf_*` / `obf_*`) instead of tail probing
+- Fixed rollback WAL sync ordering on transaction drop
+- Hardened bucket context reclaim lifecycle under gc/evictor concurrency
+- Fixed GC/txn path correctness issues and improved error mapping (`btree_store::Error::Internal -> OpCode::Invalid`)
+
+
 ## [0.0.26] 2026-02-06 (AI-Assisted)
 ### Changes
   - Bucket-centric lifecycle and runtime/metadata separation: Store owns bucket state, flush results are routed through Store to update Manifest, and runtime components no longer write metadata directly

@@ -7,8 +7,6 @@ use crate::utils::countblock::Countblock;
 use crate::utils::data::{Interval, Position};
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
-#[cfg(feature = "metric")]
-use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread::JoinHandle;
 use std::{
@@ -47,18 +45,6 @@ pub struct FlushResult {
 pub trait FlushObserver: Send + Sync {
     fn flush_directive(&self, bucket_id: u64) -> FlushDirective;
     fn on_flush(&self, result: FlushResult) -> Result<(), OpCode>;
-}
-
-#[cfg(feature = "metric")]
-macro_rules! record {
-    ($x: ident) => {
-        G_STATE.$x.fetch_add(1, Relaxed)
-    };
-}
-
-#[cfg(not(feature = "metric"))]
-macro_rules! record {
-    ($x: ident) => {};
 }
 
 fn flush_data(msg: FlushData, ctx: Handle<Context>) -> Option<FlushResult> {
@@ -108,6 +94,9 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) -> Option<FlushResult> {
         blob_stat = Some(new_mem_blob_stat.copy());
         mem_blob_stat = Some(new_mem_blob_stat);
     }
+
+    #[cfg(feature = "failpoints")]
+    crate::utils::failpoint::crash("mace_flush_after_data_sync");
 
     // 2. prepare statistics
     let mut mem_data_stat = builder.data_stat(data_id, tick);
@@ -164,7 +153,6 @@ fn try_flush(
     observer: &dyn FlushObserver,
 ) -> bool {
     while let Some(data) = q.pop_front() {
-        record!(total);
         let directive = observer.flush_directive(data.bucket_id());
         if let FlushDirective::Skip = directive {
             data.set_state(Arena::WARM, Arena::COLD);
@@ -180,7 +168,6 @@ fn try_flush(
             }
         } else {
             q.push_front(data);
-            record!(retry);
             break;
         }
     }
@@ -231,7 +218,7 @@ impl Notifier {
     fn new() -> Self {
         Self {
             quit: AtomicBool::new(false),
-            sem: Countblock::new(1),
+            sem: Countblock::new(0),
         }
     }
 
@@ -270,22 +257,4 @@ impl Flush {
         self.sync.notify_quit();
         self.sync.wait_done();
     }
-}
-
-#[cfg(feature = "metric")]
-#[derive(Debug)]
-pub struct FlushStatus {
-    retry: AtomicUsize,
-    total: AtomicUsize,
-}
-
-#[cfg(feature = "metric")]
-static G_STATE: FlushStatus = FlushStatus {
-    retry: AtomicUsize::new(0),
-    total: AtomicUsize::new(0),
-};
-
-#[cfg(feature = "metric")]
-pub fn g_flush_status() -> &'static FlushStatus {
-    &G_STATE
 }

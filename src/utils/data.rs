@@ -1,15 +1,8 @@
-use crate::OpCode;
 use crate::types::traits::IAsSlice;
 
-use super::{INIT_ID, MutRef, rand_range};
 use crate::io::{self, GatherIO, IoVec};
-use crc32c::Crc32cHasher;
-use parking_lot::Mutex;
 use std::fmt::Debug;
-use std::fs::File;
-use std::hash::Hasher;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// packed logical id and offset
 pub(crate) const JUNK_LEN: usize = size_of::<u64>();
@@ -99,7 +92,6 @@ pub struct GatherWriter {
     queue: Vec<IoVec>,
     queued_len: usize,
     max_iovcnt: usize,
-    trunc: bool,
 }
 
 unsafe impl Send for GatherWriter {}
@@ -133,7 +125,6 @@ impl GatherWriter {
             } else {
                 max_iovcnt
             },
-            trunc,
         }
     }
 
@@ -143,12 +134,6 @@ impl GatherWriter {
 
     pub fn append(path: &PathBuf, max_iovcnt: usize) -> Self {
         Self::create(path, max_iovcnt, false)
-    }
-
-    pub fn reset(&mut self, path: &PathBuf) {
-        self.path = path.clone();
-        self.flush();
-        self.file = Self::open(path, self.trunc);
     }
 
     pub fn queue(&mut self, data: &[u8]) {
@@ -237,103 +222,3 @@ impl PartialEq for Position {
 }
 
 impl Eq for Position {}
-
-#[derive(Debug)]
-#[repr(C)]
-pub(crate) struct WalDesc {
-    pub checkpoint: Position,
-    pub oldest_id: u64,
-    pub latest_id: u64,
-    pub group: u8,
-    padding1: u8,
-    padding2: u16,
-    pub checksum: u32,
-}
-
-impl WalDesc {
-    pub(crate) fn new(group_id: u8) -> Self {
-        Self {
-            checkpoint: Position::default(),
-            oldest_id: INIT_ID,
-            latest_id: INIT_ID,
-            group: group_id,
-            padding1: 0,
-            padding2: 0,
-            checksum: 0,
-        }
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        unsafe {
-            let p = self as *const Self as *const u8;
-            std::slice::from_raw_parts(p, size_of::<WalDesc>())
-        }
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe {
-            let p = self as *mut Self as *mut u8;
-            std::slice::from_raw_parts_mut(p, size_of::<WalDesc>())
-        }
-    }
-
-    pub fn crc32(&self) -> u32 {
-        let s = self.as_slice();
-        let src = &s[0..s.len() - size_of::<u32>()];
-        let mut h = Crc32cHasher::default();
-        h.write(src);
-        h.finish() as u32
-    }
-
-    pub fn is_valid(&self) -> bool {
-        self.crc32() == self.checksum
-    }
-
-    pub fn update_oldest<P: AsRef<Path>>(&mut self, path: P, oldest_id: u64) -> Result<(), OpCode> {
-        self.oldest_id = oldest_id;
-        self.sync(path)
-    }
-
-    pub fn update_ckpt<P: AsRef<Path>>(
-        &mut self,
-        path: P,
-        ckpt: Position,
-        latest_id: u64,
-    ) -> Result<(), OpCode> {
-        self.checkpoint = ckpt;
-        self.latest_id = latest_id;
-        self.sync(path)
-    }
-
-    fn sync<P>(&mut self, path: P) -> Result<(), OpCode>
-    where
-        P: AsRef<Path>,
-    {
-        let s = format!(
-            "{}_{}",
-            path.as_ref().as_os_str().to_str().unwrap(),
-            rand_range(114..514)
-        );
-        let tmp = Path::new(&s);
-        let mut f = File::options()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(tmp)
-            .inspect_err(|e| log::error!("can't open, {e:?}"))
-            .map_err(|_| OpCode::IoError)?;
-
-        self.checksum = self.crc32();
-        f.write_all(self.as_slice()).expect("can't write desc file");
-        f.sync_all().expect("can't sync desc file");
-        drop(f);
-
-        let p = path.as_ref();
-        std::fs::rename(tmp, p).map_err(|_| {
-            log::error!("can't rename from {:?} to {:?}", tmp, p);
-            OpCode::IoError
-        })
-    }
-}
-
-pub(crate) type WalDescHandle = MutRef<Mutex<WalDesc>>;

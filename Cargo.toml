@@ -1,6 +1,6 @@
 [package]
 name = "mace-kv"
-version = "0.0.26"
+version = "0.0.27"
 edition = "2024"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
 readme = "README.md"
@@ -40,6 +40,7 @@ harness = false
 default = []
 extra_check = []
 metric = []
+failpoints = []
 
 [profile.release]
 opt-level = 3

@@ -63,15 +63,12 @@ pub(crate) struct BaseHeader {
     pub(crate) size: u32,
     /// pid of right sibling, when it the right most node, it should be 0
     pub(crate) right_sibling: u64,
-    /// pid of child, when there's no mergin child, it should be 0
-    pub(crate) merging_child: u64,
     pub(crate) lo_len: u32,
     pub(crate) hi_len: u32,
     pub(crate) prefix_len: u32,
-    pub(crate) merging: bool,
     pub(crate) is_index: bool,
     pub(crate) has_multiple_versions: bool,
-    pub(crate) padding: u8,
+    pub(crate) padding: u16,
 } // sst
 
 #[repr(C, align(8))]

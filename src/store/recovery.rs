@@ -5,20 +5,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
-use parking_lot::Mutex;
-
 use crate::io::{File, GatherIO};
 
-use crate::cc::context::Context;
+use crate::cc::context::{Context, GroupBoot};
 use crate::cc::wal::{
-    EntryType, Location, PayloadType, WalAbort, WalBegin, WalCommit, WalReader, WalUpdate, ptr_to,
-    wal_record_sz,
+    EntryType, Location, PayloadType, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalReader,
+    WalUpdate, ptr_to, wal_record_sz,
 };
 use crate::index::tree::Tree;
 use crate::types::data::{Key, Record, Ver};
 use crate::types::traits::{IKey, ITree, IVal};
 use crate::utils::block::Block;
-use crate::utils::data::{Position, WalDesc, WalDescHandle};
+use crate::utils::data::Position;
 use crate::utils::lru::Lru;
 use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, MutRef, NULL_CMD, NULL_ORACLE, OpCode, ROOT_PID};
@@ -41,8 +39,7 @@ impl ITree for RecoveryTree {
 
 /// there are some cases can't recover:
 /// 1. manifest file missing or corrupted
-/// 2. log desc file checksum mismatch
-/// 3. data file lost
+/// 2. data file lost
 ///
 /// for the last point, if wal file and manifest file are intact, manually recover is possible, we can parse the log and
 /// perform necessary redo/undo to bring data back to consistent, and this only apply to the lost of latest data file
@@ -120,30 +117,31 @@ impl Recovery {
     pub(crate) fn phase1(
         &mut self,
         numerics: Arc<crate::meta::Numerics>,
-    ) -> Result<(Vec<WalDescHandle>, Handle<Context>), OpCode> {
-        let desc = self.load_desc()?;
-        let ctx = Handle::new(Context::new(self.opt.clone(), numerics, &desc));
-        Ok((desc, ctx))
+    ) -> Result<(Vec<GroupBoot>, Handle<Context>), OpCode> {
+        let wal_boot = self.load_wal_boot()?;
+        let ctx = Handle::new(Context::new(self.opt.clone(), numerics, &wal_boot));
+        Ok((wal_boot, ctx))
     }
 
     /// we must perform phase2, in case crash happened before data flush and log checkpoint
     pub(crate) fn phase2(
         &mut self,
-        _ctx: Handle<Context>,
-        desc: &[WalDescHandle],
+        wal_boot: &[GroupBoot],
         store: MutRef<Store>,
     ) -> Result<(), OpCode> {
         let g = crossbeam_epoch::pin();
         let mut oracle = store.manifest.numerics.oracle.load(Relaxed);
         let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
 
-        for d in desc.iter() {
-            let (group, checkpoint) = {
-                let x = d.lock();
-                (x.group, x.checkpoint)
-            };
+        for (group_id, boot) in wal_boot.iter().enumerate() {
             // analyze and redo starts from latest checkpoint
-            let cur_oracle = self.analyze(&g, group, checkpoint, &mut block, store.clone())?;
+            let cur_oracle = self.analyze(
+                &g,
+                group_id as u8,
+                boot.checkpoint,
+                &mut block,
+                store.clone(),
+            )?;
             oracle = max(oracle, cur_oracle);
             g.flush();
         }
@@ -440,30 +438,140 @@ impl Recovery {
         Ok(())
     }
 
-    fn load_desc(&self) -> Result<Vec<WalDescHandle>, OpCode> {
-        let mut desc: Vec<WalDescHandle> = (0..self.opt.concurrent_write)
-            .map(|x| WalDescHandle::new(Mutex::new(WalDesc::new(x))))
-            .collect();
+    fn wal_file_range(&self, group: u8) -> Option<(u64, u64)> {
+        let mut min_id = u64::MAX;
+        let mut max_id = 0;
+        let mut found = false;
+        let prefix = format!(
+            "{}{}{}{}",
+            Options::WAL_PREFIX,
+            Options::SEP,
+            group,
+            Options::SEP
+        );
 
-        for d in &mut desc {
-            let mut x = d.lock();
-            let path = self.opt.desc_file(x.group);
-            if !path.exists() {
-                log::trace!("no log record for group {}", x.group);
+        let iter = std::fs::read_dir(self.opt.log_root()).ok()?;
+        for entry in iter.flatten() {
+            let name = entry.file_name();
+            let Some(raw) = name.to_str() else {
+                continue;
+            };
+            if !raw.starts_with(&prefix) {
                 continue;
             }
-            let f = File::options()
-                .read(true)
-                .open(&path)
-                .map_err(|_e| OpCode::IoError)?;
-            let dst = x.as_mut_slice();
-            f.read(dst, 0)?;
-            if !x.is_valid() {
-                log::error!("{path:?} was corrupted");
-                return Err(crate::utils::OpCode::Corruption);
-            }
+            let Ok(id) = raw[prefix.len()..].parse::<u64>() else {
+                continue;
+            };
+            found = true;
+            min_id = min_id.min(id);
+            max_id = max_id.max(id);
         }
 
-        Ok(desc)
+        if found { Some((min_id, max_id)) } else { None }
+    }
+
+    fn load_wal_boot(&self) -> Result<Vec<GroupBoot>, OpCode> {
+        let mut out = Vec::with_capacity(self.opt.concurrent_write as usize);
+        for group in 0..self.opt.concurrent_write {
+            let group_id = group;
+            if let Some((min_id, max_id)) = self.wal_file_range(group_id) {
+                let checkpoint = self
+                    .find_latest_checkpoint(group_id, min_id, max_id)?
+                    .unwrap_or(Position {
+                        file_id: min_id,
+                        offset: 0,
+                    });
+                out.push(GroupBoot {
+                    oldest_id: min_id,
+                    latest_id: max_id,
+                    checkpoint,
+                });
+            } else {
+                out.push(GroupBoot {
+                    oldest_id: 0,
+                    latest_id: 0,
+                    checkpoint: Position::default(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn find_latest_checkpoint(
+        &self,
+        group_id: u8,
+        min_file: u64,
+        max_file: u64,
+    ) -> Result<Option<Position>, OpCode> {
+        let block = Block::alloc(Self::INIT_BLOCK_SIZE);
+        for file_id in (min_file..=max_file).rev() {
+            let path = self.opt.wal_file(group_id, file_id);
+            if !path.exists() {
+                continue;
+            }
+            let file = File::options().read(true).write(true).open(&path)?;
+            let end = file.size()?;
+            if end == 0 {
+                continue;
+            }
+            let mut pos = 0;
+            let buf = block.mut_slice(0, block.len());
+            let mut latest = None;
+            while pos < end {
+                let hdr = {
+                    let hdr = &mut buf[0..1];
+                    file.read(hdr, pos)?;
+                    hdr[0]
+                };
+                let Ok(et) = EntryType::try_from(hdr) else {
+                    break;
+                };
+                let Some(sz) = Self::get_size(et, (end - pos) as usize)? else {
+                    break;
+                };
+                file.read(&mut buf[0..sz], pos)?;
+                pos += sz as u64;
+                let ptr = buf.as_ptr();
+                match et {
+                    EntryType::Commit => {
+                        let c = ptr_to::<WalCommit>(ptr);
+                        if !c.is_intact() {
+                            break;
+                        }
+                    }
+                    EntryType::Abort => {
+                        let a = ptr_to::<WalAbort>(ptr);
+                        if !a.is_intact() {
+                            break;
+                        }
+                    }
+                    EntryType::Begin => {
+                        let b = ptr_to::<WalBegin>(ptr);
+                        if !b.is_intact() {
+                            break;
+                        }
+                    }
+                    EntryType::CheckPoint => {
+                        let c = ptr_to::<WalCheckpoint>(ptr);
+                        if !c.is_intact() {
+                            break;
+                        }
+                        latest = Some(c.checkpoint);
+                    }
+                    EntryType::Update => {
+                        let u = ptr_to::<WalUpdate>(ptr);
+                        if pos + u.payload_len() as u64 > end {
+                            break;
+                        }
+                        pos += u.payload_len() as u64;
+                    }
+                    _ => break,
+                }
+            }
+            if latest.is_some() {
+                return Ok(latest);
+            }
+        }
+        Ok(None)
     }
 }

@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::collections::BTreeSet;
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;
@@ -278,6 +278,10 @@ pub(crate) struct BucketState {
     pub(crate) next_addr: AtomicU64,
     pub(crate) is_deleting: AtomicBool,
     pub(crate) is_drop: AtomicBool,
+    pub(crate) vacuum_epoch: AtomicU64,
+    pub(crate) vacuum_inflight: AtomicBool,
+    pub(crate) vacuum_lock: Mutex<()>,
+    pub(crate) vacuum_cv: Condvar,
 }
 
 impl BucketState {
@@ -286,6 +290,10 @@ impl BucketState {
             txn_ref: AtomicUsize::new(0),
             is_deleting: AtomicBool::new(false),
             is_drop: AtomicBool::new(false),
+            vacuum_epoch: AtomicU64::new(0),
+            vacuum_inflight: AtomicBool::new(false),
+            vacuum_lock: Mutex::new(()),
+            vacuum_cv: Condvar::new(),
             next_addr: AtomicU64::new(crate::utils::INIT_ADDR),
         }
     }
@@ -318,8 +326,43 @@ impl BucketState {
         self.is_drop.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn is_vacuuming(&self) -> bool {
+        self.vacuum_inflight.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn vacuum_epoch(&self) -> u64 {
+        self.vacuum_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_begin_vacuum(&self) -> bool {
+        self.vacuum_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    pub(crate) fn end_vacuum(&self) {
+        let _guard = self.vacuum_lock.lock();
+        self.vacuum_epoch.fetch_add(1, Ordering::AcqRel);
+        self.vacuum_inflight.store(false, Ordering::Release);
+        self.vacuum_cv.notify_all();
+    }
+
+    pub(crate) fn wait_vacuum(&self, epoch: u64) {
+        if self.vacuum_epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        let mut guard = self.vacuum_lock.lock();
+        while self.vacuum_epoch.load(Ordering::Acquire) == epoch {
+            self.vacuum_cv.wait(&mut guard);
+        }
+    }
+
     pub(crate) fn is_busy(&self) -> bool {
         self.txn_ref.load(Ordering::Relaxed) > 0
+    }
+
+    pub(crate) fn reserve_addr_span(&self, span: u64) -> u64 {
+        self.next_addr.fetch_add(span, Ordering::AcqRel)
     }
 }
 

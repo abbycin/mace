@@ -19,7 +19,7 @@ use crate::{
 use crate::{
     map::{
         SharedState,
-        buffer::{BucketContext, BucketMgr, Loader, Pool},
+        buffer::{BucketContext, BucketMgr, Loader, PackedAllocCtx, Pool},
         data::Arena,
         table::Swip,
     },
@@ -45,6 +45,8 @@ pub(crate) struct Evictor {
     current_bucket_id: u64,
     frames: Vec<(Handle<Arena>, BoxView)>,
     garbage: Vec<u64>,
+    packed_ctx: Option<PackedAllocCtx>,
+    packed_frame_start: Option<usize>,
 }
 
 impl Drop for Evictor {
@@ -73,6 +75,24 @@ impl Evictor {
             current_bucket_id: NULL_PID,
             frames: vec![],
             garbage: vec![],
+            packed_ctx: None,
+            packed_frame_start: None,
+        }
+    }
+
+    fn finish_packed_if_any(&mut self) {
+        if let Some(ctx) = self.packed_ctx.take() {
+            ctx.finish();
+            self.packed_frame_start = None;
+        }
+    }
+
+    fn cancel_packed_if_any(&mut self) {
+        if let Some(ctx) = self.packed_ctx.take() {
+            ctx.cancel();
+            if let Some(start) = self.packed_frame_start.take() {
+                self.frames.truncate(start);
+            }
         }
     }
 
@@ -82,6 +102,9 @@ impl Evictor {
     }
 
     fn evict_once(&mut self, g: &Guard, limit: usize, safe_txid: u64) {
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_evictor_before_evict_once");
+
         let bucket_ctxs = self.buckets.active_contexts();
         let mut candidates: Vec<(Arc<BucketContext>, u64)> = Vec::new();
 
@@ -115,46 +138,51 @@ impl Evictor {
                     continue;
                 }
 
-                let swip = Swip::new(bucket_ctx.table.get(*pid));
+                loop {
+                    let swip = Swip::new(bucket_ctx.table.get(*pid));
 
-                // it's passible when a node was unmapped, but not removed from cache yet (concurrently)
-                if swip.is_null() {
-                    continue;
-                }
-                assert!(!swip.is_tagged());
-                let old = Page::<Loader>::from_swip(swip.untagged());
-                self.current_pool = Some(old.loader.pool);
-                self.current_bucket_id = bucket_ctx.bucket_id;
-
-                let mut compacted = false;
-                let old = Page::<Loader>::from_swip(swip.untagged());
-                let (addr, junks) = if old.delta_len() > limit {
-                    let (mut node, j) = old.compact(self, safe_txid);
-                    node.set_pid(old.pid());
-                    let addr = node.latest_addr();
-                    assert_eq!(addr, node.base_addr());
-                    compacted = true;
-                    (addr, j)
-                } else {
-                    (old.latest_addr(), Junks::new())
-                };
-
-                match bucket_ctx.table.cas(*pid, old.swip(), Swip::tagged(addr)) {
-                    Ok(_) => {
-                        if bucket_ctx.evict_cache(*pid) {
-                            evicted = true;
-                        }
-                        if compacted {
-                            old.garbage_collect(self, &junks);
-                        }
-                        // must guarded by EBR, other threads may still use the old page
-                        g.defer(move || old.reclaim());
-                        self.commit();
+                    // it's passible when a node was unmapped, but not removed from cache yet (concurrently)
+                    if swip.is_null() {
+                        break;
                     }
-                    Err(_) => {
-                        // it has been replaced by other thread, in this case, we do NOT retry, it will
-                        // be evicted next time
-                        self.rollback();
+                    assert!(!swip.is_tagged());
+                    let old = Page::<Loader>::from_swip(swip.untagged());
+                    self.current_pool = Some(old.loader.pool);
+                    self.current_bucket_id = bucket_ctx.bucket_id;
+
+                    let mut compacted = false;
+                    let old = Page::<Loader>::from_swip(swip.untagged());
+                    let Some(_lk) = old.try_lock() else {
+                        continue;
+                    };
+                    let (addr, junks) = if old.delta_len() > limit {
+                        let (mut node, j) = old.compact(self, safe_txid);
+                        node.set_pid(old.pid());
+                        let addr = node.latest_addr();
+                        assert_eq!(addr, node.base_addr());
+                        compacted = true;
+                        (addr, j)
+                    } else {
+                        (old.latest_addr(), Junks::new())
+                    };
+
+                    match bucket_ctx.table.cas(*pid, old.swip(), Swip::tagged(addr)) {
+                        Ok(_) => {
+                            if bucket_ctx.evict_cache(*pid) {
+                                evicted = true;
+                            }
+                            if compacted {
+                                old.garbage_collect(self, &junks);
+                            }
+                            // must guarded by EBR, other threads may still use the old page
+                            g.defer(move || old.reclaim());
+                            self.commit();
+                        }
+                        Err(_) => {
+                            // it has been replaced by other thread, in this case, we do NOT retry, it will
+                            // be evicted next time
+                            self.rollback();
+                        }
                     }
                 }
             }
@@ -166,6 +194,8 @@ impl Evictor {
     }
 
     fn commit(&mut self) {
+        self.finish_packed_if_any();
+
         while let Some((a, _)) = self.frames.pop() {
             a.dec_ref();
         }
@@ -186,9 +216,7 @@ impl Evictor {
                 assert_eq!(old, self.garbage.len());
             }
             let sz = self.garbage.len() * JUNK_LEN;
-            let (h, mut junk) = pool
-                .alloc(sz as u32, self.current_bucket_id)
-                .expect("never happen");
+            let (h, mut junk) = pool.alloc(sz as u32).expect("never happen");
             junk.header_mut().flag = TagFlag::Junk;
             let dst = junk.data_slice_mut::<u64>();
             dst.copy_from_slice(&self.garbage);
@@ -198,6 +226,8 @@ impl Evictor {
     }
 
     fn rollback(&mut self) {
+        self.cancel_packed_if_any();
+
         while let Some((a, b)) = self.frames.pop() {
             let h = b.header();
             a.dealloc(h.addr, h.total_size as usize);
@@ -294,13 +324,50 @@ impl Evictor {
 }
 
 impl IAlloc for Evictor {
-    fn allocate(&mut self, size: usize) -> BoxRef {
-        let pool = self.current_pool.as_ref().expect("pool must be set");
-        let (h, b) = pool
-            .alloc(size as u32, self.current_bucket_id)
-            .expect("never happen");
+    fn allocate(&mut self, size: u32) -> BoxRef {
+        let (h, b) = if let Some(ctx) = self.packed_ctx.as_mut() {
+            ctx.alloc(size)
+        } else {
+            let pool = self.current_pool.as_ref().expect("pool must be set");
+            pool.alloc(size).expect("never happen")
+        };
         self.frames.push((h, b.view()));
         b
+    }
+
+    fn allocate_pair(&mut self, size1: u32, size2: u32) -> (BoxRef, BoxRef) {
+        assert!(
+            self.packed_ctx.is_none(),
+            "allocate_pair in packed evictor allocation"
+        );
+        let pool = self.current_pool.as_ref().expect("pool must be set");
+        let ((h1, b1), (h2, b2)) = pool.alloc_pair(size1, size2).expect("never happen");
+        self.frames.push((h1, b1.view()));
+        self.frames.push((h2, b2.view()));
+        (b1, b2)
+    }
+
+    fn begin_packed_alloc(&mut self, total_real_size: u32, nr_frames: u32) {
+        if self.packed_ctx.is_some() {
+            log::error!("nested packed allocation in evictor");
+            panic!("nested packed allocation in evictor");
+        }
+
+        let pool = self.current_pool.as_ref().expect("pool must be set");
+        let ctx = pool
+            .begin_packed_ctx(total_real_size, nr_frames)
+            .expect("begin packed allocation failed");
+        self.packed_frame_start = Some(self.frames.len());
+        self.packed_ctx = Some(ctx);
+    }
+
+    fn end_packed_alloc(&mut self) {
+        let Some(ctx) = self.packed_ctx.take() else {
+            log::error!("end packed allocation without begin in evictor");
+            panic!("end packed allocation without begin in evictor");
+        };
+        ctx.finish();
+        self.packed_frame_start = None;
     }
 
     fn arena_size(&mut self) -> usize {

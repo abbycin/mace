@@ -3,7 +3,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::OpCode;
 use crate::cc::cc::ConcurrencyControl;
 use crate::meta::Numerics;
-use crate::utils::data::WalDescHandle;
+use crate::utils::data::Position;
 use crate::utils::options::ParsedOptions;
 use crate::utils::{CachePad, Handle, INIT_WMK, NULL_ORACLE, rand_range};
 
@@ -16,6 +16,13 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupBoot {
+    pub oldest_id: u64,
+    pub latest_id: u64,
+    pub checkpoint: Position,
+}
 
 pub struct Context {
     pub(crate) opt: Arc<ParsedOptions>,
@@ -32,11 +39,23 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(opt: Arc<ParsedOptions>, numerics: Arc<Numerics>, desc: &[WalDescHandle]) -> Self {
+    pub fn new(opt: Arc<ParsedOptions>, numerics: Arc<Numerics>, group_boot: &[GroupBoot]) -> Self {
         let cores = opt.concurrent_write as usize;
         let mut groups = Vec::with_capacity(cores);
-        for (i, d) in desc.iter().enumerate() {
-            let g = WriterGroup::new(i, d.clone(), numerics.clone(), opt.clone());
+        for i in 0..cores {
+            let boot = group_boot.get(i).copied().unwrap_or(GroupBoot {
+                oldest_id: 0,
+                latest_id: 0,
+                checkpoint: Position::default(),
+            });
+            let g = WriterGroup::new(
+                i,
+                boot.checkpoint,
+                boot.latest_id,
+                boot.oldest_id,
+                numerics.clone(),
+                opt.clone(),
+            );
             groups.push(g);
         }
 
@@ -92,7 +111,32 @@ impl Context {
     }
 
     pub(crate) fn next_group_id(&self) -> usize {
-        self.group_rr.fetch_add(1, Relaxed) % self.groups.len()
+        let nr = self.groups.len();
+        const SPIN_RETRY: usize = 32;
+        let mut best_gid = 0;
+        let mut best_load = usize::MAX;
+        for attempt in 0..=SPIN_RETRY {
+            let start = self.group_rr.fetch_add(1, Relaxed) % nr;
+            for i in 0..nr {
+                let gid = (start + i) % nr;
+                if self.groups[gid].try_enter_inflight_if_free() {
+                    return gid;
+                }
+                let load = self.groups[gid].inflight();
+                if load < best_load {
+                    best_load = load;
+                    best_gid = gid;
+                }
+            }
+            if best_load <= 1 && attempt < SPIN_RETRY {
+                std::thread::yield_now();
+                best_load = usize::MAX;
+                continue;
+            }
+            self.groups[best_gid].enter_inflight();
+            return best_gid;
+        }
+        unreachable!()
     }
 
     #[inline]
@@ -120,20 +164,21 @@ impl Context {
     }
 
     pub(crate) fn start(&self) {
-        self.groups
-            .iter()
-            .for_each(|w| w.logging.lock().enable_checkpoint())
+        self.groups.iter().for_each(|w| {
+            w.logging.lock().enable_checkpoint();
+        })
     }
 
     pub(crate) fn quit(&self) {
         self.groups.iter().for_each(|x| {
-            x.logging
-                .lock()
-                .stabilize()
-                .inspect_err(|e| {
-                    log::error!("can't stabilize WAL, {:?}", e);
-                })
-                .expect("can't fail");
+            let r = {
+                let mut log = x.logging.lock();
+                log.sync(true)
+            };
+            r.inspect_err(|e| {
+                log::error!("can't stabilize WAL, {:?}", e);
+            })
+            .expect("can't fail");
         });
         self.tx
             .send(())
@@ -146,7 +191,8 @@ impl Context {
 
     pub fn sync(&self) -> Result<(), OpCode> {
         for group in self.groups.iter() {
-            group.logging.lock().sync()?;
+            let mut log = group.logging.lock();
+            log.sync(true)?;
         }
         Ok(())
     }

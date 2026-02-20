@@ -51,8 +51,9 @@ pub(crate) const BUCKET_PENDING_DEL: &str = "pending_del";
 pub(crate) const BUCKET_VERSION: &str = "version";
 pub(crate) const MAX_BUCKETS: u64 = 1024;
 pub(crate) const VERSION_KEY: &str = "current_version";
-pub(crate) const ORPHAN_DATA: &str = "orphan_data";
-pub(crate) const ORPHAN_BLOB: &str = "orphan_blob";
+// keep marker keys short to reduce numerics bucket write amplification
+pub(crate) const ORPHAN_DATA_MARKER_PREFIX: &str = "odf_";
+pub(crate) const ORPHAN_BLOB_MARKER_PREFIX: &str = "obf_";
 /// storage format version
 pub(crate) const CURRENT_VERSION: u64 = 1;
 
@@ -73,6 +74,14 @@ pub(crate) fn data_interval_name(bucket_id: u64) -> String {
 
 pub(crate) fn blob_interval_name(bucket_id: u64) -> String {
     format!("blob_interval_{}", bucket_id)
+}
+
+pub(crate) fn orphan_data_marker_key(file_id: u64) -> Vec<u8> {
+    format!("{}{}", ORPHAN_DATA_MARKER_PREFIX, file_id).into_bytes()
+}
+
+pub(crate) fn orphan_blob_marker_key(file_id: u64) -> Vec<u8> {
+    format!("{}{}", ORPHAN_BLOB_MARKER_PREFIX, file_id).into_bytes()
 }
 
 pub(crate) trait IMetaCodec {
@@ -244,6 +253,9 @@ impl<'a> Txn<'a> {
             return;
         }
         loop {
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_manifest_before_multi_commit");
+
             // btree-store supports SI. refresh handle to start a fresh session
             self.btree = self.manifest.btree.clone();
 
@@ -296,7 +308,7 @@ struct FileReader {
     map: HashMap<u64, Reloc>,
 }
 
-fn new_reader<T: IFooter>(path: PathBuf) -> Result<FileReader, OpCode> {
+fn new_reader<T: IFooter>(path: PathBuf) -> Result<Arc<FileReader>, OpCode> {
     let mut loader = MetaReader::<T>::new(&path)?;
     let relocs = loader.get_reloc()?;
     let mut map = HashMap::with_capacity(relocs.len());
@@ -305,7 +317,7 @@ fn new_reader<T: IFooter>(path: PathBuf) -> Result<FileReader, OpCode> {
     }
 
     let file = loader.take();
-    Ok(FileReader { file, map })
+    Ok(Arc::new(FileReader { file, map }))
 }
 
 impl FileReader {
@@ -575,7 +587,7 @@ impl Manifest {
         self.bucket_metas_by_id.remove(&bucket_id);
 
         let state = self.get_bucket_state(bucket_id);
-        let mut busy = Arc::strong_count(&meta) > 1 || state.is_busy();
+        let mut busy = Arc::strong_count(&meta) > 1 || state.is_busy() || state.is_vacuuming();
         if matches!(mode, BucketRemoveMode::Delete) && state.is_drop() {
             busy = true;
         }
@@ -607,9 +619,8 @@ impl Manifest {
             .map(|x| x.value().clone())
         {
             ctx.flush_and_wait();
-            let _ = self.buckets.buckets.remove(&bucket_id);
-            ctx.reclaim();
         }
+        let _ = self.buckets.buckets.remove(&bucket_id);
 
         self.bucket_states.remove(&bucket_id);
         Ok(())
@@ -779,6 +790,46 @@ impl Manifest {
             btree,
             ops: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn stage_orphan_data_file(&self, file_id: u64) {
+        self.stage_orphan_marker(orphan_data_marker_key(file_id), "data", file_id);
+    }
+
+    pub(crate) fn stage_orphan_blob_file(&self, file_id: u64) {
+        self.stage_orphan_marker(orphan_blob_marker_key(file_id), "blob", file_id);
+    }
+
+    pub(crate) fn clear_orphan_data_file(&self, txn: &mut Txn<'_>, file_id: u64) {
+        txn.ops_mut()
+            .entry(BUCKET_NUMERICS.to_string())
+            .or_default()
+            .push(MetaOp::Del(orphan_data_marker_key(file_id)));
+    }
+
+    pub(crate) fn clear_orphan_blob_file(&self, txn: &mut Txn<'_>, file_id: u64) {
+        txn.ops_mut()
+            .entry(BUCKET_NUMERICS.to_string())
+            .or_default()
+            .push(MetaOp::Del(orphan_blob_marker_key(file_id)));
+    }
+
+    fn stage_orphan_marker(&self, key: Vec<u8>, kind: &str, file_id: u64) {
+        self.btree
+            .exec(BUCKET_NUMERICS, |txn| txn.put(&key, Vec::<u8>::new()))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to stage {} orphan marker for file {}: {:?}",
+                    kind, file_id, e
+                )
+            });
+    }
+
+    pub(crate) fn vacuum_meta(
+        &self,
+        target_bytes: u64,
+    ) -> Result<btree_store::CompactStats, OpCode> {
+        self.btree.compact(target_bytes).map_err(OpCode::from)
     }
 
     pub(crate) fn load_data<C>(&self, bucket_id: u64, addr: u64, cache: C) -> Result<BoxRef, OpCode>
@@ -975,8 +1026,8 @@ where
         };
 
         loop {
-            if let Some(r) = self.common.cache.get(file_id) {
-                return r.read_at(addr);
+            if let Some(reader) = self.common.cache.get(file_id).map(|r| r.clone()) {
+                return reader.read_at(addr);
             }
 
             let lk = self.common.cache.lock_shard(file_id);
@@ -986,8 +1037,8 @@ where
 
     fn get_reloc(&self, file_id: u64, pos: u64) -> Reloc {
         loop {
-            if let Some(x) = self.common.cache.get(file_id) {
-                let Some(&tmp) = x.map.get(&pos) else {
+            if let Some(reader) = self.common.cache.get(file_id).map(|x| x.clone()) {
+                let Some(&tmp) = reader.map.get(&pos) else {
                     log::error!("can't find reloc, file_id {file_id} key {pos}");
                     unreachable!("can't find reloc, file_id {file_id} key {pos}");
                 };
@@ -1008,7 +1059,7 @@ struct JunkCollector {
 
 struct StatCommon {
     pub(crate) bucket_files: DashMap<u64, Vec<u64>>,
-    cache: ShardLru<FileReader>,
+    cache: ShardLru<Arc<FileReader>>,
     mask_cache: Lru<u64, ()>,
     mask_capacity: usize,
     opt: Arc<ParsedOptions>,

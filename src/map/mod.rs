@@ -1,6 +1,5 @@
 pub(crate) mod buffer;
 pub(crate) mod cache;
-pub(crate) mod chunk;
 pub(crate) mod data;
 pub(crate) mod evictor;
 
@@ -13,9 +12,6 @@ pub(crate) enum SharedState {
     Quit,
     Evict,
 }
-
-#[cfg(feature = "metric")]
-pub use flush::g_flush_status;
 
 pub(crate) trait IFooter: Default {
     const LEN: usize = size_of::<Self>();

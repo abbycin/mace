@@ -144,6 +144,7 @@ static_assert!(size_of::<WalCommit>() == size_of::<WalBegin>());
 #[derive(Debug)]
 pub(crate) struct WalCheckpoint {
     pub(crate) wal_type: EntryType,
+    pub(crate) checkpoint: Position,
     pub(crate) checksum: u32,
 }
 
@@ -714,6 +715,10 @@ mod test {
         // checkpoint
         let mut ckpt = WalCheckpoint {
             wal_type: EntryType::CheckPoint,
+            checkpoint: crate::utils::data::Position {
+                file_id: 7,
+                offset: 11,
+            },
             checksum: 0,
         };
         ckpt.checksum = ckpt.calc_checksum();
