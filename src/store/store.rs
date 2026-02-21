@@ -100,6 +100,14 @@ impl FlushObserver for StoreFlushObserver {
         }
     }
 
+    fn stage_orphan_data_file(&self, file_id: u64) {
+        self.manifest.stage_orphan_data_file(file_id);
+    }
+
+    fn stage_orphan_blob_file(&self, file_id: u64) {
+        self.manifest.stage_orphan_blob_file(file_id);
+    }
+
     fn on_flush(&self, result: FlushResult) -> Result<(), OpCode> {
         let done = result.done;
         let mut txn = self.manifest.begin();
@@ -142,6 +150,12 @@ impl FlushObserver for StoreFlushObserver {
         }
 
         txn.record(MetaKind::Numerics, self.manifest.numerics.deref());
+        self.manifest
+            .clear_orphan_data_file(&mut txn, result.data_id);
+        if let Some(blob_ivl) = result.blob_ivl {
+            self.manifest
+                .clear_orphan_blob_file(&mut txn, blob_ivl.file_id);
+        }
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check("mace_flush_before_manifest_commit")?;
         txn.commit();

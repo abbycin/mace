@@ -44,10 +44,16 @@ pub struct FlushResult {
 
 pub trait FlushObserver: Send + Sync {
     fn flush_directive(&self, bucket_id: u64) -> FlushDirective;
+    fn stage_orphan_data_file(&self, file_id: u64);
+    fn stage_orphan_blob_file(&self, file_id: u64);
     fn on_flush(&self, result: FlushResult) -> Result<(), OpCode>;
 }
 
-fn flush_data(msg: FlushData, ctx: Handle<Context>) -> Option<FlushResult> {
+fn flush_data(
+    msg: FlushData,
+    ctx: Handle<Context>,
+    observer: &dyn FlushObserver,
+) -> Option<FlushResult> {
     let bucket_id = msg.bucket_id();
     let mut builder = FileBuilder::new(bucket_id);
     let mut map = MapBuilder::new(bucket_id);
@@ -76,6 +82,7 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) -> Option<FlushResult> {
     let tick = data_id;
     let data_path = ctx.opt.data_file(data_id);
 
+    observer.stage_orphan_data_file(data_id);
     // 1. perform disk I/O
     let Interval { lo, hi } = builder.build_data(tick, data_path);
     let data_ivl = IntervalPair::new(lo, hi, data_id, bucket_id);
@@ -86,6 +93,7 @@ fn flush_data(msg: FlushData, ctx: Handle<Context>) -> Option<FlushResult> {
     if builder.has_blob() {
         let blob_id = ctx.numerics.next_blob_id.fetch_add(1, Relaxed);
         let blob_path = ctx.opt.blob_file(blob_id);
+        observer.stage_orphan_blob_file(blob_id);
         let Interval { lo, hi } = builder.build_blob(blob_path);
         let new_blob_ivl = IntervalPair::new(lo, hi, blob_id, bucket_id);
         let mut new_mem_blob_stat = builder.blob_stat(blob_id);
@@ -163,7 +171,7 @@ fn try_flush(
         let can_flush = safe_to_flush(&data, ctx);
 
         if can_flush && data.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
-            if let Some(result) = flush_data(data, ctx) {
+            if let Some(result) = flush_data(data, ctx, observer) {
                 observer.on_flush(result).unwrap();
             }
         } else {

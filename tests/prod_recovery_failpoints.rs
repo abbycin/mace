@@ -164,6 +164,27 @@ fn assert_bucket_readable(db_root: &Path) {
     }
 }
 
+fn data_blob_files(db_root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let root = db_root.join("data");
+    let entries = std::fs::read_dir(&root).expect("read data dir failed");
+    for entry in entries {
+        let entry = entry.expect("read data dir entry failed");
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if name.starts_with("data_") || name.starts_with("blob_") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
 fn wait_for_crash(timeout: Duration) -> ! {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -319,7 +340,18 @@ fn chaos_failpoint_flush_after_data_sync() {
         "mace_flush_after_data_sync=abort@1",
     );
     assert!(!status.success(), "flush failpoint child should abort");
+    let crashed_files = data_blob_files(&path);
+    assert!(
+        !crashed_files.is_empty(),
+        "expected flush crash to leave data/blob files before recovery"
+    );
     assert_visibility_after_reopen(&path, 64, 24);
+    for file in crashed_files {
+        assert!(
+            !file.exists(),
+            "flush orphan file should be cleaned on reopen: {file:?}"
+        );
+    }
 }
 
 #[test]
@@ -335,7 +367,18 @@ fn chaos_failpoint_flush_before_manifest_commit() {
         !status.success(),
         "flush-before-manifest failpoint child should abort"
     );
+    let crashed_files = data_blob_files(&path);
+    assert!(
+        !crashed_files.is_empty(),
+        "expected flush crash to leave data/blob files before recovery"
+    );
     assert_visibility_after_reopen(&path, 64, 24);
+    for file in crashed_files {
+        assert!(
+            !file.exists(),
+            "flush orphan file should be cleaned on reopen: {file:?}"
+        );
+    }
 }
 
 #[test]
@@ -351,7 +394,16 @@ fn chaos_failpoint_flush_after_manifest_commit() {
         !status.success(),
         "flush-after-manifest failpoint child should abort"
     );
+    let crashed_files = data_blob_files(&path);
+    assert!(
+        !crashed_files.is_empty(),
+        "expected committed flush files before recovery"
+    );
     assert_visibility_after_reopen(&path, 64, 24);
+    assert!(
+        crashed_files.iter().any(|file| file.exists()),
+        "flush files committed before crash should survive recovery"
+    );
 }
 
 #[test]
