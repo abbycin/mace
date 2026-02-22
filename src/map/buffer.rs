@@ -789,7 +789,7 @@ impl BucketMgr {
             .iter()
             .filter_map(|x| {
                 let ctx = x.value().clone();
-                if ctx.state.is_deleting() {
+                if ctx.state.is_deleting() || ctx.state.is_drop() {
                     None
                 } else {
                     Some(ctx)

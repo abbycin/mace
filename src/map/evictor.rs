@@ -131,6 +131,9 @@ impl Evictor {
             let mut evicted = false;
 
             for (bucket_ctx, pid) in candidates.iter().take(target) {
+                if bucket_ctx.state.is_deleting() || bucket_ctx.state.is_drop() {
+                    continue;
+                }
                 let Some(state) = bucket_ctx.cool(*pid) else {
                     continue;
                 };
@@ -145,7 +148,10 @@ impl Evictor {
                     if swip.is_null() {
                         break;
                     }
-                    assert!(!swip.is_tagged());
+                    // tagged means the page has been evicted or was replaced while candidate ring is stale
+                    if swip.is_tagged() {
+                        break;
+                    }
                     let old = Page::<Loader>::from_swip(swip.untagged());
                     self.current_pool = Some(old.loader.pool);
                     self.current_bucket_id = bucket_ctx.bucket_id;
@@ -265,6 +271,9 @@ impl Evictor {
         for _ in 0..EVICT_SAMPLE_MAX_ROUNDS {
             candidates.shuffle(&mut rng);
             for (bucket_ctx, pid) in candidates.iter().take(target) {
+                if bucket_ctx.state.is_deleting() || bucket_ctx.state.is_drop() {
+                    continue;
+                }
                 let Some(state) = bucket_ctx.cache_state(*pid) else {
                     continue;
                 };
@@ -277,8 +286,10 @@ impl Evictor {
                 if swip.is_null() {
                     continue;
                 }
-
-                assert!(!swip.is_tagged());
+                // tagged means the page has been evicted or replaced already
+                if swip.is_tagged() {
+                    continue;
+                }
                 let old = Page::<Loader>::from_swip(swip.untagged());
                 if old.delta_len() > limit {
                     let Some(_lk) = old.try_lock() else {
