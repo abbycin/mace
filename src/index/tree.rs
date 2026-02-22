@@ -8,6 +8,9 @@ use crate::types::node::RawLeafIter;
 use crate::types::refbox::DeltaView;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::data::Position;
+use crate::utils::observe::{
+    CounterMetric, HistogramMetric, LATENCY_SAMPLE_SHIFT, observe_elapsed, sampled_instant,
+};
 use crate::utils::{Handle, MutRef, NULL_ADDR, OpCode};
 use crate::{
     Store,
@@ -587,8 +590,14 @@ impl Tree {
             let Some(node) = page.try_lock() else {
                 continue;
             };
+            let lock_started = sampled_instant(k.txid(), LATENCY_SAMPLE_SHIFT);
             // consolidate happened, we must retry from root
             if self.bucket.table.get(page.pid()) != page.swip() {
+                observe_elapsed(
+                    self.store.opt.observer.as_ref(),
+                    HistogramMetric::TreeLinkHoldMicros,
+                    lock_started,
+                );
                 return Err(OpCode::Again);
             };
 
@@ -599,6 +608,11 @@ impl Tree {
             node.insert(k, v);
             drop(node);
             txn.record_and_commit(group_id as usize, pos);
+            observe_elapsed(
+                self.store.opt.observer.as_ref(),
+                HistogramMetric::TreeLinkHoldMicros,
+                lock_started,
+            );
             return Ok(());
         }
     }
@@ -625,6 +639,10 @@ impl Tree {
             match self.try_put::<K, V>(g, &key, &val) {
                 Ok(_) => return Ok(()),
                 Err(OpCode::Again) => {
+                    self.store
+                        .opt
+                        .observer
+                        .counter(CounterMetric::TreeRetryAgain, 1);
                     g.flush();
                     continue;
                 }
@@ -677,6 +695,10 @@ impl Tree {
             match self.try_update(g, &key, &val, &mut visible) {
                 Ok(x) => return Ok(x),
                 Err(OpCode::Again) => {
+                    self.store
+                        .opt
+                        .observer
+                        .counter(CounterMetric::TreeRetryAgain, 1);
                     g.flush();
                     continue;
                 }

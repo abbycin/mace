@@ -1,4 +1,6 @@
+use mace::observe::{CounterMetric, HistogramMetric, InMemoryObserver};
 use mace::{Mace, OpCode, Options, RandomPath};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -210,6 +212,72 @@ fn gc_wal() {
 
     let backup = db.options().wal_backup(0, 1);
     assert!(backup.exists());
+}
+
+#[test]
+fn gc_observer_metrics() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let observer = Arc::new(InMemoryObserver::new(256));
+    let mut opt = Options::new(&*path);
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = true;
+    opt.sync_on_write = false;
+    opt.data_garbage_ratio = 1;
+    opt.data_file_size = 128 << 10;
+    opt.gc_compacted_size = opt.data_file_size;
+    opt.observer = observer.clone();
+
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    for i in 0..4000 {
+        let k = format!("key_{i:08}");
+        let v = format!("value_{i:08}");
+        let tx = db.begin().unwrap();
+        tx.put(&k, &v)?;
+        tx.commit()?;
+    }
+
+    for i in 0..2000 {
+        let k = format!("key_{i:08}");
+        let tx = db.begin().unwrap();
+        tx.del(&k)?;
+        tx.commit()?;
+    }
+
+    mace.start_gc();
+
+    let snapshot = observer.snapshot();
+    let gc_runs = snapshot
+        .counters
+        .iter()
+        .find(|(m, _)| *m == CounterMetric::GcRun)
+        .map(|(_, v)| *v)
+        .unwrap_or(0);
+    assert!(gc_runs >= 1, "expected at least one gc run");
+
+    let scanned_pages = snapshot
+        .counters
+        .iter()
+        .find(|(m, _)| *m == CounterMetric::GcScavengePageScan)
+        .map(|(_, v)| *v)
+        .unwrap_or(0);
+    assert!(
+        scanned_pages > 0,
+        "expected gc scavenge scan counter to be positive"
+    );
+
+    let run_hist_count = snapshot
+        .histograms
+        .iter()
+        .find(|(m, _)| *m == HistogramMetric::GcRunMicros)
+        .map(|(_, s)| s.count)
+        .unwrap_or(0);
+    assert!(
+        run_hist_count >= 1,
+        "expected at least one gc runtime histogram sample"
+    );
+    Ok(())
 }
 
 #[test]

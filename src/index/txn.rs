@@ -9,7 +9,14 @@ use crate::{
     },
     index::tree::{Iter, Tree},
     types::data::{Key, Record, Ver},
-    utils::{Handle, NULL_CMD, data::Position},
+    utils::{
+        Handle, NULL_CMD,
+        data::Position,
+        observe::{
+            CounterMetric, EventKind, HistogramMetric, LATENCY_SAMPLE_SHIFT, ObserveEvent,
+            observe_elapsed, sampled_instant,
+        },
+    },
 };
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::Ordering::Relaxed;
@@ -94,6 +101,7 @@ impl<'a> TxnKV<'a> {
             tree.bucket.state.dec_txn_ref();
             return Err(e);
         }
+        ctx.opt.observer.counter(CounterMetric::TxnBegin, 1);
 
         g.cc.commit_tree.compact(ctx, gid as u8);
         Ok(Self {
@@ -125,6 +133,29 @@ impl<'a> TxnKV<'a> {
     #[allow(clippy::mut_from_ref)]
     fn state_mut(&self) -> &mut TxnState {
         unsafe { &mut *self.state.get() }
+    }
+
+    #[inline]
+    fn observe_counter(&self, metric: CounterMetric, delta: u64) {
+        self.ctx.opt.observer.counter(metric, delta);
+    }
+
+    #[inline]
+    fn observe_event(&self, event: ObserveEvent) {
+        self.ctx.opt.observer.event(event);
+    }
+
+    #[inline]
+    fn conflict_abort(&self, txid: u64) -> OpCode {
+        self.observe_counter(CounterMetric::TxnConflictAbort, 1);
+        self.observe_event(ObserveEvent {
+            kind: EventKind::TxnConflictAbort,
+            bucket_id: self.bucket_id,
+            txid,
+            file_id: 0,
+            value: 0,
+        });
+        OpCode::AbortTx
     }
 
     fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<ValRef>, OpCode>
@@ -166,7 +197,7 @@ impl<'a> TxnKV<'a> {
                             rk.txid,
                         )
                     {
-                        Err(OpCode::AbortTx)
+                        Err(self.conflict_abort(state.start_ts))
                     } else {
                         Ok(())
                     }
@@ -210,7 +241,7 @@ impl<'a> TxnKV<'a> {
                         state.start_ts,
                         rk.txid,
                     ) {
-                        return Err(OpCode::AbortTx);
+                        return Err(self.conflict_abort(state.start_ts));
                     }
 
                     if !*logged {
@@ -292,7 +323,7 @@ impl<'a> TxnKV<'a> {
                         state.start_ts,
                         rk.txid,
                     ) {
-                        return Err(OpCode::AbortTx);
+                        return Err(self.conflict_abort(state.start_ts));
                     }
 
                     if !logged {
@@ -345,7 +376,7 @@ impl<'a> TxnKV<'a> {
                         .cc
                         .is_visible_to(self.ctx, gid as u8, t.group_id(), start_ts, rk.txid)
                     {
-                        return Err(OpCode::AbortTx);
+                        return Err(self.conflict_abort(start_ts));
                     }
 
                     if !logged {
@@ -374,6 +405,7 @@ impl<'a> TxnKV<'a> {
     pub fn commit(self) -> Result<(), OpCode> {
         self.should_abort()?;
         let state = self.state_ref();
+        let commit_started = sampled_instant(state.start_ts, LATENCY_SAMPLE_SHIFT);
         let g = self.ctx.group(state.group_id);
 
         #[cfg(feature = "failpoints")]
@@ -386,6 +418,12 @@ impl<'a> TxnKV<'a> {
             }
             g.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
+            self.observe_counter(CounterMetric::TxnCommit, 1);
+            observe_elapsed(
+                self.ctx.opt.observer.as_ref(),
+                HistogramMetric::TxnCommitMicros,
+                commit_started,
+            );
             return Ok(());
         }
 
@@ -407,6 +445,12 @@ impl<'a> TxnKV<'a> {
 
         g.active_txns.remove(&state.start_ts);
         self.is_end.set(true);
+        self.observe_counter(CounterMetric::TxnCommit, 1);
+        observe_elapsed(
+            self.ctx.opt.observer.as_ref(),
+            HistogramMetric::TxnCommitMicros,
+            commit_started,
+        );
         Ok(())
     }
 
@@ -465,9 +509,11 @@ impl Drop for TxnKV<'_> {
                         log::error!("can't record abort, {:?}", e);
                     })
                     .expect("can't fail");
+                self.observe_counter(CounterMetric::TxnAbort, 1);
             } else {
                 use crate::cc::wal::{Location, WalReader};
                 use crate::utils::block::Block;
+                let rollback_started = sampled_instant(state.start_ts, LATENCY_SAMPLE_SHIFT);
 
                 let mut log = grp.logging.lock();
                 log.sync(false)
@@ -505,6 +551,20 @@ impl Drop for TxnKV<'_> {
                 grp.cc.commit_tree.append(state.start_ts, commit_ts);
                 grp.cc.latest_cts.store(commit_ts, Relaxed);
                 grp.cc.collect_wmk(self.ctx);
+                self.observe_counter(CounterMetric::TxnAbort, 1);
+                self.observe_counter(CounterMetric::TxnRollback, 1);
+                observe_elapsed(
+                    self.ctx.opt.observer.as_ref(),
+                    HistogramMetric::TxnRollbackMicros,
+                    rollback_started,
+                );
+                self.observe_event(ObserveEvent {
+                    kind: EventKind::TxnRollbackComplete,
+                    bucket_id: self.bucket_id,
+                    txid: state.start_ts,
+                    file_id: state.prev_lsn.file_id,
+                    value: state.prev_lsn.offset,
+                });
             }
             grp.active_txns.remove(&state.start_ts);
             self.is_end.set(true);

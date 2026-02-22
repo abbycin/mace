@@ -258,6 +258,97 @@ Obsolete files are normal GC outputs (not orphans). Deletion is handled by `Mani
 This makes file deletion idempotent across crashes.
 
 
+## Observability design
+
+### Goals and non-goals
+
+- Provide low-overhead, in-process signals for correctness and performance diagnosis
+- Keep observability decoupled from engine behavior (metrics must not change durability or concurrency semantics)
+- Avoid dynamic label cardinality and allocator-heavy hot-path reporting
+- Non-goal: built-in exporter/protocol integration (Prometheus/OpenTelemetry adapters are external)
+
+### API and lifecycle
+
+- `Options::observer: Arc<dyn Observer>` is the injection point
+- Default is `NoopObserver`, so observability is opt-in and zero-cost by default
+- Public API is re-exported as `mace::observe`
+- `Observer` interface is push-based:
+  - `counter(CounterMetric, delta)`
+  - `gauge(GaugeMetric, value)`
+  - `histogram(HistogramMetric, value)`
+  - `event(ObserveEvent)`
+- Callbacks can run concurrently from writer threads, recovery, and GC thread, so implementations must be `Send + Sync`, non-blocking, and panic-free
+
+Built-in utility implementation:
+
+- `InMemoryObserver` keeps fixed metric arrays (atomics) and a bounded FIFO event buffer (`event_cap`)
+- Snapshot API (`snapshot()`) is intended for tests, local debugging, and example/demo usage
+
+### Metric and event model
+
+- `CounterMetric`: monotonic `u64` process-local counters
+- `GaugeMetric`: point-in-time `i64` gauges
+- `HistogramMetric`: reduced summary (`count`, `sum`, `max`) per metric
+- `EventKind` + `ObserveEvent { kind, bucket_id, txid, file_id, value }`: sparse structured events for critical lifecycle points
+
+All metric dimensions are encoded in enums (fixed cardinality, no runtime label map).
+
+### Coverage by subsystem
+
+- Transaction/MVCC (`TxnKV`):
+  - counters: begin/commit/abort/conflict-abort/rollback/retry
+  - histograms: commit latency, rollback latency
+  - events: conflict-abort, rollback-complete
+- Index tree (`Tree::link`, retry loops):
+  - counters: tree retry-again
+  - histograms: link lock-hold latency
+- WAL (`cc/log.rs`):
+  - counters: append count, sync count
+  - histograms: append bytes, sync latency
+- Flush/manifest orphan protocol (`meta/mod.rs`):
+  - counters: orphan data/blob staged and cleared
+  - events: orphan stage/clear transitions
+- Recovery (`store/recovery.rs`):
+  - counters: redo record count, undo txn count, wal truncate count
+  - gauges: dirty entries, undo entries
+  - histograms: phase2/analyze/redo/undo latency
+  - events: phase2 begin/end
+- GC (`store/gc.rs`):
+  - counters:
+    - gc run count
+    - wal recycle file count
+    - pending bucket clean count
+    - scavenge scanned/compacted page count
+    - data/blob rewrite count
+    - data/blob obsolete file count
+  - histograms:
+    - gc run latency
+    - scavenge latency
+    - data/blob rewrite latency
+    - data/blob rewrite victim-file count
+  - events:
+    - pending bucket cleaned
+    - data rewrite complete
+    - blob rewrite complete
+
+### Hot-path overhead control
+
+- Latency metrics in high-frequency paths are sampled via `should_sample(seed, LATENCY_SAMPLE_SHIFT)`
+- Current default sample rate is `1 / 64` (`LATENCY_SAMPLE_SHIFT = 6`) for:
+  - txn commit latency
+  - txn rollback latency
+  - tree link lock-hold latency
+  - wal sync latency
+- Low-frequency paths (recovery/GC) report full latency without sampling
+- Metric emission is inline (no background dispatch queue), so observer implementations should keep per-call work O(1)
+
+### Validation and usage
+
+- Example usage: `examples/observer.rs`
+- Baseline observer unit test: `src/utils/observe.rs` (`snapshot_counts`)
+- GC observability regression test: `tests/gc.rs` (`gc_observer_metrics`)
+
+
 ## Disk GC and rewrite
 
 ### Data and blob stats

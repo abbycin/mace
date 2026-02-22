@@ -1,9 +1,11 @@
 use std::{
     ops::Deref,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::utils::lru::LRU_SHARD;
+use crate::utils::observe::{NoopObserver, Observer};
 
 use super::OpCode;
 
@@ -97,6 +99,8 @@ pub struct Options {
     /// if true, corrupted WAL will be truncated during recovery, otherwise it will panic
     /// default is true
     pub truncate_corrupted_wal: bool,
+    /// observability callback, default is noop
+    pub observer: Arc<dyn Observer>,
 }
 
 impl Options {
@@ -154,6 +158,7 @@ impl Options {
             keep_stable_wal_file: false,
             split_elems: Self::MAX_SPLIT_ELEMS,
             truncate_corrupted_wal: true,
+            observer: Arc::new(NoopObserver),
         }
     }
 

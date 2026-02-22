@@ -5,6 +5,9 @@ use crate::types::data::Key;
 use crate::utils::MutRef;
 use crate::utils::block::Ring;
 use crate::utils::data::Position;
+use crate::utils::observe::{
+    CounterMetric, HistogramMetric, LATENCY_SAMPLE_SHIFT, observe_elapsed, sampled_instant,
+};
 use crate::utils::options::ParsedOptions;
 use crate::{cc::wal::EntryType, utils::data::GatherWriter};
 use crc32c::Crc32cHasher;
@@ -195,7 +198,17 @@ impl Logging {
             self.writer.queue(nv);
             self.writer.flush();
             if self.opt.sync_on_write {
+                let sync_started = sampled_instant(
+                    self.log_pos.file_id ^ self.log_pos.offset,
+                    LATENCY_SAMPLE_SHIFT,
+                );
                 self.writer.sync();
+                self.opt.observer.counter(CounterMetric::WalSync, 1);
+                observe_elapsed(
+                    self.opt.observer.as_ref(),
+                    HistogramMetric::WalSyncMicros,
+                    sync_started,
+                );
             }
         }
         self.advance(size)?;
@@ -263,6 +276,10 @@ impl Logging {
         } else {
             self.record_large(&u, k.raw, w.to_slice(), ov, nv)?;
         }
+        self.opt.observer.counter(CounterMetric::WalAppend, 1);
+        self.opt
+            .observer
+            .histogram(HistogramMetric::WalAppendBytes, total_sz as u64);
         Ok(current_pos)
     }
 
@@ -350,8 +367,18 @@ impl Logging {
             self.numerics.log_size.fetch_add(len, Relaxed);
         }
         if force || self.opt.sync_on_write {
+            let sync_started = sampled_instant(
+                self.log_pos.file_id ^ self.log_pos.offset,
+                LATENCY_SAMPLE_SHIFT,
+            );
             self.writer.sync();
             self.durable_pos = self.flushed_pos;
+            self.opt.observer.counter(CounterMetric::WalSync, 1);
+            observe_elapsed(
+                self.opt.observer.as_ref(),
+                HistogramMetric::WalSyncMicros,
+                sync_started,
+            );
         }
         Ok(())
     }

@@ -35,6 +35,7 @@ use crate::{
         data::{LenSeq, Reloc},
         interval::IntervalMap,
         lru::{Lru, ShardLru},
+        observe::{CounterMetric, EventKind, ObserveEvent},
         options::ParsedOptions,
     },
 };
@@ -794,10 +795,30 @@ impl Manifest {
 
     pub(crate) fn stage_orphan_data_file(&self, file_id: u64) {
         self.stage_orphan_marker(orphan_data_marker_key(file_id), "data", file_id);
+        self.opt
+            .observer
+            .counter(CounterMetric::FlushOrphanDataStaged, 1);
+        self.opt.observer.event(ObserveEvent {
+            kind: EventKind::FlushOrphanDataStaged,
+            bucket_id: 0,
+            txid: 0,
+            file_id,
+            value: 0,
+        });
     }
 
     pub(crate) fn stage_orphan_blob_file(&self, file_id: u64) {
         self.stage_orphan_marker(orphan_blob_marker_key(file_id), "blob", file_id);
+        self.opt
+            .observer
+            .counter(CounterMetric::FlushOrphanBlobStaged, 1);
+        self.opt.observer.event(ObserveEvent {
+            kind: EventKind::FlushOrphanBlobStaged,
+            bucket_id: 0,
+            txid: 0,
+            file_id,
+            value: 0,
+        });
     }
 
     pub(crate) fn clear_orphan_data_file(&self, txn: &mut Txn<'_>, file_id: u64) {
@@ -805,6 +826,16 @@ impl Manifest {
             .entry(BUCKET_NUMERICS.to_string())
             .or_default()
             .push(MetaOp::Del(orphan_data_marker_key(file_id)));
+        self.opt
+            .observer
+            .counter(CounterMetric::FlushOrphanDataCleared, 1);
+        self.opt.observer.event(ObserveEvent {
+            kind: EventKind::FlushOrphanDataCleared,
+            bucket_id: 0,
+            txid: 0,
+            file_id,
+            value: 0,
+        });
     }
 
     pub(crate) fn clear_orphan_blob_file(&self, txn: &mut Txn<'_>, file_id: u64) {
@@ -812,6 +843,16 @@ impl Manifest {
             .entry(BUCKET_NUMERICS.to_string())
             .or_default()
             .push(MetaOp::Del(orphan_blob_marker_key(file_id)));
+        self.opt
+            .observer
+            .counter(CounterMetric::FlushOrphanBlobCleared, 1);
+        self.opt.observer.event(ObserveEvent {
+            kind: EventKind::FlushOrphanBlobCleared,
+            bucket_id: 0,
+            txid: 0,
+            file_id,
+            value: 0,
+        });
     }
 
     fn stage_orphan_marker(&self, key: Vec<u8>, kind: &str, file_id: u64) {

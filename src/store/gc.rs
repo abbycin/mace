@@ -13,7 +13,7 @@ use std::{
         mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -39,6 +39,7 @@ use crate::{
         block::Block,
         countblock::Countblock,
         data::{AddrPair, GatherWriter, Interval, LenSeq},
+        observe::{CounterMetric, EventKind, HistogramMetric, ObserveEvent},
     },
 };
 
@@ -212,12 +213,18 @@ impl GarbageCollector {
     const MAX_ELEMS: usize = 1024;
 
     fn run(&mut self) {
+        let started = Instant::now();
+        self.store.opt.observer.counter(CounterMetric::GcRun, 1);
         self.process_wal();
         self.process_data();
         self.process_blob();
         self.process_pending_buckets();
         self.scavenge();
         self.store.manifest.delete_files();
+        self.store.opt.observer.histogram(
+            HistogramMetric::GcRunMicros,
+            started.elapsed().as_micros() as u64,
+        );
     }
 
     fn process_pending_buckets(&mut self) {
@@ -233,15 +240,27 @@ impl GarbageCollector {
         });
 
         if let Some(bucket_id) = bucket_id {
-            self.clean_one_bucket(bucket_id);
+            let removed_pages = self.clean_one_bucket(bucket_id);
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::GcPendingBucketClean, 1);
+            self.store.opt.observer.event(ObserveEvent {
+                kind: EventKind::GcPendingBucketCleaned,
+                bucket_id,
+                txid: 0,
+                file_id: 0,
+                value: removed_pages,
+            });
         }
     }
 
-    fn clean_one_bucket(&mut self, bucket_id: u64) {
+    fn clean_one_bucket(&mut self, bucket_id: u64) -> u64 {
         let bucket_table = page_table_name(bucket_id);
         let data_interval_table = data_interval_name(bucket_id);
         let blob_interval_table = blob_interval_name(bucket_id);
         const PID_PER_ROUND: usize = 100000;
+        let mut removed_pages = 0;
 
         loop {
             let mut pids = Vec::with_capacity(PID_PER_ROUND);
@@ -263,6 +282,7 @@ impl GarbageCollector {
 
             let mut txn = self.store.manifest.begin();
             let ops = txn.ops_mut().entry(bucket_table.clone()).or_default();
+            removed_pages += pids.len() as u64;
             for (pid, _) in &pids {
                 ops.push(MetaOp::Del(pid.to_be_bytes().to_vec()));
             }
@@ -280,10 +300,14 @@ impl GarbageCollector {
             .push(MetaOp::Del(bucket_id.to_be_bytes().to_vec()));
         self.store.manifest.nr_buckets.fetch_sub(1, Relaxed);
         txn.commit();
+        removed_pages
     }
 
     fn scavenge(&mut self) {
+        let started = Instant::now();
         let g = crossbeam_epoch::pin();
+        let mut scanned_pages = 0;
+        let mut compacted_pages = 0;
 
         let bucket_ctxs = self.store.manifest.buckets.active_contexts();
 
@@ -332,12 +356,14 @@ impl GarbageCollector {
                 if swip.is_null() {
                     continue;
                 }
+                scanned_pages += 1;
 
                 let tree = Tree::new(self.store.clone(), ROOT_PID, ctx.clone());
 
                 match tree.try_scavenge(cursor, &g) {
                     Ok(true) => {
                         compact_count += 1;
+                        compacted_pages += 1;
                     }
                     _ => {
                         // page is locked or busy or something else, just skip it this time
@@ -350,6 +376,23 @@ impl GarbageCollector {
                 }
             }
         }
+
+        if scanned_pages > 0 {
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::GcScavengePageScan, scanned_pages);
+        }
+        if compacted_pages > 0 {
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::GcScavengePageCompact, compacted_pages);
+        }
+        self.store.opt.observer.histogram(
+            HistogramMetric::GcScavengeMicros,
+            started.elapsed().as_micros() as u64,
+        );
     }
 
     fn process_obsoleted_blob(&self, obsoleted: &[u64], bucket_id: u64) {
@@ -379,6 +422,10 @@ impl GarbageCollector {
                 .remove_stat_interval(obsoleted);
             self.store.manifest.save_obsolete_blob(obsoleted);
             self.store.manifest.delete_files();
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::GcBlobObsoleteFile, obsoleted.len() as u64);
         }
     }
 
@@ -409,6 +456,10 @@ impl GarbageCollector {
                 .remove_stat_interval(&obsoleted);
             self.store.manifest.save_obsolete_data(&obsoleted);
             self.store.manifest.delete_files();
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::GcDataObsoleteFile, obsoleted.len() as u64);
         }
     }
 
@@ -558,12 +609,20 @@ impl GarbageCollector {
             }
 
             // [oldest_id, checkpoint_id)
-            Self::process_one_wal(&self.store.opt, g.id as u8, oldest_id, checkpoint_id);
+            let recycled =
+                Self::process_one_wal(&self.store.opt, g.id as u8, oldest_id, checkpoint_id);
+            if recycled > 0 {
+                self.store
+                    .opt
+                    .observer
+                    .counter(CounterMetric::GcWalRecycleFile, recycled);
+            }
             g.logging.lock().advance_oldest_wal_id(checkpoint_id);
         }
     }
 
-    fn process_one_wal(opt: &Options, id: u8, beg: u64, end: u64) {
+    fn process_one_wal(opt: &Options, id: u8, beg: u64, end: u64) -> u64 {
+        let mut recycled = 0;
         // NOTE: not including `end`
         for seq in beg..end {
             let from = opt.wal_file(id, seq);
@@ -584,10 +643,13 @@ impl GarbageCollector {
                     .inspect_err(|e| log::error!("can't remove {from:?}, error {e:?}"))
                     .unwrap();
             }
+            recycled += 1;
         }
+        recycled
     }
 
     fn rewrite_data(&mut self, candidate: Vec<Score>, bucket_id: u64) {
+        let started = Instant::now();
         let opt = &self.store.opt;
         let file_id = self.numerics.next_data_id.fetch_add(1, Relaxed);
         // stage orphan intent before rewrite output is flushed
@@ -652,6 +714,7 @@ impl GarbageCollector {
                 Some(x.id)
             })
             .collect();
+        let victim_count = victims.len() as u64;
 
         // it's possible that other thread deactived all data in data file while we are procesing
         self.process_obsoleted_data(obsoleted, bucket_id);
@@ -705,9 +768,29 @@ impl GarbageCollector {
         self.store.manifest.save_obsolete_data(&tmp);
         self.store.manifest.delete_files();
         self.data_runs.fetch_add(1, AcqRel);
+        self.store
+            .opt
+            .observer
+            .counter(CounterMetric::GcDataRewrite, 1);
+        self.store.opt.observer.histogram(
+            HistogramMetric::GcDataRewriteMicros,
+            started.elapsed().as_micros() as u64,
+        );
+        self.store
+            .opt
+            .observer
+            .histogram(HistogramMetric::GcDataRewriteVictimFiles, victim_count);
+        self.store.opt.observer.event(ObserveEvent {
+            kind: EventKind::GcDataRewriteComplete,
+            bucket_id,
+            txid: 0,
+            file_id,
+            value: victim_count,
+        });
     }
 
     fn rewrite_blob(&mut self, candidate: &[u64], bucket_id: u64) {
+        let started = Instant::now();
         let opt = &self.ctx.opt;
         let mut remap_intervals = Vec::new();
         let mut del_intervals = DelInterval {
@@ -771,6 +854,7 @@ impl GarbageCollector {
                 Some(victim_id)
             })
             .collect();
+        let victim_count = victims.len() as u64;
 
         // it's possible that other thread deactivated all data in blob file while we are processing
         self.process_obsoleted_blob(&obsoleted, bucket_id);
@@ -821,6 +905,25 @@ impl GarbageCollector {
         self.store.manifest.save_obsolete_blob(&tmp);
         self.store.manifest.delete_files();
         self.blob_runs.fetch_add(1, AcqRel);
+        self.store
+            .opt
+            .observer
+            .counter(CounterMetric::GcBlobRewrite, 1);
+        self.store.opt.observer.histogram(
+            HistogramMetric::GcBlobRewriteMicros,
+            started.elapsed().as_micros() as u64,
+        );
+        self.store
+            .opt
+            .observer
+            .histogram(HistogramMetric::GcBlobRewriteVictimFiles, victim_count);
+        self.store.opt.observer.event(ObserveEvent {
+            kind: EventKind::GcBlobRewriteComplete,
+            bucket_id,
+            txid: 0,
+            file_id: blob_id,
+            value: victim_count,
+        });
     }
 }
 

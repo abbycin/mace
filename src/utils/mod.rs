@@ -19,6 +19,7 @@ pub(crate) mod failpoint;
 pub(crate) mod imtree;
 pub(crate) mod interval;
 pub(crate) mod lru;
+pub mod observe;
 pub(crate) mod options;
 pub(crate) mod queue;
 pub(crate) mod spooky;
