@@ -606,13 +606,13 @@ impl Tree {
             let (k, v) = DeltaView::from_key_val(&mut txn, k, v);
 
             node.insert(k, v);
-            drop(node);
-            txn.record_and_commit(group_id as usize, pos);
             observe_elapsed(
                 self.store.opt.observer.as_ref(),
                 HistogramMetric::TreeLinkHoldMicros,
                 lock_started,
             );
+            drop(node);
+            txn.record_and_commit(group_id as usize, pos);
             return Ok(());
         }
     }
@@ -699,6 +699,10 @@ impl Tree {
                         .opt
                         .observer
                         .counter(CounterMetric::TreeRetryAgain, 1);
+                    self.store
+                        .opt
+                        .observer
+                        .counter(CounterMetric::TxnRetryAgain, 1);
                     g.flush();
                     continue;
                 }
