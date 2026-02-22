@@ -28,6 +28,8 @@ pub enum FlushDirective {
 pub struct FlushResult {
     pub bucket_id: u64,
     pub data_id: u64,
+    pub dep_group_id: u64,
+    pub dep_group_items: u32,
     pub tick: u64,
     pub map_table: PageTable,
     pub data_ivl: IntervalPair,
@@ -79,6 +81,8 @@ fn flush_data(
     }
 
     let data_id = msg.id();
+    let dep_group_id = msg.dep_group_id();
+    let dep_group_items = msg.dep_group_items();
     let tick = data_id;
     let data_path = ctx.opt.data_file(data_id);
 
@@ -117,6 +121,8 @@ fn flush_data(
     Some(FlushResult {
         bucket_id,
         data_id,
+        dep_group_id,
+        dep_group_items,
         tick,
         map_table: map.table(),
         data_ivl,

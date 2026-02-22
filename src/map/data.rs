@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
     bucket_id: u64,
+    dep_group_id: u64,
+    dep_group_items: u32,
     cb: Box<dyn FnOnce()>,
 }
 
@@ -32,9 +34,33 @@ unsafe impl Send for FlushData {}
 
 impl FlushData {
     pub fn new(arena: Handle<Arena>, bucket_id: u64, cb: Box<dyn FnOnce()>) -> Self {
+        let dep_group_id = arena.id();
         Self {
             arena,
             bucket_id,
+            dep_group_id,
+            dep_group_items: 1,
+            cb,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_dep_group(
+        arena: Handle<Arena>,
+        bucket_id: u64,
+        dep_group_id: u64,
+        dep_group_items: u32,
+        cb: Box<dyn FnOnce()>,
+    ) -> Self {
+        if dep_group_items == 0 {
+            log::error!("invalid dep group size 0 for flush");
+            panic!("invalid dep group size 0");
+        }
+        Self {
+            arena,
+            bucket_id,
+            dep_group_id,
+            dep_group_items,
             cb,
         }
     }
@@ -45,6 +71,14 @@ impl FlushData {
 
     pub fn id(&self) -> u64 {
         self.arena.id()
+    }
+
+    pub fn dep_group_id(&self) -> u64 {
+        self.dep_group_id
+    }
+
+    pub fn dep_group_items(&self) -> u32 {
+        self.dep_group_items
     }
 
     pub fn mark_done(self) {
