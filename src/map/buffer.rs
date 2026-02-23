@@ -144,27 +144,7 @@ pub(crate) struct Pool {
     packed_multi: AtomicBool,
 }
 
-struct PackedAlloc {
-    arena: Handle<Arena>,
-    start_addr: u64,
-    addr_cur: u64,
-    addr_end: u64,
-    total_real_size: u32,
-    remain_real_size: u32,
-    nr_frames: u32,
-    allocated_addrs: Vec<u64>,
-}
-
-pub(crate) struct PackedAllocCtx {
-    mode: PackedAllocMode,
-}
-
-enum PackedAllocMode {
-    Single(PackedAlloc),
-    Multi(PackedAllocMulti),
-}
-
-struct PackedAllocMulti {
+pub(crate) struct PackedAlloc {
     pool: Handle<Pool>,
     dep_group_id: u64,
     total_real_size: u32,
@@ -202,24 +182,9 @@ impl PackedSegment {
             allocated_addrs: Vec::new(),
         }
     }
-
-    fn rollback(&mut self) {
-        for addr in self.allocated_addrs.drain(..) {
-            if !self.arena.remove_item_only(addr) {
-                log::error!(
-                    "packed cancel remove failed, arena {}, addr {}",
-                    self.arena.id(),
-                    addr
-                );
-                panic!("packed cancel remove failed");
-            }
-        }
-        self.arena
-            .rollback_batch(self.reserved_real_size, self.reserved_frames);
-    }
 }
 
-impl PackedAllocMulti {
+impl PackedAlloc {
     fn should_rotate_before_reserve(seg: &PackedSegment, real_size: u32) -> bool {
         let cur = seg.arena.real_size.load(Relaxed);
         let cap = seg.arena.cap() as u64;
@@ -263,7 +228,7 @@ impl PackedAllocMulti {
         self.current = PackedSegment::new(next);
     }
 
-    fn alloc(&mut self, size: u32) -> (Handle<Arena>, BoxRef) {
+    pub(crate) fn alloc(&mut self, size: u32) -> (Handle<Arena>, BoxRef) {
         let real_size = BoxRef::real_size(size);
         if self.remain_frames == 0 || self.remain_real_size < real_size {
             log::error!(
@@ -320,7 +285,7 @@ impl PackedAllocMulti {
         }
     }
 
-    fn finish(mut self) {
+    pub(crate) fn finish(mut self) {
         if self.remain_frames != 0 || self.remain_real_size != 0 {
             log::error!(
                 "packed multi mismatch, group {}, frames {}, remain_frames {}, total_real {}, remain_real {}",
@@ -331,6 +296,12 @@ impl PackedAllocMulti {
                 self.remain_real_size
             );
             panic!("packed multi mismatch");
+        }
+
+        if self.detached.is_empty() {
+            self.done = true;
+            self.pool.leave_packed_multi();
+            return;
         }
 
         if self.current.reserved_frames != 0 {
@@ -354,123 +325,25 @@ impl PackedAllocMulti {
         self.done = true;
         self.pool.leave_packed_multi();
     }
-
-    fn cancel(mut self) {
-        let used_frames = self.nr_frames.saturating_sub(self.remain_frames);
-        let used_real_size = self.total_real_size.saturating_sub(self.remain_real_size);
-        for seg in self.detached.iter_mut() {
-            seg.rollback();
-            // detached arenas may still contain committed frames before this packed scope
-            // they still need to be flushed in normal pipeline
-            self.pool.flush(seg.arena);
-        }
-
-        self.current.rollback();
-        log::error!(
-            "cancel packed multi allocation, group {}, used_frames {}, used_size {}, detached {}",
-            self.dep_group_id,
-            used_frames,
-            used_real_size,
-            self.detached.len()
-        );
-
-        self.done = true;
-        self.pool.leave_packed_multi();
-
-        #[cfg(feature = "extra_check")]
-        panic!("it's impossible to run");
-    }
 }
 
-impl Drop for PackedAllocMulti {
+impl Drop for PackedAlloc {
     fn drop(&mut self) {
         if !self.done {
+            // no cancel path: packed allocation is only created by BaseView::new_leaf with strict begin/end pairing
+            // node update paths are serialized by page/node locks, so rollback never depends on partial packed cleanup
+            // dropping without finish means packed closure invariant is broken and must fail fast
             self.pool.leave_packed_multi();
-        }
-    }
-}
-
-impl PackedAllocCtx {
-    pub(crate) fn alloc(&mut self, size: u32) -> (Handle<Arena>, BoxRef) {
-        match &mut self.mode {
-            PackedAllocMode::Single(x) => {
-                let real_size = BoxRef::real_size(size);
-                if x.addr_cur >= x.addr_end || x.remain_real_size < real_size {
-                    log::error!(
-                        "packed allocation overflow, arena {}, cur {}, end {}, remain {}, need {}",
-                        x.arena.id(),
-                        x.addr_cur,
-                        x.addr_end,
-                        x.remain_real_size,
-                        real_size
-                    );
-                    panic!("packed allocation overflow");
-                }
-
-                let addr = x.addr_cur;
-                x.addr_cur += 1;
-                x.remain_real_size -= real_size;
-
-                let b = x.arena.alloc_at_addr(addr, real_size);
-                x.allocated_addrs.push(addr);
-                (x.arena, b)
-            }
-            PackedAllocMode::Multi(x) => x.alloc(size),
-        }
-    }
-
-    pub(crate) fn finish(self) {
-        match self.mode {
-            PackedAllocMode::Single(x) => {
-                let used_frames = x.allocated_addrs.len() as u32;
-                if x.addr_cur != x.addr_end || x.remain_real_size != 0 || used_frames != x.nr_frames
-                {
-                    log::error!(
-                        "packed allocation mismatch, arena {}, frames {}, addr [{}, {}), cur {}, remain {}, used {}",
-                        x.arena.id(),
-                        x.nr_frames,
-                        x.start_addr,
-                        x.addr_end,
-                        x.addr_cur,
-                        x.remain_real_size,
-                        used_frames
-                    );
-                    panic!("packed allocation mismatch");
-                }
-            }
-            PackedAllocMode::Multi(x) => x.finish(),
-        }
-    }
-
-    // it's impossible to run, because all packed allocs are gaurded by lock and will do check to avoid duplicate
-    // operation after acquire lock
-    pub(crate) fn cancel(self) {
-        match self.mode {
-            PackedAllocMode::Single(mut x) => {
-                let used_frames = x.allocated_addrs.len() as u32;
-                for addr in x.allocated_addrs.drain(..) {
-                    if !x.arena.remove_item_only(addr) {
-                        log::error!(
-                            "packed cancel remove failed, arena {}, addr {}",
-                            x.arena.id(),
-                            addr
-                        );
-                        panic!("packed cancel remove failed");
-                    }
-                }
-                x.arena.rollback_batch(x.total_real_size, x.nr_frames);
-                log::error!(
-                    "cancel packed allocation, arena {}, range [{}, {}), used_frames {}, used_size {}",
-                    x.arena.id(),
-                    x.start_addr,
-                    x.addr_end,
-                    used_frames,
-                    x.total_real_size.saturating_sub(x.remain_real_size)
-                );
-                #[cfg(feature = "extra_check")]
-                panic!("it's impossible to run");
-            }
-            PackedAllocMode::Multi(x) => x.cancel(),
+            let used_frames = self.nr_frames.saturating_sub(self.remain_frames);
+            let used_real_size = self.total_real_size.saturating_sub(self.remain_real_size);
+            log::error!(
+                "packed allocation dropped without finish, group {}, used_frames {}, used_size {}, detached {}",
+                self.dep_group_id,
+                used_frames,
+                used_real_size,
+                self.detached.len()
+            );
+            panic!("packed allocation dropped without finish");
         }
     }
 }
@@ -617,7 +490,7 @@ impl Pool {
         let map = self.map.clone();
         let out = self.flush_out.clone();
 
-        let cb = move || {
+        let release = move || {
             h.set_state(Arena::COLD, Arena::FLUSH);
             h.clear();
             map.pop();
@@ -625,18 +498,21 @@ impl Pool {
             if free.push(h).is_err() {
                 h.reclaim();
             }
+        };
+        let done = move || {
             out.fetch_add(1, Relaxed);
         };
 
         let data = if dep_group_items == 1 && dep_group_id == h.id() {
-            FlushData::new(h, self.bucket_id, Box::new(cb))
+            FlushData::new(h, self.bucket_id, Box::new(release), Box::new(done))
         } else {
             FlushData::with_dep_group(
                 h,
                 self.bucket_id,
                 dep_group_id,
                 dep_group_items,
-                Box::new(cb),
+                Box::new(release),
+                Box::new(done),
             )
         };
         let _ = self.flush.tx.send(data);
@@ -685,68 +561,34 @@ impl Pool {
         }
     }
 
-    pub(crate) fn begin_packed_ctx(
+    pub(crate) fn begin_packed_alloc(
         &self,
         total_real_size: u32,
         nr_frames: u32,
-    ) -> Result<PackedAllocCtx, OpCode> {
+    ) -> Result<PackedAlloc, OpCode> {
         if nr_frames == 0 {
             log::error!("invalid packed allocation frame count 0");
             panic!("invalid packed allocation frame count");
         }
 
-        let cur = self.current();
-        if total_real_size as usize > cur.cap() {
-            self.enter_packed_multi();
-            let pool = Handle::from(self as *const Pool as *mut Pool);
-            let current = self.current();
-            if (current.id() & Self::MULTI_DEP_GROUP_TAG) != 0 {
-                log::error!("arena id overflow for multi dep group, id {}", current.id());
-                panic!("arena id overflow for multi dep group");
-            }
-            return Ok(PackedAllocCtx {
-                mode: PackedAllocMode::Multi(PackedAllocMulti {
-                    pool,
-                    dep_group_id: current.id() | Self::MULTI_DEP_GROUP_TAG,
-                    total_real_size,
-                    remain_real_size: total_real_size,
-                    nr_frames,
-                    remain_frames: nr_frames,
-                    detached: Vec::new(),
-                    current: PackedSegment::new(current),
-                    done: false,
-                }),
-            });
+        self.enter_packed_multi();
+        let pool = Handle::from(self as *const Pool as *mut Pool);
+        let current = self.current();
+        if (current.id() & Self::MULTI_DEP_GROUP_TAG) != 0 {
+            log::error!("arena id overflow for multi dep group, id {}", current.id());
+            panic!("arena id overflow for multi dep group");
         }
-
-        let _gate = self.enter_alloc_gate();
-        loop {
-            let a = self.current();
-            match a.reserve_batch(total_real_size, nr_frames) {
-                Ok(()) => {
-                    let start = self.state.reserve_addr_span(nr_frames as u64);
-                    return Ok(PackedAllocCtx {
-                        mode: PackedAllocMode::Single(PackedAlloc {
-                            arena: a,
-                            start_addr: start,
-                            addr_cur: start,
-                            addr_end: start + nr_frames as u64,
-                            total_real_size,
-                            remain_real_size: total_real_size,
-                            nr_frames,
-                            allocated_addrs: Vec::with_capacity(nr_frames as usize),
-                        }),
-                    });
-                }
-                Err(OpCode::Again) => continue,
-                Err(OpCode::NoSpace) => {
-                    if a.set_state(Arena::HOT, Arena::WARM) == Arena::HOT {
-                        self.install_new(a);
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        Ok(PackedAlloc {
+            pool,
+            dep_group_id: current.id() | Self::MULTI_DEP_GROUP_TAG,
+            total_real_size,
+            remain_real_size: total_real_size,
+            nr_frames,
+            remain_frames: nr_frames,
+            detached: Vec::new(),
+            current: PackedSegment::new(current),
+            done: false,
+        })
     }
 
     pub(crate) fn alloc_pair(
@@ -891,12 +733,12 @@ impl BucketContext {
         self.pool.alloc_pair(size1, size2)
     }
 
-    pub(crate) fn begin_packed_ctx(
+    pub(crate) fn begin_packed_alloc(
         &self,
         total_real_size: u32,
         nr_frames: u32,
-    ) -> Result<PackedAllocCtx, OpCode> {
-        self.pool.begin_packed_ctx(total_real_size, nr_frames)
+    ) -> Result<PackedAlloc, OpCode> {
+        self.pool.begin_packed_alloc(total_real_size, nr_frames)
     }
 
     pub(crate) fn record_lsn(&self, group_id: usize, pos: Position) {
@@ -1295,7 +1137,7 @@ mod test {
             assert!(total_real as usize > opt.data_file_size);
 
             let mut packed = pool
-                .begin_packed_ctx(total_real, 3)
+                .begin_packed_alloc(total_real, 3)
                 .expect("begin packed allocation failed");
             for seq in 0..3 {
                 let (arena, mut b) = packed.alloc(frame_size);

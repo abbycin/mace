@@ -1,7 +1,7 @@
 use crate::OpCode;
 use crate::index::Node;
 use crate::index::Page;
-use crate::map::buffer::{BucketContext, PackedAllocCtx};
+use crate::map::buffer::{BucketContext, PackedAlloc};
 use crate::map::data::Arena;
 use crate::map::table::PageMap;
 use crate::types::header::TagFlag;
@@ -22,8 +22,7 @@ pub struct SysTxn<'a> {
     /// set to TombStone on failure
     garbage: Vec<u64>,
     allocs: Vec<(Handle<Arena>, BoxView)>,
-    packed_ctx: Option<PackedAllocCtx>,
-    packed_alloc_start: Option<usize>,
+    packed_alloc: Option<PackedAlloc>,
 }
 
 impl<'a> SysTxn<'a> {
@@ -41,8 +40,7 @@ impl<'a> SysTxn<'a> {
             maps: Vec::new(),
             garbage: Vec::new(),
             allocs: Vec::new(),
-            packed_ctx: None,
-            packed_alloc_start: None,
+            packed_alloc: None,
         }
     }
 
@@ -52,9 +50,8 @@ impl<'a> SysTxn<'a> {
     }
 
     pub fn commit(&mut self) {
-        if let Some(ctx) = self.packed_ctx.take() {
-            ctx.finish();
-            self.packed_alloc_start = None;
+        if let Some(packed) = self.packed_alloc.take() {
+            packed.finish();
         }
         self.maps.clear();
         while let Some((a, _)) = self.allocs.pop() {
@@ -70,8 +67,8 @@ impl<'a> SysTxn<'a> {
     }
 
     pub fn alloc(&mut self, size: u32) -> BoxRef {
-        let (h, t) = if let Some(ctx) = self.packed_ctx.as_mut() {
-            ctx.alloc(size)
+        let (h, t) = if let Some(packed) = self.packed_alloc.as_mut() {
+            packed.alloc(size)
         } else {
             self.buffer.alloc(size).expect("never happen")
         };
@@ -88,26 +85,24 @@ impl<'a> SysTxn<'a> {
     }
 
     fn begin_packed_internal(&mut self, total_real_size: u32, nr_frames: u32) {
-        if self.packed_ctx.is_some() {
+        if self.packed_alloc.is_some() {
             log::error!("nested packed allocation in SysTxn");
             panic!("nested packed allocation in SysTxn");
         }
 
-        let ctx = self
+        let packed = self
             .buffer
-            .begin_packed_ctx(total_real_size, nr_frames)
+            .begin_packed_alloc(total_real_size, nr_frames)
             .expect("begin packed allocation failed");
-        self.packed_alloc_start = Some(self.allocs.len());
-        self.packed_ctx = Some(ctx);
+        self.packed_alloc = Some(packed);
     }
 
     fn end_packed_internal(&mut self) {
-        let Some(ctx) = self.packed_ctx.take() else {
+        let Some(packed) = self.packed_alloc.take() else {
             log::error!("end packed allocation without begin in SysTxn");
             panic!("end packed allocation without begin in SysTxn");
         };
-        ctx.finish();
-        self.packed_alloc_start = None;
+        packed.finish();
     }
 
     /// map pid to page table and assign pid to page
@@ -205,14 +200,6 @@ impl<'a> SysTxn<'a> {
 
 impl Drop for SysTxn<'_> {
     fn drop(&mut self) {
-        if let Some(ctx) = self.packed_ctx.take() {
-            ctx.cancel();
-            // the arena's refs has been decreased in `cancel`, we must skip them
-            if let Some(start) = self.packed_alloc_start.take() {
-                self.allocs.truncate(start);
-            }
-        }
-
         while let Some((pid, swip)) = self.maps.pop() {
             // rollback: pid should still point to the swip we installed; failure indicates fatal corruption
             self.table

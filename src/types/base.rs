@@ -477,6 +477,18 @@ where
     type Item = (Key<'a>, Val<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_with_sibling(|_| {})
+    }
+}
+
+impl<'a, L> BaseIter<'a, L, Key<'a>>
+where
+    L: ILoader,
+{
+    pub(crate) fn next_with_sibling<F>(&mut self, mut on_sibling: F) -> Option<(Key<'a>, Val<'a>)>
+    where
+        F: FnMut(u64),
+    {
         while let Some(p) = self.sibling.as_ref() {
             if self.sibling_pos < p.header().elems as usize {
                 let (ver, val) = p.sst::<Ver>().kv_at(self.sibling_pos);
@@ -487,6 +499,7 @@ where
                 let link = p.box_header().link;
                 self.sibling_pos = 0;
                 if link != NULL_ADDR {
+                    on_sibling(link);
                     self.sibling = Some(self.loader.load_unchecked(link).as_base());
                     continue;
                 }
@@ -498,6 +511,7 @@ where
             self.beg += 1;
             if let Some(addr) = v.get_sibling() {
                 self.sib_key = k.raw;
+                on_sibling(addr);
                 self.sibling = Some(self.loader.load_unchecked(addr).as_base());
                 self.sibling_pos = 0;
                 // the sibling is still in `v`

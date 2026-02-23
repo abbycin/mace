@@ -1035,13 +1035,11 @@ where
     // instead, and apply prefix then remove new prefix in `Base::new_leaf`
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.next_r.is_none()
-                && let Some((k, v)) = self.sst_iter.next()
-            {
-                if let Some(sib) = v.get_sibling() {
-                    self.filter.junks.push(sib);
+            if self.next_r.is_none() {
+                let (sst_iter, filter) = (&mut self.sst_iter, &mut self.filter);
+                if let Some((k, v)) = sst_iter.next_with_sibling(|addr| filter.junks.push(addr)) {
+                    self.next_r = Some((LeafSeg::new(self.prefix, k.raw, k.ver), v));
                 }
-                self.next_r = Some((LeafSeg::new(self.prefix, k.raw, k.ver), v));
             }
 
             if self.next_l.is_none()
@@ -1212,17 +1210,19 @@ mod test {
     use crate::{
         Options,
         types::{
-            data::{Key, Record, Ver},
+            data::{Key, LeafSeg, Record, Val, Ver},
             node::Node,
-            refbox::{BoxRef, BoxView, DeltaView},
-            traits::{IAlloc, IHeader, ILoader},
+            refbox::{BaseView, BoxRef, BoxView, DeltaView},
+            traits::{IAlloc, ICodec, IHeader, ILoader},
         },
-        utils::OpCode,
+        utils::{NULL_ADDR, NULL_PID, OpCode},
     };
 
     struct AInner {
         map: Mutex<HashMap<u64, BoxRef>>,
         off: AtomicU64,
+        collected: Mutex<Vec<u64>>,
+        arena_size: usize,
     }
 
     #[derive(Clone)]
@@ -1232,10 +1232,16 @@ mod test {
 
     impl A {
         fn new() -> Self {
+            Self::new_with_arena_size(64 << 20)
+        }
+
+        fn new_with_arena_size(arena_size: usize) -> Self {
             Self {
                 inner: Rc::new(AInner {
                     map: Mutex::new(HashMap::new()),
                     off: AtomicU64::new(0),
+                    collected: Mutex::new(Vec::new()),
+                    arena_size,
                 }),
             }
         }
@@ -1243,6 +1249,11 @@ mod test {
         fn load(&self, addr: u64) -> BoxRef {
             let lk = self.inner.map.lock();
             lk.get(&addr).unwrap().clone()
+        }
+
+        fn take_collected(&self) -> Vec<u64> {
+            let mut lk = self.inner.collected.lock();
+            std::mem::take(&mut *lk)
         }
     }
 
@@ -1259,10 +1270,13 @@ mod test {
         }
 
         fn arena_size(&mut self) -> usize {
-            64 << 20
+            self.inner.arena_size
         }
 
-        fn collect(&mut self, _addr: &[u64]) {}
+        fn collect(&mut self, addr: &[u64]) {
+            let mut lk = self.inner.collected.lock();
+            lk.extend_from_slice(addr);
+        }
 
         fn inline_size(&self) -> usize {
             Options::INLINE_SIZE
@@ -1454,6 +1468,54 @@ mod test {
                 assert!(old.cmp(&k).is_lt());
             }
             last = Some(k);
+        }
+    }
+
+    #[test]
+    fn garbage_collect_collects_whole_sibling_chain() {
+        let mut a = A::new_with_arena_size(96);
+        let l = a.clone();
+
+        fn gen_val(a: &mut A, r: Record) -> Val<'static> {
+            let sz = Val::calc_size(false, a.inline_size(), r.packed_size());
+            let mut b = a.allocate(sz as u32);
+            Val::encode_inline(b.data_slice_mut::<u8>(), NULL_ADDR, &r);
+            Val::from_raw(unsafe { std::mem::transmute::<&[u8], &[u8]>(b.data_slice::<u8>()) })
+        }
+
+        let mut items = Vec::new();
+        for i in (0..16u64).rev() {
+            items.push((
+                LeafSeg::new(&[], "hot_key".as_bytes(), Ver::new(i + 1, 1)),
+                gen_val(&mut a, Record::normal(1, format!("v{i}").as_bytes())),
+            ));
+        }
+        let mut iter = items.iter().map(|x| (x.0, x.1));
+        let base = BaseView::new_leaf(&mut a, &l, &[], None, NULL_PID, &mut iter, 1);
+        let node = Node::new(l, base);
+
+        let mut sst_iter = node.range_iter::<A, Key>(&node.loader, 0, node.header().elems as usize);
+        let (_, val) = sst_iter.next().expect("must exist");
+        let head = val.get_sibling().expect("must have sibling");
+
+        let mut sibling_chain = Vec::new();
+        let mut cur = head;
+        while cur != NULL_ADDR {
+            sibling_chain.push(cur);
+            let view = node.loader.load_unchecked(cur);
+            cur = view.header().link;
+        }
+        assert!(sibling_chain.len() > 1);
+
+        let (_next, junks) = node.compact(&mut a, u64::MAX);
+        for addr in &sibling_chain {
+            assert!(junks.contains(addr));
+        }
+
+        node.garbage_collect(&mut a, &junks);
+        let collected = a.take_collected();
+        for addr in sibling_chain {
+            assert!(collected.contains(&addr));
         }
     }
 }

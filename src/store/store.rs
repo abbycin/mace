@@ -99,7 +99,7 @@ impl StoreFlushObserver {
         }
     }
 
-    fn push_flush_result(&self, result: FlushResult) -> Option<PendingFlushGroup> {
+    fn push_flush_result(&self, mut result: FlushResult) -> Option<PendingFlushGroup> {
         let group_id = result.dep_group_id;
         let expected = result.dep_group_items;
         if expected == 0 {
@@ -110,20 +110,25 @@ impl StoreFlushObserver {
         let groups = self.ctx.groups();
         debug_assert_eq!(result.flsn.len(), groups.len());
 
-        if let Some(ctx) = self.manifest.buckets.buckets.get(&result.bucket_id) {
-            ctx.data_intervals.write().insert(
-                result.data_ivl.lo_addr,
-                result.data_ivl.hi_addr,
-                result.data_ivl.file_id,
-            );
-            if let Some(blob_ivl) = result.blob_ivl {
-                ctx.blob_intervals.write().insert(
-                    blob_ivl.lo_addr,
-                    blob_ivl.hi_addr,
-                    blob_ivl.file_id,
-                );
-            }
+        let ctx = self
+            .manifest
+            .buckets
+            .buckets
+            .get(&result.bucket_id)
+            .expect("bucket context must exist when flushing");
+        ctx.data_intervals.write().insert(
+            result.data_ivl.lo_addr,
+            result.data_ivl.hi_addr,
+            result.data_ivl.file_id,
+        );
+        if let Some(blob_ivl) = result.blob_ivl {
+            ctx.blob_intervals
+                .write()
+                .insert(blob_ivl.lo_addr, blob_ivl.hi_addr, blob_ivl.file_id);
         }
+        // release arena after pending visibility is in place
+        // done callback stays deferred until manifest publish
+        result.done.release();
 
         let mut lk = self.pending_groups.lock();
         let entry = lk.entry(group_id).or_insert_with(|| PendingFlushGroup {
@@ -142,15 +147,11 @@ impl StoreFlushObserver {
         }
 
         for (i, g) in groups.iter().enumerate() {
-            let dep_id =
-                g.dep_group
-                    .open_group(result.flsn[i], result.flsn[i], vec![result.data_id]);
-            g.dep_group
-                .seal_group(dep_id)
-                .expect("dep group seal transition failed");
-            g.dep_group
-                .mark_group_durable(dep_id)
-                .expect("dep group durable transition failed");
+            let dep_id = g.dep_group.open_group_durable(
+                result.flsn[i],
+                result.flsn[i],
+                vec![result.data_id],
+            );
             entry.writer_dep_ids[i].push(dep_id);
         }
 

@@ -27,30 +27,37 @@ pub(crate) struct FlushData {
     bucket_id: u64,
     dep_group_id: u64,
     dep_group_items: u32,
-    cb: Box<dyn FnOnce()>,
+    release_cb: Option<Box<dyn FnOnce()>>,
+    done_cb: Option<Box<dyn FnOnce()>>,
 }
 
 unsafe impl Send for FlushData {}
 
 impl FlushData {
-    pub fn new(arena: Handle<Arena>, bucket_id: u64, cb: Box<dyn FnOnce()>) -> Self {
+    pub fn new(
+        arena: Handle<Arena>,
+        bucket_id: u64,
+        release_cb: Box<dyn FnOnce()>,
+        done_cb: Box<dyn FnOnce()>,
+    ) -> Self {
         let dep_group_id = arena.id();
         Self {
             arena,
             bucket_id,
             dep_group_id,
             dep_group_items: 1,
-            cb,
+            release_cb: Some(release_cb),
+            done_cb: Some(done_cb),
         }
     }
 
-    #[allow(dead_code)]
     pub fn with_dep_group(
         arena: Handle<Arena>,
         bucket_id: u64,
         dep_group_id: u64,
         dep_group_items: u32,
-        cb: Box<dyn FnOnce()>,
+        release_cb: Box<dyn FnOnce()>,
+        done_cb: Box<dyn FnOnce()>,
     ) -> Self {
         if dep_group_items == 0 {
             log::error!("invalid dep group size 0 for flush");
@@ -61,7 +68,8 @@ impl FlushData {
             bucket_id,
             dep_group_id,
             dep_group_items,
-            cb,
+            release_cb: Some(release_cb),
+            done_cb: Some(done_cb),
         }
     }
 
@@ -81,8 +89,17 @@ impl FlushData {
         self.dep_group_items
     }
 
-    pub fn mark_done(self) {
-        (self.cb)()
+    pub fn release(&mut self) {
+        if let Some(cb) = self.release_cb.take() {
+            cb();
+        }
+    }
+
+    pub fn mark_done(mut self) {
+        self.release();
+        if let Some(cb) = self.done_cb.take() {
+            cb();
+        }
     }
 }
 
@@ -270,16 +287,6 @@ impl Arena {
         Ok(())
     }
 
-    // we are not rollback offset in case of ABA problem
-    pub(crate) fn rollback_batch(&self, total_real_size: u32, nr_frames: u32) {
-        if total_real_size > 0 {
-            self.real_size.fetch_sub(total_real_size as u64, AcqRel);
-        }
-        if nr_frames > 0 {
-            self.refs.fetch_sub(nr_frames, AcqRel);
-        }
-    }
-
     fn alloc_at(&self, next_addr: &AtomicU64, real_size: u32) -> BoxRef {
         let addr = next_addr.fetch_add(1, Relaxed);
         self.alloc_at_addr(addr, real_size)
@@ -302,10 +309,6 @@ impl Arena {
         if self.items.remove(&addr).is_some() {
             self.real_size.fetch_sub(len as u64, AcqRel);
         }
-    }
-
-    pub(crate) fn remove_item_only(&self, addr: u64) -> bool {
-        self.items.remove(&addr).is_some()
     }
 
     #[inline]
