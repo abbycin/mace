@@ -136,8 +136,15 @@ fn drive_blob_gc_pressure(bucket: &Bucket, rounds: usize, blob_size: usize) {
     }
 }
 
-fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted: usize) {
-    let mace = open_with_tune(db_root, |_| {});
+fn assert_visibility_after_reopen(
+    db_root: &Path,
+    inline_size: usize,
+    committed: usize,
+    uncommitted: usize,
+) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.inline_size = inline_size;
+    });
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
 
@@ -153,8 +160,10 @@ fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted:
     }
 }
 
-fn assert_bucket_readable(db_root: &Path) {
-    let mace = open_with_tune(db_root, |_| {});
+fn assert_bucket_readable(db_root: &Path, inline_size: usize) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.inline_size = inline_size;
+    });
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
 
@@ -183,59 +192,6 @@ fn data_blob_files(db_root: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
-}
-
-fn wal_files(db_root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let root = db_root.join("log");
-    let entries = std::fs::read_dir(&root).expect("read log dir failed");
-    for entry in entries {
-        let entry = entry.expect("read log dir entry failed");
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
-            continue;
-        };
-        if name.starts_with("wal_") || name.starts_with("stable-wal_") {
-            files.push(path);
-        }
-    }
-    files.sort();
-    files
-}
-
-fn wal_positions(db_root: &Path) -> Vec<(u8, u64)> {
-    let mut pos = Vec::new();
-    let root = db_root.join("log");
-    let entries = std::fs::read_dir(&root).expect("read log dir failed");
-    for entry in entries {
-        let entry = entry.expect("read log dir entry failed");
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
-            continue;
-        };
-        let parts: Vec<&str> = name.split('_').collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        if parts[0] != "wal" && parts[0] != "stable-wal" {
-            continue;
-        }
-        let Ok(group_id) = parts[1].parse::<u8>() else {
-            continue;
-        };
-        let Ok(seq) = parts[2].parse::<u64>() else {
-            continue;
-        };
-        pos.push((group_id, seq));
-    }
-    pos.sort_unstable();
-    pos
 }
 
 fn wait_for_crash(timeout: Duration) -> ! {
@@ -271,33 +227,6 @@ fn child_case_manifest_before_multi_commit(db_root: &Path) -> ! {
     let (_mace, bucket) = child_setup_common(db_root);
     seed_committed_and_uncommitted(&bucket, 64, 24);
     drive_flush_pressure(&bucket, 128, 1536);
-    wait_for_crash(Duration::from_secs(20))
-}
-
-fn child_case_dep_group_unpublished_recovery(db_root: &Path) -> ! {
-    child_case_manifest_before_multi_commit(db_root)
-}
-
-fn child_case_wal_pin_boundary(db_root: &Path) -> ! {
-    let mace = open_with_tune(db_root, |opt| {
-        opt.concurrent_write = 1;
-        opt.sync_on_write = true;
-        opt.data_file_size = 16 << 10;
-        opt.max_log_size = 16 << 10;
-        opt.wal_file_size = 4 << 10;
-        opt.gc_timeout = 20;
-        opt.gc_eager = true;
-        opt.data_garbage_ratio = 1;
-        opt.gc_compacted_size = opt.data_file_size;
-        opt.inline_size = 512;
-    });
-    let bucket = match mace.get_bucket("prod") {
-        Ok(bucket) => bucket,
-        Err(OpCode::NotFound) => mace.new_bucket("prod").expect("create prod bucket failed"),
-        Err(err) => panic!("open prod bucket failed: {err:?}"),
-    };
-    seed_committed_and_uncommitted(&bucket, 64, 24);
-    drive_flush_pressure(&bucket, 256, 2048);
     wait_for_crash(Duration::from_secs(20))
 }
 
@@ -395,8 +324,6 @@ fn failpoint_child() {
         "flush_after_data_sync" => child_case_flush_after_data_sync(&db_root),
         "flush_before_manifest_commit" => child_case_manifest_before_multi_commit(&db_root),
         "flush_after_manifest_commit" => child_case_manifest_before_multi_commit(&db_root),
-        "dep_group_unpublished_recovery" => child_case_dep_group_unpublished_recovery(&db_root),
-        "wal_pin_boundary" => child_case_wal_pin_boundary(&db_root),
         "wal_after_checkpoint_write" => child_case_wal_after_checkpoint_write(&db_root),
         "manifest_before_multi_commit" => child_case_manifest_before_multi_commit(&db_root),
         "gc_data_rewrite_before_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
@@ -427,7 +354,7 @@ fn chaos_failpoint_flush_after_data_sync() {
         !crashed_files.is_empty(),
         "expected flush crash to leave data/blob files before recovery"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
     for file in crashed_files {
         assert!(
             !file.exists(),
@@ -454,7 +381,7 @@ fn chaos_failpoint_flush_before_manifest_commit() {
         !crashed_files.is_empty(),
         "expected flush crash to leave data/blob files before recovery"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
     for file in crashed_files {
         assert!(
             !file.exists(),
@@ -481,7 +408,7 @@ fn chaos_failpoint_flush_after_manifest_commit() {
         !crashed_files.is_empty(),
         "expected committed flush files before recovery"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
     assert!(
         crashed_files.iter().any(|file| file.exists()),
         "flush files committed before crash should survive recovery"
@@ -498,7 +425,7 @@ fn chaos_failpoint_wal_after_checkpoint_write() {
         "mace_wal_after_checkpoint_write=abort@1",
     );
     assert!(!status.success(), "wal failpoint child should abort");
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
 #[test]
@@ -511,132 +438,7 @@ fn chaos_failpoint_manifest_before_multi_commit() {
         "mace_manifest_before_multi_commit=abort@3",
     );
     assert!(!status.success(), "manifest failpoint child should abort");
-    assert_visibility_after_reopen(&path, 64, 24);
-}
-
-#[test]
-#[ignore]
-fn chaos_failpoint_dep_group_unpublished_recovery() {
-    let path = RandomPath::new();
-    let status = spawn_child(
-        "dep_group_unpublished_recovery",
-        &path,
-        "mace_flush_before_manifest_commit=abort@1",
-    );
-    assert!(
-        !status.success(),
-        "dep-group-unpublished failpoint child should abort"
-    );
-    let crashed_files = data_blob_files(&path);
-    assert!(
-        !crashed_files.is_empty(),
-        "expected pending flush crash to leave data/blob files before recovery"
-    );
-    assert_visibility_after_reopen(&path, 64, 24);
-    for file in crashed_files {
-        assert!(
-            !file.exists(),
-            "pending-group orphan file should be cleaned on reopen: {file:?}"
-        );
-    }
-}
-
-#[test]
-#[ignore]
-fn chaos_failpoint_wal_pin_boundary() {
-    let path = RandomPath::new();
-    let status = spawn_child(
-        "wal_pin_boundary",
-        &path,
-        "mace_flush_before_manifest_commit=abort@1",
-    );
-    assert!(!status.success(), "wal-pin failpoint child should abort");
-    let crashed_wals = wal_files(&path);
-    assert!(
-        !crashed_wals.is_empty(),
-        "expected wal files to remain for recovery before reopen"
-    );
-    let crashed_pos = wal_positions(&path);
-    assert!(
-        crashed_pos
-            .iter()
-            .any(|(group, seq)| *group == 0 && *seq >= 1),
-        "expected rotated wal sequence for writer group 0 before reopen"
-    );
-    assert_visibility_after_reopen(&path, 64, 24);
-    let reopened_pos = wal_positions(&path);
-    assert!(
-        reopened_pos.iter().any(|(group, _)| *group == 0),
-        "expected writer group 0 wal to remain after reopen"
-    );
-}
-
-#[test]
-#[ignore]
-fn chaos_failpoint_dep_group_unpublished_recovery_stress_rounds() {
-    const ROUNDS: usize = 3;
-    for round in 0..ROUNDS {
-        let path = RandomPath::new();
-        let status = spawn_child(
-            "dep_group_unpublished_recovery",
-            &path,
-            "mace_flush_before_manifest_commit=abort@1",
-        );
-        assert!(
-            !status.success(),
-            "round {round}: dep-group-unpublished failpoint child should abort"
-        );
-        let crashed_files = data_blob_files(&path);
-        assert!(
-            !crashed_files.is_empty(),
-            "round {round}: expected pending flush crash to leave data/blob files before recovery"
-        );
-        assert_visibility_after_reopen(&path, 64, 24);
-        for file in crashed_files {
-            assert!(
-                !file.exists(),
-                "round {round}: pending-group orphan file should be cleaned on reopen: {file:?}"
-            );
-        }
-    }
-}
-
-#[test]
-#[ignore]
-fn chaos_failpoint_wal_pin_boundary_stress_rounds() {
-    const ROUNDS: usize = 3;
-    for round in 0..ROUNDS {
-        let path = RandomPath::new();
-        let status = spawn_child(
-            "wal_pin_boundary",
-            &path,
-            "mace_flush_before_manifest_commit=abort@1",
-        );
-        assert!(
-            !status.success(),
-            "round {round}: wal-pin failpoint child should abort"
-        );
-
-        let crashed_wals = wal_files(&path);
-        assert!(
-            !crashed_wals.is_empty(),
-            "round {round}: expected wal files to remain for recovery before reopen"
-        );
-        let crashed_pos = wal_positions(&path);
-        assert!(
-            crashed_pos
-                .iter()
-                .any(|(group, seq)| *group == 0 && *seq >= 1),
-            "round {round}: expected rotated wal sequence for writer group 0 before reopen"
-        );
-
-        assert_visibility_after_reopen(&path, 64, 24);
-        let reopened_pos = wal_positions(&path);
-        assert!(
-            reopened_pos.iter().any(|(group, _)| *group == 0),
-            "round {round}: expected writer group 0 wal to remain after reopen"
-        );
-    }
+    assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
 #[test]
@@ -652,7 +454,7 @@ fn chaos_failpoint_txn_commit_after_record_commit() {
         !status.success(),
         "txn-after-record-commit failpoint child should abort"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
 #[test]
@@ -668,7 +470,7 @@ fn chaos_failpoint_txn_commit_after_wal_sync() {
         !status.success(),
         "txn-after-wal-sync failpoint child should abort"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
 #[test]
@@ -681,7 +483,7 @@ fn chaos_failpoint_gc_data_rewrite_before_meta_commit() {
         "mace_gc_data_rewrite_before_meta_commit=abort@1",
     );
     assert!(!status.success(), "gc-data failpoint child should abort");
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -697,7 +499,7 @@ fn chaos_failpoint_gc_data_rewrite_after_stage_marker() {
         !status.success(),
         "gc-data-after-marker failpoint child should abort"
     );
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -713,7 +515,7 @@ fn chaos_failpoint_gc_data_rewrite_after_meta_commit() {
         !status.success(),
         "gc-data-after-meta failpoint child should abort"
     );
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -726,7 +528,7 @@ fn chaos_failpoint_gc_blob_rewrite_before_meta_commit() {
         "mace_gc_blob_rewrite_before_meta_commit=abort@1",
     );
     assert!(!status.success(), "gc-blob failpoint child should abort");
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -742,7 +544,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_stage_marker() {
         !status.success(),
         "gc-blob-after-marker failpoint child should abort"
     );
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -758,7 +560,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_meta_commit() {
         !status.success(),
         "gc-blob-after-meta failpoint child should abort"
     );
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -771,5 +573,5 @@ fn chaos_failpoint_evictor_before_evict_once() {
         "mace_evictor_before_evict_once=abort@1",
     );
     assert!(!status.success(), "evictor failpoint child should abort");
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, Options::INLINE_SIZE);
 }

@@ -1,7 +1,7 @@
 use crate::OpCode;
 use crate::index::Node;
 use crate::index::Page;
-use crate::map::buffer::{BucketContext, PackedAlloc};
+use crate::map::buffer::BucketContext;
 use crate::map::data::Arena;
 use crate::map::table::PageMap;
 use crate::types::header::TagFlag;
@@ -22,7 +22,6 @@ pub struct SysTxn<'a> {
     /// set to TombStone on failure
     garbage: Vec<u64>,
     allocs: Vec<(Handle<Arena>, BoxView)>,
-    packed_alloc: Option<PackedAlloc>,
 }
 
 impl<'a> SysTxn<'a> {
@@ -40,7 +39,6 @@ impl<'a> SysTxn<'a> {
             maps: Vec::new(),
             garbage: Vec::new(),
             allocs: Vec::new(),
-            packed_alloc: None,
         }
     }
 
@@ -50,9 +48,6 @@ impl<'a> SysTxn<'a> {
     }
 
     pub fn commit(&mut self) {
-        if let Some(packed) = self.packed_alloc.take() {
-            packed.finish();
-        }
         self.maps.clear();
         while let Some((a, _)) = self.allocs.pop() {
             a.dec_ref();
@@ -67,11 +62,7 @@ impl<'a> SysTxn<'a> {
     }
 
     pub fn alloc(&mut self, size: u32) -> BoxRef {
-        let (h, t) = if let Some(packed) = self.packed_alloc.as_mut() {
-            packed.alloc(size)
-        } else {
-            self.buffer.alloc(size).expect("never happen")
-        };
+        let (h, t) = self.buffer.alloc(size).expect("never happen");
         let view: BoxView = t.view();
         self.allocs.push((h, view));
         t
@@ -82,27 +73,6 @@ impl<'a> SysTxn<'a> {
         self.allocs.push((h1, b1.view()));
         self.allocs.push((h2, b2.view()));
         (b1, b2)
-    }
-
-    fn begin_packed_internal(&mut self, total_real_size: u32, nr_frames: u32) {
-        if self.packed_alloc.is_some() {
-            log::error!("nested packed allocation in SysTxn");
-            panic!("nested packed allocation in SysTxn");
-        }
-
-        let packed = self
-            .buffer
-            .begin_packed_alloc(total_real_size, nr_frames)
-            .expect("begin packed allocation failed");
-        self.packed_alloc = Some(packed);
-    }
-
-    fn end_packed_internal(&mut self) {
-        let Some(packed) = self.packed_alloc.take() else {
-            log::error!("end packed allocation without begin in SysTxn");
-            panic!("end packed allocation without begin in SysTxn");
-        };
-        packed.finish();
     }
 
     /// map pid to page table and assign pid to page
@@ -224,14 +194,6 @@ impl IAlloc for SysTxn<'_> {
 
     fn allocate_pair(&mut self, size1: u32, size2: u32) -> (BoxRef, BoxRef) {
         self.alloc_pair_internal(size1, size2)
-    }
-
-    fn begin_packed_alloc(&mut self, total_real_size: u32, nr_frames: u32) {
-        self.begin_packed_internal(total_real_size, nr_frames)
-    }
-
-    fn end_packed_alloc(&mut self) {
-        self.end_packed_internal()
     }
 
     fn collect(&mut self, addr: &[u64]) {

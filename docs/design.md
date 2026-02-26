@@ -26,6 +26,7 @@ This document summarizes the current MACE design as reflected by the codebase. I
 - `numerics`: global counters (oracle, next ids, wmk_oldest, log_size)
 - `bucket_metas`: bucket name -> `BucketMeta` (id)
 - `pending_del`: buckets pending physical cleanup
+- `pending_sibling`: staged sibling addresses awaiting base publish/cleanup
 - `page_table_{bucket_id}`: page id -> addr mappings
 - `data_interval_{bucket_id}` / `blob_interval_{bucket_id}`: addr ranges -> file ids
 - `data_stat` / `blob_stat`: per-file stats and masks for GC
@@ -36,9 +37,11 @@ This document summarizes the current MACE design as reflected by the codebase. I
 Flush order is enforced by `StoreFlushObserver`:
 
 1. Write data/blob files to disk
-2. Ensure WAL durability barrier for this flush boundary (`flsn`) before publishing metadata
-3. Commit metadata transaction (stats, map table, intervals, numerics)
-4. Mark flush done, then advance per-group checkpoint positions and persist checkpoint records
+2. Stage `pending_sibling` metadata for sibling frames (if any)
+3. Release arena refs after pending-sibling stage becomes durable
+4. Ensure WAL durability barrier for this flush boundary (`flsn`) before publishing metadata
+5. Commit metadata transaction (stats, map table, intervals, numerics, pending-sibling clears)
+6. Mark flush done, then advance per-group checkpoint positions and persist checkpoint records
 
 This ensures data is durable before metadata points to it.
 
@@ -109,17 +112,22 @@ This replaces the old logical/physical id mapping: the logical address is stable
 - `safe_to_flush` ensures WAL is flushed past arena `flsn` before flush
 - `over_provision` allows extra arenas if all are busy
 
-### Packed allocation crash-closure
+### Sibling crash-closure via pending metadata
 
-To keep crash consistency for dependent frames (for example base+sibling and delta+remote), MACE uses a packed allocation lifecycle:
+For multi-version leaf rebuild, crash-closure is implemented with `pending_sibling` metadata instead of packed allocation scopes:
 
-- `IAlloc` uses `u32` sizes for `allocate`, `allocate_pair`, and `begin_packed_alloc`
-- `begin_packed_alloc` reserves `real_size + frames` in one arena and reserves one contiguous logical address span
-- allocations inside the packed scope always use the pre-selected arena and sequential addresses from that span
-- `end_packed_alloc` verifies plan/usage equality (`frames`, address cursor, and bytes) and fails fast on mismatch
-- rollback removes packed entries from arena visibility first, then rolls back batch counters (`real_size`/`refs`)
+- `BaseView::new_leaf` allocates sibling chains first, then allocates the base frame
+- multi-version leaf base stores sibling head hints in an in-memory footer (`u32 count + u64[] heads`)
+- dump path trims this footer and rewrites dump header, so on-disk base format excludes sibling hints
+- flush scans arena frames:
+  - sibling frames contribute `pending_sibling_addrs`
+  - base leaf frames with `has_multiple_versions` load `published_sibling_addrs` from footer hints
+- before arena release, flush stages `pending_sibling` records (`bucket_id + kind + addr` key space)
+- current flush publish path stages `PendingRangeKind::Data`; recovery logic supports both `Data` and `Blob`
+- base publish clears the corresponding pending sibling records in the same manifest txn
+- startup recovery (`recover_pending_siblings_to_stats`) applies any leftover pending siblings into stat bitmaps and clears pending entries
 
-The default trait methods are fallback-only for compatibility and tests; production allocators (`SysTxn`, `Evictor`) override them to enforce the closure guarantees.
+This keeps sibling dangling-pointer cleanup crash-safe while preserving the shared arena allocation model.
 
 ### Loader and caches
 
@@ -135,7 +143,7 @@ The default trait methods are fallback-only for compatibility and tests; product
 - Evictor runs when cache usage reaches ~80% of capacity
 - It samples candidate pids, cools to `Cold`, then evicts by tagging SWIPs
 - If delta chains are long or contain garbage, eviction triggers compaction
-- Leaf rebuild during compaction uses the same packed allocation hooks as foreground transactions
+- Leaf rebuild during compaction follows the same sibling-hint and pending-sibling flow as foreground rebuild
 - Compaction writes junk frames into arenas for later GC
 
 ## Index (Bw-Tree variant)
@@ -212,6 +220,17 @@ This prevents deleting WAL still needed for recovery or active transactions.
 - Phase 2: analyze from last checkpoint, then redo/undo
 - Bucket-aware replay skips buckets already deleted
 - After redo/undo, `oracle` and `wmk_oldest` are advanced, and loaded bucket contexts are evicted
+
+#### Pending sibling recovery
+
+`pending_sibling` is used to close the crash window between sibling flush and base publish:
+
+1. Flush stages sibling addresses into `pending_sibling` before releasing arena refs
+2. Base publish clears the pending addresses that are now reachable from durable base metadata
+3. Startup scans remaining `pending_sibling` entries and applies them to `DataStat` / `BlobStat` masks
+4. The same startup txn clears processed pending entries
+
+The flow is idempotent and does not require a dedicated GC queue for pending sibling cleanup.
 
 #### Orphan data/blob cleanup
 
@@ -393,8 +412,11 @@ All metric dimensions are encoded in enums (fixed cardinality, no runtime label 
 
 - Data must be flushed before manifest commits
 - PageMap entries must be consistent with map tables written in the same flush txn
-- Dependent allocations must be closed in one packed scope (same arena + contiguous address span)
-- Packed plan mismatch must fail fast (`error` + panic), never silently downgrade to split allocation
+- Multi-version leaf rebuild allocates sibling chains before base allocation
+- Leaf base with `has_multiple_versions` must carry sibling-head hints during flush scan
+- Pending sibling records must be durable before arena release
+- Base publish and pending-sibling clear must be committed in the same manifest txn
+- Startup pending-sibling recovery must be idempotent (safe on retry/replay)
 - Bucket deletion must be two-phase; do not decrement `nr_buckets` early
 - WAL files can only be deleted up to the safe checkpoint boundary
 

@@ -25,8 +25,6 @@ use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
     bucket_id: u64,
-    dep_group_id: u64,
-    dep_group_items: u32,
     release_cb: Option<Box<dyn FnOnce()>>,
     done_cb: Option<Box<dyn FnOnce()>>,
 }
@@ -40,34 +38,9 @@ impl FlushData {
         release_cb: Box<dyn FnOnce()>,
         done_cb: Box<dyn FnOnce()>,
     ) -> Self {
-        let dep_group_id = arena.id();
         Self {
             arena,
             bucket_id,
-            dep_group_id,
-            dep_group_items: 1,
-            release_cb: Some(release_cb),
-            done_cb: Some(done_cb),
-        }
-    }
-
-    pub fn with_dep_group(
-        arena: Handle<Arena>,
-        bucket_id: u64,
-        dep_group_id: u64,
-        dep_group_items: u32,
-        release_cb: Box<dyn FnOnce()>,
-        done_cb: Box<dyn FnOnce()>,
-    ) -> Self {
-        if dep_group_items == 0 {
-            log::error!("invalid dep group size 0 for flush");
-            panic!("invalid dep group size 0");
-        }
-        Self {
-            arena,
-            bucket_id,
-            dep_group_id,
-            dep_group_items,
             release_cb: Some(release_cb),
             done_cb: Some(done_cb),
         }
@@ -79,14 +52,6 @@ impl FlushData {
 
     pub fn id(&self) -> u64 {
         self.arena.id()
-    }
-
-    pub fn dep_group_id(&self) -> u64 {
-        self.dep_group_id
-    }
-
-    pub fn dep_group_items(&self) -> u32 {
-        self.dep_group_items
     }
 
     pub fn release(&mut self) {
@@ -560,32 +525,70 @@ impl FileBuilder {
         }
     }
 
+    fn ensure_iov_room(
+        need: usize,
+        queued_iov: &mut usize,
+        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+        w: &mut GatherWriter,
+    ) {
+        if *queued_iov + need > GatherWriter::DEFAULT_IOVCNT {
+            w.flush();
+            *queued_iov = 0;
+            hdr_batch.clear();
+        }
+    }
+
     pub(crate) fn build_data(&mut self, tick: u64, path: PathBuf) -> Interval {
         let mut pos: usize = 0;
         let mut w = GatherWriter::trunc(&path, 64);
         let mut relocs = Vec::with_capacity(self.data.len() * AddrPair::LEN);
+        let mut queued_iov = 0usize;
+        let mut hdr_batch: Vec<[u8; BoxRef::DUMP_HDR_LEN]> =
+            Vec::with_capacity(GatherWriter::DEFAULT_IOVCNT / 2);
 
         for (seq, f) in self.data.iter().enumerate() {
             let h = f.header();
-            let s = f.dump_slice();
             let mut crc = Crc32cHasher::default();
-            crc.write(s);
-            w.queue(s);
-            let reloc = AddrPair::new(h.addr, pos, s.len() as u32, seq as u32, crc.finish() as u32);
+            let len = if let Some(payload_len) = f.persist_payload_len() {
+                Self::ensure_iov_room(2, &mut queued_iov, &mut hdr_batch, &mut w);
+                hdr_batch.push([0u8; BoxRef::DUMP_HDR_LEN]);
+                let hdr_bytes = hdr_batch.last_mut().expect("must exist");
+                f.encode_dump_header(payload_len as u32, hdr_bytes);
+                let body_all = f.data_slice::<u8>();
+                let body = &body_all[..payload_len];
+                crc.write(hdr_bytes);
+                crc.write(body);
+                w.queue(hdr_bytes);
+                w.queue(body);
+                queued_iov += 2;
+                hdr_bytes.len() + body.len()
+            } else {
+                Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
+                let s = f.dump_slice();
+                crc.write(s);
+                w.queue(s);
+                queued_iov += 1;
+                s.len()
+            };
+            let reloc = AddrPair::new(h.addr, pos, len as u32, seq as u32, crc.finish() as u32);
             relocs.extend_from_slice(reloc.as_slice());
-            pos += s.len();
+            pos += len;
         }
 
         let mut interval_crc = Crc32cHasher::default();
 
         let is = self.data_interval.as_slice();
         interval_crc.write(is);
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(is);
+        queued_iov += 1;
 
         let mut reloc_crc = Crc32cHasher::default();
         let rs = relocs.as_slice();
         reloc_crc.write(rs);
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(rs);
+        queued_iov += 1;
 
         let hdr = DataFooter {
             up2: tick,
@@ -595,6 +598,7 @@ impl FileBuilder {
             interval_crc: interval_crc.finish() as u32,
         };
 
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(hdr.as_slice());
         w.flush();
         w.sync();

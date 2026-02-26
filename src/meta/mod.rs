@@ -49,6 +49,7 @@ pub(crate) const BUCKET_OBSOLETE_DATA: &str = "obsolete_data";
 pub(crate) const BUCKET_OBSOLETE_BLOB: &str = "obsolete_blob";
 pub(crate) const BUCKET_METAS: &str = "bucket_metas";
 pub(crate) const BUCKET_PENDING_DEL: &str = "pending_del";
+pub(crate) const BUCKET_PENDING_SIBLING: &str = "pending_sibling";
 pub(crate) const BUCKET_VERSION: &str = "version";
 pub(crate) const MAX_BUCKETS: u64 = 1024;
 pub(crate) const VERSION_KEY: &str = "current_version";
@@ -62,7 +63,8 @@ pub(crate) mod builder;
 mod entry;
 pub use entry::{
     BlobStat, BlobStatInner, BucketMeta, DataStat, DataStatInner, DelInterval, Delete,
-    IntervalPair, MemBlobStat, MemDataStat, MetaKind, Numerics, PageTable,
+    IntervalPair, MemBlobStat, MemDataStat, MetaKind, Numerics, PageTable, PendingRangeKind,
+    PendingSibling,
 };
 
 pub(crate) fn page_table_name(bucket_id: u64) -> String {
@@ -83,6 +85,14 @@ pub(crate) fn orphan_data_marker_key(file_id: u64) -> Vec<u8> {
 
 pub(crate) fn orphan_blob_marker_key(file_id: u64) -> Vec<u8> {
     format!("{}{}", ORPHAN_BLOB_MARKER_PREFIX, file_id).into_bytes()
+}
+
+fn pending_sibling_key(bucket_id: u64, kind: PendingRangeKind, addr: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(size_of::<u64>() * 2 + size_of::<u8>());
+    key.extend_from_slice(&bucket_id.to_be_bytes());
+    key.push(kind as u8);
+    key.extend_from_slice(&addr.to_be_bytes());
+    key
 }
 
 pub(crate) trait IMetaCodec {
@@ -363,6 +373,7 @@ impl Manifest {
             BUCKET_OBSOLETE_BLOB,
             BUCKET_METAS,
             BUCKET_PENDING_DEL,
+            BUCKET_PENDING_SIBLING,
             BUCKET_VERSION,
         ];
 
@@ -705,22 +716,12 @@ impl Manifest {
         }
     }
 
-    pub(crate) fn add_data_stat(&self, stat: MemDataStat, ivl: IntervalPair) {
-        if let Some(ctx) = self.buckets.buckets.get(&stat.bucket_id) {
-            ctx.data_intervals
-                .write()
-                .insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
-        }
-        self.data_stat.add_stat_unlocked(stat);
+    pub(crate) fn add_data_stat(&self, stat: MemDataStat) {
+        self.data_stat.add_stat_mem(stat);
     }
 
-    pub(crate) fn add_blob_stat(&self, stat: MemBlobStat, ivl: IntervalPair) {
-        if let Some(ctx) = self.buckets.buckets.get(&stat.bucket_id) {
-            ctx.blob_intervals
-                .write()
-                .insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
-        }
-        self.blob_stat.add_stat_unlocked(stat);
+    pub(crate) fn add_blob_stat(&self, stat: MemBlobStat) {
+        self.blob_stat.add_stat_mem(stat);
     }
 
     pub(crate) fn update_data_stat_interval(
@@ -791,6 +792,90 @@ impl Manifest {
             btree,
             ops: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn record_pending_sibling(&self, txn: &mut Txn<'_>, pending: &PendingSibling) {
+        let mut buf = vec![0u8; pending.packed_size()];
+        pending.encode(&mut buf);
+        let key = pending_sibling_key(pending.bucket_id, pending.kind, pending.addr);
+        txn.ops_mut()
+            .entry(BUCKET_PENDING_SIBLING.to_string())
+            .or_default()
+            .push(MetaOp::Put(key, buf));
+    }
+
+    pub(crate) fn clear_pending_sibling(
+        &self,
+        txn: &mut Txn<'_>,
+        bucket_id: u64,
+        kind: PendingRangeKind,
+        addr: u64,
+    ) {
+        let key = pending_sibling_key(bucket_id, kind, addr);
+        txn.ops_mut()
+            .entry(BUCKET_PENDING_SIBLING.to_string())
+            .or_default()
+            .push(MetaOp::Del(key));
+    }
+
+    pub(crate) fn load_pending_siblings(&self) -> Vec<PendingSibling> {
+        let mut out = Vec::new();
+        let _ = self.btree.view(BUCKET_PENDING_SIBLING, |txn| {
+            let mut iter = txn.iter();
+            let mut k = Vec::new();
+            let mut v = Vec::new();
+            while iter.next_ref(&mut k, &mut v) {
+                out.push(PendingSibling::decode(&v));
+            }
+            Ok(())
+        });
+        out
+    }
+
+    pub(crate) fn recover_pending_siblings_to_stats(&self) {
+        let pending = self.load_pending_siblings();
+        if pending.is_empty() {
+            return;
+        }
+        let tick = self.numerics.next_data_id.load(Relaxed);
+        let mut txn = self.begin();
+        let mut data_by_file: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut blob_by_file: HashMap<u64, Vec<u64>> = HashMap::new();
+        for item in &pending {
+            match item.kind {
+                PendingRangeKind::Data => data_by_file
+                    .entry(item.file_id)
+                    .or_default()
+                    .push(item.addr),
+                PendingRangeKind::Blob => blob_by_file
+                    .entry(item.file_id)
+                    .or_default()
+                    .push(item.addr),
+            }
+        }
+
+        for (file_id, addrs) in data_by_file {
+            if let Some(stat) =
+                self.data_stat
+                    .apply_pending_sibling(file_id, &addrs, tick, &self.btree)
+            {
+                txn.record(MetaKind::DataStat, &stat);
+            }
+        }
+
+        for (file_id, addrs) in blob_by_file {
+            if let Some(stat) = self
+                .blob_stat
+                .apply_pending_sibling(file_id, &addrs, &self.btree)
+            {
+                txn.record(MetaKind::BlobStat, &stat);
+            }
+        }
+
+        for item in pending {
+            self.clear_pending_sibling(&mut txn, item.bucket_id, item.kind, item.addr);
+        }
+        txn.commit();
     }
 
     pub(crate) fn stage_orphan_data_file(&self, file_id: u64) {
@@ -1257,7 +1342,7 @@ impl StatCtx<DataKind, DashMap<u64, MemDataStat>> {
         Ok(stat.mask.as_ref().expect("mask loaded").clone())
     }
 
-    pub(crate) fn add_stat_unlocked(&self, stat: MemDataStat) {
+    pub(crate) fn add_stat_mem(&self, stat: MemDataStat) {
         assert_eq!(stat.active_size, stat.total_size);
         self.update_size(stat.active_size as u64, stat.total_size as u64);
         {
@@ -1308,7 +1393,7 @@ impl StatCtx<DataKind, DashMap<u64, MemDataStat>> {
             self.common.cache.del(id);
         }
 
-        self.add_stat_unlocked(fstat);
+        self.add_stat_mem(fstat);
         stat
     }
 
@@ -1376,6 +1461,36 @@ impl StatCtx<DataKind, DashMap<u64, MemDataStat>> {
             }
         }
         v
+    }
+
+    pub(crate) fn apply_pending_sibling(
+        &self,
+        file_id: u64,
+        addrs: &[u64],
+        tick: u64,
+        btree: &BTree,
+    ) -> Option<DataStat> {
+        if self.ensure_mask(file_id, btree).is_err() {
+            return None;
+        }
+        let mut stat = self.map.get_mut(&file_id)?;
+        let mut inactive_elems = Vec::new();
+        for &addr in addrs {
+            let reloc = self.get_reloc(file_id, addr);
+            let inactive = stat.mask.as_ref().expect("mask loaded").test(reloc.seq);
+            if !inactive {
+                self.update_stat(&mut stat, addr, &reloc, tick);
+                inactive_elems.push(reloc.seq);
+            }
+        }
+        if inactive_elems.is_empty() {
+            None
+        } else {
+            Some(DataStat {
+                inner: stat.inner,
+                inactive_elems,
+            })
+        }
     }
 
     pub(crate) fn update_stat(&self, stat: &mut MemDataStat, junk: u64, reloc: &Reloc, tick: u64) {
@@ -1559,7 +1674,7 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
             self.remove_stat(id);
             self.common.cache.del(id);
         }
-        self.add_stat_unlocked(bstat);
+        self.add_stat_mem(bstat);
         ret
     }
 
@@ -1604,12 +1719,42 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
         v
     }
 
+    pub(crate) fn apply_pending_sibling(
+        &self,
+        file_id: u64,
+        addrs: &[u64],
+        btree: &BTree,
+    ) -> Option<BlobStat> {
+        if self.ensure_mask(file_id, btree).is_err() {
+            return None;
+        }
+        let mut map = self.map.write();
+        let stat = map.get_mut(&file_id)?;
+        let mut inactive_elems = Vec::new();
+        for &addr in addrs {
+            let reloc = self.get_reloc(file_id, addr);
+            let inactive = stat.mask.as_ref().expect("mask loaded").test(reloc.seq);
+            if !inactive {
+                self.update_stat(stat, &reloc, addr);
+                inactive_elems.push(reloc.seq);
+            }
+        }
+        if inactive_elems.is_empty() {
+            None
+        } else {
+            Some(BlobStat {
+                inner: stat.inner,
+                inactive_elems,
+            })
+        }
+    }
+
     fn update_stat(&self, stat: &mut MemBlobStat, reloc: &Reloc, addr: u64) {
         stat.update(reloc);
         self.common.junk.push_if_collecting(stat.file_id, addr);
     }
 
-    pub(crate) fn add_stat_unlocked(&self, stat: MemBlobStat) {
+    pub(crate) fn add_stat_mem(&self, stat: MemBlobStat) {
         {
             self.common
                 .bucket_files

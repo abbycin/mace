@@ -213,6 +213,9 @@ impl ManifestBuilder {
             })
             .map_err(|_| OpCode::IoError)?;
 
+        // recover crash-left pending sibling intents into stat bitmaps at startup
+        self.inner.recover_pending_siblings_to_stats();
+
         if !has_version {
             self.inner
                 .btree

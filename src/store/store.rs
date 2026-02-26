@@ -5,7 +5,7 @@ use crate::map::buffer::DataReader;
 use crate::map::evictor::Evictor;
 use crate::map::flush::{FlushDirective, FlushObserver, FlushResult};
 use crate::meta::builder::ManifestBuilder;
-use crate::meta::{BucketMeta, Manifest, MetaKind};
+use crate::meta::{BucketMeta, Manifest, MetaKind, PendingRangeKind};
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
 use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats, VacuumStats};
@@ -16,8 +16,6 @@ pub use crate::utils::OpCode;
 use crate::utils::ROOT_PID;
 pub use crate::utils::options::Options;
 use crate::utils::options::ParsedOptions;
-use parking_lot::Mutex;
-use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::mpsc::channel;
@@ -25,13 +23,6 @@ use std::sync::mpsc::channel;
 struct StoreFlushObserver {
     manifest: Handle<Manifest>,
     ctx: Handle<Context>,
-    pending_groups: Mutex<BTreeMap<u64, PendingFlushGroup>>,
-}
-
-struct PendingFlushGroup {
-    expected: u32,
-    results: Vec<FlushResult>,
-    writer_dep_ids: Vec<Vec<u64>>,
 }
 
 struct StoreDataReader {
@@ -92,21 +83,55 @@ impl DataReader for StoreDataReader {
 
 impl StoreFlushObserver {
     fn new(manifest: Handle<Manifest>, ctx: Handle<Context>) -> Self {
-        Self {
-            manifest,
-            ctx,
-            pending_groups: Mutex::new(BTreeMap::new()),
-        }
+        Self { manifest, ctx }
     }
 
-    fn push_flush_result(&self, mut result: FlushResult) -> Option<PendingFlushGroup> {
-        let group_id = result.dep_group_id;
-        let expected = result.dep_group_items;
-        if expected == 0 {
-            log::error!("invalid dep group size 0, group_id {}", group_id);
-            panic!("invalid dep group size 0");
+    fn remove_sorted_intersection(lhs: &mut Vec<u64>, rhs: &mut Vec<u64>) {
+        if lhs.is_empty() || rhs.is_empty() {
+            return;
         }
 
+        lhs.sort_unstable();
+        lhs.dedup();
+        rhs.sort_unstable();
+        rhs.dedup();
+
+        // rewrite lhs/rhs in place to keep only side-unique entries
+        let mut i = 0;
+        let mut j = 0;
+        let mut wl = 0;
+        let mut wr = 0;
+        while i < lhs.len() && j < rhs.len() {
+            let x = lhs[i];
+            let y = rhs[j];
+            if x < y {
+                lhs[wl] = x;
+                wl += 1;
+                i += 1;
+            } else if x > y {
+                rhs[wr] = y;
+                wr += 1;
+                j += 1;
+            } else {
+                i += 1;
+                j += 1;
+            }
+        }
+        while i < lhs.len() {
+            lhs[wl] = lhs[i];
+            wl += 1;
+            i += 1;
+        }
+        while j < rhs.len() {
+            rhs[wr] = rhs[j];
+            wr += 1;
+            j += 1;
+        }
+        lhs.truncate(wl);
+        rhs.truncate(wr);
+    }
+
+    fn publish_one(&self, mut result: FlushResult) -> Result<(), OpCode> {
         let groups = self.ctx.groups();
         debug_assert_eq!(result.flsn.len(), groups.len());
 
@@ -126,68 +151,17 @@ impl StoreFlushObserver {
                 .write()
                 .insert(blob_ivl.lo_addr, blob_ivl.hi_addr, blob_ivl.file_id);
         }
-        // release arena after pending visibility is in place
-        // done callback stays deferred until manifest publish
+        let mut stage_pending_addrs = std::mem::take(&mut result.pending_sibling_addrs);
+        let mut clear_pending_addrs = std::mem::take(&mut result.published_sibling_addrs);
+        // the siblings and base are almost in same arena, so it's unnecessary to stage/clear
+        Self::remove_sorted_intersection(&mut stage_pending_addrs, &mut clear_pending_addrs);
+        // release arena before metadata commit to avoid holding allocator capacity
+        // defer done callback until manifest publish so wait_flush still means end-to-end flush done
         result.done.release();
-
-        let mut lk = self.pending_groups.lock();
-        let entry = lk.entry(group_id).or_insert_with(|| PendingFlushGroup {
-            expected,
-            results: Vec::with_capacity(expected as usize),
-            writer_dep_ids: vec![Vec::new(); groups.len()],
-        });
-        if entry.expected != expected {
-            log::error!(
-                "dep group size mismatch, group {}, expected {}, got {}",
-                group_id,
-                entry.expected,
-                expected
-            );
-            panic!("dep group size mismatch");
-        }
-
-        for (i, g) in groups.iter().enumerate() {
-            let dep_id = g.dep_group.open_group_durable(
-                result.flsn[i],
-                result.flsn[i],
-                vec![result.data_id],
-            );
-            entry.writer_dep_ids[i].push(dep_id);
-        }
-
-        entry.results.push(result);
-        if entry.results.len() < expected as usize {
-            return None;
-        }
-
-        lk.remove(&group_id)
-    }
-
-    fn publish_group(&self, pending: PendingFlushGroup) -> Result<(), OpCode> {
-        let PendingFlushGroup {
-            results,
-            writer_dep_ids,
-            ..
-        } = pending;
-        if results.is_empty() {
-            return Ok(());
-        }
-
-        let groups = self.ctx.groups();
-        let mut durable_targets = vec![crate::utils::data::Position::default(); groups.len()];
-
-        for result in &results {
-            debug_assert_eq!(result.flsn.len(), groups.len());
-            for (i, pos) in result.flsn.iter().enumerate() {
-                if *pos > durable_targets[i] {
-                    durable_targets[i] = *pos;
-                }
-            }
-        }
 
         // make wal durable before publishing flush metadata
         for (i, g) in groups.iter().enumerate() {
-            let target = durable_targets[i];
+            let target = result.flsn[i];
             let mut lk = g.logging.lock();
             let ok = lk.should_durable(target);
             if ok {
@@ -199,41 +173,55 @@ impl StoreFlushObserver {
         }
 
         let mut txn = self.manifest.begin();
-        for result in &results {
-            let data_stats =
-                self.manifest
-                    .apply_data_junks(result.bucket_id, result.tick, &result.data_junks);
-            let blob_stats = self
-                .manifest
-                .apply_blob_junks(result.bucket_id, &result.blob_junks);
+        let data_stats =
+            self.manifest
+                .apply_data_junks(result.bucket_id, result.tick, &result.data_junks);
+        let blob_stats = self
+            .manifest
+            .apply_blob_junks(result.bucket_id, &result.blob_junks);
 
-            txn.record(MetaKind::DataStat, &result.data_stat);
-            txn.record(MetaKind::Map, &result.map_table);
-            txn.record(MetaKind::DataInterval, &result.data_ivl);
+        for &addr in &stage_pending_addrs {
+            let pending = crate::meta::PendingSibling::new(
+                result.bucket_id,
+                result.data_id,
+                PendingRangeKind::Data,
+                addr,
+            );
+            self.manifest.record_pending_sibling(&mut txn, &pending);
+        }
 
-            data_stats.iter().for_each(|x| {
-                assert_ne!(result.data_id, x.file_id);
-                txn.record(MetaKind::DataStat, x)
-            });
+        txn.record(MetaKind::DataStat, &result.data_stat);
+        txn.record(MetaKind::Map, &result.map_table);
+        txn.record(MetaKind::DataInterval, &result.data_ivl);
 
-            blob_stats.iter().for_each(|x| {
-                txn.record(MetaKind::BlobStat, x);
-            });
+        data_stats.iter().for_each(|x| {
+            assert_ne!(result.data_id, x.file_id);
+            txn.record(MetaKind::DataStat, x)
+        });
 
-            if let (Some(blob_ivl), Some(blob_stat)) = (&result.blob_ivl, &result.blob_stat) {
-                txn.record(MetaKind::BlobStat, blob_stat);
-                txn.record(MetaKind::BlobInterval, blob_ivl);
-            }
+        blob_stats.iter().for_each(|x| {
+            txn.record(MetaKind::BlobStat, x);
+        });
+
+        if let (Some(blob_ivl), Some(blob_stat)) = (&result.blob_ivl, &result.blob_stat) {
+            txn.record(MetaKind::BlobStat, blob_stat);
+            txn.record(MetaKind::BlobInterval, blob_ivl);
+        }
+        for &addr in &clear_pending_addrs {
+            self.manifest.clear_pending_sibling(
+                &mut txn,
+                result.bucket_id,
+                PendingRangeKind::Data,
+                addr,
+            );
         }
 
         txn.record(MetaKind::Numerics, self.manifest.numerics.deref());
-        for result in &results {
+        self.manifest
+            .clear_orphan_data_file(&mut txn, result.data_id);
+        if let Some(blob_ivl) = result.blob_ivl {
             self.manifest
-                .clear_orphan_data_file(&mut txn, result.data_id);
-            if let Some(blob_ivl) = result.blob_ivl {
-                self.manifest
-                    .clear_orphan_blob_file(&mut txn, blob_ivl.file_id);
-            }
+                .clear_orphan_blob_file(&mut txn, blob_ivl.file_id);
         }
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check("mace_flush_before_manifest_commit")?;
@@ -241,53 +229,28 @@ impl StoreFlushObserver {
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check("mace_flush_after_manifest_commit")?;
 
-        let mut ckpt_targets = Vec::with_capacity(results.len());
-        let mut done_list = Vec::with_capacity(results.len());
-        for result in results {
-            self.manifest
-                .add_data_stat(result.mem_data_stat, result.data_ivl);
-            if let (Some(mem_blob_stat), Some(blob_ivl)) = (result.mem_blob_stat, result.blob_ivl) {
-                self.manifest.add_blob_stat(mem_blob_stat, blob_ivl);
-            }
-            ckpt_targets.push(result.flsn);
-            done_list.push(result.done);
+        self.manifest.add_data_stat(result.mem_data_stat);
+        if let Some(mem_blob_stat) = result.mem_blob_stat {
+            self.manifest.add_blob_stat(mem_blob_stat);
         }
 
-        for (i, dep_ids) in writer_dep_ids.into_iter().enumerate() {
-            let manager = &groups[i].dep_group;
-            for dep_id in dep_ids {
-                manager
-                    .mark_group_published(dep_id)
-                    .expect("dep group publish transition failed");
-            }
-        }
-
-        for done in done_list {
-            done.mark_done();
-        }
+        result.done.mark_done();
 
         // checkpoint update is a post-flush step and must run after mark_done
         // wal durability barrier is handled before manifest commit in the first loop
-        for flsn in ckpt_targets {
-            for (i, g) in groups.iter().enumerate() {
-                let mut pos = flsn[i];
-                if let Some(min) = g.active_txns.min_lsn()
-                    && min < pos
-                {
-                    pos = min;
-                }
-                if let Some(min) = g.dep_group.pending_min_lsn()
-                    && min < pos
-                {
-                    pos = min;
-                }
-                let mut lk = g.logging.lock();
-                if lk.update_checkpoint(pos) {
-                    let mut f = lk.writer.clone();
-                    drop(lk);
-                    // checkpoint must be synced
-                    f.sync();
-                }
+        for (i, g) in groups.iter().enumerate() {
+            let mut pos = result.flsn[i];
+            if let Some(min) = g.active_txns.min_lsn()
+                && min < pos
+            {
+                pos = min;
+            }
+            let mut lk = g.logging.lock();
+            if lk.update_checkpoint(pos) {
+                let mut f = lk.writer.clone();
+                drop(lk);
+                // checkpoint must be synced
+                f.sync();
             }
         }
 
@@ -317,11 +280,7 @@ impl FlushObserver for StoreFlushObserver {
     }
 
     fn on_flush(&self, result: FlushResult) -> Result<(), OpCode> {
-        if let Some(group_results) = self.push_flush_result(result) {
-            self.publish_group(group_results)
-        } else {
-            Ok(())
-        }
+        self.publish_one(result)
     }
 }
 

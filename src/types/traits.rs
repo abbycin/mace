@@ -55,13 +55,6 @@ pub trait IAlloc {
         (self.allocate(size1), self.allocate(size2))
     }
 
-    /// no-op fallback so lightweight allocators and tests keep compiling
-    /// production allocators should override this to enforce packed flush closure
-    fn begin_packed_alloc(&mut self, _total_real_size: u32, _nr_frames: u32) {}
-
-    /// no-op fallback paired with begin_packed_alloc
-    fn end_packed_alloc(&mut self) {}
-
     fn collect(&mut self, addr: &[u64]);
 
     fn arena_size(&mut self) -> usize;

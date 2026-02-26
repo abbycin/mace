@@ -8,7 +8,7 @@ use std::{
     sync::atomic::Ordering::{AcqRel, Relaxed},
 };
 
-use super::header::{BaseHeader, BoxHeader, DeltaHeader, RemoteHeader, TagFlag};
+use super::header::{BaseHeader, BoxHeader, DeltaHeader, NodeType, RemoteHeader, TagFlag};
 use super::traits::{IAsBoxRef, IBoxHeader, IHeader};
 static_assert!(BoxRef::HDR_LEN == 48);
 static_assert!(align_of::<BoxHeader>() == align_of::<*const ()>());
@@ -84,6 +84,7 @@ impl BoxView {
 
 impl BoxRef {
     pub(crate) const HDR_LEN: usize = size_of::<BoxHeader>();
+    pub(crate) const DUMP_HDR_LEN: usize = size_of::<BoxHeader>() - size_of::<AtomicU32>();
 
     pub(crate) const fn real_size(size: u32) -> u32 {
         Self::HDR_LEN as u32 + size
@@ -134,7 +135,41 @@ impl BoxRef {
     }
 
     pub(crate) fn dump_len(&self) -> usize {
+        if let Some(payload) = self.persist_payload_len() {
+            return Self::DUMP_HDR_LEN + payload;
+        }
         self.total_size() as usize - size_of::<AtomicU32>()
+    }
+
+    pub(crate) fn persist_payload_len(&self) -> Option<usize> {
+        let h = self.header();
+        if h.kind == TagKind::Base && h.flag == TagFlag::Normal && h.node_type == NodeType::Leaf {
+            let base = self.view().as_base();
+            let logical_payload = base.header().size as usize;
+            if h.payload_size as usize > logical_payload {
+                return Some(logical_payload);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn encode_dump_header(&self, payload_size: u32, out: &mut [u8; Self::DUMP_HDR_LEN]) {
+        let src = self.header();
+        let hdr = BoxHeader {
+            refs: AtomicU32::new(0),
+            kind: src.kind,
+            node_type: src.node_type,
+            flag: src.flag,
+            total_size: Self::HDR_LEN as u32 + payload_size,
+            payload_size,
+            pid: src.pid,
+            txid: src.txid,
+            addr: src.addr,
+            link: src.link,
+        };
+        let p = (&hdr as *const BoxHeader).cast::<u8>();
+        let s = unsafe { std::slice::from_raw_parts(p.add(size_of::<AtomicU32>()), out.len()) };
+        out.copy_from_slice(s);
     }
 
     /// NOTE: for T is not u8, the caller **MUST** make sure T is aligned to pointer size
@@ -155,7 +190,8 @@ impl BoxRef {
     pub(crate) fn load_slice(&mut self) -> &mut [u8] {
         let p = self.0 as *mut u8;
         let off = size_of::<AtomicU32>();
-        unsafe { std::slice::from_raw_parts_mut(p.add(off), self.dump_len()) }
+        let len = self.total_size() as usize - off;
+        unsafe { std::slice::from_raw_parts_mut(p.add(off), len) }
     }
 
     pub(crate) fn view(&self) -> BoxView {

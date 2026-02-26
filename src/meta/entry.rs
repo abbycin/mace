@@ -48,6 +48,85 @@ impl TryFrom<u8> for MetaKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PendingRangeKind {
+    Data = 0,
+    Blob = 1,
+}
+
+impl TryFrom<u8> for PendingRangeKind {
+    type Error = OpCode;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Data),
+            1 => Ok(Self::Blob),
+            _ => Err(OpCode::Corruption),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingSibling {
+    /// namespace prefix for BUCKET_PENDING_SIBLING key
+    /// this isolates sibling intents across buckets and is reused when rebuilding del keys during recovery
+    pub bucket_id: u64,
+    pub file_id: u64,
+    pub kind: PendingRangeKind,
+    pub addr: u64,
+}
+
+impl PendingSibling {
+    pub fn new(bucket_id: u64, file_id: u64, kind: PendingRangeKind, addr: u64) -> Self {
+        Self {
+            bucket_id,
+            file_id,
+            kind,
+            addr,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed(1))]
+struct PendingSiblingHdr {
+    bucket_id: u64,
+    file_id: u64,
+    kind: u8,
+    addr: u64,
+}
+
+impl IAsSlice for PendingSiblingHdr {}
+
+impl IMetaCodec for PendingSibling {
+    fn packed_size(&self) -> usize {
+        size_of::<PendingSiblingHdr>()
+    }
+
+    fn encode(&self, to: &mut [u8]) {
+        assert_eq!(to.len(), self.packed_size());
+        let hdr = PendingSiblingHdr {
+            bucket_id: self.bucket_id,
+            file_id: self.file_id,
+            kind: self.kind as u8,
+            addr: self.addr,
+        };
+        to.copy_from_slice(hdr.as_slice());
+    }
+
+    fn decode(src: &[u8]) -> Self {
+        let hdr = PendingSiblingHdr::from_slice(src);
+        let kind = PendingRangeKind::try_from(hdr.kind).expect("invalid pending range kind");
+        Self {
+            bucket_id: hdr.bucket_id,
+            file_id: hdr.file_id,
+            kind,
+            addr: hdr.addr,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct DataStatInner {
@@ -685,5 +764,23 @@ impl IMetaCodec for BucketMeta {
 
     fn decode(src: &[u8]) -> Self {
         unsafe { std::ptr::read(src.as_ptr() as *const Self) }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{PendingRangeKind, PendingSibling};
+    use crate::meta::IMetaCodec;
+
+    #[test]
+    fn pending_sibling_codec_roundtrip() {
+        let raw = PendingSibling::new(7, 13, PendingRangeKind::Data, 101);
+        let mut buf = vec![0u8; raw.packed_size()];
+        raw.encode(&mut buf);
+        let got = PendingSibling::decode(&buf);
+        assert_eq!(got.bucket_id, 7);
+        assert_eq!(got.file_id, 13);
+        assert_eq!(got.kind, PendingRangeKind::Data);
+        assert_eq!(got.addr, 101);
     }
 }

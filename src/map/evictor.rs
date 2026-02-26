@@ -19,7 +19,7 @@ use crate::{
 use crate::{
     map::{
         SharedState,
-        buffer::{BucketContext, BucketMgr, Loader, PackedAlloc, Pool},
+        buffer::{BucketContext, BucketMgr, Loader, Pool},
         data::Arena,
         table::Swip,
     },
@@ -45,7 +45,6 @@ pub(crate) struct Evictor {
     current_bucket_id: u64,
     frames: Vec<(Handle<Arena>, BoxView)>,
     garbage: Vec<u64>,
-    packed_alloc: Option<PackedAlloc>,
 }
 
 impl Drop for Evictor {
@@ -74,13 +73,6 @@ impl Evictor {
             current_bucket_id: NULL_PID,
             frames: vec![],
             garbage: vec![],
-            packed_alloc: None,
-        }
-    }
-
-    fn finish_packed_if_any(&mut self) {
-        if let Some(packed) = self.packed_alloc.take() {
-            packed.finish();
         }
     }
 
@@ -188,8 +180,6 @@ impl Evictor {
     }
 
     fn commit(&mut self) {
-        self.finish_packed_if_any();
-
         while let Some((a, _)) = self.frames.pop() {
             a.dec_ref();
         }
@@ -220,10 +210,6 @@ impl Evictor {
     }
 
     fn rollback(&mut self) {
-        if let Some(packed) = self.packed_alloc.take() {
-            drop(packed);
-        }
-
         while let Some((a, b)) = self.frames.pop() {
             let h = b.header();
             a.dealloc(h.addr, h.total_size as usize);
@@ -326,47 +312,18 @@ impl Evictor {
 
 impl IAlloc for Evictor {
     fn allocate(&mut self, size: u32) -> BoxRef {
-        let (h, b) = if let Some(packed) = self.packed_alloc.as_mut() {
-            packed.alloc(size)
-        } else {
-            let pool = self.current_pool.as_ref().expect("pool must be set");
-            pool.alloc(size).expect("never happen")
-        };
+        let pool = self.current_pool.as_ref().expect("pool must be set");
+        let (h, b) = pool.alloc(size).expect("never happen");
         self.frames.push((h, b.view()));
         b
     }
 
     fn allocate_pair(&mut self, size1: u32, size2: u32) -> (BoxRef, BoxRef) {
-        assert!(
-            self.packed_alloc.is_none(),
-            "allocate_pair in packed evictor allocation"
-        );
         let pool = self.current_pool.as_ref().expect("pool must be set");
         let ((h1, b1), (h2, b2)) = pool.alloc_pair(size1, size2).expect("never happen");
         self.frames.push((h1, b1.view()));
         self.frames.push((h2, b2.view()));
         (b1, b2)
-    }
-
-    fn begin_packed_alloc(&mut self, total_real_size: u32, nr_frames: u32) {
-        if self.packed_alloc.is_some() {
-            log::error!("nested packed allocation in evictor");
-            panic!("nested packed allocation in evictor");
-        }
-
-        let pool = self.current_pool.as_ref().expect("pool must be set");
-        let packed = pool
-            .begin_packed_alloc(total_real_size, nr_frames)
-            .expect("begin packed allocation failed");
-        self.packed_alloc = Some(packed);
-    }
-
-    fn end_packed_alloc(&mut self) {
-        let Some(packed) = self.packed_alloc.take() else {
-            log::error!("end packed allocation without begin in evictor");
-            panic!("end packed allocation without begin in evictor");
-        };
-        packed.finish();
     }
 
     fn arena_size(&mut self) -> usize {

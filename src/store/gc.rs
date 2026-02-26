@@ -598,16 +598,11 @@ impl GarbageCollector {
     fn process_wal(&mut self) {
         for g in self.store.context.groups().iter() {
             let mut checkpoint_id = g.active_txns.min_position_file_id();
-            let pending_min_file = g
-                .dep_group
-                .pending_min_lsn()
-                .map_or(u64::MAX, |x| x.file_id);
             let (oldest_id, last_ckpt_file) = {
                 let logging = g.logging.lock();
                 (logging.oldest_wal_id(), logging.last_ckpt().file_id)
             };
             checkpoint_id = std::cmp::min(checkpoint_id, last_ckpt_file);
-            checkpoint_id = std::cmp::min(checkpoint_id, pending_min_file);
 
             if oldest_id >= checkpoint_id {
                 continue;

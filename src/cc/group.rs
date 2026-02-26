@@ -1,5 +1,4 @@
 use crate::cc::cc::ConcurrencyControl;
-use crate::cc::dep_group::DepGroupManager;
 use crate::cc::log::Logging;
 use crate::meta::Numerics;
 use crate::utils::data::Position;
@@ -115,8 +114,6 @@ impl ActiveTxns {
 pub struct WriterGroup {
     pub id: usize,
     pub cc: ConcurrencyControl,
-    #[allow(dead_code)]
-    pub dep_group: DepGroupManager,
     pub logging: Mutex<Logging>,
     pub active_txns: ActiveTxns,
     pub ckpt_cnt: Arc<AtomicUsize>,
@@ -136,7 +133,6 @@ impl WriterGroup {
         Self {
             id,
             cc: ConcurrencyControl::new(opt.concurrent_write as usize),
-            dep_group: DepGroupManager::new(),
             logging: Mutex::new(Logging::new(
                 id as u8,
                 latest_id,
