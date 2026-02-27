@@ -92,19 +92,26 @@ impl Ids {
 }
 
 struct Iim {
-    map: RwLock<Vec<Ids>>,
+    map: RwLock<(Vec<Ids>, usize)>,
 }
 
 impl Iim {
     fn new(addr: u64, arena: u64) -> Self {
+        let mut ids = Vec::with_capacity(Pool::INIT_ARENA as usize);
+        ids.push(Ids::new(addr, arena));
         Self {
-            map: RwLock::new(vec![Ids::new(addr, arena)]),
+            map: RwLock::new((ids, 0)),
         }
     }
 
     fn find(&self, addr: u64) -> Option<u64> {
         let lk = self.map.read();
-        let pos = match lk.binary_search_by(|x| x.addr.cmp(&addr)) {
+        let (ids, head) = &*lk;
+        if *head >= ids.len() {
+            return None;
+        }
+        let active = &ids[*head..];
+        let pos = match active.binary_search_by(|x| x.addr.cmp(&addr)) {
             Ok(pos) => pos,
             Err(pos) => {
                 if pos == 0 {
@@ -113,17 +120,26 @@ impl Iim {
                 pos - 1
             }
         };
-        Some(lk[pos].arena)
+        Some(active[pos].arena)
     }
 
     fn push(&self, addr: u64, arena: u64) {
         let mut lk = self.map.write();
-        lk.push(Ids::new(addr, arena));
+        lk.0.push(Ids::new(addr, arena));
     }
 
     fn pop(&self) {
         let mut lk = self.map.write();
-        lk.remove(0);
+        let (ids, head) = &mut *lk;
+        if *head >= ids.len() {
+            return;
+        }
+        *head += 1;
+        // compact prefix occasionally to keep binary-search cache friendly
+        if *head >= 64 && *head * 2 >= ids.len() {
+            ids.drain(..*head);
+            *head = 0;
+        }
     }
 }
 
@@ -140,93 +156,6 @@ pub(crate) struct Pool {
     pub(crate) bucket_id: u64,
     flush_in: AtomicU64,
     flush_out: Arc<AtomicU64>,
-}
-
-struct PackedAlloc {
-    arena: Handle<Arena>,
-    start_addr: u64,
-    addr_cur: u64,
-    addr_end: u64,
-    total_real_size: u32,
-    remain_real_size: u32,
-    nr_frames: u32,
-    allocated_addrs: Vec<u64>,
-}
-
-pub(crate) struct PackedAllocCtx {
-    data: PackedAlloc,
-}
-
-impl PackedAllocCtx {
-    pub(crate) fn alloc(&mut self, size: u32) -> (Handle<Arena>, BoxRef) {
-        let real_size = BoxRef::real_size(size);
-        let x = &mut self.data;
-        if x.addr_cur >= x.addr_end || x.remain_real_size < real_size {
-            log::error!(
-                "packed allocation overflow, arena {}, cur {}, end {}, remain {}, need {}",
-                x.arena.id(),
-                x.addr_cur,
-                x.addr_end,
-                x.remain_real_size,
-                real_size
-            );
-            panic!("packed allocation overflow");
-        }
-
-        let addr = x.addr_cur;
-        x.addr_cur += 1;
-        x.remain_real_size -= real_size;
-
-        let b = x.arena.alloc_at_addr(addr, real_size);
-        x.allocated_addrs.push(addr);
-        (x.arena, b)
-    }
-
-    pub(crate) fn finish(self) {
-        let x = self.data;
-        let used_frames = x.allocated_addrs.len() as u32;
-        if x.addr_cur != x.addr_end || x.remain_real_size != 0 || used_frames != x.nr_frames {
-            log::error!(
-                "packed allocation mismatch, arena {}, frames {}, addr [{}, {}), cur {}, remain {}, used {}",
-                x.arena.id(),
-                x.nr_frames,
-                x.start_addr,
-                x.addr_end,
-                x.addr_cur,
-                x.remain_real_size,
-                used_frames
-            );
-            panic!("packed allocation mismatch");
-        }
-    }
-
-    // it's impossible to run, because all packed allocs are gaurded by lock and will do check to avoid duplicate
-    // operation after acquire lock
-    pub(crate) fn cancel(self) {
-        let mut x = self.data;
-        let used_frames = x.allocated_addrs.len() as u32;
-        for addr in x.allocated_addrs.drain(..) {
-            if !x.arena.remove_item_only(addr) {
-                log::error!(
-                    "packed cancel remove failed, arena {}, addr {}",
-                    x.arena.id(),
-                    addr
-                );
-                panic!("packed cancel remove failed");
-            }
-        }
-        x.arena.rollback_batch(x.total_real_size, x.nr_frames);
-        log::error!(
-            "cancel packed allocation, arena {}, range [{}, {}), used_frames {}, used_size {}",
-            x.arena.id(),
-            x.start_addr,
-            x.addr_end,
-            used_frames,
-            x.total_real_size.saturating_sub(x.remain_real_size)
-        );
-        #[cfg(feature = "extra_check")]
-        panic!("it's impossible to run");
-    }
 }
 
 impl Pool {
@@ -293,7 +222,7 @@ impl Pool {
         None
     }
 
-    fn install_new(&self, cur: Handle<Arena>) {
+    fn install_new(&self, cur: Handle<Arena>) -> Handle<Arena> {
         let id = Self::get_id(&self.ctx.numerics);
         self.wait.insert(cur.id(), cur);
         self.flush(cur);
@@ -315,6 +244,7 @@ impl Pool {
         self.cur
             .compare_exchange(cur.inner(), p.inner(), Relaxed, Relaxed)
             .expect("never happen");
+        p
     }
 
     fn flush(&self, h: Handle<Arena>) {
@@ -323,7 +253,7 @@ impl Pool {
         let map = self.map.clone();
         let out = self.flush_out.clone();
 
-        let cb = move || {
+        let release = move || {
             h.set_state(Arena::COLD, Arena::FLUSH);
             h.clear();
             map.pop();
@@ -331,13 +261,13 @@ impl Pool {
             if free.push(h).is_err() {
                 h.reclaim();
             }
+        };
+        let done = move || {
             out.fetch_add(1, Relaxed);
         };
 
-        let _ = self
-            .flush
-            .tx
-            .send(FlushData::new(h, self.bucket_id, Box::new(cb)));
+        let data = FlushData::new(h, self.bucket_id, Box::new(release), Box::new(done));
+        let _ = self.flush.tx.send(data);
         self.flush_in.fetch_add(1, Relaxed);
     }
 
@@ -377,45 +307,6 @@ impl Pool {
                     }
                 }
                 _ => unreachable!(),
-            }
-        }
-    }
-
-    pub(crate) fn begin_packed_ctx(
-        &self,
-        total_real_size: u32,
-        nr_frames: u32,
-    ) -> Result<PackedAllocCtx, OpCode> {
-        if nr_frames == 0 {
-            log::error!("invalid packed allocation frame count 0");
-            panic!("invalid packed allocation frame count");
-        }
-
-        loop {
-            let a = self.current();
-            match a.reserve_batch(total_real_size, nr_frames) {
-                Ok(()) => {
-                    let start = self.state.reserve_addr_span(nr_frames as u64);
-                    return Ok(PackedAllocCtx {
-                        data: PackedAlloc {
-                            arena: a,
-                            start_addr: start,
-                            addr_cur: start,
-                            addr_end: start + nr_frames as u64,
-                            total_real_size,
-                            remain_real_size: total_real_size,
-                            nr_frames,
-                            allocated_addrs: Vec::with_capacity(nr_frames as usize),
-                        },
-                    });
-                }
-                Err(OpCode::Again) => continue,
-                Err(OpCode::NoSpace) => {
-                    if a.set_state(Arena::HOT, Arena::WARM) == Arena::HOT {
-                        self.install_new(a);
-                    }
-                }
-                Err(e) => return Err(e),
             }
         }
     }
@@ -558,14 +449,6 @@ impl BucketContext {
         size2: u32,
     ) -> Result<((Handle<Arena>, BoxRef), (Handle<Arena>, BoxRef)), OpCode> {
         self.pool.alloc_pair(size1, size2)
-    }
-
-    pub(crate) fn begin_packed_ctx(
-        &self,
-        total_real_size: u32,
-        nr_frames: u32,
-    ) -> Result<PackedAllocCtx, OpCode> {
-        self.pool.begin_packed_ctx(total_real_size, nr_frames)
     }
 
     pub(crate) fn record_lsn(&self, group_id: usize, pos: Position) {

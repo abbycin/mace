@@ -1,6 +1,8 @@
 use crate::cc::context::Context;
 use crate::map::data::{Arena, FileBuilder};
 use crate::meta::{BlobStat, DataStat, IntervalPair, MemBlobStat, MemDataStat, PageTable};
+use crate::types::header::{NodeType, TagFlag, TagKind};
+use crate::types::traits::IHeader;
 use crate::utils::Handle;
 use crate::utils::OpCode;
 use crate::utils::countblock::Countblock;
@@ -38,6 +40,8 @@ pub struct FlushResult {
     pub mem_blob_stat: Option<MemBlobStat>,
     pub blob_stat: Option<BlobStat>,
     pub blob_junks: Vec<u64>,
+    pub pending_sibling_addrs: Vec<u64>,
+    pub published_sibling_addrs: Vec<u64>,
     pub flsn: Vec<Position>,
     pub done: FlushData,
 }
@@ -57,12 +61,23 @@ fn flush_data(
     let bucket_id = msg.bucket_id();
     let mut builder = FileBuilder::new(bucket_id);
     let mut map = MapBuilder::new(bucket_id);
+    let mut sibling_addrs = Vec::new();
+    let mut published_sibling_addrs = Vec::new();
 
     for x in msg.iter() {
         let f = x.value();
-        #[cfg(feature = "extra_check")]
+        let hdr = f.header();
+        if hdr.flag == TagFlag::Sibling {
+            sibling_addrs.push(hdr.addr);
+        } else if hdr.flag == TagFlag::Normal
+            && hdr.kind == TagKind::Base
+            && hdr.node_type == NodeType::Leaf
         {
-            // bucket id is tracked by FlushData; BoxHeader no longer stores it
+            let base = f.view().as_base();
+            if base.header().has_multiple_versions {
+                let has_hint = base.load_sibling_heads_hint(&mut published_sibling_addrs);
+                assert!(has_hint, "missing sibling hint for base addr {}", hdr.addr);
+            }
         }
         map.add(f);
         builder.add(f.clone());
@@ -127,6 +142,8 @@ fn flush_data(
         mem_blob_stat,
         blob_stat,
         blob_junks: builder.blob_junks,
+        pending_sibling_addrs: sibling_addrs,
+        published_sibling_addrs,
         flsn,
         done: msg,
     })

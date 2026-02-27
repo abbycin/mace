@@ -14,6 +14,8 @@ use crate::{
 
 impl BaseView {
     const HDR_LEN: usize = size_of::<BaseHeader>();
+    const SIBLING_HINT_CNT_LEN: usize = size_of::<u32>();
+    const SIBLING_HINT_ADDR_LEN: usize = size_of::<u64>();
 
     pub(crate) fn null() -> Self {
         Self(null_mut())
@@ -49,13 +51,9 @@ impl BaseView {
         I: Iterator<Item = (LeafSeg<'a>, Val<'a>)>,
     {
         let inline_size = a.inline_size();
-        let arena_size = a.arena_size();
         let mut elems = 0;
         let mut hints = VecDeque::new();
         let mut is_new_sibling = false;
-        let mut sibling_frame_len = 0;
-        let mut sib_frames = 0;
-        let mut sib_real_size = 0;
         let mut last_raw: Option<LeafSeg<'a>> = None;
         let mut pos = 0;
         let mut payload_sz = 0;
@@ -80,52 +78,14 @@ impl BaseView {
             {
                 if !is_new_sibling {
                     is_new_sibling = true;
-                    sibling_frame_len = Self::HDR_LEN;
                     payload_sz += Val::calc_size(true, inline_size, v.data_size());
                     hints.push_back((pos - 1, 0));
                 }
-                let item_len =
-                    Ver::len() + Val::calc_size(false, inline_size, v.data_size()) + SLOT_LEN;
-                if sibling_frame_len + item_len > arena_size {
-                    if sibling_frame_len == Self::HDR_LEN {
-                        log::error!(
-                            "sibling frame planning failed, arena_size {}, item_len {}",
-                            arena_size,
-                            item_len
-                        );
-                        panic!("sibling frame planning failed");
-                    }
-                    sib_frames += 1;
-                    sib_real_size += BoxRef::real_size(sibling_frame_len as u32) as usize;
-                    sibling_frame_len = Self::HDR_LEN;
-                }
-                if sibling_frame_len + item_len > arena_size {
-                    log::error!(
-                        "sibling frame planning failed after split, arena_size {}, item_len {}",
-                        arena_size,
-                        item_len
-                    );
-                    panic!("sibling frame planning failed");
-                }
-                sibling_frame_len += item_len;
 
                 let (_, cnt) = hints.back_mut().unwrap();
                 *cnt += 1;
                 pos += 1;
                 continue;
-            }
-
-            if is_new_sibling {
-                if sibling_frame_len <= Self::HDR_LEN {
-                    log::error!(
-                        "sibling frame planning empty frame, arena_size {}",
-                        arena_size
-                    );
-                    panic!("sibling frame planning failed");
-                }
-                sib_frames += 1;
-                sib_real_size += BoxRef::real_size(sibling_frame_len as u32) as usize;
-                sibling_frame_len = 0;
             }
 
             pos += 1;
@@ -137,29 +97,32 @@ impl BaseView {
             elems += 1;
         }
 
-        if is_new_sibling {
-            if sibling_frame_len <= Self::HDR_LEN {
-                log::error!(
-                    "sibling frame planning empty tail frame, arena_size {}",
-                    arena_size
-                );
-                panic!("sibling frame planning failed");
-            }
-            sib_frames += 1;
-            sib_real_size += BoxRef::real_size(sibling_frame_len as u32) as usize;
-        }
-
         let hdr_sz = elems * SLOT_LEN + Self::HDR_LEN;
-        let boundary = lo.len() + hi.map_or(0, |x| x.len());
-        let base_real_size = BoxRef::real_size((hdr_sz + payload_sz + boundary) as u32) as usize;
-        let total_frames = 1 + sib_frames;
-        let total_real_size = base_real_size + sib_real_size;
-
-        a.begin_packed_alloc(total_real_size as u32, total_frames as u32);
+        // head pointer of all sibling slots in Node
+        let mut sibling_heads = VecDeque::with_capacity(hints.len());
+        let mut sibling_hint_addrs = Vec::new();
+        for &(idx, cnt) in hints.iter() {
+            seekable.seek_to((idx + 1) as usize);
+            sibling_heads.push_back(Self::save_versions(
+                a,
+                l,
+                cnt as usize,
+                &seekable,
+                txid,
+                &mut sibling_hint_addrs,
+            ));
+        }
+        let hint_sz = if sibling_hint_addrs.is_empty() {
+            0
+        } else {
+            Self::sibling_hint_size(sibling_hint_addrs.len())
+        };
+        seekable.seek_to(0);
 
         let b = Self::alloc::<false, _>(
             a,
             hdr_sz + payload_sz,
+            hint_sz,
             lo,
             hi,
             elems,
@@ -181,25 +144,27 @@ impl BaseView {
 
             let (r, _) = v.get_record(l, true);
             let remote = v.get_remote();
-            let Some((idx, _)) = hints.front() else {
-                builder.add_leaf(inline_size, k, &r, NULL_ADDR, remote);
-                pos += 1;
-                continue;
-            };
-
-            if pos == *idx {
-                let (_, cnt) = hints.pop_front().unwrap();
-                let sib_addr = Self::save_versions(a, l, cnt as usize, &mut pos, &seekable, txid);
+            let mut sib_addr = NULL_ADDR;
+            if let Some((idx, cnt)) = hints.front().copied()
+                && pos == idx
+            {
+                hints.pop_front().expect("must exist");
+                sib_addr = sibling_heads.pop_front().expect("must exist");
                 has_multiple_versions = true;
-
-                builder.add_leaf(inline_size, k, &r, sib_addr, remote);
-            } else {
-                builder.add_leaf(inline_size, k, &r, NULL_ADDR, remote);
+                if cnt != 0 {
+                    seekable.seek_to((pos + cnt + 1) as usize);
+                    pos += cnt;
+                }
             }
+            builder.add_leaf(inline_size, k, &r, sib_addr, remote);
             pos += 1;
         }
+        debug_assert!(hints.is_empty());
+        debug_assert!(sibling_heads.is_empty());
         base.header_mut().has_multiple_versions = has_multiple_versions;
-        a.end_packed_alloc();
+        if !sibling_hint_addrs.is_empty() {
+            base.write_sibling_heads_hint(&sibling_hint_addrs);
+        }
         b
     }
 
@@ -228,7 +193,7 @@ impl BaseView {
             .sum();
 
         let hdr_sz = elems * SLOT_LEN + Self::HDR_LEN;
-        let b = Self::alloc::<true, _>(a, hdr_sz + sz, lo, hi, elems, sibling, prefix_len, txid);
+        let b = Self::alloc::<true, _>(a, hdr_sz + sz, 0, lo, hi, elems, sibling, prefix_len, txid);
         let mut base = b.view().as_base();
         let mut builder = Builder::from(base.data_mut(), elems);
         builder.setup_boundary_keys(lo, hi);
@@ -246,9 +211,9 @@ impl BaseView {
         a: &mut A,
         l: &L,
         mut cnt: usize,
-        pos: &mut u32,
         iter: &SeekableIter<'a>,
         txid: u64,
+        hint_addrs: &mut Vec<u64>,
     ) -> u64 {
         let inline_size = a.inline_size();
         let arena_size = a.arena_size();
@@ -272,7 +237,7 @@ impl BaseView {
             }
             iter.seek_to(saved);
 
-            let b = Self::alloc::<false, _>(a, len, &[], None, beg - saved, NULL_PID, 0, txid);
+            let b = Self::alloc::<false, _>(a, len, 0, &[], None, beg - saved, NULL_PID, 0, txid);
             // NOTE: this is the only place to set flag to Sibling
             let mut base = b.view().as_base();
             base.box_header_mut().flag = TagFlag::Sibling;
@@ -283,10 +248,10 @@ impl BaseView {
                 let (k, v) = iter.next().unwrap();
                 let (r, _) = v.get_record(l, true);
                 builder.add_leaf(inline_size, &k.ver, &r, NULL_ADDR, v.get_remote());
-                *pos += 1;
             }
 
             let addr = base.box_header().addr;
+            hint_addrs.push(addr);
 
             if head.is_none() {
                 head = Some(addr);
@@ -305,6 +270,7 @@ impl BaseView {
     fn alloc<const IS_INDEX: bool, A: IAlloc>(
         a: &mut A,
         mut size: usize,
+        extra_payload: usize,
         lo: &[u8],
         hi: Option<&[u8]>,
         elems: usize,
@@ -318,7 +284,7 @@ impl BaseView {
         // and the lo/hi keys are both stored in sst directly discard it's length
         size += lo.len() + hi.map_or(0, |x| x.len());
 
-        let mut p = a.allocate(size as u32);
+        let mut p = a.allocate((size + extra_payload) as u32);
         let h = p.header_mut();
         h.kind = TagKind::Base;
         h.link = NULL_ADDR;
@@ -342,6 +308,47 @@ impl BaseView {
         h.padding = 0;
 
         p
+    }
+
+    const fn sibling_hint_size(nr_heads: usize) -> usize {
+        Self::SIBLING_HINT_CNT_LEN + nr_heads * Self::SIBLING_HINT_ADDR_LEN
+    }
+
+    fn write_sibling_heads_hint(&mut self, heads: &[u64]) {
+        debug_assert!(!self.header().is_index);
+        let payload = self.box_header().payload_size as usize;
+        let off = self.header().size as usize;
+        let need = off + Self::sibling_hint_size(heads.len());
+        assert!(payload >= need);
+
+        let p = self.0.cast::<u8>();
+        unsafe {
+            p.add(off).cast::<u32>().write_unaligned(heads.len() as u32);
+            let src = heads.as_ptr().cast::<u8>();
+            let dst = p.add(off + Self::SIBLING_HINT_CNT_LEN);
+            std::ptr::copy_nonoverlapping(src, dst, heads.len() * Self::SIBLING_HINT_ADDR_LEN);
+        }
+    }
+
+    pub(crate) fn load_sibling_heads_hint(&self, out: &mut Vec<u64>) -> bool {
+        debug_assert!(!self.header().is_index);
+        let payload = self.box_header().payload_size as usize;
+        let off = self.header().size as usize;
+        if payload == off {
+            return false;
+        }
+        assert!(payload >= off + Self::SIBLING_HINT_CNT_LEN);
+        let p = self.0.cast::<u8>();
+        let cnt = unsafe { p.add(off).cast::<u32>().read_unaligned() as usize };
+        let start = out.len();
+        out.resize(start + cnt, 0);
+        assert!(payload >= off + Self::sibling_hint_size(cnt));
+        unsafe {
+            let src = p.add(off + Self::SIBLING_HINT_CNT_LEN).cast::<u8>();
+            let dst = out.as_mut_ptr().add(start).cast::<u8>();
+            std::ptr::copy_nonoverlapping(src, dst, cnt * Self::SIBLING_HINT_ADDR_LEN);
+        }
+        true
     }
 
     pub(crate) fn merge<A: IAlloc, L: ILoader>(
@@ -477,6 +484,18 @@ where
     type Item = (Key<'a>, Val<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_with_sibling(|_| {})
+    }
+}
+
+impl<'a, L> BaseIter<'a, L, Key<'a>>
+where
+    L: ILoader,
+{
+    pub(crate) fn next_with_sibling<F>(&mut self, mut on_sibling: F) -> Option<(Key<'a>, Val<'a>)>
+    where
+        F: FnMut(u64),
+    {
         while let Some(p) = self.sibling.as_ref() {
             if self.sibling_pos < p.header().elems as usize {
                 let (ver, val) = p.sst::<Ver>().kv_at(self.sibling_pos);
@@ -487,6 +506,7 @@ where
                 let link = p.box_header().link;
                 self.sibling_pos = 0;
                 if link != NULL_ADDR {
+                    on_sibling(link);
                     self.sibling = Some(self.loader.load_unchecked(link).as_base());
                     continue;
                 }
@@ -498,6 +518,7 @@ where
             self.beg += 1;
             if let Some(addr) = v.get_sibling() {
                 self.sib_key = k.raw;
+                on_sibling(addr);
                 self.sibling = Some(self.loader.load_unchecked(addr).as_base());
                 self.sibling_pos = 0;
                 // the sibling is still in `v`
@@ -892,7 +913,8 @@ mod test {
 
         check(&k, &v, &l, "foo", 2, 1, "bar", 1);
 
-        assert!(v.get_sibling().is_some());
+        let sibling_addr = v.get_sibling().expect("must have sibling");
+        assert!(sibling_addr < b.header().addr);
 
         iter.next(); // skip the expanded sibling
 

@@ -25,17 +25,24 @@ use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
     bucket_id: u64,
-    cb: Box<dyn FnOnce()>,
+    release_cb: Option<Box<dyn FnOnce()>>,
+    done_cb: Option<Box<dyn FnOnce()>>,
 }
 
 unsafe impl Send for FlushData {}
 
 impl FlushData {
-    pub fn new(arena: Handle<Arena>, bucket_id: u64, cb: Box<dyn FnOnce()>) -> Self {
+    pub fn new(
+        arena: Handle<Arena>,
+        bucket_id: u64,
+        release_cb: Box<dyn FnOnce()>,
+        done_cb: Box<dyn FnOnce()>,
+    ) -> Self {
         Self {
             arena,
             bucket_id,
-            cb,
+            release_cb: Some(release_cb),
+            done_cb: Some(done_cb),
         }
     }
 
@@ -47,8 +54,17 @@ impl FlushData {
         self.arena.id()
     }
 
-    pub fn mark_done(self) {
-        (self.cb)()
+    pub fn release(&mut self) {
+        if let Some(cb) = self.release_cb.take() {
+            cb();
+        }
+    }
+
+    pub fn mark_done(mut self) {
+        self.release();
+        if let Some(cb) = self.done_cb.take() {
+            cb();
+        }
     }
 }
 
@@ -236,16 +252,6 @@ impl Arena {
         Ok(())
     }
 
-    // we are not rollback offset in case of ABA problem
-    pub(crate) fn rollback_batch(&self, total_real_size: u32, nr_frames: u32) {
-        if total_real_size > 0 {
-            self.real_size.fetch_sub(total_real_size as u64, AcqRel);
-        }
-        if nr_frames > 0 {
-            self.refs.fetch_sub(nr_frames, AcqRel);
-        }
-    }
-
     fn alloc_at(&self, next_addr: &AtomicU64, real_size: u32) -> BoxRef {
         let addr = next_addr.fetch_add(1, Relaxed);
         self.alloc_at_addr(addr, real_size)
@@ -268,10 +274,6 @@ impl Arena {
         if self.items.remove(&addr).is_some() {
             self.real_size.fetch_sub(len as u64, AcqRel);
         }
-    }
-
-    pub(crate) fn remove_item_only(&self, addr: u64) -> bool {
-        self.items.remove(&addr).is_some()
     }
 
     #[inline]
@@ -523,32 +525,70 @@ impl FileBuilder {
         }
     }
 
+    fn ensure_iov_room(
+        need: usize,
+        queued_iov: &mut usize,
+        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+        w: &mut GatherWriter,
+    ) {
+        if *queued_iov + need > GatherWriter::DEFAULT_IOVCNT {
+            w.flush();
+            *queued_iov = 0;
+            hdr_batch.clear();
+        }
+    }
+
     pub(crate) fn build_data(&mut self, tick: u64, path: PathBuf) -> Interval {
         let mut pos: usize = 0;
         let mut w = GatherWriter::trunc(&path, 64);
         let mut relocs = Vec::with_capacity(self.data.len() * AddrPair::LEN);
+        let mut queued_iov = 0usize;
+        let mut hdr_batch: Vec<[u8; BoxRef::DUMP_HDR_LEN]> =
+            Vec::with_capacity(GatherWriter::DEFAULT_IOVCNT / 2);
 
         for (seq, f) in self.data.iter().enumerate() {
             let h = f.header();
-            let s = f.dump_slice();
             let mut crc = Crc32cHasher::default();
-            crc.write(s);
-            w.queue(s);
-            let reloc = AddrPair::new(h.addr, pos, s.len() as u32, seq as u32, crc.finish() as u32);
+            let len = if let Some(payload_len) = f.persist_payload_len() {
+                Self::ensure_iov_room(2, &mut queued_iov, &mut hdr_batch, &mut w);
+                hdr_batch.push([0u8; BoxRef::DUMP_HDR_LEN]);
+                let hdr_bytes = hdr_batch.last_mut().expect("must exist");
+                f.encode_dump_header(payload_len as u32, hdr_bytes);
+                let body_all = f.data_slice::<u8>();
+                let body = &body_all[..payload_len];
+                crc.write(hdr_bytes);
+                crc.write(body);
+                w.queue(hdr_bytes);
+                w.queue(body);
+                queued_iov += 2;
+                hdr_bytes.len() + body.len()
+            } else {
+                Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
+                let s = f.dump_slice();
+                crc.write(s);
+                w.queue(s);
+                queued_iov += 1;
+                s.len()
+            };
+            let reloc = AddrPair::new(h.addr, pos, len as u32, seq as u32, crc.finish() as u32);
             relocs.extend_from_slice(reloc.as_slice());
-            pos += s.len();
+            pos += len;
         }
 
         let mut interval_crc = Crc32cHasher::default();
 
         let is = self.data_interval.as_slice();
         interval_crc.write(is);
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(is);
+        queued_iov += 1;
 
         let mut reloc_crc = Crc32cHasher::default();
         let rs = relocs.as_slice();
         reloc_crc.write(rs);
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(rs);
+        queued_iov += 1;
 
         let hdr = DataFooter {
             up2: tick,
@@ -558,6 +598,7 @@ impl FileBuilder {
             interval_crc: interval_crc.finish() as u32,
         };
 
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(hdr.as_slice());
         w.flush();
         w.sync();

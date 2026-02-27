@@ -5,7 +5,7 @@ use crate::map::buffer::DataReader;
 use crate::map::evictor::Evictor;
 use crate::map::flush::{FlushDirective, FlushObserver, FlushResult};
 use crate::meta::builder::ManifestBuilder;
-use crate::meta::{BucketMeta, Manifest, MetaKind};
+use crate::meta::{BucketMeta, Manifest, MetaKind, PendingRangeKind};
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
 use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats, VacuumStats};
@@ -85,6 +85,177 @@ impl StoreFlushObserver {
     fn new(manifest: Handle<Manifest>, ctx: Handle<Context>) -> Self {
         Self { manifest, ctx }
     }
+
+    fn remove_sorted_intersection(lhs: &mut Vec<u64>, rhs: &mut Vec<u64>) {
+        if lhs.is_empty() || rhs.is_empty() {
+            return;
+        }
+
+        lhs.sort_unstable();
+        lhs.dedup();
+        rhs.sort_unstable();
+        rhs.dedup();
+
+        // rewrite lhs/rhs in place to keep only side-unique entries
+        let mut i = 0;
+        let mut j = 0;
+        let mut wl = 0;
+        let mut wr = 0;
+        while i < lhs.len() && j < rhs.len() {
+            let x = lhs[i];
+            let y = rhs[j];
+            if x < y {
+                lhs[wl] = x;
+                wl += 1;
+                i += 1;
+            } else if x > y {
+                rhs[wr] = y;
+                wr += 1;
+                j += 1;
+            } else {
+                i += 1;
+                j += 1;
+            }
+        }
+        while i < lhs.len() {
+            lhs[wl] = lhs[i];
+            wl += 1;
+            i += 1;
+        }
+        while j < rhs.len() {
+            rhs[wr] = rhs[j];
+            wr += 1;
+            j += 1;
+        }
+        lhs.truncate(wl);
+        rhs.truncate(wr);
+    }
+
+    fn publish_one(&self, mut result: FlushResult) -> Result<(), OpCode> {
+        let groups = self.ctx.groups();
+        debug_assert_eq!(result.flsn.len(), groups.len());
+
+        let ctx = self
+            .manifest
+            .buckets
+            .buckets
+            .get(&result.bucket_id)
+            .expect("bucket context must exist when flushing");
+        ctx.data_intervals.write().insert(
+            result.data_ivl.lo_addr,
+            result.data_ivl.hi_addr,
+            result.data_ivl.file_id,
+        );
+        if let Some(blob_ivl) = result.blob_ivl {
+            ctx.blob_intervals
+                .write()
+                .insert(blob_ivl.lo_addr, blob_ivl.hi_addr, blob_ivl.file_id);
+        }
+        let mut stage_pending_addrs = std::mem::take(&mut result.pending_sibling_addrs);
+        let mut clear_pending_addrs = std::mem::take(&mut result.published_sibling_addrs);
+        // the siblings and base are almost in same arena, so it's unnecessary to stage/clear
+        Self::remove_sorted_intersection(&mut stage_pending_addrs, &mut clear_pending_addrs);
+        // release arena before metadata commit to avoid holding allocator capacity
+        // defer done callback until manifest publish so wait_flush still means end-to-end flush done
+        result.done.release();
+
+        // make wal durable before publishing flush metadata
+        for (i, g) in groups.iter().enumerate() {
+            let target = result.flsn[i];
+            let mut lk = g.logging.lock();
+            let ok = lk.should_durable(target);
+            if ok {
+                let mut f = lk.writer.clone();
+                drop(lk);
+                // it's safe because we make sure wal entry has been written before
+                f.sync();
+            }
+        }
+
+        let mut txn = self.manifest.begin();
+        let data_stats =
+            self.manifest
+                .apply_data_junks(result.bucket_id, result.tick, &result.data_junks);
+        let blob_stats = self
+            .manifest
+            .apply_blob_junks(result.bucket_id, &result.blob_junks);
+
+        for &addr in &stage_pending_addrs {
+            let pending = crate::meta::PendingSibling::new(
+                result.bucket_id,
+                result.data_id,
+                PendingRangeKind::Data,
+                addr,
+            );
+            self.manifest.record_pending_sibling(&mut txn, &pending);
+        }
+
+        txn.record(MetaKind::DataStat, &result.data_stat);
+        txn.record(MetaKind::Map, &result.map_table);
+        txn.record(MetaKind::DataInterval, &result.data_ivl);
+
+        data_stats.iter().for_each(|x| {
+            assert_ne!(result.data_id, x.file_id);
+            txn.record(MetaKind::DataStat, x)
+        });
+
+        blob_stats.iter().for_each(|x| {
+            txn.record(MetaKind::BlobStat, x);
+        });
+
+        if let (Some(blob_ivl), Some(blob_stat)) = (&result.blob_ivl, &result.blob_stat) {
+            txn.record(MetaKind::BlobStat, blob_stat);
+            txn.record(MetaKind::BlobInterval, blob_ivl);
+        }
+        for &addr in &clear_pending_addrs {
+            self.manifest.clear_pending_sibling(
+                &mut txn,
+                result.bucket_id,
+                PendingRangeKind::Data,
+                addr,
+            );
+        }
+
+        txn.record(MetaKind::Numerics, self.manifest.numerics.deref());
+        self.manifest
+            .clear_orphan_data_file(&mut txn, result.data_id);
+        if let Some(blob_ivl) = result.blob_ivl {
+            self.manifest
+                .clear_orphan_blob_file(&mut txn, blob_ivl.file_id);
+        }
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_flush_before_manifest_commit")?;
+        txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_flush_after_manifest_commit")?;
+
+        self.manifest.add_data_stat(result.mem_data_stat);
+        if let Some(mem_blob_stat) = result.mem_blob_stat {
+            self.manifest.add_blob_stat(mem_blob_stat);
+        }
+
+        result.done.mark_done();
+
+        // checkpoint update is a post-flush step and must run after mark_done
+        // wal durability barrier is handled before manifest commit in the first loop
+        for (i, g) in groups.iter().enumerate() {
+            let mut pos = result.flsn[i];
+            if let Some(min) = g.active_txns.min_lsn()
+                && min < pos
+            {
+                pos = min;
+            }
+            let mut lk = g.logging.lock();
+            if lk.update_checkpoint(pos) {
+                let mut f = lk.writer.clone();
+                drop(lk);
+                // checkpoint must be synced
+                f.sync();
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl FlushObserver for StoreFlushObserver {
@@ -109,84 +280,7 @@ impl FlushObserver for StoreFlushObserver {
     }
 
     fn on_flush(&self, result: FlushResult) -> Result<(), OpCode> {
-        let done = result.done;
-        let mut txn = self.manifest.begin();
-
-        let data_stats =
-            self.manifest
-                .apply_data_junks(result.bucket_id, result.tick, &result.data_junks);
-        let blob_stats = self
-            .manifest
-            .apply_blob_junks(result.bucket_id, &result.blob_junks);
-
-        txn.record(MetaKind::DataStat, &result.data_stat);
-        txn.record(MetaKind::Map, &result.map_table);
-        txn.record(MetaKind::DataInterval, &result.data_ivl);
-
-        data_stats.iter().for_each(|x| {
-            assert_ne!(result.data_id, x.file_id);
-            txn.record(MetaKind::DataStat, x)
-        });
-
-        blob_stats.iter().for_each(|x| {
-            txn.record(MetaKind::BlobStat, x);
-        });
-
-        if let (Some(blob_ivl), Some(blob_stat)) = (&result.blob_ivl, &result.blob_stat) {
-            txn.record(MetaKind::BlobStat, blob_stat);
-            txn.record(MetaKind::BlobInterval, blob_ivl);
-        }
-
-        // make wal durable before publishing flush metadata
-        for (i, g) in self.ctx.groups().iter().enumerate() {
-            let mut lk = g.logging.lock();
-            let ok = lk.should_durable(result.flsn[i]);
-            if ok {
-                let mut f = lk.writer.clone();
-                drop(lk);
-                // it's safe because we make sure wal entry has been written before
-                f.sync();
-            }
-        }
-
-        txn.record(MetaKind::Numerics, self.manifest.numerics.deref());
-        self.manifest
-            .clear_orphan_data_file(&mut txn, result.data_id);
-        if let Some(blob_ivl) = result.blob_ivl {
-            self.manifest
-                .clear_orphan_blob_file(&mut txn, blob_ivl.file_id);
-        }
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::check("mace_flush_before_manifest_commit")?;
-        txn.commit();
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::check("mace_flush_after_manifest_commit")?;
-
-        self.manifest
-            .add_data_stat(result.mem_data_stat, result.data_ivl);
-        if let (Some(mem_blob_stat), Some(blob_ivl)) = (result.mem_blob_stat, result.blob_ivl) {
-            self.manifest.add_blob_stat(mem_blob_stat, blob_ivl);
-        }
-
-        done.mark_done();
-        // checkpoint update is a post-flush step and must run after mark_done
-        // wal durability barrier is handled before manifest commit in the first loop
-        for (i, g) in self.ctx.groups().iter().enumerate() {
-            let mut pos = result.flsn[i];
-            if let Some(min) = g.active_txns.min_lsn()
-                && min < pos
-            {
-                pos = min;
-            }
-            let mut lk = g.logging.lock();
-            if lk.update_checkpoint(pos) {
-                let mut f = lk.writer.clone();
-                drop(lk);
-                // checkpoint must be synced
-                f.sync();
-            }
-        }
-        Ok(())
+        self.publish_one(result)
     }
 }
 

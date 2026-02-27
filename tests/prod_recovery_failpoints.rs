@@ -136,8 +136,15 @@ fn drive_blob_gc_pressure(bucket: &Bucket, rounds: usize, blob_size: usize) {
     }
 }
 
-fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted: usize) {
-    let mace = open_with_tune(db_root, |_| {});
+fn assert_visibility_after_reopen(
+    db_root: &Path,
+    inline_size: usize,
+    committed: usize,
+    uncommitted: usize,
+) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.inline_size = inline_size;
+    });
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
 
@@ -153,8 +160,10 @@ fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted:
     }
 }
 
-fn assert_bucket_readable(db_root: &Path) {
-    let mace = open_with_tune(db_root, |_| {});
+fn assert_bucket_readable(db_root: &Path, inline_size: usize) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.inline_size = inline_size;
+    });
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
 
@@ -345,7 +354,7 @@ fn chaos_failpoint_flush_after_data_sync() {
         !crashed_files.is_empty(),
         "expected flush crash to leave data/blob files before recovery"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
     for file in crashed_files {
         assert!(
             !file.exists(),
@@ -372,7 +381,7 @@ fn chaos_failpoint_flush_before_manifest_commit() {
         !crashed_files.is_empty(),
         "expected flush crash to leave data/blob files before recovery"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
     for file in crashed_files {
         assert!(
             !file.exists(),
@@ -399,7 +408,7 @@ fn chaos_failpoint_flush_after_manifest_commit() {
         !crashed_files.is_empty(),
         "expected committed flush files before recovery"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
     assert!(
         crashed_files.iter().any(|file| file.exists()),
         "flush files committed before crash should survive recovery"
@@ -416,7 +425,7 @@ fn chaos_failpoint_wal_after_checkpoint_write() {
         "mace_wal_after_checkpoint_write=abort@1",
     );
     assert!(!status.success(), "wal failpoint child should abort");
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
 #[test]
@@ -429,7 +438,7 @@ fn chaos_failpoint_manifest_before_multi_commit() {
         "mace_manifest_before_multi_commit=abort@3",
     );
     assert!(!status.success(), "manifest failpoint child should abort");
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
 #[test]
@@ -445,7 +454,7 @@ fn chaos_failpoint_txn_commit_after_record_commit() {
         !status.success(),
         "txn-after-record-commit failpoint child should abort"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
 #[test]
@@ -461,7 +470,7 @@ fn chaos_failpoint_txn_commit_after_wal_sync() {
         !status.success(),
         "txn-after-wal-sync failpoint child should abort"
     );
-    assert_visibility_after_reopen(&path, 64, 24);
+    assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
 #[test]
@@ -474,7 +483,7 @@ fn chaos_failpoint_gc_data_rewrite_before_meta_commit() {
         "mace_gc_data_rewrite_before_meta_commit=abort@1",
     );
     assert!(!status.success(), "gc-data failpoint child should abort");
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -490,7 +499,7 @@ fn chaos_failpoint_gc_data_rewrite_after_stage_marker() {
         !status.success(),
         "gc-data-after-marker failpoint child should abort"
     );
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -506,7 +515,7 @@ fn chaos_failpoint_gc_data_rewrite_after_meta_commit() {
         !status.success(),
         "gc-data-after-meta failpoint child should abort"
     );
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -519,7 +528,7 @@ fn chaos_failpoint_gc_blob_rewrite_before_meta_commit() {
         "mace_gc_blob_rewrite_before_meta_commit=abort@1",
     );
     assert!(!status.success(), "gc-blob failpoint child should abort");
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -535,7 +544,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_stage_marker() {
         !status.success(),
         "gc-blob-after-marker failpoint child should abort"
     );
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -551,7 +560,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_meta_commit() {
         !status.success(),
         "gc-blob-after-meta failpoint child should abort"
     );
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, 256);
 }
 
 #[test]
@@ -564,5 +573,5 @@ fn chaos_failpoint_evictor_before_evict_once() {
         "mace_evictor_before_evict_once=abort@1",
     );
     assert!(!status.success(), "evictor failpoint child should abort");
-    assert_bucket_readable(&path);
+    assert_bucket_readable(&path, Options::INLINE_SIZE);
 }
