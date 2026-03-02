@@ -300,20 +300,50 @@ pub(crate) struct LeafSeg<'a> {
     pub(crate) ver: Ver,
 }
 
+#[inline]
+fn cmp_raw_with_prefixed_tail(lhs: &[u8], rhs_prefix_tail: &[u8], rhs_base: &[u8]) -> Ordering {
+    let n = lhs.len().min(rhs_prefix_tail.len());
+    let o = lhs[..n].cmp(&rhs_prefix_tail[..n]);
+    if o != Ordering::Equal {
+        return o;
+    }
+    if lhs.len() < rhs_prefix_tail.len() {
+        return Ordering::Less;
+    }
+    lhs[n..].cmp(rhs_base)
+}
+
+#[inline]
+fn full_raw_cmp(l_prefix: &[u8], l_raw: &[u8], r_prefix: &[u8], r_raw: &[u8]) -> Ordering {
+    let n = l_prefix.len().min(r_prefix.len());
+    match l_prefix[..n].cmp(&r_prefix[..n]) {
+        Ordering::Equal => match l_prefix.len().cmp(&r_prefix.len()) {
+            Ordering::Equal => l_raw.cmp(r_raw),
+            Ordering::Less => cmp_raw_with_prefixed_tail(l_raw, &r_prefix[n..], r_raw),
+            Ordering::Greater => cmp_raw_with_prefixed_tail(r_raw, &l_prefix[n..], l_raw).reverse(),
+        },
+        x => x,
+    }
+}
+
 impl<'a> LeafSeg<'a> {
     pub(crate) fn new(prefix: &'a [u8], base: &'a [u8], ver: Ver) -> Self {
         Self { prefix, base, ver }
-    }
-
-    /// compare in same node, they share same prefix
-    pub(crate) fn raw_cmp(&self, other: &Self) -> Ordering {
-        self.base.cmp(other.base)
     }
 
     pub(crate) fn cmp(&self, other: &Self) -> Ordering {
         match self.raw_cmp(other) {
             Ordering::Equal => self.ver.cmp(&other.ver),
             o => o,
+        }
+    }
+
+    pub(crate) fn raw_cmp(&self, other: &Self) -> Ordering {
+        // merge can feed items from different prefix domains, only then use full key compare
+        if self.prefix == other.prefix {
+            self.base.cmp(other.base)
+        } else {
+            full_raw_cmp(self.prefix, self.base, other.prefix, other.base)
         }
     }
 
@@ -759,14 +789,21 @@ where
     }
 
     pub(crate) fn cmp(&self, other: &Self) -> Ordering {
-        match (self.prefix, other.prefix) {
-            (&[], _) => other.cmp_key(self.base.raw).reverse(),
-            (_, &[]) => self.cmp_key(other.base.raw),
-            (s, o) => match s.cmp(o) {
-                Ordering::Equal => self.base.raw.cmp(other.base.raw),
-                x => x,
-            },
+        // fast path: most scan compares happen within the same prefix domain
+        if self.prefix == other.prefix {
+            return self.base.raw.cmp(other.base.raw);
         }
+
+        // preserve old cheap path for one-side-empty prefixes
+        if self.prefix.is_empty() {
+            return other.cmp_key(self.base.raw).reverse();
+        }
+        if other.prefix.is_empty() {
+            return self.cmp_key(other.base.raw);
+        }
+
+        // mixed non-empty prefixes need full-key compare for correctness
+        full_raw_cmp(self.prefix, self.base.raw, other.prefix, other.base.raw)
     }
 
     pub(crate) fn txid(&self) -> u64 {
@@ -821,7 +858,7 @@ mod test {
         utils::NULL_ADDR,
     };
 
-    use super::{Index, Key};
+    use super::{Index, Key, LeafSeg};
 
     #[test]
     fn test_ver() {
@@ -886,6 +923,21 @@ mod test {
         ik.encode_to(&mut buf);
         let dik = IntlKey::decode_from(&buf);
         assert_eq!(dik.raw, ik.raw);
+    }
+
+    #[test]
+    fn leaf_seg_full_raw_cmp_handles_prefix_boundary() {
+        let l = LeafSeg::new("aa".as_bytes(), "z".as_bytes(), Ver::new(3, 1));
+        let r = LeafSeg::new("aab".as_bytes(), "x".as_bytes(), Ver::new(2, 1));
+        assert!(l.raw_cmp(&r).is_gt());
+
+        let l = LeafSeg::new("ab".as_bytes(), "0".as_bytes(), Ver::new(3, 1));
+        let r = LeafSeg::new("ab".as_bytes(), "1".as_bytes(), Ver::new(2, 1));
+        assert!(l.raw_cmp(&r).is_lt());
+
+        let l = LeafSeg::new("ab".as_bytes(), "1".as_bytes(), Ver::new(3, 1));
+        let r = LeafSeg::new("ab1".as_bytes(), "".as_bytes(), Ver::new(2, 1));
+        assert!(l.raw_cmp(&r).is_eq());
     }
 
     #[test]

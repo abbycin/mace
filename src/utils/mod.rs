@@ -8,6 +8,7 @@ use std::{
         AtomicI64, AtomicU32,
         Ordering::{AcqRel, Relaxed},
     },
+    time::Duration,
 };
 
 pub(crate) mod bitmap;
@@ -97,6 +98,42 @@ pub(crate) const INIT_WMK: u64 = 0;
 /// NOTE: must larger than wmk_oldest (which is 0 by default)
 pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
+
+pub(crate) struct Backoff {
+    count: u32,
+}
+
+impl Backoff {
+    const SPIN_COUNT: u32 = 3;
+    const YIELD_COUNT: u32 = 5;
+
+    pub(crate) const fn new() -> Self {
+        Self { count: 0 }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.count = 0;
+    }
+
+    pub(crate) fn shape(&mut self) {
+        if self.count <= Self::SPIN_COUNT {
+            for _ in 0..(1 << Self::SPIN_COUNT) {
+                std::hint::spin_loop();
+            }
+        } else if self.count <= Self::YIELD_COUNT {
+            for _ in 0..(1 << self.count) {
+                std::hint::spin_loop();
+            }
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_micros(20));
+        }
+
+        if self.count <= Self::YIELD_COUNT {
+            self.count += 1;
+        }
+    }
+}
 
 pub(crate) const fn align_up(n: usize, align: usize) -> usize {
     (n + (align - 1)) & !(align - 1)

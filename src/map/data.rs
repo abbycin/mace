@@ -20,7 +20,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64};
 
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
@@ -77,16 +77,20 @@ impl Deref for FlushData {
 }
 
 pub(crate) struct Arena {
+    // hot fields for alloc fast path
+    pub(crate) state: AtomicU16,
+    pub(crate) real_size: AtomicU64,
+    // pack file_id and seq
+    offset: AtomicU64,
+    alloc_inflight: CachePad<AtomicU32>,
+    refs: AtomicU32,
+    cap: usize,
+    // colder metadata and lookup state
+    origin: AtomicU8,
     id: Cell<u64>,
     pub(crate) items: DashMap<u64, BoxRef>,
     /// flush LSN
     pub(crate) flsn: Box<[CachePad<Flsn>]>,
-    pub(crate) real_size: AtomicU64,
-    // pack file_id and seq
-    offset: AtomicU64,
-    cap: usize,
-    refs: AtomicU32,
-    pub(crate) state: AtomicU16,
 }
 
 pub(crate) struct Flsn {
@@ -145,6 +149,9 @@ impl Arena {
     pub(crate) const COLD: u16 = 2;
     /// flushed to disk
     pub(crate) const FLUSH: u16 = 1;
+    pub(crate) const ORIGIN_BASE: u8 = 0;
+    pub(crate) const ORIGIN_BURST: u8 = 1;
+    pub(crate) const ORIGIN_STRUCT: u8 = 2;
 
     fn alloc_flsn(n: usize) -> Box<[CachePad<Flsn>]> {
         let mut v = Vec::with_capacity(n);
@@ -156,14 +163,16 @@ impl Arena {
 
     pub(crate) fn new(cap: usize, groups: u8) -> Self {
         Self {
-            items: DashMap::with_capacity(16 << 10),
-            flsn: Self::alloc_flsn(groups as usize),
-            id: Cell::new(INIT_ID),
+            state: AtomicU16::new(Self::FLUSH),
+            real_size: AtomicU64::new(0),
+            alloc_inflight: CachePad::from(AtomicU32::new(0)),
             refs: AtomicU32::new(0),
             offset: AtomicU64::new(0),
-            real_size: AtomicU64::new(0),
             cap,
-            state: AtomicU16::new(Self::FLUSH),
+            origin: AtomicU8::new(Self::ORIGIN_BASE),
+            id: Cell::new(INIT_ID),
+            items: DashMap::with_capacity(16 << 10),
+            flsn: Self::alloc_flsn(groups as usize),
         }
     }
 
@@ -175,18 +184,50 @@ impl Arena {
         self.id.set(id);
         assert_eq!(self.state(), Self::FLUSH);
         self.set_state(Arena::FLUSH, Arena::HOT);
+        self.origin.store(Self::ORIGIN_BASE, Relaxed);
+        self.alloc_inflight.store(0, Relaxed);
         self.offset.store(0, Relaxed);
         self.real_size.store(0, Relaxed);
         assert!(self.unref());
         self.clear();
     }
 
-    pub(crate) fn cap(&self) -> usize {
-        self.cap
+    pub(crate) fn set_origin(&self, origin: u8) {
+        self.origin.store(origin, Relaxed);
     }
 
-    pub(crate) fn groups(&self) -> u8 {
-        self.flsn.len() as u8
+    pub(crate) fn is_burst(&self) -> bool {
+        self.origin.load(Relaxed) == Self::ORIGIN_BURST
+    }
+
+    pub(crate) fn is_struct(&self) -> bool {
+        self.origin.load(Relaxed) == Self::ORIGIN_STRUCT
+    }
+
+    pub(crate) fn try_enter_hot_alloc(&self) -> bool {
+        if self.state() != Self::HOT {
+            return false;
+        }
+        self.alloc_inflight.fetch_add(1, AcqRel);
+        if self.state() == Self::HOT {
+            return true;
+        }
+        let old = self.alloc_inflight.fetch_sub(1, AcqRel);
+        debug_assert!(old > 0);
+        false
+    }
+
+    pub(crate) fn leave_hot_alloc(&self) {
+        let old = self.alloc_inflight.fetch_sub(1, AcqRel);
+        debug_assert!(old > 0);
+    }
+
+    pub(crate) fn alloc_inflight(&self) -> u32 {
+        self.alloc_inflight.load(Acquire)
+    }
+
+    pub(crate) fn mark_warm(&self) -> bool {
+        self.set_state(Self::HOT, Self::WARM) == Self::HOT
     }
 
     fn alloc_size(&self, size: u32) -> Result<u64, OpCode> {
@@ -266,8 +307,13 @@ impl Arena {
     pub fn alloc(&self, next_addr: &AtomicU64, size: u32) -> Result<BoxRef, OpCode> {
         let real_size = BoxRef::real_size(size);
         self.inc_ref();
-        let _ = self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
-        Ok(self.alloc_at(next_addr, real_size))
+        match self.alloc_size(real_size) {
+            Ok(_) => Ok(self.alloc_at(next_addr, real_size)),
+            Err(e) => {
+                self.dec_ref();
+                Err(e)
+            }
+        }
     }
 
     pub(crate) fn dealloc(&self, addr: u64, len: usize) {

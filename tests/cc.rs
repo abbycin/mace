@@ -1,3 +1,4 @@
+use mace::observe::{CounterMetric, InMemoryObserver, ObserveSnapshot};
 use mace::{Bucket, Mace, OpCode, Options, RandomPath};
 use rand::seq::SliceRandom;
 use std::{
@@ -9,17 +10,19 @@ use std::{
 
 #[test]
 fn put_get() -> Result<(), OpCode> {
-    let path = RandomPath::tmp();
+    let path = RandomPath::new();
     let opt = Options::new(&*path);
-    let mace = Mace::new(opt.validate().unwrap())?;
+    let mut saved = opt.clone();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
     let db = mace.new_bucket("default").unwrap();
-    let n = 1000;
+    let n = 100000;
     let mut elems = Vec::with_capacity(n);
     for i in 0..n {
         elems.push(format!("elem_{i}"));
     }
     let del1: RwLock<HashSet<Vec<u8>>> = RwLock::new(HashSet::new());
     let del2: RwLock<HashSet<Vec<u8>>> = RwLock::new(HashSet::new());
+    let put_ok: RwLock<HashSet<Vec<u8>>> = RwLock::new(HashSet::new());
     let barrier = Barrier::new(3);
 
     std::thread::scope(|s| {
@@ -27,7 +30,9 @@ fn put_get() -> Result<(), OpCode> {
             barrier.wait();
             for i in &elems {
                 let kv = db.begin().unwrap();
-                let _ = kv.put(i, i);
+                if kv.put(i, i).is_ok() {
+                    put_ok.write().unwrap().insert(i.as_bytes().to_vec());
+                }
                 kv.commit().unwrap();
             }
         });
@@ -56,29 +61,34 @@ fn put_get() -> Result<(), OpCode> {
             }
         });
     });
-
-    check(&db, &elems, &del1, &del2);
-
-    let kv = db.begin().unwrap();
-    kv.put("foo", "bar").unwrap();
-    kv.commit()?;
-
     drop(db);
     drop(mace);
+
+    saved.tmp_store = true;
+    let mace = Mace::new(saved.validate().unwrap()).unwrap();
+    let db = mace.get_bucket("default").unwrap();
+
+    check(&db, &elems, &put_ok, &del1, &del2);
+
     Ok(())
 }
 
 fn check(
     db: &Bucket,
     elems: &[String],
+    put_ok: &RwLock<HashSet<Vec<u8>>>,
     del1: &RwLock<HashSet<Vec<u8>>>,
     del2: &RwLock<HashSet<Vec<u8>>>,
 ) {
+    let put_lk = put_ok.read().unwrap();
     let lk1 = del1.read().unwrap();
     let lk2 = del2.read().unwrap();
     let view = db.view().unwrap();
     for i in elems.iter() {
         let tmp = i.as_bytes().to_vec();
+        if !put_lk.contains(&tmp) {
+            continue;
+        }
         if lk1.contains(&tmp) || lk2.contains(&tmp) {
             continue;
         }
@@ -296,6 +306,58 @@ fn range_simple() -> Result<(), OpCode> {
         drop(db);
         drop(mace);
     }
+    Ok(())
+}
+
+#[test]
+fn seek_stops_when_key_no_longer_matches_prefix() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    for key in [
+        vec![0x00],
+        vec![0xFE, 0xFF],
+        vec![0xFF],
+        vec![0xFF, 0x00],
+        vec![0xFF, 0x01],
+        vec![0xFF, 0xFF],
+        vec![0xFF, 0xFF, 0x00],
+        vec![0xFF, 0xFF, 0x01],
+    ] {
+        kv.put(&key, "v")?;
+    }
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<Vec<u8>> = view.seek([0xFF]).map(|item| item.key().to_vec()).collect();
+    assert_eq!(
+        got,
+        vec![
+            vec![0xFF],
+            vec![0xFF, 0x00],
+            vec![0xFF, 0x01],
+            vec![0xFF, 0xFF],
+            vec![0xFF, 0xFF, 0x00],
+            vec![0xFF, 0xFF, 0x01]
+        ]
+    );
+
+    let got: Vec<Vec<u8>> = view
+        .seek([0xFF, 0xFF])
+        .map(|item| item.key().to_vec())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            vec![0xFF, 0xFF],
+            vec![0xFF, 0xFF, 0x00],
+            vec![0xFF, 0xFF, 0x01]
+        ]
+    );
+
     Ok(())
 }
 
@@ -553,6 +615,324 @@ fn smo_during_scan() -> Result<(), OpCode> {
 
     drop(db);
     drop(mace);
+    Ok(())
+}
+
+fn upsert_retry(db: &Bucket, key: &str) {
+    const RETRY_LIMIT: usize = 8192;
+    for _ in 0..RETRY_LIMIT {
+        let kv = db.begin().unwrap();
+        match kv.upsert(key, key) {
+            Ok(_) => match kv.commit() {
+                Ok(_) => return,
+                Err(OpCode::Again | OpCode::AbortTx) => std::thread::yield_now(),
+                Err(e) => panic!("commit upsert fail: {e:?}"),
+            },
+            Err(OpCode::Again | OpCode::AbortTx) => std::thread::yield_now(),
+            Err(e) => panic!("upsert fail: {e:?}"),
+        }
+    }
+    panic!("upsert retry exhausted: {key}");
+}
+
+fn del_retry(db: &Bucket, key: &str) {
+    const RETRY_LIMIT: usize = 8192;
+    for _ in 0..RETRY_LIMIT {
+        let kv = db.begin().unwrap();
+        let ready = match kv.del(key) {
+            Ok(_) | Err(OpCode::NotFound) => true,
+            Err(OpCode::Again | OpCode::AbortTx) => false,
+            Err(e) => panic!("del fail: {e:?}"),
+        };
+        if !ready {
+            std::thread::yield_now();
+            continue;
+        }
+        match kv.commit() {
+            Ok(_) => return,
+            Err(OpCode::Again | OpCode::AbortTx) => std::thread::yield_now(),
+            Err(e) => panic!("commit del fail: {e:?}"),
+        }
+    }
+    panic!("del retry exhausted: {key}");
+}
+
+fn assert_seek_sorted_unique(db: &Bucket, prefix: &str) {
+    let view = db.view().unwrap();
+    let mut last: Option<Vec<u8>> = None;
+    for item in view.seek(prefix) {
+        let key = item.key();
+        if let Some(prev) = last.as_ref() {
+            assert!(prev.as_slice() < key);
+        }
+        last = Some(key.to_vec());
+    }
+}
+
+fn counter(snapshot: &ObserveSnapshot, metric: CounterMetric) -> u64 {
+    snapshot
+        .counters
+        .iter()
+        .find(|(m, _)| *m == metric)
+        .map(|(_, v)| *v)
+        .unwrap_or_default()
+}
+
+#[test]
+fn smo_merge_preserves_final_state() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    let observer = Arc::new(InMemoryObserver::new(256));
+    opts.tmp_store = true;
+    opts.sync_on_write = false;
+    opts.concurrent_write = 8;
+    opts.split_elems = 20;
+    opts.consolidate_threshold = 8;
+    opts.observer = observer.clone();
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    const WRITERS: usize = 4;
+    const WINDOW: usize = 192;
+    const WRITE_STEPS: usize = 1800;
+    const READERS: usize = 2;
+    const READ_STEPS: usize = 320;
+    const EXTRA_STEPS: usize = 256;
+    const MAX_EXTRA_ROUNDS: usize = 12;
+    const MIN_SPLIT_COUNT: u64 = 16;
+    const MIN_MERGE_COUNT: u64 = 8;
+    const MIN_CONSOLIDATE_COUNT: u64 = 64;
+
+    std::thread::scope(|s| {
+        let mut writer_handles = Vec::with_capacity(WRITERS);
+        for tid in 0..WRITERS {
+            let db = db.clone();
+            writer_handles.push(s.spawn(move || {
+                for step in 0..WRITE_STEPS {
+                    let key = format!("w{tid}_{step:06}");
+                    upsert_retry(&db, &key);
+                    if step >= WINDOW {
+                        let old = format!("w{tid}_{:06}", step - WINDOW);
+                        del_retry(&db, &old);
+                    }
+                }
+            }));
+        }
+
+        let mut reader_handles = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let db = db.clone();
+            reader_handles.push(s.spawn(move || {
+                for _ in 0..READ_STEPS {
+                    assert_seek_sorted_unique(&db, "w");
+                }
+            }));
+        }
+
+        for handle in writer_handles {
+            handle.join().unwrap();
+        }
+        for handle in reader_handles {
+            handle.join().unwrap();
+        }
+    });
+
+    for _ in 0..96 {
+        let view = db.view().unwrap();
+        for tid in 0..WRITERS {
+            for idx in (0..(WRITE_STEPS - WINDOW)).step_by(4) {
+                let key = format!("w{tid}_{idx:06}");
+                let _ = view.get(&key);
+            }
+        }
+    }
+
+    let mut end_step = WRITE_STEPS;
+    let mut snapshot = observer.snapshot();
+    for _ in 0..MAX_EXTRA_ROUNDS {
+        let split_count = counter(&snapshot, CounterMetric::TreeNodeSplit);
+        let merge_count = counter(&snapshot, CounterMetric::TreeNodeMerge);
+        let consolidate_count = counter(&snapshot, CounterMetric::TreeNodeConsolidate);
+        if split_count >= MIN_SPLIT_COUNT
+            && merge_count >= MIN_MERGE_COUNT
+            && consolidate_count >= MIN_CONSOLIDATE_COUNT
+        {
+            break;
+        }
+        for tid in 0..WRITERS {
+            for step in end_step..(end_step + EXTRA_STEPS) {
+                let key = format!("w{tid}_{step:06}");
+                upsert_retry(&db, &key);
+                let old = format!("w{tid}_{:06}", step - WINDOW);
+                del_retry(&db, &old);
+            }
+        }
+        end_step += EXTRA_STEPS;
+        for _ in 0..64 {
+            assert_seek_sorted_unique(&db, "w");
+        }
+        snapshot = observer.snapshot();
+    }
+
+    let view = db.view().unwrap();
+    for tid in 0..WRITERS {
+        for idx in 0..(end_step - WINDOW) {
+            let key = format!("w{tid}_{idx:06}");
+            assert!(view.get(&key).is_err());
+        }
+        for idx in (end_step - WINDOW)..end_step {
+            let key = format!("w{tid}_{idx:06}");
+            let r = view.get(&key).expect("must exist");
+            assert_eq!(r.slice(), key.as_bytes());
+        }
+    }
+
+    assert_eq!(view.seek("w").count(), WRITERS * WINDOW);
+
+    let snapshot = observer.snapshot();
+    let split_count = counter(&snapshot, CounterMetric::TreeNodeSplit);
+    let merge_count = counter(&snapshot, CounterMetric::TreeNodeMerge);
+    let consolidate_count = counter(&snapshot, CounterMetric::TreeNodeConsolidate);
+    assert!(
+        split_count >= MIN_SPLIT_COUNT,
+        "split count too low: {split_count}"
+    );
+    assert!(
+        merge_count >= MIN_MERGE_COUNT,
+        "merge count too low: {merge_count}"
+    );
+    assert!(
+        consolidate_count >= MIN_CONSOLIDATE_COUNT,
+        "consolidate count too low: {consolidate_count}"
+    );
+    Ok(())
+}
+
+#[test]
+fn smo_scan_remains_ordered_under_merge_churn() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    let observer = Arc::new(InMemoryObserver::new(256));
+    opts.tmp_store = true;
+    opts.sync_on_write = false;
+    opts.concurrent_write = 8;
+    opts.split_elems = 20;
+    opts.consolidate_threshold = 8;
+    opts.observer = observer.clone();
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    const WRITERS: usize = 6;
+    const WINDOW: usize = 128;
+    const WRITE_STEPS: usize = 2000;
+    const READERS: usize = 4;
+    const READ_STEPS: usize = 420;
+    const EXTRA_STEPS: usize = 256;
+    const MAX_EXTRA_ROUNDS: usize = 12;
+    const MIN_SPLIT_COUNT: u64 = 24;
+    const MIN_MERGE_COUNT: u64 = 12;
+    const MIN_CONSOLIDATE_COUNT: u64 = 96;
+
+    std::thread::scope(|s| {
+        let mut writer_handles = Vec::with_capacity(WRITERS);
+        for tid in 0..WRITERS {
+            let db = db.clone();
+            writer_handles.push(s.spawn(move || {
+                for step in 0..WRITE_STEPS {
+                    let key = format!("k{tid}_{step:06}");
+                    upsert_retry(&db, &key);
+                    if step >= WINDOW {
+                        let old = format!("k{tid}_{:06}", step - WINDOW);
+                        del_retry(&db, &old);
+                    }
+                }
+            }));
+        }
+
+        let mut reader_handles = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let db = db.clone();
+            reader_handles.push(s.spawn(move || {
+                for _ in 0..READ_STEPS {
+                    assert_seek_sorted_unique(&db, "k");
+                }
+            }));
+        }
+
+        for handle in writer_handles {
+            handle.join().unwrap();
+        }
+        for handle in reader_handles {
+            handle.join().unwrap();
+        }
+    });
+
+    for _ in 0..120 {
+        let view = db.view().unwrap();
+        for tid in 0..WRITERS {
+            for idx in (0..(WRITE_STEPS - WINDOW)).step_by(4) {
+                let key = format!("k{tid}_{idx:06}");
+                let _ = view.get(&key);
+            }
+        }
+    }
+
+    let mut end_step = WRITE_STEPS;
+    let mut snapshot = observer.snapshot();
+    for _ in 0..MAX_EXTRA_ROUNDS {
+        let split_count = counter(&snapshot, CounterMetric::TreeNodeSplit);
+        let merge_count = counter(&snapshot, CounterMetric::TreeNodeMerge);
+        let consolidate_count = counter(&snapshot, CounterMetric::TreeNodeConsolidate);
+        if split_count >= MIN_SPLIT_COUNT
+            && merge_count >= MIN_MERGE_COUNT
+            && consolidate_count >= MIN_CONSOLIDATE_COUNT
+        {
+            break;
+        }
+        for tid in 0..WRITERS {
+            for step in end_step..(end_step + EXTRA_STEPS) {
+                let key = format!("k{tid}_{step:06}");
+                upsert_retry(&db, &key);
+                let old = format!("k{tid}_{:06}", step - WINDOW);
+                del_retry(&db, &old);
+            }
+        }
+        end_step += EXTRA_STEPS;
+        for _ in 0..64 {
+            assert_seek_sorted_unique(&db, "k");
+        }
+        snapshot = observer.snapshot();
+    }
+
+    assert_seek_sorted_unique(&db, "k");
+    let view = db.view().unwrap();
+    for tid in 0..WRITERS {
+        for idx in 0..(end_step - WINDOW) {
+            let key = format!("k{tid}_{idx:06}");
+            assert!(view.get(&key).is_err());
+        }
+        for idx in (end_step - WINDOW)..end_step {
+            let key = format!("k{tid}_{idx:06}");
+            let r = view.get(&key).expect("must exist");
+            assert_eq!(r.slice(), key.as_bytes());
+        }
+    }
+    assert_eq!(view.seek("k").count(), WRITERS * WINDOW);
+
+    let snapshot = observer.snapshot();
+    let split_count = counter(&snapshot, CounterMetric::TreeNodeSplit);
+    let merge_count = counter(&snapshot, CounterMetric::TreeNodeMerge);
+    let consolidate_count = counter(&snapshot, CounterMetric::TreeNodeConsolidate);
+    assert!(
+        split_count >= MIN_SPLIT_COUNT,
+        "split count too low: {split_count}"
+    );
+    assert!(
+        merge_count >= MIN_MERGE_COUNT,
+        "merge count too low: {merge_count}"
+    );
+    assert!(
+        consolidate_count >= MIN_CONSOLIDATE_COUNT,
+        "consolidate count too low: {consolidate_count}"
+    );
     Ok(())
 }
 

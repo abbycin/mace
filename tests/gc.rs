@@ -94,7 +94,6 @@ fn gc_blob() -> Result<(), OpCode> {
     opt.gc_timeout = 20;
     opt.inline_size = 1024;
     opt.max_log_size = 20480;
-    opt.over_provision = true;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x").unwrap();
     let cap = 10000;

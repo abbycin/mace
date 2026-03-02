@@ -15,9 +15,15 @@ pub struct Options {
     /// force sync data to disk for every log write, the default value is `true`, turning it off may
     /// result in data loss, while turning it on may result in performance degradation
     pub sync_on_write: bool,
-    /// allows allocation of more arenas than a fixed value when arena exhaustion occurs, rather than
-    /// waiting for arenas to become available, the default value is false
-    pub over_provision: bool,
+    /// base arena budget per bucket for flow control
+    ///
+    /// flow control rules:
+    /// - base arena budget = `default_arenas`
+    /// - per-bucket burst budget = `max(default_arenas / 2, 1)`
+    /// - per-bucket in-flight flush slot cap = `default_arenas + burst_budget`
+    ///
+    /// must be power of two, default is 16
+    pub default_arenas: u32,
     /// default is hardware concurrency count, it must be power of 2
     ///
     /// **Once set, it cannot be modified**
@@ -129,7 +135,7 @@ impl Options {
             .next_power_of_two() as u8;
         Self {
             sync_on_write: true,
-            over_provision: false,
+            default_arenas: 16,
             concurrent_write: cores,
             tmp_store: false,
             gc_timeout: 60 * 1000,  // 1min
@@ -169,6 +175,10 @@ impl Options {
     /// Validates the options and returns a ParsedOptions instance.
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
         self.concurrent_write = self.concurrent_write.clamp(1, Self::MAX_CONCURRENT_WRITE);
+        self.default_arenas = self.default_arenas.clamp(1, 1024);
+        if !self.default_arenas.is_power_of_two() {
+            self.default_arenas = self.default_arenas.next_power_of_two();
+        }
         self.split_elems = self
             .split_elems
             .clamp(Self::MIN_SPLIT_ELEMS, Self::MAX_SPLIT_ELEMS);

@@ -22,7 +22,6 @@ use crate::{
     utils::{NULL_CMD, NULL_PID},
 };
 use crossbeam_epoch::Guard;
-use std::borrow::Cow;
 use std::cmp::Ordering::Equal;
 use std::ops::{Bound, Deref, RangeBounds};
 use std::sync::Arc;
@@ -111,6 +110,10 @@ impl Tree {
 
     pub(crate) fn begin<'a>(&'a self, g: &'a Guard) -> SysTxn<'a> {
         SysTxn::new(&self.bucket.table, &self.store.opt, g, &self.bucket)
+    }
+
+    pub(crate) fn begin_structural<'a>(&'a self, g: &'a Guard) -> SysTxn<'a> {
+        SysTxn::new_structural(&self.bucket.table, &self.store.opt, g, &self.bucket)
     }
 
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
@@ -205,6 +208,7 @@ impl Tree {
         };
 
         let safe_txid = self.txid();
+        let mut merged_child_into_left = false;
         loop {
             let cursor_ptr = if let Some(x) = self.load_node(g, cursor_pid)? {
                 x
@@ -223,14 +227,21 @@ impl Tree {
             };
 
             // 3.
+            let Some(_cursor_lk) = cursor_ptr.try_lock() else {
+                continue;
+            };
+            if self.bucket.table.get(cursor_ptr.pid()) != cursor_ptr.swip() {
+                continue;
+            }
             let next_pid = cursor_ptr.header().right_sibling;
-            let mut txn = self.begin(g);
+            let mut txn = self.begin_structural(g);
             // verify this candidate still points to child as its right sibling
             if next_pid == child_pid {
                 let (new_node, lj, rj) = cursor_ptr.merge_node(&mut txn, &child_ptr, safe_txid);
                 if txn.replace(cursor_ptr, new_node, &lj).is_ok() {
                     child_ptr.garbage_collect(&mut txn, &rj);
                     txn.commit();
+                    merged_child_into_left = true;
                     break;
                 }
                 // retry merge on replace race
@@ -252,6 +263,10 @@ impl Tree {
             }
         }
 
+        if !merged_child_into_left {
+            return Ok(());
+        }
+
         // 4.
         if !self.remove_node_index(parent_ptr, child_pid, g, safe_txid)? {
             return Ok(());
@@ -260,9 +275,13 @@ impl Tree {
         // 5.
         debug_assert_eq!(child_ptr.box_header().pid, child_pid);
         merge_mark.clear();
-        let mut txn = self.begin(g);
+        let mut txn = self.begin_structural(g);
         txn.unmap(child_ptr, &[])?; // child's junks were already collected
         txn.commit();
+        self.store
+            .opt
+            .observer
+            .counter(CounterMetric::TreeNodeMerge, 1);
 
         Ok(())
     }
@@ -275,31 +294,21 @@ impl Tree {
         g: &Guard,
         safe_txid: u64,
     ) -> Result<bool, OpCode> {
-        let mut parent = Cow::Borrowed(parent_ptr);
-        loop {
-            let mut txn = self.begin(g);
-            let (new_ptr, j) = {
-                let Some(x) = parent.remove_index(&mut txn, child_pid, safe_txid) else {
-                    return Ok(false);
-                };
-                x
-            };
-            if let Ok(new_parent) = txn.replace(*parent, new_ptr, &j) {
-                txn.commit();
-                let _ = parent_ptr.clear_runtime_merging_child(child_pid);
-                let _ = new_parent.clear_runtime_merging_child(child_pid);
-                return Ok(true);
-            }
-            let new_ptr = if let Some(x) = self.load_node(g, parent_ptr.box_header().pid)? {
-                x
-            } else {
+        debug_assert_eq!(parent_ptr.runtime_merging_child(), child_pid);
+        let mut txn = self.begin_structural(g);
+        let (new_ptr, j) = {
+            let Some(x) = parent_ptr.remove_index(&mut txn, child_pid, safe_txid) else {
                 return Ok(false);
             };
-            if new_ptr.runtime_merging_child() != child_pid {
-                return Ok(false);
-            }
-            parent = Cow::Owned(new_ptr);
-        }
+            x
+        };
+        let Ok(new_parent) = txn.replace(*parent_ptr, new_ptr, &j) else {
+            return Ok(false);
+        };
+        txn.commit();
+        let _ = parent_ptr.clear_runtime_merging_child(child_pid);
+        let _ = new_parent.clear_runtime_merging_child(child_pid);
+        Ok(true)
     }
 
     // 1. load child
@@ -313,11 +322,13 @@ impl Tree {
             } else {
                 return Ok(None);
             };
-
-            if page.runtime_merging() {
-                return Ok(Some(page));
+            // lock child to bind live-check and merge-mark to the same swip
+            // without this, a stale child handle may be marked after table swap
+            let _lk = page.lock();
+            if self.bucket.table.get(page.pid()) != page.swip() {
+                continue;
             }
-            if page.try_mark_runtime_merging() {
+            if page.runtime_merging() || page.try_mark_runtime_merging() {
                 return Ok(Some(page));
             }
         }
@@ -336,7 +347,7 @@ impl Tree {
             return Err(OpCode::Again);
         };
         let safe_txid = self.store.context.numerics.safe_tixd();
-        let mut txn = self.begin(g);
+        let mut txn = self.begin_structural(g);
         // 1.
         let (mut lnode, rnode, split_junks) = node.split_overlay(&mut txn, safe_txid);
         let mut rpage = Page::new(rnode);
@@ -369,6 +380,10 @@ impl Tree {
             txn.replace(parent, new_node, &j).inspect_err(|_| {})?;
             // publish new parent to page table
             txn.commit();
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::TreeNodeSplit, 1);
         } else {
             // 5.
             self.split_root(g, lpage, rpid, lo, safe_txid)?;
@@ -389,7 +404,7 @@ impl Tree {
         if self.bucket.table.get(root.pid()) != root.swip() {
             return Err(OpCode::Again);
         };
-        let mut txn = self.begin(g);
+        let mut txn = self.begin_structural(g);
 
         // compact root before building new root because step-3 publication can race with new writes
         let (mut lnode, j) = root.compact(&mut txn, safe_txid);
@@ -410,6 +425,10 @@ impl Tree {
         assert_eq!(n.box_header().pid, self.root_index.pid);
         // publish new root to global
         txn.commit();
+        self.store
+            .opt
+            .observer
+            .counter(CounterMetric::TreeNodeSplit, 1);
         self.bucket.cache(lpage);
         Ok(())
     }
@@ -479,7 +498,7 @@ impl Tree {
 
             // complete pending parent separator installation cooperatively
             if let Some(unsplit) = unsplit_parent_opt.take() {
-                let mut txn = self.begin(g);
+                let mut txn = self.begin_structural(g);
                 let _lk = unsplit.lock();
                 if self.bucket.table.get(unsplit.pid()) != unsplit.swip() {
                     // another thread already finished this parent update
@@ -493,6 +512,10 @@ impl Tree {
                 };
                 txn.replace(unsplit, split_node, &j).inspect_err(|_| {})?;
                 txn.commit();
+                self.store
+                    .opt
+                    .observer
+                    .counter(CounterMetric::TreeNodeSplit, 1);
             }
 
             if !leftmost
@@ -527,10 +550,14 @@ impl Tree {
         };
 
         // consolidation never retry
-        let mut txn = self.begin(g);
+        let mut txn = self.begin_structural(g);
         let (new_node, j) = page.compact(&mut txn, self.txid());
         if txn.replace(page, new_node, &j).is_ok() {
             txn.commit();
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::TreeNodeConsolidate, 1);
         }
     }
 
@@ -566,6 +593,9 @@ impl Tree {
         let Some(lk) = parent.try_lock() else {
             return Err(OpCode::Again);
         };
+        if self.bucket.table.get(parent.pid()) != parent.swip() {
+            return Err(OpCode::Again);
+        }
         if parent.runtime_merging_child() != NULL_PID {
             return Err(OpCode::Again);
         }

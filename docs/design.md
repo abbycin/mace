@@ -110,7 +110,38 @@ This replaces the old logical/physical id mapping: the logical address is stable
 - `Iim` tracks the addr -> arena id mapping for in-memory loads
 - `flsn` per writer group records WAL position of dirty data
 - `safe_to_flush` ensures WAL is flushed past arena `flsn` before flush
-- `over_provision` allows extra arenas if all are busy
+- flow control is quota-based and starts from allocation admission instead of post-facto cleanup
+
+### Flow control
+
+`Pool` uses bounded admission and explicit backpressure. The base budget is configurable via
+`Options::default_arenas` (default `16`), replacing the old hard-coded arena constant.
+
+- per-bucket base arena budget: `default_arenas`
+- per-bucket burst budget: `max(default_arenas / 2, 1)`
+- per-bucket flush slot cap: `base + burst_budget`
+- global flush slot cap: `loaded_buckets * per_bucket_cap`
+- cache-pressure coupling:
+  - when cache usage reaches `>= 90%`, burst budget is clamped to `0`
+  - this shrinks both burst allocation and slot caps back to the base budget
+
+Admission path behavior:
+
+- `OPEN`: normal allocation path
+- `SHAPE`: short delay smoothing (`~50us`) when pending flush pressure rises
+- `GATE`: blocking wait/notify when local or global quota is exhausted
+- no busy-spin in allocator slow path (wait uses condvar-based signaling)
+
+Observability:
+
+- counters: wait count, burst grant/deny, gate enter/exit
+- gauges: global pending flush, global burst in use, gate bucket count
+- events: `FlowGateEnter` / `FlowGateExit` with `bucket_id` and pending value
+
+Failure semantics:
+
+- `Pool::flush` enqueue to flusher channel is required to succeed
+- flusher channel disconnect is treated as fatal (fail-fast), never as a recoverable drop path
 
 ### Sibling crash-closure via pending metadata
 

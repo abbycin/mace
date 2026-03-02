@@ -52,19 +52,31 @@ where
     K: AsRef<[u8]>,
 {
     let b = prefix.as_ref();
-    let mut e = b.to_vec();
     #[cfg(feature = "extra_check")]
-    assert!(!e.is_empty(), "prefix can't be empty");
+    assert!(!b.is_empty(), "prefix can't be empty");
 
-    if *e.last().unwrap() == u8::MAX {
-        e.push(0);
+    let upper = prefix_upper_exclusive(b);
+    if let Some(ref upper) = upper {
+        tree.range(b..upper.as_slice(), move |ctx, txid, record_gid| {
+            cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
+        })
     } else {
-        *e.last_mut().unwrap() += 1;
+        tree.range(b.., move |ctx, txid, record_gid| {
+            cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
+        })
     }
+}
 
-    tree.range(b..e.as_slice(), move |ctx, txid, record_gid| {
-        cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
-    })
+fn prefix_upper_exclusive(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for i in (0..upper.len()).rev() {
+        if upper[i] != u8::MAX {
+            upper[i] += 1;
+            upper.truncate(i + 1);
+            return Some(upper);
+        }
+    }
+    None
 }
 
 /// A read-write transaction.
@@ -628,11 +640,26 @@ impl Drop for TxnView<'_> {
 
 #[cfg(test)]
 mod test {
+    use super::prefix_upper_exclusive;
     use crate::{Mace, OpCode, Options, RandomPath};
 
     #[test]
     fn txnkv() {
         txnkv_impl().unwrap();
+    }
+
+    #[test]
+    fn prefix_upper_exclusive_handles_carry() {
+        assert_eq!(
+            prefix_upper_exclusive(&[0x61, 0x62, 0x63]),
+            Some(vec![0x61, 0x62, 0x64])
+        );
+        assert_eq!(
+            prefix_upper_exclusive(&[0x61, 0xff, 0xff]),
+            Some(vec![0x62])
+        );
+        assert_eq!(prefix_upper_exclusive(&[0xff]), None);
+        assert_eq!(prefix_upper_exclusive(&[0xff, 0xff]), None);
     }
 
     fn txnkv_impl() -> Result<(), OpCode> {

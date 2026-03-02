@@ -17,6 +17,7 @@ pub struct SysTxn<'a> {
     pub(crate) buffer: &'a BucketContext,
     opt: &'a ParsedOptions,
     g: &'a Guard,
+    structural: bool,
     maps: Vec<(u64, u64)>,
     /// garbage and allocs may overlap, garbage will be set to Junk on success, while allocs will be
     /// set to TombStone on failure
@@ -31,11 +32,31 @@ impl<'a> SysTxn<'a> {
         g: &'a Guard,
         buffer: &'a BucketContext,
     ) -> Self {
+        Self::new_with_mode(table, opt, g, buffer, false)
+    }
+
+    pub fn new_structural(
+        table: &'a PageMap,
+        opt: &'a ParsedOptions,
+        g: &'a Guard,
+        buffer: &'a BucketContext,
+    ) -> Self {
+        Self::new_with_mode(table, opt, g, buffer, true)
+    }
+
+    fn new_with_mode(
+        table: &'a PageMap,
+        opt: &'a ParsedOptions,
+        g: &'a Guard,
+        buffer: &'a BucketContext,
+        structural: bool,
+    ) -> Self {
         Self {
             table,
             buffer,
             opt,
             g,
+            structural,
             maps: Vec::new(),
             garbage: Vec::new(),
             allocs: Vec::new(),
@@ -62,7 +83,12 @@ impl<'a> SysTxn<'a> {
     }
 
     pub fn alloc(&mut self, size: u32) -> BoxRef {
-        let (h, t) = self.buffer.alloc(size).expect("never happen");
+        let (h, t) = if self.structural {
+            self.buffer.alloc_struct(size)
+        } else {
+            self.buffer.alloc(size)
+        }
+        .expect("never happen");
         let view: BoxView = t.view();
         self.allocs.push((h, view));
         t
@@ -116,7 +142,12 @@ impl<'a> SysTxn<'a> {
             assert_eq!(old, self.garbage.len());
         }
         let sz = self.garbage.len() * JUNK_LEN;
-        let (h, mut junk) = self.buffer.alloc(sz as u32).unwrap();
+        let (h, mut junk) = if self.structural {
+            self.buffer.alloc_struct(sz as u32)
+        } else {
+            self.buffer.alloc(sz as u32)
+        }
+        .unwrap();
         junk.header_mut().flag = TagFlag::Junk;
         let dst = junk.data_slice_mut::<u64>();
         dst.copy_from_slice(&self.garbage);

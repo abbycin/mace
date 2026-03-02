@@ -545,6 +545,7 @@ impl Manifest {
         let ctx = Arc::new(BucketContext::new(
             self.buckets.ctx,
             state,
+            self.buckets.flow.clone(),
             bucket_id,
             next_addr,
             table,
@@ -566,6 +567,7 @@ impl Manifest {
         }
 
         self.buckets.buckets.insert(bucket_id, ctx.clone());
+        self.buckets.flow.on_bucket_load();
         ctx
     }
 
@@ -632,7 +634,9 @@ impl Manifest {
         {
             ctx.flush_and_wait();
         }
-        let _ = self.buckets.buckets.remove(&bucket_id);
+        if self.buckets.buckets.remove(&bucket_id).is_some() {
+            self.buckets.flow.on_bucket_unload();
+        }
 
         self.bucket_states.remove(&bucket_id);
         Ok(())

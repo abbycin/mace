@@ -66,6 +66,7 @@ impl BaseView {
             #[cfg(feature = "extra_check")]
             {
                 if let Some(x) = last_k {
+                    // merge path may interleave segments from different prefixes
                     assert!(x.cmp(&ks).is_lt());
                 }
                 last_k = Some(ks);
@@ -960,6 +961,66 @@ mod test {
         let (k, v) = iter.next().unwrap();
         test!(k, v, "baz", 3);
 
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn merge_leaf_with_different_prefix_lengths_keeps_distinct_raw_keys() {
+        fn gen_val(a: &mut Allocator, r: Record) -> Val<'static> {
+            let sz = Val::calc_size(false, a.inline_size(), r.packed_size());
+            let mut b = a.allocate(sz as u32);
+            Val::encode_inline(b.data_slice_mut::<u8>(), NULL_ADDR, &r);
+            Val::from_raw(unsafe { std::mem::transmute::<&[u8], &[u8]>(b.data_slice::<u8>()) })
+        }
+
+        let mut a = Allocator::new();
+        let l = a.clone();
+
+        let mut left_data = LeafData {
+            data: &[(
+                LeafSeg::new(&[], "aa1".as_bytes(), Ver::new(3, 1)),
+                gen_val(&mut a, Record::normal(1, "left".as_bytes())),
+            )],
+            pos: 0,
+        };
+        let left = BaseView::new_leaf(
+            &mut a,
+            &l,
+            "aa0".as_bytes(),
+            Some("ab0".as_bytes()),
+            NULL_PID,
+            &mut left_data,
+            NULL_ORACLE,
+        );
+
+        let mut right_data = LeafData {
+            data: &[(
+                LeafSeg::new(&[], "aba1".as_bytes(), Ver::new(2, 1)),
+                gen_val(&mut a, Record::normal(1, "right".as_bytes())),
+            )],
+            pos: 0,
+        };
+        let right = BaseView::new_leaf(
+            &mut a,
+            &l,
+            "ab0".as_bytes(),
+            Some("abz".as_bytes()),
+            NULL_PID,
+            &mut right_data,
+            NULL_ORACLE,
+        );
+
+        let merged = left
+            .view()
+            .as_base()
+            .merge(&mut a, &l, right.view().as_base(), NULL_ORACLE);
+        let base = merged.view().as_base();
+        let mut iter = base.range_iter::<Allocator, Key>(&l, 0, base.header().elems as usize);
+
+        let (k1, _) = iter.next().expect("must have first key");
+        assert_eq!(k1.raw, "a1".as_bytes());
+        let (k2, _) = iter.next().expect("must have second key");
+        assert_eq!(k2.raw, "ba1".as_bytes());
         assert!(iter.next().is_none());
     }
 }

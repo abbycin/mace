@@ -73,7 +73,8 @@ jobs:
         run: bash ./scripts/prod_test.sh all 8
 
   perf-regression:
-    name: Perf Regression Gate
+    name: Perf Regression Gate (Ubuntu x86_64)
+    if: ${{ runner.os == 'Linux' && runner.arch == 'X64' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -83,6 +84,10 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify runner arch is x86_64
+        run: |
+          test "$(uname -m)" = "x86_64"
 
       - name: Run perf compare gate
         env:

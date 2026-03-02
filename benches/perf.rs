@@ -1,5 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mace::{Mace, Options, RandomPath};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -41,6 +43,54 @@ fn env_bool(name: &str, default: bool) -> bool {
         })
         .unwrap_or(default)
 }
+
+fn bench_cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[cfg(target_os = "linux")]
+fn allowed_cpus() -> &'static Vec<usize> {
+    static CPUS: OnceLock<Vec<usize>> = OnceLock::new();
+    CPUS.get_or_init(|| unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Vec::new();
+        }
+        let mut cpus = Vec::new();
+        let max = libc::CPU_SETSIZE as usize;
+        for cpu in 0..max {
+            if libc::CPU_ISSET(cpu, &set) {
+                cpus.push(cpu);
+            }
+        }
+        cpus
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to_cpu(hint: usize) {
+    let cpus = allowed_cpus();
+    if cpus.is_empty() {
+        return;
+    }
+    let cpu = cpus[hint % cpus.len()];
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        let _ = libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread_to_cpu(_cpu: usize) {}
 
 fn parse_thread_counts(default: &[usize]) -> Vec<usize> {
     std::env::var("MACE_BENCH_THREADS")
@@ -84,6 +134,7 @@ fn parse_kv_sizes(default: &[(usize, usize)]) -> Vec<(usize, usize)> {
 
 fn bench_config() -> BenchConfig {
     let quick = env_bool("MACE_BENCH_QUICK", false);
+    let cpu_count = bench_cpu_count();
 
     let default_total_items = if quick { 20_000 } else { 100_000 };
     let default_threads: Vec<usize> = if quick { vec![1, 4] } else { vec![1, 2, 4, 8] };
@@ -98,9 +149,19 @@ fn bench_config() -> BenchConfig {
     let default_scan_measure_secs = if quick { 5 } else { 10 };
     let default_sample_size = 10;
 
+    let mut thread_counts = parse_thread_counts(&default_threads);
+    for t in &mut thread_counts {
+        *t = (*t).min(cpu_count);
+    }
+    thread_counts.sort_unstable();
+    thread_counts.dedup();
+    if thread_counts.is_empty() {
+        thread_counts.push(cpu_count);
+    }
+
     BenchConfig {
         total_items: env_usize("MACE_BENCH_TOTAL_ITEMS", default_total_items),
-        thread_counts: parse_thread_counts(&default_threads),
+        thread_counts,
         kv_sizes: parse_kv_sizes(&default_kv_sizes),
         put_measure_secs: env_u64("MACE_BENCH_PUT_MEAS_SECS", default_put_measure_secs),
         get_measure_secs: env_u64("MACE_BENCH_GET_MEAS_SECS", default_get_measure_secs),
@@ -153,6 +214,7 @@ fn bench_put(c: &mut Criterion) {
                         let barrier = Arc::new(Barrier::new(thread_cnt));
                         let mut handles = vec![];
                         let chunk_size = (cfg.total_items / thread_cnt).max(1);
+                        let cpu_count = bench_cpu_count();
 
                         let start = Instant::now();
                         for i in 0..thread_cnt {
@@ -160,7 +222,9 @@ fn bench_put(c: &mut Criterion) {
                             let keys = keys.clone();
                             let val = value.clone();
                             let br = barrier.clone();
+                            let cpu = i % cpu_count;
                             handles.push(std::thread::spawn(move || {
+                                pin_current_thread_to_cpu(cpu);
                                 br.wait();
                                 let start_idx = i * chunk_size;
                                 if start_idx >= keys.len() {
@@ -224,13 +288,16 @@ fn bench_get(c: &mut Criterion) {
                         let barrier = Arc::new(Barrier::new(thread_cnt));
                         let mut handles = vec![];
                         let chunk_size = (cfg.total_items / thread_cnt).max(1);
+                        let cpu_count = bench_cpu_count();
 
                         let start = Instant::now();
                         for i in 0..thread_cnt {
                             let b = bucket_arc.clone();
                             let keys = keys.clone();
                             let br = barrier.clone();
+                            let cpu = i % cpu_count;
                             handles.push(std::thread::spawn(move || {
+                                pin_current_thread_to_cpu(cpu);
                                 br.wait();
                                 let start_idx = i * chunk_size;
                                 if start_idx >= keys.len() {
@@ -294,13 +361,16 @@ fn bench_scan(c: &mut Criterion) {
                         let mut handles = vec![];
                         let total_scans = (cfg.total_items / 100).max(thread_cnt);
                         let scans_per_thread = (total_scans / thread_cnt).max(1);
+                        let cpu_count = bench_cpu_count();
 
                         let start = Instant::now();
                         for i in 0..thread_cnt {
                             let b = bucket_arc.clone();
                             let keys = keys.clone();
                             let br = barrier.clone();
+                            let cpu = i % cpu_count;
                             handles.push(std::thread::spawn(move || {
+                                pin_current_thread_to_cpu(cpu);
                                 br.wait();
                                 let view = b.view().unwrap();
                                 for j in 0..scans_per_thread {
