@@ -23,7 +23,7 @@ use crate::{
 };
 use crossbeam_epoch::Guard;
 use std::cmp::Ordering::Equal;
-use std::ops::{Bound, Deref, RangeBounds};
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Acquire;
 
@@ -780,10 +780,7 @@ impl Tree {
             cache: None,
             iter_bound: None,
             checker: Box::new(visible),
-            filter: Filter {
-                last: Vec::new(),
-                has_last: false,
-            },
+            filter: Filter { has_last: false },
         }
     }
 
@@ -1015,18 +1012,16 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 struct Filter {
-    last: Vec<u8>,
     has_last: bool,
 }
 
 impl Filter {
     fn check<L: ILoader>(&mut self, item: &IterItem<L>) -> bool {
-        if self.has_last && item.cmp_key(&self.last).is_eq() {
+        // key() returns cached assembled key from previous accepted item
+        if self.has_last && item.cmp_key(item.key()).is_eq() {
             return false;
         }
-        let last = item.assembled_key();
-        self.last.clear();
-        self.last.extend_from_slice(last.deref());
+        let _ = item.assembled_key();
         self.has_last = true;
         !item.is_tombstone()
     }
