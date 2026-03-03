@@ -5,7 +5,7 @@ use mace::observe::{CounterMetric, InMemoryObserver};
 use mace::{OpCode, Options};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn counter(snapshot: &mace::observe::ObserveSnapshot, metric: CounterMetric) -> u64 {
     snapshot
@@ -55,23 +55,23 @@ fn burst_should_touch_metrics() -> Result<(), OpCode> {
     let observer = Arc::new(InMemoryObserver::new(4096));
     let engine = env.open_with(|opt| {
         opt.sync_on_write = false;
-        opt.default_arenas = 8;
-        opt.concurrent_write = 8;
-        opt.data_file_size = 8 << 10;
+        opt.default_arenas = 4;
+        opt.concurrent_write = 4;
+        opt.data_file_size = 4 << 10;
         opt.max_log_size = 8 << 10;
         opt.observer = observer.clone();
     })?;
     let bucket = engine.new_bucket("flow_burst")?;
 
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(8) {
-        heavy_write_workload(bucket.clone(), 8, 128, 2048)?;
+    for _ in 0..24 {
+        heavy_write_workload(bucket.clone(), 2, 16, 1024)?;
         let snapshot = observer.snapshot();
         let grant = counter(&snapshot, CounterMetric::FlowAllocBurstGrant);
         let deny = counter(&snapshot, CounterMetric::FlowAllocBurstDeny);
         if grant + deny > 0 {
             return Ok(());
         }
+        thread::sleep(Duration::from_millis(10));
     }
 
     let snapshot = observer.snapshot();

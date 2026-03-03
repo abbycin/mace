@@ -832,7 +832,11 @@ mod test {
     use crate::{
         Options, RandomPath,
         map::data::{DataFooter, MetaReader},
-        types::{refbox::BoxRef, traits::IHeader},
+        types::{
+            header::{NodeType, TagKind},
+            refbox::BoxRef,
+            traits::IHeader,
+        },
         utils::INIT_ID,
     };
 
@@ -850,9 +854,13 @@ mod test {
         let (pid, addr) = (114514, 1919810);
         let mut p = BoxRef::alloc(233, addr);
         p.header_mut().pid = pid;
+        p.header_mut().kind = TagKind::Delta;
+        p.header_mut().node_type = NodeType::Leaf;
         let (pid1, addr1) = (192, 68);
         let mut p1 = BoxRef::alloc(666, addr1);
         p1.header_mut().pid = pid1;
+        p1.header_mut().kind = TagKind::Delta;
+        p1.header_mut().node_type = NodeType::Leaf;
 
         let mut builder = FileBuilder::new(0);
 
