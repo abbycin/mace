@@ -301,7 +301,11 @@ pub(crate) struct LeafSeg<'a> {
 }
 
 #[inline]
-fn cmp_raw_with_prefixed_tail(lhs: &[u8], rhs_prefix_tail: &[u8], rhs_base: &[u8]) -> Ordering {
+pub(crate) fn cmp_raw_with_prefixed_tail(
+    lhs: &[u8],
+    rhs_prefix_tail: &[u8],
+    rhs_base: &[u8],
+) -> Ordering {
     let n = lhs.len().min(rhs_prefix_tail.len());
     let o = lhs[..n].cmp(&rhs_prefix_tail[..n]);
     if o != Ordering::Equal {
@@ -794,12 +798,13 @@ where
             return self.base.raw.cmp(other.base.raw);
         }
 
-        // preserve old cheap path for one-side-empty prefixes
+        // keep one-side-empty path branch-local to avoid cmp_key + reverse overhead
         if self.prefix.is_empty() {
-            return other.cmp_key(self.base.raw).reverse();
+            return cmp_raw_with_prefixed_tail(self.base.raw, other.prefix, other.base.raw);
         }
         if other.prefix.is_empty() {
-            return self.cmp_key(other.base.raw);
+            return cmp_raw_with_prefixed_tail(other.base.raw, self.prefix, self.base.raw)
+                .reverse();
         }
 
         // mixed non-empty prefixes need full-key compare for correctness
@@ -938,6 +943,22 @@ mod test {
         let l = LeafSeg::new("ab".as_bytes(), "1".as_bytes(), Ver::new(3, 1));
         let r = LeafSeg::new("ab1".as_bytes(), "".as_bytes(), Ver::new(2, 1));
         assert!(l.raw_cmp(&r).is_eq());
+    }
+
+    #[test]
+    fn full_raw_cmp_handles_one_side_empty_prefix() {
+        assert_eq!(
+            super::cmp_raw_with_prefixed_tail("ab1".as_bytes(), "ab".as_bytes(), "1".as_bytes()),
+            Ordering::Equal
+        );
+        assert_eq!(
+            super::cmp_raw_with_prefixed_tail("ab".as_bytes(), "abc".as_bytes(), "".as_bytes()),
+            Ordering::Less
+        );
+        assert_eq!(
+            super::cmp_raw_with_prefixed_tail("abd".as_bytes(), "ab".as_bytes(), "c".as_bytes()),
+            Ordering::Greater
+        );
     }
 
     #[test]

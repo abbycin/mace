@@ -14,7 +14,10 @@ use std::{
 use crate::{
     types::{
         base::BaseIter,
-        data::{Index, IntlKey, IntlSeg, IterItem, Key, LeafSeg, Record, Val, Ver},
+        data::{
+            Index, IntlKey, IntlSeg, IterItem, Key, LeafSeg, Record, Val, Ver,
+            cmp_raw_with_prefixed_tail,
+        },
         header::{BoxHeader, NodeType},
         refbox::{BaseView, BoxView, DeltaView, RemoteView},
         traits::{IAlloc, IAsBoxRef, IBoxHeader, IDecode, IHeader, IKey, ILoader, IVal},
@@ -1124,22 +1127,29 @@ where
             (None, None) => None,
             (None, Some(r)) => Some(r),
             (Some(l), None) => Some(l),
-            (Some(l), Some(r)) => match l.cmp(&r) {
-                Less => {
-                    self.next_r = Some(r);
-                    Some(l)
+            (Some(l), Some(r)) => {
+                let ord = if self.prefix.is_empty() {
+                    l.cmp(&r)
+                } else {
+                    cmp_raw_with_prefixed_tail(l.base.raw, self.prefix, r.base.raw)
+                };
+                match ord {
+                    Less => {
+                        self.next_r = Some(r);
+                        Some(l)
+                    }
+                    Greater => {
+                        self.next_l = Some(l);
+                        Some(r)
+                    }
+                    Equal => {
+                        // old key may be updated or deleted (or both), we simply return the latest one
+                        // and do visibility check outside
+                        self.next_r = Some(r);
+                        Some(l)
+                    }
                 }
-                Greater => {
-                    self.next_l = Some(l);
-                    Some(r)
-                }
-                Equal => {
-                    // old key may be updated or deleted (or both), we simply return the latest one
-                    // and do visibility check outside
-                    self.next_r = Some(r);
-                    Some(l)
-                }
-            },
+            }
         };
     }
 }
