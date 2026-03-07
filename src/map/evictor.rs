@@ -25,14 +25,26 @@ use crate::{
     },
     meta::Numerics,
     types::{
-        header::TagFlag,
         page::Page,
-        refbox::{BoxRef, BoxView},
-        traits::{IAlloc, IHeader},
+        refbox::{BoxRef, BoxView, RemoteView},
+        traits::{IFrameAlloc, IHeader, IRetireSink},
     },
-    utils::{Handle, NULL_PID, data::JUNK_LEN, options::ParsedOptions},
+    utils::{Handle, OpCode, options::ParsedOptions},
 };
 use rand::seq::SliceRandom;
+
+struct EvictBuildCtx<'a> {
+    opt: &'a ParsedOptions,
+    pool: Handle<Pool>,
+    frames: Vec<(Handle<Arena>, BoxView)>,
+}
+
+struct EvictPublishCtx {
+    pool: Handle<Pool>,
+    frames: Vec<(Handle<Arena>, BoxView)>,
+    retire_target_arena: Option<u64>,
+    garbage: Vec<u64>,
+}
 
 pub(crate) struct Evictor {
     opt: Arc<ParsedOptions>,
@@ -41,10 +53,6 @@ pub(crate) struct Evictor {
     used: Arc<AtomicIsize>,
     rx: Receiver<SharedState>,
     tx: Sender<()>,
-    current_pool: Option<Handle<Pool>>,
-    current_bucket_id: u64,
-    frames: Vec<(Handle<Arena>, BoxView)>,
-    garbage: Vec<u64>,
 }
 
 impl Drop for Evictor {
@@ -52,6 +60,132 @@ impl Drop for Evictor {
 }
 
 unsafe impl Send for Evictor {}
+
+impl<'a> EvictBuildCtx<'a> {
+    fn new(opt: &'a ParsedOptions, pool: Handle<Pool>) -> Self {
+        Self {
+            opt,
+            pool,
+            frames: vec![],
+        }
+    }
+
+    fn into_publish(mut self) -> EvictPublishCtx {
+        let mut frames = Vec::new();
+        std::mem::swap(&mut frames, &mut self.frames);
+        EvictPublishCtx {
+            pool: self.pool,
+            frames,
+            retire_target_arena: None,
+            garbage: vec![],
+        }
+    }
+}
+
+impl Drop for EvictBuildCtx<'_> {
+    fn drop(&mut self) {
+        while let Some((a, b)) = self.frames.pop() {
+            let h = b.header();
+            a.dealloc(h.addr, h.total_size as usize);
+            a.dec_ref();
+        }
+    }
+}
+
+impl IFrameAlloc for EvictBuildCtx<'_> {
+    fn try_alloc(&mut self, size: u32) -> Result<BoxRef, OpCode> {
+        let (h, b) = self.pool.alloc(size)?;
+        self.frames.push((h, b.view()));
+        Ok(b)
+    }
+
+    fn try_alloc_pair(&mut self, size1: u32, size2: u32) -> Result<(BoxRef, BoxRef), OpCode> {
+        let ((h1, b1), (h2, b2)) = self.pool.alloc_pair(size1, size2)?;
+        self.frames.push((h1, b1.view()));
+        self.frames.push((h2, b2.view()));
+        Ok((b1, b2))
+    }
+
+    fn arena_size(&mut self) -> usize {
+        self.opt.data_file_size
+    }
+
+    fn inline_size(&self) -> usize {
+        self.opt.inline_size
+    }
+}
+
+impl EvictPublishCtx {
+    fn set_retire_target_addr(&mut self, addr: u64) {
+        self.retire_target_arena = Some(
+            self.pool
+                .arena_id_of(addr)
+                .unwrap_or_else(|| panic!("failed to resolve evict retire arena for addr {addr}")),
+        );
+    }
+
+    fn finish(mut self) {
+        let mut garbage: Vec<u64> = Vec::new();
+        std::mem::swap(&mut garbage, &mut self.garbage);
+        if !garbage.is_empty() {
+            let arena_id = self
+                .retire_target_arena
+                .take()
+                .expect("evictor retire target must be set before finish");
+            let mut data = Vec::new();
+            let mut blob = Vec::new();
+            self.pool.recycle(&garbage, |addr| {
+                if RemoteView::is_tagged(addr) {
+                    blob.push(RemoteView::untagged(addr));
+                } else {
+                    data.push(addr);
+                }
+            });
+            if !data.is_empty() || !blob.is_empty() {
+                #[cfg(feature = "extra_check")]
+                {
+                    let old_data = data.len();
+                    data.sort_unstable();
+                    data.dedup();
+                    assert_eq!(old_data, data.len());
+                    let old_blob = blob.len();
+                    blob.sort_unstable();
+                    blob.dedup();
+                    assert_eq!(old_blob, blob.len());
+                }
+                self.pool.stage_retire(arena_id, &data, &blob);
+            }
+        } else {
+            self.retire_target_arena = None;
+        }
+
+        while let Some((a, _)) = self.frames.pop() {
+            a.dec_ref();
+        }
+    }
+}
+
+impl Drop for EvictPublishCtx {
+    fn drop(&mut self) {
+        while let Some((a, b)) = self.frames.pop() {
+            let h = b.header();
+            a.dealloc(h.addr, h.total_size as usize);
+            a.dec_ref();
+        }
+        self.retire_target_arena = None;
+        self.garbage.clear();
+    }
+}
+
+impl IRetireSink for EvictPublishCtx {
+    fn collect(&mut self, addr: &[u64]) {
+        assert!(
+            self.retire_target_arena.is_some(),
+            "evictor collect must run with arena target"
+        );
+        self.garbage.extend_from_slice(addr);
+    }
+}
 
 impl Evictor {
     pub(crate) fn new(
@@ -69,10 +203,6 @@ impl Evictor {
             used,
             rx,
             tx,
-            current_pool: None,
-            current_bucket_id: NULL_PID,
-            frames: vec![],
-            garbage: vec![],
         }
     }
 
@@ -133,20 +263,19 @@ impl Evictor {
                         break;
                     }
                     let old = Page::<Loader>::from_swip(swip.untagged());
-                    self.current_pool = Some(old.loader.pool);
-                    self.current_bucket_id = bucket_ctx.bucket_id;
-
-                    let mut compacted = false;
-                    let old = Page::<Loader>::from_swip(swip.untagged());
                     let Some(_lk) = old.try_lock() else {
                         continue;
                     };
+                    let mut publish_opt = None;
                     let (addr, junks) = if old.delta_len() > limit {
-                        let (mut node, j) = old.compact(self, safe_txid);
+                        let mut build = EvictBuildCtx::new(self.opt.as_ref(), old.loader.pool);
+                        let Ok((mut node, j)) = old.try_compact(&mut build, safe_txid) else {
+                            break;
+                        };
                         node.set_pid(old.pid());
                         let addr = node.latest_addr();
                         assert_eq!(addr, node.base_addr());
-                        compacted = true;
+                        publish_opt = Some(build.into_publish());
                         (addr, j)
                     } else {
                         (old.latest_addr(), Junks::new())
@@ -157,17 +286,17 @@ impl Evictor {
                             if bucket_ctx.evict_cache(*pid) {
                                 evicted = true;
                             }
-                            if compacted {
-                                old.garbage_collect(self, &junks);
+                            if let Some(mut publish) = publish_opt {
+                                publish.set_retire_target_addr(addr);
+                                old.garbage_collect(&mut publish, &junks);
+                                publish.finish();
                             }
                             // must guarded by EBR, other threads may still use the old page
                             g.defer(move || old.reclaim());
-                            self.commit();
                         }
                         Err(_) => {
                             // it has been replaced by other thread, in this case, we do NOT retry, it will
                             // be evicted next time
-                            self.rollback();
                         }
                     }
                 }
@@ -177,45 +306,6 @@ impl Evictor {
                 return;
             }
         }
-    }
-
-    fn commit(&mut self) {
-        while let Some((a, _)) = self.frames.pop() {
-            a.dec_ref();
-        }
-
-        let mut garbage: Vec<u64> = Vec::new();
-        std::mem::swap(&mut garbage, &mut self.garbage);
-        let pool = self.current_pool.as_ref().unwrap();
-        pool.recycle(&garbage, |addr| {
-            self.garbage.push(addr);
-        });
-
-        if !self.garbage.is_empty() {
-            #[cfg(feature = "extra_check")]
-            {
-                let old = self.garbage.len();
-                self.garbage.sort();
-                self.garbage.dedup();
-                assert_eq!(old, self.garbage.len());
-            }
-            let sz = self.garbage.len() * JUNK_LEN;
-            let (h, mut junk) = pool.alloc(sz as u32).expect("never happen");
-            junk.header_mut().flag = TagFlag::Junk;
-            let dst = junk.data_slice_mut::<u64>();
-            dst.copy_from_slice(&self.garbage);
-            self.garbage.clear();
-            h.dec_ref();
-        }
-    }
-
-    fn rollback(&mut self) {
-        while let Some((a, b)) = self.frames.pop() {
-            let h = b.header();
-            a.dealloc(h.addr, h.total_size as usize);
-            a.dec_ref();
-        }
-        self.garbage.clear();
     }
 
     fn compact_once(&mut self, g: &Guard, limit: usize, safe_txid: u64) {
@@ -272,24 +362,25 @@ impl Evictor {
                         continue;
                     };
 
-                    self.current_pool = Some(old.loader.pool);
-                    self.current_bucket_id = bucket_ctx.bucket_id;
-
-                    let (mut node, junks) = old.compact(self, safe_txid);
+                    let mut build = EvictBuildCtx::new(self.opt.as_ref(), old.loader.pool);
+                    let Ok((mut node, junks)) = old.try_compact(&mut build, safe_txid) else {
+                        continue;
+                    };
                     node.set_pid(old.pid());
                     let new = Page::new(node);
+                    let mut publish = build.into_publish();
 
                     // never retry, probability of successful CAS > 70%
                     // NOTE: other threads may perform cas in the same time
                     if bucket_ctx.table.cas(*pid, old.swip(), new.swip()).is_ok() {
                         bucket_ctx.update_cache_size(*pid, new.size());
-                        old.garbage_collect(self, &junks);
+                        publish.set_retire_target_addr(new.latest_addr());
+                        old.garbage_collect(&mut publish, &junks);
                         g.defer(move || old.reclaim());
-                        self.commit();
+                        publish.finish();
                         compacted = true;
                     } else {
                         new.reclaim();
-                        self.rollback();
                     }
                 }
             }
@@ -307,35 +398,6 @@ impl Evictor {
                 evictor_loop(self);
             })
             .expect("can't start evictor thread");
-    }
-}
-
-impl IAlloc for Evictor {
-    fn allocate(&mut self, size: u32) -> BoxRef {
-        let pool = self.current_pool.as_ref().expect("pool must be set");
-        let (h, b) = pool.alloc(size).expect("never happen");
-        self.frames.push((h, b.view()));
-        b
-    }
-
-    fn allocate_pair(&mut self, size1: u32, size2: u32) -> (BoxRef, BoxRef) {
-        let pool = self.current_pool.as_ref().expect("pool must be set");
-        let ((h1, b1), (h2, b2)) = pool.alloc_pair(size1, size2).expect("never happen");
-        self.frames.push((h1, b1.view()));
-        self.frames.push((h2, b2.view()));
-        (b1, b2)
-    }
-
-    fn arena_size(&mut self) -> usize {
-        self.opt.data_file_size
-    }
-
-    fn collect(&mut self, addr: &[u64]) {
-        self.garbage.extend_from_slice(addr);
-    }
-
-    fn inline_size(&self) -> usize {
-        self.opt.inline_size
     }
 }
 

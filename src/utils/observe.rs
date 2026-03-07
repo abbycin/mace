@@ -50,17 +50,22 @@ pub enum CounterMetric {
     GcBlobRewrite,
     GcDataObsoleteFile,
     GcBlobObsoleteFile,
-    FlowAllocWaitCount,
-    FlowAllocBurstGrant,
-    FlowAllocBurstDeny,
-    FlowAllocStructGrant,
-    FlowAllocStructDeny,
-    FlowGateEnterCount,
-    FlowGateExitCount,
+    FlowFgDelay,
+    FlowFlushPacingSleep,
+    FlowFlushPacingBypassHighDebt,
+    FlowFlushPacingBypassTeardown,
+    FlowFlushPacingBypassArenaStarvation,
+    FlowArenaSpillCreate,
+    FlowArenaSpillReclaim,
+    FlowArenaSpillCapHit,
+    RetireRecorded,
+    RetireDataApplied,
+    RetireBlobApplied,
+    RetireCleared,
 }
 
 impl CounterMetric {
-    pub const COUNT: usize = 35;
+    pub const COUNT: usize = 40;
     pub const ALL: [CounterMetric; Self::COUNT] = [
         CounterMetric::TxnBegin,
         CounterMetric::TxnCommit,
@@ -90,13 +95,18 @@ impl CounterMetric {
         CounterMetric::GcBlobRewrite,
         CounterMetric::GcDataObsoleteFile,
         CounterMetric::GcBlobObsoleteFile,
-        CounterMetric::FlowAllocWaitCount,
-        CounterMetric::FlowAllocBurstGrant,
-        CounterMetric::FlowAllocBurstDeny,
-        CounterMetric::FlowAllocStructGrant,
-        CounterMetric::FlowAllocStructDeny,
-        CounterMetric::FlowGateEnterCount,
-        CounterMetric::FlowGateExitCount,
+        CounterMetric::FlowFgDelay,
+        CounterMetric::FlowFlushPacingSleep,
+        CounterMetric::FlowFlushPacingBypassHighDebt,
+        CounterMetric::FlowFlushPacingBypassTeardown,
+        CounterMetric::FlowFlushPacingBypassArenaStarvation,
+        CounterMetric::FlowArenaSpillCreate,
+        CounterMetric::FlowArenaSpillReclaim,
+        CounterMetric::FlowArenaSpillCapHit,
+        CounterMetric::RetireRecorded,
+        CounterMetric::RetireDataApplied,
+        CounterMetric::RetireBlobApplied,
+        CounterMetric::RetireCleared,
     ];
 
     #[inline]
@@ -110,19 +120,13 @@ impl CounterMetric {
 pub enum GaugeMetric {
     RecoveryDirtyEntries,
     RecoveryUndoEntries,
-    FlowPendingFlushGlobal,
-    FlowBurstInUseGlobal,
-    FlowGateBucketCount,
 }
 
 impl GaugeMetric {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 2;
     pub const ALL: [GaugeMetric; Self::COUNT] = [
         GaugeMetric::RecoveryDirtyEntries,
         GaugeMetric::RecoveryUndoEntries,
-        GaugeMetric::FlowPendingFlushGlobal,
-        GaugeMetric::FlowBurstInUseGlobal,
-        GaugeMetric::FlowGateBucketCount,
     ];
 
     #[inline]
@@ -149,11 +153,13 @@ pub enum HistogramMetric {
     GcBlobRewriteMicros,
     GcDataRewriteVictimFiles,
     GcBlobRewriteVictimFiles,
-    FlowAllocWaitMicros,
+    FlowFgDelayMicros,
+    FlowFlushPacingSleepMicros,
+    FlowArenaStarvingWaitMicros,
 }
 
 impl HistogramMetric {
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 18;
     pub const ALL: [HistogramMetric; Self::COUNT] = [
         HistogramMetric::TxnCommitMicros,
         HistogramMetric::TxnRollbackMicros,
@@ -170,7 +176,9 @@ impl HistogramMetric {
         HistogramMetric::GcBlobRewriteMicros,
         HistogramMetric::GcDataRewriteVictimFiles,
         HistogramMetric::GcBlobRewriteVictimFiles,
-        HistogramMetric::FlowAllocWaitMicros,
+        HistogramMetric::FlowFgDelayMicros,
+        HistogramMetric::FlowFlushPacingSleepMicros,
+        HistogramMetric::FlowArenaStarvingWaitMicros,
     ];
 
     #[inline]
@@ -193,8 +201,6 @@ pub enum EventKind {
     GcPendingBucketCleaned,
     GcDataRewriteComplete,
     GcBlobRewriteComplete,
-    FlowGateEnter,
-    FlowGateExit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

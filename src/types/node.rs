@@ -20,7 +20,9 @@ use crate::{
         },
         header::{BoxHeader, NodeType},
         refbox::{BaseView, BoxView, DeltaView, RemoteView},
-        traits::{IAlloc, IAsBoxRef, IBoxHeader, IDecode, IHeader, IKey, ILoader, IVal},
+        traits::{
+            IAsBoxRef, IBoxHeader, IDecode, IFrameAlloc, IHeader, IKey, ILoader, IRetireSink, IVal,
+        },
     },
     utils::{
         Handle, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, OpCode,
@@ -150,23 +152,31 @@ where
         self.inner.box_header_mut().pid = pid;
     }
 
-    pub(crate) fn new_leaf<A: IAlloc>(a: &mut A, loader: L) -> Node<L> {
-        let empty: &[(LeafSeg, Val)] = &[];
-        let mut iter = empty.iter().map(|x| (x.0, x.1));
-        let b = BaseView::new_leaf(a, &loader, [].as_slice(), None, NULL_PID, &mut iter, 0);
-        Self::new(loader, b)
+    pub(crate) fn new_leaf<A: IFrameAlloc>(a: &mut A, loader: L) -> Node<L> {
+        Self::try_new_leaf(a, loader).expect("node leaf alloc fail")
     }
 
-    pub(crate) fn new_root<A: IAlloc>(a: &mut A, loader: L, item: &[(IntlKey, Index)]) -> Node<L> {
-        let b = BaseView::new_intl(
+    pub(crate) fn try_new_leaf<A: IFrameAlloc>(a: &mut A, loader: L) -> Result<Node<L>, OpCode> {
+        let empty: &[(LeafSeg, Val)] = &[];
+        let mut iter = empty.iter().map(|x| (x.0, x.1));
+        let b = BaseView::try_new_leaf(a, &loader, [].as_slice(), None, NULL_PID, &mut iter, 0)?;
+        Ok(Self::new(loader, b))
+    }
+
+    pub(crate) fn try_new_root<A: IFrameAlloc>(
+        a: &mut A,
+        loader: L,
+        item: &[(IntlKey, Index)],
+    ) -> Result<Node<L>, OpCode> {
+        let b = BaseView::try_new_intl(
             a,
             [].as_slice(),
             None,
             NULL_PID,
             || item.iter().map(|&(x, y)| (IntlSeg::new(&[], x.raw), y)),
             0,
-        );
-        Self::new(loader, b)
+        )?;
+        Ok(Self::new(loader, b))
     }
 
     /// the length of delta + base
@@ -182,8 +192,7 @@ where
         self.inner.as_box()
     }
 
-    // TODO: use iter will introduce Clone, which is not needed and will cause performace degradation
-    pub(crate) fn garbage_collect<A: IAlloc>(&self, a: &mut A, junks: &[u64]) {
+    pub(crate) fn garbage_collect<A: IRetireSink>(&self, a: &mut A, junks: &[u64]) {
         // collect key-value addr, if value is remote and invisible, it has been collected in junks
         self.state
             .read()
@@ -318,24 +327,22 @@ where
         self.runtime_merging() || self.runtime_merging_child() != NULL_PID
     }
 
-    pub(crate) fn merge_node<A: IAlloc>(
+    pub(crate) fn try_merge_node<A: IFrameAlloc>(
         &self,
         a: &mut A,
         other: &Node<L>,
         safe_txid: u64,
-    ) -> (Node<L>, Junks, Junks) {
-        let (lb, lj) = self.merge_to_base(a, safe_txid);
-        let (rb, rj) = other.merge_to_base(a, safe_txid);
+    ) -> Result<(Node<L>, Junks, Junks), OpCode> {
+        let (lb, lj) = self.try_merge_to_base(a, safe_txid)?;
+        let (rb, rj) = other.try_merge_to_base(a, safe_txid)?;
         let (lhs, rhs) = (lb.view().as_base(), rb.view().as_base());
 
         #[cfg(feature = "extra_check")]
         assert_ne!(self.base_addr(), other.base_addr());
-        let mut node = Self::new(
-            self.loader.deep_copy(),
-            lhs.merge(a, &self.loader, rhs, safe_txid),
-        );
+        let merged = lhs.try_merge(a, &self.loader, rhs, safe_txid)?;
+        let mut node = Self::new(self.loader.deep_copy(), merged);
         node.header_mut().split_elems = self.header().split_elems;
-        (node, lj, rj)
+        Ok((node, lj, rj))
     }
 
     pub(crate) fn child_index(&self, k: &[u8]) -> (bool, u64) {
@@ -360,13 +367,13 @@ where
 
     /// NOTE: before we add lock, it will search key in current node and return None if find, after
     /// add lock, the search is useless, so it was removed, but we keep return an Option<Node<L>>
-    pub(crate) fn insert_index<A: IAlloc>(
+    pub(crate) fn try_insert_index<A: IFrameAlloc>(
         &self,
         a: &mut A,
         key: &[u8],
         pid: u64,
         safe_txid: u64,
-    ) -> Option<(Node<L>, Junks)> {
+    ) -> Result<Option<(Node<L>, Junks)>, OpCode> {
         #[cfg(feature = "extra_check")]
         if key < self.lo()
             || if let Some(hi) = self.hi() {
@@ -378,9 +385,9 @@ where
             panic!("somehow it happens");
         }
 
-        let b = DeltaView::from_key_index(a, IntlKey::new(key), Index::new(pid), safe_txid);
+        let b = DeltaView::try_from_key_index(a, IntlKey::new(key), Index::new(pid), safe_txid)?;
         let view = b.view().as_delta();
-        Some(self.insert(view).compact(a, safe_txid)) // 1/SPLIT_ELEMS chance to run
+        Ok(Some(self.insert(view).try_compact(a, safe_txid)?)) // 1/SPLIT_ELEMS chance to run
     }
 
     fn decode_pefix<K>(
@@ -406,7 +413,10 @@ where
 
     /// split base entries only
     /// callers should use `split_overlay` when delta may be present
-    pub(crate) fn split<A: IAlloc>(&self, a: &mut A) -> (Node<L>, Node<L>) {
+    pub(crate) fn try_split<A: IFrameAlloc>(
+        &self,
+        a: &mut A,
+    ) -> Result<(Node<L>, Node<L>), OpCode> {
         let h = self.inner.header();
         let prefix_len = h.prefix_len as usize;
         let elems = h.elems as usize;
@@ -424,7 +434,7 @@ where
             // prefix never shrinks in split
             let (ld, rd) = (lhs_prefix.len() - prefix_len, rhs_prefix.len() - prefix_len);
             (
-                BaseView::new_intl(
+                BaseView::try_new_intl(
                     a,
                     lo,
                     Some(sep_key.as_slice()),
@@ -435,8 +445,8 @@ where
                             .map(|(k, v)| (IntlSeg::new(lhs_prefix, &k.raw[ld..]), v))
                     },
                     txid,
-                ),
-                BaseView::new_intl(
+                )?,
+                BaseView::try_new_intl(
                     a,
                     sep_key.as_slice(),
                     hi,
@@ -447,7 +457,7 @@ where
                             .map(|(k, v)| (IntlSeg::new(rhs_prefix, &k.raw[rd..]), v))
                     },
                     txid,
-                ),
+                )?,
             )
         } else {
             let (sep_key, (llen, rlen)) = self.decode_pefix::<Key>(sep, prefix_len, lo, &hi);
@@ -463,7 +473,7 @@ where
                 .range_iter::<L, Key>(&self.loader, sep, elems)
                 .map(|(k, v)| (LeafSeg::new(&sep_key[..rlen], &k.raw[rd..], k.ver), v));
             (
-                BaseView::new_leaf(
+                BaseView::try_new_leaf(
                     a,
                     &self.loader,
                     lo,
@@ -471,8 +481,8 @@ where
                     sibling,
                     &mut liter,
                     txid,
-                ),
-                BaseView::new_leaf(
+                )?,
+                BaseView::try_new_leaf(
                     a,
                     &self.loader,
                     sep_key.as_slice(),
@@ -480,7 +490,7 @@ where
                     sibling,
                     &mut riter,
                     txid,
-                ),
+                )?,
             )
         };
 
@@ -490,23 +500,23 @@ where
         );
         lhs.header_mut().split_elems = sep as u16;
         rhs.header_mut().split_elems = (elems - sep) as u16;
-        (lhs, rhs)
+        Ok((lhs, rhs))
     }
 
-    pub(crate) fn split_overlay<A: IAlloc>(
+    pub(crate) fn try_split_overlay<A: IFrameAlloc>(
         &self,
         a: &mut A,
         safe_txid: u64,
-    ) -> (Node<L>, Node<L>, Junks) {
+    ) -> Result<(Node<L>, Node<L>, Junks), OpCode> {
         // fast path: split base directly when there is no overlay delta
         if self.delta_len() == 0 {
-            let (lhs, rhs) = self.split(a);
-            return (lhs, rhs, Junks::new());
+            let (lhs, rhs) = self.try_split(a)?;
+            return Ok((lhs, rhs, Junks::new()));
         }
         // slow path: compact overlay into base first so split sees a stable ordered view
-        let (node, junks) = self.compact(a, safe_txid);
-        let (lhs, rhs) = node.split(a);
-        (lhs, rhs, junks)
+        let (node, junks) = self.try_compact(a, safe_txid)?;
+        let (lhs, rhs) = node.try_split(a)?;
+        Ok((lhs, rhs, junks))
     }
 
     #[allow(clippy::iter_skip_zero)]
@@ -547,8 +557,12 @@ where
         }
     }
 
-    pub(crate) fn compact<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> (Node<L>, Junks) {
-        let (b, j) = self.merge_to_base(a, safe_txid);
+    pub(crate) fn try_compact<A: IFrameAlloc>(
+        &self,
+        a: &mut A,
+        safe_txid: u64,
+    ) -> Result<(Node<L>, Junks), OpCode> {
+        let (b, j) = self.try_merge_to_base(a, safe_txid)?;
         let node = Self::new(self.loader.deep_copy(), b);
         node.smo
             .merge_state
@@ -556,22 +570,26 @@ where
         node.smo
             .merging_child
             .store(self.smo.merging_child.load(Acquire), Relaxed);
-        (node, j)
+        Ok((node, j))
     }
 
-    fn merge_to_base<A: IAlloc>(&self, a: &mut A, safe_txid: u64) -> (BoxRef, Junks) {
+    fn try_merge_to_base<A: IFrameAlloc>(
+        &self,
+        a: &mut A,
+        safe_txid: u64,
+    ) -> Result<(BoxRef, Junks), OpCode> {
         let h = self.header();
         let lo = self.lo();
         let hi = self.hi();
 
         if h.is_index {
-            (
-                BaseView::new_intl(a, lo, hi, h.right_sibling, || self.intl_iter(), safe_txid),
+            Ok((
+                BaseView::try_new_intl(a, lo, hi, h.right_sibling, || self.intl_iter(), safe_txid)?,
                 Vec::new(),
-            )
+            ))
         } else {
             let mut iter = self.leaf_iter(safe_txid);
-            let b = BaseView::new_leaf(
+            let b = BaseView::try_new_leaf(
                 a,
                 &self.loader,
                 lo,
@@ -579,27 +597,30 @@ where
                 h.right_sibling,
                 &mut iter,
                 safe_txid,
-            );
-            (b, iter.filter.junks)
+            )?;
+            Ok((b, iter.filter.junks))
         }
     }
 
-    pub(crate) fn remove_index<A: IAlloc>(
+    pub(crate) fn try_remove_index<A: IFrameAlloc>(
         &self,
         a: &mut A,
         child_pid: u64,
         safe_txid: u64,
-    ) -> Option<(Node<L>, Junks)> {
+    ) -> Result<Option<(Node<L>, Junks)>, OpCode> {
         assert_eq!(self.box_header().node_type, NodeType::Intl);
         let key = self
             .intl_iter()
             .find(|(_, idx)| idx.pid == child_pid)
-            .map(|(k, _)| k)?;
-        let b = DeltaView::from_key_index(a, key, Index::null(), safe_txid);
+            .map(|(k, _)| k);
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let b = DeltaView::try_from_key_index(a, key, Index::null(), safe_txid)?;
         let tmp = self.insert(b.view().as_delta());
-        let (mut p, j) = tmp.compact(a, safe_txid);
+        let (mut p, j) = tmp.try_compact(a, safe_txid)?;
         p.header_mut().split_elems = self.header().split_elems + 1;
-        Some((p, j))
+        Ok(Some((p, j)))
     }
 
     pub(crate) fn insert(&self, mut k: DeltaView) -> Node<L> {
@@ -1223,7 +1244,7 @@ mod test {
             data::{Key, LeafSeg, Record, Val, Ver},
             node::Node,
             refbox::{BaseView, BoxRef, BoxView, DeltaView},
-            traits::{IAlloc, ICodec, IHeader, ILoader},
+            traits::{ICodec, IFrameAlloc, IHeader, ILoader, IRetireSink},
         },
         utils::{NULL_ADDR, NULL_PID, OpCode},
     };
@@ -1267,8 +1288,8 @@ mod test {
         }
     }
 
-    impl IAlloc for A {
-        fn allocate(&mut self, size: u32) -> BoxRef {
+    impl IFrameAlloc for A {
+        fn try_alloc(&mut self, size: u32) -> Result<BoxRef, OpCode> {
             let addr = self
                 .inner
                 .off
@@ -1276,20 +1297,26 @@ mod test {
             let p = BoxRef::alloc(size, addr);
             let mut lk = self.inner.map.lock();
             lk.insert(addr, p.clone());
-            p
+            Ok(p)
+        }
+
+        fn try_alloc_pair(&mut self, size1: u32, size2: u32) -> Result<(BoxRef, BoxRef), OpCode> {
+            Ok((self.try_alloc(size1)?, self.try_alloc(size2)?))
         }
 
         fn arena_size(&mut self) -> usize {
             self.inner.arena_size
         }
 
+        fn inline_size(&self) -> usize {
+            Options::MIN_INLINE_SIZE
+        }
+    }
+
+    impl IRetireSink for A {
         fn collect(&mut self, addr: &[u64]) {
             let mut lk = self.inner.collected.lock();
             lk.extend_from_slice(addr);
-        }
-
-        fn inline_size(&self) -> usize {
-            Options::INLINE_SIZE
         }
     }
 
@@ -1326,22 +1353,22 @@ mod test {
         for raw in ["a", "b", "c", "d"] {
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
             let v = Record::normal(1, raw.as_bytes());
-            let (d, r) = DeltaView::from_key_val(&mut a, &k, &v);
+            let (d, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
             node.insert_inplace(d.view().as_delta());
             node.save(d, r);
         }
 
-        (node, _) = node.compact(&mut a, u64::MAX);
+        (node, _) = node.try_compact(&mut a, u64::MAX).unwrap();
 
         let k = Key::new("zz".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
         let v = Record::normal(1, "zz".as_bytes());
-        let (d, r) = DeltaView::from_key_val(&mut a, &k, &v);
+        let (d, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
         node.insert_inplace(d.view().as_delta());
         node.save(d, r);
 
         let probe = Key::new("zz".as_bytes(), Ver::new(u64::MAX, 0));
-        let (l_new, r_new, _) = node.split_overlay(&mut a, u64::MAX);
-        let (l_old, r_old) = node.split(&mut a);
+        let (l_new, r_new, _) = node.try_split_overlay(&mut a, u64::MAX).unwrap();
+        let (l_old, r_old) = node.try_split(&mut a).unwrap();
         assert!(l_old.find_latest(&probe).is_none());
         assert!(r_old.find_latest(&probe).is_none());
         assert!(l_new.find_latest(&probe).is_some() || r_new.find_latest(&probe).is_some());
@@ -1357,26 +1384,26 @@ mod test {
         for raw in ["a", "b", "c", "d"] {
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
             let v = Record::normal(1, raw.as_bytes());
-            let (d, r) = DeltaView::from_key_val(&mut a, &k, &v);
+            let (d, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
             node.insert_inplace(d.view().as_delta());
             node.save(d, r);
         }
-        (node, _) = node.compact(&mut a, u64::MAX);
-        let (left, right) = node.split(&mut a);
+        (node, _) = node.try_compact(&mut a, u64::MAX).unwrap();
+        let (left, right) = node.try_split(&mut a).unwrap();
 
         let kl = Key::new("aa".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
         let vl = Record::normal(1, "aa".as_bytes());
-        let (dl, rl) = DeltaView::from_key_val(&mut a, &kl, &vl);
+        let (dl, rl) = DeltaView::try_from_key_val(&mut a, &kl, &vl).unwrap();
         left.insert_inplace(dl.view().as_delta());
         left.save(dl, rl);
 
         let kr = Key::new("zz".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
         let vr = Record::normal(1, "zz".as_bytes());
-        let (dr, rr) = DeltaView::from_key_val(&mut a, &kr, &vr);
+        let (dr, rr) = DeltaView::try_from_key_val(&mut a, &kr, &vr).unwrap();
         right.insert_inplace(dr.view().as_delta());
         right.save(dr, rr);
 
-        let (merged, _, _) = left.merge_node(&mut a, &right, u64::MAX);
+        let (merged, _, _) = left.try_merge_node(&mut a, &right, u64::MAX).unwrap();
         let probe_l = Key::new("aa".as_bytes(), Ver::new(u64::MAX, 0));
         let probe_r = Key::new("zz".as_bytes(), Ver::new(u64::MAX, 0));
         assert!(merged.find_latest(&probe_l).is_some());
@@ -1393,28 +1420,31 @@ mod test {
             let l = a.clone();
             let mut node = Node::new_leaf(&mut a, l);
 
-            let (d1, r1) = DeltaView::from_key_val(
+            let (d1, r1) = DeltaView::try_from_key_val(
                 &mut a,
                 &Key::new("foo".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1)),
                 &Record::normal(1, "1".as_bytes()),
-            );
-            let (d2, r2) = DeltaView::from_key_val(
+            )
+            .unwrap();
+            let (d2, r2) = DeltaView::try_from_key_val(
                 &mut a,
                 &Key::new("foo".as_bytes(), Ver::new(txid.load(Relaxed), 2)),
                 &Record::normal(1, "2".as_bytes()),
-            );
+            )
+            .unwrap();
 
-            let (d3, r3) = DeltaView::from_key_val(
+            let (d3, r3) = DeltaView::try_from_key_val(
                 &mut a,
                 &Key::new("foo".as_bytes(), Ver::new(txid.load(Relaxed), 3)),
                 &Record::remove(1),
-            );
+            )
+            .unwrap();
 
             node.insert_inplace(d1.view().as_delta());
             node.save(d1, r1);
             node.insert_inplace(d2.view().as_delta());
             node.save(d2, r2);
-            (node, _) = node.compact(&mut a, 1);
+            (node, _) = node.try_compact(&mut a, 1).unwrap();
 
             let iter = node.leaf_iter(1);
             assert_eq!(iter.count(), 2);
@@ -1432,12 +1462,12 @@ mod test {
             let raw = format!("key_{i}");
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
             let v = Record::normal(1, raw.as_bytes());
-            let (delta, r) = DeltaView::from_key_val(&mut a, &k, &v);
+            let (delta, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
             node.insert_inplace(delta.view().as_delta());
             node.save(delta, r);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                (node, _) = node.compact(&mut a, 3);
+                (node, _) = node.try_compact(&mut a, 3).unwrap();
             }
         }
 
@@ -1446,12 +1476,12 @@ mod test {
             let raw = format!("key_{i}");
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 0));
             let v = Record::remove(1);
-            let (delta, r) = DeltaView::from_key_val(&mut a, &k, &v);
+            let (delta, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
             node.insert_inplace(delta.view().as_delta());
             node.save(delta, r);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                (node, _) = node.compact(&mut a, 3);
+                (node, _) = node.try_compact(&mut a, 3).unwrap();
             }
         }
 
@@ -1460,12 +1490,12 @@ mod test {
             let raw = format!("key_{i}");
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 0));
             let v = Record::normal(1, raw.as_bytes());
-            let (delta, r) = DeltaView::from_key_val(&mut a, &k, &v);
+            let (delta, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
             node.insert_inplace(delta.view().as_delta());
             node.save(delta, r);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                (node, _) = node.compact(&mut a, 3);
+                (node, _) = node.try_compact(&mut a, 3).unwrap();
             }
         }
 
@@ -1488,7 +1518,7 @@ mod test {
 
         fn gen_val(a: &mut A, r: Record) -> Val<'static> {
             let sz = Val::calc_size(false, a.inline_size(), r.packed_size());
-            let mut b = a.allocate(sz as u32);
+            let mut b = a.try_alloc(sz as u32).unwrap();
             Val::encode_inline(b.data_slice_mut::<u8>(), NULL_ADDR, &r);
             Val::from_raw(unsafe { std::mem::transmute::<&[u8], &[u8]>(b.data_slice::<u8>()) })
         }
@@ -1501,7 +1531,7 @@ mod test {
             ));
         }
         let mut iter = items.iter().map(|x| (x.0, x.1));
-        let base = BaseView::new_leaf(&mut a, &l, &[], None, NULL_PID, &mut iter, 1);
+        let base = BaseView::try_new_leaf(&mut a, &l, &[], None, NULL_PID, &mut iter, 1).unwrap();
         let node = Node::new(l, base);
 
         let mut sst_iter = node.range_iter::<A, Key>(&node.loader, 0, node.header().elems as usize);
@@ -1517,7 +1547,7 @@ mod test {
         }
         assert!(sibling_chain.len() > 1);
 
-        let (_next, junks) = node.compact(&mut a, u64::MAX);
+        let (_next, junks) = node.try_compact(&mut a, u64::MAX).unwrap();
         for addr in &sibling_chain {
             assert!(junks.contains(addr));
         }

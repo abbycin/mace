@@ -27,6 +27,7 @@ This document summarizes the current MACE design as reflected by the codebase. I
 - `bucket_metas`: bucket name -> `BucketMeta` (id)
 - `pending_del`: buckets pending physical cleanup
 - `pending_sibling`: staged sibling addresses awaiting base publish/cleanup
+- `pending_retire`: staged retire addresses awaiting stat apply/cleanup
 - `page_table_{bucket_id}`: page id -> addr mappings
 - `data_interval_{bucket_id}` / `blob_interval_{bucket_id}`: addr ranges -> file ids
 - `data_stat` / `blob_stat`: per-file stats and masks for GC
@@ -37,11 +38,14 @@ This document summarizes the current MACE design as reflected by the codebase. I
 Flush order is enforced by `StoreFlushObserver`:
 
 1. Write data/blob files to disk
-2. Stage `pending_sibling` metadata for sibling frames (if any)
-3. Release arena refs after pending-sibling stage becomes durable
-4. Ensure WAL durability barrier for this flush boundary (`flsn`) before publishing metadata
-5. Commit metadata transaction (stats, map table, intervals, numerics, pending-sibling clears)
-6. Mark flush done, then advance per-group checkpoint positions and persist checkpoint records
+2. Ensure WAL durability barrier for this flush boundary (`flsn`) before publishing metadata
+3. Commit one manifest txn for this flush boundary:
+   - map/stat/interval publish
+   - `pending_sibling` record/clear
+   - `pending_retire` record
+   - orphan marker clear + numerics
+4. Mark flush done and release arena refs
+5. Advance per-group checkpoint positions and persist checkpoint records
 
 This ensures data is durable before metadata points to it.
 
@@ -103,45 +107,51 @@ This replaces the old logical/physical id mapping: the logical address is stable
 - `Arena` is an append-only allocator with reference counting
 - Allocation uses direct `BoxRef` allocation (`alloc_exact`) with per-arena accounting (no chunk allocator)
 - `Arena` states: `HOT` (allocating), `WARM` (sealed), `COLD` (ready to flush), `FLUSH` (flushed)
-- Tombstones mark reclaimed entries; junk addresses are collected for GC
+- Tombstones suppress in-arena dead frames; unresolved retire addresses are staged for manifest-backed recovery
 
 `Pool` manages arenas for a bucket:
 
 - `Iim` tracks the addr -> arena id mapping for in-memory loads
 - `flsn` per writer group records WAL position of dirty data
 - `safe_to_flush` ensures WAL is flushed past arena `flsn` before flush
-- flow control is quota-based and starts from allocation admission instead of post-facto cleanup
-
-### Flow control
-
-`Pool` uses bounded admission and explicit backpressure. The base budget is configurable via
-`Options::default_arenas` (default `16`), replacing the old hard-coded arena constant.
-
-- per-bucket base arena budget: `default_arenas`
-- per-bucket burst budget: `max(default_arenas / 2, 1)`
-- per-bucket flush slot cap: `base + burst_budget`
-- global flush slot cap: `loaded_buckets * per_bucket_cap`
-- cache-pressure coupling:
-  - when cache usage reaches `>= 90%`, burst budget is clamped to `0`
-  - this shrinks both burst allocation and slot caps back to the base budget
-
-Admission path behavior:
-
-- `OPEN`: normal allocation path
-- `SHAPE`: short delay smoothing (`~50us`) when pending flush pressure rises
-- `GATE`: blocking wait/notify when local or global quota is exhausted
-- no busy-spin in allocator slow path (wait uses condvar-based signaling)
-
-Observability:
-
-- counters: wait count, burst grant/deny, gate enter/exit
-- gauges: global pending flush, global burst in use, gate bucket count
-- events: `FlowGateEnter` / `FlowGateExit` with `bucket_id` and pending value
+- allocator handoff marks old arena `WARM` and waits for in-flight allocs to drain before publishing next arena, which avoids cross-arena address overlap races
+- `Options::default_arenas` controls per-bucket pre-allocated arena count (`>= 2`, power-of-two, validated in `Options::validate`)
+- allocator may create bounded spill arenas (`default_arenas + arena_spill_limit`) under starvation; `arena_spill_limit` is clamped to `[1, MAX_DEFAULT_ARENAS]` in `Options::validate`
+- spill over-cap fail-fast returns `Again` to tree-internal retry path
+- retire addresses are staged arena-local in `Pool::pending_retire` and extracted by that arena's flush boundary
 
 Failure semantics:
 
 - `Pool::flush` enqueue to flusher channel is required to succeed
 - flusher channel disconnect is treated as fatal (fail-fast), never as a recoverable drop path
+- tree write paths consume allocator `Again` internally, instead of exposing spill pressure directly to user write APIs
+
+### Flow control and flush pacing
+
+MACE uses a shared `FlowController` for foreground backpressure and flusher pacing.
+
+Core model:
+
+- debt accounting is ticket-based:
+  - `on_enqueue_est`: `debt += est_bytes`
+  - `on_io_built`: reconcile by `debt += actual_bytes - est_bytes`
+  - `on_mark_done`: release `debt -= actual_or_est`
+- `on_mark_done` settles debt for `Flushed`/`Skip`/`Empty`/`MetaOnly`; throughput EWMA updates only for `Flushed`
+- effective throughput is derived from `min(io_bps_ewma, e2e_bps_ewma)` with floor protection
+- long idle windows reset stale throughput samples (`bp_idle_reset_ms`)
+
+Foreground backpressure:
+
+- `before_write_budget` is executed **before** entering `tree.update`
+- no sleep is allowed inside the tree update closure (leaf lock critical section)
+- write paths use estimated bytes for pre-update throttling; exact WAL shape is still decided in closure logic
+
+Flush pacing:
+
+- pacing is FIFO-preserving and runs only after `safe_to_flush`
+- low debt: pacing may sleep to smooth flush cadence
+- high debt: pacing bypasses to chase backlog
+- teardown and arena starvation use global reference-counted bypass scopes so all in-flight buckets observe bypass consistently
 
 ### Sibling crash-closure via pending metadata
 
@@ -159,6 +169,22 @@ For multi-version leaf rebuild, crash-closure is implemented with `pending_sibli
 - startup recovery (`recover_pending_siblings_to_stats`) applies any leftover pending siblings into stat bitmaps and clears pending entries
 
 This keeps sibling dangling-pointer cleanup crash-safe while preserving the shared arena allocation model.
+
+### Retire crash-closure via pending metadata
+
+Retire/junk closure is implemented by `pending_retire` metadata, not by requiring data and retire records to share one arena:
+
+- tree/evict publish contexts collect retire addresses in memory and stage them into `Pool::pending_retire` keyed by arena id
+- when that arena is flushed, retire sets are attached to `FlushResult` and written as `pending_retire` in the same manifest txn as map/stat/interval publish
+- startup (`Mace::new`) and periodic GC ticks call `recover_pending_retires_to_stats`
+- recovery path applies `pending_retire` to data/blob stats first, then clears processed entries in the same txn
+- `OpCode::NotFound` during recover only clears when bucket is truly deleted (`pending_del` or missing `bucket_meta`); unloaded buckets keep intents for retry
+- failpoint `mace_retire_after_apply_before_clear` validates apply/clear crash window idempotence
+
+This closes both retire failure classes:
+
+- no leak from "data durable but retire missing"
+- no wrong reclaim from "retire visible before new mapping publish"
 
 ### Loader and caches
 
@@ -263,6 +289,18 @@ This prevents deleting WAL still needed for recovery or active transactions.
 
 The flow is idempotent and does not require a dedicated GC queue for pending sibling cleanup.
 
+#### Pending retire recovery
+
+`pending_retire` is used to close the crash window between new mapping publish and retire stat apply:
+
+1. Flush publish records `pending_retire` entries in the same manifest txn as mapping/stat updates
+2. Recovery and GC call `recover_pending_retires_to_stats` to replay pending retire intents
+3. The replay path groups entries by bucket/kind, applies to data/blob stats, then clears only applied entries in one txn
+4. If bucket context cannot be loaded temporarily (for example unloaded), intents are retained for retry
+5. If bucket is truly deleted (`pending_del` or no persisted bucket meta), stale intents are cleared safely
+
+The flow is idempotent and preserves bucket-local isolation.
+
 #### Orphan data/blob cleanup
 
 Orphans are data/blob files that were written to disk but never published by manifest metadata
@@ -357,6 +395,7 @@ All metric dimensions are encoded in enums (fixed cardinality, no runtime label 
   - histograms: append bytes, sync latency
 - Flush/manifest orphan protocol (`meta/mod.rs`):
   - counters: orphan data/blob staged and cleared
+  - counters: retire recorded
   - events: orphan stage/clear transitions
 - Recovery (`store/recovery.rs`):
   - counters: redo record count, undo txn count, wal truncate count
@@ -366,6 +405,7 @@ All metric dimensions are encoded in enums (fixed cardinality, no runtime label 
 - GC (`store/gc.rs`):
   - counters:
     - gc run count
+    - retire data/blob applied and retire cleared
     - wal recycle file count
     - pending bucket clean count
     - scavenge scanned/compacted page count
@@ -380,6 +420,14 @@ All metric dimensions are encoded in enums (fixed cardinality, no runtime label 
     - pending bucket cleaned
     - data rewrite complete
     - blob rewrite complete
+- Flow control (`map/flow.rs`):
+  - counters:
+    - foreground delay count
+    - pacing sleep count
+    - pacing bypass count (high debt / teardown / arena starvation)
+  - histograms:
+    - foreground delay micros
+    - pacing sleep micros
 
 ### Hot-path overhead control
 
@@ -448,8 +496,13 @@ All metric dimensions are encoded in enums (fixed cardinality, no runtime label 
 - Pending sibling records must be durable before arena release
 - Base publish and pending-sibling clear must be committed in the same manifest txn
 - Startup pending-sibling recovery must be idempotent (safe on retry/replay)
+- Pending retire records must be committed in the same manifest txn as the flush publish that makes replacements durable
+- Pending retire clear must not happen unless the corresponding stat apply is part of the same committed txn
+- Pending retire `NotFound` clear is allowed only for truly deleted buckets; unloaded buckets must keep intents for retry
 - Bucket deletion must be two-phase; do not decrement `nr_buckets` early
 - WAL files can only be deleted up to the safe checkpoint boundary
+- Foreground backpressure delay must not run in tree leaf lock critical sections
+- spill-cap `Again` must be retried inside tree to avoid user-visible retry storms
 
 ## Operational validation pipeline
 
@@ -460,6 +513,7 @@ To keep production behavior aligned with crash-safety and performance invariants
   - `stress` for long-run pressure
   - `chaos` for failpoint crash/fault windows
   - `all` for full matrix (`fast + stress + chaos`)
+  - crash-window coverage includes `after_data_sync`, `before_manifest_commit`, `after_manifest_commit`, and `retire_after_apply_before_clear`
 - `scripts/perf_gate.sh`
   - `snapshot` captures current benchmark summary
   - `compare` gates regressions against a baseline ref (`MACE_PERF_BASE_REF`)

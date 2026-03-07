@@ -22,9 +22,8 @@ pub(crate) enum NodeType {
 pub(crate) enum TagFlag {
     Normal = 1,
     TombStone = 2,
-    Junk = 3,
-    Sibling = 4,
-    Unmap = 5,
+    Sibling = 3,
+    Unmap = 4,
 }
 
 #[derive(Debug)]

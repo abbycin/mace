@@ -158,6 +158,13 @@ impl<'a> TxnKV<'a> {
     }
 
     #[inline]
+    fn before_write_budget(&self, estimated_bytes: usize) {
+        self.tree
+            .bucket
+            .before_foreground_write(estimated_bytes as u64);
+    }
+
+    #[inline]
     fn conflict_abort(&self, txid: u64) -> OpCode {
         self.observe_counter(CounterMetric::TxnConflictAbort, 1);
         self.observe_event(ObserveEvent {
@@ -170,7 +177,13 @@ impl<'a> TxnKV<'a> {
         OpCode::AbortTx
     }
 
-    fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<ValRef>, OpCode>
+    fn modify<F>(
+        &self,
+        k: &[u8],
+        v: &[u8],
+        estimated_bytes: usize,
+        mut f: F,
+    ) -> Result<Option<ValRef>, OpCode>
     where
         F: FnMut(&Option<(Key, ValRef)>, Ver, &mut TxnState) -> Result<(u8, Position), OpCode>,
     {
@@ -187,13 +200,15 @@ impl<'a> TxnKV<'a> {
         state.cmd_id += 1;
         let key = Key::new(k, Ver::new(start_ts, cmd_id_val));
         let val = Record::normal(gid as u8, v);
+        self.before_write_budget(estimated_bytes);
 
         self.tree
             .update(&g, key, val, |opt| f(opt, *key.ver(), state))
     }
 
     fn put_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<(), OpCode> {
-        self.modify(k, v, |opt, ver, state| {
+        let estimated = k.len().saturating_add(v.len());
+        self.modify(k, v, estimated, |opt, ver, state| {
             let gid = state.group_id;
             let g = self.ctx.group(gid);
 
@@ -236,7 +251,8 @@ impl<'a> TxnKV<'a> {
     }
 
     fn update_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<ValRef, OpCode> {
-        self.modify(k, v, |opt, ver, state| {
+        let estimated = k.len().saturating_add(v.len().saturating_mul(2));
+        self.modify(k, v, estimated, |opt, ver, state| {
             let gid = state.group_id;
             let g = self.ctx.group(gid);
             match opt {
@@ -305,7 +321,8 @@ impl<'a> TxnKV<'a> {
     {
         let mut logged = false;
         let (k, v) = (k.as_ref(), v.as_ref());
-        self.modify(k, v, |opt, ver, state| {
+        let estimated = k.len().saturating_add(v.len().saturating_mul(2));
+        self.modify(k, v, estimated, |opt, ver, state| {
             let gid = state.group_id;
             let g = self.ctx.group(gid);
             match opt {
@@ -374,6 +391,7 @@ impl<'a> TxnKV<'a> {
         let val = Record::remove(gid as u8);
         let mut logged = false;
         let guard = crossbeam_epoch::pin();
+        self.before_write_budget(key.raw.len());
 
         let res = self.tree.update(&guard, key, val, |opt| {
             let g = self.ctx.group(gid);

@@ -18,6 +18,30 @@ pub struct PageMap {
     free: Mutex<BTreeSet<u64>>,
 }
 
+pub(crate) struct PidLease<'a> {
+    table: &'a PageMap,
+    pid: u64,
+    published: bool,
+}
+
+impl PidLease<'_> {
+    pub(crate) fn pid(&self) -> u64 {
+        self.pid
+    }
+}
+
+impl Drop for PidLease<'_> {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        assert_eq!(self.table.get(self.pid), NULL_ADDR);
+        let mut lk = self.table.free.lock();
+        assert!(!lk.contains(&self.pid));
+        lk.insert(self.pid);
+    }
+}
+
 // currently in stable rust we can't create large object directly using Box, since it will create the
 // object on stack, and then copy to heap, for large object, it may cause stack overflow
 // https://github.com/rust-lang/rust/issues/53827
@@ -45,32 +69,46 @@ impl Default for PageMap {
 }
 
 impl PageMap {
-    pub fn map(&self, data: u64) -> Option<u64> {
+    pub(crate) fn reserve_pid(&self) -> Option<PidLease<'_>> {
         let mut lk = self.free.lock();
         if let Some(pid) = lk.pop_first() {
-            self.index(pid)
-                .compare_exchange(NULL_ADDR, data, Ordering::AcqRel, Ordering::Relaxed)
-                .expect("impossible");
-            return Some(pid);
+            return Some(PidLease {
+                table: self,
+                pid,
+                published: false,
+            });
         }
         drop(lk);
 
         let mut pid = self.next.fetch_add(1, Ordering::Relaxed);
         let mut cnt = 0;
-
         while cnt < MAX_ID {
-            match self.index(pid).compare_exchange(
-                NULL_ADDR,
-                data,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(pid),
-                Err(_) => pid = self.next.fetch_add(1, Ordering::Relaxed),
+            if self.index(pid).load(Ordering::Relaxed) == NULL_ADDR {
+                return Some(PidLease {
+                    table: self,
+                    pid,
+                    published: false,
+                });
             }
+            pid = self.next.fetch_add(1, Ordering::Relaxed);
             cnt += 1;
         }
         None
+    }
+
+    pub(crate) fn publish_reserved(&self, lease: &mut PidLease<'_>, data: u64) {
+        self.index(lease.pid)
+            .compare_exchange(NULL_ADDR, data, Ordering::AcqRel, Ordering::Relaxed)
+            .expect("reserved pid must still be empty");
+        self.next.fetch_max(lease.pid + 1, Ordering::AcqRel);
+        lease.published = true;
+    }
+
+    pub fn map(&self, data: u64) -> Option<u64> {
+        let mut lease = self.reserve_pid()?;
+        let pid = lease.pid;
+        self.publish_reserved(&mut lease, data);
+        Some(pid)
     }
 
     pub fn map_to(&self, pid: u64, data: u64) {
@@ -407,5 +445,29 @@ mod test {
         }
 
         assert_eq!(pids.len(), mapped_pid.len());
+    }
+
+    #[test]
+    fn reserve_pid_drop_returns_pid_to_free() {
+        let table = PageMap::default();
+        let lease = table.reserve_pid().expect("must reserve pid");
+        let pid = lease.pid();
+        assert_eq!(table.get(pid), NULL_ADDR);
+        drop(lease);
+
+        let remap = table.map(addr(7)).expect("must reuse released pid");
+        assert_eq!(remap, pid);
+        assert_eq!(table.get(pid), addr(7));
+    }
+
+    #[test]
+    fn publish_reserved_makes_pid_visible_once() {
+        let table = PageMap::default();
+        let mut lease = table.reserve_pid().expect("must reserve pid");
+        let pid = lease.pid();
+        table.publish_reserved(&mut lease, addr(11));
+        assert_eq!(table.get(pid), addr(11));
+        drop(lease);
+        assert_eq!(table.get(pid), addr(11));
     }
 }

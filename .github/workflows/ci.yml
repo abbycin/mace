@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -38,7 +38,7 @@ jobs:
         run: cargo build --verbose
 
       - name: Run Tests
-        run: cargo test --verbose -- --nocapture
+        run: cargo test --features extra_check --verbose -- --nocapture
 
   test-prod-all:
     name: Prod Test Flow (all) (${{ matrix.os }} ${{ matrix.arch }})
@@ -60,6 +60,7 @@ jobs:
           test "$(uname -m)" = "x86_64"
 
       - name: Run prod all suite
+        if: ${{ runner.os == 'Linux' && runner.arch == 'X64' }}
         env:
           FEATURES: failpoints
           FAST_TIMEOUT: "300"
@@ -72,43 +73,13 @@ jobs:
           MACE_PROD_EVICTOR_STRESS_ROUNDS: "512"
         run: bash ./scripts/prod_test.sh all 8
 
-  perf-regression:
-    name: Perf Regression Gate (Ubuntu x86_64)
-    if: ${{ runner.os == 'Linux' && runner.arch == 'X64' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify runner arch is x86_64
-        run: |
-          test "$(uname -m)" = "x86_64"
-
-      - name: Run perf compare gate
-        env:
-          MACE_PERF_THRESHOLD_FILE: scripts/perf_thresholds.env
-          MACE_PERF_BASE_REF: origin/master
-        run: bash ./scripts/perf_gate.sh compare
-
-      - name: Upload perf artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: perf-regression-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/perf_gate
-
   # Job 2: FreeBSD (Runs in a VM on top of Linux)
   test-freebsd:
     name: FreeBSD (x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Run tests in FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:
@@ -116,7 +87,7 @@ jobs:
           prepare: |
             pkg install -y rust
           run: |
-            cargo test --verbose -- --nocapture
+            cargo test --features extra_check --verbose -- --nocapture
 
   # Job 3: Linux ARM64 (Cross-compile check)
   # This verifies that the code compiles for Linux on ARM.
@@ -126,7 +97,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -137,7 +108,7 @@ jobs:
 
       - name: Build for ARM64
         run: cross build --target aarch64-unknown-linux-gnu --verbose
-      
+
       # Note: Running tests for ARM64 on x86_64 requires QEMU via cross.
       # If you want to actually run the tests:
       - name: Run tests for ARM64

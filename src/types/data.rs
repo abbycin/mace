@@ -858,7 +858,7 @@ mod test {
         types::{
             data::{IntlKey, Record, Val, Ver},
             refbox::{BoxRef, BoxView, RemoteView},
-            traits::{IAlloc, ICodec, IDecode, IHeader, ILoader},
+            traits::{ICodec, IDecode, IFrameAlloc, IHeader, ILoader, IRetireSink},
         },
         utils::NULL_ADDR,
     };
@@ -978,23 +978,33 @@ mod test {
             }
         }
 
-        impl IAlloc for L {
-            fn allocate(&mut self, size: u32) -> BoxRef {
+        impl IFrameAlloc for L {
+            fn try_alloc(&mut self, size: u32) -> Result<BoxRef, OpCode> {
                 let addr = self.addr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let b = BoxRef::alloc(size, addr);
                 self.m.borrow_mut().insert(addr, b.clone());
-                b
+                Ok(b)
+            }
+
+            fn try_alloc_pair(
+                &mut self,
+                size1: u32,
+                size2: u32,
+            ) -> Result<(BoxRef, BoxRef), OpCode> {
+                Ok((self.try_alloc(size1)?, self.try_alloc(size2)?))
             }
 
             fn arena_size(&mut self) -> usize {
                 64 << 20
             }
 
-            fn collect(&mut self, _addr: &[u64]) {}
-
             fn inline_size(&self) -> usize {
-                Options::INLINE_SIZE
+                Options::MIN_INLINE_SIZE
             }
+        }
+
+        impl IRetireSink for L {
+            fn collect(&mut self, _addr: &[u64]) {}
         }
 
         impl ILoader for L {

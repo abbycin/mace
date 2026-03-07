@@ -14,6 +14,7 @@ use crate::utils::Handle;
 use crate::utils::MutRef;
 pub use crate::utils::OpCode;
 use crate::utils::ROOT_PID;
+use crate::utils::observe::CounterMetric;
 pub use crate::utils::options::Options;
 use crate::utils::options::ParsedOptions;
 use std::ops::Deref;
@@ -141,11 +142,11 @@ impl StoreFlushObserver {
             .buckets
             .get(&result.bucket_id)
             .expect("bucket context must exist when flushing");
-        ctx.data_intervals.write().insert(
-            result.data_ivl.lo_addr,
-            result.data_ivl.hi_addr,
-            result.data_ivl.file_id,
-        );
+        if let Some(data_ivl) = &result.data_ivl {
+            ctx.data_intervals
+                .write()
+                .insert(data_ivl.lo_addr, data_ivl.hi_addr, data_ivl.file_id);
+        }
         if let Some(blob_ivl) = result.blob_ivl {
             ctx.blob_intervals
                 .write()
@@ -173,35 +174,48 @@ impl StoreFlushObserver {
         }
 
         let mut txn = self.manifest.begin();
-        let data_stats =
-            self.manifest
-                .apply_data_junks(result.bucket_id, result.tick, &result.data_junks);
-        let blob_stats = self
-            .manifest
-            .apply_blob_junks(result.bucket_id, &result.blob_junks);
-
-        for &addr in &stage_pending_addrs {
-            let pending = crate::meta::PendingSibling::new(
-                result.bucket_id,
-                result.data_id,
-                PendingRangeKind::Data,
-                addr,
+        for &addr in &result.data_junks {
+            self.manifest.record_pending_retire(
+                &mut txn,
+                &crate::meta::PendingRetire::new(result.bucket_id, PendingRangeKind::Data, addr),
             );
-            self.manifest.record_pending_sibling(&mut txn, &pending);
+        }
+        for &addr in &result.blob_junks {
+            self.manifest.record_pending_retire(
+                &mut txn,
+                &crate::meta::PendingRetire::new(result.bucket_id, PendingRangeKind::Blob, addr),
+            );
+        }
+        let retire_recorded = (result.data_junks.len() + result.blob_junks.len()) as u64;
+        if retire_recorded > 0 {
+            self.ctx
+                .opt
+                .observer
+                .counter(CounterMetric::RetireRecorded, retire_recorded);
         }
 
-        txn.record(MetaKind::DataStat, &result.data_stat);
+        if !stage_pending_addrs.is_empty() {
+            let data_id = result
+                .data_id
+                .expect("pending sibling publish requires data file id");
+            for &addr in &stage_pending_addrs {
+                let pending = crate::meta::PendingSibling::new(
+                    result.bucket_id,
+                    data_id,
+                    PendingRangeKind::Data,
+                    addr,
+                );
+                self.manifest.record_pending_sibling(&mut txn, &pending);
+            }
+        }
+
+        if let Some(data_stat) = &result.data_stat {
+            txn.record(MetaKind::DataStat, data_stat);
+        }
         txn.record(MetaKind::Map, &result.map_table);
-        txn.record(MetaKind::DataInterval, &result.data_ivl);
-
-        data_stats.iter().for_each(|x| {
-            assert_ne!(result.data_id, x.file_id);
-            txn.record(MetaKind::DataStat, x)
-        });
-
-        blob_stats.iter().for_each(|x| {
-            txn.record(MetaKind::BlobStat, x);
-        });
+        if let Some(data_ivl) = &result.data_ivl {
+            txn.record(MetaKind::DataInterval, data_ivl);
+        }
 
         if let (Some(blob_ivl), Some(blob_stat)) = (&result.blob_ivl, &result.blob_stat) {
             txn.record(MetaKind::BlobStat, blob_stat);
@@ -217,8 +231,9 @@ impl StoreFlushObserver {
         }
 
         txn.record(MetaKind::Numerics, self.manifest.numerics.deref());
-        self.manifest
-            .clear_orphan_data_file(&mut txn, result.data_id);
+        if let Some(data_id) = result.data_id {
+            self.manifest.clear_orphan_data_file(&mut txn, data_id);
+        }
         if let Some(blob_ivl) = result.blob_ivl {
             self.manifest
                 .clear_orphan_blob_file(&mut txn, blob_ivl.file_id);
@@ -229,7 +244,9 @@ impl StoreFlushObserver {
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check("mace_flush_after_manifest_commit")?;
 
-        self.manifest.add_data_stat(result.mem_data_stat);
+        if let Some(mem_data_stat) = result.mem_data_stat {
+            self.manifest.add_data_stat(mem_data_stat);
+        }
         if let Some(mem_blob_stat) = result.mem_blob_stat {
             self.manifest.add_blob_stat(mem_blob_stat);
         }
@@ -456,6 +473,7 @@ impl Mace {
         let observer = Arc::new(StoreFlushObserver::new(manifest, ctx));
         let reader = Arc::new(StoreDataReader::new(manifest));
         manifest.set_context(ctx, reader, observer);
+        manifest.recover_pending_retires_to_stats();
 
         let store = MutRef::new(Store::new(opt.clone(), manifest, ctx));
 

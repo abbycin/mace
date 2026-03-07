@@ -15,15 +15,13 @@ pub struct Options {
     /// force sync data to disk for every log write, the default value is `true`, turning it off may
     /// result in data loss, while turning it on may result in performance degradation
     pub sync_on_write: bool,
-    /// base arena budget per bucket for flow control
+    /// pre-allocated arena count per bucket
     ///
-    /// flow control rules:
-    /// - base arena budget = `default_arenas`
-    /// - per-bucket burst budget = `max(default_arenas / 2, 1)`
-    /// - per-bucket in-flight flush slot cap = `default_arenas + burst_budget`
-    ///
-    /// must be power of two, default is 16
+    /// this controls the size of the reusable arena queue for each bucket
+    /// must be >= 2 and power of two, default is 16
     pub default_arenas: u32,
+    /// max extra arenas that can be created during starvation
+    pub arena_spill_limit: u32,
     /// default is hardware concurrency count, it must be power of 2
     ///
     /// **Once set, it cannot be modified**
@@ -107,6 +105,24 @@ pub struct Options {
     pub truncate_corrupted_wal: bool,
     /// observability callback, default is noop
     pub observer: Arc<dyn Observer>,
+    /// enable foreground write backpressure
+    pub enable_backpressure: bool,
+    /// enable flush pacing in flusher thread
+    pub enable_flush_pacing: bool,
+    /// debt threshold in milliseconds to start delaying foreground writes
+    pub bp_soft_debt_ms: u64,
+    /// debt threshold in milliseconds to increase delay aggressively
+    pub bp_hard_debt_ms: u64,
+    /// debt threshold in milliseconds to cap delay at max
+    pub bp_stop_debt_ms: u64,
+    /// minimum ratio (percent) of effective_bps when debt is high
+    pub bp_min_ratio_pct: u32,
+    /// minimum effective throughput in bytes/sec used for debt conversion
+    pub bp_floor_bps: u64,
+    /// if debt stays zero beyond this duration, decay historical bps
+    pub bp_idle_reset_ms: u64,
+    /// maximum sleep duration for a single backpressure decision
+    pub bp_max_delay_us: u64,
 }
 
 impl Options {
@@ -120,10 +136,16 @@ impl Options {
     pub const FILE_CACHE: usize = 512;
     pub const WAL_BUF_SZ: usize = 8 << 20; // 8MB
     pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
-    pub const INLINE_SIZE: usize = 8192;
+    pub const MIN_INLINE_SIZE: usize = 8192;
+    pub const MAX_INLINE_SIZE: usize = 64 << 10;
     pub const MAX_SPLIT_ELEMS: u16 = 512;
     pub const MAX_LOG_SIZE: usize = 72 << 20;
     const MIN_SPLIT_ELEMS: u16 = 64;
+    const MIN_DEFAULT_ARENAS: u32 = 2;
+    const MAX_DEFAULT_ARENAS: u32 = 1024;
+    const MIN_ARENA_SPILL: u32 = 1;
+    const MAX_ARENA_SPILL: u32 = Self::MAX_DEFAULT_ARENAS;
+    pub(crate) const MAX_KEY_SIZE: usize = 64 << 10;
     pub(crate) const MAX_KV_SIZE: usize = 1 << 30; // 1GB
 
     /// Creates a new Options instance with default values and the given database root.
@@ -136,6 +158,7 @@ impl Options {
         Self {
             sync_on_write: true,
             default_arenas: 16,
+            arena_spill_limit: 1,
             concurrent_write: cores,
             tmp_store: false,
             gc_timeout: 60 * 1000,  // 1min
@@ -154,7 +177,7 @@ impl Options {
             high_priority_ratio: 80, // 80%
             data_handle_cache_capacity: 128,
             blob_handle_cache_capacity: 128,
-            inline_size: Self::INLINE_SIZE,
+            inline_size: Self::MIN_INLINE_SIZE,
             data_file_size: Self::DATA_FILE_SIZE,
             max_log_size: Self::MAX_LOG_SIZE,
             consolidate_threshold: Self::MAX_SPLIT_ELEMS / 2,
@@ -165,6 +188,15 @@ impl Options {
             split_elems: Self::MAX_SPLIT_ELEMS,
             truncate_corrupted_wal: true,
             observer: Arc::new(NoopObserver),
+            enable_backpressure: true,
+            enable_flush_pacing: true,
+            bp_soft_debt_ms: 1_000,
+            bp_hard_debt_ms: 4_000,
+            bp_stop_debt_ms: 8_000,
+            bp_min_ratio_pct: 5,
+            bp_floor_bps: 8 << 20, // 8MB/s
+            bp_idle_reset_ms: 5_000,
+            bp_max_delay_us: 10_000,
         }
     }
 
@@ -175,13 +207,22 @@ impl Options {
     /// Validates the options and returns a ParsedOptions instance.
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
         self.concurrent_write = self.concurrent_write.clamp(1, Self::MAX_CONCURRENT_WRITE);
-        self.default_arenas = self.default_arenas.clamp(1, 1024);
-        if !self.default_arenas.is_power_of_two() {
-            self.default_arenas = self.default_arenas.next_power_of_two();
+        if self.default_arenas < Self::MIN_DEFAULT_ARENAS
+            || self.default_arenas > Self::MAX_DEFAULT_ARENAS
+            || !self.default_arenas.is_power_of_two()
+        {
+            return Err(OpCode::Invalid);
         }
         self.split_elems = self
             .split_elems
             .clamp(Self::MIN_SPLIT_ELEMS, Self::MAX_SPLIT_ELEMS);
+        self.inline_size = self
+            .inline_size
+            .clamp(Self::MIN_INLINE_SIZE, Self::MAX_INLINE_SIZE);
+
+        self.arena_spill_limit = self
+            .arena_spill_limit
+            .clamp(Self::MIN_ARENA_SPILL, Self::MAX_ARENA_SPILL);
         if self.consolidate_threshold > self.split_elems / 2 {
             self.consolidate_threshold = self.split_elems / 2;
         }
@@ -193,6 +234,25 @@ impl Options {
         }
         if self.cache_capacity < Self::MIN_CACHE_CAP {
             self.cache_capacity = Self::CACHE_CAP;
+        }
+        self.bp_min_ratio_pct = self.bp_min_ratio_pct.clamp(1, 100);
+        if self.bp_soft_debt_ms == 0 {
+            self.bp_soft_debt_ms = 1;
+        }
+        if self.bp_hard_debt_ms <= self.bp_soft_debt_ms {
+            self.bp_hard_debt_ms = self.bp_soft_debt_ms + 1;
+        }
+        if self.bp_stop_debt_ms <= self.bp_hard_debt_ms {
+            self.bp_stop_debt_ms = self.bp_hard_debt_ms + 1;
+        }
+        if self.bp_floor_bps == 0 {
+            self.bp_floor_bps = 8 << 20;
+        }
+        if self.bp_idle_reset_ms == 0 {
+            self.bp_idle_reset_ms = 5_000;
+        }
+        if self.bp_max_delay_us == 0 {
+            self.bp_max_delay_us = 10_000;
         }
 
         self.create_dir().map_err(|e| {

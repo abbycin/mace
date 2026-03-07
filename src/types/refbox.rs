@@ -180,6 +180,7 @@ impl BoxRef {
     }
 
     /// NOTE: for T is not u8, the caller **MUST** make sure T is aligned to pointer size
+    #[cfg(test)]
     pub(crate) fn data_slice_mut<'a, T>(&mut self) -> &'a mut [T] {
         let h = self.header();
         let len = h.total_size as usize - Self::HDR_LEN;

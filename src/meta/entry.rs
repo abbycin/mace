@@ -88,6 +88,25 @@ impl PendingSibling {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingRetire {
+    /// namespace prefix for BUCKET_PENDING_RETIRE key
+    /// this isolates retire intents across buckets and supports idempotent clear
+    pub bucket_id: u64,
+    pub kind: PendingRangeKind,
+    pub addr: u64,
+}
+
+impl PendingRetire {
+    pub fn new(bucket_id: u64, kind: PendingRangeKind, addr: u64) -> Self {
+        Self {
+            bucket_id,
+            kind,
+            addr,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C, packed(1))]
 struct PendingSiblingHdr {
@@ -98,6 +117,16 @@ struct PendingSiblingHdr {
 }
 
 impl IAsSlice for PendingSiblingHdr {}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed(1))]
+struct PendingRetireHdr {
+    bucket_id: u64,
+    kind: u8,
+    addr: u64,
+}
+
+impl IAsSlice for PendingRetireHdr {}
 
 impl IMetaCodec for PendingSibling {
     fn packed_size(&self) -> usize {
@@ -121,6 +150,32 @@ impl IMetaCodec for PendingSibling {
         Self {
             bucket_id: hdr.bucket_id,
             file_id: hdr.file_id,
+            kind,
+            addr: hdr.addr,
+        }
+    }
+}
+
+impl IMetaCodec for PendingRetire {
+    fn packed_size(&self) -> usize {
+        size_of::<PendingRetireHdr>()
+    }
+
+    fn encode(&self, to: &mut [u8]) {
+        assert_eq!(to.len(), self.packed_size());
+        let hdr = PendingRetireHdr {
+            bucket_id: self.bucket_id,
+            kind: self.kind as u8,
+            addr: self.addr,
+        };
+        to.copy_from_slice(hdr.as_slice());
+    }
+
+    fn decode(src: &[u8]) -> Self {
+        let hdr = PendingRetireHdr::from_slice(src);
+        let kind = PendingRangeKind::try_from(hdr.kind).expect("invalid pending range kind");
+        Self {
+            bucket_id: hdr.bucket_id,
             kind,
             addr: hdr.addr,
         }
@@ -302,7 +357,6 @@ impl MemBlobStat {
         self.mask.as_mut().expect("mask loaded").set(reloc.seq);
     }
 
-    #[allow(dead_code)]
     pub fn copy(&self) -> BlobStat {
         BlobStat {
             inner: self.inner,
@@ -518,7 +572,6 @@ pub struct Numerics {
 }
 
 impl Numerics {
-    #[allow(dead_code)]
     pub(crate) fn safe_tixd(&self) -> u64 {
         self.wmk_oldest.load(Relaxed)
     }
@@ -769,7 +822,7 @@ impl IMetaCodec for BucketMeta {
 
 #[cfg(test)]
 mod test {
-    use super::{PendingRangeKind, PendingSibling};
+    use super::{PendingRangeKind, PendingRetire, PendingSibling};
     use crate::meta::IMetaCodec;
 
     #[test]
@@ -782,5 +835,16 @@ mod test {
         assert_eq!(got.file_id, 13);
         assert_eq!(got.kind, PendingRangeKind::Data);
         assert_eq!(got.addr, 101);
+    }
+
+    #[test]
+    fn pending_retire_codec_roundtrip() {
+        let raw = PendingRetire::new(9, PendingRangeKind::Blob, 131);
+        let mut buf = vec![0u8; raw.packed_size()];
+        raw.encode(&mut buf);
+        let got = PendingRetire::decode(&buf);
+        assert_eq!(got.bucket_id, 9);
+        assert_eq!(got.kind, PendingRangeKind::Blob);
+        assert_eq!(got.addr, 131);
     }
 }

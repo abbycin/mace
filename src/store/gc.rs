@@ -215,6 +215,7 @@ impl GarbageCollector {
     fn run(&mut self) {
         let started = Instant::now();
         self.store.opt.observer.counter(CounterMetric::GcRun, 1);
+        self.store.manifest.recover_pending_retires_to_stats();
         self.process_wal();
         self.process_data();
         self.process_blob();
@@ -407,7 +408,9 @@ impl GarbageCollector {
                     .expect("never happen");
                 let ivls = loader.get_interval().unwrap();
                 for i in ivls {
-                    del_intervals.push(i.lo);
+                    if i.lo <= i.hi {
+                        del_intervals.push(i.lo);
+                    }
                 }
                 unlinked.push(x);
             });
@@ -441,6 +444,7 @@ impl GarbageCollector {
                     .expect("never happen");
                 let ivls = loader.get_interval().unwrap();
                 for i in ivls {
+                    // keep deleting legacy sentinel keys from old empty data files
                     del_intervals.push(i.lo);
                 }
                 unlinked.push(x);
@@ -672,8 +676,14 @@ impl GarbageCollector {
                 let mut loader =
                     MetaReader::<DataFooter>::new(opt.data_file(x.id)).expect("never happen");
                 let relocs = loader.get_reloc().unwrap();
-                let ivls = loader.get_interval().unwrap();
-                let mut im = InactiveMap::new(ivls);
+                let ivls: Vec<Interval> = loader
+                    .get_interval()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .filter(|ivl| ivl.lo <= ivl.hi)
+                    .collect();
+                let mut im = InactiveMap::new(&ivls);
                 let bitmap = self
                     .store
                     .manifest
@@ -819,8 +829,14 @@ impl GarbageCollector {
                     .blob_stat
                     .load_mask_clone(victim_id, &self.store.manifest.btree)
                     .expect("must exist");
-                let ivls = loader.get_interval().unwrap();
-                let mut im = InactiveMap::new(ivls);
+                let ivls: Vec<Interval> = loader
+                    .get_interval()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .filter(|ivl| ivl.lo <= ivl.hi)
+                    .collect();
+                let mut im = InactiveMap::new(&ivls);
 
                 let active: Vec<Entry> = relocs
                     .iter()

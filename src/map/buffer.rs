@@ -7,7 +7,7 @@ use std::sync::{
     },
     mpsc::{Receiver, Sender},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{
     cc::context::Context,
@@ -29,7 +29,7 @@ use crate::{
         data::Position,
         interval::IntervalMap,
         lru::{CachePriority, ShardPriorityLru},
-        observe::{CounterMetric, EventKind, GaugeMetric, ObserveEvent, Observer},
+        observe::{CounterMetric, HistogramMetric},
         options::ParsedOptions,
         queue::Queue,
     },
@@ -37,6 +37,7 @@ use crate::{
 use dashmap::{DashMap, Entry};
 
 use super::data::FlushData;
+use super::flow::FlowController;
 use super::flush::{Flush, FlushObserver};
 use crate::map::table::{BucketState, PageMap};
 use crate::types::refbox::BoxRef;
@@ -146,176 +147,54 @@ impl Iim {
     }
 }
 
-pub(crate) struct FlowGlobal {
-    burst_in_use: AtomicU64,
-    loaded_buckets: AtomicU64,
-    pending_flush: AtomicU64,
-    gate_buckets: AtomicU64,
-    burst_cap_cfg: u64,
-    burst_per_bucket: u64,
-    cache_used: Arc<AtomicIsize>,
-    cache_cap: usize,
-    observer: Arc<dyn Observer>,
-}
-
-impl FlowGlobal {
-    pub(crate) fn new(opt: &ParsedOptions, cache_used: Arc<AtomicIsize>) -> Self {
-        let burst_per_bucket = (opt.default_arenas / 2).max(1) as u64;
-        let burst_cap_cfg = if burst_per_bucket == 0 {
-            0
-        } else {
-            (opt.cache_capacity / (4 * opt.data_file_size)).max(1) as u64
-        };
-        Self {
-            burst_in_use: AtomicU64::new(0),
-            loaded_buckets: AtomicU64::new(0),
-            pending_flush: AtomicU64::new(0),
-            gate_buckets: AtomicU64::new(0),
-            burst_cap_cfg,
-            burst_per_bucket,
-            cache_used,
-            cache_cap: opt.cache_capacity,
-            observer: opt.observer.clone(),
-        }
-    }
-
-    pub(crate) fn on_bucket_load(&self) {
-        self.loaded_buckets.fetch_add(1, AcqRel);
-    }
-
-    pub(crate) fn on_bucket_unload(&self) {
-        let old = self.loaded_buckets.fetch_sub(1, AcqRel);
-        debug_assert!(old > 0);
-    }
-
-    pub(crate) fn on_bucket_unload_n(&self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        let old = self.loaded_buckets.fetch_sub(n as u64, AcqRel);
-        debug_assert!(old >= n as u64);
-    }
-
-    fn cap(&self) -> u64 {
-        let used = self.cache_used.load(Acquire).max(0) as usize;
-        if self.cache_cap > 0 && used >= self.cache_cap * 90 / 100 {
-            return 0;
-        }
-        let by_bucket = self.loaded_buckets.load(Acquire) * self.burst_per_bucket;
-        self.burst_cap_cfg.min(by_bucket)
-    }
-
-    pub(crate) fn try_acquire_burst(&self) -> bool {
-        if self.burst_cap_cfg == 0 || self.burst_per_bucket == 0 {
-            return false;
-        }
-        let mut cur = self.burst_in_use.load(Acquire);
-        loop {
-            let cap = self.cap();
-            if cur >= cap {
-                return false;
-            }
-            match self
-                .burst_in_use
-                .compare_exchange_weak(cur, cur + 1, AcqRel, Acquire)
-            {
-                Ok(_) => {
-                    self.observer
-                        .gauge(GaugeMetric::FlowBurstInUseGlobal, (cur + 1) as i64);
-                    return true;
-                }
-                Err(x) => cur = x,
-            }
-        }
-    }
-
-    pub(crate) fn release_burst(&self) {
-        let old = self.burst_in_use.fetch_sub(1, AcqRel);
-        debug_assert!(old > 0);
-        self.observer
-            .gauge(GaugeMetric::FlowBurstInUseGlobal, (old - 1) as i64);
-    }
-
-    pub(crate) fn burst_budget_for_bucket(&self, local_max: u32) -> u64 {
-        if local_max == 0 {
-            return 0;
-        }
-        let used = self.cache_used.load(Acquire).max(0) as usize;
-        if self.cache_cap > 0 && used >= self.cache_cap * 90 / 100 {
-            return 0;
-        }
-        local_max as u64
-    }
-
-    pub(crate) fn on_flush_enqueue(&self) {
-        let cur = self.pending_flush.fetch_add(1, AcqRel) + 1;
-        self.observer
-            .gauge(GaugeMetric::FlowPendingFlushGlobal, cur as i64);
-    }
-
-    pub(crate) fn on_flush_done(&self) {
-        let old = self.pending_flush.fetch_sub(1, AcqRel);
-        debug_assert!(old > 0);
-        self.observer
-            .gauge(GaugeMetric::FlowPendingFlushGlobal, (old - 1) as i64);
-    }
-
-    pub(crate) fn gate_enter(&self) {
-        let cur = self.gate_buckets.fetch_add(1, AcqRel) + 1;
-        self.observer
-            .gauge(GaugeMetric::FlowGateBucketCount, cur as i64);
-    }
-
-    pub(crate) fn gate_exit(&self) {
-        let old = self.gate_buckets.fetch_sub(1, AcqRel);
-        debug_assert!(old > 0);
-        self.observer
-            .gauge(GaugeMetric::FlowGateBucketCount, (old - 1) as i64);
-    }
+#[derive(Default)]
+struct RetireBatch {
+    data: Vec<u64>,
+    blob: Vec<u64>,
 }
 
 pub(crate) struct Pool {
     flush: Flush,
+    flow: Arc<FlowController>,
     map: Arc<Iim>,
+    pending_retire: Arc<DashMap<u64, RetireBatch>>,
     free: Arc<Queue<Handle<Arena>>>,
     wait: Arc<DashMap<u64, Handle<Arena>>>,
     cur: AtomicPtr<Arena>,
     pub(crate) ctx: Handle<Context>,
     state: MutRef<BucketState>,
-    flow: Arc<FlowGlobal>,
-    arena_cap: usize,
     arena_groups: u8,
-    init_arena: u32,
-    burst_max: u32,
-    burst_in_use: Arc<AtomicU64>,
+    max_live_arenas: u64,
+    live_arenas: Arc<AtomicU64>,
     max_log_size: usize,
     pub(crate) bucket_id: u64,
     flush_in: AtomicU64,
     flush_out: Arc<AtomicU64>,
-    free_wait: Arc<Countblock>,
     flush_wait: Arc<Countblock>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AllocClass {
+enum FlushReason {
     Normal,
-    Structural,
+    Teardown,
 }
 
 impl Pool {
     const WAIT_WARN_SECS: u64 = 5;
+    const SPILL_WAIT_MICROS: u64 = 200;
+    const SPILL_FAILFAST_WAIT_MICROS: u64 = 20_000;
 
     pub(crate) fn new(
         opt: Arc<ParsedOptions>,
         ctx: Handle<Context>,
         state: MutRef<BucketState>,
-        flow: Arc<FlowGlobal>,
+        flow: Arc<FlowController>,
         flush: Flush,
         bucket_id: u64,
         next_addr: u64,
     ) -> Self {
         let groups = ctx.groups().len() as u8;
-        let init_arena = opt.default_arenas;
+        let init_arena = opt.default_arenas as u64;
         let id = Self::get_id(&ctx.numerics);
         let q = Queue::new(init_arena as usize);
         for _ in 0..init_arena {
@@ -325,27 +204,25 @@ impl Pool {
 
         let h = q.pop().unwrap();
         let max_log_size = opt.max_log_size * opt.concurrent_write as usize;
-        let burst_max = (init_arena / 2).max(1);
+        let max_live_arenas = init_arena.saturating_add(opt.arena_spill_limit as u64);
 
         let this = Self {
             flush,
+            flow,
             map: Arc::new(Iim::new(next_addr, id, init_arena as usize)),
+            pending_retire: Arc::new(DashMap::new()),
             free: Arc::new(q),
             wait: Arc::new(DashMap::new()),
             cur: AtomicPtr::new(h.inner()),
             ctx,
             state,
-            flow,
-            arena_cap: opt.data_file_size,
             arena_groups: groups,
-            init_arena,
-            burst_max,
-            burst_in_use: Arc::new(AtomicU64::new(0)),
+            max_live_arenas,
+            live_arenas: Arc::new(AtomicU64::new(init_arena)),
             max_log_size,
             bucket_id,
             flush_in: AtomicU64::new(0),
             flush_out: Arc::new(AtomicU64::new(0)),
-            free_wait: Arc::new(Countblock::new(0)),
             flush_wait: Arc::new(Countblock::new(0)),
         };
 
@@ -359,6 +236,19 @@ impl Pool {
 
     pub(crate) fn current(&self) -> Handle<Arena> {
         self.cur.load(Relaxed).into()
+    }
+
+    pub(crate) fn arena_id_of(&self, addr: u64) -> Option<u64> {
+        self.map.find(addr)
+    }
+
+    pub(crate) fn stage_retire(&self, arena_id: u64, data: &[u64], blob: &[u64]) {
+        if data.is_empty() && blob.is_empty() {
+            return;
+        }
+        let mut batch = self.pending_retire.entry(arena_id).or_default();
+        batch.data.extend_from_slice(data);
+        batch.blob.extend_from_slice(blob);
     }
 
     pub(crate) fn load(&self, addr: u64) -> Option<BoxRef> {
@@ -376,54 +266,10 @@ impl Pool {
         None
     }
 
-    fn try_acquire_burst(&self) -> bool {
-        if self.burst_max == 0 {
-            return false;
-        }
-        let mut cur = self.burst_in_use.load(Acquire);
-        loop {
-            if cur >= self.burst_max as u64 {
-                return false;
-            }
-            match self
-                .burst_in_use
-                .compare_exchange_weak(cur, cur + 1, AcqRel, Acquire)
-            {
-                Ok(_) => {
-                    if self.flow.try_acquire_burst() {
-                        return true;
-                    }
-                    let old = self.burst_in_use.fetch_sub(1, AcqRel);
-                    debug_assert!(old > 0);
-                    return false;
-                }
-                Err(x) => cur = x,
-            }
-        }
-    }
-
-    fn flush_slot_cap(&self) -> u64 {
-        self.init_arena as u64 + self.flow.burst_budget_for_bucket(self.burst_max)
-    }
-
     fn pending_flush(&self) -> u64 {
         self.flush_in
             .load(Acquire)
             .saturating_sub(self.flush_out.load(Acquire))
-    }
-
-    fn wait_free_signal(&self) {
-        let ok = self
-            .free_wait
-            .wait_timeout(Duration::from_secs(Self::WAIT_WARN_SECS));
-        if !ok {
-            log::warn!(
-                "bucket {} alloc wait timeout, pending_flush {}, burst_in_use {}",
-                self.bucket_id,
-                self.pending_flush(),
-                self.burst_in_use.load(Acquire),
-            );
-        }
     }
 
     fn wait_flush_signal(&self) {
@@ -440,62 +286,14 @@ impl Pool {
     }
 
     fn wait_alloc_drain(&self, arena: Handle<Arena>) {
-        let mut sched = Backoff::new();
+        let mut sched = Backoff::new(0);
         while arena.alloc_inflight() != 0 {
             sched.shape();
         }
     }
 
-    fn maybe_shape(&self, pending: u64, sched: &mut Backoff) {
-        let shape_floor = (self.init_arena / 2) as u64;
-        let gate_ceil = self.flush_slot_cap().max(1);
-        if pending >= shape_floor && pending < gate_ceil {
-            sched.shape();
-        } else {
-            sched.reset();
-        }
-    }
-
-    fn enter_gate(&self, in_gate: &mut bool, pending: u64) {
-        if *in_gate {
-            return;
-        }
-        *in_gate = true;
-        self.ctx
-            .opt
-            .observer
-            .counter(CounterMetric::FlowGateEnterCount, 1);
-        self.ctx.opt.observer.event(ObserveEvent {
-            kind: EventKind::FlowGateEnter,
-            bucket_id: self.bucket_id,
-            txid: 0,
-            file_id: 0,
-            value: pending,
-        });
-        self.flow.gate_enter();
-    }
-
-    fn exit_gate(&self, in_gate: &mut bool, pending: u64) {
-        if !*in_gate {
-            return;
-        }
-        *in_gate = false;
-        self.ctx
-            .opt
-            .observer
-            .counter(CounterMetric::FlowGateExitCount, 1);
-        self.ctx.opt.observer.event(ObserveEvent {
-            kind: EventKind::FlowGateExit,
-            bucket_id: self.bucket_id,
-            txid: 0,
-            file_id: 0,
-            value: pending,
-        });
-        self.flow.gate_exit();
-    }
-
     fn wait_install_handoff(&self, observed: Handle<Arena>) {
-        let mut sched = Backoff::new();
+        let mut sched = Backoff::new(0);
         loop {
             let cur = self.current();
             if cur.inner() != observed.inner() {
@@ -508,8 +306,8 @@ impl Pool {
         }
     }
 
-    fn handle_log_limit(&self, observed: Handle<Arena>, cur_log: usize, class: AllocClass) {
-        if self.install_new(class) {
+    fn handle_log_limit(&self, observed: Handle<Arena>, cur_log: usize) -> Result<(), OpCode> {
+        if self.install_new()? {
             let _ = self
                 .ctx
                 .numerics
@@ -518,141 +316,182 @@ impl Pool {
         } else {
             self.wait_install_handoff(observed);
         }
+        Ok(())
     }
 
-    fn handle_no_space(&self, observed: Handle<Arena>, class: AllocClass) {
-        if !self.install_new(class) {
+    fn handle_no_space(&self, observed: Handle<Arena>) -> Result<(), OpCode> {
+        if !self.install_new()? {
             self.wait_install_handoff(observed);
         }
+        Ok(())
     }
 
-    fn try_take_next_arena(
-        &self,
-        in_gate: &mut bool,
-        pending: u64,
-        class: AllocClass,
-    ) -> Option<Handle<Arena>> {
-        if let Some(p) = self.free.pop() {
-            self.exit_gate(in_gate, pending);
-            return Some(p);
-        }
-        if self.try_acquire_burst() {
+    fn observe_starving_wait(&self, started: Option<Instant>) {
+        if let Some(started) = started {
+            let waited = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
             self.ctx
                 .opt
                 .observer
-                .counter(CounterMetric::FlowAllocBurstGrant, 1);
-            self.exit_gate(in_gate, pending);
-            let p = Handle::new(Arena::new(self.arena_cap, self.arena_groups));
-            p.set_origin(Arena::ORIGIN_BURST);
-            return Some(p);
+                .histogram(HistogramMetric::FlowArenaStarvingWaitMicros, waited);
         }
-        self.ctx
-            .opt
-            .observer
-            .counter(CounterMetric::FlowAllocBurstDeny, 1);
-        if class == AllocClass::Structural {
-            self.ctx
-                .opt
-                .observer
-                .counter(CounterMetric::FlowAllocStructGrant, 1);
-            self.exit_gate(in_gate, pending);
-            let p = Handle::new(Arena::new(self.arena_cap, self.arena_groups));
-            p.set_origin(Arena::ORIGIN_STRUCT);
-            return Some(p);
-        }
-        if class == AllocClass::Structural {
-            self.ctx
-                .opt
-                .observer
-                .counter(CounterMetric::FlowAllocStructDeny, 1);
-        }
-        None
     }
 
-    fn acquire_next_arena(&self, class: AllocClass) -> Handle<Arena> {
-        let mut in_gate = false;
-        let mut sched = Backoff::new();
+    fn try_create_spill(&self) -> Option<Handle<Arena>> {
+        let mut cur = self.live_arenas.load(Acquire);
         loop {
-            let pending = self.pending_flush();
-            if let Some(p) = self.try_take_next_arena(&mut in_gate, pending, class) {
-                sched.reset();
-                return p;
+            if cur >= self.max_live_arenas {
+                return None;
             }
-            self.enter_gate(&mut in_gate, pending);
-            self.maybe_shape(pending, &mut sched);
-            self.wait_free_signal();
+            match self
+                .live_arenas
+                .compare_exchange_weak(cur, cur + 1, AcqRel, Acquire)
+            {
+                Ok(_) => {
+                    self.ctx
+                        .opt
+                        .observer
+                        .counter(CounterMetric::FlowArenaSpillCreate, 1);
+                    return Some(Handle::new(Arena::new(
+                        self.ctx.opt.data_file_size,
+                        self.arena_groups,
+                    )));
+                }
+                Err(next) => cur = next,
+            }
         }
     }
 
-    // NOTE: currently, Structural alloc has no restriction
-    fn install_new(&self, class: AllocClass) -> bool {
+    fn acquire_next_arena(&self) -> Result<Handle<Arena>, OpCode> {
+        let mut sched = Backoff::new(20);
+        let mut starving_marked = false;
+        let mut starving_since = None;
+        let mut cap_hit_reported = false;
+        loop {
+            if let Some(p) = self.free.pop() {
+                if starving_marked {
+                    self.flow.leave_arena_starving();
+                    self.observe_starving_wait(starving_since.take());
+                }
+                return Ok(p);
+            }
+            if !starving_marked {
+                self.flow.enter_arena_starving();
+                starving_marked = true;
+                starving_since = Some(Instant::now());
+            }
+
+            if let Some(started) = starving_since
+                && started.elapsed().as_micros() >= Self::SPILL_WAIT_MICROS as u128
+            {
+                if let Some(h) = self.try_create_spill() {
+                    self.flow.leave_arena_starving();
+                    self.observe_starving_wait(starving_since.take());
+                    return Ok(h);
+                }
+                if !cap_hit_reported {
+                    self.ctx
+                        .opt
+                        .observer
+                        .counter(CounterMetric::FlowArenaSpillCapHit, 1);
+                    cap_hit_reported = true;
+                }
+                if started.elapsed().as_micros() >= Self::SPILL_FAILFAST_WAIT_MICROS as u128 {
+                    self.flow.leave_arena_starving();
+                    self.observe_starving_wait(starving_since.take());
+                    return Err(OpCode::Again);
+                }
+            }
+            sched.shape();
+        }
+    }
+
+    fn release_or_reclaim_spill(&self, h: Handle<Arena>) {
+        if self.free.push(h).is_err() {
+            h.reclaim();
+            let old = self.live_arenas.fetch_sub(1, AcqRel);
+            debug_assert!(old > 0);
+            self.ctx
+                .opt
+                .observer
+                .counter(CounterMetric::FlowArenaSpillReclaim, 1);
+        }
+    }
+
+    fn install_new(&self) -> Result<bool, OpCode> {
+        // acquire the next arena before warming current one, so allocation can fail-fast safely
+        let next = self.acquire_next_arena()?;
         let cur = self.current();
         if !cur.mark_warm() {
-            return false;
+            self.release_or_reclaim_spill(next);
+            return Ok(false);
         }
         self.wait_alloc_drain(cur);
-        let p = self.acquire_next_arena(class);
 
         let id = Self::get_id(&self.ctx.numerics);
         self.wait.insert(cur.id(), cur);
-        self.flush(cur);
+        self.flush(cur, FlushReason::Normal);
 
         let next_addr = self.state.next_addr.load(Relaxed);
         self.map.push(next_addr, id);
 
-        let was_burst = p.is_burst();
-        let was_struct = p.is_struct();
-        p.reset(id);
-        if was_burst {
-            p.set_origin(Arena::ORIGIN_BURST);
-        } else if was_struct {
-            p.set_origin(Arena::ORIGIN_STRUCT);
-        }
+        next.reset(id);
 
         self.cur
-            .compare_exchange(cur.inner(), p.inner(), Relaxed, Relaxed)
+            .compare_exchange(cur.inner(), next.inner(), Relaxed, Relaxed)
             .expect("never happen");
-        true
+        Ok(true)
     }
 
-    fn flush(&self, h: Handle<Arena>) {
+    fn flush(&self, h: Handle<Arena>, reason: FlushReason) {
         let wait = self.wait.clone();
         let free = self.free.clone();
         let map = self.map.clone();
         let out = self.flush_out.clone();
-        let free_wait = self.free_wait.clone();
         let flush_wait = self.flush_wait.clone();
-        let burst_in_use = self.burst_in_use.clone();
-        let flow_release = self.flow.clone();
-        let flow_done = self.flow.clone();
+        let flow = self.flow.clone();
+        let live_arenas = self.live_arenas.clone();
+        let observer = self.ctx.opt.observer.clone();
+        let flow_task = self.flow.on_enqueue_est(h.real_size.load(Relaxed));
+        let flow_task_done = flow_task.clone();
+        let pending_retire = self.pending_retire.clone();
+        if reason == FlushReason::Teardown {
+            flow_task.mark_force_bypass();
+        }
 
         let release = move || {
             map.pop();
             wait.remove(&h.id());
 
-            if h.is_struct() {
+            h.clear();
+            h.set_state(Arena::COLD, Arena::FLUSH);
+            if free.push(h).is_err() {
                 h.reclaim();
-            } else if h.is_burst() {
-                let old = burst_in_use.fetch_sub(1, AcqRel);
+                let old = live_arenas.fetch_sub(1, AcqRel);
                 debug_assert!(old > 0);
-                flow_release.release_burst();
-                h.reclaim();
-            } else {
-                h.clear();
-                h.set_state(Arena::COLD, Arena::FLUSH);
-                free.push(h).expect("can't fail");
+                observer.counter(CounterMetric::FlowArenaSpillReclaim, 1);
             }
-            free_wait.post();
         };
         let done = move || {
             out.fetch_add(1, Relaxed);
-            flow_done.on_flush_done();
+            flow.on_mark_done(flow_task_done.as_ref());
             flush_wait.post();
         };
 
-        let data = FlushData::new(h, self.bucket_id, Box::new(release), Box::new(done));
+        let data = FlushData::new(
+            h,
+            self.bucket_id,
+            Box::new(move |arena_id| {
+                pending_retire
+                    .remove(&arena_id)
+                    .map(|(_, batch)| (batch.data, batch.blob))
+                    .unwrap_or_default()
+            }),
+            Box::new(release),
+            Box::new(done),
+            flow_task,
+            self.flow.clone(),
+        );
         self.flush_in.fetch_add(1, AcqRel);
-        self.flow.on_flush_enqueue();
         self.flush
             .tx
             .send(data)
@@ -669,7 +508,7 @@ impl Pool {
                 debug_assert_eq!(old, Arena::HOT);
             }
             self.wait_alloc_drain(h);
-            self.flush(h);
+            self.flush(h, FlushReason::Teardown);
         }
     }
 
@@ -679,12 +518,16 @@ impl Pool {
         }
     }
 
-    fn alloc_inner(&self, size: u32, class: AllocClass) -> Result<(Handle<Arena>, BoxRef), OpCode> {
+    pub(crate) fn before_foreground_write(&self, bytes: u64) {
+        self.flow.before_foreground_write(bytes);
+    }
+
+    pub(crate) fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
         loop {
             let a = self.current();
             let cur = self.ctx.numerics.log_size.load(Relaxed);
             if cur >= self.max_log_size {
-                self.handle_log_limit(a, cur, class);
+                self.handle_log_limit(a, cur)?;
                 continue;
             }
             if !a.try_enter_hot_alloc() {
@@ -700,18 +543,12 @@ impl Pool {
                     self.wait_install_handoff(a);
                     continue;
                 }
-                Err(OpCode::NoSpace) => self.handle_no_space(a, class),
+                Err(OpCode::NoSpace) => {
+                    self.handle_no_space(a)?;
+                }
                 _ => unreachable!(),
             }
         }
-    }
-
-    pub(crate) fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
-        self.alloc_inner(size, AllocClass::Normal)
-    }
-
-    pub(crate) fn alloc_struct(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
-        self.alloc_inner(size, AllocClass::Structural)
     }
 
     pub(crate) fn alloc_pair(
@@ -724,7 +561,7 @@ impl Pool {
             let a = self.current();
             let cur = self.ctx.numerics.log_size.load(Relaxed);
             if cur >= self.max_log_size {
-                self.handle_log_limit(a, cur, AllocClass::Normal);
+                self.handle_log_limit(a, cur)?;
                 continue;
             }
             if !a.try_enter_hot_alloc() {
@@ -746,7 +583,7 @@ impl Pool {
                     continue;
                 }
                 Err(OpCode::NoSpace) => {
-                    self.handle_no_space(a, AllocClass::Normal);
+                    self.handle_no_space(a)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -812,7 +649,7 @@ impl BucketContext {
     pub(crate) fn new(
         ctx: Handle<Context>,
         state: MutRef<BucketState>,
-        flow: Arc<FlowGlobal>,
+        flow: Arc<FlowController>,
         bucket_id: u64,
         next_addr: u64,
         table: MutRef<PageMap>,
@@ -853,8 +690,8 @@ impl BucketContext {
         self.pool.alloc(size)
     }
 
-    pub(crate) fn alloc_struct(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
-        self.pool.alloc_struct(size)
+    pub(crate) fn before_foreground_write(&self, bytes: u64) {
+        self.pool.before_foreground_write(bytes);
     }
 
     pub(crate) fn alloc_pair(
@@ -863,6 +700,14 @@ impl BucketContext {
         size2: u32,
     ) -> Result<((Handle<Arena>, BoxRef), (Handle<Arena>, BoxRef)), OpCode> {
         self.pool.alloc_pair(size1, size2)
+    }
+
+    pub(crate) fn arena_id_of(&self, addr: u64) -> Option<u64> {
+        self.pool.arena_id_of(addr)
+    }
+
+    pub(crate) fn stage_retire(&self, arena_id: u64, data: &[u64], blob: &[u64]) {
+        self.pool.stage_retire(arena_id, data, blob);
     }
 
     pub(crate) fn record_lsn(&self, group_id: usize, pos: Position) {
@@ -977,8 +822,10 @@ impl BucketContext {
     }
 
     pub(crate) fn flush_and_wait(&self) {
+        self.pool.flow.enter_teardown_bypass();
         self.pool.flush_all();
         self.pool.wait_flush();
+        self.pool.flow.leave_teardown_bypass();
     }
 
     pub(crate) fn reclaim(&self) {
@@ -1006,7 +853,7 @@ pub(crate) struct BucketMgr {
     pub(crate) buckets: DashMap<u64, Arc<BucketContext>>,
     pub(crate) lru: Handle<ShardPriorityLru<BoxRef>>,
     pub(crate) used: Arc<AtomicIsize>,
-    pub(crate) flow: Arc<FlowGlobal>,
+    pub(crate) flow: Arc<FlowController>,
     pub(crate) flush: Option<Flush>,
     pub(crate) tx: Sender<SharedState>,
     pub(crate) rx: Receiver<()>,
@@ -1023,7 +870,7 @@ impl BucketMgr {
     ) -> Self {
         let reader = Arc::new(DummyDataReader);
         let used = Arc::new(AtomicIsize::new(0));
-        let flow = Arc::new(FlowGlobal::new(opt.as_ref(), used.clone()));
+        let flow = Arc::new(FlowController::new(opt.as_ref()));
         Self {
             buckets: DashMap::new(),
             lru: Handle::new(ShardPriorityLru::new(
@@ -1072,7 +919,6 @@ impl BucketMgr {
 
         // 4) release bucket contexts after flushers are gone to avoid races
         // reclaim is deferred to BucketContext::drop when the last Arc goes away
-        self.flow.on_bucket_unload_n(self.buckets.len());
         self.buckets.clear();
 
         // 5) release shared lru
@@ -1083,9 +929,7 @@ impl BucketMgr {
         if let Some(ctx) = self.buckets.get(&bucket_id).map(|x| x.value().clone()) {
             ctx.flush_and_wait();
         }
-        if self.buckets.remove(&bucket_id).is_some() {
-            self.flow.on_bucket_unload();
-        }
+        let _ = self.buckets.remove(&bucket_id);
     }
 
     pub(crate) fn active_contexts(&self) -> Vec<Arc<BucketContext>> {
@@ -1196,107 +1040,5 @@ impl ILoader for Loader {
         self.reader
             .load_blob_uncached(self.bucket_id, addr)
             .expect("must exist")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::FlowGlobal;
-    use crate::utils::observe::NoopObserver;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering::Acquire};
-
-    #[test]
-    fn flow_global_should_be_bounded_by_loaded_buckets() {
-        let flow = FlowGlobal {
-            burst_in_use: AtomicU64::new(0),
-            loaded_buckets: AtomicU64::new(0),
-            pending_flush: AtomicU64::new(0),
-            gate_buckets: AtomicU64::new(0),
-            burst_cap_cfg: 10,
-            burst_per_bucket: 2,
-            cache_used: Arc::new(AtomicIsize::new(0)),
-            cache_cap: 100,
-            observer: Arc::new(NoopObserver),
-        };
-
-        assert!(!flow.try_acquire_burst());
-
-        flow.on_bucket_load();
-        assert!(flow.try_acquire_burst());
-        assert!(flow.try_acquire_burst());
-        assert!(!flow.try_acquire_burst());
-
-        flow.on_bucket_load();
-        assert!(flow.try_acquire_burst());
-        assert!(flow.try_acquire_burst());
-        assert!(!flow.try_acquire_burst());
-    }
-
-    #[test]
-    fn flow_global_release_should_return_capacity() {
-        let flow = FlowGlobal {
-            burst_in_use: AtomicU64::new(0),
-            loaded_buckets: AtomicU64::new(2),
-            pending_flush: AtomicU64::new(0),
-            gate_buckets: AtomicU64::new(0),
-            burst_cap_cfg: 3,
-            burst_per_bucket: 8,
-            cache_used: Arc::new(AtomicIsize::new(0)),
-            cache_cap: 100,
-            observer: Arc::new(NoopObserver),
-        };
-
-        assert!(flow.try_acquire_burst());
-        assert!(flow.try_acquire_burst());
-        assert!(flow.try_acquire_burst());
-        assert!(!flow.try_acquire_burst());
-
-        flow.release_burst();
-        assert!(flow.try_acquire_burst());
-    }
-
-    #[test]
-    fn flow_global_should_disable_burst_under_high_cache_pressure() {
-        let cache_used = Arc::new(AtomicIsize::new(95));
-        let flow = FlowGlobal {
-            burst_in_use: AtomicU64::new(0),
-            loaded_buckets: AtomicU64::new(4),
-            pending_flush: AtomicU64::new(0),
-            gate_buckets: AtomicU64::new(0),
-            burst_cap_cfg: 32,
-            burst_per_bucket: 8,
-            cache_used: cache_used.clone(),
-            cache_cap: 100,
-            observer: Arc::new(NoopObserver),
-        };
-
-        assert!(!flow.try_acquire_burst());
-
-        cache_used.store(70, std::sync::atomic::Ordering::Relaxed);
-        assert!(flow.try_acquire_burst());
-    }
-
-    #[test]
-    fn flow_global_pending_flush_should_track_enqueue_and_done() {
-        let flow = FlowGlobal {
-            burst_in_use: AtomicU64::new(0),
-            loaded_buckets: AtomicU64::new(2),
-            pending_flush: AtomicU64::new(0),
-            gate_buckets: AtomicU64::new(0),
-            burst_cap_cfg: 32,
-            burst_per_bucket: 8,
-            cache_used: Arc::new(AtomicIsize::new(0)),
-            cache_cap: 100,
-            observer: Arc::new(NoopObserver),
-        };
-
-        for _ in 0..40 {
-            flow.on_flush_enqueue();
-        }
-        assert_eq!(flow.pending_flush.load(Acquire), 40);
-
-        flow.on_flush_done();
-        assert_eq!(flow.pending_flush.load(Acquire), 39);
     }
 }

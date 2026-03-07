@@ -1,7 +1,7 @@
 use btree_store::BTree;
 use parking_lot::{Mutex, RwLock};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     hash::Hasher,
     marker::PhantomData,
     ops::Deref,
@@ -50,6 +50,7 @@ pub(crate) const BUCKET_OBSOLETE_BLOB: &str = "obsolete_blob";
 pub(crate) const BUCKET_METAS: &str = "bucket_metas";
 pub(crate) const BUCKET_PENDING_DEL: &str = "pending_del";
 pub(crate) const BUCKET_PENDING_SIBLING: &str = "pending_sibling";
+pub(crate) const BUCKET_PENDING_RETIRE: &str = "pending_retire";
 pub(crate) const BUCKET_VERSION: &str = "version";
 pub(crate) const MAX_BUCKETS: u64 = 1024;
 pub(crate) const VERSION_KEY: &str = "current_version";
@@ -64,7 +65,7 @@ mod entry;
 pub use entry::{
     BlobStat, BlobStatInner, BucketMeta, DataStat, DataStatInner, DelInterval, Delete,
     IntervalPair, MemBlobStat, MemDataStat, MetaKind, Numerics, PageTable, PendingRangeKind,
-    PendingSibling,
+    PendingRetire, PendingSibling,
 };
 
 pub(crate) fn page_table_name(bucket_id: u64) -> String {
@@ -88,6 +89,14 @@ pub(crate) fn orphan_blob_marker_key(file_id: u64) -> Vec<u8> {
 }
 
 fn pending_sibling_key(bucket_id: u64, kind: PendingRangeKind, addr: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(size_of::<u64>() * 2 + size_of::<u8>());
+    key.extend_from_slice(&bucket_id.to_be_bytes());
+    key.push(kind as u8);
+    key.extend_from_slice(&addr.to_be_bytes());
+    key
+}
+
+fn pending_retire_key(bucket_id: u64, kind: PendingRangeKind, addr: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(size_of::<u64>() * 2 + size_of::<u8>());
     key.extend_from_slice(&bucket_id.to_be_bytes());
     key.push(kind as u8);
@@ -213,8 +222,11 @@ impl MetaRecord for DelInterval {
             blob_interval_name(self.bucket_id)
         };
         let bucket_ops = ops.entry(bucket).or_default();
+        let mut dedup = BTreeSet::new();
         for &lo in self.iter() {
-            bucket_ops.push(MetaOp::Del(lo.to_be_bytes().to_vec()));
+            if dedup.insert(lo) {
+                bucket_ops.push(MetaOp::Del(lo.to_be_bytes().to_vec()));
+            }
         }
     }
 }
@@ -374,6 +386,7 @@ impl Manifest {
             BUCKET_METAS,
             BUCKET_PENDING_DEL,
             BUCKET_PENDING_SIBLING,
+            BUCKET_PENDING_RETIRE,
             BUCKET_VERSION,
         ];
 
@@ -567,7 +580,6 @@ impl Manifest {
         }
 
         self.buckets.buckets.insert(bucket_id, ctx.clone());
-        self.buckets.flow.on_bucket_load();
         ctx
     }
 
@@ -634,9 +646,7 @@ impl Manifest {
         {
             ctx.flush_and_wait();
         }
-        if self.buckets.buckets.remove(&bucket_id).is_some() {
-            self.buckets.flow.on_bucket_unload();
-        }
+        let _ = self.buckets.buckets.remove(&bucket_id);
 
         self.bucket_states.remove(&bucket_id);
         Ok(())
@@ -776,17 +786,19 @@ impl Manifest {
 
     pub(crate) fn apply_data_junks(
         &self,
-        bucket_id: u64,
         tick: u64,
         junks: &[u64],
+        ctx: &Arc<BucketContext>,
     ) -> Vec<DataStat> {
-        let ctx = self.get_bucket_context_must_exist(bucket_id);
-        self.data_stat.apply_junks(tick, junks, &ctx, &self.btree)
+        self.data_stat.apply_junks(tick, junks, ctx, &self.btree)
     }
 
-    pub(crate) fn apply_blob_junks(&self, bucket_id: u64, junks: &[u64]) -> Vec<BlobStat> {
-        let ctx = self.get_bucket_context_must_exist(bucket_id);
-        self.blob_stat.apply_junks(junks, &ctx, &self.btree)
+    pub(crate) fn apply_blob_junks(
+        &self,
+        junks: &[u64],
+        ctx: &Arc<BucketContext>,
+    ) -> Vec<BlobStat> {
+        self.blob_stat.apply_junks(junks, ctx, &self.btree)
     }
 
     pub(crate) fn begin(&self) -> Txn<'_> {
@@ -834,6 +846,206 @@ impl Manifest {
             Ok(())
         });
         out
+    }
+
+    pub(crate) fn record_pending_retire(&self, txn: &mut Txn<'_>, pending: &PendingRetire) {
+        let mut buf = vec![0u8; pending.packed_size()];
+        pending.encode(&mut buf);
+        let key = pending_retire_key(pending.bucket_id, pending.kind, pending.addr);
+        txn.ops_mut()
+            .entry(BUCKET_PENDING_RETIRE.to_string())
+            .or_default()
+            .push(MetaOp::Put(key, buf));
+    }
+
+    pub(crate) fn clear_pending_retire(
+        &self,
+        txn: &mut Txn<'_>,
+        bucket_id: u64,
+        kind: PendingRangeKind,
+        addr: u64,
+    ) {
+        let key = pending_retire_key(bucket_id, kind, addr);
+        txn.ops_mut()
+            .entry(BUCKET_PENDING_RETIRE.to_string())
+            .or_default()
+            .push(MetaOp::Del(key));
+    }
+
+    pub(crate) fn load_pending_retires(&self) -> Vec<PendingRetire> {
+        let mut out = Vec::new();
+        let _ = self.btree.view(BUCKET_PENDING_RETIRE, |txn| {
+            let mut iter = txn.iter();
+            let mut k = Vec::new();
+            let mut v = Vec::new();
+            while iter.next_ref(&mut k, &mut v) {
+                out.push(PendingRetire::decode(&v));
+            }
+            Ok(())
+        });
+        out
+    }
+
+    pub(crate) fn recover_pending_retires_to_stats(&self) {
+        let pending = self.load_pending_retires();
+        if pending.is_empty() {
+            return;
+        }
+
+        let persisted_bucket_ids: HashSet<u64> = {
+            let mut out = HashSet::new();
+            let _ = self.btree.view(BUCKET_METAS, |txn| {
+                let mut iter = txn.iter();
+                let mut k = Vec::new();
+                let mut v = Vec::new();
+                while iter.next_ref(&mut k, &mut v) {
+                    out.insert(BucketMeta::decode(&v).bucket_id);
+                }
+                Ok(())
+            });
+            out
+        };
+        let pending_delete_bucket_ids: HashSet<u64> = {
+            let mut out = HashSet::new();
+            let _ = self.btree.view(BUCKET_PENDING_DEL, |txn| {
+                let mut iter = txn.iter();
+                let mut k = Vec::new();
+                let mut v = Vec::new();
+                while iter.next_ref(&mut k, &mut v) {
+                    if k.len() >= size_of::<u64>() {
+                        out.insert(<u64>::from_be_bytes(k[..8].try_into().unwrap()));
+                    }
+                }
+                Ok(())
+            });
+            out
+        };
+        let should_clear_not_found = |bucket_id: u64| {
+            pending_delete_bucket_ids.contains(&bucket_id)
+                || !persisted_bucket_ids.contains(&bucket_id)
+        };
+
+        let tick = self.numerics.next_data_id.load(Relaxed);
+        let mut data_by_bucket: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut blob_by_bucket: HashMap<u64, Vec<u64>> = HashMap::new();
+        for item in &pending {
+            match item.kind {
+                PendingRangeKind::Data => data_by_bucket
+                    .entry(item.bucket_id)
+                    .or_default()
+                    .push(item.addr),
+                PendingRangeKind::Blob => blob_by_bucket
+                    .entry(item.bucket_id)
+                    .or_default()
+                    .push(item.addr),
+            }
+        }
+
+        let mut stats_data: Vec<DataStat> = Vec::new();
+        let mut stats_blob: Vec<BlobStat> = Vec::new();
+        let mut clear_items: Vec<PendingRetire> = Vec::new();
+
+        for (bucket_id, mut addrs) in data_by_bucket {
+            addrs.sort_unstable();
+            addrs.dedup();
+            match self.load_bucket_context(bucket_id) {
+                Ok(ctx) => {
+                    let v = self.apply_data_junks(tick, &addrs, &ctx);
+                    stats_data.extend(v);
+                    for addr in addrs {
+                        clear_items.push(PendingRetire::new(
+                            bucket_id,
+                            PendingRangeKind::Data,
+                            addr,
+                        ));
+                    }
+                }
+                Err(OpCode::NotFound) => {
+                    if should_clear_not_found(bucket_id) {
+                        for addr in addrs {
+                            clear_items.push(PendingRetire::new(
+                                bucket_id,
+                                PendingRangeKind::Data,
+                                addr,
+                            ));
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+
+        for (bucket_id, mut addrs) in blob_by_bucket {
+            addrs.sort_unstable();
+            addrs.dedup();
+            match self.load_bucket_context(bucket_id) {
+                Ok(ctx) => {
+                    let v = self.apply_blob_junks(&addrs, &ctx);
+                    stats_blob.extend(v);
+                    for addr in addrs {
+                        clear_items.push(PendingRetire::new(
+                            bucket_id,
+                            PendingRangeKind::Blob,
+                            addr,
+                        ));
+                    }
+                }
+                Err(OpCode::NotFound) => {
+                    if should_clear_not_found(bucket_id) {
+                        for addr in addrs {
+                            clear_items.push(PendingRetire::new(
+                                bucket_id,
+                                PendingRangeKind::Blob,
+                                addr,
+                            ));
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+
+        if stats_data.is_empty() && stats_blob.is_empty() && clear_items.is_empty() {
+            return;
+        }
+
+        let mut txn = self.begin();
+        for stat in &stats_data {
+            txn.record(MetaKind::DataStat, stat);
+        }
+        for stat in &stats_blob {
+            txn.record(MetaKind::BlobStat, stat);
+        }
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_retire_after_apply_before_clear");
+        for item in &clear_items {
+            self.clear_pending_retire(&mut txn, item.bucket_id, item.kind, item.addr);
+        }
+        txn.commit();
+
+        if !stats_data.is_empty() {
+            self.opt.observer.counter(
+                CounterMetric::RetireDataApplied,
+                stats_data
+                    .iter()
+                    .map(|x| x.inactive_elems.len() as u64)
+                    .sum(),
+            );
+        }
+        if !stats_blob.is_empty() {
+            self.opt.observer.counter(
+                CounterMetric::RetireBlobApplied,
+                stats_blob
+                    .iter()
+                    .map(|x| x.inactive_elems.len() as u64)
+                    .sum(),
+            );
+        }
+        if !clear_items.is_empty() {
+            self.opt
+                .observer
+                .counter(CounterMetric::RetireCleared, clear_items.len() as u64);
+        }
     }
 
     pub(crate) fn recover_pending_siblings_to_stats(&self) {
@@ -1262,18 +1474,6 @@ impl StatCtx<DataKind, DashMap<u64, MemDataStat>> {
             active_size: AtomicU64::new(0),
             _kind: PhantomData,
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn total_active(&self) -> (u64, u64) {
-        let mut total = 0;
-        let mut active = 0;
-        self.iter().for_each(|x| {
-            let s = x.value();
-            total += s.total_size as u64;
-            active += s.active_size as u64;
-        });
-        (total, active)
     }
 
     pub(crate) fn update_size(&self, active_size: u64, total_size: u64) {

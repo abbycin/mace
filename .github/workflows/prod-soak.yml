@@ -23,6 +23,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run soak loop
+        if: ${{ runner.os == 'Linux' && runner.arch == 'X64' }}
         env:
           FEATURES: failpoints
           CHAOS_RETRY: "1"

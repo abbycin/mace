@@ -100,19 +100,16 @@ pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
 
 pub(crate) struct Backoff {
-    count: u32,
+    count: u16,
+    sleep_us: u16,
 }
 
 impl Backoff {
-    const SPIN_COUNT: u32 = 3;
-    const YIELD_COUNT: u32 = 5;
+    const SPIN_COUNT: u16 = 3;
+    const YIELD_COUNT: u16 = 5;
 
-    pub(crate) const fn new() -> Self {
-        Self { count: 0 }
-    }
-
-    pub(crate) fn reset(&mut self) {
-        self.count = 0;
+    pub(crate) const fn new(sleep_us: u16) -> Self {
+        Self { count: 0, sleep_us }
     }
 
     pub(crate) fn shape(&mut self) {
@@ -125,13 +122,13 @@ impl Backoff {
                 std::hint::spin_loop();
             }
             std::thread::yield_now();
+        } else if self.sleep_us != 0 {
+            std::thread::sleep(Duration::from_micros(self.sleep_us as u64));
         } else {
-            std::thread::sleep(Duration::from_micros(20));
+            std::thread::yield_now();
         }
 
-        if self.count <= Self::YIELD_COUNT {
-            self.count += 1;
-        }
+        self.count = self.count.saturating_add(1);
     }
 }
 

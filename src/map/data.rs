@@ -3,6 +3,7 @@ use crc32c::Crc32cHasher;
 use dashmap::DashMap;
 
 use crate::map::IFooter;
+use crate::map::flow::{FlowController, FlowOutcome, FlowTask};
 use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, PageTable};
 use crate::types::header::{TagFlag, TagKind};
 use crate::types::refbox::{BoxRef, RemoteView};
@@ -19,14 +20,19 @@ use std::hash::Hasher;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
+use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+use std::time::Duration;
 
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
     bucket_id: u64,
+    retire_take: Option<Box<dyn FnOnce(u64) -> (Vec<u64>, Vec<u64>) + Send>>,
     release_cb: Option<Box<dyn FnOnce()>>,
     done_cb: Option<Box<dyn FnOnce()>>,
+    flow_task: Arc<FlowTask>,
+    flow_ctrl: Arc<FlowController>,
 }
 
 unsafe impl Send for FlushData {}
@@ -35,14 +41,20 @@ impl FlushData {
     pub fn new(
         arena: Handle<Arena>,
         bucket_id: u64,
+        retire_take: Box<dyn FnOnce(u64) -> (Vec<u64>, Vec<u64>) + Send>,
         release_cb: Box<dyn FnOnce()>,
         done_cb: Box<dyn FnOnce()>,
+        flow_task: Arc<FlowTask>,
+        flow_ctrl: Arc<FlowController>,
     ) -> Self {
         Self {
             arena,
             bucket_id,
+            retire_take: Some(retire_take),
             release_cb: Some(release_cb),
             done_cb: Some(done_cb),
+            flow_task,
+            flow_ctrl,
         }
     }
 
@@ -52,6 +64,13 @@ impl FlushData {
 
     pub fn id(&self) -> u64 {
         self.arena.id()
+    }
+
+    pub fn take_retires(&mut self) -> (Vec<u64>, Vec<u64>) {
+        self.retire_take
+            .take()
+            .map(|f| f(self.id()))
+            .unwrap_or_default()
     }
 
     pub fn release(&mut self) {
@@ -65,6 +84,19 @@ impl FlushData {
         if let Some(cb) = self.done_cb.take() {
             cb();
         }
+    }
+
+    pub(crate) fn set_flow_outcome(&self, outcome: FlowOutcome) {
+        self.flow_task.mark_outcome(outcome);
+    }
+
+    pub(crate) fn mark_flow_io_built(&self, bytes: u64, elapsed: Duration) {
+        self.flow_ctrl
+            .on_io_built(self.flow_task.as_ref(), bytes, elapsed);
+    }
+
+    pub(crate) fn pace_before_flush(&self) {
+        self.flow_ctrl.before_flush(self.flow_task.as_ref());
     }
 }
 
@@ -86,7 +118,6 @@ pub(crate) struct Arena {
     refs: AtomicU32,
     cap: usize,
     // colder metadata and lookup state
-    origin: AtomicU8,
     id: Cell<u64>,
     pub(crate) items: DashMap<u64, BoxRef>,
     /// flush LSN
@@ -149,9 +180,6 @@ impl Arena {
     pub(crate) const COLD: u16 = 2;
     /// flushed to disk
     pub(crate) const FLUSH: u16 = 1;
-    pub(crate) const ORIGIN_BASE: u8 = 0;
-    pub(crate) const ORIGIN_BURST: u8 = 1;
-    pub(crate) const ORIGIN_STRUCT: u8 = 2;
 
     fn alloc_flsn(n: usize) -> Box<[CachePad<Flsn>]> {
         let mut v = Vec::with_capacity(n);
@@ -169,7 +197,6 @@ impl Arena {
             refs: AtomicU32::new(0),
             offset: AtomicU64::new(0),
             cap,
-            origin: AtomicU8::new(Self::ORIGIN_BASE),
             id: Cell::new(INIT_ID),
             items: DashMap::with_capacity(16 << 10),
             flsn: Self::alloc_flsn(groups as usize),
@@ -184,24 +211,11 @@ impl Arena {
         self.id.set(id);
         assert_eq!(self.state(), Self::FLUSH);
         self.set_state(Arena::FLUSH, Arena::HOT);
-        self.origin.store(Self::ORIGIN_BASE, Relaxed);
         self.alloc_inflight.store(0, Relaxed);
         self.offset.store(0, Relaxed);
         self.real_size.store(0, Relaxed);
         assert!(self.unref());
         self.clear();
-    }
-
-    pub(crate) fn set_origin(&self, origin: u8) {
-        self.origin.store(origin, Relaxed);
-    }
-
-    pub(crate) fn is_burst(&self) -> bool {
-        self.origin.load(Relaxed) == Self::ORIGIN_BURST
-    }
-
-    pub(crate) fn is_struct(&self) -> bool {
-        self.origin.load(Relaxed) == Self::ORIGIN_STRUCT
     }
 
     pub(crate) fn try_enter_hot_alloc(&self) -> bool {
@@ -473,9 +487,6 @@ pub(crate) struct FileBuilder {
     bucket_id: u64,
     data_active_size: usize,
     blob_active_size: usize,
-    /// never flush to file
-    pub(crate) data_junks: Vec<u64>,
-    pub(crate) blob_junks: Vec<u64>,
     data_interval: Interval,
     blob_interval: Interval,
     data: Vec<BoxRef>,
@@ -493,8 +504,6 @@ impl FileBuilder {
             bucket_id,
             data_active_size: 0,
             blob_active_size: 0,
-            data_junks: Vec::new(),
-            blob_junks: Vec::new(),
             data_interval: Interval::new(u64::MAX, 0),
             blob_interval: Interval::new(u64::MAX, 0),
             data: Vec::new(),
@@ -518,16 +527,6 @@ impl FileBuilder {
                     self.data.push(f);
                 }
             }
-            TagFlag::Junk => {
-                let tmp = f.data_slice::<u64>();
-                for &x in tmp {
-                    if RemoteView::is_tagged(x) {
-                        self.blob_junks.push(RemoteView::untagged(x));
-                    } else {
-                        self.data_junks.push(x);
-                    }
-                }
-            }
             TagFlag::TombStone | TagFlag::Unmap => {}
         }
     }
@@ -537,7 +536,7 @@ impl FileBuilder {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.data.is_empty() && self.data_junks.is_empty() && self.blobs.is_empty()
+        self.data.is_empty() && self.blobs.is_empty()
     }
 
     pub(crate) fn data_stat(&self, id: u64, tick: u64) -> MemDataStat {
@@ -584,7 +583,7 @@ impl FileBuilder {
         }
     }
 
-    pub(crate) fn build_data(&mut self, tick: u64, path: PathBuf) -> Interval {
+    pub(crate) fn build_data(&mut self, tick: u64, path: PathBuf) -> Option<Interval> {
         let mut pos: usize = 0;
         let mut w = GatherWriter::trunc(&path, 64);
         let mut relocs = Vec::with_capacity(self.data.len() * AddrPair::LEN);
@@ -621,13 +620,18 @@ impl FileBuilder {
             pos += len;
         }
 
-        let mut interval_crc = Crc32cHasher::default();
-
-        let is = self.data_interval.as_slice();
-        interval_crc.write(is);
-        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
-        w.queue(is);
-        queued_iov += 1;
+        let mut interval_crc = 0u32;
+        let mut nr_intervals = 0u32;
+        if !self.data.is_empty() {
+            let mut h = Crc32cHasher::default();
+            let is = self.data_interval.as_slice();
+            h.write(is);
+            interval_crc = h.finish() as u32;
+            nr_intervals = 1;
+            Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
+            w.queue(is);
+            queued_iov += 1;
+        }
 
         let mut reloc_crc = Crc32cHasher::default();
         let rs = relocs.as_slice();
@@ -639,9 +643,9 @@ impl FileBuilder {
         let hdr = DataFooter {
             up2: tick,
             nr_reloc: self.data.len() as u32,
-            nr_intervals: 1,
+            nr_intervals,
             reloc_crc: reloc_crc.finish() as u32,
-            interval_crc: interval_crc.finish() as u32,
+            interval_crc,
         };
 
         Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
@@ -649,7 +653,11 @@ impl FileBuilder {
         w.flush();
         w.sync();
 
-        self.data_interval
+        if self.data.is_empty() {
+            None
+        } else {
+            Some(self.data_interval)
+        }
     }
 
     pub(crate) fn build_blob(&mut self, path: PathBuf) -> Interval {
