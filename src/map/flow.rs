@@ -73,11 +73,16 @@ pub(crate) struct FlowController {
     observer: Arc<dyn Observer>,
     backpressure_enabled: bool,
     flush_pacing_enabled: bool,
-    soft_debt_us: u64,
-    hard_debt_us: u64,
-    stop_debt_us: u64,
+    soft_debt_units: u64,
+    hard_debt_units: u64,
+    stop_debt_units: u64,
+    cold_start_fail_safe_units: u64,
+    pacing_soft_debt_units: u64,
+    flush_unit_bytes: u64,
     min_ratio_pct: u64,
     floor_bps: u64,
+    warmup_min_samples: u64,
+    publish_guard_min_ratio_pct: u64,
     idle_reset: Duration,
     max_delay_us: u64,
     debt_bytes: AtomicU64,
@@ -87,6 +92,7 @@ pub(crate) struct FlowController {
     /// end-to-end throughput (enqueue to completion, includes scheduling/queuing)
     /// we track both to distinguish device bottleneck (io_bps low) from scheduling bottleneck (e2e low)
     e2e_bps_ewma: AtomicU64,
+    io_sample_count: AtomicU64,
     adaptive_floor_bps: AtomicU64,
     teardown_bypass_scopes: AtomicU64,
     arena_starving_scopes: AtomicU64,
@@ -103,16 +109,22 @@ impl FlowController {
             observer: opt.observer.clone(),
             backpressure_enabled: opt.enable_backpressure,
             flush_pacing_enabled: opt.enable_flush_pacing,
-            soft_debt_us: opt.bp_soft_debt_ms.saturating_mul(1_000),
-            hard_debt_us: opt.bp_hard_debt_ms.saturating_mul(1_000),
-            stop_debt_us: opt.bp_stop_debt_ms.saturating_mul(1_000),
+            soft_debt_units: opt.bp_soft_debt_units as u64,
+            hard_debt_units: opt.bp_hard_debt_units as u64,
+            stop_debt_units: opt.bp_stop_debt_units as u64,
+            cold_start_fail_safe_units: opt.bp_cold_start_fail_safe_units as u64,
+            pacing_soft_debt_units: opt.bp_pacing_soft_debt_units as u64,
+            flush_unit_bytes: opt.bp_flush_unit_bytes.max(1),
             min_ratio_pct: opt.bp_min_ratio_pct as u64,
             floor_bps: opt.bp_floor_bps,
+            warmup_min_samples: opt.bp_warmup_min_samples as u64,
+            publish_guard_min_ratio_pct: opt.bp_publish_guard_min_ratio_pct as u64,
             idle_reset: Duration::from_millis(opt.bp_idle_reset_ms),
             max_delay_us: opt.bp_max_delay_us,
             debt_bytes: AtomicU64::new(0),
             io_bps_ewma: AtomicU64::new(0),
             e2e_bps_ewma: AtomicU64::new(0),
+            io_sample_count: AtomicU64::new(0),
             adaptive_floor_bps: AtomicU64::new(opt.bp_floor_bps),
             teardown_bypass_scopes: AtomicU64::new(0),
             arena_starving_scopes: AtomicU64::new(0),
@@ -141,13 +153,6 @@ impl FlowController {
             return;
         }
 
-        let io_micros = task.io_micros.load(Relaxed);
-        if io_micros != 0 {
-            let sample = ((settle as u128) * 1_000_000u128 / (io_micros as u128))
-                .min(u64::MAX as u128) as u64;
-            self.update_ewma(&self.io_bps_ewma, sample);
-        }
-
         let e2e_micros = task.enqueue_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
         if e2e_micros != 0 {
             let sample = ((settle as u128) * 1_000_000u128 / (e2e_micros as u128))
@@ -163,6 +168,13 @@ impl FlowController {
         } else if est > bytes {
             self.settle_debt(est - bytes);
         }
+        let io_micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        if bytes != 0 && io_micros != 0 {
+            let sample = ((bytes as u128) * 1_000_000u128 / (io_micros as u128))
+                .min(u64::MAX as u128) as u64;
+            self.update_ewma(&self.io_bps_ewma, sample);
+            self.io_sample_count.fetch_add(1, Relaxed);
+        }
         task.mark_io_built(bytes, elapsed);
     }
 
@@ -175,28 +187,49 @@ impl FlowController {
             return;
         }
 
-        let effective_bps = self.effective_bps();
-        let debt_us =
-            ((debt as u128) * 1_000_000u128 / (effective_bps as u128)).min(u64::MAX as u128) as u64;
-        if debt_us <= self.soft_debt_us {
+        let debt_units = self.debt_milli_units(debt);
+        let soft = self.soft_debt_milli_units();
+        let hard = self.hard_debt_milli_units();
+        let stop = self.stop_debt_milli_units();
+        let cold_fail_safe = self.cold_start_fail_safe_milli_units();
+        let cold_start = !self.cold_start_ready();
+
+        if cold_start && debt_units < cold_fail_safe {
+            return;
+        }
+        if !cold_start && debt_units <= soft {
             return;
         }
 
-        let delay_us = if debt_us >= self.stop_debt_us {
+        let base_units = if cold_start { cold_fail_safe } else { soft };
+        let base_bps = if cold_start {
+            self.effective_floor_bps()
+        } else {
+            self.disk_bps()
+        };
+        if base_bps == 0 {
+            return;
+        }
+
+        let delay_us = if debt_units >= stop {
             self.max_delay_us
         } else {
-            // ratio_pct scales down write speed proportionally to debt level:
-            // higher debt → lower ratio → slower writes
             let ratio_pct =
-                ((self.soft_debt_us as u128) * 100u128 / (debt_us as u128)).min(100u128) as u64;
+                ((base_units as u128) * 100u128 / (debt_units as u128)).min(100u128) as u64;
             let ratio_pct = ratio_pct.max(self.min_ratio_pct).min(100);
-            let target_bps = effective_bps
+            let mut target_bps = base_bps
                 .saturating_mul(ratio_pct)
                 .saturating_div(100)
-                .max(self.effective_floor_bps());
+                .max(1);
+            if !cold_start {
+                target_bps = target_bps
+                    .saturating_mul(self.publish_guard_ratio_pct())
+                    .saturating_div(100)
+                    .max(1);
+            }
             let mut delay = ((write_bytes as u128) * 1_000_000u128 / (target_bps as u128))
                 .min(u64::MAX as u128) as u64;
-            if debt_us >= self.hard_debt_us {
+            if debt_units >= hard {
                 delay = delay.saturating_mul(2);
             }
             delay.min(self.max_delay_us)
@@ -228,16 +261,21 @@ impl FlowController {
         if debt == 0 {
             return;
         }
-        let effective_bps = self.effective_bps();
-        let debt_us =
-            ((debt as u128) * 1_000_000u128 / (effective_bps as u128)).min(u64::MAX as u128) as u64;
-        if debt_us > self.soft_debt_us {
+        if !self.cold_start_ready() {
+            return;
+        }
+        let debt_units = self.debt_milli_units(debt);
+        if debt_units > self.pacing_soft_debt_milli_units() {
             self.observer
                 .counter(CounterMetric::FlowFlushPacingBypassHighDebt, 1);
             return;
         }
+        let disk_bps = self.disk_bps();
+        if disk_bps == 0 {
+            return;
+        }
         let bytes = task.est_bytes.max(1);
-        let interval_us = ((bytes as u128) * 1_000_000u128 / (effective_bps as u128))
+        let interval_us = ((bytes as u128) * 1_000_000u128 / (disk_bps as u128))
             .min(self.max_delay_us as u128)
             .max(1) as u64;
         let mut next = self
@@ -283,15 +321,55 @@ impl FlowController {
         self.dec_scope(&self.arena_starving_scopes);
     }
 
-    fn effective_bps(&self) -> u64 {
-        let floor = self.effective_floor_bps();
+    fn cold_start_ready(&self) -> bool {
+        self.io_sample_count.load(Relaxed) >= self.warmup_min_samples
+    }
+
+    fn debt_milli_units(&self, debt_bytes: u64) -> u64 {
+        if debt_bytes == 0 {
+            return 0;
+        }
+        (((debt_bytes as u128) * 1_000u128) / (self.flush_unit_bytes as u128))
+            .max(1)
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn soft_debt_milli_units(&self) -> u64 {
+        self.soft_debt_units.saturating_mul(1_000)
+    }
+
+    fn hard_debt_milli_units(&self) -> u64 {
+        self.hard_debt_units.saturating_mul(1_000)
+    }
+
+    fn stop_debt_milli_units(&self) -> u64 {
+        self.stop_debt_units.saturating_mul(1_000)
+    }
+
+    fn cold_start_fail_safe_milli_units(&self) -> u64 {
+        self.cold_start_fail_safe_units.saturating_mul(1_000)
+    }
+
+    fn pacing_soft_debt_milli_units(&self) -> u64 {
+        self.pacing_soft_debt_units.saturating_mul(1_000)
+    }
+
+    fn disk_bps(&self) -> u64 {
+        if !self.cold_start_ready() {
+            return 0;
+        }
+        self.io_bps_ewma.load(Relaxed).max(1)
+    }
+
+    fn publish_guard_ratio_pct(&self) -> u64 {
         let io = self.io_bps_ewma.load(Relaxed);
         let e2e = self.e2e_bps_ewma.load(Relaxed);
-        let mut effective = if e2e == 0 { io } else { io.min(e2e) };
-        if effective == 0 {
-            effective = floor;
+        if io == 0 || e2e == 0 || e2e >= io {
+            return 100;
         }
-        effective.max(floor)
+        (((e2e as u128) * 100u128) / (io as u128))
+            .min(100u128)
+            .max(self.publish_guard_min_ratio_pct as u128) as u64
     }
 
     fn update_ewma(&self, slot: &AtomicU64, sample: u64) {
@@ -350,6 +428,7 @@ impl FlowController {
     fn reset_idle_samples(&self) {
         self.io_bps_ewma.store(0, Relaxed);
         self.e2e_bps_ewma.store(0, Relaxed);
+        self.io_sample_count.store(0, Relaxed);
         self.adaptive_floor_bps.store(self.floor_bps, Relaxed);
     }
 
@@ -394,6 +473,8 @@ mod test {
             NEXT_ID.fetch_add(1, Relaxed)
         ));
         let mut opt = Options::new(root.clone());
+        opt.enable_backpressure = true;
+        opt.enable_flush_pacing = true;
         configure(&mut opt);
         let parsed = opt.validate().expect("options validate must succeed");
         let flow = FlowController::new(&parsed);
@@ -401,22 +482,55 @@ mod test {
         flow
     }
 
+    fn prime_io_sample(flow: &FlowController, bytes: u64, micros: u64) {
+        let t = flow.on_enqueue_est(bytes);
+        flow.on_io_built(t.as_ref(), bytes, Duration::from_micros(micros));
+        flow.on_mark_done(t.as_ref());
+    }
+
     #[test]
-    fn foreground_backpressure_sleeps_when_debt_exceeds_stop() {
+    fn foreground_backpressure_skips_cold_start_before_fail_safe_backlog() {
         let flow = make_flow(|opt| {
             opt.bp_floor_bps = 1_000_000;
-            opt.bp_soft_debt_ms = 1;
-            opt.bp_hard_debt_ms = 2;
-            opt.bp_stop_debt_ms = 3;
+            opt.bp_flush_unit_bytes = 1_000;
+            opt.bp_soft_debt_units = 2;
+            opt.bp_hard_debt_units = 6;
+            opt.bp_stop_debt_units = 12;
+            opt.bp_cold_start_fail_safe_units = 4;
             opt.bp_max_delay_us = 20_000;
         });
+
+        let _t = flow.on_enqueue_est(3_000);
+
+        let start = Instant::now();
+        flow.before_foreground_write(1);
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "cold start should collect io samples before throttling below fail-safe backlog"
+        );
+    }
+
+    #[test]
+    fn foreground_backpressure_sleeps_when_steady_state_debt_exceeds_stop() {
+        let flow = make_flow(|opt| {
+            opt.bp_floor_bps = 1_000_000;
+            opt.bp_flush_unit_bytes = 1_000;
+            opt.bp_soft_debt_units = 1;
+            opt.bp_hard_debt_units = 2;
+            opt.bp_stop_debt_units = 3;
+            opt.bp_warmup_min_samples = 1;
+            opt.bp_publish_guard_min_ratio_pct = 100;
+            opt.bp_max_delay_us = 20_000;
+        });
+
+        prime_io_sample(&flow, 1_000, 1_000);
         let _t = flow.on_enqueue_est(10_000);
 
         let start = Instant::now();
         flow.before_foreground_write(1);
         assert!(
             start.elapsed() >= Duration::from_micros(15_000),
-            "foreground backpressure should apply visible sleep under stop debt"
+            "steady-state backpressure should apply visible sleep under stop debt"
         );
     }
 
@@ -424,12 +538,16 @@ mod test {
     fn flush_pacing_sleeps_under_low_debt() {
         let flow = make_flow(|opt| {
             opt.bp_floor_bps = 1_000_000;
-            opt.bp_soft_debt_ms = 50;
-            opt.bp_hard_debt_ms = 100;
-            opt.bp_stop_debt_ms = 200;
+            opt.bp_flush_unit_bytes = 1_000_000;
+            opt.bp_soft_debt_units = 1;
+            opt.bp_pacing_soft_debt_units = 1;
+            opt.bp_hard_debt_units = 2;
+            opt.bp_stop_debt_units = 3;
+            opt.bp_warmup_min_samples = 1;
             opt.bp_max_delay_us = 50_000;
         });
 
+        prime_io_sample(&flow, 10_000, 10_000);
         let t1 = flow.on_enqueue_est(10_000);
         let t2 = flow.on_enqueue_est(10_000);
 
@@ -446,12 +564,16 @@ mod test {
     fn flush_pacing_bypasses_under_high_debt() {
         let flow = make_flow(|opt| {
             opt.bp_floor_bps = 1_000_000;
-            opt.bp_soft_debt_ms = 5;
-            opt.bp_hard_debt_ms = 10;
-            opt.bp_stop_debt_ms = 20;
+            opt.bp_flush_unit_bytes = 10_000;
+            opt.bp_soft_debt_units = 1;
+            opt.bp_pacing_soft_debt_units = 1;
+            opt.bp_hard_debt_units = 2;
+            opt.bp_stop_debt_units = 3;
+            opt.bp_warmup_min_samples = 1;
             opt.bp_max_delay_us = 50_000;
         });
 
+        prime_io_sample(&flow, 10_000, 10_000);
         let t = flow.on_enqueue_est(20_000);
         flow.before_flush(t.as_ref());
         let next = flow
@@ -469,12 +591,16 @@ mod test {
     fn flush_pacing_bypasses_on_teardown_flag() {
         let flow = make_flow(|opt| {
             opt.bp_floor_bps = 1_000_000;
-            opt.bp_soft_debt_ms = 100;
-            opt.bp_hard_debt_ms = 200;
-            opt.bp_stop_debt_ms = 400;
+            opt.bp_flush_unit_bytes = 1_000_000;
+            opt.bp_soft_debt_units = 10;
+            opt.bp_pacing_soft_debt_units = 1;
+            opt.bp_hard_debt_units = 20;
+            opt.bp_stop_debt_units = 40;
+            opt.bp_warmup_min_samples = 1;
             opt.bp_max_delay_us = 50_000;
         });
 
+        prime_io_sample(&flow, 10_000, 10_000);
         let t = flow.on_enqueue_est(10_000);
         t.mark_force_bypass();
         flow.before_flush(t.as_ref());
@@ -493,9 +619,10 @@ mod test {
     fn idle_reset_clears_stale_samples() {
         let flow = make_flow(|opt| {
             opt.bp_floor_bps = 1_000_000;
-            opt.bp_soft_debt_ms = 50;
-            opt.bp_hard_debt_ms = 100;
-            opt.bp_stop_debt_ms = 200;
+            opt.bp_flush_unit_bytes = 1_000_000;
+            opt.bp_soft_debt_units = 10;
+            opt.bp_hard_debt_units = 20;
+            opt.bp_stop_debt_units = 40;
             opt.bp_idle_reset_ms = 1;
         });
 
@@ -519,6 +646,11 @@ mod test {
             flow.e2e_bps_ewma.load(Relaxed),
             0,
             "idle reset should clear e2e ewma"
+        );
+        assert_eq!(
+            flow.io_sample_count.load(Relaxed),
+            0,
+            "idle reset should clear io sample count"
         );
         assert_eq!(
             flow.adaptive_floor_bps.load(Relaxed),
@@ -580,12 +712,16 @@ mod test {
     fn teardown_scope_bypasses_pacing_for_normal_tasks() {
         let flow = make_flow(|opt| {
             opt.bp_floor_bps = 1_000_000;
-            opt.bp_soft_debt_ms = 1_000_000;
-            opt.bp_hard_debt_ms = 1_200_000;
-            opt.bp_stop_debt_ms = 1_500_000;
+            opt.bp_flush_unit_bytes = 1_000_000;
+            opt.bp_soft_debt_units = 10;
+            opt.bp_pacing_soft_debt_units = 1;
+            opt.bp_hard_debt_units = 12;
+            opt.bp_stop_debt_units = 15;
+            opt.bp_warmup_min_samples = 1;
             opt.bp_max_delay_us = 50_000;
         });
 
+        prime_io_sample(&flow, 10_000, 10_000);
         let t = flow.on_enqueue_est(10_000);
         flow.enter_teardown_bypass();
         flow.before_flush(t.as_ref());
@@ -606,12 +742,16 @@ mod test {
     fn arena_starving_scope_is_reference_counted() {
         let flow = make_flow(|opt| {
             opt.bp_floor_bps = 1_000_000;
-            opt.bp_soft_debt_ms = 1_000_000;
-            opt.bp_hard_debt_ms = 1_200_000;
-            opt.bp_stop_debt_ms = 1_500_000;
+            opt.bp_flush_unit_bytes = 1_000_000;
+            opt.bp_soft_debt_units = 10;
+            opt.bp_pacing_soft_debt_units = 1;
+            opt.bp_hard_debt_units = 12;
+            opt.bp_stop_debt_units = 15;
+            opt.bp_warmup_min_samples = 1;
             opt.bp_max_delay_us = 50_000;
         });
 
+        prime_io_sample(&flow, 10_000, 10_000);
         let t = flow.on_enqueue_est(10_000);
         flow.enter_arena_starving();
         flow.enter_arena_starving();
@@ -638,6 +778,34 @@ mod test {
         assert!(
             next_after_clear.is_some(),
             "pacing should resume when starving scopes are all cleared"
+        );
+    }
+
+    #[test]
+    fn flush_pacing_uses_dedicated_threshold_instead_of_foreground_soft_limit() {
+        let flow = make_flow(|opt| {
+            opt.bp_floor_bps = 1_000_000;
+            opt.bp_flush_unit_bytes = 10_000;
+            opt.bp_soft_debt_units = 8;
+            opt.bp_pacing_soft_debt_units = 1;
+            opt.bp_hard_debt_units = 24;
+            opt.bp_stop_debt_units = 48;
+            opt.bp_warmup_min_samples = 1;
+            opt.bp_max_delay_us = 50_000;
+        });
+
+        prime_io_sample(&flow, 10_000, 10_000);
+        let t = flow.on_enqueue_est(20_000);
+        flow.before_flush(t.as_ref());
+
+        let next = flow
+            .next_flush_at
+            .lock()
+            .expect("flow pacing mutex poisoned")
+            .to_owned();
+        assert!(
+            next.is_none(),
+            "pacing should bypass once backlog exceeds pacing threshold even if foreground soft limit is larger"
         );
     }
 }

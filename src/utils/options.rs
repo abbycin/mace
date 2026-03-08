@@ -70,6 +70,7 @@ pub struct Options {
     /// NOTE:
     /// - too large a file size will cause the flushing to be slow
     /// - this option will be affected by [`Self::max_log_size`], a checkpoint will cause unfull data buffer to be flushed
+    /// - backpressure calibration should treat one data_file_size as the baseline flush unit
     pub data_file_size: usize,
     /// if wal log file size large than this value times [`Self::concurrent_write`], a checkpoint will be created
     ///
@@ -109,16 +110,40 @@ pub struct Options {
     pub enable_backpressure: bool,
     /// enable flush pacing in flusher thread
     pub enable_flush_pacing: bool,
-    /// debt threshold in milliseconds to start delaying foreground writes
-    pub bp_soft_debt_ms: u64,
-    /// debt threshold in milliseconds to increase delay aggressively
-    pub bp_hard_debt_ms: u64,
-    /// debt threshold in milliseconds to cap delay at max
-    pub bp_stop_debt_ms: u64,
-    /// minimum ratio (percent) of effective_bps when debt is high
+    /// soft backlog threshold in flush units to start delaying foreground writes
+    ///
+    /// calibrate it against the count of typical flush units rather than a time budget
+    pub bp_soft_debt_units: u32,
+    /// backlog threshold in flush units to increase delay aggressively
+    ///
+    /// calibrate it to allow multiple flush units of backlog before entering strong throttling
+    pub bp_hard_debt_units: u32,
+    /// backlog threshold in flush units to cap delay at max
+    ///
+    /// calibrate it to cap runaway backlog rather than to police a single flush unit
+    pub bp_stop_debt_units: u32,
+    /// fail-safe backlog threshold in flush units used before io samples are ready
+    ///
+    /// cold start should collect disk samples first and only throttle when backlog grows beyond this bound
+    pub bp_cold_start_fail_safe_units: u32,
+    /// maximum backlog in flush units where flush pacing is still allowed
+    ///
+    /// pacing should only smooth very low backlog and must bypass once the system enters catch-up mode
+    pub bp_pacing_soft_debt_units: u32,
+    /// baseline flush unit used to convert bytes into backlog units
+    ///
+    /// for arena-backed writes, use one `data_file_size` as the starting point
+    pub bp_flush_unit_bytes: u64,
+    /// minimum ratio (percent) of disk bps when debt is high
     pub bp_min_ratio_pct: u32,
-    /// minimum effective throughput in bytes/sec used for debt conversion
+    /// minimum fail-safe throughput in bytes/sec used before io samples are ready
+    ///
+    /// calibrate it to a conservative sustained flush throughput instead of peak device bandwidth
     pub bp_floor_bps: u64,
+    /// minimum count of real flush io samples required before steady-state backpressure activates
+    pub bp_warmup_min_samples: u32,
+    /// minimum ratio (percent) applied when publish path lags behind disk io
+    pub bp_publish_guard_min_ratio_pct: u32,
     /// if debt stays zero beyond this duration, decay historical bps
     pub bp_idle_reset_ms: u64,
     /// maximum sleep duration for a single backpressure decision
@@ -188,13 +213,18 @@ impl Options {
             split_elems: Self::MAX_SPLIT_ELEMS,
             truncate_corrupted_wal: true,
             observer: Arc::new(NoopObserver),
-            enable_backpressure: true,
-            enable_flush_pacing: true,
-            bp_soft_debt_ms: 1_000,
-            bp_hard_debt_ms: 4_000,
-            bp_stop_debt_ms: 8_000,
+            enable_backpressure: false,
+            enable_flush_pacing: false,
+            bp_soft_debt_units: 8,
+            bp_hard_debt_units: 24,
+            bp_stop_debt_units: 48,
+            bp_cold_start_fail_safe_units: 8,
+            bp_pacing_soft_debt_units: 2,
+            bp_flush_unit_bytes: Self::DATA_FILE_SIZE as u64,
             bp_min_ratio_pct: 5,
-            bp_floor_bps: 8 << 20, // 8MB/s
+            bp_floor_bps: 16 << 20, // 16MB/s
+            bp_warmup_min_samples: 4,
+            bp_publish_guard_min_ratio_pct: 50,
             bp_idle_reset_ms: 5_000,
             bp_max_delay_us: 10_000,
         }
@@ -236,17 +266,33 @@ impl Options {
             self.cache_capacity = Self::CACHE_CAP;
         }
         self.bp_min_ratio_pct = self.bp_min_ratio_pct.clamp(1, 100);
-        if self.bp_soft_debt_ms == 0 {
-            self.bp_soft_debt_ms = 1;
+        self.bp_publish_guard_min_ratio_pct = self.bp_publish_guard_min_ratio_pct.clamp(1, 100);
+        if self.bp_soft_debt_units == 0 {
+            self.bp_soft_debt_units = 1;
         }
-        if self.bp_hard_debt_ms <= self.bp_soft_debt_ms {
-            self.bp_hard_debt_ms = self.bp_soft_debt_ms + 1;
+        if self.bp_hard_debt_units <= self.bp_soft_debt_units {
+            self.bp_hard_debt_units = self.bp_soft_debt_units + 1;
         }
-        if self.bp_stop_debt_ms <= self.bp_hard_debt_ms {
-            self.bp_stop_debt_ms = self.bp_hard_debt_ms + 1;
+        if self.bp_stop_debt_units <= self.bp_hard_debt_units {
+            self.bp_stop_debt_units = self.bp_hard_debt_units + 1;
+        }
+        if self.bp_cold_start_fail_safe_units < self.bp_soft_debt_units {
+            self.bp_cold_start_fail_safe_units = self.bp_soft_debt_units;
+        }
+        if self.bp_pacing_soft_debt_units == 0 {
+            self.bp_pacing_soft_debt_units = 1;
+        }
+        if self.bp_pacing_soft_debt_units > self.bp_soft_debt_units {
+            self.bp_pacing_soft_debt_units = self.bp_soft_debt_units;
+        }
+        if self.bp_flush_unit_bytes == 0 {
+            self.bp_flush_unit_bytes = self.data_file_size as u64;
         }
         if self.bp_floor_bps == 0 {
             self.bp_floor_bps = 8 << 20;
+        }
+        if self.bp_warmup_min_samples == 0 {
+            self.bp_warmup_min_samples = 4;
         }
         if self.bp_idle_reset_ms == 0 {
             self.bp_idle_reset_ms = 5_000;

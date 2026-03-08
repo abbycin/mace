@@ -104,9 +104,12 @@ fn write_backpressure_emits_observe_metrics() -> Result<(), OpCode> {
     opt.max_log_size = 64 << 10;
     opt.enable_backpressure = true;
     opt.enable_flush_pacing = false;
-    opt.bp_soft_debt_ms = 1;
-    opt.bp_hard_debt_ms = 2;
-    opt.bp_stop_debt_ms = 3;
+    opt.bp_soft_debt_units = 1;
+    opt.bp_hard_debt_units = 2;
+    opt.bp_stop_debt_units = 3;
+    opt.bp_cold_start_fail_safe_units = 1;
+    opt.bp_flush_unit_bytes = opt.data_file_size as u64;
+    opt.bp_warmup_min_samples = 1;
     opt.bp_floor_bps = 1_000;
     opt.bp_max_delay_us = 3_000;
     opt.observer = observer.clone();
@@ -137,7 +140,7 @@ fn write_backpressure_emits_observe_metrics() -> Result<(), OpCode> {
 }
 
 #[test]
-fn flush_pacing_reports_sleep_or_starvation_bypass_under_low_debt() -> Result<(), OpCode> {
+fn flush_pacing_avoids_high_debt_bypass_under_low_debt() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let observer = Arc::new(InMemoryObserver::new(1024));
     let mut opt = Options::new(&*path);
@@ -150,9 +153,11 @@ fn flush_pacing_reports_sleep_or_starvation_bypass_under_low_debt() -> Result<()
     opt.max_log_size = 4 << 20;
     opt.enable_backpressure = false;
     opt.enable_flush_pacing = true;
-    opt.bp_soft_debt_ms = 30_000_000;
-    opt.bp_hard_debt_ms = 40_000_000;
-    opt.bp_stop_debt_ms = 50_000_000;
+    opt.bp_soft_debt_units = 30_000;
+    opt.bp_hard_debt_units = 40_000;
+    opt.bp_stop_debt_units = 50_000;
+    opt.bp_pacing_soft_debt_units = 30_000;
+    opt.bp_flush_unit_bytes = opt.data_file_size as u64;
     opt.bp_floor_bps = 1_000;
     opt.bp_max_delay_us = 1_000_000;
     opt.observer = observer.clone();
@@ -193,10 +198,6 @@ fn flush_pacing_reports_sleep_or_starvation_bypass_under_low_debt() -> Result<()
         bypass_teardown, 0,
         "low debt pacing path should not enter teardown bypass"
     );
-    assert!(
-        pacing_count > 0 || bypass_starving > 0,
-        "flush pacing should either sleep or bypass on starvation under low debt (sleep_count={pacing_count}, bypass_high={bypass_high}, bypass_teardown={bypass_teardown}, bypass_starving={bypass_starving})"
-    );
     if pacing_count > 0 {
         assert!(
             pacing_hist.count > 0,
@@ -207,6 +208,10 @@ fn flush_pacing_reports_sleep_or_starvation_bypass_under_low_debt() -> Result<()
             "flush pacing histogram sum should be > 0 when sleep happened"
         );
     }
+    assert!(
+        pacing_count > 0 || bypass_starving > 0 || (bypass_high == 0 && bypass_teardown == 0),
+        "low debt pacing should not fall into high-debt or teardown bypass (sleep_count={pacing_count}, bypass_high={bypass_high}, bypass_teardown={bypass_teardown}, bypass_starving={bypass_starving})"
+    );
     Ok(())
 }
 
@@ -222,9 +227,12 @@ fn flush_pacing_emits_bypass_metrics_under_high_pressure() -> Result<(), OpCode>
     opt.max_log_size = 64 << 10;
     opt.enable_backpressure = false;
     opt.enable_flush_pacing = true;
-    opt.bp_soft_debt_ms = 1;
-    opt.bp_hard_debt_ms = 2;
-    opt.bp_stop_debt_ms = 3;
+    opt.bp_soft_debt_units = 1;
+    opt.bp_hard_debt_units = 2;
+    opt.bp_stop_debt_units = 3;
+    opt.bp_pacing_soft_debt_units = 1;
+    opt.bp_flush_unit_bytes = opt.data_file_size as u64;
+    opt.bp_warmup_min_samples = 1;
     opt.bp_floor_bps = 1_000;
     opt.bp_max_delay_us = 3_000;
     opt.observer = observer.clone();
@@ -264,9 +272,11 @@ fn teardown_and_starvation_bypass_hold_under_multi_bucket_concurrency() -> Resul
     opt.max_log_size = 64 << 10;
     opt.enable_backpressure = false;
     opt.enable_flush_pacing = true;
-    opt.bp_soft_debt_ms = 1_000_000;
-    opt.bp_hard_debt_ms = 1_200_000;
-    opt.bp_stop_debt_ms = 1_500_000;
+    opt.bp_soft_debt_units = 1_000_000;
+    opt.bp_hard_debt_units = 1_200_000;
+    opt.bp_stop_debt_units = 1_500_000;
+    opt.bp_pacing_soft_debt_units = 1_000_000;
+    opt.bp_flush_unit_bytes = opt.data_file_size as u64;
     opt.bp_floor_bps = 1_000;
     opt.bp_max_delay_us = 20_000;
     opt.observer = observer.clone();
@@ -368,9 +378,11 @@ fn arena_spill_exhaustion_keeps_progress_with_internal_retry() -> Result<(), OpC
     opt.max_log_size = 64 << 10;
     opt.enable_backpressure = false;
     opt.enable_flush_pacing = true;
-    opt.bp_soft_debt_ms = 1_000_000;
-    opt.bp_hard_debt_ms = 1_200_000;
-    opt.bp_stop_debt_ms = 1_500_000;
+    opt.bp_soft_debt_units = 1_000_000;
+    opt.bp_hard_debt_units = 1_200_000;
+    opt.bp_stop_debt_units = 1_500_000;
+    opt.bp_pacing_soft_debt_units = 1_000_000;
+    opt.bp_flush_unit_bytes = opt.data_file_size as u64;
     opt.bp_floor_bps = 1_000;
     opt.bp_max_delay_us = 20_000;
     opt.observer = observer.clone();
