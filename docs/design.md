@@ -129,15 +129,22 @@ Failure semantics:
 ### Flow control and flush pacing
 
 MACE uses a shared `FlowController` for foreground backpressure and flusher pacing.
+The controller is always present, but the current `Options::new()` defaults keep both
+`enable_backpressure` and `enable_flush_pacing` disabled unless explicitly enabled.
 
 Core model:
 
 - debt accounting is ticket-based:
   - `on_enqueue_est`: `debt += est_bytes`
-  - `on_io_built`: reconcile by `debt += actual_bytes - est_bytes`
+  - `on_io_built`: reconcile by `debt += actual_bytes - est_bytes`, update `io_bps_ewma`, and count a real IO sample
   - `on_mark_done`: release `debt -= actual_or_est`
-- `on_mark_done` settles debt for `Flushed`/`Skip`/`Empty`/`MetaOnly`; throughput EWMA updates only for `Flushed`
-- effective throughput is derived from `min(io_bps_ewma, e2e_bps_ewma)` with floor protection
+- `on_mark_done` settles debt for `Flushed`/`Skip`/`Empty`/`MetaOnly`
+- `io_bps_ewma` is updated on real build/sync completion, while `e2e_bps_ewma` is updated only for `Flushed`
+- backlog thresholds are expressed in flush units (`bp_*_debt_units`) rather than debt milliseconds
+- steady-state foreground backpressure uses `io_bps_ewma` as the primary disk signal
+- `e2e_bps_ewma` is not the steady-state primary denominator; it is used as a publish guard to scale writes down when publish/WAL follow-up materially lags disk IO
+- cold start waits for `bp_warmup_min_samples` real IO samples before enabling steady-state disk-based control
+- before warmup completes, only the cold-start fail-safe backlog window may throttle foreground writes
 - long idle windows reset stale throughput samples (`bp_idle_reset_ms`)
 
 Foreground backpressure:
@@ -145,11 +152,15 @@ Foreground backpressure:
 - `before_write_budget` is executed **before** entering `tree.update`
 - no sleep is allowed inside the tree update closure (leaf lock critical section)
 - write paths use estimated bytes for pre-update throttling; exact WAL shape is still decided in closure logic
+- below the cold-start fail-safe backlog, foreground writes are allowed to proceed without sleep so the system can collect initial IO samples
+- in steady state, delay is derived from backlog units, `io_bps_ewma`, publish guard ratio, and is capped by `bp_max_delay_us`
 
 Flush pacing:
 
 - pacing is FIFO-preserving and runs only after `safe_to_flush`
+- pacing only runs after warmup has enough real IO samples
 - low debt: pacing may sleep to smooth flush cadence
+- pacing uses its own low-backlog threshold (`bp_pacing_soft_debt_units`) instead of sharing the foreground soft threshold
 - high debt: pacing bypasses to chase backlog
 - teardown and arena starvation use global reference-counted bypass scopes so all in-flight buckets observe bypass consistently
 
