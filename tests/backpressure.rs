@@ -231,7 +231,7 @@ fn flush_pacing_emits_bypass_metrics_under_high_pressure() -> Result<(), OpCode>
     opt.bp_hard_debt_units = 2;
     opt.bp_stop_debt_units = 3;
     opt.bp_pacing_soft_debt_units = 1;
-    opt.bp_flush_unit_bytes = opt.data_file_size as u64;
+    opt.bp_flush_unit_bytes = 1;
     opt.bp_warmup_min_samples = 1;
     opt.bp_floor_bps = 1_000;
     opt.bp_max_delay_us = 3_000;
