@@ -1,4 +1,6 @@
+use mace::observe::{CounterMetric, HistogramMetric, InMemoryObserver};
 use mace::{Mace, OpCode, Options, RandomPath};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -92,7 +94,6 @@ fn gc_blob() -> Result<(), OpCode> {
     opt.gc_timeout = 20;
     opt.inline_size = 1024;
     opt.max_log_size = 20480;
-    opt.over_provision = true;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x").unwrap();
     let cap = 10000;
@@ -209,7 +210,241 @@ fn gc_wal() {
     }
 
     let backup = db.options().wal_backup(0, 1);
-    assert!(backup.exists());
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        mace.start_gc();
+        if backup.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut files = Vec::new();
+    if let Ok(iter) = std::fs::read_dir(db.options().log_root()) {
+        for entry in iter.flatten() {
+            files.push(entry.file_name().to_string_lossy().to_string());
+        }
+        files.sort_unstable();
+    }
+    panic!(
+        "stable wal backup did not appear in time: backup={:?}, files={:?}, data_gc_count={}, blob_gc_count={}",
+        backup,
+        files,
+        mace.data_gc_count(),
+        mace.blob_gc_count()
+    );
+}
+
+#[test]
+fn gc_observer_metrics() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let observer = Arc::new(InMemoryObserver::new(256));
+    let mut opt = Options::new(&*path);
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = true;
+    opt.sync_on_write = false;
+    opt.data_garbage_ratio = 1;
+    opt.data_file_size = 128 << 10;
+    opt.gc_compacted_size = opt.data_file_size;
+    opt.observer = observer.clone();
+
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    for i in 0..4000 {
+        let k = format!("key_{i:08}");
+        let v = format!("value_{i:08}");
+        let tx = db.begin().unwrap();
+        tx.put(&k, &v)?;
+        tx.commit()?;
+    }
+
+    for i in 0..2000 {
+        let k = format!("key_{i:08}");
+        let tx = db.begin().unwrap();
+        tx.del(&k)?;
+        tx.commit()?;
+    }
+
+    mace.start_gc();
+
+    let snapshot = observer.snapshot();
+    let gc_runs = snapshot
+        .counters
+        .iter()
+        .find(|(m, _)| *m == CounterMetric::GcRun)
+        .map(|(_, v)| *v)
+        .unwrap_or(0);
+    assert!(gc_runs >= 1, "expected at least one gc run");
+
+    let scanned_pages = snapshot
+        .counters
+        .iter()
+        .find(|(m, _)| *m == CounterMetric::GcScavengePageScan)
+        .map(|(_, v)| *v)
+        .unwrap_or(0);
+    assert!(
+        scanned_pages > 0,
+        "expected gc scavenge scan counter to be positive"
+    );
+
+    let run_hist_count = snapshot
+        .histograms
+        .iter()
+        .find(|(m, _)| *m == HistogramMetric::GcRunMicros)
+        .map(|(_, s)| s.count)
+        .unwrap_or(0);
+    assert!(
+        run_hist_count >= 1,
+        "expected at least one gc runtime histogram sample"
+    );
+    Ok(())
+}
+
+fn counter(snapshot: &mace::observe::ObserveSnapshot, metric: CounterMetric) -> u64 {
+    snapshot
+        .counters
+        .iter()
+        .find(|(m, _)| *m == metric)
+        .map(|(_, v)| *v)
+        .unwrap_or(0)
+}
+
+#[test]
+fn retire_pending_metrics_progress() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let observer = Arc::new(InMemoryObserver::new(256));
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_eager = true;
+    opt.gc_timeout = 20;
+    opt.data_garbage_ratio = 1;
+    opt.data_file_size = 128 << 10;
+    opt.gc_compacted_size = opt.data_file_size;
+    opt.observer = observer.clone();
+
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    for i in 0..3000 {
+        let k = format!("k_{i:08}");
+        let v = format!("v_{i:08}");
+        let tx = db.begin().unwrap();
+        tx.put(&k, &v)?;
+        tx.commit()?;
+    }
+
+    for i in 0..3000 {
+        let k = format!("k_{i:08}");
+        let tx = db.begin().unwrap();
+        tx.update(&k, &k)?;
+        tx.commit()?;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        mace.start_gc();
+        let snapshot = observer.snapshot();
+        let recorded = counter(&snapshot, CounterMetric::RetireRecorded);
+        let applied = counter(&snapshot, CounterMetric::RetireDataApplied);
+        let cleared = counter(&snapshot, CounterMetric::RetireCleared);
+        if recorded > 0 && applied > 0 && cleared > 0 {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let snapshot = observer.snapshot();
+    panic!(
+        "retire metrics did not progress in time, recorded={}, applied={}, cleared={}",
+        counter(&snapshot, CounterMetric::RetireRecorded),
+        counter(&snapshot, CounterMetric::RetireDataApplied),
+        counter(&snapshot, CounterMetric::RetireCleared)
+    );
+}
+
+#[test]
+fn pending_retire_preserved_across_unload() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let observer = Arc::new(InMemoryObserver::new(256));
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_eager = false;
+    opt.gc_timeout = 60_000;
+    opt.data_garbage_ratio = 1;
+    opt.data_file_size = 64 << 10;
+    opt.gc_compacted_size = opt.data_file_size;
+    opt.observer = observer.clone();
+
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    for i in 0..2000 {
+        let k = format!("u_{i:08}");
+        let tx = db.begin().unwrap();
+        tx.put(&k, &k)?;
+        tx.commit()?;
+    }
+
+    for _ in 0..3 {
+        for i in 0..2000 {
+            let k = format!("u_{i:08}");
+            let tx = db.begin().unwrap();
+            tx.update(&k, &k)?;
+            tx.commit()?;
+        }
+    }
+
+    drop(db);
+    mace.drop_bucket("x")?;
+
+    let snap0 = observer.snapshot();
+    let recorded0 = counter(&snap0, CounterMetric::RetireRecorded);
+    assert!(
+        recorded0 > 0,
+        "expected retire to be recorded before unload"
+    );
+    let applied0 = counter(&snap0, CounterMetric::RetireDataApplied)
+        + counter(&snap0, CounterMetric::RetireBlobApplied);
+    let cleared0 = counter(&snap0, CounterMetric::RetireCleared);
+
+    mace.start_gc();
+
+    let snap1 = observer.snapshot();
+    let applied1 = counter(&snap1, CounterMetric::RetireDataApplied)
+        + counter(&snap1, CounterMetric::RetireBlobApplied);
+    let cleared1 = counter(&snap1, CounterMetric::RetireCleared);
+    assert_eq!(
+        applied1, applied0,
+        "unloaded bucket should not apply pending retire"
+    );
+    assert_eq!(
+        cleared1, cleared0,
+        "unloaded bucket should not clear pending retire"
+    );
+
+    let reopened = mace.get_bucket("x")?;
+    let view = reopened.view()?;
+    let _ = view.get("u_00000000");
+    drop(view);
+    drop(reopened);
+
+    mace.start_gc();
+    let snap2 = observer.snapshot();
+    let applied2 = counter(&snap2, CounterMetric::RetireDataApplied)
+        + counter(&snap2, CounterMetric::RetireBlobApplied);
+    let cleared2 = counter(&snap2, CounterMetric::RetireCleared);
+    assert!(
+        applied2 > applied1,
+        "reloaded bucket should replay pending retire"
+    );
+    assert!(
+        cleared2 > cleared1,
+        "reloaded bucket should clear replayed pending retire"
+    );
+    Ok(())
 }
 
 #[test]

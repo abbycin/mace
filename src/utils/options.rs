@@ -1,9 +1,11 @@
 use std::{
     ops::Deref,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::utils::lru::LRU_SHARD;
+use crate::utils::observe::{NoopObserver, Observer};
 
 use super::OpCode;
 
@@ -13,9 +15,13 @@ pub struct Options {
     /// force sync data to disk for every log write, the default value is `true`, turning it off may
     /// result in data loss, while turning it on may result in performance degradation
     pub sync_on_write: bool,
-    /// allows allocation of more arenas than a fixed value when arena exhaustion occurs, rather than
-    /// waiting for arenas to become available, the default value is false
-    pub over_provision: bool,
+    /// pre-allocated arena count per bucket
+    ///
+    /// this controls the size of the reusable arena queue for each bucket
+    /// must be >= 2 and power of two, default is 16
+    pub default_arenas: u32,
+    /// max extra arenas that can be created during starvation
+    pub arena_spill_limit: u32,
     /// default is hardware concurrency count, it must be power of 2
     ///
     /// **Once set, it cannot be modified**
@@ -64,6 +70,7 @@ pub struct Options {
     /// NOTE:
     /// - too large a file size will cause the flushing to be slow
     /// - this option will be affected by [`Self::max_log_size`], a checkpoint will cause unfull data buffer to be flushed
+    /// - backpressure calibration should treat one data_file_size as the baseline flush unit
     pub data_file_size: usize,
     /// if wal log file size large than this value times [`Self::concurrent_write`], a checkpoint will be created
     ///
@@ -97,6 +104,50 @@ pub struct Options {
     /// if true, corrupted WAL will be truncated during recovery, otherwise it will panic
     /// default is true
     pub truncate_corrupted_wal: bool,
+    /// observability callback, default is noop
+    pub observer: Arc<dyn Observer>,
+    /// enable foreground write backpressure
+    pub enable_backpressure: bool,
+    /// enable flush pacing in flusher thread
+    pub enable_flush_pacing: bool,
+    /// soft backlog threshold in flush units to start delaying foreground writes
+    ///
+    /// calibrate it against the count of typical flush units rather than a time budget
+    pub bp_soft_debt_units: u32,
+    /// backlog threshold in flush units to increase delay aggressively
+    ///
+    /// calibrate it to allow multiple flush units of backlog before entering strong throttling
+    pub bp_hard_debt_units: u32,
+    /// backlog threshold in flush units to cap delay at max
+    ///
+    /// calibrate it to cap runaway backlog rather than to police a single flush unit
+    pub bp_stop_debt_units: u32,
+    /// fail-safe backlog threshold in flush units used before io samples are ready
+    ///
+    /// cold start should collect disk samples first and only throttle when backlog grows beyond this bound
+    pub bp_cold_start_fail_safe_units: u32,
+    /// maximum backlog in flush units where flush pacing is still allowed
+    ///
+    /// pacing should only smooth very low backlog and must bypass once the system enters catch-up mode
+    pub bp_pacing_soft_debt_units: u32,
+    /// baseline flush unit used to convert bytes into backlog units
+    ///
+    /// for arena-backed writes, use one `data_file_size` as the starting point
+    pub bp_flush_unit_bytes: u64,
+    /// minimum ratio (percent) of disk bps when debt is high
+    pub bp_min_ratio_pct: u32,
+    /// minimum fail-safe throughput in bytes/sec used before io samples are ready
+    ///
+    /// calibrate it to a conservative sustained flush throughput instead of peak device bandwidth
+    pub bp_floor_bps: u64,
+    /// minimum count of real flush io samples required before steady-state backpressure activates
+    pub bp_warmup_min_samples: u32,
+    /// minimum ratio (percent) applied when publish path lags behind disk io
+    pub bp_publish_guard_min_ratio_pct: u32,
+    /// if debt stays zero beyond this duration, decay historical bps
+    pub bp_idle_reset_ms: u64,
+    /// maximum sleep duration for a single backpressure decision
+    pub bp_max_delay_us: u64,
 }
 
 impl Options {
@@ -110,10 +161,16 @@ impl Options {
     pub const FILE_CACHE: usize = 512;
     pub const WAL_BUF_SZ: usize = 8 << 20; // 8MB
     pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
-    pub const INLINE_SIZE: usize = 8192;
+    pub const MIN_INLINE_SIZE: usize = 8192;
+    pub const MAX_INLINE_SIZE: usize = 64 << 10;
     pub const MAX_SPLIT_ELEMS: u16 = 512;
     pub const MAX_LOG_SIZE: usize = 72 << 20;
     const MIN_SPLIT_ELEMS: u16 = 64;
+    const MIN_DEFAULT_ARENAS: u32 = 2;
+    const MAX_DEFAULT_ARENAS: u32 = 1024;
+    const MIN_ARENA_SPILL: u32 = 1;
+    const MAX_ARENA_SPILL: u32 = Self::MAX_DEFAULT_ARENAS;
+    pub(crate) const MAX_KEY_SIZE: usize = 64 << 10;
     pub(crate) const MAX_KV_SIZE: usize = 1 << 30; // 1GB
 
     /// Creates a new Options instance with default values and the given database root.
@@ -125,7 +182,8 @@ impl Options {
             .next_power_of_two() as u8;
         Self {
             sync_on_write: true,
-            over_provision: false,
+            default_arenas: 16,
+            arena_spill_limit: 1,
             concurrent_write: cores,
             tmp_store: false,
             gc_timeout: 60 * 1000,  // 1min
@@ -144,7 +202,7 @@ impl Options {
             high_priority_ratio: 80, // 80%
             data_handle_cache_capacity: 128,
             blob_handle_cache_capacity: 128,
-            inline_size: Self::INLINE_SIZE,
+            inline_size: Self::MIN_INLINE_SIZE,
             data_file_size: Self::DATA_FILE_SIZE,
             max_log_size: Self::MAX_LOG_SIZE,
             consolidate_threshold: Self::MAX_SPLIT_ELEMS / 2,
@@ -154,6 +212,21 @@ impl Options {
             keep_stable_wal_file: false,
             split_elems: Self::MAX_SPLIT_ELEMS,
             truncate_corrupted_wal: true,
+            observer: Arc::new(NoopObserver),
+            enable_backpressure: false,
+            enable_flush_pacing: false,
+            bp_soft_debt_units: 8,
+            bp_hard_debt_units: 24,
+            bp_stop_debt_units: 48,
+            bp_cold_start_fail_safe_units: 8,
+            bp_pacing_soft_debt_units: 2,
+            bp_flush_unit_bytes: Self::DATA_FILE_SIZE as u64,
+            bp_min_ratio_pct: 5,
+            bp_floor_bps: 16 << 20, // 16MB/s
+            bp_warmup_min_samples: 4,
+            bp_publish_guard_min_ratio_pct: 50,
+            bp_idle_reset_ms: 5_000,
+            bp_max_delay_us: 10_000,
         }
     }
 
@@ -164,9 +237,22 @@ impl Options {
     /// Validates the options and returns a ParsedOptions instance.
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
         self.concurrent_write = self.concurrent_write.clamp(1, Self::MAX_CONCURRENT_WRITE);
+        if self.default_arenas < Self::MIN_DEFAULT_ARENAS
+            || self.default_arenas > Self::MAX_DEFAULT_ARENAS
+            || !self.default_arenas.is_power_of_two()
+        {
+            return Err(OpCode::Invalid);
+        }
         self.split_elems = self
             .split_elems
             .clamp(Self::MIN_SPLIT_ELEMS, Self::MAX_SPLIT_ELEMS);
+        self.inline_size = self
+            .inline_size
+            .clamp(Self::MIN_INLINE_SIZE, Self::MAX_INLINE_SIZE);
+
+        self.arena_spill_limit = self
+            .arena_spill_limit
+            .clamp(Self::MIN_ARENA_SPILL, Self::MAX_ARENA_SPILL);
         if self.consolidate_threshold > self.split_elems / 2 {
             self.consolidate_threshold = self.split_elems / 2;
         }
@@ -178,6 +264,41 @@ impl Options {
         }
         if self.cache_capacity < Self::MIN_CACHE_CAP {
             self.cache_capacity = Self::CACHE_CAP;
+        }
+        self.bp_min_ratio_pct = self.bp_min_ratio_pct.clamp(1, 100);
+        self.bp_publish_guard_min_ratio_pct = self.bp_publish_guard_min_ratio_pct.clamp(1, 100);
+        if self.bp_soft_debt_units == 0 {
+            self.bp_soft_debt_units = 1;
+        }
+        if self.bp_hard_debt_units <= self.bp_soft_debt_units {
+            self.bp_hard_debt_units = self.bp_soft_debt_units + 1;
+        }
+        if self.bp_stop_debt_units <= self.bp_hard_debt_units {
+            self.bp_stop_debt_units = self.bp_hard_debt_units + 1;
+        }
+        if self.bp_cold_start_fail_safe_units < self.bp_soft_debt_units {
+            self.bp_cold_start_fail_safe_units = self.bp_soft_debt_units;
+        }
+        if self.bp_pacing_soft_debt_units == 0 {
+            self.bp_pacing_soft_debt_units = 1;
+        }
+        if self.bp_pacing_soft_debt_units > self.bp_soft_debt_units {
+            self.bp_pacing_soft_debt_units = self.bp_soft_debt_units;
+        }
+        if self.bp_flush_unit_bytes == 0 {
+            self.bp_flush_unit_bytes = self.data_file_size as u64;
+        }
+        if self.bp_floor_bps == 0 {
+            self.bp_floor_bps = 8 << 20;
+        }
+        if self.bp_warmup_min_samples == 0 {
+            self.bp_warmup_min_samples = 4;
+        }
+        if self.bp_idle_reset_ms == 0 {
+            self.bp_idle_reset_ms = 5_000;
+        }
+        if self.bp_max_delay_us == 0 {
+            self.bp_max_delay_us = 10_000;
         }
 
         self.create_dir().map_err(|e| {

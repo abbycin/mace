@@ -213,6 +213,9 @@ impl ManifestBuilder {
             })
             .map_err(|_| OpCode::IoError)?;
 
+        // recover crash-left pending sibling intents into stat bitmaps at startup
+        self.inner.recover_pending_siblings_to_stats();
+
         if !has_version {
             self.inner
                 .btree
@@ -257,9 +260,11 @@ impl ManifestBuilder {
             let mut v = Vec::new();
             while iter.next_ref(&mut k, &mut v) {
                 if let Some(id) = Self::parse_orphan_marker_id(&k, ORPHAN_DATA_MARKER_PREFIX) {
+                    self.max_data_id = self.max_data_id.max(id);
                     data_markers.push((id, k.clone()));
                 } else if let Some(id) = Self::parse_orphan_marker_id(&k, ORPHAN_BLOB_MARKER_PREFIX)
                 {
+                    self.max_blob_id = self.max_blob_id.max(id);
                     blob_markers.push((id, k.clone()));
                 }
             }

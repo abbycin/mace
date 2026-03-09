@@ -1,3 +1,18 @@
+## [0.0.28] 2026-03-09 (AI-Assisted)
+### New Features
+- Added observer-based observability with GC coverage
+- Added pending sibling metadata flow to preserve crash-closure and prevent arena exhaustion under excessive sibling chains
+- Added backpressure-aware flush pacing and junk leak handling improvements
+
+### Performance
+- Optimized scan hot paths and hardened ccpool shrink behavior
+- Reduced key copies in index iterator filtering
+
+### Bug Fixes
+- Fixed evictor panic on tagged swip during shutdown
+- Fixed sibling junk collection routing through base iterator
+- Fixed orphan marker cleanup to preserve max file IDs
+
 ## [0.0.27] 2026-02-20 (AI-Assisted)
 ### New Features
 - Added `Mace::vacuum_bucket` and `VacuumStats` (`scanned`, `compacted`) to support explicit per-bucket vacuuming

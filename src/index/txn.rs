@@ -9,7 +9,14 @@ use crate::{
     },
     index::tree::{Iter, Tree},
     types::data::{Key, Record, Ver},
-    utils::{Handle, NULL_CMD, data::Position},
+    utils::{
+        Handle, NULL_CMD,
+        data::Position,
+        observe::{
+            CounterMetric, EventKind, HistogramMetric, LATENCY_SAMPLE_SHIFT, ObserveEvent,
+            observe_elapsed, sampled_instant,
+        },
+    },
 };
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::Ordering::Relaxed;
@@ -45,19 +52,31 @@ where
     K: AsRef<[u8]>,
 {
     let b = prefix.as_ref();
-    let mut e = b.to_vec();
     #[cfg(feature = "extra_check")]
-    assert!(!e.is_empty(), "prefix can't be empty");
+    assert!(!b.is_empty(), "prefix can't be empty");
 
-    if *e.last().unwrap() == u8::MAX {
-        e.push(0);
+    let upper = prefix_upper_exclusive(b);
+    if let Some(ref upper) = upper {
+        tree.range(b..upper.as_slice(), move |ctx, txid, record_gid| {
+            cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
+        })
     } else {
-        *e.last_mut().unwrap() += 1;
+        tree.range(b.., move |ctx, txid, record_gid| {
+            cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
+        })
     }
+}
 
-    tree.range(b..e.as_slice(), move |ctx, txid, record_gid| {
-        cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
-    })
+fn prefix_upper_exclusive(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for i in (0..upper.len()).rev() {
+        if upper[i] != u8::MAX {
+            upper[i] += 1;
+            upper.truncate(i + 1);
+            return Some(upper);
+        }
+    }
+    None
 }
 
 /// A read-write transaction.
@@ -94,6 +113,7 @@ impl<'a> TxnKV<'a> {
             tree.bucket.state.dec_txn_ref();
             return Err(e);
         }
+        ctx.opt.observer.counter(CounterMetric::TxnBegin, 1);
 
         g.cc.commit_tree.compact(ctx, gid as u8);
         Ok(Self {
@@ -127,7 +147,43 @@ impl<'a> TxnKV<'a> {
         unsafe { &mut *self.state.get() }
     }
 
-    fn modify<F>(&self, k: &[u8], v: &[u8], mut f: F) -> Result<Option<ValRef>, OpCode>
+    #[inline]
+    fn observe_counter(&self, metric: CounterMetric, delta: u64) {
+        self.ctx.opt.observer.counter(metric, delta);
+    }
+
+    #[inline]
+    fn observe_event(&self, event: ObserveEvent) {
+        self.ctx.opt.observer.event(event);
+    }
+
+    #[inline]
+    fn before_write_budget(&self, estimated_bytes: usize) {
+        self.tree
+            .bucket
+            .before_foreground_write(estimated_bytes as u64);
+    }
+
+    #[inline]
+    fn conflict_abort(&self, txid: u64) -> OpCode {
+        self.observe_counter(CounterMetric::TxnConflictAbort, 1);
+        self.observe_event(ObserveEvent {
+            kind: EventKind::TxnConflictAbort,
+            bucket_id: self.bucket_id,
+            txid,
+            file_id: 0,
+            value: 0,
+        });
+        OpCode::AbortTx
+    }
+
+    fn modify<F>(
+        &self,
+        k: &[u8],
+        v: &[u8],
+        estimated_bytes: usize,
+        mut f: F,
+    ) -> Result<Option<ValRef>, OpCode>
     where
         F: FnMut(&Option<(Key, ValRef)>, Ver, &mut TxnState) -> Result<(u8, Position), OpCode>,
     {
@@ -144,13 +200,15 @@ impl<'a> TxnKV<'a> {
         state.cmd_id += 1;
         let key = Key::new(k, Ver::new(start_ts, cmd_id_val));
         let val = Record::normal(gid as u8, v);
+        self.before_write_budget(estimated_bytes);
 
         self.tree
             .update(&g, key, val, |opt| f(opt, *key.ver(), state))
     }
 
     fn put_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<(), OpCode> {
-        self.modify(k, v, |opt, ver, state| {
+        let estimated = k.len().saturating_add(v.len());
+        self.modify(k, v, estimated, |opt, ver, state| {
             let gid = state.group_id;
             let g = self.ctx.group(gid);
 
@@ -166,7 +224,7 @@ impl<'a> TxnKV<'a> {
                             rk.txid,
                         )
                     {
-                        Err(OpCode::AbortTx)
+                        Err(self.conflict_abort(state.start_ts))
                     } else {
                         Ok(())
                     }
@@ -193,7 +251,8 @@ impl<'a> TxnKV<'a> {
     }
 
     fn update_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<ValRef, OpCode> {
-        self.modify(k, v, |opt, ver, state| {
+        let estimated = k.len().saturating_add(v.len().saturating_mul(2));
+        self.modify(k, v, estimated, |opt, ver, state| {
             let gid = state.group_id;
             let g = self.ctx.group(gid);
             match opt {
@@ -210,7 +269,7 @@ impl<'a> TxnKV<'a> {
                         state.start_ts,
                         rk.txid,
                     ) {
-                        return Err(OpCode::AbortTx);
+                        return Err(self.conflict_abort(state.start_ts));
                     }
 
                     if !*logged {
@@ -262,7 +321,8 @@ impl<'a> TxnKV<'a> {
     {
         let mut logged = false;
         let (k, v) = (k.as_ref(), v.as_ref());
-        self.modify(k, v, |opt, ver, state| {
+        let estimated = k.len().saturating_add(v.len().saturating_mul(2));
+        self.modify(k, v, estimated, |opt, ver, state| {
             let gid = state.group_id;
             let g = self.ctx.group(gid);
             match opt {
@@ -292,7 +352,7 @@ impl<'a> TxnKV<'a> {
                         state.start_ts,
                         rk.txid,
                     ) {
-                        return Err(OpCode::AbortTx);
+                        return Err(self.conflict_abort(state.start_ts));
                     }
 
                     if !logged {
@@ -331,6 +391,7 @@ impl<'a> TxnKV<'a> {
         let val = Record::remove(gid as u8);
         let mut logged = false;
         let guard = crossbeam_epoch::pin();
+        self.before_write_budget(key.raw.len());
 
         let res = self.tree.update(&guard, key, val, |opt| {
             let g = self.ctx.group(gid);
@@ -345,7 +406,7 @@ impl<'a> TxnKV<'a> {
                         .cc
                         .is_visible_to(self.ctx, gid as u8, t.group_id(), start_ts, rk.txid)
                     {
-                        return Err(OpCode::AbortTx);
+                        return Err(self.conflict_abort(start_ts));
                     }
 
                     if !logged {
@@ -374,6 +435,7 @@ impl<'a> TxnKV<'a> {
     pub fn commit(self) -> Result<(), OpCode> {
         self.should_abort()?;
         let state = self.state_ref();
+        let commit_started = sampled_instant(state.start_ts, LATENCY_SAMPLE_SHIFT);
         let g = self.ctx.group(state.group_id);
 
         #[cfg(feature = "failpoints")]
@@ -386,6 +448,12 @@ impl<'a> TxnKV<'a> {
             }
             g.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
+            self.observe_counter(CounterMetric::TxnCommit, 1);
+            observe_elapsed(
+                self.ctx.opt.observer.as_ref(),
+                HistogramMetric::TxnCommitMicros,
+                commit_started,
+            );
             return Ok(());
         }
 
@@ -407,6 +475,12 @@ impl<'a> TxnKV<'a> {
 
         g.active_txns.remove(&state.start_ts);
         self.is_end.set(true);
+        self.observe_counter(CounterMetric::TxnCommit, 1);
+        observe_elapsed(
+            self.ctx.opt.observer.as_ref(),
+            HistogramMetric::TxnCommitMicros,
+            commit_started,
+        );
         Ok(())
     }
 
@@ -465,9 +539,11 @@ impl Drop for TxnKV<'_> {
                         log::error!("can't record abort, {:?}", e);
                     })
                     .expect("can't fail");
+                self.observe_counter(CounterMetric::TxnAbort, 1);
             } else {
                 use crate::cc::wal::{Location, WalReader};
                 use crate::utils::block::Block;
+                let rollback_started = sampled_instant(state.start_ts, LATENCY_SAMPLE_SHIFT);
 
                 let mut log = grp.logging.lock();
                 log.sync(false)
@@ -505,6 +581,20 @@ impl Drop for TxnKV<'_> {
                 grp.cc.commit_tree.append(state.start_ts, commit_ts);
                 grp.cc.latest_cts.store(commit_ts, Relaxed);
                 grp.cc.collect_wmk(self.ctx);
+                self.observe_counter(CounterMetric::TxnAbort, 1);
+                self.observe_counter(CounterMetric::TxnRollback, 1);
+                observe_elapsed(
+                    self.ctx.opt.observer.as_ref(),
+                    HistogramMetric::TxnRollbackMicros,
+                    rollback_started,
+                );
+                self.observe_event(ObserveEvent {
+                    kind: EventKind::TxnRollbackComplete,
+                    bucket_id: self.bucket_id,
+                    txid: state.start_ts,
+                    file_id: state.prev_lsn.file_id,
+                    value: state.prev_lsn.offset,
+                });
             }
             grp.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
@@ -568,11 +658,26 @@ impl Drop for TxnView<'_> {
 
 #[cfg(test)]
 mod test {
+    use super::prefix_upper_exclusive;
     use crate::{Mace, OpCode, Options, RandomPath};
 
     #[test]
     fn txnkv() {
         txnkv_impl().unwrap();
+    }
+
+    #[test]
+    fn prefix_upper_exclusive_handles_carry() {
+        assert_eq!(
+            prefix_upper_exclusive(&[0x61, 0x62, 0x63]),
+            Some(vec![0x61, 0x62, 0x64])
+        );
+        assert_eq!(
+            prefix_upper_exclusive(&[0x61, 0xff, 0xff]),
+            Some(vec![0x62])
+        );
+        assert_eq!(prefix_upper_exclusive(&[0xff]), None);
+        assert_eq!(prefix_upper_exclusive(&[0xff, 0xff]), None);
     }
 
     fn txnkv_impl() -> Result<(), OpCode> {

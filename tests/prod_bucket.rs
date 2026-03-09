@@ -102,7 +102,6 @@ fn stress_create_delete() -> Result<(), OpCode> {
     let env = TestEnv::new();
     let engine = env.open_with(|options| {
         options.sync_on_write = false;
-        options.over_provision = true;
     })?;
 
     let rounds = env_usize("MACE_PROD_BUCKET_STRESS_ROUNDS", 4096);

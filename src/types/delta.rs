@@ -3,19 +3,19 @@ use crate::{
         data::Val,
         header::{DeltaHeader, NodeType, RemoteHeader, TagKind},
         refbox::{BoxRef, DeltaView},
-        traits::{IAlloc, IBoxHeader, ICodec, IHeader, IKey, IVal},
+        traits::{IBoxHeader, ICodec, IFrameAlloc, IHeader, IKey, IVal},
     },
-    utils::NULL_ADDR,
+    utils::{NULL_ADDR, OpCode},
 };
 
 impl DeltaView {
     pub(crate) const HDR_LEN: usize = size_of::<DeltaHeader>();
 
-    pub(crate) fn from_key_val<A: IAlloc, K: IKey, V: IVal>(
+    pub(crate) fn try_from_key_val<A: IFrameAlloc, K: IKey, V: IVal>(
         a: &mut A,
         k: &K,
         v: &V,
-    ) -> (BoxRef, Option<BoxRef>) {
+    ) -> Result<(BoxRef, Option<BoxRef>), OpCode> {
         let ksz = k.packed_size();
         let vsz = v.packed_size();
         let inline_size = a.inline_size();
@@ -23,13 +23,13 @@ impl DeltaView {
 
         let sz = Val::calc_size(false, inline_size, vsz);
         let (d, remote) = if is_remote {
-            let (d, r) = a.allocate_pair(
+            let (d, r) = a.try_alloc_pair(
                 (ksz + sz + Self::HDR_LEN) as u32,
                 (vsz + size_of::<RemoteHeader>()) as u32,
-            );
+            )?;
             (d, Some(r))
         } else {
-            (a.allocate((ksz + sz + Self::HDR_LEN) as u32), None)
+            (a.try_alloc((ksz + sz + Self::HDR_LEN) as u32)?, None)
         };
         let mut view = d.view();
         let h = view.header_mut();
@@ -43,7 +43,7 @@ impl DeltaView {
         k.encode_to(delta.key_mut());
         if !is_remote {
             Val::encode_inline(delta.val_mut(), NULL_ADDR, v);
-            (d, None)
+            Ok((d, None))
         } else {
             let mut r = remote.expect("remote allocation must exist");
             r.header_mut().kind = TagKind::Remote;
@@ -51,18 +51,18 @@ impl DeltaView {
             view.header_mut().size = vsz;
             v.encode_to(view.raw_mut());
             Val::encode_remote(delta.val_mut(), NULL_ADDR, view.addr(), v);
-            (d, Some(r))
+            Ok((d, Some(r)))
         }
     }
 
-    pub(crate) fn from_key_index<A: IAlloc, K: ICodec, V: ICodec>(
+    pub(crate) fn try_from_key_index<A: IFrameAlloc, K: ICodec, V: ICodec>(
         a: &mut A,
         k: K,
         v: V,
         txid: u64,
-    ) -> BoxRef {
+    ) -> Result<BoxRef, OpCode> {
         let sz = k.packed_size() + v.packed_size() + Self::HDR_LEN;
-        let d = a.allocate(sz as u32);
+        let d = a.try_alloc(sz as u32)?;
         let mut view = d.view();
         let h = view.header_mut();
         h.kind = TagKind::Delta;
@@ -75,7 +75,7 @@ impl DeltaView {
         };
         k.encode_to(delta.key_mut());
         v.encode_to(delta.val_mut());
-        d
+        Ok(d)
     }
 
     fn data_ptr(&self, off: u64) -> *mut u8 {

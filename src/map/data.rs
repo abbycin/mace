@@ -3,6 +3,7 @@ use crc32c::Crc32cHasher;
 use dashmap::DashMap;
 
 use crate::map::IFooter;
+use crate::map::flow::{FlowController, FlowOutcome, FlowTask};
 use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, PageTable};
 use crate::types::header::{TagFlag, TagKind};
 use crate::types::refbox::{BoxRef, RemoteView};
@@ -19,23 +20,41 @@ use std::hash::Hasher;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
+use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+use std::time::Duration;
 
 pub(crate) struct FlushData {
     arena: Handle<Arena>,
     bucket_id: u64,
-    cb: Box<dyn FnOnce()>,
+    retire_take: Option<Box<dyn FnOnce(u64) -> (Vec<u64>, Vec<u64>) + Send>>,
+    release_cb: Option<Box<dyn FnOnce()>>,
+    done_cb: Option<Box<dyn FnOnce()>>,
+    flow_task: Arc<FlowTask>,
+    flow_ctrl: Arc<FlowController>,
 }
 
 unsafe impl Send for FlushData {}
 
 impl FlushData {
-    pub fn new(arena: Handle<Arena>, bucket_id: u64, cb: Box<dyn FnOnce()>) -> Self {
+    pub fn new(
+        arena: Handle<Arena>,
+        bucket_id: u64,
+        retire_take: Box<dyn FnOnce(u64) -> (Vec<u64>, Vec<u64>) + Send>,
+        release_cb: Box<dyn FnOnce()>,
+        done_cb: Box<dyn FnOnce()>,
+        flow_task: Arc<FlowTask>,
+        flow_ctrl: Arc<FlowController>,
+    ) -> Self {
         Self {
             arena,
             bucket_id,
-            cb,
+            retire_take: Some(retire_take),
+            release_cb: Some(release_cb),
+            done_cb: Some(done_cb),
+            flow_task,
+            flow_ctrl,
         }
     }
 
@@ -47,8 +66,37 @@ impl FlushData {
         self.arena.id()
     }
 
-    pub fn mark_done(self) {
-        (self.cb)()
+    pub fn take_retires(&mut self) -> (Vec<u64>, Vec<u64>) {
+        self.retire_take
+            .take()
+            .map(|f| f(self.id()))
+            .unwrap_or_default()
+    }
+
+    pub fn release(&mut self) {
+        if let Some(cb) = self.release_cb.take() {
+            cb();
+        }
+    }
+
+    pub fn mark_done(mut self) {
+        self.release();
+        if let Some(cb) = self.done_cb.take() {
+            cb();
+        }
+    }
+
+    pub(crate) fn set_flow_outcome(&self, outcome: FlowOutcome) {
+        self.flow_task.mark_outcome(outcome);
+    }
+
+    pub(crate) fn mark_flow_io_built(&self, bytes: u64, elapsed: Duration) {
+        self.flow_ctrl
+            .on_io_built(self.flow_task.as_ref(), bytes, elapsed);
+    }
+
+    pub(crate) fn pace_before_flush(&self) {
+        self.flow_ctrl.before_flush(self.flow_task.as_ref());
     }
 }
 
@@ -61,16 +109,19 @@ impl Deref for FlushData {
 }
 
 pub(crate) struct Arena {
+    // hot fields for alloc fast path
+    pub(crate) state: AtomicU16,
+    pub(crate) real_size: AtomicU64,
+    // pack file_id and seq
+    offset: AtomicU64,
+    alloc_inflight: CachePad<AtomicU32>,
+    refs: AtomicU32,
+    cap: usize,
+    // colder metadata and lookup state
     id: Cell<u64>,
     pub(crate) items: DashMap<u64, BoxRef>,
     /// flush LSN
     pub(crate) flsn: Box<[CachePad<Flsn>]>,
-    pub(crate) real_size: AtomicU64,
-    // pack file_id and seq
-    offset: AtomicU64,
-    cap: usize,
-    refs: AtomicU32,
-    pub(crate) state: AtomicU16,
 }
 
 pub(crate) struct Flsn {
@@ -140,14 +191,15 @@ impl Arena {
 
     pub(crate) fn new(cap: usize, groups: u8) -> Self {
         Self {
-            items: DashMap::with_capacity(16 << 10),
-            flsn: Self::alloc_flsn(groups as usize),
-            id: Cell::new(INIT_ID),
+            state: AtomicU16::new(Self::FLUSH),
+            real_size: AtomicU64::new(0),
+            alloc_inflight: CachePad::from(AtomicU32::new(0)),
             refs: AtomicU32::new(0),
             offset: AtomicU64::new(0),
-            real_size: AtomicU64::new(0),
             cap,
-            state: AtomicU16::new(Self::FLUSH),
+            id: Cell::new(INIT_ID),
+            items: DashMap::with_capacity(16 << 10),
+            flsn: Self::alloc_flsn(groups as usize),
         }
     }
 
@@ -159,18 +211,37 @@ impl Arena {
         self.id.set(id);
         assert_eq!(self.state(), Self::FLUSH);
         self.set_state(Arena::FLUSH, Arena::HOT);
+        self.alloc_inflight.store(0, Relaxed);
         self.offset.store(0, Relaxed);
         self.real_size.store(0, Relaxed);
         assert!(self.unref());
         self.clear();
     }
 
-    pub(crate) fn cap(&self) -> usize {
-        self.cap
+    pub(crate) fn try_enter_hot_alloc(&self) -> bool {
+        if self.state() != Self::HOT {
+            return false;
+        }
+        self.alloc_inflight.fetch_add(1, AcqRel);
+        if self.state() == Self::HOT {
+            return true;
+        }
+        let old = self.alloc_inflight.fetch_sub(1, AcqRel);
+        debug_assert!(old > 0);
+        false
     }
 
-    pub(crate) fn groups(&self) -> u8 {
-        self.flsn.len() as u8
+    pub(crate) fn leave_hot_alloc(&self) {
+        let old = self.alloc_inflight.fetch_sub(1, AcqRel);
+        debug_assert!(old > 0);
+    }
+
+    pub(crate) fn alloc_inflight(&self) -> u32 {
+        self.alloc_inflight.load(Acquire)
+    }
+
+    pub(crate) fn mark_warm(&self) -> bool {
+        self.set_state(Self::HOT, Self::WARM) == Self::HOT
     }
 
     fn alloc_size(&self, size: u32) -> Result<u64, OpCode> {
@@ -236,16 +307,6 @@ impl Arena {
         Ok(())
     }
 
-    // we are not rollback offset in case of ABA problem
-    pub(crate) fn rollback_batch(&self, total_real_size: u32, nr_frames: u32) {
-        if total_real_size > 0 {
-            self.real_size.fetch_sub(total_real_size as u64, AcqRel);
-        }
-        if nr_frames > 0 {
-            self.refs.fetch_sub(nr_frames, AcqRel);
-        }
-    }
-
     fn alloc_at(&self, next_addr: &AtomicU64, real_size: u32) -> BoxRef {
         let addr = next_addr.fetch_add(1, Relaxed);
         self.alloc_at_addr(addr, real_size)
@@ -260,18 +321,19 @@ impl Arena {
     pub fn alloc(&self, next_addr: &AtomicU64, size: u32) -> Result<BoxRef, OpCode> {
         let real_size = BoxRef::real_size(size);
         self.inc_ref();
-        let _ = self.alloc_size(real_size).inspect_err(|_| self.dec_ref())?;
-        Ok(self.alloc_at(next_addr, real_size))
+        match self.alloc_size(real_size) {
+            Ok(_) => Ok(self.alloc_at(next_addr, real_size)),
+            Err(e) => {
+                self.dec_ref();
+                Err(e)
+            }
+        }
     }
 
     pub(crate) fn dealloc(&self, addr: u64, len: usize) {
         if self.items.remove(&addr).is_some() {
             self.real_size.fetch_sub(len as u64, AcqRel);
         }
-    }
-
-    pub(crate) fn remove_item_only(&self, addr: u64) -> bool {
-        self.items.remove(&addr).is_some()
     }
 
     #[inline]
@@ -425,9 +487,6 @@ pub(crate) struct FileBuilder {
     bucket_id: u64,
     data_active_size: usize,
     blob_active_size: usize,
-    /// never flush to file
-    pub(crate) data_junks: Vec<u64>,
-    pub(crate) blob_junks: Vec<u64>,
     data_interval: Interval,
     blob_interval: Interval,
     data: Vec<BoxRef>,
@@ -445,8 +504,6 @@ impl FileBuilder {
             bucket_id,
             data_active_size: 0,
             blob_active_size: 0,
-            data_junks: Vec::new(),
-            blob_junks: Vec::new(),
             data_interval: Interval::new(u64::MAX, 0),
             blob_interval: Interval::new(u64::MAX, 0),
             data: Vec::new(),
@@ -470,16 +527,6 @@ impl FileBuilder {
                     self.data.push(f);
                 }
             }
-            TagFlag::Junk => {
-                let tmp = f.data_slice::<u64>();
-                for &x in tmp {
-                    if RemoteView::is_tagged(x) {
-                        self.blob_junks.push(RemoteView::untagged(x));
-                    } else {
-                        self.data_junks.push(x);
-                    }
-                }
-            }
             TagFlag::TombStone | TagFlag::Unmap => {}
         }
     }
@@ -489,7 +536,7 @@ impl FileBuilder {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.data.is_empty() && self.data_junks.is_empty() && self.blobs.is_empty()
+        self.data.is_empty() && self.blobs.is_empty()
     }
 
     pub(crate) fn data_stat(&self, id: u64, tick: u64) -> MemDataStat {
@@ -523,46 +570,94 @@ impl FileBuilder {
         }
     }
 
-    pub(crate) fn build_data(&mut self, tick: u64, path: PathBuf) -> Interval {
+    fn ensure_iov_room(
+        need: usize,
+        queued_iov: &mut usize,
+        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+        w: &mut GatherWriter,
+    ) {
+        if *queued_iov + need > GatherWriter::DEFAULT_IOVCNT {
+            w.flush();
+            *queued_iov = 0;
+            hdr_batch.clear();
+        }
+    }
+
+    pub(crate) fn build_data(&mut self, tick: u64, path: PathBuf) -> Option<Interval> {
         let mut pos: usize = 0;
         let mut w = GatherWriter::trunc(&path, 64);
         let mut relocs = Vec::with_capacity(self.data.len() * AddrPair::LEN);
+        let mut queued_iov = 0usize;
+        let mut hdr_batch: Vec<[u8; BoxRef::DUMP_HDR_LEN]> =
+            Vec::with_capacity(GatherWriter::DEFAULT_IOVCNT / 2);
 
         for (seq, f) in self.data.iter().enumerate() {
             let h = f.header();
-            let s = f.dump_slice();
             let mut crc = Crc32cHasher::default();
-            crc.write(s);
-            w.queue(s);
-            let reloc = AddrPair::new(h.addr, pos, s.len() as u32, seq as u32, crc.finish() as u32);
+            let len = if let Some(payload_len) = f.persist_payload_len() {
+                Self::ensure_iov_room(2, &mut queued_iov, &mut hdr_batch, &mut w);
+                hdr_batch.push([0u8; BoxRef::DUMP_HDR_LEN]);
+                let hdr_bytes = hdr_batch.last_mut().expect("must exist");
+                f.encode_dump_header(payload_len as u32, hdr_bytes);
+                let body_all = f.data_slice::<u8>();
+                let body = &body_all[..payload_len];
+                crc.write(hdr_bytes);
+                crc.write(body);
+                w.queue(hdr_bytes);
+                w.queue(body);
+                queued_iov += 2;
+                hdr_bytes.len() + body.len()
+            } else {
+                Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
+                let s = f.dump_slice();
+                crc.write(s);
+                w.queue(s);
+                queued_iov += 1;
+                s.len()
+            };
+            let reloc = AddrPair::new(h.addr, pos, len as u32, seq as u32, crc.finish() as u32);
             relocs.extend_from_slice(reloc.as_slice());
-            pos += s.len();
+            pos += len;
         }
 
-        let mut interval_crc = Crc32cHasher::default();
-
-        let is = self.data_interval.as_slice();
-        interval_crc.write(is);
-        w.queue(is);
+        let mut interval_crc = 0u32;
+        let mut nr_intervals = 0u32;
+        if !self.data.is_empty() {
+            let mut h = Crc32cHasher::default();
+            let is = self.data_interval.as_slice();
+            h.write(is);
+            interval_crc = h.finish() as u32;
+            nr_intervals = 1;
+            Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
+            w.queue(is);
+            queued_iov += 1;
+        }
 
         let mut reloc_crc = Crc32cHasher::default();
         let rs = relocs.as_slice();
         reloc_crc.write(rs);
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(rs);
+        queued_iov += 1;
 
         let hdr = DataFooter {
             up2: tick,
             nr_reloc: self.data.len() as u32,
-            nr_intervals: 1,
+            nr_intervals,
             reloc_crc: reloc_crc.finish() as u32,
-            interval_crc: interval_crc.finish() as u32,
+            interval_crc,
         };
 
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(hdr.as_slice());
         w.flush();
         w.sync();
 
-        self.data_interval
+        if self.data.is_empty() {
+            None
+        } else {
+            Some(self.data_interval)
+        }
     }
 
     pub(crate) fn build_blob(&mut self, path: PathBuf) -> Interval {
@@ -745,7 +840,11 @@ mod test {
     use crate::{
         Options, RandomPath,
         map::data::{DataFooter, MetaReader},
-        types::{refbox::BoxRef, traits::IHeader},
+        types::{
+            header::{NodeType, TagKind},
+            refbox::BoxRef,
+            traits::IHeader,
+        },
         utils::INIT_ID,
     };
 
@@ -763,9 +862,13 @@ mod test {
         let (pid, addr) = (114514, 1919810);
         let mut p = BoxRef::alloc(233, addr);
         p.header_mut().pid = pid;
+        p.header_mut().kind = TagKind::Delta;
+        p.header_mut().node_type = NodeType::Leaf;
         let (pid1, addr1) = (192, 68);
         let mut p1 = BoxRef::alloc(666, addr1);
         p1.header_mut().pid = pid1;
+        p1.header_mut().kind = TagKind::Delta;
+        p1.header_mut().node_type = NodeType::Leaf;
 
         let mut builder = FileBuilder::new(0);
 

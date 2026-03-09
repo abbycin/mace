@@ -8,6 +8,7 @@ use std::{
         AtomicI64, AtomicU32,
         Ordering::{AcqRel, Relaxed},
     },
+    time::Duration,
 };
 
 pub(crate) mod bitmap;
@@ -19,6 +20,7 @@ pub(crate) mod failpoint;
 pub(crate) mod imtree;
 pub(crate) mod interval;
 pub(crate) mod lru;
+pub mod observe;
 pub(crate) mod options;
 pub(crate) mod queue;
 pub(crate) mod spooky;
@@ -96,6 +98,39 @@ pub(crate) const INIT_WMK: u64 = 0;
 /// NOTE: must larger than wmk_oldest (which is 0 by default)
 pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
+
+pub(crate) struct Backoff {
+    count: u16,
+    sleep_us: u16,
+}
+
+impl Backoff {
+    const SPIN_COUNT: u16 = 3;
+    const YIELD_COUNT: u16 = 5;
+
+    pub(crate) const fn new(sleep_us: u16) -> Self {
+        Self { count: 0, sleep_us }
+    }
+
+    pub(crate) fn shape(&mut self) {
+        if self.count <= Self::SPIN_COUNT {
+            for _ in 0..(1 << Self::SPIN_COUNT) {
+                std::hint::spin_loop();
+            }
+        } else if self.count <= Self::YIELD_COUNT {
+            for _ in 0..(1 << self.count) {
+                std::hint::spin_loop();
+            }
+            std::thread::yield_now();
+        } else if self.sleep_us != 0 {
+            std::thread::sleep(Duration::from_micros(self.sleep_us as u64));
+        } else {
+            std::thread::yield_now();
+        }
+
+        self.count = self.count.saturating_add(1);
+    }
+}
 
 pub(crate) const fn align_up(n: usize, align: usize) -> usize {
     (n + (align - 1)) & !(align - 1)

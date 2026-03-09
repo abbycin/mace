@@ -18,10 +18,12 @@ use crate::types::traits::{IKey, ITree, IVal};
 use crate::utils::block::Block;
 use crate::utils::data::Position;
 use crate::utils::lru::Lru;
+use crate::utils::observe::{CounterMetric, EventKind, GaugeMetric, HistogramMetric, ObserveEvent};
 use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, MutRef, NULL_CMD, NULL_ORACLE, OpCode, ROOT_PID};
 use crate::{Options, Store, static_assert};
 use crossbeam_epoch::Guard;
+use std::time::Instant;
 
 struct RecoveryTree(Option<Tree>);
 
@@ -129,12 +131,22 @@ impl Recovery {
         wal_boot: &[GroupBoot],
         store: MutRef<Store>,
     ) -> Result<(), OpCode> {
+        let phase2_started = Instant::now();
+        self.opt.observer.event(ObserveEvent {
+            kind: EventKind::RecoveryPhase2Begin,
+            bucket_id: 0,
+            txid: 0,
+            file_id: 0,
+            value: wal_boot.len() as u64,
+        });
+
         let g = crossbeam_epoch::pin();
         let mut oracle = store.manifest.numerics.oracle.load(Relaxed);
         let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
 
         for (group_id, boot) in wal_boot.iter().enumerate() {
             // analyze and redo starts from latest checkpoint
+            let analyze_started = Instant::now();
             let cur_oracle = self.analyze(
                 &g,
                 group_id as u8,
@@ -142,16 +154,44 @@ impl Recovery {
                 &mut block,
                 store.clone(),
             )?;
+            self.opt.observer.histogram(
+                HistogramMetric::RecoveryAnalyzeMicros,
+                analyze_started.elapsed().as_micros() as u64,
+            );
             oracle = max(oracle, cur_oracle);
             g.flush();
         }
 
         let recovered = !self.dirty_table.is_empty() || !self.undo_table.is_empty();
+        self.opt.observer.gauge(
+            GaugeMetric::RecoveryDirtyEntries,
+            self.dirty_table.len() as i64,
+        );
+        self.opt.observer.gauge(
+            GaugeMetric::RecoveryUndoEntries,
+            self.undo_table.len() as i64,
+        );
         if !self.dirty_table.is_empty() {
-            self.redo(&mut block, &g, store.clone())?;
+            let redo_started = Instant::now();
+            let count = self.redo(&mut block, &g, store.clone())?;
+            self.opt
+                .observer
+                .counter(CounterMetric::RecoveryRedoRecord, count);
+            self.opt.observer.histogram(
+                HistogramMetric::RecoveryRedoMicros,
+                redo_started.elapsed().as_micros() as u64,
+            );
         }
         if !self.undo_table.is_empty() {
-            self.undo(&mut block, &g, store.clone())?;
+            let undo_started = Instant::now();
+            let count = self.undo(&mut block, &g, store.clone())?;
+            self.opt
+                .observer
+                .counter(CounterMetric::RecoveryUndoTxn, count);
+            self.opt.observer.histogram(
+                HistogramMetric::RecoveryUndoMicros,
+                undo_started.elapsed().as_micros() as u64,
+            );
         }
         if recovered {
             // that's why we call it oracle, or else keep using the intact oracle in numerics
@@ -161,6 +201,17 @@ impl Recovery {
         store.manifest.numerics.oracle.store(oracle, Relaxed);
         store.manifest.numerics.wmk_oldest.store(oracle, Relaxed);
         self.evict_all(store);
+        self.opt.observer.histogram(
+            HistogramMetric::RecoveryPhase2Micros,
+            phase2_started.elapsed().as_micros() as u64,
+        );
+        self.opt.observer.event(ObserveEvent {
+            kind: EventKind::RecoveryPhase2End,
+            bucket_id: 0,
+            txid: oracle,
+            file_id: 0,
+            value: recovered as u64,
+        });
         Ok(())
     }
 
@@ -348,6 +399,9 @@ impl Recovery {
                 // truncate the WAL if it's incomplete
                 log::trace!("truncate {path:?} from {end} to {pos}");
                 f.truncate(pos)?;
+                self.opt
+                    .observer
+                    .counter(CounterMetric::RecoveryWalTruncate, 1);
                 // if we truncated the file, we must stop here
                 break;
             }
@@ -377,9 +431,10 @@ impl Recovery {
         }
     }
 
-    fn redo(&mut self, block: &mut Block, g: &Guard, store: MutRef<Store>) -> Result<(), OpCode> {
+    fn redo(&mut self, block: &mut Block, g: &Guard, store: MutRef<Store>) -> Result<u64, OpCode> {
         let cache = Lru::new();
         let cap = 32;
+        let mut applied = 0u64;
 
         // NOTE: because the `Ver` is descending ordered by txid first, we call `rev` here to make
         //  smaller txid to apply first
@@ -424,18 +479,21 @@ impl Recovery {
                     target_tree.put(g, key, val)
                 }
             };
+            applied += 1;
         }
-        Ok(())
+        Ok(applied)
     }
 
-    fn undo(&self, block: &mut Block, g: &Guard, store: MutRef<Store>) -> Result<(), OpCode> {
+    fn undo(&self, block: &mut Block, g: &Guard, store: MutRef<Store>) -> Result<u64, OpCode> {
         let reader = WalReader::new(&store.context, g);
+        let mut rolled_back = 0u64;
         for (txid, addr) in &self.undo_table {
             reader.rollback(block, *txid, *addr, |bucket_id| {
                 self.get_tree(bucket_id, store.clone())
             })?;
+            rolled_back += 1;
         }
-        Ok(())
+        Ok(rolled_back)
     }
 
     fn wal_file_range(&self, group: u8) -> Option<(u64, u64)> {

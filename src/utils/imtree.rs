@@ -919,28 +919,38 @@ mod test {
     use crate::Options;
     use crate::types::data::{Key, Record, Ver};
     use crate::types::refbox::{BoxRef, DeltaView};
-    use crate::types::traits::IAlloc;
+    use crate::types::traits::{IFrameAlloc, IRetireSink};
     use crate::utils::imtree::ImTree;
 
     struct Allocator;
 
     static G_OFF: AtomicU64 = AtomicU64::new(0);
 
-    impl IAlloc for Allocator {
-        fn allocate(&mut self, size: u32) -> BoxRef {
+    impl IFrameAlloc for Allocator {
+        fn try_alloc(&mut self, size: u32) -> Result<BoxRef, crate::OpCode> {
             let addr = G_OFF.fetch_add(size as u64, Relaxed);
-            BoxRef::alloc(size, addr)
+            Ok(BoxRef::alloc(size, addr))
         }
 
-        fn collect(&mut self, _addr: &[u64]) {}
+        fn try_alloc_pair(
+            &mut self,
+            size1: u32,
+            size2: u32,
+        ) -> Result<(BoxRef, BoxRef), crate::OpCode> {
+            Ok((self.try_alloc(size1)?, self.try_alloc(size2)?))
+        }
 
         fn arena_size(&mut self) -> usize {
             1 << 20
         }
 
         fn inline_size(&self) -> usize {
-            Options::INLINE_SIZE
+            Options::MIN_INLINE_SIZE
         }
+    }
+
+    impl IRetireSink for Allocator {
+        fn collect(&mut self, _addr: &[u64]) {}
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1029,11 +1039,12 @@ mod test {
         let mut im = ImTree::<DeltaView>::new(|x, y| x.key().cmp(y.key()));
         let mut a = Allocator;
 
-        let (delta, _r) = DeltaView::from_key_val(
+        let (delta, _r) = DeltaView::try_from_key_val(
             &mut a,
             &Key::new("foo".as_bytes(), Ver::new(1, 0)),
             &Record::normal(1, "bar".as_bytes()),
-        );
+        )
+        .unwrap();
         im = im.update(delta.view().as_delta());
 
         assert_eq!(im.len(), 1);

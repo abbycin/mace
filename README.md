@@ -17,6 +17,7 @@ Built for modern storage hardware, Mace employs a flash-optimized log-structured
 - **Large Value Separation**: Efficiently handles large values by separating them from the indexing structure, significantly reducing I/O overhead during maintenance.
 - **ACID Transactions**: Full support for Atomicity, Consistency, Isolation, and Durability.
 - **Data Integrity**: Integrated CRC checksums ensure data remains uncorrupted across restarts and crashes.
+- **Flow Control**: Foreground backpressure + FIFO-preserving flush pacing with debt/throughput feedback.
 - **Cross-Platform**: Native support for Linux, Windows, and macOS.
 
 ## Installation

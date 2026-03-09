@@ -1,3 +1,4 @@
+use crossbeam_epoch::Guard;
 use parking_lot::{Mutex, RwLock};
 
 use crate::OpCode;
@@ -5,7 +6,7 @@ use crate::cc::cc::ConcurrencyControl;
 use crate::meta::Numerics;
 use crate::utils::data::Position;
 use crate::utils::options::ParsedOptions;
-use crate::utils::{CachePad, Handle, INIT_WMK, NULL_ORACLE, rand_range};
+use crate::utils::{CachePad, Handle, INIT_WMK, NULL_ORACLE};
 
 use super::group::WriterGroup;
 use std::ops::{Deref, DerefMut};
@@ -15,7 +16,7 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GroupBoot {
@@ -33,6 +34,7 @@ pub struct Context {
     groups: Arc<Vec<WriterGroup>>,
     nr_view: CachePad<AtomicUsize>,
     group_rr: CachePad<AtomicUsize>,
+    /// this value is advanced by collect_thread based on active view snapshots
     min_view_txid: Arc<AtomicU64>,
     tx: Sender<()>,
     collector: Mutex<Option<JoinHandle<()>>>,
@@ -219,6 +221,7 @@ fn collect_thread(
                         if min != NULL_ORACLE {
                             min_view_txid.store(min, Relaxed);
                         }
+                        pool.maybe_shrink();
                     }
                     _ => break,
                 }
@@ -267,6 +270,7 @@ struct CCPool {
     shard_index: CachePad<AtomicUsize>,
     // TODO: maybe change to seqlock ?
     registry: RwLock<Vec<Handle<CCNode>>>,
+    registry_len: CachePad<AtomicUsize>,
     concurrent_write: usize,
 }
 
@@ -283,6 +287,7 @@ impl CCPool {
             shards,
             shard_index: CachePad::default(),
             registry: RwLock::new(registry),
+            registry_len: CachePad::from(AtomicUsize::new(CCPOOL_SHARD)),
             concurrent_write,
         }
     }
@@ -291,61 +296,27 @@ impl CCPool {
         self.shard_index.fetch_add(1, Relaxed) & CCPOOL_SHARD_MASK
     }
 
-    fn alloc(&self, start_ts: u64) -> Handle<CCNode> {
-        let mut shard = self.get_shard_idx();
-
-        let mut h = 'outer: loop {
-            let head = self.shards[shard].load(Acquire);
-            if !head.is_null() {
-                let next = unsafe { (*head).next.load(Acquire) };
-                if self.shards[shard]
-                    .compare_exchange_weak(head, next, AcqRel, Relaxed)
-                    .is_ok()
-                {
-                    let mut h = Handle::from(head);
-                    h.shard_index = shard;
-                    break h;
-                }
+    fn try_pop_shard(&self, index: usize, _guard: &Guard) -> Option<Handle<CCNode>> {
+        loop {
+            let head = self.shards[index].load(Acquire);
+            if head.is_null() {
+                return None;
             }
-
-            for i in 0..CCPOOL_SHARD {
-                let idx = (shard + i) & CCPOOL_SHARD_MASK;
-                let head = self.shards[idx].load(Acquire);
-                if !head.is_null() {
-                    shard = idx;
-                    continue 'outer;
-                }
+            let next = unsafe { (*head).next.load(Acquire) };
+            if self.shards[index]
+                .compare_exchange_weak(head, next, AcqRel, Relaxed)
+                .is_ok()
+            {
+                let mut h = Handle::from(head);
+                h.shard_index = index;
+                return Some(h);
             }
-
-            let mut cc = Handle::new(CCNode::new(self.concurrent_write));
-            cc.shard_index = shard;
-            let mut r = self.registry.write();
-            cc.registry_index = r.len();
-            r.push(cc);
-            break cc;
-        };
-        h.start_ts = start_ts;
-        h
+        }
     }
 
-    fn free(&self, mut cc: Handle<CCNode>) {
-        if self.registry.read().len() > CCPOOL_SHARD
-            && rand_range(0..CCPOOL_SHARD) == 0
-            && let Some(mut r) = self.registry.try_write()
-            && r.len() > CCPOOL_SHARD
-        {
-            let last = r.swap_remove(cc.registry_index);
-            assert_eq!(last.inner(), cc.inner());
-            if cc.registry_index < r.len() {
-                r[cc.registry_index].registry_index = cc.registry_index;
-            }
-            cc.reclaim();
-            return;
-        }
-
+    fn push_shard(&self, index: usize, mut cc: Handle<CCNode>) {
         cc.start_ts = NULL_ORACLE;
         let ptr = cc.inner();
-        let index = cc.shard_index;
         loop {
             let head = self.shards[index].load(Acquire);
             unsafe { (*ptr).next.store(head, Release) };
@@ -353,8 +324,106 @@ impl CCPool {
                 .compare_exchange_weak(head, ptr, AcqRel, Relaxed)
                 .is_ok()
             {
+                return;
+            }
+        }
+    }
+
+    fn alloc(&self, start_ts: u64) -> Handle<CCNode> {
+        let shard = self.get_shard_idx();
+        let guard = crossbeam_epoch::pin();
+
+        let mut h = if let Some(x) = self.try_pop_shard(shard, &guard) {
+            x
+        } else {
+            let mut popped = None;
+            for i in 0..CCPOOL_SHARD {
+                let idx = (shard + i) & CCPOOL_SHARD_MASK;
+                if let Some(x) = self.try_pop_shard(idx, &guard) {
+                    popped = Some(x);
+                    break;
+                }
+            }
+
+            if let Some(x) = popped {
+                x
+            } else {
+                let mut cc = Handle::new(CCNode::new(self.concurrent_write));
+                cc.shard_index = shard;
+                cc.start_ts = start_ts;
+                let mut r = self.registry.write();
+                cc.registry_index = r.len();
+                r.push(cc);
+                self.registry_len.store(r.len(), Release);
+                cc
+            }
+        };
+        h.start_ts = start_ts;
+        h
+    }
+
+    fn free(&self, cc: Handle<CCNode>) {
+        self.push_shard(cc.shard_index, cc);
+    }
+
+    fn maybe_shrink_one(&self, start: usize, guard: &Guard) -> bool {
+        let mut victim = None;
+        for i in 0..CCPOOL_SHARD {
+            let idx = (start + i) & CCPOOL_SHARD_MASK;
+            if let Some(cc) = self.try_pop_shard(idx, guard) {
+                victim = Some((idx, cc));
                 break;
             }
+        }
+        let Some((idx, cc)) = victim else {
+            return false;
+        };
+        let Some(mut r) = self.registry.try_write() else {
+            self.push_shard(idx, cc);
+            return false;
+        };
+        if r.len() <= CCPOOL_SHARD {
+            drop(r);
+            self.push_shard(idx, cc);
+            return false;
+        }
+
+        let last = r.swap_remove(cc.registry_index);
+        assert_eq!(last.inner(), cc.inner());
+        if cc.registry_index < r.len() {
+            r[cc.registry_index].registry_index = cc.registry_index;
+        }
+        self.registry_len.store(r.len(), Release);
+        drop(r);
+        guard.defer(move || cc.reclaim());
+        true
+    }
+
+    fn maybe_shrink(&self) {
+        let len = self.registry_len.load(Acquire);
+        if len <= CCPOOL_SHARD {
+            return;
+        }
+        let backlog = len - CCPOOL_SHARD;
+        let mut batch = backlog / 8;
+        if !backlog.is_multiple_of(8) {
+            batch += 1;
+        }
+        batch = batch.clamp(1, 16);
+
+        let guard = crossbeam_epoch::pin();
+        let deadline = Instant::now() + Duration::from_micros(200);
+        let mut start = self.get_shard_idx();
+        let mut done = 0;
+        while done < batch
+            && self.registry_len.load(Acquire) > CCPOOL_SHARD
+            && Instant::now() < deadline
+        {
+            if !self.maybe_shrink_one(start, &guard) {
+                break;
+            }
+            done += 1;
+            start = (start + 1) & CCPOOL_SHARD_MASK;
         }
     }
 }
@@ -365,5 +434,46 @@ impl Drop for CCPool {
         while let Some(x) = r.pop() {
             x.reclaim();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CCPOOL_SHARD, CCPool};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn ccpool_shrink_reclaims_idle_nodes() {
+        let pool = CCPool::new(4);
+        let total = CCPOOL_SHARD + 8;
+        let mut handles = Vec::with_capacity(total);
+        for i in 0..total {
+            handles.push(pool.alloc(i as u64 + 1));
+        }
+        assert!(pool.registry_len.load(Relaxed) >= total);
+
+        for h in handles {
+            pool.free(h);
+        }
+        for _ in 0..(total * 4) {
+            pool.maybe_shrink();
+            if pool.registry_len.load(Relaxed) == CCPOOL_SHARD {
+                break;
+            }
+        }
+        assert_eq!(pool.registry_len.load(Relaxed), CCPOOL_SHARD);
+    }
+
+    #[test]
+    fn ccpool_alloc_free_fast_path_keeps_registry_len() {
+        let pool = CCPool::new(4);
+        let base_len = pool.registry_len.load(Relaxed);
+        let h = pool.alloc(10);
+        pool.free(h);
+        assert_eq!(pool.registry_len.load(Relaxed), base_len);
+
+        let h2 = pool.alloc(11);
+        assert_eq!(h2.start_ts, 11);
+        pool.free(h2);
     }
 }

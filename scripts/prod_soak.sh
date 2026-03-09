@@ -29,7 +29,7 @@ collect_perf_snapshot() {
   local elapsed="$2"
   local snapshot="$metrics_dir/perf_cycle_${cycle_id}.json"
 
-  MACE_PERF_OUTPUT="$snapshot" ./scripts/perf_gate.sh snapshot
+  MACE_PERF_OUTPUT="$snapshot" bash scripts/perf_gate.sh snapshot
 
   python3 - "$snapshot" "$perf_csv" "$cycle_id" "$elapsed" <<'PY'
 import json
@@ -73,11 +73,11 @@ while true; do
   echo "==> soak cycle ${cycle} elapsed=${elapsed}s"
 
   FAST_TIMEOUT="$fast_timeout" STRESS_TIMEOUT="$stress_timeout" CHAOS_TIMEOUT="$chaos_timeout" \
-    ./scripts/prod_test.sh stress "$threads"
+    bash scripts/prod_test.sh stress "$threads"
 
   if (( chaos_every > 0 )) && (( cycle % chaos_every == 0 )); then
     FAST_TIMEOUT="$fast_timeout" STRESS_TIMEOUT="$stress_timeout" CHAOS_TIMEOUT="$chaos_timeout" \
-      ./scripts/prod_test.sh chaos "$threads"
+      bash scripts/prod_test.sh chaos "$threads"
   fi
 
   if (( perf_every > 0 )) && (( cycle % perf_every == 0 )); then
@@ -88,7 +88,7 @@ while true; do
 done
 
 FAST_TIMEOUT="$fast_timeout" STRESS_TIMEOUT="$stress_timeout" CHAOS_TIMEOUT="$chaos_timeout" \
-  ./scripts/prod_test.sh fast "$threads"
+  bash scripts/prod_test.sh fast "$threads"
 
 echo ""
 echo "soak finished cycles=${cycle} elapsed=$(( $(date +%s) - start_ts ))s"

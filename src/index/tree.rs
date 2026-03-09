@@ -1,4 +1,4 @@
-use super::{Node, Page, systxn::SysTxn};
+use super::{Node, Page, publish::TreeBuildCtx};
 
 use crate::Options;
 use crate::cc::context::Context;
@@ -8,6 +8,9 @@ use crate::types::node::RawLeafIter;
 use crate::types::refbox::DeltaView;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::data::Position;
+use crate::utils::observe::{
+    CounterMetric, HistogramMetric, LATENCY_SAMPLE_SHIFT, observe_elapsed, sampled_instant,
+};
 use crate::utils::{Handle, MutRef, NULL_ADDR, OpCode};
 use crate::{
     Store,
@@ -19,9 +22,8 @@ use crate::{
     utils::{NULL_CMD, NULL_PID},
 };
 use crossbeam_epoch::Guard;
-use std::borrow::Cow;
 use std::cmp::Ordering::Equal;
-use std::ops::{Bound, Deref, RangeBounds};
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Acquire;
 
@@ -90,12 +92,13 @@ impl Tree {
 
     fn init(&self, root_pid: u64) {
         let g = crossbeam_epoch::pin();
-        let mut txn = self.begin(&g);
-        let node = Node::new_leaf(&mut txn, self.bucket.loader(self.store.context));
+        let mut build = self.begin_build();
+        let node = Node::new_leaf(&mut build, self.bucket.loader(self.store.context));
         let mut page = Page::new(node);
-        txn.map_to(&mut page, root_pid);
+        let mut publish = build.into_publish(&g);
+        publish.map_to(&mut page, root_pid);
         self.bucket.cache(page);
-        txn.commit();
+        publish.finish();
     }
 
     fn txid(&self) -> u64 {
@@ -106,8 +109,8 @@ impl Tree {
         self.bucket.bucket_id
     }
 
-    pub(crate) fn begin<'a>(&'a self, g: &'a Guard) -> SysTxn<'a> {
-        SysTxn::new(&self.bucket.table, &self.store.opt, g, &self.bucket)
+    pub(crate) fn begin_build(&self) -> TreeBuildCtx<'_> {
+        TreeBuildCtx::new(&self.bucket.table, &self.store.opt, &self.bucket)
     }
 
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
@@ -202,6 +205,7 @@ impl Tree {
         };
 
         let safe_txid = self.txid();
+        let mut merged_child_into_left = false;
         loop {
             let cursor_ptr = if let Some(x) = self.load_node(g, cursor_pid)? {
                 x
@@ -220,14 +224,23 @@ impl Tree {
             };
 
             // 3.
+            let Some(_cursor_lk) = cursor_ptr.try_lock() else {
+                continue;
+            };
+            if self.bucket.table.get(cursor_ptr.pid()) != cursor_ptr.swip() {
+                continue;
+            }
             let next_pid = cursor_ptr.header().right_sibling;
-            let mut txn = self.begin(g);
+            let mut build = self.begin_build();
             // verify this candidate still points to child as its right sibling
             if next_pid == child_pid {
-                let (new_node, lj, rj) = cursor_ptr.merge_node(&mut txn, &child_ptr, safe_txid);
-                if txn.replace(cursor_ptr, new_node, &lj).is_ok() {
-                    child_ptr.garbage_collect(&mut txn, &rj);
-                    txn.commit();
+                let (new_node, lj, rj) =
+                    cursor_ptr.try_merge_node(&mut build, &child_ptr, safe_txid)?;
+                let mut publish = build.into_publish(g);
+                if let Ok(new_cursor) = publish.replace(cursor_ptr, new_node, &lj) {
+                    publish.collect_garbage(new_cursor.latest_addr(), child_ptr, &rj);
+                    publish.finish();
+                    merged_child_into_left = true;
                     break;
                 }
                 // retry merge on replace race
@@ -249,6 +262,10 @@ impl Tree {
             }
         }
 
+        if !merged_child_into_left {
+            return Ok(());
+        }
+
         // 4.
         if !self.remove_node_index(parent_ptr, child_pid, g, safe_txid)? {
             return Ok(());
@@ -257,9 +274,15 @@ impl Tree {
         // 5.
         debug_assert_eq!(child_ptr.box_header().pid, child_pid);
         merge_mark.clear();
-        let mut txn = self.begin(g);
-        txn.unmap(child_ptr, &[])?; // child's junks were already collected
-        txn.commit();
+        let mut build = self.begin_build();
+        let pending = build.prepare_unmap(child_ptr.pid())?;
+        let mut publish = build.into_publish(g);
+        publish.unmap(child_ptr, pending, &[])?; // child's junks were already collected
+        publish.finish();
+        self.store
+            .opt
+            .observer
+            .counter(CounterMetric::TreeNodeMerge, 1);
 
         Ok(())
     }
@@ -272,30 +295,31 @@ impl Tree {
         g: &Guard,
         safe_txid: u64,
     ) -> Result<bool, OpCode> {
-        let mut parent = Cow::Borrowed(parent_ptr);
+        debug_assert_eq!(parent_ptr.runtime_merging_child(), child_pid);
+        let parent_pid = parent_ptr.pid();
+        let mut parent = *parent_ptr;
         loop {
-            let mut txn = self.begin(g);
+            let mut build = self.begin_build();
             let (new_ptr, j) = {
-                let Some(x) = parent.remove_index(&mut txn, child_pid, safe_txid) else {
+                let Some(x) = parent.try_remove_index(&mut build, child_pid, safe_txid)? else {
                     return Ok(false);
                 };
                 x
             };
-            if let Ok(new_parent) = txn.replace(*parent, new_ptr, &j) {
-                txn.commit();
+            let mut publish = build.into_publish(g);
+            if let Ok(new_parent) = publish.replace(parent, new_ptr, &j) {
+                publish.finish();
                 let _ = parent_ptr.clear_runtime_merging_child(child_pid);
                 let _ = new_parent.clear_runtime_merging_child(child_pid);
                 return Ok(true);
             }
-            let new_ptr = if let Some(x) = self.load_node(g, parent_ptr.box_header().pid)? {
-                x
-            } else {
+            let Some(new_parent) = self.bucket.load(parent_pid)? else {
                 return Ok(false);
             };
-            if new_ptr.runtime_merging_child() != child_pid {
+            if new_parent.runtime_merging_child() != child_pid {
                 return Ok(false);
             }
-            parent = Cow::Owned(new_ptr);
+            parent = new_parent;
         }
     }
 
@@ -310,11 +334,13 @@ impl Tree {
             } else {
                 return Ok(None);
             };
-
-            if page.runtime_merging() {
-                return Ok(Some(page));
+            // lock child to bind live-check and merge-mark to the same swip
+            // without this, a stale child handle may be marked after table swap
+            let _lk = page.lock();
+            if self.bucket.table.get(page.pid()) != page.swip() {
+                continue;
             }
-            if page.try_mark_runtime_merging() {
+            if page.runtime_merging() || page.try_mark_runtime_merging() {
                 return Ok(Some(page));
             }
         }
@@ -333,22 +359,25 @@ impl Tree {
             return Err(OpCode::Again);
         };
         let safe_txid = self.store.context.numerics.safe_tixd();
-        let mut txn = self.begin(g);
+        let mut build = self.begin_build();
         // 1.
-        let (mut lnode, rnode, split_junks) = node.split_overlay(&mut txn, safe_txid);
+        let (mut lnode, rnode, split_junks) = node.try_split_overlay(&mut build, safe_txid)?;
         let mut rpage = Page::new(rnode);
 
         // 2.
-        let rpid = txn.map(&mut rpage);
+        let mut publish = build.into_publish(g);
+        let rpid = publish.map(&mut rpage);
         lnode.header_mut().right_sibling = rpid;
 
         // 3.
-        let lpage = txn.replace(node, lnode, &split_junks).inspect_err(|_| {})?;
+        let lpage = publish
+            .replace(node, lnode, &split_junks)
+            .inspect_err(|_| {})?;
         self.bucket.cache(rpage);
         // drop lock early so cooperative threads can make progress
         drop(node_lock);
         // publish rpage to page table
-        txn.commit();
+        publish.finish();
 
         let lo = rpage.lo();
         if let Some(parent) = parent_opt {
@@ -359,13 +388,20 @@ impl Tree {
                 return Ok(());
             }
             // 4.
-            let Some((new_node, j)) = parent.insert_index(&mut txn, lo, rpid, safe_txid) else {
-                // parent update raced with other structural change
+            let mut build = self.begin_build();
+            let Some((new_node, j)) = parent.try_insert_index(&mut build, lo, rpid, safe_txid)?
+            else {
+                // parent update raced with other tree change
                 return Ok(());
             };
-            txn.replace(parent, new_node, &j).inspect_err(|_| {})?;
+            let mut publish = build.into_publish(g);
+            publish.replace(parent, new_node, &j).inspect_err(|_| {})?;
             // publish new parent to page table
-            txn.commit();
+            publish.finish();
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::TreeNodeSplit, 1);
         } else {
             // 5.
             self.split_root(g, lpage, rpid, lo, safe_txid)?;
@@ -386,27 +422,34 @@ impl Tree {
         if self.bucket.table.get(root.pid()) != root.swip() {
             return Err(OpCode::Again);
         };
-        let mut txn = self.begin(g);
+        let mut build = self.begin_build();
 
         // compact root before building new root because step-3 publication can race with new writes
-        let (mut lnode, j) = root.compact(&mut txn, safe_txid);
+        let (mut lnode, j) = root.try_compact(&mut build, safe_txid)?;
         lnode.header_mut().right_sibling = rpid;
         let mut lpage = Page::new(lnode);
+        let mut lpid = build.reserve_pid()?;
 
-        let lpid = txn.map(&mut lpage);
-
-        let new_root_node = Node::new_root(
-            &mut txn,
+        let new_root_node = Node::try_new_root(
+            &mut build,
             self.bucket.loader(self.store.context),
             &[
-                (IntlKey::new([].as_slice()), Index::new(lpid)),
+                (IntlKey::new([].as_slice()), Index::new(lpid.pid())),
                 (IntlKey::new(lo), Index::new(rpid)),
             ],
-        );
-        let n = txn.replace(root, new_root_node, &j).inspect_err(|_| {})?;
+        )?;
+        let mut publish = build.into_publish(g);
+        publish.map_reserved(&mut lpage, &mut lpid);
+        let n = publish
+            .replace(root, new_root_node, &j)
+            .inspect_err(|_| {})?;
         assert_eq!(n.box_header().pid, self.root_index.pid);
         // publish new root to global
-        txn.commit();
+        publish.finish();
+        self.store
+            .opt
+            .observer
+            .counter(CounterMetric::TreeNodeSplit, 1);
         self.bucket.cache(lpage);
         Ok(())
     }
@@ -414,7 +457,10 @@ impl Tree {
     fn find_leaf(&self, g: &Guard, k: &[u8]) -> Result<Page, OpCode> {
         loop {
             match self.try_find_leaf(g, k) {
-                Err(OpCode::Again) => continue,
+                Err(OpCode::Again) => {
+                    g.flush();
+                    continue;
+                }
                 Err(e) => unreachable!("invalid opcode {:?}", e),
                 o => return o,
             }
@@ -476,7 +522,7 @@ impl Tree {
 
             // complete pending parent separator installation cooperatively
             if let Some(unsplit) = unsplit_parent_opt.take() {
-                let mut txn = self.begin(g);
+                let mut build = self.begin_build();
                 let _lk = unsplit.lock();
                 if self.bucket.table.get(unsplit.pid()) != unsplit.swip() {
                     // another thread already finished this parent update
@@ -484,12 +530,20 @@ impl Tree {
                 }
 
                 // create a new index in intl node
-                let Some((split_node, j)) = unsplit.insert_index(&mut txn, lo, cursor, self.txid())
+                let Some((split_node, j)) =
+                    unsplit.try_insert_index(&mut build, lo, cursor, self.txid())?
                 else {
                     return Err(OpCode::Again);
                 };
-                txn.replace(unsplit, split_node, &j).inspect_err(|_| {})?;
-                txn.commit();
+                let mut publish = build.into_publish(g);
+                publish
+                    .replace(unsplit, split_node, &j)
+                    .inspect_err(|_| {})?;
+                publish.finish();
+                self.store
+                    .opt
+                    .observer
+                    .counter(CounterMetric::TreeNodeSplit, 1);
             }
 
             if !leftmost
@@ -524,10 +578,17 @@ impl Tree {
         };
 
         // consolidation never retry
-        let mut txn = self.begin(g);
-        let (new_node, j) = page.compact(&mut txn, self.txid());
-        if txn.replace(page, new_node, &j).is_ok() {
-            txn.commit();
+        let mut build = self.begin_build();
+        let Ok((new_node, j)) = page.try_compact(&mut build, self.txid()) else {
+            return;
+        };
+        let mut publish = build.into_publish(g);
+        if publish.replace(page, new_node, &j).is_ok() {
+            publish.finish();
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::TreeNodeConsolidate, 1);
         }
     }
 
@@ -563,6 +624,9 @@ impl Tree {
         let Some(lk) = parent.try_lock() else {
             return Err(OpCode::Again);
         };
+        if self.bucket.table.get(parent.pid()) != parent.swip() {
+            return Err(OpCode::Again);
+        }
         if parent.runtime_merging_child() != NULL_PID {
             return Err(OpCode::Again);
         }
@@ -587,18 +651,31 @@ impl Tree {
             let Some(node) = page.try_lock() else {
                 continue;
             };
+            let lock_started = sampled_instant(k.txid(), LATENCY_SAMPLE_SHIFT);
             // consolidate happened, we must retry from root
             if self.bucket.table.get(page.pid()) != page.swip() {
+                observe_elapsed(
+                    self.store.opt.observer.as_ref(),
+                    HistogramMetric::TreeLinkHoldMicros,
+                    lock_started,
+                );
                 return Err(OpCode::Again);
             };
 
             let (group_id, pos) = check(page, k)?;
-            let mut txn = self.begin(g);
-            let (k, v) = DeltaView::from_key_val(&mut txn, k, v);
+            let mut build = self.begin_build();
+            let (k, v) = DeltaView::try_from_key_val(&mut build, k, v)?;
 
             node.insert(k, v);
+            observe_elapsed(
+                self.store.opt.observer.as_ref(),
+                HistogramMetric::TreeLinkHoldMicros,
+                lock_started,
+            );
             drop(node);
-            txn.record_and_commit(group_id as usize, pos);
+            build
+                .into_publish(g)
+                .record_lsn_and_finish(group_id as usize, pos);
             return Ok(());
         }
     }
@@ -625,6 +702,10 @@ impl Tree {
             match self.try_put::<K, V>(g, &key, &val) {
                 Ok(_) => return Ok(()),
                 Err(OpCode::Again) => {
+                    self.store
+                        .opt
+                        .observer
+                        .counter(CounterMetric::TreeRetryAgain, 1);
                     g.flush();
                     continue;
                 }
@@ -669,14 +750,22 @@ impl Tree {
         V: IVal,
         F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, Position), OpCode>,
     {
-        let size = key.packed_size() + val.packed_size();
-        if size > Options::MAX_KV_SIZE {
+        let ksz = key.packed_size();
+        if ksz > Options::MAX_KEY_SIZE || ksz + val.packed_size() > Options::MAX_KV_SIZE {
             return Err(OpCode::TooLarge);
         }
         loop {
             match self.try_update(g, &key, &val, &mut visible) {
                 Ok(x) => return Ok(x),
                 Err(OpCode::Again) => {
+                    self.store
+                        .opt
+                        .observer
+                        .counter(CounterMetric::TreeRetryAgain, 1);
+                    self.store
+                        .opt
+                        .observer
+                        .counter(CounterMetric::TxnRetryAgain, 1);
                     g.flush();
                     continue;
                 }
@@ -724,10 +813,7 @@ impl Tree {
             cache: None,
             iter_bound: None,
             checker: Box::new(visible),
-            filter: Filter {
-                last: Vec::new(),
-                has_last: false,
-            },
+            filter: Filter { has_last: false },
         }
     }
 
@@ -871,7 +957,15 @@ impl Iter<'_> {
         while !self.collapsed() {
             if self.iter.is_none() {
                 let g = crossbeam_epoch::pin();
-                let node = self.tree.find_leaf(&g, self.low_key()).expect("must exist");
+                let node = match self.tree.find_leaf(&g, self.low_key()) {
+                    Ok(node) => node,
+                    Err(OpCode::Again) => {
+                        g.flush();
+                        continue;
+                    }
+                    Err(OpCode::NotFound) => return None,
+                    Err(e) => panic!("iter find_leaf failed: {e:?}"),
+                };
                 let next_node = node.ref_node();
                 let next_bound = self.lo.clone();
 
@@ -959,18 +1053,16 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 struct Filter {
-    last: Vec<u8>,
     has_last: bool,
 }
 
 impl Filter {
     fn check<L: ILoader>(&mut self, item: &IterItem<L>) -> bool {
-        if self.has_last && item.cmp_key(&self.last).is_eq() {
+        // key() returns cached assembled key from previous accepted item
+        if self.has_last && item.cmp_key(item.key()).is_eq() {
             return false;
         }
-        let last = item.assembled_key();
-        self.last.clear();
-        self.last.extend_from_slice(last.deref());
+        let _ = item.assembled_key();
         self.has_last = true;
         !item.is_tombstone()
     }

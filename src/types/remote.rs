@@ -9,13 +9,15 @@ use crate::{
 impl RemoteView {
     const TAG: u64 = 1 << 63;
     #[cfg(test)]
-    pub fn alloc<A: crate::types::traits::IAlloc>(
+    pub fn alloc<A: crate::types::traits::IFrameAlloc>(
         a: &mut A,
         size: usize,
     ) -> crate::types::refbox::BoxRef {
         use crate::types::header::{RemoteHeader, TagKind};
 
-        let mut p = a.allocate((size + size_of::<RemoteHeader>()) as u32);
+        let mut p = a
+            .try_alloc((size + size_of::<RemoteHeader>()) as u32)
+            .unwrap();
         p.header_mut().kind = TagKind::Remote;
         p.view().as_remote().header_mut().size = size;
         p

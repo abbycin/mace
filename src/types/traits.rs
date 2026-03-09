@@ -46,27 +46,18 @@ pub trait IHeader<T> {
     fn header_mut(&mut self) -> &mut T;
 }
 
-pub trait IAlloc {
-    fn allocate(&mut self, size: u32) -> BoxRef;
+pub trait IFrameAlloc {
+    fn try_alloc(&mut self, size: u32) -> Result<BoxRef, OpCode>;
 
-    /// fallback for compatibility and tests, not a same-arena guarantee
-    /// production allocators should override this when crash-closure is required
-    fn allocate_pair(&mut self, size1: u32, size2: u32) -> (BoxRef, BoxRef) {
-        (self.allocate(size1), self.allocate(size2))
-    }
-
-    /// no-op fallback so lightweight allocators and tests keep compiling
-    /// production allocators should override this to enforce packed flush closure
-    fn begin_packed_alloc(&mut self, _total_real_size: u32, _nr_frames: u32) {}
-
-    /// no-op fallback paired with begin_packed_alloc
-    fn end_packed_alloc(&mut self) {}
-
-    fn collect(&mut self, addr: &[u64]);
+    fn try_alloc_pair(&mut self, size1: u32, size2: u32) -> Result<(BoxRef, BoxRef), OpCode>;
 
     fn arena_size(&mut self) -> usize;
 
     fn inline_size(&self) -> usize;
+}
+
+pub trait IRetireSink {
+    fn collect(&mut self, addr: &[u64]);
 }
 
 pub trait IKey: Default + IKeyCodec + Ord {

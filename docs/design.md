@@ -26,6 +26,8 @@ This document summarizes the current MACE design as reflected by the codebase. I
 - `numerics`: global counters (oracle, next ids, wmk_oldest, log_size)
 - `bucket_metas`: bucket name -> `BucketMeta` (id)
 - `pending_del`: buckets pending physical cleanup
+- `pending_sibling`: staged sibling addresses awaiting base publish/cleanup
+- `pending_retire`: staged retire addresses awaiting stat apply/cleanup
 - `page_table_{bucket_id}`: page id -> addr mappings
 - `data_interval_{bucket_id}` / `blob_interval_{bucket_id}`: addr ranges -> file ids
 - `data_stat` / `blob_stat`: per-file stats and masks for GC
@@ -37,8 +39,13 @@ Flush order is enforced by `StoreFlushObserver`:
 
 1. Write data/blob files to disk
 2. Ensure WAL durability barrier for this flush boundary (`flsn`) before publishing metadata
-3. Commit metadata transaction (stats, map table, intervals, numerics)
-4. Mark flush done, then advance per-group checkpoint positions and persist checkpoint records
+3. Commit one manifest txn for this flush boundary:
+   - map/stat/interval publish
+   - `pending_sibling` record/clear
+   - `pending_retire` record
+   - orphan marker clear + numerics
+4. Mark flush done and release arena refs
+5. Advance per-group checkpoint positions and persist checkpoint records
 
 This ensures data is durable before metadata points to it.
 
@@ -100,26 +107,95 @@ This replaces the old logical/physical id mapping: the logical address is stable
 - `Arena` is an append-only allocator with reference counting
 - Allocation uses direct `BoxRef` allocation (`alloc_exact`) with per-arena accounting (no chunk allocator)
 - `Arena` states: `HOT` (allocating), `WARM` (sealed), `COLD` (ready to flush), `FLUSH` (flushed)
-- Tombstones mark reclaimed entries; junk addresses are collected for GC
+- Tombstones suppress in-arena dead frames; unresolved retire addresses are staged for manifest-backed recovery
 
 `Pool` manages arenas for a bucket:
 
 - `Iim` tracks the addr -> arena id mapping for in-memory loads
 - `flsn` per writer group records WAL position of dirty data
 - `safe_to_flush` ensures WAL is flushed past arena `flsn` before flush
-- `over_provision` allows extra arenas if all are busy
+- allocator handoff marks old arena `WARM` and waits for in-flight allocs to drain before publishing next arena, which avoids cross-arena address overlap races
+- `Options::default_arenas` controls per-bucket pre-allocated arena count (`>= 2`, power-of-two, validated in `Options::validate`)
+- allocator may create bounded spill arenas (`default_arenas + arena_spill_limit`) under starvation; `arena_spill_limit` is clamped to `[1, MAX_DEFAULT_ARENAS]` in `Options::validate`
+- spill over-cap fail-fast returns `Again` to tree-internal retry path
+- retire addresses are staged arena-local in `Pool::pending_retire` and extracted by that arena's flush boundary
 
-### Packed allocation crash-closure
+Failure semantics:
 
-To keep crash consistency for dependent frames (for example base+sibling and delta+remote), MACE uses a packed allocation lifecycle:
+- `Pool::flush` enqueue to flusher channel is required to succeed
+- flusher channel disconnect is treated as fatal (fail-fast), never as a recoverable drop path
+- tree write paths consume allocator `Again` internally, instead of exposing spill pressure directly to user write APIs
 
-- `IAlloc` uses `u32` sizes for `allocate`, `allocate_pair`, and `begin_packed_alloc`
-- `begin_packed_alloc` reserves `real_size + frames` in one arena and reserves one contiguous logical address span
-- allocations inside the packed scope always use the pre-selected arena and sequential addresses from that span
-- `end_packed_alloc` verifies plan/usage equality (`frames`, address cursor, and bytes) and fails fast on mismatch
-- rollback removes packed entries from arena visibility first, then rolls back batch counters (`real_size`/`refs`)
+### Flow control and flush pacing
 
-The default trait methods are fallback-only for compatibility and tests; production allocators (`SysTxn`, `Evictor`) override them to enforce the closure guarantees.
+MACE uses a shared `FlowController` for foreground backpressure and flusher pacing.
+The controller is always present, but the current `Options::new()` defaults keep both
+`enable_backpressure` and `enable_flush_pacing` disabled unless explicitly enabled.
+
+Core model:
+
+- debt accounting is ticket-based:
+  - `on_enqueue_est`: `debt += est_bytes`
+  - `on_io_built`: reconcile by `debt += actual_bytes - est_bytes`, update `io_bps_ewma`, and count a real IO sample
+  - `on_mark_done`: release `debt -= actual_or_est`
+- `on_mark_done` settles debt for `Flushed`/`Skip`/`Empty`/`MetaOnly`
+- `io_bps_ewma` is updated on real build/sync completion, while `e2e_bps_ewma` is updated only for `Flushed`
+- backlog thresholds are expressed in flush units (`bp_*_debt_units`) rather than debt milliseconds
+- steady-state foreground backpressure uses `io_bps_ewma` as the primary disk signal
+- `e2e_bps_ewma` is not the steady-state primary denominator; it is used as a publish guard to scale writes down when publish/WAL follow-up materially lags disk IO
+- cold start waits for `bp_warmup_min_samples` real IO samples before enabling steady-state disk-based control
+- before warmup completes, only the cold-start fail-safe backlog window may throttle foreground writes
+- long idle windows reset stale throughput samples (`bp_idle_reset_ms`)
+
+Foreground backpressure:
+
+- `before_write_budget` is executed **before** entering `tree.update`
+- no sleep is allowed inside the tree update closure (leaf lock critical section)
+- write paths use estimated bytes for pre-update throttling; exact WAL shape is still decided in closure logic
+- below the cold-start fail-safe backlog, foreground writes are allowed to proceed without sleep so the system can collect initial IO samples
+- in steady state, delay is derived from backlog units, `io_bps_ewma`, publish guard ratio, and is capped by `bp_max_delay_us`
+
+Flush pacing:
+
+- pacing is FIFO-preserving and runs only after `safe_to_flush`
+- pacing only runs after warmup has enough real IO samples
+- low debt: pacing may sleep to smooth flush cadence
+- pacing uses its own low-backlog threshold (`bp_pacing_soft_debt_units`) instead of sharing the foreground soft threshold
+- high debt: pacing bypasses to chase backlog
+- teardown and arena starvation use global reference-counted bypass scopes so all in-flight buckets observe bypass consistently
+
+### Sibling crash-closure via pending metadata
+
+For multi-version leaf rebuild, crash-closure is implemented with `pending_sibling` metadata instead of packed allocation scopes:
+
+- `BaseView::new_leaf` allocates sibling chains first, then allocates the base frame
+- multi-version leaf base stores sibling head hints in an in-memory footer (`u32 count + u64[] heads`)
+- dump path trims this footer and rewrites dump header, so on-disk base format excludes sibling hints
+- flush scans arena frames:
+  - sibling frames contribute `pending_sibling_addrs`
+  - base leaf frames with `has_multiple_versions` load `published_sibling_addrs` from footer hints
+- before arena release, flush stages `pending_sibling` records (`bucket_id + kind + addr` key space)
+- current flush publish path stages `PendingRangeKind::Data`; recovery logic supports both `Data` and `Blob`
+- base publish clears the corresponding pending sibling records in the same manifest txn
+- startup recovery (`recover_pending_siblings_to_stats`) applies any leftover pending siblings into stat bitmaps and clears pending entries
+
+This keeps sibling dangling-pointer cleanup crash-safe while preserving the shared arena allocation model.
+
+### Retire crash-closure via pending metadata
+
+Retire/junk closure is implemented by `pending_retire` metadata, not by requiring data and retire records to share one arena:
+
+- tree/evict publish contexts collect retire addresses in memory and stage them into `Pool::pending_retire` keyed by arena id
+- when that arena is flushed, retire sets are attached to `FlushResult` and written as `pending_retire` in the same manifest txn as map/stat/interval publish
+- startup (`Mace::new`) and periodic GC ticks call `recover_pending_retires_to_stats`
+- recovery path applies `pending_retire` to data/blob stats first, then clears processed entries in the same txn
+- `OpCode::NotFound` during recover only clears when bucket is truly deleted (`pending_del` or missing `bucket_meta`); unloaded buckets keep intents for retry
+- failpoint `mace_retire_after_apply_before_clear` validates apply/clear crash window idempotence
+
+This closes both retire failure classes:
+
+- no leak from "data durable but retire missing"
+- no wrong reclaim from "retire visible before new mapping publish"
 
 ### Loader and caches
 
@@ -135,7 +211,7 @@ The default trait methods are fallback-only for compatibility and tests; product
 - Evictor runs when cache usage reaches ~80% of capacity
 - It samples candidate pids, cools to `Cold`, then evicts by tagging SWIPs
 - If delta chains are long or contain garbage, eviction triggers compaction
-- Leaf rebuild during compaction uses the same packed allocation hooks as foreground transactions
+- Leaf rebuild during compaction follows the same sibling-hint and pending-sibling flow as foreground rebuild
 - Compaction writes junk frames into arenas for later GC
 
 ## Index (Bw-Tree variant)
@@ -213,6 +289,29 @@ This prevents deleting WAL still needed for recovery or active transactions.
 - Bucket-aware replay skips buckets already deleted
 - After redo/undo, `oracle` and `wmk_oldest` are advanced, and loaded bucket contexts are evicted
 
+#### Pending sibling recovery
+
+`pending_sibling` is used to close the crash window between sibling flush and base publish:
+
+1. Flush stages sibling addresses into `pending_sibling` before releasing arena refs
+2. Base publish clears the pending addresses that are now reachable from durable base metadata
+3. Startup scans remaining `pending_sibling` entries and applies them to `DataStat` / `BlobStat` masks
+4. The same startup txn clears processed pending entries
+
+The flow is idempotent and does not require a dedicated GC queue for pending sibling cleanup.
+
+#### Pending retire recovery
+
+`pending_retire` is used to close the crash window between new mapping publish and retire stat apply:
+
+1. Flush publish records `pending_retire` entries in the same manifest txn as mapping/stat updates
+2. Recovery and GC call `recover_pending_retires_to_stats` to replay pending retire intents
+3. The replay path groups entries by bucket/kind, applies to data/blob stats, then clears only applied entries in one txn
+4. If bucket context cannot be loaded temporarily (for example unloaded), intents are retained for retry
+5. If bucket is truly deleted (`pending_del` or no persisted bucket meta), stale intents are cleared safely
+
+The flow is idempotent and preserves bucket-local isolation.
+
 #### Orphan data/blob cleanup
 
 Orphans are data/blob files that were written to disk but never published by manifest metadata
@@ -256,6 +355,107 @@ Obsolete files are normal GC outputs (not orphans). Deletion is handled by `Mani
 - If a crash happens mid-delete, the remaining entries stay in the obsolete lists and will be retried at the next run.
 
 This makes file deletion idempotent across crashes.
+
+
+## Observability design
+
+### Goals and non-goals
+
+- Provide low-overhead, in-process signals for correctness and performance diagnosis
+- Keep observability decoupled from engine behavior (metrics must not change durability or concurrency semantics)
+- Avoid dynamic label cardinality and allocator-heavy hot-path reporting
+- Non-goal: built-in exporter/protocol integration (Prometheus/OpenTelemetry adapters are external)
+
+### API and lifecycle
+
+- `Options::observer: Arc<dyn Observer>` is the injection point
+- Default is `NoopObserver`, so observability is opt-in and zero-cost by default
+- Public API is re-exported as `mace::observe`
+- `Observer` interface is push-based:
+  - `counter(CounterMetric, delta)`
+  - `gauge(GaugeMetric, value)`
+  - `histogram(HistogramMetric, value)`
+  - `event(ObserveEvent)`
+- Callbacks can run concurrently from writer threads, recovery, and GC thread, so implementations must be `Send + Sync`, non-blocking, and panic-free
+
+Built-in utility implementation:
+
+- `InMemoryObserver` keeps fixed metric arrays (atomics) and a bounded FIFO event buffer (`event_cap`)
+- Snapshot API (`snapshot()`) is intended for tests, local debugging, and example/demo usage
+
+### Metric and event model
+
+- `CounterMetric`: monotonic `u64` process-local counters
+- `GaugeMetric`: point-in-time `i64` gauges
+- `HistogramMetric`: reduced summary (`count`, `sum`, `max`) per metric
+- `EventKind` + `ObserveEvent { kind, bucket_id, txid, file_id, value }`: sparse structured events for critical lifecycle points
+
+All metric dimensions are encoded in enums (fixed cardinality, no runtime label map).
+
+### Coverage by subsystem
+
+- Transaction/MVCC (`TxnKV`):
+  - counters: begin/commit/abort/conflict-abort/rollback/retry
+  - histograms: commit latency, rollback latency
+  - events: conflict-abort, rollback-complete
+- Index tree (`Tree::link`, retry loops):
+  - counters: tree retry-again
+  - histograms: link lock-hold latency
+- WAL (`cc/log.rs`):
+  - counters: append count, sync count
+  - histograms: append bytes, sync latency
+- Flush/manifest orphan protocol (`meta/mod.rs`):
+  - counters: orphan data/blob staged and cleared
+  - counters: retire recorded
+  - events: orphan stage/clear transitions
+- Recovery (`store/recovery.rs`):
+  - counters: redo record count, undo txn count, wal truncate count
+  - gauges: dirty entries, undo entries
+  - histograms: phase2/analyze/redo/undo latency
+  - events: phase2 begin/end
+- GC (`store/gc.rs`):
+  - counters:
+    - gc run count
+    - retire data/blob applied and retire cleared
+    - wal recycle file count
+    - pending bucket clean count
+    - scavenge scanned/compacted page count
+    - data/blob rewrite count
+    - data/blob obsolete file count
+  - histograms:
+    - gc run latency
+    - scavenge latency
+    - data/blob rewrite latency
+    - data/blob rewrite victim-file count
+  - events:
+    - pending bucket cleaned
+    - data rewrite complete
+    - blob rewrite complete
+- Flow control (`map/flow.rs`):
+  - counters:
+    - foreground delay count
+    - pacing sleep count
+    - pacing bypass count (high debt / teardown / arena starvation)
+  - histograms:
+    - foreground delay micros
+    - pacing sleep micros
+
+### Hot-path overhead control
+
+- Latency metrics in high-frequency paths are sampled via `should_sample(seed, LATENCY_SAMPLE_SHIFT)`
+- Current default sample rate is `1 / 64` (`LATENCY_SAMPLE_SHIFT = 6`) for:
+  - txn commit latency
+  - txn rollback latency
+  - tree link lock-hold latency
+  - wal sync latency
+- Low-frequency paths (recovery/GC) report full latency without sampling
+- Metric emission is inline (no background dispatch queue), so observer implementations should keep per-call work O(1)
+
+### Validation and usage
+
+- Example usage: `examples/observer.rs`
+- Baseline observer unit test: `src/utils/observe.rs` (`snapshot_counts`)
+- GC observability regression test: `tests/gc.rs` (`gc_observer_metrics`)
 
 
 ## Disk GC and rewrite
@@ -302,10 +502,18 @@ This makes file deletion idempotent across crashes.
 
 - Data must be flushed before manifest commits
 - PageMap entries must be consistent with map tables written in the same flush txn
-- Dependent allocations must be closed in one packed scope (same arena + contiguous address span)
-- Packed plan mismatch must fail fast (`error` + panic), never silently downgrade to split allocation
+- Multi-version leaf rebuild allocates sibling chains before base allocation
+- Leaf base with `has_multiple_versions` must carry sibling-head hints during flush scan
+- Pending sibling records must be durable before arena release
+- Base publish and pending-sibling clear must be committed in the same manifest txn
+- Startup pending-sibling recovery must be idempotent (safe on retry/replay)
+- Pending retire records must be committed in the same manifest txn as the flush publish that makes replacements durable
+- Pending retire clear must not happen unless the corresponding stat apply is part of the same committed txn
+- Pending retire `NotFound` clear is allowed only for truly deleted buckets; unloaded buckets must keep intents for retry
 - Bucket deletion must be two-phase; do not decrement `nr_buckets` early
 - WAL files can only be deleted up to the safe checkpoint boundary
+- Foreground backpressure delay must not run in tree leaf lock critical sections
+- spill-cap `Again` must be retried inside tree to avoid user-visible retry storms
 
 ## Operational validation pipeline
 
@@ -316,6 +524,7 @@ To keep production behavior aligned with crash-safety and performance invariants
   - `stress` for long-run pressure
   - `chaos` for failpoint crash/fault windows
   - `all` for full matrix (`fast + stress + chaos`)
+  - crash-window coverage includes `after_data_sync`, `before_manifest_commit`, `after_manifest_commit`, and `retire_after_apply_before_clear`
 - `scripts/perf_gate.sh`
   - `snapshot` captures current benchmark summary
   - `compare` gates regressions against a baseline ref (`MACE_PERF_BASE_REF`)

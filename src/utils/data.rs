@@ -4,9 +4,6 @@ use crate::io::{self, GatherIO, IoVec};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
-/// packed logical id and offset
-pub(crate) const JUNK_LEN: usize = size_of::<u64>();
-
 #[derive(Clone, Copy)]
 pub struct LenSeq {
     pub len: u32,
