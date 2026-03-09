@@ -239,15 +239,37 @@ fn flush_pacing_emits_bypass_metrics_under_high_pressure() -> Result<(), OpCode>
 
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x").unwrap();
-    let value = vec![b'h'; 2048];
-    for i in 0..500 {
-        let key = format!("k{i:06}");
-        let tx = db.begin().unwrap();
-        tx.put(&key, &value)?;
-        tx.commit()?;
+    let value = vec![b'h'; 16 << 10];
+    let mut seq = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        for _ in 0..128 {
+            let tx = match db.begin() {
+                Ok(tx) => tx,
+                Err(OpCode::Again | OpCode::AbortTx) => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let key = format!("k{seq:010}");
+            seq += 1;
+            match tx.upsert(&key, &value) {
+                Ok(_) => match tx.commit() {
+                    Ok(_) => {}
+                    Err(OpCode::Again | OpCode::AbortTx) => std::thread::yield_now(),
+                    Err(e) => return Err(e),
+                },
+                Err(OpCode::Again | OpCode::AbortTx) => std::thread::yield_now(),
+                Err(e) => return Err(e),
+            }
+        }
+        let snapshot = observer.snapshot();
+        let bypass_count = counter(&snapshot, CounterMetric::FlowFlushPacingBypassHighDebt);
+        if bypass_count > 0 {
+            return Ok(());
+        }
     }
-
-    std::thread::sleep(Duration::from_millis(100));
 
     let snapshot = observer.snapshot();
     let bypass_count = counter(&snapshot, CounterMetric::FlowFlushPacingBypassHighDebt);

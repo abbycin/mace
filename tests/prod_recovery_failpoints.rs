@@ -215,6 +215,22 @@ fn counter(snapshot: &ObserveSnapshot, metric: CounterMetric) -> u64 {
         .unwrap_or(0)
 }
 
+fn wait_retire_replayed(observer: &Arc<InMemoryObserver>, mace: &Mace, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        mace.start_gc();
+        let snapshot = observer.snapshot();
+        let applied = counter(&snapshot, CounterMetric::RetireDataApplied)
+            + counter(&snapshot, CounterMetric::RetireBlobApplied);
+        let cleared = counter(&snapshot, CounterMetric::RetireCleared);
+        if applied > 0 && cleared > 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("retire replay did not complete in expected window")
+}
+
 fn assert_retire_replayed_after_reopen(db_root: &Path, inline_size: usize) {
     let observer = Arc::new(InMemoryObserver::new(256));
     let mace = open_with_tune(db_root, |opt| {
@@ -229,7 +245,7 @@ fn assert_retire_replayed_after_reopen(db_root: &Path, inline_size: usize) {
         let key = format!("rk_{idx}");
         let _ = view.get(&key);
     }
-    mace.start_gc();
+    wait_retire_replayed(&observer, &mace, Duration::from_secs(5));
     let snapshot = observer.snapshot();
     let applied = counter(&snapshot, CounterMetric::RetireDataApplied)
         + counter(&snapshot, CounterMetric::RetireBlobApplied);
@@ -256,7 +272,7 @@ fn assert_retire_replayed_after_reopen_multi_bucket(db_root: &Path, inline_size:
         let _ = view1.get(&key1);
         let _ = view2.get(&key2);
     }
-    mace.start_gc();
+    wait_retire_replayed(&observer, &mace, Duration::from_secs(5));
     let snapshot = observer.snapshot();
     let applied = counter(&snapshot, CounterMetric::RetireDataApplied)
         + counter(&snapshot, CounterMetric::RetireBlobApplied);
