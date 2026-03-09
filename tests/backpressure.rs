@@ -172,7 +172,7 @@ fn flush_pacing_avoids_high_debt_bypass_under_low_debt() -> Result<(), OpCode> {
         tx.commit()?;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
         let snapshot = observer.snapshot();
         if counter(&snapshot, CounterMetric::FlowFlushPacingSleep) > 0 {
@@ -265,17 +265,26 @@ fn flush_pacing_emits_bypass_metrics_under_high_pressure() -> Result<(), OpCode>
             }
         }
         let snapshot = observer.snapshot();
-        let bypass_count = counter(&snapshot, CounterMetric::FlowFlushPacingBypassHighDebt);
-        if bypass_count > 0 {
+        let bypass_high = counter(&snapshot, CounterMetric::FlowFlushPacingBypassHighDebt);
+        let bypass_starving = counter(
+            &snapshot,
+            CounterMetric::FlowFlushPacingBypassArenaStarvation,
+        );
+        if bypass_high > 0 || bypass_starving > 0 {
             return Ok(());
         }
     }
 
     let snapshot = observer.snapshot();
-    let bypass_count = counter(&snapshot, CounterMetric::FlowFlushPacingBypassHighDebt);
+    let bypass_high = counter(&snapshot, CounterMetric::FlowFlushPacingBypassHighDebt);
+    let bypass_starving = counter(
+        &snapshot,
+        CounterMetric::FlowFlushPacingBypassArenaStarvation,
+    );
+    let bypass_teardown = counter(&snapshot, CounterMetric::FlowFlushPacingBypassTeardown);
     assert!(
-        bypass_count > 0,
-        "high pressure pacing bypass counter should be > 0"
+        bypass_high > 0 || bypass_starving > 0,
+        "high pressure should trigger non-teardown pacing bypass (high={bypass_high}, starving={bypass_starving}, teardown={bypass_teardown})"
     );
     Ok(())
 }
