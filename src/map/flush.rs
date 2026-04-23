@@ -1,13 +1,12 @@
 use crate::cc::context::Context;
-use crate::map::data::{Arena, FileBuilder};
-use crate::map::flow::FlowOutcome;
+use crate::map::data::{CheckpointTask, FileBuilder, MapBuilder};
 use crate::meta::{BlobStat, DataStat, IntervalPair, MemBlobStat, MemDataStat, PageTable};
-use crate::types::header::{NodeType, TagFlag, TagKind};
-use crate::types::traits::IHeader;
-use crate::utils::Handle;
-use crate::utils::OpCode;
+#[cfg(feature = "extra_check")]
+use crate::utils::NULL_ADDR;
 use crate::utils::countblock::Countblock;
-use crate::utils::data::{Interval, Position};
+use crate::utils::data::{GatherWriter, GroupPositions, Interval};
+use crate::utils::observe::CounterMetric;
+use crate::utils::{Handle, MutRef};
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::RecvTimeoutError;
@@ -21,258 +20,274 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::data::{FlushData, MapBuilder};
-
 pub enum FlushDirective {
     Skip,
     Normal,
 }
 
 pub struct FlushResult {
+    sync_all: bool,
     pub bucket_id: u64,
-    pub data_id: Option<u64>,
     pub map_table: PageTable,
-    pub data_ivl: Option<IntervalPair>,
-    pub data_stat: Option<DataStat>,
-    pub mem_data_stat: Option<MemDataStat>,
-    pub data_junks: Vec<u64>,
-    pub blob_ivl: Option<IntervalPair>,
-    pub mem_blob_stat: Option<MemBlobStat>,
-    pub blob_stat: Option<BlobStat>,
-    pub blob_junks: Vec<u64>,
-    pub pending_sibling_addrs: Vec<u64>,
-    pub published_sibling_addrs: Vec<u64>,
-    pub flsn: Vec<Position>,
-    pub done: FlushData,
+    pub data_ivls: Vec<IntervalPair>,
+    pub data_stats: Vec<DataStat>,
+    pub blob_ivls: Vec<IntervalPair>,
+    pub blob_stats: Vec<BlobStat>,
+    pub blob_junk: Vec<u64>,
+    pub data_junk: Vec<u64>,
+    pub writers: Vec<GatherWriter>,
+    pub latest_chkpoint_lsn: MutRef<GroupPositions>,
 }
 
-pub trait FlushObserver: Send + Sync {
-    fn flush_directive(&self, bucket_id: u64) -> FlushDirective;
-    fn stage_orphan_data_file(&self, file_id: u64);
-    fn stage_orphan_blob_file(&self, file_id: u64);
-    fn on_flush(&self, result: FlushResult) -> Result<(), OpCode>;
-}
-
-fn file_size(path: &std::path::Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-}
-
-fn flush_data(
-    mut msg: FlushData,
-    ctx: Handle<Context>,
-    observer: &dyn FlushObserver,
-) -> Option<FlushResult> {
-    let bucket_id = msg.bucket_id();
-    let mut builder = FileBuilder::new(bucket_id);
-    let mut map = MapBuilder::new(bucket_id);
-    let mut sibling_addrs = Vec::new();
-    let mut published_sibling_addrs = Vec::new();
-
-    for x in msg.iter() {
-        let f = x.value();
-        let hdr = f.header();
-        if hdr.flag == TagFlag::Sibling {
-            sibling_addrs.push(hdr.addr);
-        } else if hdr.flag == TagFlag::Normal
-            && hdr.kind == TagKind::Base
-            && hdr.node_type == NodeType::Leaf
-        {
-            let base = f.view().as_base();
-            if base.header().has_multiple_versions {
-                let has_hint = base.load_sibling_heads_hint(&mut published_sibling_addrs);
-                assert!(has_hint, "missing sibling hint for base addr {}", hdr.addr);
+impl FlushResult {
+    pub fn sync(&mut self) {
+        if self.sync_all {
+            for mut x in self.writers.drain(..) {
+                x.sync();
+            }
+        } else {
+            for mut x in self.writers.drain(..) {
+                x.sync_data();
             }
         }
-        map.add(f);
-        builder.add(f.clone());
     }
-    let map_table = map.table();
+}
 
-    let (mut retire_data, mut retire_blob) = msg.take_retires();
-    retire_data.sort_unstable();
-    retire_data.dedup();
-    retire_blob.sort_unstable();
-    retire_blob.dedup();
+pub trait CheckpointObserver: Send + Sync {
+    fn flush_directive(&self, bucket_id: u64) -> FlushDirective;
+    fn stage_unsynced_data_file(&self, file_id: u64);
+    fn stage_unsynced_blob_file(&self, file_id: u64);
+    fn stage_orphan_data_file(&self, file_id: u64);
+    fn stage_orphan_blob_file(&self, file_id: u64);
+    fn update_data_mem_interval_stat(&self, ivl: IntervalPair, stat: MemDataStat);
+    fn update_blob_mem_interval_stat(&self, ivl: IntervalPair, stat: MemBlobStat);
+    fn on_flush(&self, result: FlushResult);
+}
 
-    if builder.is_empty()
-        && map_table.is_empty()
-        && retire_data.is_empty()
-        && retire_blob.is_empty()
-    {
-        msg.set_flow_outcome(FlowOutcome::Empty);
-        msg.mark_done();
-        return None;
+fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn CheckpointObserver) {
+    let bucket_id = task.bucket_id;
+    let mut snapshot = task.snapshot();
+    let mut map_builder = MapBuilder::new(bucket_id, &snapshot.unmap_pid);
+    let mut file_builder = FileBuilder::new(bucket_id);
+
+    let pages = std::mem::take(&mut snapshot.pages);
+    for b in pages {
+        map_builder.add(&b);
+        file_builder.add(b);
     }
-    let flsn = msg.flsn.iter().map(|x| x.load()).collect();
 
-    if builder.is_empty() {
-        msg.set_flow_outcome(FlowOutcome::MetaOnly);
-        return Some(FlushResult {
+    let mapping = map_builder.table();
+    #[cfg(feature = "extra_check")]
+    for (&pid, &addr) in mapping.iter() {
+        assert!(
+            addr == NULL_ADDR || addr <= task.snap_addr,
+            "map addr {} for pid {} exceeds snap_addr {}",
+            addr,
+            pid,
+            task.snap_addr
+        );
+    }
+
+    if file_builder.is_empty() {
+        observer.on_flush(FlushResult {
+            sync_all: false,
             bucket_id,
-            data_id: None,
-            map_table,
-            data_ivl: None,
-            data_stat: None,
-            mem_data_stat: None,
-            data_junks: retire_data,
-            blob_ivl: None,
-            mem_blob_stat: None,
-            blob_stat: None,
-            blob_junks: retire_blob,
-            pending_sibling_addrs: sibling_addrs,
-            published_sibling_addrs,
-            flsn,
-            done: msg,
+            map_table: mapping,
+            data_ivls: Vec::new(),
+            data_stats: Vec::new(),
+            blob_ivls: Vec::new(),
+            blob_stats: Vec::new(),
+            blob_junk: std::mem::take(&mut snapshot.blob_junk),
+            data_junk: std::mem::take(&mut snapshot.data_junk),
+            writers: Vec::new(),
+            latest_chkpoint_lsn: task.last_chkpt_lsn.clone(),
         });
+        task.done(snapshot);
+        return;
     }
 
-    if !ctx.opt.db_root.exists() {
-        log::error!("db_root {:?} not exist", ctx.opt.db_root);
-        panic!("db_root {:?} not exist", ctx.opt.db_root);
-    }
-
-    let data_id = msg.id();
-    let data_path = ctx.opt.data_file(data_id);
+    let mut data_ivls = Vec::new();
+    let mut data_stats = Vec::new();
+    let mut blob_ivls = Vec::new();
+    let mut blob_stats = Vec::new();
+    let mut writers = Vec::new();
+    let actual_bytes = file_builder.io_bytes();
     let io_started = Instant::now();
 
-    observer.stage_orphan_data_file(data_id);
-    // 1. perform disk I/O
-    let data_ivl = builder
-        .build_data(data_id, data_path)
-        .map(|Interval { lo, hi }| IntervalPair::new(lo, hi, data_id, bucket_id));
-
-    let mut blob_ivl = None;
-    let mut mem_blob_stat = None;
-    let mut blob_stat = None;
-    let mut blob_bytes = 0;
-    if builder.has_blob() {
-        let blob_id = ctx.numerics.next_blob_id.fetch_add(1, Relaxed);
-        let blob_path = ctx.opt.blob_file(blob_id);
-        observer.stage_orphan_blob_file(blob_id);
-        let Interval { lo, hi } = builder.build_blob(blob_path);
-        blob_bytes = file_size(&ctx.opt.blob_file(blob_id));
-        let new_blob_ivl = IntervalPair::new(lo, hi, blob_id, bucket_id);
-        let mut new_mem_blob_stat = builder.blob_stat(blob_id);
-        new_mem_blob_stat.inner.bucket_id = bucket_id;
-        blob_ivl = Some(new_blob_ivl);
-        blob_stat = Some(new_mem_blob_stat.copy());
-        mem_blob_stat = Some(new_mem_blob_stat);
+    if file_builder.has_data() {
+        let data_files = file_builder.flush_data_files(
+            ctx.opt.data_file_size,
+            || {
+                let data_file_id = ctx.numerics.next_data_id.fetch_add(1, Relaxed);
+                observer.stage_orphan_data_file(data_file_id);
+                observer.stage_unsynced_data_file(data_file_id);
+                (data_file_id, ctx.opt.data_file(data_file_id))
+            },
+            |bytes| {
+                task.mark_checkpoint_progress(bytes);
+            },
+            |file| {
+                let ivl =
+                    IntervalPair::new(file.interval.lo, file.interval.hi, file.file_id, bucket_id);
+                observer.update_data_mem_interval_stat(ivl, file.stat.clone_mem());
+                task.release_persisted_pages(&file.addrs);
+            },
+        );
+        for file in data_files {
+            let Interval { lo, hi } = file.interval;
+            data_ivls.push(IntervalPair::new(lo, hi, file.file_id, bucket_id));
+            data_stats.push(file.stat.copy());
+            writers.push(file.writer);
+        }
     }
 
-    let actual_bytes = file_size(&ctx.opt.data_file(data_id)).saturating_add(blob_bytes);
-    msg.mark_flow_io_built(actual_bytes, io_started.elapsed());
+    if file_builder.has_blob() {
+        let blob_files = file_builder.flush_blob_files(
+            ctx.opt.blob_file_size,
+            || {
+                let blob_file_id = ctx.numerics.next_blob_id.fetch_add(1, Relaxed);
+                observer.stage_orphan_blob_file(blob_file_id);
+                observer.stage_unsynced_blob_file(blob_file_id);
+                (blob_file_id, ctx.opt.blob_file(blob_file_id))
+            },
+            |bytes| {
+                task.mark_checkpoint_progress(bytes);
+            },
+            |file| {
+                let ivl =
+                    IntervalPair::new(file.interval.lo, file.interval.hi, file.file_id, bucket_id);
+                observer.update_blob_mem_interval_stat(ivl, file.stat.clone_mem());
+                task.release_persisted_pages(&file.addrs);
+            },
+        );
+        for file in blob_files {
+            let Interval { lo, hi } = file.interval;
+            blob_ivls.push(IntervalPair::new(lo, hi, file.file_id, bucket_id));
+            blob_stats.push(file.stat.copy());
+            writers.push(file.writer);
+        }
+    }
 
     #[cfg(feature = "failpoints")]
     crate::utils::failpoint::crash("mace_flush_after_data_sync");
 
-    // 2. prepare statistics
-    let mut mem_data_stat = builder.data_stat(data_id, data_id);
-    mem_data_stat.inner.bucket_id = bucket_id;
-    let data_stat = mem_data_stat.copy();
-    Some(FlushResult {
+    task.mark_io_built(actual_bytes, io_started.elapsed());
+    observer.on_flush(FlushResult {
+        sync_all: ctx.opt.sync_on_write,
         bucket_id,
-        data_id: Some(data_id),
-        map_table,
-        data_ivl,
-        data_stat: Some(data_stat),
-        mem_data_stat: Some(mem_data_stat),
-        data_junks: retire_data,
-        blob_ivl,
-        mem_blob_stat,
-        blob_stat,
-        blob_junks: retire_blob,
-        pending_sibling_addrs: sibling_addrs,
-        published_sibling_addrs,
-        flsn,
-        done: msg,
-    })
+        map_table: mapping,
+        data_ivls,
+        data_stats,
+        blob_ivls,
+        blob_stats,
+        blob_junk: std::mem::take(&mut snapshot.blob_junk),
+        data_junk: std::mem::take(&mut snapshot.data_junk),
+        writers,
+        latest_chkpoint_lsn: task.last_chkpt_lsn.clone(),
+    });
+
+    task.done(snapshot);
 }
 
-fn safe_to_flush(data: &FlushData, ctx: Handle<Context>) -> bool {
-    if data.refcnt() != 0 {
-        return false;
-    }
-    safe_to_flush_force(data, ctx)
-}
-
-fn safe_to_flush_force(data: &FlushData, ctx: Handle<Context>) -> bool {
-    let groups = ctx.groups();
-    debug_assert_eq!(data.flsn.len(), groups.len());
-    for (i, g) in groups.iter().enumerate() {
-        // first update dirty page, and later update flsn on flush
-        let pos = data.flsn[i].load();
-        let flushed = g.logging.lock().flushed_pos();
-        if pos.file_id > flushed.file_id
-            || (pos.file_id == flushed.file_id && pos.offset > flushed.offset)
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn try_flush(
-    q: &mut VecDeque<FlushData>,
+fn process_task(
+    q: &mut VecDeque<CheckpointTask>,
     ctx: Handle<Context>,
-    observer: &dyn FlushObserver,
-) -> bool {
-    while let Some(data) = q.pop_front() {
-        let directive = observer.flush_directive(data.bucket_id());
+    observer: &dyn CheckpointObserver,
+) {
+    let mut flushed = false;
+    while let Some(task) = q.pop_front() {
+        flushed = true;
+        let directive = observer.flush_directive(task.bucket_id);
         if let FlushDirective::Skip = directive {
-            data.set_flow_outcome(FlowOutcome::Skip);
-            data.set_state(Arena::WARM, Arena::COLD);
-            data.mark_done();
+            // Skip is only used for unload/delete bucket
+            // in this lifecycle the bucket is being reclaimed, so persisting this sealed batch,
+            // reclaiming its generation resources, and settling flow-control accounting are all
+            // intentionally unnecessary
+            task.force_done();
+            continue;
+        }
+        checkpoint(task, ctx, observer);
+    }
+    if flushed {
+        process_wal_clean(ctx);
+    }
+}
+
+fn process_wal_clean(ctx: Handle<Context>) {
+    for g in ctx.groups().iter() {
+        let mut checkpoint_id = g.active_txns.min_position_file_id();
+        let (oldest_id, last_ckpt_file) = {
+            let logging = g.logging.lock();
+            (logging.oldest_wal_id(), logging.last_ckpt().file_id)
+        };
+        checkpoint_id = std::cmp::min(checkpoint_id, last_ckpt_file);
+        if oldest_id >= checkpoint_id {
             continue;
         }
 
-        let can_flush = safe_to_flush(&data, ctx);
-
-        if can_flush && data.set_state(Arena::WARM, Arena::COLD) == Arena::WARM {
-            data.pace_before_flush();
-            if let Some(result) = flush_data(data, ctx, observer) {
-                observer.on_flush(result).unwrap();
-            }
-        } else {
-            q.push_front(data);
-            break;
+        // [oldest_id, checkpoint_id)
+        let recycled = process_one_wal(ctx, g.id as u8, oldest_id, checkpoint_id);
+        if recycled > 0 {
+            ctx.opt
+                .observer
+                .counter(CounterMetric::GcWalRecycleFile, recycled);
         }
+        g.logging.lock().advance_oldest_wal_id(checkpoint_id);
     }
-    q.is_empty()
 }
 
-fn flush_thread(
-    rx: Receiver<FlushData>,
+fn process_one_wal(ctx: Handle<Context>, group: u8, beg: u64, end: u64) -> u64 {
+    let mut recycled = 0;
+    // NOTE: not including `end`
+    for seq in beg..end {
+        let from = ctx.opt.wal_file(group, seq);
+        if !from.exists() {
+            continue;
+        }
+        let to = ctx.opt.wal_backup(group, seq);
+        if ctx.opt.keep_stable_wal_file {
+            log::info!("rename {from:?} to {to:?}");
+            std::fs::rename(&from, &to)
+                .inspect_err(|e| {
+                    log::error!("can't rename {from:?} to {to:?}, error {e:?}");
+                })
+                .unwrap();
+        } else {
+            log::info!("unlink {from:?}");
+            std::fs::remove_file(&from)
+                .inspect_err(|e| log::error!("can't remove {from:?}, error {e:?}"))
+                .unwrap();
+        }
+        recycled += 1;
+    }
+    recycled
+}
+
+fn checkpoint_thread(
+    rx: Receiver<CheckpointTask>,
     ctx: Handle<Context>,
-    observer: Arc<dyn FlushObserver>,
+    observer: Arc<dyn CheckpointObserver>,
     sync: Arc<Notifier>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
-        .name("flusher".into())
+        .name("checkpointer".into())
         .spawn(move || {
-            log::debug!("start flush thread");
             let mut q = VecDeque::new();
 
             while !sync.is_quit() {
-                match rx.recv_timeout(Duration::from_millis(50)) {
+                match rx.recv_timeout(Duration::from_millis(1)) {
                     Ok(x) => q.push_back(x),
                     Err(RecvTimeoutError::Disconnected) => break,
                     _ => {}
                 }
-                try_flush(&mut q, ctx, observer.as_ref());
+                process_task(&mut q, ctx, observer.as_ref());
             }
 
-            while let Ok(data) = rx.try_recv() {
-                q.push_back(data);
-            }
-
-            while !try_flush(&mut q, ctx, observer.as_ref()) {
-                std::thread::yield_now();
-            }
-            drop(rx);
+            process_task(&mut q, ctx, observer.as_ref());
             sync.notify_done();
-            log::info!("flusher thread eixt");
+            log::info!("checkpoint thread exit");
         })
-        .expect("can't build flush thread")
+        .expect("can't build checkpoint thread")
 }
 
 struct Notifier {
@@ -306,16 +321,16 @@ impl Notifier {
 }
 
 #[derive(Clone)]
-pub struct Flush {
-    pub tx: Sender<FlushData>,
+pub struct Checkpoint {
+    pub tx: Sender<CheckpointTask>,
     sync: Arc<Notifier>,
 }
 
-impl Flush {
-    pub fn new(ctx: Handle<Context>, observer: Arc<dyn FlushObserver>) -> Self {
+impl Checkpoint {
+    pub fn new(ctx: Handle<Context>, observer: Arc<dyn CheckpointObserver>) -> Self {
         let (tx, rx) = channel();
         let sync = Arc::new(Notifier::new());
-        flush_thread(rx, ctx, observer, sync.clone());
+        checkpoint_thread(rx, ctx, observer, sync.clone());
         Self { tx, sync }
     }
 

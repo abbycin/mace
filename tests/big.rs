@@ -1,5 +1,5 @@
 use mace::{Mace, Options, RandomPath};
-use rand::Rng;
+use rand::RngExt;
 
 #[test]
 fn upsert_delete() {

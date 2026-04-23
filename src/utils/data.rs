@@ -1,3 +1,4 @@
+use crate::Options;
 use crate::types::traits::IAsSlice;
 
 use crate::io::{self, GatherIO, IoVec};
@@ -182,6 +183,15 @@ impl GatherWriter {
             })
             .expect("can't fail");
     }
+
+    pub fn sync_data(&mut self) {
+        self.file
+            .sync_data()
+            .inspect_err(|x| {
+                log::error!("can't sync data {:?}, {}", self.path, x);
+            })
+            .expect("can't fail");
+    }
 }
 
 impl Drop for GatherWriter {
@@ -195,6 +205,22 @@ impl Drop for GatherWriter {
 pub struct Position {
     pub file_id: u64,
     pub offset: u64,
+}
+
+pub type GroupPositions = [Position; Options::MAX_CONCURRENT_WRITE as usize];
+pub const fn init_group_pos() -> GroupPositions {
+    [Position::MIN; Options::MAX_CONCURRENT_WRITE as usize]
+}
+
+impl Position {
+    pub const MIN: Self = Position::new(u64::MIN, u64::MIN);
+
+    pub const fn new(id: u64, off: u64) -> Self {
+        Self {
+            file_id: id,
+            offset: off,
+        }
+    }
 }
 
 impl Ord for Position {

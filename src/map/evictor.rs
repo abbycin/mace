@@ -7,44 +7,26 @@ use std::{
         },
         mpsc::{Receiver, RecvTimeoutError, Sender},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossbeam_epoch::Guard;
 
-use crate::{
-    map::cache::{CacheState, EVICT_SAMPLE_MAX_ROUNDS},
-    types::node::Junks,
+use crate::map::{
+    Page,
+    cache::{CacheState, EVICT_SAMPLE_MAX_ROUNDS},
+    publish::AllocGuard,
 };
 use crate::{
     map::{
         SharedState,
-        buffer::{BucketContext, BucketMgr, Loader, Pool},
-        data::Arena,
+        buffer::{BucketContext, BucketMgr},
         table::Swip,
     },
     meta::Numerics,
-    types::{
-        page::Page,
-        refbox::{BoxRef, BoxView, RemoteView},
-        traits::{IFrameAlloc, IHeader, IRetireSink},
-    },
-    utils::{Handle, OpCode, options::ParsedOptions},
+    utils::{Handle, options::ParsedOptions},
 };
 use rand::seq::SliceRandom;
-
-struct EvictBuildCtx<'a> {
-    opt: &'a ParsedOptions,
-    pool: Handle<Pool>,
-    frames: Vec<(Handle<Arena>, BoxView)>,
-}
-
-struct EvictPublishCtx {
-    pool: Handle<Pool>,
-    frames: Vec<(Handle<Arena>, BoxView)>,
-    retire_target_arena: Option<u64>,
-    garbage: Vec<u64>,
-}
 
 pub(crate) struct Evictor {
     opt: Arc<ParsedOptions>,
@@ -55,137 +37,7 @@ pub(crate) struct Evictor {
     tx: Sender<()>,
 }
 
-impl Drop for Evictor {
-    fn drop(&mut self) {}
-}
-
 unsafe impl Send for Evictor {}
-
-impl<'a> EvictBuildCtx<'a> {
-    fn new(opt: &'a ParsedOptions, pool: Handle<Pool>) -> Self {
-        Self {
-            opt,
-            pool,
-            frames: vec![],
-        }
-    }
-
-    fn into_publish(mut self) -> EvictPublishCtx {
-        let mut frames = Vec::new();
-        std::mem::swap(&mut frames, &mut self.frames);
-        EvictPublishCtx {
-            pool: self.pool,
-            frames,
-            retire_target_arena: None,
-            garbage: vec![],
-        }
-    }
-}
-
-impl Drop for EvictBuildCtx<'_> {
-    fn drop(&mut self) {
-        while let Some((a, b)) = self.frames.pop() {
-            let h = b.header();
-            a.dealloc(h.addr, h.total_size as usize);
-            a.dec_ref();
-        }
-    }
-}
-
-impl IFrameAlloc for EvictBuildCtx<'_> {
-    fn try_alloc(&mut self, size: u32) -> Result<BoxRef, OpCode> {
-        let (h, b) = self.pool.alloc(size)?;
-        self.frames.push((h, b.view()));
-        Ok(b)
-    }
-
-    fn try_alloc_pair(&mut self, size1: u32, size2: u32) -> Result<(BoxRef, BoxRef), OpCode> {
-        let ((h1, b1), (h2, b2)) = self.pool.alloc_pair(size1, size2)?;
-        self.frames.push((h1, b1.view()));
-        self.frames.push((h2, b2.view()));
-        Ok((b1, b2))
-    }
-
-    fn arena_size(&mut self) -> usize {
-        self.opt.data_file_size
-    }
-
-    fn inline_size(&self) -> usize {
-        self.opt.inline_size
-    }
-}
-
-impl EvictPublishCtx {
-    fn set_retire_target_addr(&mut self, addr: u64) {
-        self.retire_target_arena = Some(
-            self.pool
-                .arena_id_of(addr)
-                .unwrap_or_else(|| panic!("failed to resolve evict retire arena for addr {addr}")),
-        );
-    }
-
-    fn finish(mut self) {
-        let mut garbage: Vec<u64> = Vec::new();
-        std::mem::swap(&mut garbage, &mut self.garbage);
-        if !garbage.is_empty() {
-            let arena_id = self
-                .retire_target_arena
-                .take()
-                .expect("evictor retire target must be set before finish");
-            let mut data = Vec::new();
-            let mut blob = Vec::new();
-            self.pool.recycle(&garbage, |addr| {
-                if RemoteView::is_tagged(addr) {
-                    blob.push(RemoteView::untagged(addr));
-                } else {
-                    data.push(addr);
-                }
-            });
-            if !data.is_empty() || !blob.is_empty() {
-                #[cfg(feature = "extra_check")]
-                {
-                    let old_data = data.len();
-                    data.sort_unstable();
-                    data.dedup();
-                    assert_eq!(old_data, data.len());
-                    let old_blob = blob.len();
-                    blob.sort_unstable();
-                    blob.dedup();
-                    assert_eq!(old_blob, blob.len());
-                }
-                self.pool.stage_retire(arena_id, &data, &blob);
-            }
-        } else {
-            self.retire_target_arena = None;
-        }
-
-        while let Some((a, _)) = self.frames.pop() {
-            a.dec_ref();
-        }
-    }
-}
-
-impl Drop for EvictPublishCtx {
-    fn drop(&mut self) {
-        while let Some((a, b)) = self.frames.pop() {
-            let h = b.header();
-            a.dealloc(h.addr, h.total_size as usize);
-            a.dec_ref();
-        }
-        self.retire_target_arena = None;
-        self.garbage.clear();
-    }
-}
-
-impl IRetireSink for EvictPublishCtx {
-    fn collect(&mut self, addr: &[u64]) {
-        assert!(
-            self.retire_target_arena.is_some(),
-            "evictor collect must run with arena target"
-        );
-        self.garbage.extend_from_slice(addr);
-    }
-}
 
 impl Evictor {
     pub(crate) fn new(
@@ -204,6 +56,10 @@ impl Evictor {
             rx,
             tx,
         }
+    }
+
+    fn begin_build<'a, 'b: 'a>(&'a self, bucket: &'b BucketContext) -> AllocGuard<'a> {
+        AllocGuard::new(&self.opt, bucket)
     }
 
     fn almose_full(&self) -> bool {
@@ -244,7 +100,8 @@ impl Evictor {
                 if bucket_ctx.state.is_deleting() || bucket_ctx.state.is_drop() {
                     continue;
                 }
-                let Some(state) = bucket_ctx.cool(*pid) else {
+                let pid = *pid;
+                let Some(state) = bucket_ctx.cool(pid) else {
                     continue;
                 };
                 if state != CacheState::Cold {
@@ -252,7 +109,7 @@ impl Evictor {
                 }
 
                 loop {
-                    let swip = Swip::new(bucket_ctx.table.get(*pid));
+                    let swip = Swip::new(bucket_ctx.table.get(pid));
 
                     // it's passible when a node was unmapped, but not removed from cache yet (concurrently)
                     if swip.is_null() {
@@ -262,42 +119,29 @@ impl Evictor {
                     if swip.is_tagged() {
                         break;
                     }
-                    let old = Page::<Loader>::from_swip(swip.untagged());
+                    let old = Page::from_swip(swip.untagged());
                     let Some(_lk) = old.try_lock() else {
                         continue;
                     };
-                    let mut publish_opt = None;
-                    let (addr, junks) = if old.delta_len() > limit {
-                        let mut build = EvictBuildCtx::new(self.opt.as_ref(), old.loader.pool);
-                        let Ok((mut node, j)) = old.try_compact(&mut build, safe_txid) else {
-                            break;
-                        };
-                        node.set_pid(old.pid());
+                    if bucket_ctx.table.get(pid) != old.swip() {
+                        // mapping changed after snapshot/read; it become warm again, so break
+                        break;
+                    }
+
+                    evicted = true;
+
+                    let mut build = self.begin_build(bucket_ctx);
+                    if old.delta_len() > limit {
+                        let (node, junk) = old.compact(&mut build, safe_txid);
                         let addr = node.latest_addr();
                         assert_eq!(addr, node.base_addr());
-                        publish_opt = Some(build.into_publish());
-                        (addr, j)
+                        let mut publish = build.into_publish(g);
+                        publish.evict(old, node, junk, Swip::tagged(addr));
+                        publish.commit();
                     } else {
-                        (old.latest_addr(), Junks::new())
-                    };
-
-                    match bucket_ctx.table.cas(*pid, old.swip(), Swip::tagged(addr)) {
-                        Ok(_) => {
-                            if bucket_ctx.evict_cache(*pid) {
-                                evicted = true;
-                            }
-                            if let Some(mut publish) = publish_opt {
-                                publish.set_retire_target_addr(addr);
-                                old.garbage_collect(&mut publish, &junks);
-                                publish.finish();
-                            }
-                            // must guarded by EBR, other threads may still use the old page
-                            g.defer(move || old.reclaim());
-                        }
-                        Err(_) => {
-                            // it has been replaced by other thread, in this case, we do NOT retry, it will
-                            // be evicted next time
-                        }
+                        let mut publish = build.into_publish(g);
+                        publish.evict_simple(pid, old, Swip::tagged(old.latest_addr()));
+                        publish.commit();
                     }
                 }
             }
@@ -356,38 +200,33 @@ impl Evictor {
                 if swip.is_tagged() {
                     continue;
                 }
-                let old = Page::<Loader>::from_swip(swip.untagged());
+                let old = Page::from_swip(swip.untagged());
                 if old.delta_len() > limit {
                     let Some(_lk) = old.try_lock() else {
                         continue;
                     };
-
-                    let mut build = EvictBuildCtx::new(self.opt.as_ref(), old.loader.pool);
-                    let Ok((mut node, junks)) = old.try_compact(&mut build, safe_txid) else {
+                    if bucket_ctx.table.get(*pid) != old.swip() {
                         continue;
-                    };
-                    node.set_pid(old.pid());
-                    let new = Page::new(node);
-                    let mut publish = build.into_publish();
-
-                    // never retry, probability of successful CAS > 70%
-                    // NOTE: other threads may perform cas in the same time
-                    if bucket_ctx.table.cas(*pid, old.swip(), new.swip()).is_ok() {
-                        bucket_ctx.update_cache_size(*pid, new.size());
-                        publish.set_retire_target_addr(new.latest_addr());
-                        old.garbage_collect(&mut publish, &junks);
-                        g.defer(move || old.reclaim());
-                        publish.finish();
-                        compacted = true;
-                    } else {
-                        new.reclaim();
                     }
+                    let mut build = self.begin_build(bucket_ctx);
+                    let (node, junk) = old.compact(&mut build, safe_txid);
+                    let mut publish = build.into_publish(g);
+
+                    publish.replace(old, node, junk);
+                    publish.commit();
+                    compacted = true;
                 }
             }
 
             if compacted {
                 return;
             }
+        }
+    }
+
+    fn nudge_stale_checkpoints(&self, interval_ms: u64) {
+        for bucket_ctx in self.buckets.active_contexts() {
+            bucket_ctx.nudge_checkpoint(interval_ms);
         }
     }
 
@@ -404,7 +243,10 @@ impl Evictor {
 fn evictor_loop(mut e: Evictor) {
     const TMO_MS: u64 = 200;
     const COMPACT_TMO: u64 = 5 * TMO_MS;
+    const SCAN_MS: u64 = 10 * 1000;
     let mut compact_cnt = 0;
+    let chkpt_ivl = e.opt.checkpoint_nudge_ms;
+    let mut last_nudge_scan = Instant::now();
     let limit = e.opt.max_delta_len();
     loop {
         let r = e.rx.recv_timeout(Duration::from_millis(TMO_MS));
@@ -430,6 +272,11 @@ fn evictor_loop(mut e: Evictor) {
                 }
             }
             Err(_) => break,
+        }
+
+        if chkpt_ivl > 0 && last_nudge_scan.elapsed() >= Duration::from_millis(SCAN_MS) {
+            last_nudge_scan = Instant::now();
+            e.nudge_stale_checkpoints(chkpt_ivl);
         }
     }
 

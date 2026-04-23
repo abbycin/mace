@@ -1,5 +1,4 @@
 use parking_lot::{Condvar, Mutex};
-use std::time::Duration;
 
 pub struct Countblock {
     lock: Mutex<usize>,
@@ -26,17 +25,5 @@ impl Countblock {
             self.cond.wait(&mut c);
         }
         *c -= 1;
-    }
-
-    pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        let mut c = self.lock.lock();
-        while *c == 0 {
-            let r = self.cond.wait_for(&mut c, timeout);
-            if r.timed_out() {
-                return false;
-            }
-        }
-        *c -= 1;
-        true
     }
 }

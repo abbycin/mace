@@ -21,6 +21,8 @@ pub trait GatherIO {
 
     fn sync(&mut self) -> Result<(), io::Error>;
 
+    fn sync_data(&mut self) -> Result<(), io::Error>;
+
     fn truncate(&self, to: u64) -> Result<(), io::Error>;
 
     fn size(&self) -> Result<u64, io::Error>;

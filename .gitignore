@@ -5,6 +5,7 @@
 .idea
 .vscode
 .cache
+*.log
 Cargo.lock
 *.md
 !docs/design.md

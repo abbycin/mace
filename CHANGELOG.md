@@ -1,3 +1,13 @@
+## [0.0.29] 2026-04-23 (AI-Assisted)
+### Changes
+- Refactored Pool from an arena/batch-oriented flush pipeline to a page-checkpoint pipeline: checkpoint now snapshots sealed page generations, frozen dirty roots, and retired chains directly from page state.
+
+### Performance
+- Optimized flow control by replacing sleep-based debt throttling with checkpoint-aware foreground admission permits, progress-driven wakeups, and per-bucket controllers tuned by `checkpoint_size` and `pool_capacity`.
+
+### Bug Fixes
+- Fixed cross-bucket shared LRU cache key collisions during multi-bucket reopen/recovery reads, and reduced the repaired hot-path lookup overhead with `FxHasher`.
+
 ## [0.0.28] 2026-03-09 (AI-Assisted)
 ### New Features
 - Added observer-based observability with GC coverage

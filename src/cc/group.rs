@@ -1,6 +1,5 @@
 use crate::cc::cc::ConcurrencyControl;
 use crate::cc::log::Logging;
-use crate::meta::Numerics;
 use crate::utils::data::Position;
 use crate::utils::options::ParsedOptions;
 use parking_lot::{Mutex, RwLock};
@@ -126,7 +125,6 @@ impl WriterGroup {
         checkpoint: Position,
         latest_id: u64,
         oldest_id: u64,
-        numerics: Arc<Numerics>,
         opt: Arc<ParsedOptions>,
     ) -> Self {
         let ckpt_cnt = Arc::new(AtomicUsize::new(0));
@@ -138,7 +136,6 @@ impl WriterGroup {
                 latest_id,
                 oldest_id,
                 checkpoint,
-                numerics,
                 opt,
                 ckpt_cnt.clone(),
             )),

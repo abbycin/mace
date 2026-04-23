@@ -1,10 +1,10 @@
-use super::{Node, Page, publish::TreeBuildCtx};
-
 use crate::Options;
 use crate::cc::context::Context;
-use crate::map::buffer::{BucketContext, Loader};
+use crate::map::buffer::BucketContext;
+use crate::map::publish::AllocGuard;
+use crate::map::{Loader, Node, Page};
 use crate::types::data::{IterItem, Record, Val};
-use crate::types::node::RawLeafIter;
+use crate::types::node::{Junk, MergeOp, RawLeafIter};
 use crate::types::refbox::DeltaView;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::data::Position;
@@ -35,8 +35,8 @@ pub struct ValRef {
 }
 
 impl ValRef {
-    fn new(raw: Record, f: BoxRef) -> Self {
-        Self { raw, _owner: f }
+    fn new(raw: Record, owner: BoxRef) -> Self {
+        Self { raw, _owner: owner }
     }
 
     /// Returns the data as a byte slice.
@@ -49,8 +49,8 @@ impl ValRef {
         self.raw.data().to_vec()
     }
 
-    pub(crate) fn unwrap(&self) -> &Record {
-        &self.raw
+    pub(crate) fn group_id(&self) -> u8 {
+        self.raw.group_id()
     }
 
     pub(crate) fn is_put(&self) -> bool {
@@ -93,12 +93,13 @@ impl Tree {
     fn init(&self, root_pid: u64) {
         let g = crossbeam_epoch::pin();
         let mut build = self.begin_build();
-        let node = Node::new_leaf(&mut build, self.bucket.loader(self.store.context));
+        let lsn = self.store.context.group(0).logging.lock().current_pos();
+        let node = Node::new_leaf(&mut build, self.bucket.loader(self.store.context), 0, lsn);
         let mut page = Page::new(node);
         let mut publish = build.into_publish(&g);
         publish.map_to(&mut page, root_pid);
-        self.bucket.cache(page);
-        publish.finish();
+        publish.cache_after_commit(page);
+        publish.commit();
     }
 
     fn txid(&self) -> u64 {
@@ -109,16 +110,16 @@ impl Tree {
         self.bucket.bucket_id
     }
 
-    pub(crate) fn begin_build(&self) -> TreeBuildCtx<'_> {
-        TreeBuildCtx::new(&self.bucket.table, &self.store.opt, &self.bucket)
+    pub(crate) fn begin_build(&self) -> AllocGuard<'_> {
+        AllocGuard::new(&self.store.opt, &self.bucket)
     }
 
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
         loop {
             if let Some(p) = self.bucket.load(pid)? {
-                let child_pid = p.runtime_merging_child();
+                let child_pid = p.header().merging_child;
                 if child_pid != NULL_PID {
-                    self.merge_node(&p, child_pid, g)?;
+                    self.merge_node(p, child_pid, g)?;
                     continue;
                 }
                 return Ok(Some(p));
@@ -128,47 +129,13 @@ impl Tree {
         }
     }
 
-    // merge flow:
-    // 1. mark child as runtime merging
-    // 2. find a live left sibling that still links to child
-    // 3. replace that sibling with merged content
-    // 4. remove child index from parent
-    // 5. unmap child pid from page table
-    fn merge_node(&self, parent_ptr: &Page, child_pid: u64, g: &Guard) -> Result<(), OpCode> {
-        struct MergeMarkGuard {
-            parent: Page,
-            child: Page,
-            child_pid: u64,
-            armed: bool,
-        }
-
-        impl MergeMarkGuard {
-            fn new(parent: Page, child: Page, child_pid: u64) -> Self {
-                Self {
-                    parent,
-                    child,
-                    child_pid,
-                    armed: true,
-                }
-            }
-
-            fn clear(&mut self) {
-                if !self.armed {
-                    return;
-                }
-                self.child.clear_runtime_merging();
-                let _ = self.parent.clear_runtime_merging_child(self.child_pid);
-                self.armed = false;
-            }
-        }
-
-        impl Drop for MergeMarkGuard {
-            fn drop(&mut self) {
-                self.clear();
-            }
-        }
-
-        // parent lock serializes merge on this parent
+    // 1. mark child node as `merging`
+    // 2. find it's left sibling, to merge child into it
+    // 3. replace old left sibling with merged node
+    // 4. unmap child pid from page table
+    // 5. remove index to child from it's parent
+    fn merge_node(&self, parent_ptr: Page, child_pid: u64, g: &Guard) -> Result<(), OpCode> {
+        // NOTE: a big lock is necessary because the merge process must be exclusive
         let Some(_lk) = parent_ptr.try_lock() else {
             // return ok so cooperative callers avoid retry storms
             return Ok(());
@@ -179,33 +146,32 @@ impl Tree {
         }
 
         assert_ne!(child_pid, NULL_PID);
-        // 1.
-        let child_ptr = if let Some(x) = self.set_node_merging(child_pid, g)? {
-            x
-        } else {
-            return Ok(());
-        };
-        let mut merge_mark = MergeMarkGuard::new(*parent_ptr, child_ptr, child_pid);
         assert!(parent_ptr.is_intl());
-        let Some(child_index) = parent_ptr
+        let child_index = parent_ptr
             .intl_iter()
             .position(|(_, idx)| idx.pid == child_pid)
-        else {
+            .unwrap();
+        // the "can_merge_child" check is somewhat failed
+        assert_ne!(child_index, 0, "we can't handle merge the leftmost node");
+
+        let safe_txid = self.txid();
+        // 1.
+        let child_ptr = if let Some(x) = self.set_node_merging(child_pid, g, safe_txid)? {
+            x
+        } else {
+            // child_pid was unmapped (and crashed) but not removed from parent yet
+            self.remove_node_index(parent_ptr, child_pid, g, safe_txid);
             return Ok(());
         };
-        if child_index == 0 {
-            return Ok(());
-        }
 
         // 2.
         let mut merge_index = child_index - 1;
-        let Some(mut cursor_pid) = parent_ptr.intl_iter().nth(merge_index).map(|(_, x)| x.pid)
-        else {
-            return Ok(());
-        };
+        let mut cursor_pid = parent_ptr
+            .intl_iter()
+            .nth(merge_index)
+            .map(|(_, x)| x.pid)
+            .unwrap();
 
-        let safe_txid = self.txid();
-        let mut merged_child_into_left = false;
         loop {
             let cursor_ptr = if let Some(x) = self.load_node(g, cursor_pid)? {
                 x
@@ -216,35 +182,34 @@ impl Tree {
                 }
 
                 merge_index -= 1;
-                let Some(pid) = parent_ptr.intl_iter().nth(merge_index).map(|(_, x)| x.pid) else {
-                    return Ok(());
-                };
-                cursor_pid = pid;
+                cursor_pid = parent_ptr
+                    .intl_iter()
+                    .nth(merge_index)
+                    .map(|(_, x)| x.pid)
+                    .unwrap();
                 continue;
             };
 
-            // 3.
+            // 3. necessary, because cursor node itself maybe split concurrently
             let Some(_cursor_lk) = cursor_ptr.try_lock() else {
                 continue;
             };
             if self.bucket.table.get(cursor_ptr.pid()) != cursor_ptr.swip() {
                 continue;
             }
+
             let next_pid = cursor_ptr.header().right_sibling;
             let mut build = self.begin_build();
             // verify this candidate still points to child as its right sibling
             if next_pid == child_pid {
-                let (new_node, lj, rj) =
-                    cursor_ptr.try_merge_node(&mut build, &child_ptr, safe_txid)?;
+                let (new_node, mut junks) =
+                    cursor_ptr.merge_node(&mut build, &child_ptr, safe_txid);
+                child_ptr.collect_junk(|x| junks.push(x));
+                build.collect_retired(child_ptr.base_addr(), &mut junks);
                 let mut publish = build.into_publish(g);
-                if let Ok(new_cursor) = publish.replace(cursor_ptr, new_node, &lj) {
-                    publish.collect_garbage(new_cursor.latest_addr(), child_ptr, &rj);
-                    publish.finish();
-                    merged_child_into_left = true;
-                    break;
-                }
-                // retry merge on replace race
-                continue;
+                publish.replace(cursor_ptr, new_node, junks);
+                publish.commit();
+                break;
             }
             let hi = cursor_ptr.hi();
             let lo = child_ptr.lo();
@@ -262,23 +227,18 @@ impl Tree {
             }
         }
 
-        if !merged_child_into_left {
-            return Ok(());
-        }
-
-        // 4.
-        if !self.remove_node_index(parent_ptr, child_pid, g, safe_txid)? {
-            return Ok(());
-        }
+        // 4. hide child from the in-memory page table before reclaiming it (or else scavenge process
+        // may use it cause memory bug).
+        // checkpoint will later make this NULL mapping durable and only then recycle child_pid into
+        // the free list. otherwise readers/gc can still load child_pid and observe a reclaimed page.
+        debug_assert_eq!(child_ptr.box_header().pid, child_pid);
+        self.begin_build().mark_unmap(child_pid, child_ptr.swip()); // child's junks were already collected
+        self.bucket.evict_cache(child_pid);
+        g.defer(move || child_ptr.reclaim());
 
         // 5.
-        debug_assert_eq!(child_ptr.box_header().pid, child_pid);
-        merge_mark.clear();
-        let mut build = self.begin_build();
-        let pending = build.prepare_unmap(child_ptr.pid())?;
-        let mut publish = build.into_publish(g);
-        publish.unmap(child_ptr, pending, &[])?; // child's junks were already collected
-        publish.finish();
+        self.remove_node_index(parent_ptr, child_pid, g, safe_txid);
+
         self.store
             .opt
             .observer
@@ -287,63 +247,46 @@ impl Tree {
         Ok(())
     }
 
-    // caller must hold parent lock
-    fn remove_node_index(
+    // NOTE: caller must hold parent lock
+    fn remove_node_index(&self, parent_ptr: Page, child_pid: u64, g: &Guard, safe_txid: u64) {
+        debug_assert_eq!(parent_ptr.header().merging_child, child_pid);
+
+        let mut build = self.begin_build();
+        let (new_ptr, junks) = parent_ptr.process_merge(&mut build, MergeOp::Merged, safe_txid);
+        let mut publish = build.into_publish(g);
+        publish.replace(parent_ptr, new_ptr, junks);
+        publish.commit();
+    }
+
+    // 1. load child node and check if it's merging
+    // 2. return if it's merging
+    // 3. or else create a new node with merging set to true
+    // 4. replace old child node with the new node
+    // NOTE: it must be protected by lock
+    fn set_node_merging(
         &self,
-        parent_ptr: &Page,
         child_pid: u64,
         g: &Guard,
         safe_txid: u64,
-    ) -> Result<bool, OpCode> {
-        debug_assert_eq!(parent_ptr.runtime_merging_child(), child_pid);
-        let parent_pid = parent_ptr.pid();
-        let mut parent = *parent_ptr;
-        loop {
-            let mut build = self.begin_build();
-            let (new_ptr, j) = {
-                let Some(x) = parent.try_remove_index(&mut build, child_pid, safe_txid)? else {
-                    return Ok(false);
-                };
-                x
-            };
-            let mut publish = build.into_publish(g);
-            if let Ok(new_parent) = publish.replace(parent, new_ptr, &j) {
-                publish.finish();
-                let _ = parent_ptr.clear_runtime_merging_child(child_pid);
-                let _ = new_parent.clear_runtime_merging_child(child_pid);
-                return Ok(true);
-            }
-            let Some(new_parent) = self.bucket.load(parent_pid)? else {
-                return Ok(false);
-            };
-            if new_parent.runtime_merging_child() != child_pid {
-                return Ok(false);
-            }
-            parent = new_parent;
+    ) -> Result<Option<Page>, OpCode> {
+        let page = if let Some(x) = self.load_node(g, child_pid)? {
+            x
+        } else {
+            return Ok(None);
+        };
+        if page.header().merging {
+            return Ok(Some(page));
         }
-    }
-
-    // 1. load child
-    // 2. return immediately if child is already marked merging
-    // 3. otherwise set runtime merging flag with cas and retry on race
-    // caller must hold parent lock so parent and child markers stay paired
-    fn set_node_merging(&self, child_pid: u64, g: &Guard) -> Result<Option<Page>, OpCode> {
-        loop {
-            let page = if let Some(x) = self.load_node(g, child_pid)? {
-                x
-            } else {
-                return Ok(None);
-            };
-            // lock child to bind live-check and merge-mark to the same swip
-            // without this, a stale child handle may be marked after table swap
-            let _lk = page.lock();
-            if self.bucket.table.get(page.pid()) != page.swip() {
-                continue;
-            }
-            if page.runtime_merging() || page.try_mark_runtime_merging() {
-                return Ok(Some(page));
-            }
+        let _lk = page.lock();
+        if self.bucket.table.get(page.pid()) != page.swip() {
+            return Err(OpCode::Again);
         }
+        let mut build = self.begin_build();
+        let (new_node, junks) = page.process_merge(&mut build, MergeOp::MarkChild, safe_txid);
+        let mut publish = build.into_publish(g);
+        let new_page = publish.replace(page, new_node, junks);
+        publish.commit();
+        Ok(Some(new_page))
     }
 
     /// split flow:
@@ -358,10 +301,13 @@ impl Tree {
         let Some(node_lock) = node.try_lock() else {
             return Err(OpCode::Again);
         };
-        let safe_txid = self.store.context.numerics.safe_tixd();
+        if self.bucket.table.get(node.pid()) != node.swip() {
+            return Err(OpCode::Again);
+        }
+        let safe_txid = self.txid();
         let mut build = self.begin_build();
         // 1.
-        let (mut lnode, rnode, split_junks) = node.try_split_overlay(&mut build, safe_txid)?;
+        let (mut lnode, rnode) = node.split(&mut build);
         let mut rpage = Page::new(rnode);
 
         // 2.
@@ -370,14 +316,13 @@ impl Tree {
         lnode.header_mut().right_sibling = rpid;
 
         // 3.
-        let lpage = publish
-            .replace(node, lnode, &split_junks)
-            .inspect_err(|_| {})?;
-        self.bucket.cache(rpage);
+        let junk = Junk::new();
+        let lpage = publish.replace(node, lnode, junk);
+        publish.cache_after_commit(rpage);
         // drop lock early so cooperative threads can make progress
         drop(node_lock);
         // publish rpage to page table
-        publish.finish();
+        publish.commit();
 
         let lo = rpage.lo();
         if let Some(parent) = parent_opt {
@@ -389,15 +334,15 @@ impl Tree {
             }
             // 4.
             let mut build = self.begin_build();
-            let Some((new_node, j)) = parent.try_insert_index(&mut build, lo, rpid, safe_txid)?
+            let Some((new_node, junk)) = parent.insert_index(&mut build, lo, rpid, safe_txid)
             else {
                 // parent update raced with other tree change
                 return Ok(());
             };
             let mut publish = build.into_publish(g);
-            publish.replace(parent, new_node, &j).inspect_err(|_| {})?;
+            publish.replace(parent, new_node, junk);
             // publish new parent to page table
-            publish.finish();
+            publish.commit();
             self.store
                 .opt
                 .observer
@@ -423,34 +368,35 @@ impl Tree {
             return Err(OpCode::Again);
         };
         let mut build = self.begin_build();
+        let lpid = build.reserve_pid(); // no early return, no leak is possible
 
         // compact root before building new root because step-3 publication can race with new writes
-        let (mut lnode, j) = root.try_compact(&mut build, safe_txid)?;
+        let (mut lnode, junk) = root.compact(&mut build, safe_txid);
         lnode.header_mut().right_sibling = rpid;
+        let (group, lsn) = lnode.get_group_lsn();
         let mut lpage = Page::new(lnode);
-        let mut lpid = build.reserve_pid()?;
 
-        let new_root_node = Node::try_new_root(
+        let new_root_node = Node::new_root(
             &mut build,
             self.bucket.loader(self.store.context),
             &[
-                (IntlKey::new([].as_slice()), Index::new(lpid.pid())),
+                (IntlKey::new([].as_slice()), Index::new(lpid)),
                 (IntlKey::new(lo), Index::new(rpid)),
             ],
-        )?;
+            group,
+            lsn,
+        );
         let mut publish = build.into_publish(g);
-        publish.map_reserved(&mut lpage, &mut lpid);
-        let n = publish
-            .replace(root, new_root_node, &j)
-            .inspect_err(|_| {})?;
+        publish.map_to(&mut lpage, lpid);
+        let n = publish.replace(root, new_root_node, junk);
         assert_eq!(n.box_header().pid, self.root_index.pid);
+        publish.cache_after_commit(lpage);
         // publish new root to global
-        publish.finish();
+        publish.commit();
         self.store
             .opt
             .observer
             .counter(CounterMetric::TreeNodeSplit, 1);
-        self.bucket.cache(lpage);
         Ok(())
     }
 
@@ -480,7 +426,7 @@ impl Tree {
                 return Err(OpCode::Again);
             };
 
-            if node_ptr.is_smo_busy() {
+            if node_ptr.header().merging {
                 return Err(OpCode::Again);
             }
 
@@ -530,16 +476,14 @@ impl Tree {
                 }
 
                 // create a new index in intl node
-                let Some((split_node, j)) =
-                    unsplit.try_insert_index(&mut build, lo, cursor, self.txid())?
+                let Some((split_node, junk)) =
+                    unsplit.insert_index(&mut build, lo, cursor, self.txid())
                 else {
                     return Err(OpCode::Again);
                 };
                 let mut publish = build.into_publish(g);
-                publish
-                    .replace(unsplit, split_node, &j)
-                    .inspect_err(|_| {})?;
-                publish.finish();
+                publish.replace(unsplit, split_node, junk);
+                publish.commit();
                 self.store
                     .opt
                     .observer
@@ -579,17 +523,14 @@ impl Tree {
 
         // consolidation never retry
         let mut build = self.begin_build();
-        let Ok((new_node, j)) = page.try_compact(&mut build, self.txid()) else {
-            return;
-        };
+        let (new_node, junk) = page.compact(&mut build, self.txid());
         let mut publish = build.into_publish(g);
-        if publish.replace(page, new_node, &j).is_ok() {
-            publish.finish();
-            self.store
-                .opt
-                .observer
-                .counter(CounterMetric::TreeNodeConsolidate, 1);
-        }
+        publish.replace(page, new_node, junk);
+        publish.commit();
+        self.store
+            .opt
+            .observer
+            .counter(CounterMetric::TreeNodeConsolidate, 1);
     }
 
     pub(crate) fn try_scavenge(&self, pid: u64, g: &Guard) -> Result<bool, OpCode> {
@@ -599,7 +540,8 @@ impl Tree {
             return Ok(false);
         };
 
-        if page.is_smo_busy() {
+        let h = page.header();
+        if h.merging || h.merging_child != NULL_ADDR {
             return Ok(false);
         }
 
@@ -627,21 +569,32 @@ impl Tree {
         if self.bucket.table.get(parent.pid()) != parent.swip() {
             return Err(OpCode::Again);
         }
-        if parent.runtime_merging_child() != NULL_PID {
+        if parent.header().merging_child != NULL_ADDR {
             return Err(OpCode::Again);
         }
         let pid = cur.pid();
 
-        if parent.can_merge_child_runtime(cur.lo(), pid)
-            && parent.try_mark_runtime_merging_child(pid)
-        {
+        if parent.can_merge_child(cur.lo(), pid) {
+            let mut build = self.begin_build();
+            let (new_parent, j) =
+                parent.process_merge(&mut build, MergeOp::MarkParent(pid), self.txid());
+            let mut publish = build.into_publish(g);
+            let new_page = publish.replace(parent, new_parent, j);
+            publish.commit();
             drop(lk);
-            self.merge_node(&parent, pid, g)?;
+            self.merge_node(new_page, pid, g)?;
         }
         Ok(())
     }
 
-    fn link<K, V, F>(&self, g: &Guard, page: Page, k: &K, v: &V, mut check: F) -> Result<(), OpCode>
+    fn link<K, V, F>(
+        &self,
+        _g: &Guard,
+        page: Page,
+        k: &K,
+        v: &V,
+        mut check: F,
+    ) -> Result<(), OpCode>
     where
         K: IKey,
         V: IVal,
@@ -652,8 +605,9 @@ impl Tree {
                 continue;
             };
             let lock_started = sampled_instant(k.txid(), LATENCY_SAMPLE_SHIFT);
+            let pid = page.pid();
             // consolidate happened, we must retry from root
-            if self.bucket.table.get(page.pid()) != page.swip() {
+            if self.bucket.table.get(pid) != page.swip() {
                 observe_elapsed(
                     self.store.opt.observer.as_ref(),
                     HistogramMetric::TreeLinkHoldMicros,
@@ -662,20 +616,18 @@ impl Tree {
                 return Err(OpCode::Again);
             };
 
-            let (group_id, pos) = check(page, k)?;
+            let (group, pos) = check(page, k)?;
             let mut build = self.begin_build();
-            let (k, v) = DeltaView::try_from_key_val(&mut build, k, v)?;
+            let (k, v) = DeltaView::from_key_val(&mut build, k, v, group, pos);
 
-            node.insert(k, v);
+            let addr = node.insert(k, v);
+            build.mark_dirty(pid, addr);
             observe_elapsed(
                 self.store.opt.observer.as_ref(),
                 HistogramMetric::TreeLinkHoldMicros,
                 lock_started,
             );
             drop(node);
-            build
-                .into_publish(g)
-                .record_lsn_and_finish(group_id as usize, pos);
             return Ok(());
         }
     }
@@ -735,7 +687,7 @@ impl Tree {
             visible(&r)
         })?;
 
-        Ok(r.map(|x| x.1.clone()))
+        Ok(r.map(|x| x.1))
     }
 
     // NOTE: the `visible` function may be called multiple times
@@ -814,6 +766,7 @@ impl Tree {
             iter_bound: None,
             checker: Box::new(visible),
             filter: Filter { has_last: false },
+            guard: crossbeam_epoch::pin(),
         }
     }
 
@@ -834,6 +787,7 @@ impl Tree {
             let ptr = l.load(addr)?.as_base();
             let sst = ptr.sst::<Ver>();
             let mut pos = sst.lower_bound(&ver).unwrap_or_else(|pos| pos);
+            // pos is the first possible visible
             while pos < sst.header().elems as usize {
                 let (k, v) = sst.kv_at::<Val>(pos);
                 if visible(k.txid, v.group_id()) {
@@ -927,6 +881,7 @@ pub struct Iter<'a> {
     iter_bound: Option<Box<Bound<Vec<u8>>>>,
     checker: Box<dyn FnMut(&Context, u64, u8) -> bool + 'a>,
     filter: Filter,
+    guard: Guard,
 }
 
 impl Drop for Iter<'_> {
@@ -954,13 +909,12 @@ impl Iter<'_> {
     }
 
     fn get_next(&mut self) -> Option<<Self as Iterator>::Item> {
-        while !self.collapsed() {
+        'retry: while !self.collapsed() {
             if self.iter.is_none() {
-                let g = crossbeam_epoch::pin();
-                let node = match self.tree.find_leaf(&g, self.low_key()) {
+                let node = match self.tree.find_leaf(&self.guard, self.low_key()) {
                     Ok(node) => node,
                     Err(OpCode::Again) => {
-                        g.flush();
+                        self.guard.flush();
                         continue;
                     }
                     Err(OpCode::NotFound) => return None,
@@ -990,19 +944,37 @@ impl Iter<'_> {
                 });
             }
 
-            let iter = self.iter.as_mut().expect("must valid");
-            let r = iter.find(|item| {
-                let ok = match &self.lo {
-                    Bound::Unbounded => true,
-                    Bound::Included(b) => item.cmp_key(b.as_slice()).is_ge(),
-                    Bound::Excluded(b) => item.cmp_key(b.as_slice()).is_gt(),
+            let r = loop {
+                let next = {
+                    let iter = self.iter.as_mut().expect("must valid");
+                    iter.try_next()
                 };
-                if ok && (self.checker)(&self.tree.store.context, item.txid(), item.group_id()) {
-                    self.filter.check(item)
-                } else {
-                    false
+                match next {
+                    Ok(Some(item)) => {
+                        let ok = match &self.lo {
+                            Bound::Unbounded => true,
+                            Bound::Included(b) => item.cmp_key(b.as_slice()).is_ge(),
+                            Bound::Excluded(b) => item.cmp_key(b.as_slice()).is_gt(),
+                        };
+                        if ok
+                            && (self.checker)(
+                                &self.tree.store.context,
+                                item.txid(),
+                                item.group_id(),
+                            )
+                            && self.filter.check(&item)
+                        {
+                            break Some(item);
+                        }
+                    }
+                    Ok(None) => break None,
+                    Err(OpCode::Again | OpCode::NotFound) => {
+                        self.iter.take();
+                        continue 'retry;
+                    }
+                    Err(e) => panic!("iter load failed: {e:?}"),
                 }
-            });
+            };
 
             if let Some(item) = r {
                 // reuse existing lower-bound buffer to avoid realloc per item
@@ -1071,10 +1043,6 @@ impl Filter {
 #[cfg(test)]
 mod test {
     use crate::{Mace, Options, RandomPath};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering::Relaxed},
-    };
     use std::thread;
 
     #[test]
@@ -1113,132 +1081,5 @@ mod test {
                 }
             });
         });
-    }
-
-    #[test]
-    fn concurrent_page_hit_runtime_smo() {
-        let path = RandomPath::tmp();
-        let mut opt = Options::new(&*path);
-        opt.split_elems = 128;
-        opt.consolidate_threshold = 32;
-        opt.tmp_store = true;
-        let mace = Mace::new(opt.validate().unwrap()).unwrap();
-        let db = mace.new_bucket("default").unwrap();
-
-        let num_readers = 4;
-        let num_iterations = 1500;
-
-        thread::scope(|s| {
-            for _ in 0..num_readers {
-                let db = db.clone();
-                s.spawn(move || {
-                    for _ in 0..num_iterations {
-                        let view = db.view().unwrap();
-                        let mut count = 0;
-                        for _ in view.seek("key") {
-                            count += 1;
-                        }
-                        assert!(count >= 0);
-                    }
-                });
-            }
-
-            s.spawn(|| {
-                for i in 0..num_iterations {
-                    let kv = db.begin().unwrap();
-                    let key = format!("key_{:05}", i);
-                    kv.put(&key, &key).unwrap();
-                    if i > 256 {
-                        let old = format!("key_{:05}", i - 256);
-                        let _ = kv.del(&old);
-                    }
-                    kv.commit().unwrap();
-                }
-            });
-        });
-    }
-
-    #[test]
-    fn runtime_smo_merge_retry_idempotence_stress() {
-        let path = RandomPath::tmp();
-        let mut opt = Options::new(&*path);
-        opt.split_elems = 64;
-        opt.consolidate_threshold = 16;
-        opt.tmp_store = true;
-        let mace = Mace::new(opt.validate().unwrap()).unwrap();
-        let db = mace.new_bucket("default").unwrap();
-        let init_keys = 1024;
-
-        for i in 0..init_keys {
-            let kv = db.begin().unwrap();
-            let key = format!("k_{:04}", i);
-            kv.put(&key, &key).unwrap();
-            kv.commit().unwrap();
-        }
-
-        let write_threads = 4;
-        let read_threads = 2;
-        let write_iterations = 1500;
-        let read_iterations = 1200;
-        let success = Arc::new(AtomicUsize::new(0));
-
-        thread::scope(|s| {
-            for tid in 0..write_threads {
-                let db = db.clone();
-                let success = success.clone();
-                s.spawn(move || {
-                    for i in 0..write_iterations {
-                        let idx = (i * 37 + tid * 17) % init_keys;
-                        let key = format!("k_{:04}", idx);
-                        let do_del = (i + tid) % 3 == 0;
-
-                        for _ in 0..16 {
-                            let kv = db.begin().unwrap();
-                            let res = if do_del {
-                                kv.del(&key).map(|_| ())
-                            } else {
-                                kv.put(&key, &key)
-                            };
-
-                            match res {
-                                Ok(_) => match kv.commit() {
-                                    Ok(_) => {
-                                        success.fetch_add(1, Relaxed);
-                                        break;
-                                    }
-                                    Err(crate::OpCode::AbortTx | crate::OpCode::Again) => continue,
-                                    Err(e) => panic!("commit fail: {e:?}"),
-                                },
-                                Err(crate::OpCode::NotFound) if do_del => {
-                                    success.fetch_add(1, Relaxed);
-                                    break;
-                                }
-                                Err(crate::OpCode::AbortTx | crate::OpCode::Again) => continue,
-                                Err(e) => panic!("modify fail: {e:?}"),
-                            }
-                        }
-                    }
-                });
-            }
-
-            for _ in 0..read_threads {
-                let db = db.clone();
-                s.spawn(move || {
-                    for _ in 0..read_iterations {
-                        let view = db.view().unwrap();
-                        let mut seen = 0usize;
-                        for _ in view.seek("k_") {
-                            seen += 1;
-                            if seen > init_keys {
-                                break;
-                            }
-                        }
-                        assert!(seen <= init_keys);
-                    }
-                });
-            }
-        });
-
-        assert!(success.load(Relaxed) > write_threads * write_iterations / 8);
     }
 }

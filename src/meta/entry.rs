@@ -3,7 +3,7 @@ use std::{
     fmt::Debug,
     ops::{Deref, DerefMut},
     ptr::addr_of_mut,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 
 use crate::{
@@ -11,9 +11,9 @@ use crate::{
     meta::IMetaCodec,
     types::traits::IAsSlice,
     utils::{
-        INIT_ID, INIT_ORACLE, INIT_WMK,
+        INIT_ID, INIT_ORACLE, INIT_WMK, NULL_ADDR,
         bitmap::BitMap,
-        data::{MapEntry, Reloc},
+        data::{GroupPositions, MapEntry, Reloc},
     },
 };
 
@@ -26,6 +26,7 @@ pub enum MetaKind {
     DataStat,
     BlobStat,
     Map,
+    BucketFrontier,
     DataDelete,
     BlobDelete,
     DataDeleteDone,
@@ -44,140 +45,6 @@ impl TryFrom<u8> for MetaKind {
             Err(OpCode::Corruption)
         } else {
             Ok(unsafe { std::mem::transmute::<u8, MetaKind>(value) })
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PendingRangeKind {
-    Data = 0,
-    Blob = 1,
-}
-
-impl TryFrom<u8> for PendingRangeKind {
-    type Error = OpCode;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Data),
-            1 => Ok(Self::Blob),
-            _ => Err(OpCode::Corruption),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct PendingSibling {
-    /// namespace prefix for BUCKET_PENDING_SIBLING key
-    /// this isolates sibling intents across buckets and is reused when rebuilding del keys during recovery
-    pub bucket_id: u64,
-    pub file_id: u64,
-    pub kind: PendingRangeKind,
-    pub addr: u64,
-}
-
-impl PendingSibling {
-    pub fn new(bucket_id: u64, file_id: u64, kind: PendingRangeKind, addr: u64) -> Self {
-        Self {
-            bucket_id,
-            file_id,
-            kind,
-            addr,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct PendingRetire {
-    /// namespace prefix for BUCKET_PENDING_RETIRE key
-    /// this isolates retire intents across buckets and supports idempotent clear
-    pub bucket_id: u64,
-    pub kind: PendingRangeKind,
-    pub addr: u64,
-}
-
-impl PendingRetire {
-    pub fn new(bucket_id: u64, kind: PendingRangeKind, addr: u64) -> Self {
-        Self {
-            bucket_id,
-            kind,
-            addr,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-#[repr(C, packed(1))]
-struct PendingSiblingHdr {
-    bucket_id: u64,
-    file_id: u64,
-    kind: u8,
-    addr: u64,
-}
-
-impl IAsSlice for PendingSiblingHdr {}
-
-#[derive(Clone, Copy)]
-#[repr(C, packed(1))]
-struct PendingRetireHdr {
-    bucket_id: u64,
-    kind: u8,
-    addr: u64,
-}
-
-impl IAsSlice for PendingRetireHdr {}
-
-impl IMetaCodec for PendingSibling {
-    fn packed_size(&self) -> usize {
-        size_of::<PendingSiblingHdr>()
-    }
-
-    fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
-        let hdr = PendingSiblingHdr {
-            bucket_id: self.bucket_id,
-            file_id: self.file_id,
-            kind: self.kind as u8,
-            addr: self.addr,
-        };
-        to.copy_from_slice(hdr.as_slice());
-    }
-
-    fn decode(src: &[u8]) -> Self {
-        let hdr = PendingSiblingHdr::from_slice(src);
-        let kind = PendingRangeKind::try_from(hdr.kind).expect("invalid pending range kind");
-        Self {
-            bucket_id: hdr.bucket_id,
-            file_id: hdr.file_id,
-            kind,
-            addr: hdr.addr,
-        }
-    }
-}
-
-impl IMetaCodec for PendingRetire {
-    fn packed_size(&self) -> usize {
-        size_of::<PendingRetireHdr>()
-    }
-
-    fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
-        let hdr = PendingRetireHdr {
-            bucket_id: self.bucket_id,
-            kind: self.kind as u8,
-            addr: self.addr,
-        };
-        to.copy_from_slice(hdr.as_slice());
-    }
-
-    fn decode(src: &[u8]) -> Self {
-        let hdr = PendingRetireHdr::from_slice(src);
-        let kind = PendingRangeKind::try_from(hdr.kind).expect("invalid pending range kind");
-        Self {
-            bucket_id: hdr.bucket_id,
-            kind,
-            addr: hdr.addr,
         }
     }
 }
@@ -277,6 +144,13 @@ impl MemDataStat {
             inactive_elems: Vec::new(),
         }
     }
+
+    pub(crate) fn clone_mem(&self) -> Self {
+        Self {
+            inner: self.inner,
+            mask: self.mask.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -361,6 +235,13 @@ impl MemBlobStat {
         BlobStat {
             inner: self.inner,
             inactive_elems: Vec::new(),
+        }
+    }
+
+    pub(crate) fn clone_mem(&self) -> Self {
+        Self {
+            inner: self.inner,
+            mask: self.mask.clone(),
         }
     }
 }
@@ -501,7 +382,8 @@ impl PageTable {
         self.data
             .entry(pid)
             .and_modify(|x| {
-                if *x < addr {
+                // unmap or update
+                if *x < addr || addr == NULL_ADDR {
                     *x = addr;
                 }
             })
@@ -559,16 +441,44 @@ impl IMetaCodec for PageTable {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct BucketDurableFrontier {
+    pub bucket_id: u64,
+    pub lsn: GroupPositions,
+}
+
+impl BucketDurableFrontier {
+    pub const fn new(bucket_id: u64, lsn: GroupPositions) -> Self {
+        Self { bucket_id, lsn }
+    }
+}
+
+impl IAsSlice for BucketDurableFrontier {}
+
+impl IMetaCodec for BucketDurableFrontier {
+    fn packed_size(&self) -> usize {
+        size_of::<Self>()
+    }
+
+    fn encode(&self, to: &mut [u8]) {
+        assert_eq!(to.len(), self.packed_size());
+        to.copy_from_slice(self.as_slice());
+    }
+
+    fn decode(src: &[u8]) -> Self {
+        Self::from_slice(src)
+    }
+}
+
 #[derive(Debug)]
 #[repr(C)]
 pub struct Numerics {
     pub next_data_id: AtomicU64,
     pub next_blob_id: AtomicU64,
-    pub next_manifest_id: AtomicU64,
     pub next_bucket_id: AtomicU64,
     pub oracle: AtomicU64,
     pub wmk_oldest: AtomicU64,
-    pub log_size: AtomicUsize,
 }
 
 impl Numerics {
@@ -582,11 +492,9 @@ impl Default for Numerics {
         Self {
             next_data_id: AtomicU64::new(INIT_ID),
             next_blob_id: AtomicU64::new(INIT_ID),
-            next_manifest_id: AtomicU64::new(INIT_ID),
             next_bucket_id: AtomicU64::new(INIT_ID),
             oracle: AtomicU64::new(INIT_ORACLE),
             wmk_oldest: AtomicU64::new(INIT_WMK),
-            log_size: AtomicUsize::new(0),
         }
     }
 }
@@ -790,8 +698,6 @@ impl IMetaCodec for DelInterval {
 #[derive(Debug)]
 #[repr(C)]
 pub struct BucketMeta {
-    /// because root pid will be unmapped and reused, so we use an extra bucket_id to filter-out reused root_pid in
-    /// flush thread
     pub bucket_id: u64,
 }
 
@@ -817,34 +723,5 @@ impl IMetaCodec for BucketMeta {
 
     fn decode(src: &[u8]) -> Self {
         unsafe { std::ptr::read(src.as_ptr() as *const Self) }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::{PendingRangeKind, PendingRetire, PendingSibling};
-    use crate::meta::IMetaCodec;
-
-    #[test]
-    fn pending_sibling_codec_roundtrip() {
-        let raw = PendingSibling::new(7, 13, PendingRangeKind::Data, 101);
-        let mut buf = vec![0u8; raw.packed_size()];
-        raw.encode(&mut buf);
-        let got = PendingSibling::decode(&buf);
-        assert_eq!(got.bucket_id, 7);
-        assert_eq!(got.file_id, 13);
-        assert_eq!(got.kind, PendingRangeKind::Data);
-        assert_eq!(got.addr, 101);
-    }
-
-    #[test]
-    fn pending_retire_codec_roundtrip() {
-        let raw = PendingRetire::new(9, PendingRangeKind::Blob, 131);
-        let mut buf = vec![0u8; raw.packed_size()];
-        raw.encode(&mut buf);
-        let got = PendingRetire::decode(&buf);
-        assert_eq!(got.bucket_id, 9);
-        assert_eq!(got.kind, PendingRangeKind::Blob);
-        assert_eq!(got.addr, 131);
     }
 }

@@ -19,20 +19,21 @@ use crc32c::Crc32cHasher;
 use dashmap::DashMap;
 
 use crate::{
+    Options,
     cc::context::Context,
     io::{File, GatherIO},
     map::{
-        IFooter, SharedState,
-        buffer::{BucketContext, BucketMgr, DataReader},
+        DataReader, IFooter, SharedState,
+        buffer::{BucketContext, BucketMgr},
         data::{BlobFooter, DataFooter, MetaReader},
-        flush::FlushObserver,
+        flush::CheckpointObserver,
         table::{BucketState, PageMap},
     },
     types::refbox::BoxRef,
     utils::{
         Handle, MutRef, OpCode,
         bitmap::BitMap,
-        data::{LenSeq, Reloc},
+        data::{GroupPositions, LenSeq, Position, Reloc, init_group_pos},
         interval::IntervalMap,
         lru::{Lru, ShardLru},
         observe::{CounterMetric, EventKind, ObserveEvent},
@@ -49,8 +50,7 @@ pub(crate) const BUCKET_OBSOLETE_DATA: &str = "obsolete_data";
 pub(crate) const BUCKET_OBSOLETE_BLOB: &str = "obsolete_blob";
 pub(crate) const BUCKET_METAS: &str = "bucket_metas";
 pub(crate) const BUCKET_PENDING_DEL: &str = "pending_del";
-pub(crate) const BUCKET_PENDING_SIBLING: &str = "pending_sibling";
-pub(crate) const BUCKET_PENDING_RETIRE: &str = "pending_retire";
+pub(crate) const BUCKET_FRONTIER: &str = "bucket_frontier";
 pub(crate) const BUCKET_VERSION: &str = "version";
 pub(crate) const MAX_BUCKETS: u64 = 1024;
 pub(crate) const VERSION_KEY: &str = "current_version";
@@ -63,9 +63,8 @@ pub(crate) const CURRENT_VERSION: u64 = 1;
 pub(crate) mod builder;
 mod entry;
 pub use entry::{
-    BlobStat, BlobStatInner, BucketMeta, DataStat, DataStatInner, DelInterval, Delete,
-    IntervalPair, MemBlobStat, MemDataStat, MetaKind, Numerics, PageTable, PendingRangeKind,
-    PendingRetire, PendingSibling,
+    BlobStat, BlobStatInner, BucketDurableFrontier, BucketMeta, DataStat, DataStatInner,
+    DelInterval, Delete, IntervalPair, MemBlobStat, MemDataStat, MetaKind, Numerics, PageTable,
 };
 
 pub(crate) fn page_table_name(bucket_id: u64) -> String {
@@ -86,22 +85,6 @@ pub(crate) fn orphan_data_marker_key(file_id: u64) -> Vec<u8> {
 
 pub(crate) fn orphan_blob_marker_key(file_id: u64) -> Vec<u8> {
     format!("{}{}", ORPHAN_BLOB_MARKER_PREFIX, file_id).into_bytes()
-}
-
-fn pending_sibling_key(bucket_id: u64, kind: PendingRangeKind, addr: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(size_of::<u64>() * 2 + size_of::<u8>());
-    key.extend_from_slice(&bucket_id.to_be_bytes());
-    key.push(kind as u8);
-    key.extend_from_slice(&addr.to_be_bytes());
-    key
-}
-
-fn pending_retire_key(bucket_id: u64, kind: PendingRangeKind, addr: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(size_of::<u64>() * 2 + size_of::<u8>());
-    key.extend_from_slice(&bucket_id.to_be_bytes());
-    key.push(kind as u8);
-    key.extend_from_slice(&addr.to_be_bytes());
-    key
 }
 
 pub(crate) trait IMetaCodec {
@@ -136,6 +119,16 @@ impl MetaRecord for PageTable {
                 addr.to_be_bytes().to_vec(),
             ));
         }
+    }
+}
+
+impl MetaRecord for BucketDurableFrontier {
+    fn record(&self, _kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
+        let mut buf = vec![0u8; self.packed_size()];
+        self.encode(&mut buf);
+        ops.entry(BUCKET_FRONTIER.to_string())
+            .or_default()
+            .push(MetaOp::Put(self.bucket_id.to_be_bytes().to_vec(), buf));
     }
 }
 
@@ -244,12 +237,15 @@ pub(crate) struct Manifest {
     pub(crate) buckets: Handle<BucketMgr>,
     pub(crate) bucket_metas: DashMap<String, Arc<BucketMeta>>,
     pub(crate) bucket_metas_by_id: DashMap<u64, Arc<BucketMeta>>,
+    pub(crate) bucket_frontier: DashMap<u64, GroupPositions>,
     pub(crate) bucket_states: DashMap<u64, MutRef<BucketState>>,
     pub(crate) structural_lock: Mutex<()>,
     /// total bucket count including both active/pending_del
     pub(crate) nr_buckets: AtomicU64,
     pub(crate) obsolete_data: Mutex<Vec<u64>>,
     pub(crate) obsolete_blob: Mutex<Vec<u64>>,
+    pub(crate) data_unsync: RwLock<HashSet<u64>>,
+    pub(crate) blob_unsync: RwLock<HashSet<u64>>,
     pub(crate) opt: Arc<ParsedOptions>,
     pub(crate) btree: BTree,
 }
@@ -332,8 +328,8 @@ struct FileReader {
 }
 
 fn new_reader<T: IFooter>(path: PathBuf) -> Result<Arc<FileReader>, OpCode> {
-    let mut loader = MetaReader::<T>::new(&path)?;
-    let relocs = loader.get_reloc()?;
+    let mut loader = MetaReader::<T>::new(&path).expect("not such path");
+    let relocs = loader.get_reloc().expect("must exist");
     let mut map = HashMap::with_capacity(relocs.len());
     for x in relocs {
         map.insert(x.key, x.val);
@@ -345,7 +341,7 @@ fn new_reader<T: IFooter>(path: PathBuf) -> Result<Arc<FileReader>, OpCode> {
 
 impl FileReader {
     fn read_at(&self, pos: u64) -> Result<BoxRef, OpCode> {
-        let m = self.map.get(&pos).expect("never happen");
+        let m = self.map.get(&pos).expect("can't find addr in reloc");
         let real_size = BoxRef::real_size_from_dump(m.len);
         let mut p = BoxRef::alloc_exact(real_size, pos);
         let mut crc = Crc32cHasher::default();
@@ -385,8 +381,7 @@ impl Manifest {
             BUCKET_OBSOLETE_BLOB,
             BUCKET_METAS,
             BUCKET_PENDING_DEL,
-            BUCKET_PENDING_SIBLING,
-            BUCKET_PENDING_RETIRE,
+            BUCKET_FRONTIER,
             BUCKET_VERSION,
         ];
 
@@ -408,10 +403,13 @@ impl Manifest {
             )),
             bucket_metas: DashMap::new(),
             bucket_metas_by_id: DashMap::new(),
+            bucket_frontier: DashMap::new(),
             bucket_states: DashMap::new(),
             structural_lock: Mutex::new(()),
             obsolete_data: Mutex::new(Vec::new()),
             obsolete_blob: Mutex::new(Vec::new()),
+            data_unsync: RwLock::new(HashSet::new()),
+            blob_unsync: RwLock::new(HashSet::new()),
             nr_buckets: AtomicU64::new(0),
             opt,
             btree,
@@ -422,7 +420,7 @@ impl Manifest {
         &self,
         ctx: Handle<Context>,
         reader: Arc<dyn DataReader>,
-        observer: Arc<dyn FlushObserver>,
+        observer: Arc<dyn CheckpointObserver>,
     ) {
         unsafe {
             let mgr = &mut *self.buckets.inner();
@@ -446,6 +444,7 @@ impl Manifest {
         let meta = meta.ok_or(OpCode::NotFound)?;
         self.bucket_metas.insert(name.to_string(), meta.clone());
         self.bucket_metas_by_id.insert(meta.bucket_id, meta.clone());
+        self.ensure_bucket_state(meta.bucket_id);
         Ok(meta)
     }
 
@@ -484,10 +483,14 @@ impl Manifest {
 
         // ensure state and pagemap are initialized
         let bucket_ctx = self.load_bucket_context_locked(bucket_id);
+        let frontier = self.current_group_checkpoints();
+        self.bucket_frontier.insert(bucket_id, frontier);
+        let frontier_rec = BucketDurableFrontier::new(bucket_id, frontier);
 
         let mut buf = vec![0u8; meta.as_ref().packed_size()];
         let mut txn = self.begin();
         txn.record(MetaKind::Numerics, self.numerics.as_ref());
+        txn.record(MetaKind::BucketFrontier, &frontier_rec);
         meta.as_ref().encode(&mut buf);
         txn.ops_mut()
             .entry(BUCKET_METAS.to_string())
@@ -544,11 +547,6 @@ impl Manifest {
             table
         };
 
-        let mut data_ivls = RwLock::new(IntervalMap::new());
-        let mut blob_ivls = RwLock::new(IntervalMap::new());
-        let next_addr = self.recover_intervals(bucket_id, &data_ivls, &blob_ivls);
-        state.next_addr.fetch_max(next_addr, Relaxed);
-
         let flush = self
             .buckets
             .flush
@@ -558,9 +556,7 @@ impl Manifest {
         let ctx = Arc::new(BucketContext::new(
             self.buckets.ctx,
             state,
-            self.buckets.flow.clone(),
             bucket_id,
-            next_addr,
             table,
             flush,
             self.buckets.lru,
@@ -569,15 +565,7 @@ impl Manifest {
             self.buckets.tx.clone(),
         ));
 
-        // Inject recovered intervals
-        {
-            let mut dst = ctx.data_intervals.write();
-            *dst = std::mem::take(data_ivls.get_mut());
-        }
-        {
-            let mut dst = ctx.blob_intervals.write();
-            *dst = std::mem::take(blob_ivls.get_mut());
-        }
+        self.recover_intervals(bucket_id, &ctx);
 
         self.buckets.buckets.insert(bucket_id, ctx.clone());
         ctx
@@ -590,14 +578,25 @@ impl Manifest {
             .expect("must exist")
     }
 
-    // bucket state is in-memory only and can be dropped during unload/delete or after restart
-    // context loading must recreate it on first touch, while repeated loads reuse the existing state
+    // bucket state is in-memory only and can be dropped during unload/delete or after restart.
+    // every published bucket meta must have a matching state entry; load/create paths call this
+    // to keep that invariant
     fn ensure_bucket_state(&self, bucket_id: u64) -> MutRef<BucketState> {
         self.bucket_states
             .entry(bucket_id)
             .or_insert_with(|| MutRef::new(BucketState::new()))
             .value()
             .clone()
+    }
+
+    fn current_group_checkpoints(&self) -> GroupPositions {
+        let mut out = init_group_pos();
+        let groups = self.buckets.ctx.groups();
+        let n = groups.len().min(Options::MAX_CONCURRENT_WRITE as usize);
+        for i in 0..n {
+            out[i] = groups[i].logging.lock().last_ckpt();
+        }
+        out
     }
 
     fn begin_bucket_remove_locked(
@@ -644,7 +643,7 @@ impl Manifest {
             .get(&bucket_id)
             .map(|x| x.value().clone())
         {
-            ctx.flush_and_wait();
+            ctx.checkpoint_before_reclaim();
         }
         let _ = self.buckets.buckets.remove(&bucket_id);
 
@@ -691,6 +690,12 @@ impl Manifest {
             .entry(BUCKET_PENDING_DEL.to_string())
             .or_default()
             .push(MetaOp::Put(bucket_id.to_be_bytes().to_vec(), vec![]));
+        if self.bucket_frontier.contains_key(&bucket_id) {
+            txn.ops_mut()
+                .entry(BUCKET_FRONTIER.to_string())
+                .or_default()
+                .push(MetaOp::Del(bucket_id.to_be_bytes().to_vec()));
+        }
 
         // record obsolete files
         if !data_files.is_empty() {
@@ -703,6 +708,12 @@ impl Manifest {
         txn.commit();
 
         // in-memory cleanup for stats
+        // once a bucket enters pending-delete, its file metadata must no longer participate in
+        // GC victim selection; otherwise GC may try to update interval buckets that were already
+        // physically dropped by pending-bucket cleanup.
+        self.data_stat.remove_stat_interval(&data_files);
+        self.blob_stat.remove_stat_interval(&blob_files);
+
         // remove from stat caches to release file handles
         for &id in &data_files {
             self.data_stat.remove_cache(id);
@@ -714,6 +725,7 @@ impl Manifest {
         // add to in-memory obsolete list for physical deletion by GC
         self.save_obsolete_data(&data_files);
         self.save_obsolete_blob(&blob_files);
+        self.bucket_frontier.remove(&bucket_id);
         self.delete_files();
 
         Ok(())
@@ -730,11 +742,21 @@ impl Manifest {
         }
     }
 
-    pub(crate) fn add_data_stat(&self, stat: MemDataStat) {
+    pub(crate) fn add_data_stat(&self, stat: MemDataStat, ivl: IntervalPair) {
+        if let Some(ctx) = self.buckets.buckets.get(&stat.bucket_id) {
+            ctx.data_intervals
+                .write()
+                .insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
+        }
         self.data_stat.add_stat_mem(stat);
     }
 
-    pub(crate) fn add_blob_stat(&self, stat: MemBlobStat) {
+    pub(crate) fn add_blob_stat(&self, stat: MemBlobStat, ivl: IntervalPair) {
+        if let Some(ctx) = self.buckets.buckets.get(&stat.bucket_id) {
+            ctx.blob_intervals
+                .write()
+                .insert(ivl.lo_addr, ivl.hi_addr, ivl.file_id);
+        }
         self.blob_stat.add_stat_mem(stat);
     }
 
@@ -786,19 +808,85 @@ impl Manifest {
 
     pub(crate) fn apply_data_junks(
         &self,
+        bucket_id: u64,
         tick: u64,
         junks: &[u64],
-        ctx: &Arc<BucketContext>,
     ) -> Vec<DataStat> {
-        self.data_stat.apply_junks(tick, junks, ctx, &self.btree)
+        if !junks.is_empty() {
+            let ctx = self.get_bucket_context_must_exist(bucket_id);
+            self.data_stat.apply_junks(tick, junks, &ctx, &self.btree)
+        } else {
+            Vec::new()
+        }
     }
 
-    pub(crate) fn apply_blob_junks(
+    pub(crate) fn apply_blob_junks(&self, bucket_id: u64, junks: &[u64]) -> Vec<BlobStat> {
+        if !junks.is_empty() {
+            let ctx = self.get_bucket_context_must_exist(bucket_id);
+            self.blob_stat.apply_junks(junks, &ctx, &self.btree)
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn durable_frontier_lsn(&self, bucket_id: u64, group: u8) -> Position {
+        let idx = group as usize;
+        debug_assert!(idx < Options::MAX_CONCURRENT_WRITE as usize);
+        self.bucket_frontier
+            .get(&bucket_id)
+            .map(|x| x[idx])
+            .unwrap_or(Position::MIN)
+    }
+
+    pub(crate) fn merge_bucket_frontier(
         &self,
-        junks: &[u64],
-        ctx: &Arc<BucketContext>,
-    ) -> Vec<BlobStat> {
-        self.blob_stat.apply_junks(junks, ctx, &self.btree)
+        bucket_id: u64,
+        delta: &GroupPositions,
+    ) -> BucketDurableFrontier {
+        let mut merged = self
+            .bucket_frontier
+            .get(&bucket_id)
+            .map(|x| *x.value())
+            .unwrap_or(init_group_pos());
+        for i in 0..merged.len() {
+            merged[i] = merged[i].max(delta[i]);
+        }
+        self.bucket_frontier.insert(bucket_id, merged);
+        BucketDurableFrontier::new(bucket_id, merged)
+    }
+
+    pub(crate) fn global_frontier_lower_bound(&self, groups: usize) -> GroupPositions {
+        let mut lower = init_group_pos();
+        let mut init = [false; Options::MAX_CONCURRENT_WRITE as usize];
+        let groups = groups.min(Options::MAX_CONCURRENT_WRITE as usize);
+        let fallback = self.current_group_checkpoints();
+        for meta in self.bucket_metas_by_id.iter() {
+            let bucket_id = *meta.key();
+            let bucket_ctx = self.buckets.buckets.get(&bucket_id);
+            let has_pending_flush = bucket_ctx
+                .as_ref()
+                .is_some_and(|ctx| ctx.value().has_pending_flush_data());
+            let frontier = self.bucket_frontier.get(&bucket_id);
+            for i in 0..groups {
+                // clean/read-only buckets must not pin global frontier with stale bucket frontier.
+                // only buckets that still have pending flush data participate via durable frontier.
+                let pos = if has_pending_flush {
+                    frontier.as_ref().map_or(fallback[i], |x| x[i])
+                } else {
+                    fallback[i]
+                };
+                if !init[i] || pos < lower[i] {
+                    lower[i] = pos;
+                    init[i] = true;
+                }
+            }
+        }
+        for i in 0..groups {
+            if !init[i] {
+                lower[i] = fallback[i];
+            }
+        }
+        lower
     }
 
     pub(crate) fn begin(&self) -> Txn<'_> {
@@ -808,290 +896,6 @@ impl Manifest {
             btree,
             ops: BTreeMap::new(),
         }
-    }
-
-    pub(crate) fn record_pending_sibling(&self, txn: &mut Txn<'_>, pending: &PendingSibling) {
-        let mut buf = vec![0u8; pending.packed_size()];
-        pending.encode(&mut buf);
-        let key = pending_sibling_key(pending.bucket_id, pending.kind, pending.addr);
-        txn.ops_mut()
-            .entry(BUCKET_PENDING_SIBLING.to_string())
-            .or_default()
-            .push(MetaOp::Put(key, buf));
-    }
-
-    pub(crate) fn clear_pending_sibling(
-        &self,
-        txn: &mut Txn<'_>,
-        bucket_id: u64,
-        kind: PendingRangeKind,
-        addr: u64,
-    ) {
-        let key = pending_sibling_key(bucket_id, kind, addr);
-        txn.ops_mut()
-            .entry(BUCKET_PENDING_SIBLING.to_string())
-            .or_default()
-            .push(MetaOp::Del(key));
-    }
-
-    pub(crate) fn load_pending_siblings(&self) -> Vec<PendingSibling> {
-        let mut out = Vec::new();
-        let _ = self.btree.view(BUCKET_PENDING_SIBLING, |txn| {
-            let mut iter = txn.iter();
-            let mut k = Vec::new();
-            let mut v = Vec::new();
-            while iter.next_ref(&mut k, &mut v) {
-                out.push(PendingSibling::decode(&v));
-            }
-            Ok(())
-        });
-        out
-    }
-
-    pub(crate) fn record_pending_retire(&self, txn: &mut Txn<'_>, pending: &PendingRetire) {
-        let mut buf = vec![0u8; pending.packed_size()];
-        pending.encode(&mut buf);
-        let key = pending_retire_key(pending.bucket_id, pending.kind, pending.addr);
-        txn.ops_mut()
-            .entry(BUCKET_PENDING_RETIRE.to_string())
-            .or_default()
-            .push(MetaOp::Put(key, buf));
-    }
-
-    pub(crate) fn clear_pending_retire(
-        &self,
-        txn: &mut Txn<'_>,
-        bucket_id: u64,
-        kind: PendingRangeKind,
-        addr: u64,
-    ) {
-        let key = pending_retire_key(bucket_id, kind, addr);
-        txn.ops_mut()
-            .entry(BUCKET_PENDING_RETIRE.to_string())
-            .or_default()
-            .push(MetaOp::Del(key));
-    }
-
-    pub(crate) fn load_pending_retires(&self) -> Vec<PendingRetire> {
-        let mut out = Vec::new();
-        let _ = self.btree.view(BUCKET_PENDING_RETIRE, |txn| {
-            let mut iter = txn.iter();
-            let mut k = Vec::new();
-            let mut v = Vec::new();
-            while iter.next_ref(&mut k, &mut v) {
-                out.push(PendingRetire::decode(&v));
-            }
-            Ok(())
-        });
-        out
-    }
-
-    pub(crate) fn recover_pending_retires_to_stats(&self) {
-        let pending = self.load_pending_retires();
-        if pending.is_empty() {
-            return;
-        }
-
-        let persisted_bucket_ids: HashSet<u64> = {
-            let mut out = HashSet::new();
-            let _ = self.btree.view(BUCKET_METAS, |txn| {
-                let mut iter = txn.iter();
-                let mut k = Vec::new();
-                let mut v = Vec::new();
-                while iter.next_ref(&mut k, &mut v) {
-                    out.insert(BucketMeta::decode(&v).bucket_id);
-                }
-                Ok(())
-            });
-            out
-        };
-        let pending_delete_bucket_ids: HashSet<u64> = {
-            let mut out = HashSet::new();
-            let _ = self.btree.view(BUCKET_PENDING_DEL, |txn| {
-                let mut iter = txn.iter();
-                let mut k = Vec::new();
-                let mut v = Vec::new();
-                while iter.next_ref(&mut k, &mut v) {
-                    if k.len() >= size_of::<u64>() {
-                        out.insert(<u64>::from_be_bytes(k[..8].try_into().unwrap()));
-                    }
-                }
-                Ok(())
-            });
-            out
-        };
-        let should_clear_not_found = |bucket_id: u64| {
-            pending_delete_bucket_ids.contains(&bucket_id)
-                || !persisted_bucket_ids.contains(&bucket_id)
-        };
-
-        let tick = self.numerics.next_data_id.load(Relaxed);
-        let mut data_by_bucket: HashMap<u64, Vec<u64>> = HashMap::new();
-        let mut blob_by_bucket: HashMap<u64, Vec<u64>> = HashMap::new();
-        for item in &pending {
-            match item.kind {
-                PendingRangeKind::Data => data_by_bucket
-                    .entry(item.bucket_id)
-                    .or_default()
-                    .push(item.addr),
-                PendingRangeKind::Blob => blob_by_bucket
-                    .entry(item.bucket_id)
-                    .or_default()
-                    .push(item.addr),
-            }
-        }
-
-        let mut stats_data: Vec<DataStat> = Vec::new();
-        let mut stats_blob: Vec<BlobStat> = Vec::new();
-        let mut clear_items: Vec<PendingRetire> = Vec::new();
-
-        for (bucket_id, mut addrs) in data_by_bucket {
-            addrs.sort_unstable();
-            addrs.dedup();
-            match self.load_bucket_context(bucket_id) {
-                Ok(ctx) => {
-                    let v = self.apply_data_junks(tick, &addrs, &ctx);
-                    stats_data.extend(v);
-                    for addr in addrs {
-                        clear_items.push(PendingRetire::new(
-                            bucket_id,
-                            PendingRangeKind::Data,
-                            addr,
-                        ));
-                    }
-                }
-                Err(OpCode::NotFound) => {
-                    if should_clear_not_found(bucket_id) {
-                        for addr in addrs {
-                            clear_items.push(PendingRetire::new(
-                                bucket_id,
-                                PendingRangeKind::Data,
-                                addr,
-                            ));
-                        }
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-
-        for (bucket_id, mut addrs) in blob_by_bucket {
-            addrs.sort_unstable();
-            addrs.dedup();
-            match self.load_bucket_context(bucket_id) {
-                Ok(ctx) => {
-                    let v = self.apply_blob_junks(&addrs, &ctx);
-                    stats_blob.extend(v);
-                    for addr in addrs {
-                        clear_items.push(PendingRetire::new(
-                            bucket_id,
-                            PendingRangeKind::Blob,
-                            addr,
-                        ));
-                    }
-                }
-                Err(OpCode::NotFound) => {
-                    if should_clear_not_found(bucket_id) {
-                        for addr in addrs {
-                            clear_items.push(PendingRetire::new(
-                                bucket_id,
-                                PendingRangeKind::Blob,
-                                addr,
-                            ));
-                        }
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-
-        if stats_data.is_empty() && stats_blob.is_empty() && clear_items.is_empty() {
-            return;
-        }
-
-        let mut txn = self.begin();
-        for stat in &stats_data {
-            txn.record(MetaKind::DataStat, stat);
-        }
-        for stat in &stats_blob {
-            txn.record(MetaKind::BlobStat, stat);
-        }
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_retire_after_apply_before_clear");
-        for item in &clear_items {
-            self.clear_pending_retire(&mut txn, item.bucket_id, item.kind, item.addr);
-        }
-        txn.commit();
-
-        if !stats_data.is_empty() {
-            self.opt.observer.counter(
-                CounterMetric::RetireDataApplied,
-                stats_data
-                    .iter()
-                    .map(|x| x.inactive_elems.len() as u64)
-                    .sum(),
-            );
-        }
-        if !stats_blob.is_empty() {
-            self.opt.observer.counter(
-                CounterMetric::RetireBlobApplied,
-                stats_blob
-                    .iter()
-                    .map(|x| x.inactive_elems.len() as u64)
-                    .sum(),
-            );
-        }
-        if !clear_items.is_empty() {
-            self.opt
-                .observer
-                .counter(CounterMetric::RetireCleared, clear_items.len() as u64);
-        }
-    }
-
-    pub(crate) fn recover_pending_siblings_to_stats(&self) {
-        let pending = self.load_pending_siblings();
-        if pending.is_empty() {
-            return;
-        }
-        let tick = self.numerics.next_data_id.load(Relaxed);
-        let mut txn = self.begin();
-        let mut data_by_file: HashMap<u64, Vec<u64>> = HashMap::new();
-        let mut blob_by_file: HashMap<u64, Vec<u64>> = HashMap::new();
-        for item in &pending {
-            match item.kind {
-                PendingRangeKind::Data => data_by_file
-                    .entry(item.file_id)
-                    .or_default()
-                    .push(item.addr),
-                PendingRangeKind::Blob => blob_by_file
-                    .entry(item.file_id)
-                    .or_default()
-                    .push(item.addr),
-            }
-        }
-
-        for (file_id, addrs) in data_by_file {
-            if let Some(stat) =
-                self.data_stat
-                    .apply_pending_sibling(file_id, &addrs, tick, &self.btree)
-            {
-                txn.record(MetaKind::DataStat, &stat);
-            }
-        }
-
-        for (file_id, addrs) in blob_by_file {
-            if let Some(stat) = self
-                .blob_stat
-                .apply_pending_sibling(file_id, &addrs, &self.btree)
-            {
-                txn.record(MetaKind::BlobStat, &stat);
-            }
-        }
-
-        for item in pending {
-            self.clear_pending_sibling(&mut txn, item.bucket_id, item.kind, item.addr);
-        }
-        txn.commit();
     }
 
     pub(crate) fn stage_orphan_data_file(&self, file_id: u64) {
@@ -1139,6 +943,30 @@ impl Manifest {
         });
     }
 
+    pub(crate) fn stage_unsynced_data_file(&self, file_id: u64) {
+        self.data_unsync.write().insert(file_id);
+    }
+
+    pub(crate) fn stage_unsynced_blob_file(&self, file_id: u64) {
+        self.blob_unsync.write().insert(file_id);
+    }
+
+    pub(crate) fn clear_synced_data(&self) {
+        self.data_unsync.write().clear();
+    }
+
+    pub(crate) fn clear_synced_blob(&self) {
+        self.blob_unsync.write().clear();
+    }
+
+    pub(crate) fn is_unsynced_data_file(&self, file_id: u64) -> bool {
+        self.data_unsync.read().contains(&file_id)
+    }
+
+    pub(crate) fn is_unsynced_blob_file(&self, file_id: u64) -> bool {
+        self.blob_unsync.read().contains(&file_id)
+    }
+
     pub(crate) fn clear_orphan_blob_file(&self, txn: &mut Txn<'_>, file_id: u64) {
         txn.ops_mut()
             .entry(BUCKET_NUMERICS.to_string())
@@ -1157,8 +985,9 @@ impl Manifest {
     }
 
     fn stage_orphan_marker(&self, key: Vec<u8>, kind: &str, file_id: u64) {
+        let v = [];
         self.btree
-            .exec(BUCKET_NUMERICS, |txn| txn.put(&key, Vec::<u8>::new()))
+            .exec(BUCKET_NUMERICS, |txn| txn.put(&key, v))
             .unwrap_or_else(|e| {
                 panic!(
                     "failed to stage {} orphan marker for file {}: {:?}",
@@ -1259,12 +1088,7 @@ impl Manifest {
         }
     }
 
-    pub(crate) fn recover_intervals(
-        &self,
-        bucket_id: u64,
-        data_ivls: &RwLock<IntervalMap>,
-        blob_ivls: &RwLock<IntervalMap>,
-    ) -> u64 {
+    pub(crate) fn recover_intervals(&self, bucket_id: u64, ctx: &BucketContext) {
         let mut max_addr = crate::utils::INIT_ADDR;
 
         let data_ivl_table = data_interval_name(bucket_id);
@@ -1272,7 +1096,7 @@ impl Manifest {
             let mut iter = txn.iter();
             let mut k = Vec::new();
             let mut v = Vec::new();
-            let mut map = data_ivls.write();
+            let mut map = ctx.data_intervals.write();
             while iter.next_ref(&mut k, &mut v) {
                 let ivl = IntervalPair::decode(&v);
                 max_addr = max_addr.max(ivl.hi_addr);
@@ -1286,7 +1110,7 @@ impl Manifest {
             let mut iter = txn.iter();
             let mut k = Vec::new();
             let mut v = Vec::new();
-            let mut map = blob_ivls.write();
+            let mut map = ctx.blob_intervals.write();
             while iter.next_ref(&mut k, &mut v) {
                 let ivl = IntervalPair::decode(&v);
                 max_addr = max_addr.max(ivl.hi_addr);
@@ -1295,7 +1119,7 @@ impl Manifest {
             Ok(())
         });
 
-        max_addr + 1
+        ctx.state.next_addr.fetch_max(max_addr + 1, Relaxed);
     }
 }
 
@@ -1361,6 +1185,7 @@ where
         self.common.junk.start();
     }
 
+    // see comment in `try_get_reloc`
     fn load(&self, addr: u64, ctx: &BucketContext) -> Result<BoxRef, OpCode> {
         let file_id = {
             let ivl_map = K::intervals(ctx).read();
@@ -1377,14 +1202,13 @@ where
         }
     }
 
-    fn get_reloc(&self, file_id: u64, pos: u64) -> Reloc {
+    // it's possible that during multiple compaction the intermediate sibling/blob addr may be removed
+    // from dirty page and never flush to disk, but meanwhile someone may still hold the old ref to
+    // those addr, in this case we can't find reloc by addr
+    fn try_get_reloc(&self, file_id: u64, pos: u64) -> Option<Reloc> {
         loop {
             if let Some(reader) = self.common.cache.get(file_id).map(|x| x.clone()) {
-                let Some(&tmp) = reader.map.get(&pos) else {
-                    log::error!("can't find reloc, file_id {file_id} key {pos}");
-                    unreachable!("can't find reloc, file_id {file_id} key {pos}");
-                };
-                return tmp;
+                return reader.map.get(&pos).copied();
             }
 
             let lk = self.common.cache.lock_shard(file_id);
@@ -1627,74 +1451,53 @@ impl StatCtx<DataKind, DashMap<u64, MemDataStat>> {
         ctx: &BucketContext,
         btree: &BTree,
     ) -> Vec<DataStat> {
-        let candidates: Vec<(u64, u64)> = {
+        let grouped: BTreeMap<u64, Vec<u64>> = {
             let lk = ctx.data_intervals.read();
-            junks
-                .iter()
-                .filter_map(|&addr| {
-                    // race condition: gc might have already removed the interval containing this junk
-                    // 1. flush thread holds a junk addr
-                    // 2. gc thread rewrites the file containing addr, and since it is junk, it is not moved
-                    // 3. gc thread removes the interval from interval map if it becomes empty
-                    // 4. flush thread tries to find the file_id of the junk, but the interval is gone
-                    let file_id = lk.find(addr)?;
-                    Some((addr, file_id))
-                })
-                .collect()
+            let mut grouped = BTreeMap::<u64, Vec<u64>>::new();
+            for &addr in junks {
+                // race condition: gc might have already removed the interval containing this junk
+                // 1. flush thread holds a junk addr
+                // 2. gc thread rewrites the file containing addr, and since it is junk, it is not moved
+                // 3. gc thread removes the interval from interval map if it becomes empty
+                // 4. flush thread tries to find the file_id of the junk, but the interval is gone
+                if let Some(file_id) = lk.find(addr) {
+                    grouped.entry(file_id).or_default().push(addr);
+                }
+            }
+            grouped
         };
 
-        let mut v: Vec<DataStat> = Vec::with_capacity(junks.len());
-        for (addr, file_id) in candidates {
+        // Merge all updates on the same file_id into one DataStat record to avoid
+        // generating many duplicate per-file meta puts in a single publish round.
+        let mut v: Vec<DataStat> = Vec::with_capacity(grouped.len());
+        for (file_id, addrs) in grouped {
             if self.ensure_mask(file_id, btree).is_err() {
                 continue;
             }
             if let Some(mut stat) = self.map.get_mut(&file_id) {
-                let reloc = self.get_reloc(file_id, addr);
-                self.update_stat(&mut stat, addr, &reloc, tick);
-                if let Some(b) = v.last_mut()
-                    && b.inner.file_id == file_id
-                {
-                    b.inner = stat.inner;
-                    b.inactive_elems.push(reloc.seq);
-                } else {
+                let mut seqs = Vec::new();
+                for addr in addrs {
+                    // race condition: gc might have already removed the interval containing this junk
+                    let Some(reloc) = self.try_get_reloc(file_id, addr) else {
+                        // interval ranges can cover sparse logical addresses, so a junk addr may
+                        // resolve to a file without having ever been written into its reloc table
+                        continue;
+                    };
+                    if stat.mask.as_ref().expect("mask loaded").test(reloc.seq) {
+                        continue;
+                    }
+                    self.update_stat(&mut stat, addr, &reloc, tick);
+                    seqs.push(reloc.seq);
+                }
+                if !seqs.is_empty() {
                     v.push(DataStat {
                         inner: stat.inner,
-                        inactive_elems: vec![reloc.seq],
+                        inactive_elems: seqs,
                     });
                 }
             }
         }
         v
-    }
-
-    pub(crate) fn apply_pending_sibling(
-        &self,
-        file_id: u64,
-        addrs: &[u64],
-        tick: u64,
-        btree: &BTree,
-    ) -> Option<DataStat> {
-        if self.ensure_mask(file_id, btree).is_err() {
-            return None;
-        }
-        let mut stat = self.map.get_mut(&file_id)?;
-        let mut inactive_elems = Vec::new();
-        for &addr in addrs {
-            let reloc = self.get_reloc(file_id, addr);
-            let inactive = stat.mask.as_ref().expect("mask loaded").test(reloc.seq);
-            if !inactive {
-                self.update_stat(&mut stat, addr, &reloc, tick);
-                inactive_elems.push(reloc.seq);
-            }
-        }
-        if inactive_elems.is_empty() {
-            None
-        } else {
-            Some(DataStat {
-                inner: stat.inner,
-                inactive_elems,
-            })
-        }
     }
 
     pub(crate) fn update_stat(&self, stat: &mut MemDataStat, junk: u64, reloc: &Reloc, tick: u64) {
@@ -1803,10 +1606,11 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
         Ok(stat.mask.as_ref().expect("mask loaded").clone())
     }
 
-    pub(crate) fn get_victims(
+    pub(crate) fn get_blob_victims<F: Fn(u64) -> bool>(
         &self,
         file_ratio: usize,
         garbage_ratio: usize,
+        filter_out: F,
     ) -> (Vec<u64>, Vec<(u64, usize, u64)>) {
         let lk = self.map.read();
         let n = lk.len() * file_ratio / 100;
@@ -1815,10 +1619,17 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
         let mut nr_total = 0;
         let mut nr_active = 0;
 
+        // always collect fully obsolete blob files, regardless of victim sampling ratio
+        for (_, x) in lk.iter() {
+            if x.nr_active == 0 && !filter_out(x.file_id) {
+                o.push(x.file_id);
+            }
+        }
+
         for (_, x) in lk.iter().take(n) {
             if x.nr_active == 0 {
-                o.push(x.file_id);
-            } else {
+                continue;
+            } else if !filter_out(x.file_id) {
                 nr_total += x.nr_total;
                 nr_active += x.nr_active;
                 v.push((x.file_id, x.active_size, x.bucket_id));
@@ -1883,74 +1694,50 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
     }
 
     fn apply_junks(&self, junks: &[u64], ctx: &BucketContext, btree: &BTree) -> Vec<BlobStat> {
-        let candidates: Vec<(u64, u64)> = {
+        let grouped: BTreeMap<u64, Vec<u64>> = {
             let lk = ctx.blob_intervals.read();
-            junks
-                .iter()
-                .filter_map(|&addr| {
-                    // race condition: gc might have already removed the interval containing this junk
-                    // 1. flush thread holds a junk addr
-                    // 2. gc thread rewrites the file containing addr, and since it is junk, it is not moved
-                    // 3. gc thread removes the interval from interval map if it becomes empty
-                    // 4. flush thread tries to find the file_id of the junk, but the interval is gone
-                    let file_id = lk.find(addr)?;
-                    Some((addr, file_id))
-                })
-                .collect()
+            let mut grouped = BTreeMap::<u64, Vec<u64>>::new();
+            for &addr in junks {
+                // race condition: gc might have already removed the interval containing this junk
+                // 1. flush thread holds a junk addr
+                // 2. gc thread rewrites the file containing addr, and since it is junk, it is not moved
+                // 3. gc thread removes the interval from interval map if it becomes empty
+                // 4. flush thread tries to find the file_id of the junk, but the interval is gone
+                if let Some(file_id) = lk.find(addr) {
+                    grouped.entry(file_id).or_default().push(addr);
+                }
+            }
+            grouped
         };
-        let mut v: Vec<BlobStat> = Vec::with_capacity(junks.len());
-        for (addr, file_id) in candidates {
+        let mut v: Vec<BlobStat> = Vec::with_capacity(grouped.len());
+        for (file_id, addrs) in grouped {
             if self.ensure_mask(file_id, btree).is_err() {
                 continue;
             }
             let mut map = self.map.write();
             if let Some(stat) = map.get_mut(&file_id) {
-                let reloc = self.get_reloc(file_id, addr);
-                self.update_stat(stat, &reloc, addr);
-                if let Some(b) = v.last_mut()
-                    && b.inner.file_id == file_id
-                {
-                    b.inner = stat.inner;
-                    b.inactive_elems.push(reloc.seq);
-                } else {
+                let mut seqs = Vec::new();
+                for addr in addrs {
+                    let Some(reloc) = self.try_get_reloc(file_id, addr) else {
+                        // interval ranges can cover sparse logical addresses, so a junk addr may
+                        // resolve to a file without having ever been written into its reloc table
+                        continue;
+                    };
+                    if stat.mask.as_ref().expect("mask loaded").test(reloc.seq) {
+                        continue;
+                    }
+                    self.update_stat(stat, &reloc, addr);
+                    seqs.push(reloc.seq);
+                }
+                if !seqs.is_empty() {
                     v.push(BlobStat {
                         inner: stat.inner,
-                        inactive_elems: vec![reloc.seq],
+                        inactive_elems: seqs,
                     });
                 }
             }
         }
         v
-    }
-
-    pub(crate) fn apply_pending_sibling(
-        &self,
-        file_id: u64,
-        addrs: &[u64],
-        btree: &BTree,
-    ) -> Option<BlobStat> {
-        if self.ensure_mask(file_id, btree).is_err() {
-            return None;
-        }
-        let mut map = self.map.write();
-        let stat = map.get_mut(&file_id)?;
-        let mut inactive_elems = Vec::new();
-        for &addr in addrs {
-            let reloc = self.get_reloc(file_id, addr);
-            let inactive = stat.mask.as_ref().expect("mask loaded").test(reloc.seq);
-            if !inactive {
-                self.update_stat(stat, &reloc, addr);
-                inactive_elems.push(reloc.seq);
-            }
-        }
-        if inactive_elems.is_empty() {
-            None
-        } else {
-            Some(BlobStat {
-                inner: stat.inner,
-                inactive_elems,
-            })
-        }
     }
 
     fn update_stat(&self, stat: &mut MemBlobStat, reloc: &Reloc, addr: u64) {

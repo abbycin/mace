@@ -1,11 +1,13 @@
 use crate::cc::context::Context;
 use crate::index::tree::Tree;
 pub use crate::index::txn::{TxnKV, TxnView};
-use crate::map::buffer::DataReader;
+use crate::map::DataReader;
 use crate::map::evictor::Evictor;
-use crate::map::flush::{FlushDirective, FlushObserver, FlushResult};
+use crate::map::flush::{CheckpointObserver, FlushDirective, FlushResult};
 use crate::meta::builder::ManifestBuilder;
-use crate::meta::{BucketMeta, Manifest, MetaKind, PendingRangeKind};
+use crate::meta::{
+    BlobStat, BucketMeta, DataStat, IntervalPair, Manifest, MemBlobStat, MemDataStat, MetaKind, Txn,
+};
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
 use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats, VacuumStats};
@@ -14,11 +16,12 @@ use crate::utils::Handle;
 use crate::utils::MutRef;
 pub use crate::utils::OpCode;
 use crate::utils::ROOT_PID;
-use crate::utils::observe::CounterMetric;
 pub use crate::utils::options::Options;
 use crate::utils::options::ParsedOptions;
+use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::channel;
 
 struct StoreFlushObserver {
@@ -87,195 +90,134 @@ impl StoreFlushObserver {
         Self { manifest, ctx }
     }
 
-    fn remove_sorted_intersection(lhs: &mut Vec<u64>, rhs: &mut Vec<u64>) {
-        if lhs.is_empty() || rhs.is_empty() {
-            return;
-        }
-
-        lhs.sort_unstable();
-        lhs.dedup();
-        rhs.sort_unstable();
-        rhs.dedup();
-
-        // rewrite lhs/rhs in place to keep only side-unique entries
-        let mut i = 0;
-        let mut j = 0;
-        let mut wl = 0;
-        let mut wr = 0;
-        while i < lhs.len() && j < rhs.len() {
-            let x = lhs[i];
-            let y = rhs[j];
-            if x < y {
-                lhs[wl] = x;
-                wl += 1;
-                i += 1;
-            } else if x > y {
-                rhs[wr] = y;
-                wr += 1;
-                j += 1;
-            } else {
-                i += 1;
-                j += 1;
-            }
-        }
-        while i < lhs.len() {
-            lhs[wl] = lhs[i];
-            wl += 1;
-            i += 1;
-        }
-        while j < rhs.len() {
-            rhs[wr] = rhs[j];
-            wr += 1;
-            j += 1;
-        }
-        lhs.truncate(wl);
-        rhs.truncate(wr);
+    #[cfg(feature = "failpoints")]
+    #[cold]
+    fn abort_flush_publish(stage: &str, err: OpCode) -> ! {
+        log::error!("flush publish {} failed: {:?}", stage, err);
+        std::process::abort()
     }
 
-    fn publish_one(&self, mut result: FlushResult) -> Result<(), OpCode> {
-        let groups = self.ctx.groups();
-        debug_assert_eq!(result.flsn.len(), groups.len());
-
-        let ctx = self
+    fn update_stat_interval(
+        &self,
+        txn: &mut Txn,
+        result: &mut FlushResult,
+    ) -> (Vec<DataStat>, Vec<BlobStat>) {
+        let bucket_id = result.bucket_id;
+        let data_tick = result
+            .data_ivls
+            .iter()
+            .map(|x| x.file_id)
+            .max()
+            .unwrap_or_else(|| self.manifest.numerics.next_data_id.load(Relaxed));
+        let mut data_by_file = BTreeMap::<u64, DataStat>::new();
+        for stat in self
             .manifest
-            .buckets
-            .buckets
-            .get(&result.bucket_id)
-            .expect("bucket context must exist when flushing");
-        if let Some(data_ivl) = &result.data_ivl {
-            ctx.data_intervals
-                .write()
-                .insert(data_ivl.lo_addr, data_ivl.hi_addr, data_ivl.file_id);
+            .apply_data_junks(bucket_id, data_tick, &result.data_junk)
+        {
+            data_by_file.insert(stat.file_id, stat);
         }
-        if let Some(blob_ivl) = result.blob_ivl {
-            ctx.blob_intervals
-                .write()
-                .insert(blob_ivl.lo_addr, blob_ivl.hi_addr, blob_ivl.file_id);
-        }
-        let mut stage_pending_addrs = std::mem::take(&mut result.pending_sibling_addrs);
-        let mut clear_pending_addrs = std::mem::take(&mut result.published_sibling_addrs);
-        // the siblings and base are almost in same arena, so it's unnecessary to stage/clear
-        Self::remove_sorted_intersection(&mut stage_pending_addrs, &mut clear_pending_addrs);
-        // release arena before metadata commit to avoid holding allocator capacity
-        // defer done callback until manifest publish so wait_flush still means end-to-end flush done
-        result.done.release();
-
-        // make wal durable before publishing flush metadata
-        for (i, g) in groups.iter().enumerate() {
-            let target = result.flsn[i];
-            let mut lk = g.logging.lock();
-            let ok = lk.should_durable(target);
-            if ok {
-                let mut f = lk.writer.clone();
-                drop(lk);
-                // it's safe because we make sure wal entry has been written before
-                f.sync();
-            }
+        let mut blob_by_file = BTreeMap::<u64, BlobStat>::new();
+        for stat in self.manifest.apply_blob_junks(bucket_id, &result.blob_junk) {
+            blob_by_file.insert(stat.file_id, stat);
         }
 
+        #[cfg(feature = "extra_check")]
+        assert_eq!(result.data_stats.len(), result.data_ivls.len());
+        #[cfg(feature = "extra_check")]
+        assert_eq!(result.blob_stats.len(), result.blob_ivls.len());
+
+        for (mem_stat, ivl) in result
+            .data_stats
+            .drain(..)
+            .zip(result.data_ivls.iter().copied())
+        {
+            data_by_file
+                .entry(mem_stat.file_id)
+                .or_insert_with(|| mem_stat);
+            self.manifest.clear_orphan_data_file(txn, ivl.file_id);
+        }
+
+        for (mem_stat, ivl) in result
+            .blob_stats
+            .drain(..)
+            .zip(result.blob_ivls.iter().copied())
+        {
+            blob_by_file
+                .entry(mem_stat.file_id)
+                .or_insert_with(|| mem_stat);
+            self.manifest.clear_orphan_blob_file(txn, ivl.file_id);
+        }
+        (
+            data_by_file.into_values().collect(),
+            blob_by_file.into_values().collect(),
+        )
+    }
+
+    fn publish(&self, mut result: FlushResult) {
+        result.sync(); // must be called before updatin manifest
+        let bucket_id = result.bucket_id;
+        let frontier_delta = *result.latest_chkpoint_lsn.deref();
+        let bucket_frontier = self
+            .manifest
+            .merge_bucket_frontier(bucket_id, &frontier_delta);
         let mut txn = self.manifest.begin();
-        for &addr in &result.data_junks {
-            self.manifest.record_pending_retire(
-                &mut txn,
-                &crate::meta::PendingRetire::new(result.bucket_id, PendingRangeKind::Data, addr),
-            );
+        let (data_stats, blob_stats) = self.update_stat_interval(&mut txn, &mut result);
+
+        for ivl in &result.data_ivls {
+            txn.record(MetaKind::DataInterval, ivl);
         }
-        for &addr in &result.blob_junks {
-            self.manifest.record_pending_retire(
-                &mut txn,
-                &crate::meta::PendingRetire::new(result.bucket_id, PendingRangeKind::Blob, addr),
-            );
-        }
-        let retire_recorded = (result.data_junks.len() + result.blob_junks.len()) as u64;
-        if retire_recorded > 0 {
-            self.ctx
-                .opt
-                .observer
-                .counter(CounterMetric::RetireRecorded, retire_recorded);
+        for ivl in &result.blob_ivls {
+            txn.record(MetaKind::BlobInterval, ivl);
         }
 
-        if !stage_pending_addrs.is_empty() {
-            let data_id = result
-                .data_id
-                .expect("pending sibling publish requires data file id");
-            for &addr in &stage_pending_addrs {
-                let pending = crate::meta::PendingSibling::new(
-                    result.bucket_id,
-                    data_id,
-                    PendingRangeKind::Data,
-                    addr,
-                );
-                self.manifest.record_pending_sibling(&mut txn, &pending);
-            }
-        }
+        data_stats.iter().for_each(|x| {
+            txn.record(MetaKind::DataStat, x);
+        });
+        blob_stats.iter().for_each(|x| {
+            txn.record(MetaKind::BlobStat, x);
+        });
 
-        if let Some(data_stat) = &result.data_stat {
-            txn.record(MetaKind::DataStat, data_stat);
-        }
+        txn.record(MetaKind::BucketFrontier, &bucket_frontier);
         txn.record(MetaKind::Map, &result.map_table);
-        if let Some(data_ivl) = &result.data_ivl {
-            txn.record(MetaKind::DataInterval, data_ivl);
-        }
-
-        if let (Some(blob_ivl), Some(blob_stat)) = (&result.blob_ivl, &result.blob_stat) {
-            txn.record(MetaKind::BlobStat, blob_stat);
-            txn.record(MetaKind::BlobInterval, blob_ivl);
-        }
-        for &addr in &clear_pending_addrs {
-            self.manifest.clear_pending_sibling(
-                &mut txn,
-                result.bucket_id,
-                PendingRangeKind::Data,
-                addr,
-            );
-        }
-
         txn.record(MetaKind::Numerics, self.manifest.numerics.deref());
-        if let Some(data_id) = result.data_id {
-            self.manifest.clear_orphan_data_file(&mut txn, data_id);
-        }
-        if let Some(blob_ivl) = result.blob_ivl {
-            self.manifest
-                .clear_orphan_blob_file(&mut txn, blob_ivl.file_id);
-        }
+
         #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::check("mace_flush_before_manifest_commit")?;
+        if let Err(e) = crate::utils::failpoint::check("mace_flush_before_manifest_commit") {
+            Self::abort_flush_publish("before manifest commit", e);
+        }
         txn.commit();
+
+        self.manifest.clear_synced_data();
+        self.manifest.clear_synced_blob();
+
         #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::check("mace_flush_after_manifest_commit")?;
-
-        if let Some(mem_data_stat) = result.mem_data_stat {
-            self.manifest.add_data_stat(mem_data_stat);
-        }
-        if let Some(mem_blob_stat) = result.mem_blob_stat {
-            self.manifest.add_blob_stat(mem_blob_stat);
+        if let Err(e) = crate::utils::failpoint::check("mace_flush_after_manifest_commit") {
+            Self::abort_flush_publish("after manifest commit", e);
         }
 
-        result.done.mark_done();
+        let groups = self.ctx.groups();
+        let sync = self.ctx.opt.sync_on_write;
+        let global_frontier = self.manifest.global_frontier_lower_bound(groups.len());
 
-        // checkpoint update is a post-flush step and must run after mark_done
-        // wal durability barrier is handled before manifest commit in the first loop
         for (i, g) in groups.iter().enumerate() {
-            let mut pos = result.flsn[i];
+            let mut pos = global_frontier[i];
             if let Some(min) = g.active_txns.min_lsn()
                 && min < pos
             {
                 pos = min;
             }
             let mut lk = g.logging.lock();
-            if lk.update_checkpoint(pos) {
+            if lk.update_checkpoint(pos) && sync {
                 let mut f = lk.writer.clone();
                 drop(lk);
-                // checkpoint must be synced
+                // checkpoint must be synced in durable mode
                 f.sync();
             }
         }
-
-        Ok(())
     }
 }
 
-impl FlushObserver for StoreFlushObserver {
+impl CheckpointObserver for StoreFlushObserver {
     fn flush_directive(&self, bucket_id: u64) -> FlushDirective {
         match self.manifest.bucket_states.get(&bucket_id) {
             Some(state) => {
@@ -288,6 +230,14 @@ impl FlushObserver for StoreFlushObserver {
         }
     }
 
+    fn stage_unsynced_data_file(&self, file_id: u64) {
+        self.manifest.stage_unsynced_data_file(file_id);
+    }
+
+    fn stage_unsynced_blob_file(&self, file_id: u64) {
+        self.manifest.stage_unsynced_blob_file(file_id);
+    }
+
     fn stage_orphan_data_file(&self, file_id: u64) {
         self.manifest.stage_orphan_data_file(file_id);
     }
@@ -296,8 +246,16 @@ impl FlushObserver for StoreFlushObserver {
         self.manifest.stage_orphan_blob_file(file_id);
     }
 
-    fn on_flush(&self, result: FlushResult) -> Result<(), OpCode> {
-        self.publish_one(result)
+    fn update_data_mem_interval_stat(&self, ivl: IntervalPair, stat: MemDataStat) {
+        self.manifest.add_data_stat(stat, ivl);
+    }
+
+    fn update_blob_mem_interval_stat(&self, ivl: IntervalPair, stat: MemBlobStat) {
+        self.manifest.add_blob_stat(stat, ivl);
+    }
+
+    fn on_flush(&self, result: FlushResult) {
+        self.publish(result)
     }
 }
 
@@ -404,6 +362,12 @@ impl Inner {
     fn vacuum_meta(self: &Inner) -> Result<MetaVacuumStats, OpCode> {
         self.store.manifest.vacuum_meta(META_VACUUM_TARGET_BYTES)
     }
+
+    fn checkpoint(&self, bucket_id: u64) {
+        if let Ok(ctx) = self.store.manifest.load_bucket_context(bucket_id) {
+            ctx.checkpoint();
+        }
+    }
 }
 
 impl Drop for Inner {
@@ -430,6 +394,11 @@ impl Bucket {
     /// Begins a new read-only transaction (view).
     pub fn view(&'_ self) -> Result<TxnView<'_>, OpCode> {
         TxnView::new(&self.inner.store.context, &self.tree)
+    }
+
+    /// Starts a manual checkpoint which will flush dirty pages to disk and may trigger WAL gc
+    pub fn checkpoint(&self) {
+        self.inner.checkpoint(self.id());
     }
 
     /// Returns the unique identifier of this bucket.
@@ -473,7 +442,6 @@ impl Mace {
         let observer = Arc::new(StoreFlushObserver::new(manifest, ctx));
         let reader = Arc::new(StoreDataReader::new(manifest));
         manifest.set_context(ctx, reader, observer);
-        manifest.recover_pending_retires_to_stats();
 
         let store = MutRef::new(Store::new(opt.clone(), manifest, ctx));
 

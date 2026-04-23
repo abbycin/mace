@@ -1,13 +1,16 @@
 use parking_lot::{Mutex, MutexGuard};
+use rustc_hash::FxHasher;
 use std::{
-    cell::Cell,
     collections::HashMap,
-    hash::Hash,
+    hash::{BuildHasherDefault, Hash},
     ops::Deref,
     ptr::{self},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use super::spooky::spooky_hash;
+use super::spooky::{spooky_hash, spooky_hash_pair};
+
+type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 fn init_head<K, V>() -> *mut Node<K, V> {
     let p = Box::into_raw(Box::new(Node::default()));
@@ -83,7 +86,7 @@ impl<K, V> Default for Node<K, V> {
 
 pub(crate) struct LruGuard<'a, K, V, N> {
     data: &'a V,
-    _guard: MutexGuard<'a, HashMap<K, N>>,
+    _guard: MutexGuard<'a, FastHashMap<K, N>>,
 }
 
 impl<K, V, N> Deref for LruGuard<'_, K, V, N> {
@@ -98,7 +101,7 @@ pub(crate) struct LruShardGuard<'a, K, V> {
     cap: usize,
     k: K,
     lru: &'a Lru<K, V>,
-    map: MutexGuard<'a, HashMap<K, *mut Node<K, V>>>,
+    map: MutexGuard<'a, FastHashMap<K, *mut Node<K, V>>>,
 }
 
 impl<'a, K, V> LruShardGuard<'a, K, V>
@@ -119,12 +122,12 @@ where
 
 pub(crate) struct Lru<K, V> {
     head: *mut Node<K, V>,
-    map: Mutex<HashMap<K, *mut Node<K, V>>>,
+    map: Mutex<FastHashMap<K, *mut Node<K, V>>>,
 }
 
-// it's larger than 64 on macOS
+// FxHasher drops RandomState storage, so the non-macOS layout is smaller.
 #[cfg(not(target_os = "macos"))]
-crate::static_assert!(size_of::<Lru<u32, crate::io::File>>() == 64);
+crate::static_assert!(size_of::<Lru<u32, crate::io::File>>() == 48);
 
 unsafe impl<K, V> Send for Lru<K, V> {}
 unsafe impl<K, V> Sync for Lru<K, V> {}
@@ -136,7 +139,7 @@ where
     pub(crate) fn new() -> Self {
         Self {
             head: init_head(),
-            map: Mutex::new(HashMap::new()),
+            map: Mutex::new(FastHashMap::default()),
         }
     }
 
@@ -183,7 +186,7 @@ where
 
     fn add_unlocked(
         &self,
-        map: &mut MutexGuard<'_, HashMap<K, *mut Node<K, V>>>,
+        map: &mut MutexGuard<'_, FastHashMap<K, *mut Node<K, V>>>,
         cap: usize,
         k: K,
         v: V,
@@ -255,89 +258,145 @@ pub enum CachePriority {
     High,
 }
 
-struct Cap {
-    curr: Cell<usize>,
-    limit: usize,
+pub(crate) struct PriorityValue<V> {
+    val: V,
+    prio: CachePriority,
+    weight: usize,
 }
 
-impl Cap {
-    const fn new(limit: usize) -> Self {
+impl<V> PriorityValue<V> {
+    fn new(val: V, prio: CachePriority, weight: usize) -> Self {
+        Self { val, prio, weight }
+    }
+}
+
+type PriorityNode<V> = Node<u128, PriorityValue<V>>;
+
+struct EvictOutcome {
+    prio: usize,
+    weight: usize,
+}
+
+struct PriorityShard<V> {
+    queue: [*mut PriorityNode<V>; 2],
+    map: Mutex<FastHashMap<u128, *mut PriorityNode<V>>>,
+}
+
+impl<V> PriorityShard<V> {
+    fn new() -> Self {
         Self {
-            curr: Cell::new(0),
-            limit,
-        }
-    }
-
-    fn inc(&self) {
-        self.curr.set(self.curr.get() + 1);
-    }
-
-    fn dec(&self) {
-        self.curr.set(self.curr.get() - 1);
-    }
-
-    fn is_full(&self) -> bool {
-        self.curr.get() >= self.limit
-    }
-}
-
-struct PriorityLru<K, V> {
-    cap: [Cap; 2],
-    queue: [*mut Node<K, (V, CachePriority)>; 2],
-    map: Mutex<HashMap<K, *mut Node<K, (V, CachePriority)>>>,
-}
-
-impl<K, V> PriorityLru<K, V>
-where
-    K: Eq + Hash + Clone,
-{
-    fn new(cap: usize, high_ratio: usize) -> Self {
-        let hi_cap = cap * high_ratio / 100;
-        let lo_cap = cap - hi_cap;
-
-        Self {
-            cap: [Cap::new(lo_cap), Cap::new(hi_cap)],
             queue: [init_head(), init_head()],
-            map: Mutex::new(HashMap::new()),
+            map: Mutex::new(FastHashMap::default()),
         }
     }
 
-    fn add(&self, prio: CachePriority, k: K, v: V) {
-        let mut lk = self.map.lock();
-        let index = prio as usize;
-        let head = self.queue[index];
-        let cap = &self.cap[index];
-
-        if let Some(e) = lk.get(&k) {
-            unsafe { (*(*e)).set_val((v, prio)) };
-            Node::move_back(head, *e);
-        } else {
-            let node = Box::new(Node::new(k.clone(), (v, prio)));
-            let p = Box::into_raw(node);
-            lk.insert(k, p);
-            Node::push_back(head, p);
-            cap.inc();
-        }
-
-        if cap.is_full() {
-            let node = Node::front(head);
-            unsafe {
-                let key = (*node).key.take().unwrap();
-                lk.remove(&key);
-                Node::remove(node);
-                let _ = Box::from_raw(node);
+    fn atomic_saturating_sub(x: &AtomicUsize, delta: usize) {
+        let mut old = x.load(Ordering::Relaxed);
+        loop {
+            let new = old.saturating_sub(delta);
+            match x.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(cur) => old = cur,
             }
-            cap.dec();
         }
     }
 
-    fn get<'a>(&'a self, k: &K) -> Option<LruGuard<'a, K, V, *mut Node<K, (V, CachePriority)>>> {
+    fn account_add(
+        used_bytes: &[AtomicUsize; 2],
+        used_entries: &AtomicUsize,
+        old_prio: Option<usize>,
+        old_weight: usize,
+        new_prio: usize,
+        new_weight: usize,
+    ) {
+        if let Some(old_prio) = old_prio {
+            Self::atomic_saturating_sub(&used_bytes[old_prio], old_weight);
+        } else {
+            used_entries.fetch_add(1, Ordering::AcqRel);
+        }
+        used_bytes[new_prio].fetch_add(new_weight, Ordering::AcqRel);
+    }
+
+    fn add_and_account(
+        &self,
+        prio: CachePriority,
+        weight: usize,
+        key: u128,
+        val: V,
+        used_bytes: &[AtomicUsize; 2],
+        used_entries: &AtomicUsize,
+    ) {
+        let mut lk = self.map.lock();
+        let weight = weight.max(1);
+        let new_prio = prio as usize;
+        let new_head = self.queue[new_prio];
+
+        if let Some(node) = lk.get(&key).copied() {
+            let (old_prio, old_weight) = unsafe {
+                let old = (*node).val.as_ref().expect("priority lru value must exist");
+                (old.prio as usize, old.weight)
+            };
+            unsafe { (*node).set_val(PriorityValue::new(val, prio, weight)) };
+            if old_prio == new_prio {
+                Node::move_back(new_head, node);
+            } else {
+                Node::remove(node);
+                Node::push_back(new_head, node);
+            }
+            Self::account_add(
+                used_bytes,
+                used_entries,
+                Some(old_prio),
+                old_weight,
+                new_prio,
+                weight,
+            );
+        } else {
+            let node = Box::new(Node::new(key, PriorityValue::new(val, prio, weight)));
+            let ptr = Box::into_raw(node);
+            lk.insert(key, ptr);
+            Node::push_back(new_head, ptr);
+            Self::account_add(used_bytes, used_entries, None, 0, new_prio, weight);
+        }
+    }
+
+    fn pop_one_locked(
+        &self,
+        lk: &mut MutexGuard<'_, FastHashMap<u128, *mut PriorityNode<V>>>,
+        prio: usize,
+    ) -> Option<EvictOutcome> {
+        let head = self.queue[prio];
+        let node = Node::front(head);
+        if node == head {
+            return None;
+        }
+        unsafe {
+            let key = (*node).key.take().expect("priority lru key must exist");
+            let weight = (*node).val.as_ref().map(|x| x.weight.max(1)).unwrap_or(1);
+            lk.remove(&key);
+            Node::remove(node);
+            let _ = Box::from_raw(node);
+            Some(EvictOutcome { prio, weight })
+        }
+    }
+
+    fn evict_one(&self, prefer: Option<CachePriority>) -> Option<EvictOutcome> {
+        let mut lk = self.map.lock();
+        if let Some(prio) = prefer {
+            self.pop_one_locked(&mut lk, prio as usize)
+        } else {
+            self.pop_one_locked(&mut lk, CachePriority::Low as usize)
+                .or_else(|| self.pop_one_locked(&mut lk, CachePriority::High as usize))
+        }
+    }
+
+    fn get<'a>(&'a self, key: &u128) -> Option<LruGuard<'a, u128, V, *mut PriorityNode<V>>> {
         let lk = self.map.lock();
-        if let Some(e) = lk.get(k) {
-            let v = unsafe { (*(*e)).val.as_ref().unwrap() };
-            Node::move_back(self.queue[v.1 as usize], *e);
+        if let Some(node) = lk.get(key).copied() {
+            let val = unsafe { (*node).val.as_ref().expect("priority lru value must exist") };
+            Node::move_back(self.queue[val.prio as usize], node);
             Some(LruGuard {
-                data: &v.0,
+                data: &val.val,
                 _guard: lk,
             })
         } else {
@@ -346,7 +405,7 @@ where
     }
 }
 
-impl<K, V> Drop for PriorityLru<K, V> {
+impl<V> Drop for PriorityShard<V> {
     fn drop(&mut self) {
         unsafe {
             for head in self.queue {
@@ -403,30 +462,137 @@ impl<V> ShardLru<V> {
 }
 
 pub(crate) struct ShardPriorityLru<V> {
-    shard: [PriorityLru<u64, V>; LRU_SHARD],
+    shard: [PriorityShard<V>; LRU_SHARD],
+    used_bytes: [AtomicUsize; 2],
+    used_entries: AtomicUsize,
+    byte_cap: [usize; 2],
+    entry_cap: usize,
+    cursor: AtomicUsize,
+    trim_running: AtomicBool,
+    trim_requested: AtomicBool,
 }
 
 impl<V> ShardPriorityLru<V> {
-    pub(crate) fn new(cap: usize, high_ratio: usize) -> Self {
-        let shard_cap = cap / LRU_SHARD;
+    const MAX_TRIM_EVICT_PER_ROUND: usize = 16;
+
+    pub(crate) fn new(cap: usize, high_ratio: usize, max_entries: usize) -> Self {
+        let high_ratio = high_ratio.min(100);
+        let hi_cap = cap.saturating_mul(high_ratio) / 100;
+        let lo_cap = cap.saturating_sub(hi_cap);
         Self {
-            shard: std::array::from_fn(|_| PriorityLru::new(shard_cap, high_ratio)),
+            shard: std::array::from_fn(|_| PriorityShard::new()),
+            used_bytes: std::array::from_fn(|_| AtomicUsize::new(0)),
+            used_entries: AtomicUsize::new(0),
+            byte_cap: [lo_cap, hi_cap],
+            entry_cap: max_entries,
+            cursor: AtomicUsize::new(0),
+            trim_running: AtomicBool::new(false),
+            trim_requested: AtomicBool::new(false),
         }
     }
 
     #[inline(always)]
-    fn get_shard(k: u64) -> usize {
-        spooky_hash(k) as usize & LRU_SHARD_MASK
+    fn get_shard(k: u128) -> usize {
+        let hi = (k >> 64) as u64;
+        let lo = k as u64;
+        spooky_hash_pair(hi, lo) as usize & LRU_SHARD_MASK
     }
 
-    pub(crate) fn add(&self, prio: CachePriority, k: u64, v: V) {
-        self.shard[Self::get_shard(k)].add(prio, k, v);
+    #[inline]
+    fn over_bytes(&self, prio: CachePriority) -> bool {
+        let idx = prio as usize;
+        self.used_bytes[idx].load(Ordering::Acquire) > self.byte_cap[idx]
+    }
+
+    #[inline]
+    fn over_entry_limit(&self) -> bool {
+        self.entry_cap != 0 && self.used_entries.load(Ordering::Acquire) > self.entry_cap
+    }
+
+    #[inline]
+    fn maybe_over_limit(&self) -> bool {
+        self.over_bytes(CachePriority::Low)
+            || self.over_bytes(CachePriority::High)
+            || self.over_entry_limit()
+    }
+
+    fn account_eviction(&self, prio: usize, weight: usize) {
+        PriorityShard::<V>::atomic_saturating_sub(&self.used_bytes[prio], weight);
+        PriorityShard::<V>::atomic_saturating_sub(&self.used_entries, 1);
+    }
+
+    fn evict_round_robin(&self, prefer: Option<CachePriority>) -> bool {
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) & LRU_SHARD_MASK;
+        for step in 0..LRU_SHARD {
+            let idx = (start + step) & LRU_SHARD_MASK;
+            if let Some(evicted) = self.shard[idx].evict_one(prefer) {
+                self.account_eviction(evicted.prio, evicted.weight);
+                self.cursor
+                    .store((idx + 1) & LRU_SHARD_MASK, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn trim(&self) {
+        let mut evicted = 0;
+        while evicted < Self::MAX_TRIM_EVICT_PER_ROUND && self.maybe_over_limit() {
+            let prefer = if self.over_bytes(CachePriority::Low) {
+                Some(CachePriority::Low)
+            } else if self.over_bytes(CachePriority::High) {
+                Some(CachePriority::High)
+            } else {
+                None
+            };
+            let ok = self.evict_round_robin(prefer);
+            if !ok {
+                break;
+            }
+            evicted += 1;
+        }
+    }
+
+    fn try_trim(&self) {
+        if self
+            .trim_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        self.trim_requested.store(false, Ordering::Release);
+        self.trim();
+        self.trim_running.store(false, Ordering::Release);
+
+        // One call processes at most MAX_TRIM_EVICT_PER_ROUND evictions.
+        // If pressure remains, keep the request bit set for later callers.
+        if self.trim_requested.swap(false, Ordering::AcqRel) || self.maybe_over_limit() {
+            self.trim_requested.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn add(&self, prio: CachePriority, k: u128, weight: usize, v: V) {
+        let shard_idx = Self::get_shard(k);
+        self.shard[shard_idx].add_and_account(
+            prio,
+            weight,
+            k,
+            v,
+            &self.used_bytes,
+            &self.used_entries,
+        );
+        if self.maybe_over_limit() {
+            self.trim_requested.store(true, Ordering::Release);
+            self.try_trim();
+        }
     }
 
     pub(crate) fn get<'a>(
         &'a self,
-        k: u64,
-    ) -> Option<LruGuard<'a, u64, V, *mut Node<u64, (V, CachePriority)>>> {
+        k: u128,
+    ) -> Option<LruGuard<'a, u128, V, *mut Node<u128, PriorityValue<V>>>> {
         self.shard[Self::get_shard(k)].get(&k)
     }
 }
@@ -435,7 +601,7 @@ impl<V> ShardPriorityLru<V> {
 mod test {
     use std::ops::Deref;
 
-    use crate::utils::lru::Lru;
+    use crate::utils::lru::{CachePriority, Lru, ShardPriorityLru};
 
     #[test]
     fn lru() {
@@ -455,5 +621,18 @@ mod test {
         assert_eq!(m.get(&2).unwrap().deref(), &2);
         assert_eq!(m.get(&3).unwrap().deref(), &3);
         assert_eq!(m.get(&4).unwrap().deref(), &4);
+    }
+
+    #[test]
+    fn priority_lru_keeps_distinct_u128_keys() {
+        let m = ShardPriorityLru::new(64, 50, 0);
+        let k1 = (1_u128 << 64) | 7;
+        let k2 = (2_u128 << 64) | 7;
+
+        m.add(CachePriority::High, k1, 1, 11_u8);
+        m.add(CachePriority::High, k2, 1, 22_u8);
+
+        assert_eq!(m.get(k1).unwrap().deref(), &11);
+        assert_eq!(m.get(k2).unwrap().deref(), &22);
     }
 }

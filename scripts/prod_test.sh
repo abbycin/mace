@@ -55,7 +55,6 @@ chaos_cases=(
   "prod_recovery_failpoints:chaos_failpoint_flush_after_manifest_commit_with_retire"
   "prod_recovery_failpoints:chaos_failpoint_flush_after_data_sync_with_retire"
   "prod_recovery_failpoints:chaos_failpoint_flush_before_manifest_commit_with_retire"
-  "prod_recovery_failpoints:chaos_failpoint_retire_after_apply_before_clear"
   "prod_recovery_failpoints:chaos_failpoint_flush_after_manifest_commit_with_retire_multi_bucket"
   "prod_recovery_failpoints:chaos_failpoint_wal_after_checkpoint_write"
   "prod_recovery_failpoints:chaos_failpoint_manifest_before_multi_commit"

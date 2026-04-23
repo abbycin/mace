@@ -5,11 +5,12 @@ use crate::types::{
     refbox::{BoxRef, BoxView},
 };
 use crate::utils::OpCode;
+use crate::utils::data::Position;
 
 pub trait ILoader {
-    fn deep_copy(&self) -> Self;
+    fn copy_without_pin(&self) -> Self;
 
-    fn shallow_copy(&self) -> Self;
+    fn copy_with_pin(&self) -> Self;
 
     fn pin(&self, data: BoxRef);
 
@@ -47,17 +48,15 @@ pub trait IHeader<T> {
 }
 
 pub trait IFrameAlloc {
-    fn try_alloc(&mut self, size: u32) -> Result<BoxRef, OpCode>;
+    fn alloc(&mut self, size: u32) -> BoxRef;
 
-    fn try_alloc_pair(&mut self, size1: u32, size2: u32) -> Result<(BoxRef, BoxRef), OpCode>;
-
-    fn arena_size(&mut self) -> usize;
+    fn frame_budget(&mut self) -> usize;
 
     fn inline_size(&self) -> usize;
-}
 
-pub trait IRetireSink {
-    fn collect(&mut self, addr: &[u64]);
+    fn checkpoint_lsn(&self, _group: u8) -> Position {
+        Position::MIN
+    }
 }
 
 pub trait IKey: Default + IKeyCodec + Ord {

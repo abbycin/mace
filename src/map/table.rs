@@ -4,8 +4,7 @@ use std::mem::MaybeUninit;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use crate::OpCode;
-use crate::utils::{NULL_ADDR, ROOT_PID};
+use crate::utils::{INIT_ADDR, NULL_ADDR, ROOT_PID};
 
 const SLOT_SIZE: u64 = 1u64 << 16;
 
@@ -16,30 +15,6 @@ pub struct PageMap {
     next: AtomicU64,
     pub scavenge_cursor: AtomicU64,
     free: Mutex<BTreeSet<u64>>,
-}
-
-pub(crate) struct PidLease<'a> {
-    table: &'a PageMap,
-    pid: u64,
-    published: bool,
-}
-
-impl PidLease<'_> {
-    pub(crate) fn pid(&self) -> u64 {
-        self.pid
-    }
-}
-
-impl Drop for PidLease<'_> {
-    fn drop(&mut self) {
-        if self.published {
-            return;
-        }
-        assert_eq!(self.table.get(self.pid), NULL_ADDR);
-        let mut lk = self.table.free.lock();
-        assert!(!lk.contains(&self.pid));
-        lk.insert(self.pid);
-    }
 }
 
 // currently in stable rust we can't create large object directly using Box, since it will create the
@@ -69,14 +44,24 @@ impl Default for PageMap {
 }
 
 impl PageMap {
-    pub(crate) fn reserve_pid(&self) -> Option<PidLease<'_>> {
+    fn insert_free_pid(&self, lk: &mut BTreeSet<u64>, pid: u64) {
+        assert_eq!(
+            self.index(pid).load(Ordering::Acquire),
+            NULL_ADDR,
+            "free list pid {pid} must be unmapped"
+        );
+        assert!(lk.insert(pid), "free list already contains pid {pid}");
+    }
+
+    pub(crate) fn reserve_pid(&self) -> u64 {
         let mut lk = self.free.lock();
         if let Some(pid) = lk.pop_first() {
-            return Some(PidLease {
-                table: self,
-                pid,
-                published: false,
-            });
+            assert_eq!(
+                self.index(pid).load(Ordering::Acquire),
+                NULL_ADDR,
+                "free list returned mapped pid {pid}"
+            );
+            return pid;
         }
         drop(lk);
 
@@ -84,31 +69,18 @@ impl PageMap {
         let mut cnt = 0;
         while cnt < MAX_ID {
             if self.index(pid).load(Ordering::Relaxed) == NULL_ADDR {
-                return Some(PidLease {
-                    table: self,
-                    pid,
-                    published: false,
-                });
+                return pid;
             }
             pid = self.next.fetch_add(1, Ordering::Relaxed);
             cnt += 1;
         }
-        None
+        unreachable!("no pid available");
     }
 
-    pub(crate) fn publish_reserved(&self, lease: &mut PidLease<'_>, data: u64) {
-        self.index(lease.pid)
-            .compare_exchange(NULL_ADDR, data, Ordering::AcqRel, Ordering::Relaxed)
-            .expect("reserved pid must still be empty");
-        self.next.fetch_max(lease.pid + 1, Ordering::AcqRel);
-        lease.published = true;
-    }
-
-    pub fn map(&self, data: u64) -> Option<u64> {
-        let mut lease = self.reserve_pid()?;
-        let pid = lease.pid;
-        self.publish_reserved(&mut lease, data);
-        Some(pid)
+    pub fn map(&self, data: u64) -> u64 {
+        let pid = self.reserve_pid();
+        self.map_to(pid, data);
+        pid
     }
 
     pub fn map_to(&self, pid: u64, data: u64) {
@@ -121,15 +93,15 @@ impl PageMap {
         self.next.fetch_max(pid + 1, Ordering::AcqRel);
     }
 
-    pub fn unmap(&self, pid: u64, addr: u64) -> Result<(), OpCode> {
-        self.index(pid)
-            .compare_exchange(addr, NULL_ADDR, Ordering::AcqRel, Ordering::Relaxed)
-            .map_err(|_| OpCode::Again)?;
+    #[cfg(test)]
+    pub fn unmap(&self, pid: u64) {
+        self.index(pid).store(NULL_ADDR, Ordering::Release);
+        self.recycle_pid(pid);
+    }
 
+    pub(crate) fn recycle_pid(&self, pid: u64) {
         let mut lk = self.free.lock();
-        assert!(!lk.contains(&pid));
-        lk.insert(pid);
-        Ok(())
+        self.insert_free_pid(&mut lk, pid);
     }
 
     pub fn get(&self, pid: u64) -> u64 {
@@ -154,9 +126,13 @@ impl PageMap {
                         .map_err(|_| btree_store::Error::Corruption)?;
                     let pid = <u64>::from_be_bytes(pid_bytes);
                     let addr = <u64>::from_be_bytes(addr_bytes);
+                    let swip = if addr == NULL_ADDR {
+                        NULL_ADDR
+                    } else {
+                        Swip::tagged(addr)
+                    };
 
-                    self.index(pid)
-                        .fetch_max(Swip::tagged(addr), Ordering::Relaxed);
+                    self.index(pid).store(swip, Ordering::Relaxed);
                     next_pid = next_pid.max(pid + 1);
                 }
                 Ok(())
@@ -173,7 +149,7 @@ impl PageMap {
         let max_pid = next_pid;
         for pid in ROOT_PID..max_pid {
             if self.index(pid).load(Ordering::Relaxed) == NULL_ADDR {
-                lk.insert(pid);
+                self.insert_free_pid(&mut lk, pid);
             }
         }
     }
@@ -332,7 +308,7 @@ impl BucketState {
             vacuum_inflight: AtomicBool::new(false),
             vacuum_lock: Mutex::new(()),
             vacuum_cv: Condvar::new(),
-            next_addr: AtomicU64::new(crate::utils::INIT_ADDR),
+            next_addr: AtomicU64::new(INIT_ADDR),
         }
     }
 
@@ -398,10 +374,6 @@ impl BucketState {
     pub(crate) fn is_busy(&self) -> bool {
         self.txn_ref.load(Ordering::Relaxed) > 0
     }
-
-    pub(crate) fn reserve_addr_span(&self, span: u64) -> u64 {
-        self.next_addr.fetch_add(span, Ordering::AcqRel)
-    }
 }
 
 #[cfg(test)]
@@ -410,6 +382,7 @@ mod test {
         map::table::{L1_FANOUT, L2_FANOUT, L3_FANOUT, PageMap},
         utils::NULL_ADDR,
     };
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn addr(a: u64) -> u64 {
         a * 2
@@ -439,8 +412,8 @@ mod test {
             assert_eq!(table.get(i), addr(i));
         }
 
-        for (idx, pid) in mapped_pid.iter().enumerate() {
-            table.unmap(*pid, addr(pids[idx])).unwrap();
+        for pid in mapped_pid.iter() {
+            table.unmap(*pid);
             assert_eq!(table.get(*pid), NULL_ADDR);
         }
 
@@ -448,26 +421,11 @@ mod test {
     }
 
     #[test]
-    fn reserve_pid_drop_returns_pid_to_free() {
+    fn recycle_pid_requires_null_mapping() {
         let table = PageMap::default();
-        let lease = table.reserve_pid().expect("must reserve pid");
-        let pid = lease.pid();
-        assert_eq!(table.get(pid), NULL_ADDR);
-        drop(lease);
-
-        let remap = table.map(addr(7)).expect("must reuse released pid");
-        assert_eq!(remap, pid);
-        assert_eq!(table.get(pid), addr(7));
-    }
-
-    #[test]
-    fn publish_reserved_makes_pid_visible_once() {
-        let table = PageMap::default();
-        let mut lease = table.reserve_pid().expect("must reserve pid");
-        let pid = lease.pid();
-        table.publish_reserved(&mut lease, addr(11));
-        assert_eq!(table.get(pid), addr(11));
-        drop(lease);
-        assert_eq!(table.get(pid), addr(11));
+        let pid = table.map(addr(13));
+        let panic = catch_unwind(AssertUnwindSafe(|| table.recycle_pid(pid)));
+        assert!(panic.is_err(), "recycling a mapped pid must panic");
+        assert_eq!(table.get(pid), addr(13));
     }
 }

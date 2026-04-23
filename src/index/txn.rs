@@ -8,6 +8,7 @@ use crate::{
         wal::{WalDel, WalPut, WalReplace},
     },
     index::tree::{Iter, Tree},
+    map::flow::ForegroundWritePermit,
     types::data::{Key, Record, Ver},
     utils::{
         Handle, NULL_CMD,
@@ -115,7 +116,7 @@ impl<'a> TxnKV<'a> {
         }
         ctx.opt.observer.counter(CounterMetric::TxnBegin, 1);
 
-        g.cc.commit_tree.compact(ctx, gid as u8);
+        g.cc.commit_tree.compact(ctx);
         Ok(Self {
             ctx,
             state: UnsafeCell::new(state),
@@ -158,10 +159,10 @@ impl<'a> TxnKV<'a> {
     }
 
     #[inline]
-    fn before_write_budget(&self, estimated_bytes: usize) {
+    fn before_write_budget(&self, estimated_bytes: usize) -> ForegroundWritePermit {
         self.tree
             .bucket
-            .before_foreground_write(estimated_bytes as u64);
+            .before_foreground_write(estimated_bytes as u64)
     }
 
     #[inline]
@@ -200,7 +201,7 @@ impl<'a> TxnKV<'a> {
         state.cmd_id += 1;
         let key = Key::new(k, Ver::new(start_ts, cmd_id_val));
         let val = Record::normal(gid as u8, v);
-        self.before_write_budget(estimated_bytes);
+        let _write_permit = self.before_write_budget(estimated_bytes);
 
         self.tree
             .update(&g, key, val, |opt| f(opt, *key.ver(), state))
@@ -219,7 +220,7 @@ impl<'a> TxnKV<'a> {
                         || !g.cc.is_visible_to(
                             self.ctx,
                             gid as u8,
-                            rv.unwrap().group_id(),
+                            rv.group_id(),
                             state.start_ts,
                             rk.txid,
                         )
@@ -261,11 +262,10 @@ impl<'a> TxnKV<'a> {
                     if rv.is_del() {
                         return Err(OpCode::NotFound);
                     }
-                    let t = rv.unwrap();
                     if !g.cc.is_visible_to(
                         self.ctx,
                         gid as u8,
-                        t.group_id(),
+                        rv.group_id(),
                         state.start_ts,
                         rk.txid,
                     ) {
@@ -278,8 +278,8 @@ impl<'a> TxnKV<'a> {
                         let mut log = g.logging.lock();
                         let new_pos = log.record_update(
                             &Key::new(rk.raw, ver),
-                            WalReplace::new(t.data().len(), v.len()),
-                            t.data(),
+                            WalReplace::new(rv.slice().len(), v.len()),
+                            rv.slice(),
                             v,
                             state.prev_lsn,
                             self.bucket_id,
@@ -344,11 +344,10 @@ impl<'a> TxnKV<'a> {
                     Ok((gid as u8, state.prev_lsn))
                 }
                 Some((rk, rv)) => {
-                    let t = rv.unwrap();
                     if !g.cc.is_visible_to(
                         self.ctx,
                         gid as u8,
-                        t.group_id(),
+                        rv.group_id(),
                         state.start_ts,
                         rk.txid,
                     ) {
@@ -361,8 +360,8 @@ impl<'a> TxnKV<'a> {
                         let mut log = g.logging.lock();
                         let new_pos = log.record_update(
                             &Key::new(rk.raw, ver),
-                            WalReplace::new(t.data().len(), v.len()),
-                            t.data(),
+                            WalReplace::new(rv.slice().len(), v.len()),
+                            rv.slice(),
                             v,
                             state.prev_lsn,
                             self.bucket_id,
@@ -391,7 +390,7 @@ impl<'a> TxnKV<'a> {
         let val = Record::remove(gid as u8);
         let mut logged = false;
         let guard = crossbeam_epoch::pin();
-        self.before_write_budget(key.raw.len());
+        let _write_permit = self.before_write_budget(key.raw.len());
 
         let res = self.tree.update(&guard, key, val, |opt| {
             let g = self.ctx.group(gid);
@@ -401,10 +400,9 @@ impl<'a> TxnKV<'a> {
                     if rv.is_del() {
                         return Err(OpCode::NotFound);
                     }
-                    let t = rv.unwrap();
                     if !g
                         .cc
-                        .is_visible_to(self.ctx, gid as u8, t.group_id(), start_ts, rk.txid)
+                        .is_visible_to(self.ctx, gid as u8, rv.group_id(), start_ts, rk.txid)
                     {
                         return Err(self.conflict_abort(start_ts));
                     }
@@ -415,8 +413,8 @@ impl<'a> TxnKV<'a> {
                         let mut log = g.logging.lock();
                         let new_pos = log.record_update(
                             &key,
-                            WalDel::new(t.data().len()),
-                            t.data(),
+                            WalDel::new(rv.slice().len()),
+                            rv.slice(),
                             [].as_slice(),
                             state.prev_lsn,
                             self.bucket_id,

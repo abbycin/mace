@@ -134,16 +134,6 @@ impl NodeCache {
         }
     }
 
-    pub(crate) fn update_size(&self, pid: u64, size: isize) -> bool {
-        if let Some(mut item) = self.map.get_mut(&pid) {
-            self.used.fetch_add(size - item.size, AcqRel);
-            item.size = size;
-            true
-        } else {
-            false
-        }
-    }
-
     pub(crate) fn used(&self) -> isize {
         self.used.load(Relaxed)
     }

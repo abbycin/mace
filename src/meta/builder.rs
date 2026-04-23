@@ -4,8 +4,9 @@ use std::sync::atomic::Ordering::Relaxed;
 use crate::map::SharedState;
 use crate::meta::entry::BlobStat;
 use crate::meta::{
-    BUCKET_VERSION, CURRENT_VERSION, DataStat, IMetaCodec, MemBlobStat, MemDataStat, NUMERICS_KEY,
-    ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, VERSION_KEY, entry::BucketMeta,
+    BUCKET_FRONTIER, BUCKET_VERSION, BucketDurableFrontier, CURRENT_VERSION, DataStat, IMetaCodec,
+    MemBlobStat, MemDataStat, NUMERICS_KEY, ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX,
+    VERSION_KEY, entry::BucketMeta,
 };
 use crate::{
     OpCode,
@@ -84,11 +85,9 @@ impl ManifestBuilder {
                 src;
                 next_data_id,
                 next_blob_id,
-                next_manifest_id,
                 next_bucket_id,
                 oracle,
-                wmk_oldest,
-                log_size
+                wmk_oldest
             );
             self.max_data_id = src.next_data_id.load(Relaxed).saturating_sub(1);
             self.max_blob_id = src.next_blob_id.load(Relaxed).saturating_sub(1);
@@ -106,10 +105,12 @@ impl ManifestBuilder {
                     let name =
                         std::str::from_utf8(&k).map_err(|_| btree_store::Error::Corruption)?;
                     let meta = Arc::new(meta);
+                    let bucket_id = meta.bucket_id;
                     self.inner
                         .bucket_metas_by_id
-                        .insert(meta.bucket_id, meta.clone());
+                        .insert(bucket_id, meta.clone());
                     self.inner.bucket_metas.insert(name.into(), meta);
+                    self.inner.ensure_bucket_state(bucket_id);
                 }
                 Ok(())
             })
@@ -127,6 +128,21 @@ impl ManifestBuilder {
             Ok(())
         });
         self.inner.nr_buckets.store(nr_buckets, Relaxed);
+
+        // 3. load bucket durable frontier
+        self.inner
+            .btree
+            .view(BUCKET_FRONTIER, |txn| {
+                let mut iter = txn.iter();
+                let mut k = Vec::new();
+                let mut v = Vec::new();
+                while iter.next_ref(&mut k, &mut v) {
+                    let item = BucketDurableFrontier::decode(&v);
+                    self.inner.bucket_frontier.insert(item.bucket_id, item.lsn);
+                }
+                Ok(())
+            })
+            .map_err(|_| OpCode::IoError)?;
 
         // 4. load DataStat
         let mut active_size = 0;
@@ -212,9 +228,6 @@ impl ManifestBuilder {
                 Ok(())
             })
             .map_err(|_| OpCode::IoError)?;
-
-        // recover crash-left pending sibling intents into stat bitmaps at startup
-        self.inner.recover_pending_siblings_to_stats();
 
         if !has_version {
             self.inner

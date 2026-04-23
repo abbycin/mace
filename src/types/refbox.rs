@@ -1,5 +1,6 @@
 use crate::static_assert;
 use crate::types::header::TagKind;
+use crate::utils::data::Position;
 use crate::utils::{NULL_ADDR, NULL_PID, raw_ptr_to_ref, raw_ptr_to_ref_mut};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicU32;
@@ -10,10 +11,13 @@ use std::{
 
 use super::header::{BaseHeader, BoxHeader, DeltaHeader, NodeType, RemoteHeader, TagFlag};
 use super::traits::{IAsBoxRef, IBoxHeader, IHeader};
-static_assert!(BoxRef::HDR_LEN == 48);
+static_assert!(BoxRef::HDR_LEN == 64);
 static_assert!(align_of::<BoxHeader>() == align_of::<*const ()>());
 
 pub struct BoxRef(*mut BoxHeader);
+
+unsafe impl Send for BoxRef {}
+unsafe impl Sync for BoxRef {}
 
 #[derive(Clone, Copy)]
 pub struct BoxView(*mut BoxHeader);
@@ -107,17 +111,17 @@ impl BoxRef {
         h.total_size = size;
         h.payload_size = size - Self::HDR_LEN as u32;
         h.flag = TagFlag::Normal;
+        h.group = 0;
         h.pid = NULL_PID;
         h.txid = 0;
         h.addr = addr;
         h.link = NULL_ADDR;
+        h.lsn = Position::MIN;
         h.refs.store(1, Relaxed);
         this
     }
 
     /// NOTE: the alignment is hard code to pointer's alignment, and it's true in mace
-    #[inline(always)]
-    #[cfg(test)]
     pub(crate) fn alloc(size: u32, addr: u64) -> BoxRef {
         Self::alloc_exact(Self::real_size(size), addr)
     }
@@ -143,7 +147,7 @@ impl BoxRef {
 
     pub(crate) fn persist_payload_len(&self) -> Option<usize> {
         let h = self.header();
-        if h.kind == TagKind::Base && h.flag == TagFlag::Normal && h.node_type == NodeType::Leaf {
+        if h.kind == TagKind::Base && h.node_type == NodeType::Leaf {
             let base = self.view().as_base();
             let logical_payload = base.header().size as usize;
             if h.payload_size as usize > logical_payload {
@@ -160,12 +164,14 @@ impl BoxRef {
             kind: src.kind,
             node_type: src.node_type,
             flag: src.flag,
+            group: src.group,
             total_size: Self::HDR_LEN as u32 + payload_size,
             payload_size,
             pid: src.pid,
             txid: src.txid,
             addr: src.addr,
             link: src.link,
+            lsn: src.lsn,
         };
         let p = (&hdr as *const BoxHeader).cast::<u8>();
         let s = unsafe { std::slice::from_raw_parts(p.add(size_of::<AtomicU32>()), out.len()) };

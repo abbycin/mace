@@ -3,11 +3,9 @@
 mod common;
 
 use common::child_test_command;
-use mace::observe::{CounterMetric, InMemoryObserver, ObserveSnapshot};
 use mace::{Bucket, Mace, OpCode, Options, RandomPath};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const ENV_CHILD: &str = "MACE_PROD_FP_CHILD";
@@ -28,6 +26,18 @@ fn spawn_child(case: &str, db_root: &Path, failpoint: &str) -> ExitStatus {
         .expect("spawn failpoint child failed")
 }
 
+#[cfg(unix)]
+fn assert_child_aborted(status: ExitStatus, msg: &str) {
+    use std::os::unix::process::ExitStatusExt;
+
+    assert_eq!(status.signal(), Some(6), "{msg}");
+}
+
+#[cfg(not(unix))]
+fn assert_child_aborted(status: ExitStatus, msg: &str) {
+    assert!(!status.success(), "{msg}");
+}
+
 fn open_with_tune<F>(db_root: &Path, tune: F) -> Mace
 where
     F: FnOnce(&mut Options),
@@ -42,7 +52,7 @@ fn child_setup_common(db_root: &Path) -> (Mace, Bucket) {
     let mace = open_with_tune(db_root, |opt| {
         opt.sync_on_write = true;
         opt.data_file_size = 16 << 10;
-        opt.max_log_size = 32 << 10;
+        opt.wal_buffer_size = 32 << 10;
         opt.wal_file_size = 8 << 10;
         opt.gc_timeout = 20;
         opt.gc_eager = true;
@@ -64,8 +74,8 @@ fn child_setup_gc(db_root: &Path) -> (Mace, Bucket) {
     let mace = open_with_tune(db_root, |opt| {
         opt.concurrent_write = 1;
         opt.sync_on_write = true;
-        opt.data_file_size = 16 << 10;
-        opt.max_log_size = 1 << 20;
+        opt.data_file_size = 128 << 10;
+        opt.wal_buffer_size = 1 << 20;
         opt.wal_file_size = 1 << 20;
         opt.gc_timeout = 20;
         opt.gc_eager = true;
@@ -74,7 +84,7 @@ fn child_setup_gc(db_root: &Path) -> (Mace, Bucket) {
         opt.inline_size = 256;
         opt.blob_garbage_ratio = 1;
         opt.blob_gc_ratio = 100;
-        opt.blob_max_size = 128 << 10;
+        opt.blob_file_size = 128 << 10;
     });
 
     let bucket = match mace.get_bucket("prod") {
@@ -90,7 +100,7 @@ fn child_setup_retire(db_root: &Path) -> (Mace, Bucket) {
     let mace = open_with_tune(db_root, |opt| {
         opt.sync_on_write = true;
         opt.data_file_size = 16 << 10;
-        opt.max_log_size = 64 << 10;
+        opt.wal_buffer_size = 64 << 10;
         opt.wal_file_size = 8 << 10;
         opt.gc_timeout = 60_000;
         opt.gc_eager = false;
@@ -136,10 +146,18 @@ fn drive_flush_pressure(bucket: &Bucket, rounds: usize, value_size: usize) {
 }
 
 fn drive_gc_pressure(bucket: &Bucket, rounds: usize) {
+    let txn = bucket.begin().expect("begin data gc seed txn failed");
+    for idx in 0..2048 {
+        txn.upsert(format!("k_{idx:05}"), format!("seed_{idx}"))
+            .expect("seed data gc key failed");
+    }
+    txn.commit().expect("commit data gc seed txn failed");
+
     for round in 0..rounds {
         let txn = bucket.begin().expect("begin gc txn failed");
-        for idx in 0..128 {
-            txn.upsert(format!("k_{idx}"), format!("g_{round}_{idx}"))
+        for idx in 0..512 {
+            let key_idx = (idx * 2) % 2048;
+            txn.upsert(format!("k_{key_idx:05}"), format!("g_{round}_{idx}"))
                 .expect("upsert gc key failed");
         }
         txn.commit().expect("commit gc txn failed");
@@ -206,59 +224,29 @@ fn assert_bucket_readable(db_root: &Path, inline_size: usize) {
     }
 }
 
-fn counter(snapshot: &ObserveSnapshot, metric: CounterMetric) -> u64 {
-    snapshot
-        .counters
-        .iter()
-        .find(|(m, _)| *m == metric)
-        .map(|(_, v)| *v)
-        .unwrap_or(0)
-}
-
-fn wait_retire_replayed(observer: &Arc<InMemoryObserver>, mace: &Mace, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        mace.start_gc();
-        let snapshot = observer.snapshot();
-        let applied = counter(&snapshot, CounterMetric::RetireDataApplied)
-            + counter(&snapshot, CounterMetric::RetireBlobApplied);
-        let cleared = counter(&snapshot, CounterMetric::RetireCleared);
-        if applied > 0 && cleared > 0 {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("retire replay did not complete in expected window")
-}
-
-fn assert_retire_replayed_after_reopen(db_root: &Path, inline_size: usize) {
-    let observer = Arc::new(InMemoryObserver::new(256));
+fn assert_rewrite_visibility_after_reopen(db_root: &Path, inline_size: usize) {
     let mace = open_with_tune(db_root, |opt| {
         opt.inline_size = inline_size;
-        opt.observer = observer.clone();
         opt.gc_timeout = 20;
         opt.gc_eager = true;
     });
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
+    let payload = vec![b'r'; 1024];
     for idx in 0..16 {
         let key = format!("rk_{idx}");
-        let _ = view.get(&key);
+        let val = view.get(&key).expect("rewrite key missing after reopen");
+        assert_eq!(val.slice(), payload.as_slice());
     }
-    wait_retire_replayed(&observer, &mace, Duration::from_secs(5));
-    let snapshot = observer.snapshot();
-    let applied = counter(&snapshot, CounterMetric::RetireDataApplied)
-        + counter(&snapshot, CounterMetric::RetireBlobApplied);
-    let cleared = counter(&snapshot, CounterMetric::RetireCleared);
-    assert!(applied > 0, "expected retire apply after reopen");
-    assert!(cleared > 0, "expected retire clear after reopen");
+    for _ in 0..4 {
+        mace.start_gc();
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
-fn assert_retire_replayed_after_reopen_multi_bucket(db_root: &Path, inline_size: usize) {
-    let observer = Arc::new(InMemoryObserver::new(256));
+fn assert_rewrite_visibility_after_reopen_multi_bucket(db_root: &Path, inline_size: usize) {
     let mace = open_with_tune(db_root, |opt| {
         opt.inline_size = inline_size;
-        opt.observer = observer.clone();
         opt.gc_timeout = 20;
         opt.gc_eager = true;
     });
@@ -266,19 +254,23 @@ fn assert_retire_replayed_after_reopen_multi_bucket(db_root: &Path, inline_size:
     let bucket2 = mace.get_bucket("prod2").expect("bucket prod2 should exist");
     let view1 = bucket1.view().expect("open post-crash view1 failed");
     let view2 = bucket2.view().expect("open post-crash view2 failed");
+    let payload = vec![b'r'; 1024];
     for idx in 0..16 {
         let key1 = format!("rk_a_{idx}");
         let key2 = format!("rk_b_{idx}");
-        let _ = view1.get(&key1);
-        let _ = view2.get(&key2);
+        let val1 = view1
+            .get(&key1)
+            .expect("bucket1 rewrite key missing after reopen");
+        let val2 = view2
+            .get(&key2)
+            .expect("bucket2 rewrite key missing after reopen");
+        assert_eq!(val1.slice(), payload.as_slice());
+        assert_eq!(val2.slice(), payload.as_slice());
     }
-    wait_retire_replayed(&observer, &mace, Duration::from_secs(5));
-    let snapshot = observer.snapshot();
-    let applied = counter(&snapshot, CounterMetric::RetireDataApplied)
-        + counter(&snapshot, CounterMetric::RetireBlobApplied);
-    let cleared = counter(&snapshot, CounterMetric::RetireCleared);
-    assert!(applied > 0, "expected retire apply after reopen");
-    assert!(cleared > 0, "expected retire clear after reopen");
+    for _ in 0..4 {
+        mace.start_gc();
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn data_blob_files(db_root: &Path) -> Vec<PathBuf> {
@@ -300,6 +292,48 @@ fn data_blob_files(db_root: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+fn wait_for_data_dir_quiet(db_root: &Path, quiet: Duration, timeout: Duration) {
+    let root = db_root.join("data");
+    let fingerprint = || -> (u64, u64) {
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("data_") && !name.starts_with("blob_") {
+                    continue;
+                }
+                files += 1;
+                bytes = bytes.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+            }
+        }
+        (files, bytes)
+    };
+
+    let deadline = Instant::now() + timeout;
+    let mut last = fingerprint();
+    let mut stable_since = Instant::now();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = fingerprint();
+        if now == last {
+            if stable_since.elapsed() >= quiet {
+                return;
+            }
+        } else {
+            last = now;
+            stable_since = Instant::now();
+        }
+    }
+    panic!("data dir did not become quiet in expected window");
 }
 
 fn wait_for_crash(timeout: Duration) -> ! {
@@ -385,11 +419,6 @@ fn child_case_flush_after_manifest_commit_with_retire_multi_bucket(db_root: &Pat
     wait_for_crash(Duration::from_secs(20))
 }
 
-fn child_case_retire_recovery_probe(db_root: &Path) -> ! {
-    let (_mace, _bucket) = child_setup_retire(db_root);
-    panic!("retire recovery failpoint did not fire")
-}
-
 fn child_case_wal_after_checkpoint_write(db_root: &Path) -> ! {
     let (_mace, bucket) = child_setup_common(db_root);
     seed_committed_and_uncommitted(&bucket, 64, 24);
@@ -434,6 +463,7 @@ fn child_case_gc_data_before_meta_commit(db_root: &Path) -> ! {
     seed_committed_and_uncommitted(&bucket, 64, 0);
     drive_gc_pressure(&bucket, 64);
     mace.sync().expect("sync before data gc failed");
+    wait_for_data_dir_quiet(db_root, Duration::from_millis(300), Duration::from_secs(20));
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -450,6 +480,7 @@ fn child_case_gc_blob_before_meta_commit(db_root: &Path) -> ! {
     seed_committed_and_uncommitted(&bucket, 64, 0);
     drive_blob_gc_pressure(&bucket, 24, 16 << 10);
     mace.sync().expect("sync before blob gc failed");
+    wait_for_data_dir_quiet(db_root, Duration::from_millis(300), Duration::from_secs(20));
 
     wait_for_crash(Duration::from_secs(20))
 }
@@ -460,7 +491,7 @@ fn child_case_evictor_before_evict_once(db_root: &Path) -> ! {
         opt.cache_capacity = Options::MIN_CACHE_CAP;
         opt.cache_evict_pct = 100;
         opt.data_file_size = 16 << 10;
-        opt.max_log_size = 32 << 10;
+        opt.wal_buffer_size = 32 << 10;
         opt.wal_file_size = 8 << 10;
     });
     let bucket = mace.new_bucket("prod").expect("create prod bucket failed");
@@ -499,13 +530,15 @@ fn failpoint_child() {
         "flush_after_data_sync" => child_case_flush_after_data_sync(&db_root),
         "flush_before_manifest_commit" => child_case_manifest_before_multi_commit(&db_root),
         "flush_after_manifest_commit" => child_case_manifest_before_multi_commit(&db_root),
+        "flush_after_manifest_commit_before_wal_checkpoint" => {
+            child_case_manifest_before_multi_commit(&db_root)
+        }
         "flush_after_manifest_commit_with_retire" => {
             child_case_flush_after_manifest_commit_with_retire(&db_root)
         }
         "flush_after_manifest_commit_with_retire_multi_bucket" => {
             child_case_flush_after_manifest_commit_with_retire_multi_bucket(&db_root)
         }
-        "retire_recovery_probe" => child_case_retire_recovery_probe(&db_root),
         "wal_after_checkpoint_write" => child_case_wal_after_checkpoint_write(&db_root),
         "manifest_before_multi_commit" => child_case_manifest_before_multi_commit(&db_root),
         "gc_data_rewrite_before_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
@@ -530,7 +563,7 @@ fn chaos_failpoint_flush_after_data_sync() {
         &path,
         "mace_flush_after_data_sync=abort@1",
     );
-    assert!(!status.success(), "flush failpoint child should abort");
+    assert_child_aborted(status, "flush failpoint child should abort");
     let crashed_files = data_blob_files(&path);
     assert!(
         !crashed_files.is_empty(),
@@ -554,10 +587,7 @@ fn chaos_failpoint_flush_before_manifest_commit() {
         &path,
         "mace_flush_before_manifest_commit=abort@1",
     );
-    assert!(
-        !status.success(),
-        "flush-before-manifest failpoint child should abort"
-    );
+    assert_child_aborted(status, "flush-before-manifest failpoint child should abort");
     let crashed_files = data_blob_files(&path);
     assert!(
         !crashed_files.is_empty(),
@@ -581,10 +611,7 @@ fn chaos_failpoint_flush_after_manifest_commit() {
         &path,
         "mace_flush_after_manifest_commit=abort@1",
     );
-    assert!(
-        !status.success(),
-        "flush-after-manifest failpoint child should abort"
-    );
+    assert_child_aborted(status, "flush-after-manifest failpoint child should abort");
     let crashed_files = data_blob_files(&path);
     assert!(
         !crashed_files.is_empty(),
@@ -604,13 +631,13 @@ fn chaos_failpoint_flush_after_manifest_commit_with_retire() {
     let status = spawn_child(
         "flush_after_manifest_commit_with_retire",
         &path,
-        "mace_flush_after_manifest_commit=abort@32",
+        "mace_flush_after_manifest_commit=abort@8",
     );
-    assert!(
-        !status.success(),
-        "flush-after-manifest-with-retire failpoint child should abort"
+    assert_child_aborted(
+        status,
+        "flush-after-manifest-with-retire failpoint child should abort",
     );
-    assert_retire_replayed_after_reopen(&path, 512);
+    assert_rewrite_visibility_after_reopen(&path, 512);
 }
 
 #[test]
@@ -620,13 +647,13 @@ fn chaos_failpoint_flush_after_data_sync_with_retire() {
     let status = spawn_child(
         "flush_after_manifest_commit_with_retire",
         &path,
-        "mace_flush_after_data_sync=abort@32",
+        "mace_flush_after_data_sync=abort@8",
     );
-    assert!(
-        !status.success(),
-        "flush-after-data-sync-with-retire failpoint child should abort"
+    assert_child_aborted(
+        status,
+        "flush-after-data-sync-with-retire failpoint child should abort",
     );
-    assert_retire_replayed_after_reopen(&path, 512);
+    assert_rewrite_visibility_after_reopen(&path, 512);
 }
 
 #[test]
@@ -636,39 +663,13 @@ fn chaos_failpoint_flush_before_manifest_commit_with_retire() {
     let status = spawn_child(
         "flush_after_manifest_commit_with_retire",
         &path,
-        "mace_flush_before_manifest_commit=abort@32",
+        "mace_flush_before_manifest_commit=abort@8",
     );
-    assert!(
-        !status.success(),
-        "flush-before-manifest-with-retire failpoint child should abort"
+    assert_child_aborted(
+        status,
+        "flush-before-manifest-with-retire failpoint child should abort",
     );
-    assert_retire_replayed_after_reopen(&path, 512);
-}
-
-#[test]
-#[ignore]
-fn chaos_failpoint_retire_after_apply_before_clear() {
-    let path = RandomPath::new();
-    let status = spawn_child(
-        "flush_after_manifest_commit_with_retire",
-        &path,
-        "mace_flush_after_manifest_commit=abort@32",
-    );
-    assert!(
-        !status.success(),
-        "flush-after-manifest-with-retire failpoint child should abort"
-    );
-
-    let status = spawn_child(
-        "retire_recovery_probe",
-        &path,
-        "mace_retire_after_apply_before_clear=abort@1",
-    );
-    assert!(
-        !status.success(),
-        "retire-after-apply-before-clear failpoint child should abort"
-    );
-    assert_retire_replayed_after_reopen(&path, 512);
+    assert_rewrite_visibility_after_reopen(&path, 512);
 }
 
 #[test]
@@ -678,13 +679,13 @@ fn chaos_failpoint_flush_after_manifest_commit_with_retire_multi_bucket() {
     let status = spawn_child(
         "flush_after_manifest_commit_with_retire_multi_bucket",
         &path,
-        "mace_flush_after_manifest_commit=abort@32",
+        "mace_flush_after_manifest_commit=abort@8",
     );
-    assert!(
-        !status.success(),
-        "flush-after-manifest-with-retire-multi-bucket failpoint child should abort"
+    assert_child_aborted(
+        status,
+        "flush-after-manifest-with-retire-multi-bucket failpoint child should abort",
     );
-    assert_retire_replayed_after_reopen_multi_bucket(&path, 512);
+    assert_rewrite_visibility_after_reopen_multi_bucket(&path, 512);
 }
 
 #[test]
@@ -696,7 +697,7 @@ fn chaos_failpoint_wal_after_checkpoint_write() {
         &path,
         "mace_wal_after_checkpoint_write=abort@1",
     );
-    assert!(!status.success(), "wal failpoint child should abort");
+    assert_child_aborted(status, "wal failpoint child should abort");
     assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
@@ -709,7 +710,7 @@ fn chaos_failpoint_manifest_before_multi_commit() {
         &path,
         "mace_manifest_before_multi_commit=abort@3",
     );
-    assert!(!status.success(), "manifest failpoint child should abort");
+    assert_child_aborted(status, "manifest failpoint child should abort");
     assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
@@ -722,9 +723,9 @@ fn chaos_failpoint_txn_commit_after_record_commit() {
         &path,
         "mace_txn_commit_after_record_commit=abort@2",
     );
-    assert!(
-        !status.success(),
-        "txn-after-record-commit failpoint child should abort"
+    assert_child_aborted(
+        status,
+        "txn-after-record-commit failpoint child should abort",
     );
     assert_visibility_after_reopen(&path, 512, 64, 24);
 }
@@ -738,10 +739,7 @@ fn chaos_failpoint_txn_commit_after_wal_sync() {
         &path,
         "mace_txn_commit_after_wal_sync=abort@2",
     );
-    assert!(
-        !status.success(),
-        "txn-after-wal-sync failpoint child should abort"
-    );
+    assert_child_aborted(status, "txn-after-wal-sync failpoint child should abort");
     assert_visibility_after_reopen(&path, 512, 64, 24);
 }
 
@@ -754,7 +752,7 @@ fn chaos_failpoint_gc_data_rewrite_before_meta_commit() {
         &path,
         "mace_gc_data_rewrite_before_meta_commit=abort@1",
     );
-    assert!(!status.success(), "gc-data failpoint child should abort");
+    assert_child_aborted(status, "gc-data failpoint child should abort");
     assert_bucket_readable(&path, 256);
 }
 
@@ -767,10 +765,7 @@ fn chaos_failpoint_gc_data_rewrite_after_stage_marker() {
         &path,
         "mace_gc_data_rewrite_after_stage_marker=abort@1",
     );
-    assert!(
-        !status.success(),
-        "gc-data-after-marker failpoint child should abort"
-    );
+    assert_child_aborted(status, "gc-data-after-marker failpoint child should abort");
     assert_bucket_readable(&path, 256);
 }
 
@@ -783,10 +778,7 @@ fn chaos_failpoint_gc_data_rewrite_after_meta_commit() {
         &path,
         "mace_gc_data_rewrite_after_meta_commit=abort@1",
     );
-    assert!(
-        !status.success(),
-        "gc-data-after-meta failpoint child should abort"
-    );
+    assert_child_aborted(status, "gc-data-after-meta failpoint child should abort");
     assert_bucket_readable(&path, 256);
 }
 
@@ -799,7 +791,7 @@ fn chaos_failpoint_gc_blob_rewrite_before_meta_commit() {
         &path,
         "mace_gc_blob_rewrite_before_meta_commit=abort@1",
     );
-    assert!(!status.success(), "gc-blob failpoint child should abort");
+    assert_child_aborted(status, "gc-blob failpoint child should abort");
     assert_bucket_readable(&path, 256);
 }
 
@@ -812,10 +804,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_stage_marker() {
         &path,
         "mace_gc_blob_rewrite_after_stage_marker=abort@1",
     );
-    assert!(
-        !status.success(),
-        "gc-blob-after-marker failpoint child should abort"
-    );
+    assert_child_aborted(status, "gc-blob-after-marker failpoint child should abort");
     assert_bucket_readable(&path, 256);
 }
 
@@ -828,10 +817,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_meta_commit() {
         &path,
         "mace_gc_blob_rewrite_after_meta_commit=abort@1",
     );
-    assert!(
-        !status.success(),
-        "gc-blob-after-meta failpoint child should abort"
-    );
+    assert_child_aborted(status, "gc-blob-after-meta failpoint child should abort");
     assert_bucket_readable(&path, 256);
 }
 
@@ -844,6 +830,6 @@ fn chaos_failpoint_evictor_before_evict_once() {
         &path,
         "mace_evictor_before_evict_once=abort@1",
     );
-    assert!(!status.success(), "evictor failpoint child should abort");
+    assert_child_aborted(status, "evictor failpoint child should abort");
     assert_bucket_readable(&path, Options::MIN_INLINE_SIZE);
 }

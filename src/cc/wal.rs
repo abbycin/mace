@@ -484,7 +484,16 @@ impl<'a> WalReader<'a> {
 
         'outer: loop {
             let (f, end) = match self.get_file(group_id as u8, addr.pos.file_id) {
-                None => break, // for rollback, this will not happen, but may happen in recovery
+                None => {
+                    log::error!(
+                        "rollback source wal file missing, group={} file_id={} txid={} current={:?}",
+                        group_id,
+                        addr.pos.file_id,
+                        txid,
+                        addr.pos
+                    );
+                    return Err(OpCode::Corruption);
+                }
                 Some(f) => {
                     if f.1 == 0 {
                         break; // empty file
@@ -602,6 +611,9 @@ impl<'a> WalReader<'a> {
             current_pos,
             c.bucket_id,
         )?;
+
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_undo_after_clr_before_put");
 
         let tree = get_tree(c.bucket_id);
         tree.put(self.guard, key, val);

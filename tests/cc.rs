@@ -220,6 +220,75 @@ fn rollback() {
 }
 
 #[test]
+fn rollback_multiple_updates_in_same_txn_restores_committed_value() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap())?;
+    let db = mace.new_bucket("x")?;
+
+    let committed = db.begin()?;
+    committed.put("k", "base")?;
+    committed.commit()?;
+
+    {
+        let txn = db.begin()?;
+        txn.update("k", "v1")?;
+        txn.update("k", "v2")?;
+    }
+
+    let view = db.view()?;
+    assert_eq!(view.get("k")?.slice(), b"base");
+    Ok(())
+}
+
+#[test]
+fn rollback_upsert_replace_on_tombstone_restores_delete() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap())?;
+    let db = mace.new_bucket("x")?;
+
+    let committed = db.begin()?;
+    committed.put("k", "base")?;
+    committed.commit()?;
+
+    let deleted = db.begin()?;
+    deleted.del("k")?;
+    deleted.commit()?;
+
+    {
+        let txn = db.begin()?;
+        txn.upsert("k", "resurrect")?;
+    }
+
+    let view = db.view()?;
+    assert!(view.get("k").is_err());
+    Ok(())
+}
+
+#[test]
+fn rollback_delete_restores_committed_value() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap())?;
+    let db = mace.new_bucket("x")?;
+
+    let committed = db.begin()?;
+    committed.put("k", "base")?;
+    committed.commit()?;
+
+    {
+        let txn = db.begin()?;
+        let deleted = txn.del("k")?;
+        assert_eq!(deleted.slice(), b"base");
+    }
+
+    let view = db.view()?;
+    assert_eq!(view.get("k")?.slice(), b"base");
+    Ok(())
+}
+
+#[test]
 fn range_simple() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;

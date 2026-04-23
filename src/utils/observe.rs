@@ -50,22 +50,11 @@ pub enum CounterMetric {
     GcBlobRewrite,
     GcDataObsoleteFile,
     GcBlobObsoleteFile,
-    FlowFgDelay,
-    FlowFlushPacingSleep,
-    FlowFlushPacingBypassHighDebt,
-    FlowFlushPacingBypassTeardown,
-    FlowFlushPacingBypassArenaStarvation,
-    FlowArenaSpillCreate,
-    FlowArenaSpillReclaim,
-    FlowArenaSpillCapHit,
-    RetireRecorded,
-    RetireDataApplied,
-    RetireBlobApplied,
-    RetireCleared,
+    FlowFgAdmissionWait,
 }
 
 impl CounterMetric {
-    pub const COUNT: usize = 40;
+    pub const COUNT: usize = 29;
     pub const ALL: [CounterMetric; Self::COUNT] = [
         CounterMetric::TxnBegin,
         CounterMetric::TxnCommit,
@@ -95,18 +84,7 @@ impl CounterMetric {
         CounterMetric::GcBlobRewrite,
         CounterMetric::GcDataObsoleteFile,
         CounterMetric::GcBlobObsoleteFile,
-        CounterMetric::FlowFgDelay,
-        CounterMetric::FlowFlushPacingSleep,
-        CounterMetric::FlowFlushPacingBypassHighDebt,
-        CounterMetric::FlowFlushPacingBypassTeardown,
-        CounterMetric::FlowFlushPacingBypassArenaStarvation,
-        CounterMetric::FlowArenaSpillCreate,
-        CounterMetric::FlowArenaSpillReclaim,
-        CounterMetric::FlowArenaSpillCapHit,
-        CounterMetric::RetireRecorded,
-        CounterMetric::RetireDataApplied,
-        CounterMetric::RetireBlobApplied,
-        CounterMetric::RetireCleared,
+        CounterMetric::FlowFgAdmissionWait,
     ];
 
     #[inline]
@@ -153,13 +131,11 @@ pub enum HistogramMetric {
     GcBlobRewriteMicros,
     GcDataRewriteVictimFiles,
     GcBlobRewriteVictimFiles,
-    FlowFgDelayMicros,
-    FlowFlushPacingSleepMicros,
-    FlowArenaStarvingWaitMicros,
+    FlowFgAdmissionWaitMicros,
 }
 
 impl HistogramMetric {
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 16;
     pub const ALL: [HistogramMetric; Self::COUNT] = [
         HistogramMetric::TxnCommitMicros,
         HistogramMetric::TxnRollbackMicros,
@@ -176,9 +152,7 @@ impl HistogramMetric {
         HistogramMetric::GcBlobRewriteMicros,
         HistogramMetric::GcDataRewriteVictimFiles,
         HistogramMetric::GcBlobRewriteVictimFiles,
-        HistogramMetric::FlowFgDelayMicros,
-        HistogramMetric::FlowFlushPacingSleepMicros,
-        HistogramMetric::FlowArenaStarvingWaitMicros,
+        HistogramMetric::FlowFgAdmissionWaitMicros,
     ];
 
     #[inline]

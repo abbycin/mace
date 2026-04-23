@@ -1,544 +1,370 @@
 # MACE design notes
 
-This document summarizes the current MACE design as reflected by the codebase. It focuses on the architecture, lifecycles, and invariants that matter for correctness and performance.
+This document describes the current implementation in this repository.
+It is focused on behavior that affects correctness, crash safety, and operational tuning.
 
 ## High-level goals
 
-- Embedded key-value storage engine with a log-structured data path
-- Bw-Tree style indexing for predictable reads and high write throughput
-- Snapshot isolation (SI) via MVCC with WAL-based durability
-- Key-value separation: large values stored in blob files, indexed by pointers
+- Embedded key-value engine with predictable point-read latency.
+- High write throughput via append-only WAL + asynchronous checkpoint publish.
+- Snapshot isolation (SI) with MVCC visibility.
+- Key/value separation: large values stored in blob files.
+- Crash-safe metadata updates and idempotent startup cleanup.
 
 ## Core architecture
 
-- **Store** (`src/store`): owns `Manifest`, `Context`, GC, evictor, flusher, and orchestrates shutdown order
-- **Manifest** (`src/meta`): metadata root persisted in `btree_store`, and the source of truth for buckets, stats, and mappings
-- **Bucket-centric runtime** (`src/map`): each bucket has its own `BucketContext` (Pool, PageMap, IntervalMaps, caches)
-- **Index** (`src/index`): Bw-Tree variant with delta chains, compaction, split/merge, and sibling pages
-- **Concurrency control** (`src/cc`): SI visibility with `CommitTree`, WAL, and checkpoint coordination
+- `src/store`
+  - Owns startup/shutdown orchestration, recovery, GC thread, and public `Mace` APIs.
+- `src/meta`
+  - Owns persistent metadata (`btree_store`) and in-memory stat/index caches.
+- `src/map`
+  - Bucket runtime (dirty-page generations, checkpoint build, loader/cache, flow control).
+- `src/index`
+  - Bw-Tree style index, delta chains, split/merge/compact paths, iterator paths.
+- `src/cc`
+  - Concurrency control, writer groups, commit tree, WAL encode/decode, rollback.
+- `src/utils/observe.rs`
+  - Fixed-cardinality observability model.
 
-## Metadata and persistence
+## Metadata model
 
-### Manifest as root
+`Manifest` persists metadata in BTree buckets.
 
-`Manifest` stores all metadata in a persistent B-Tree namespace. Key buckets include:
+Main buckets:
 
-- `numerics`: global counters (oracle, next ids, wmk_oldest, log_size)
-- `bucket_metas`: bucket name -> `BucketMeta` (id)
-- `pending_del`: buckets pending physical cleanup
-- `pending_sibling`: staged sibling addresses awaiting base publish/cleanup
-- `pending_retire`: staged retire addresses awaiting stat apply/cleanup
-- `page_table_{bucket_id}`: page id -> addr mappings
-- `data_interval_{bucket_id}` / `blob_interval_{bucket_id}`: addr ranges -> file ids
-- `data_stat` / `blob_stat`: per-file stats and masks for GC
-- `obsolete_data` / `obsolete_blob`: files to be deleted
+- `numerics`
+  - global counters and orphan markers (`odf_*`, `obf_*`).
+- `bucket_metas`
+  - bucket name -> `BucketMeta { bucket_id }`.
+- `bucket_frontier`
+  - `BucketDurableFrontier` per bucket (per-writer-group durable LSN frontier).
+- `pending_del`
+  - buckets pending physical table cleanup.
+- `page_table_{bucket_id}`
+  - `pid -> logical_addr` map.
+- `data_interval_{bucket_id}` / `blob_interval_{bucket_id}`
+  - `addr-range -> file_id` mapping.
+- `data_stat` / `blob_stat`
+  - per-file stats + bitmap references used by GC.
+- `obsolete_data` / `obsolete_blob`
+  - files pending physical delete.
 
-### Data-first, meta-last
+Addressing model:
 
-Flush order is enforced by `StoreFlushObserver`:
+- each bucket has an independent logical address space (`BucketState::next_addr`).
+- page table maps `pid -> swip` (`tagged` means on-disk logical address).
+- interval tables map logical address ranges to data/blob file IDs.
+- relocation tables in file footers map logical address to file offset.
 
-1. Write data/blob files to disk
-2. Ensure WAL durability barrier for this flush boundary (`flsn`) before publishing metadata
-3. Commit one manifest txn for this flush boundary:
-   - map/stat/interval publish
-   - `pending_sibling` record/clear
-   - `pending_retire` record
-   - orphan marker clear + numerics
-4. Mark flush done and release arena refs
-5. Advance per-group checkpoint positions and persist checkpoint records
+## Bucket lifecycle
 
-This ensures data is durable before metadata points to it.
+Creation (`Manifest::create_bucket`):
 
-## Bucket model
+1. Take `structural_lock`.
+2. Reject duplicates and enforce `MAX_BUCKETS` via `nr_buckets`.
+3. Allocate `bucket_id`, create runtime context/state lazily, initialize frontier.
+4. Commit one metadata txn (`numerics`, `bucket_frontier`, `bucket_metas`).
 
-### Bucket lifecycle
+Loading (`load_bucket_context`):
 
-- **Create**: `Manifest::create_bucket` uses `structural_lock`, checks `MAX_BUCKETS`, allocates id, initializes state and page map, and persists `BucketMeta`
-- **Load**: contexts are lazy-loaded; repeated loads reuse cached `BucketContext`
-- **Unload**: `unload_bucket` unpublishes bucket context from runtime maps and flushes pending data; actual memory release is deferred to `Arc` drop without touching on-disk data
-- **Delete**: two-phase
-  - Logical delete: remove meta, record in `pending_del`, mark obsolete files
-  - Physical delete: GC cleans page table/interval tables and decrements `nr_buckets`
+- lazy-load runtime context when first accessed.
+- recover page table + data/blob intervals from metadata.
+- cache context in `BucketMgr`.
 
-`nr_buckets` counts both active and pending-delete buckets to prevent bypassing the limit.
+Unload (`unload_bucket`):
 
-### BucketContext
+- runtime-only operation.
+- unpublish from in-memory maps, checkpoint-and-reclaim loaded context.
+- persisted bucket metadata/data are kept.
 
-Each bucket has its own runtime context:
+Delete (`delete_bucket`):
 
-- `Pool` (Arenas)
-- `PageMap` (page id -> SWIP)
-- `IntervalMap` for data and blob
-- `NodeCache` and `ShardPriorityLru` caches
-- eviction candidate ring and per-bucket loaders
+- logical delete txn removes `bucket_metas` entry, inserts `pending_del`, records obsolete files.
+- runtime context/state are removed first.
+- GC later performs physical cleanup (`pending_del`) and decrements `nr_buckets`.
 
-`BucketContext::reclaim` is idempotent (CAS-guarded). Runtime remove paths only unpublish and flush; final reclaim is deferred to `Drop` of the last `Arc<BucketContext>` so GC/evictor snapshots cannot observe nulled shared refs.
+`BucketState` (in-memory only):
 
-`BucketState` is in-memory only and includes:
+- `txn_ref`, `is_deleting`, `is_drop`.
+- vacuum coordination: `vacuum_inflight`, `vacuum_epoch`, wait/notify primitives.
 
-- `txn_ref`: active txn count to block deletion
-- `is_deleting` / `is_drop`: lifecycle markers
-- `next_addr`: per-bucket address allocator (isolated address space)
+## Dirty-page generations and checkpoint cut
 
-### Lazy loading
+`Pool` uses generation slots instead of arena/chunk allocators.
 
-`PageMap` and interval maps are reconstructed on first bucket access from manifest tables:
+- hot generation: writable pages/retired-chain/root marks.
+- sealed generation: previous hot generation retained while checkpoint is in flight.
+- epoch gate (`epochs.gate`) ensures writers do not straddle a checkpoint cut.
 
-- `page_table_{bucket_id}` is replayed into `PageMap`
-- `data_interval_{bucket_id}` / `blob_interval_{bucket_id}` are loaded into `IntervalMap`
+Write-side flow:
 
-This keeps startup time and memory usage low for unused buckets.
+1. writer captures `WriteEpoch` (`capture_epoch`) and increments inflight counter.
+2. allocation uses `BoxRef::alloc` and inserts into hot page map.
+3. publish path marks dirty roots (`pid -> latest addr`) and optional unmap marks.
+4. page replacement/evict paths move retired logical addresses into lineage chains (`RetiredChain`).
 
-## Addressing and mapping
+Checkpoint trigger conditions:
 
-- Each bucket has its own **logical address space** (`BucketState::next_addr`)
-- `PageMap` maps **page id -> SWIP**
-  - **untagged** SWIP is an in-memory pointer
-  - **tagged** SWIP stores a logical address for on-disk pages
-- `IntervalMap` resolves **addr -> file id**
-- Per-file relocation tables resolve **addr -> file offset**
+- hot bytes >= `checkpoint_size`, or
+- total dirty bytes (hot + sealed) >= `pool_capacity`, or
+- proactive nudge from evictor (`checkpoint_nudge_ms`) when dirty data remains stale.
 
-This replaces the old logical/physical id mapping: the logical address is stable; the file and offset are resolved through intervals and relocations.
+Checkpoint cut (`Pool::checkpoint`):
 
-## Buffer and memory management
+1. atomically swap hot generation to new empty maps.
+2. publish old generation as sealed.
+3. rotate inflight/root slots in one critical section.
+4. create `CheckpointTask` and enqueue to checkpointer thread.
 
-### Arena and Pool
+`CheckpointTask::snapshot`:
 
-- `Arena` is an append-only allocator with reference counting
-- Allocation uses direct `BoxRef` allocation (`alloc_exact`) with per-arena accounting (no chunk allocator)
-- `Arena` states: `HOT` (allocating), `WARM` (sealed), `COLD` (ready to flush), `FLUSH` (flushed)
-- Tombstones suppress in-arena dead frames; unresolved retire addresses are staged for manifest-backed recovery
+- waits old-generation writers to leave (`EpochInflight::wait_zero`).
+- walks dirty roots and reachable chains (link/sibling/remote hints).
+- carries `addr > snap_addr` mutations back to new hot generation.
+- computes per-group checkpoint frontier delta.
+- emits data/blob junk candidates for stat apply.
 
-`Pool` manages arenas for a bucket:
+`CheckpointTask::finish`:
 
-- `Iim` tracks the addr -> arena id mapping for in-memory loads
-- `flsn` per writer group records WAL position of dirty data
-- `safe_to_flush` ensures WAL is flushed past arena `flsn` before flush
-- allocator handoff marks old arena `WARM` and waits for in-flight allocs to drain before publishing next arena, which avoids cross-arena address overlap races
-- `Options::default_arenas` controls per-bucket pre-allocated arena count (`>= 2`, power-of-two, validated in `Options::validate`)
-- allocator may create bounded spill arenas (`default_arenas + arena_spill_limit`) under starvation; `arena_spill_limit` is clamped to `[1, MAX_DEFAULT_ARENAS]` in `Options::validate`
-- spill over-cap fail-fast returns `Again` to tree-internal retry path
-- retire addresses are staged arena-local in `Pool::pending_retire` and extracted by that arena's flush boundary
-
-Failure semantics:
-
-- `Pool::flush` enqueue to flusher channel is required to succeed
-- flusher channel disconnect is treated as fatal (fail-fast), never as a recoverable drop path
-- tree write paths consume allocator `Again` internally, instead of exposing spill pressure directly to user write APIs
-
-### Flow control and flush pacing
-
-MACE uses a shared `FlowController` for foreground backpressure and flusher pacing.
-The controller is always present, but the current `Options::new()` defaults keep both
-`enable_backpressure` and `enable_flush_pacing` disabled unless explicitly enabled.
+- clears sealed slots.
+- requires sealed generations to be uniquely owned (`Arc::try_unwrap`).
+- recycles maps for reuse.
+- signals flow-controller completion.
 
-Core model:
+## Frontier design (durable boundary)
 
-- debt accounting is ticket-based:
-  - `on_enqueue_est`: `debt += est_bytes`
-  - `on_io_built`: reconcile by `debt += actual_bytes - est_bytes`, update `io_bps_ewma`, and count a real IO sample
-  - `on_mark_done`: release `debt -= actual_or_est`
-- `on_mark_done` settles debt for `Flushed`/`Skip`/`Empty`/`MetaOnly`
-- `io_bps_ewma` is updated on real build/sync completion, while `e2e_bps_ewma` is updated only for `Flushed`
-- backlog thresholds are expressed in flush units (`bp_*_debt_units`) rather than debt milliseconds
-- steady-state foreground backpressure uses `io_bps_ewma` as the primary disk signal
-- `e2e_bps_ewma` is not the steady-state primary denominator; it is used as a publish guard to scale writes down when publish/WAL follow-up materially lags disk IO
-- cold start waits for `bp_warmup_min_samples` real IO samples before enabling steady-state disk-based control
-- before warmup completes, only the cold-start fail-safe backlog window may throttle foreground writes
-- long idle windows reset stale throughput samples (`bp_idle_reset_ms`)
+Background issue solved by the frontier design:
 
-Foreground backpressure:
+- a compacted/materialized durable page can absorb updates from multiple writer groups.
+- each page header still carries only one `(group, lsn)` pair.
+- if recovery correctness relies on per-group WAL checkpoint only, multi-group absorbed history can be replayed incorrectly.
 
-- `before_write_budget` is executed **before** entering `tree.update`
-- no sleep is allowed inside the tree update closure (leaf lock critical section)
-- write paths use estimated bytes for pre-update throttling; exact WAL shape is still decided in closure logic
-- below the cold-start fail-safe backlog, foreground writes are allowed to proceed without sleep so the system can collect initial IO samples
-- in steady state, delay is derived from backlog units, `io_bps_ewma`, publish guard ratio, and is capped by `bp_max_delay_us`
+Correctness model:
 
-Flush pacing:
+- the durable boundary is `per bucket, per writer group`, not a single global/group scalar.
+- this boundary is represented by `BucketDurableFrontier` in manifest (`bucket_frontier` bucket).
+- frontier metadata is committed in the same manifest txn as map/stat publish; page/data/blob formats do not need extra frontier fields.
 
-- pacing is FIFO-preserving and runs only after `safe_to_flush`
-- pacing only runs after warmup has enough real IO samples
-- low debt: pacing may sleep to smooth flush cadence
-- pacing uses its own low-backlog threshold (`bp_pacing_soft_debt_units`) instead of sharing the foreground soft threshold
-- high debt: pacing bypasses to chase backlog
-- teardown and arena starvation use global reference-counted bypass scopes so all in-flight buckets observe bypass consistently
+Runtime carrier and propagation:
 
-### Sibling crash-closure via pending metadata
+- hot paths keep building lineage frontier using `SparseFrontier` carried in `RetiredChain`.
+- replace/evict transfer paths fold source lineage by pointwise-max per group.
+- checkpoint snapshot applies chained frontier to group checkpoint positions (`frontier.apply_to`).
+- when no chain frontier is present for an item, snapshot falls back to page-header `(group, lsn)` contribution.
 
-For multi-version leaf rebuild, crash-closure is implemented with `pending_sibling` metadata instead of packed allocation scopes:
+Durable publish boundary:
 
-- `BaseView::new_leaf` allocates sibling chains first, then allocates the base frame
-- multi-version leaf base stores sibling head hints in an in-memory footer (`u32 count + u64[] heads`)
-- dump path trims this footer and rewrites dump header, so on-disk base format excludes sibling hints
-- flush scans arena frames:
-  - sibling frames contribute `pending_sibling_addrs`
-  - base leaf frames with `has_multiple_versions` load `published_sibling_addrs` from footer hints
-- before arena release, flush stages `pending_sibling` records (`bucket_id + kind + addr` key space)
-- current flush publish path stages `PendingRangeKind::Data`; recovery logic supports both `Data` and `Blob`
-- base publish clears the corresponding pending sibling records in the same manifest txn
-- startup recovery (`recover_pending_siblings_to_stats`) applies any leftover pending siblings into stat bitmaps and clears pending entries
+- checkpoint builds a bucket-level frontier delta for this publish.
+- `StoreFlushObserver::publish` merges and persists it via `Manifest::merge_bucket_frontier`.
+- map + frontier are durable together, so crash after manifest commit still has a consistent durable boundary.
 
-This keeps sibling dangling-pointer cleanup crash-safe while preserving the shared arena allocation model.
+## Flush publish protocol
 
-### Retire crash-closure via pending metadata
+Checkpointer builds flushed files from snapshot pages.
 
-Retire/junk closure is implemented by `pending_retire` metadata, not by requiring data and retire records to share one arena:
+Data/blob file layout:
 
-- tree/evict publish contexts collect retire addresses in memory and stage them into `Pool::pending_retire` keyed by arena id
-- when that arena is flushed, retire sets are attached to `FlushResult` and written as `pending_retire` in the same manifest txn as map/stat/interval publish
-- startup (`Mace::new`) and periodic GC ticks call `recover_pending_retires_to_stats`
-- recovery path applies `pending_retire` to data/blob stats first, then clears processed entries in the same txn
-- `OpCode::NotFound` during recover only clears when bucket is truly deleted (`pending_del` or missing `bucket_meta`); unloaded buckets keep intents for retry
-- failpoint `mace_retire_after_apply_before_clear` validates apply/clear crash window idempotence
+- payload frames
+- interval table
+- relocation table
+- footer (`DataFooter` / `BlobFooter`)
 
-This closes both retire failure classes:
+Protocol for each new file:
 
-- no leak from "data durable but retire missing"
-- no wrong reclaim from "retire visible before new mapping publish"
+1. stage orphan marker in `numerics` (`odf_*` / `obf_*`).
+2. stage in-memory unsynced-file marker (`data_unsync` / `blob_unsync`).
+3. write file bytes.
+4. publish metadata and clear orphan marker in the same manifest txn.
 
-### Loader and caches
+`StoreFlushObserver::publish` flow:
 
-- `Loader` resolves data from:
-  1. LRU (priority cache)
-  2. Arena (hot data)
-  3. Disk via `DataReader`
-- `NodeCache` tracks node memory usage and hot/warm/cold state
-- `CandidateRing` samples evictable pids to reduce contention
+1. sync built data/blob writers (`sync_data` or `sync` based on `sync_on_write`).
+2. merge bucket frontier with snapshot frontier delta.
+3. begin manifest txn:
+   - apply junk to data/blob stats,
+   - clear orphan markers for published files,
+   - record intervals/stats/map/frontier/numerics in one atomic commit boundary.
+4. commit txn.
+5. clear in-memory unsynced sets.
+6. update WAL checkpoint records per writer group from global frontier lower bound (scan/recycle hint).
 
-### Eviction and compaction
+Global frontier lower bound (`Manifest::global_frontier_lower_bound`):
 
-- Evictor runs when cache usage reaches ~80% of capacity
-- It samples candidate pids, cools to `Cold`, then evicts by tagging SWIPs
-- If delta chains are long or contain garbage, eviction triggers compaction
-- Leaf rebuild during compaction follows the same sibling-hint and pending-sibling flow as foreground rebuild
-- Compaction writes junk frames into arenas for later GC
+- considers all active buckets.
+- buckets with pending flush can pin frontier via durable bucket frontier.
+- clean/read-only buckets fallback to current group checkpoint to avoid stale pinning.
 
-## Index (Bw-Tree variant)
+## Foreground admission / backpressure
 
-- Nodes are stored as base + delta chains
-- Delta inserts use CAS with retry; compaction merges delta chains
-- `merge` and `split` are explicit and serialized with locks
-- Leaf nodes store versions; sibling pages keep versions for the same key together
+`FlowController` exists for every bucket; enforcement is gated by `Options::enable_backpressure`.
 
-### Key-value separation
+Admission model:
 
-- Values larger than `inline_size` are stored as remote blobs
-- Leaf entries store remote pointers; blob files are managed separately
-- LRU has high/low priorities; remote values are cached with lower priority
+- foreground write acquires `ForegroundWritePermit` before `tree.update`.
+- permit reserves bytes against dirty-memory budget.
+- if projected dirty bytes exceed admission limit, writer waits on condvar.
+- checkpoint progress wakes waiting writers in byte-based quanta.
+- permit drop releases reservation.
 
-## MVCC and visibility
+Throughput/debt model:
 
-### Visibility checks
+- checkpoint enqueue records estimated bytes.
+- actual built bytes reconcile debt and feed IO EWMA.
+- completion updates end-to-end EWMA.
+- idle windows reset stale EWMA samples.
 
-Visibility is based on `CommitTree` and LCB (Last Commit Before):
+Current flow metrics:
 
-- if `record_txid == start_ts`, only visible in the same writer group
-- if `record_txid > start_ts`, invisible
-- if `safe_txid > record_txid`, visible
-- otherwise compute LCB and compare
+- `CounterMetric::FlowFgAdmissionWait`
+- `HistogramMetric::FlowFgAdmissionWaitMicros`
 
-`ConcurrencyControl` maintains per-group caches to avoid cross-thread LCB on the fast path.
+## Transactions, MVCC, and WAL
 
-### Watermark and safe_txid
+`TxnKV`:
 
-`collect_wmk` computes a global watermark:
+- allocated to writer group via inflight-aware scheduling.
+- records `Begin` at start.
+- first mutation logs `WalUpdate` and links via `prev_lsn` chain.
+- commit path:
+  - `record_commit(start_ts)`
+  - `log.sync(false)`
+  - append `(start_ts, commit_ts)` to commit tree
+  - update watermark (`collect_wmk`)
 
-1. find the smallest active txid across groups
-2. compute each group’s LCB for that txid
-3. take the global minimum and publish as `wmk_oldest`
+Drop of uncommitted `TxnKV`:
 
-`safe_txid` is derived from `wmk_oldest` and drives compaction/GC safety.
+- no writes: log `Abort`.
+- with writes: rollback through WAL chain (`WalReader::rollback`), logging CLR records and inverse versions.
 
-### Transaction types
+`TxnView`:
 
-- **TxnKV** (read-write):
-  - selects writer group via inflight-aware scheduling
-  - records `Begin` when txn starts, and WAL updates on first mutation
-  - commits by `record_commit` + `log.sync(false)` (checkpoint is not advanced here)
-  - appends `(start_ts, commit_ts)` to `CommitTree`
-- **TxnView** (read-only):
-  - allocates a CC node from `CCPool`
-  - uses snapshot `start_ts`, no WAL
+- allocates from `CCPool`, holds snapshot `start_ts`, no WAL writes.
 
-Long transactions are bounded by `max_ckpt_per_txn` to prevent WAL starvation.
+Visibility (`ConcurrencyControl::is_visible_to`):
 
-## WAL, checkpoints, and recovery
+- own uncommitted version visible only in same writer group.
+- future txid invisible.
+- `safe_txid` fast path from global watermark.
+- fallback to per-group `CommitTree::lcb(start_ts)`.
 
-- WAL is per writer group, backed by a ring buffer
-- `log.sync(force)` flushes ring-buffered WAL; fsync happens only when `force` is true or `sync_on_write` is enabled
-- Checkpoint advancement is driven by flush completion (`StoreFlushObserver`), not by a `numerics.signal`
-- `Logging::checkpoint` writes `WalCheckpoint { checkpoint: Position }` after flushing pending ring data
-- After checkpoint write, `StoreFlushObserver` explicitly fsyncs the writer to persist checkpoint boundary
-- `last_ckpt` is advanced from flush results, clamped by active txns' minimum LSN
+WAL payload semantics:
 
-### WAL recycling guard
+- `Insert`: new value image.
+- `Update`: old value + new value.
+- `Delete`: old value image.
+- `Clr`: tombstone/value + undo pointer (`undo_id`, `undo_off`).
 
-GC reclaims WAL files in `[oldest_id, checkpoint_id)` where:
+## Recovery
 
-```
-checkpoint_id = min(active_txns.min_file_id, logging.last_ckpt.file_id)
-```
+Startup sequence:
 
-This prevents deleting WAL still needed for recovery or active transactions.
+1. `ManifestBuilder::load` loads metadata caches and counters.
+2. `clean_orphans` scans orphan markers (`odf_*`, `obf_*`), removes stray files, deletes markers.
+3. WAL phase1 scans wal files per group and finds latest valid checkpoint as conservative scan start.
+4. context is created with per-group bootstrap info.
+5. phase2 runs `analyze -> redo -> undo`.
 
-### Recovery (crash handling)
+Analyze stage:
 
-- Phase 1: scan WAL files per writer group to build `GroupBoot` (`oldest_id`, `latest_id`, `checkpoint`) and build `Context`
-- Phase 2: analyze from last checkpoint, then redo/undo
-- Bucket-aware replay skips buckets already deleted
-- After redo/undo, `oracle` and `wmk_oldest` are advanced, and loaded bucket contexts are evicted
+- reads WAL from checkpoint position.
+- truncates tail on corruption if `truncate_corrupted_wal=true`.
+- checks bucket durable frontier first (`durable_frontier_lsn`):
+  - if `record_lsn <= frontier[bucket][group]`, treat as already durable and skip dirty-table enrollment.
+  - only records beyond frontier continue to redo/undo candidate logic.
 
-#### Pending sibling recovery
+Boundary split (important semantic change):
 
-`pending_sibling` is used to close the crash window between sibling flush and base publish:
+- `WalCheckpoint[group]` is a scan-start optimization and WAL recycle aid.
+- `BucketDurableFrontier[bucket][group]` is the correctness gate for "already durable or not".
+- therefore "one WAL record before checkpoint and another after checkpoint" can still exist, but only affects scan cost, not replay correctness.
 
-1. Flush stages sibling addresses into `pending_sibling` before releasing arena refs
-2. Base publish clears the pending addresses that are now reachable from durable base metadata
-3. Startup scans remaining `pending_sibling` entries and applies them to `DataStat` / `BlobStat` masks
-4. The same startup txn clears processed pending entries
+Redo stage:
 
-The flow is idempotent and does not require a dedicated GC queue for pending sibling cleanup.
+- reapplies remaining update/insert/delete/clr records in version order.
 
-#### Pending retire recovery
+Undo stage:
 
-`pending_retire` is used to close the crash window between new mapping publish and retire stat apply:
+- rolls back incomplete txns using same WAL rollback path used at runtime.
 
-1. Flush publish records `pending_retire` entries in the same manifest txn as mapping/stat updates
-2. Recovery and GC call `recover_pending_retires_to_stats` to replay pending retire intents
-3. The replay path groups entries by bucket/kind, applies to data/blob stats, then clears only applied entries in one txn
-4. If bucket context cannot be loaded temporarily (for example unloaded), intents are retained for retry
-5. If bucket is truly deleted (`pending_del` or no persisted bucket meta), stale intents are cleared safely
+Post recovery:
 
-The flow is idempotent and preserves bucket-local isolation.
+- advances `oracle`/`wmk_oldest`.
+- evicts loaded recovery bucket contexts.
 
-#### Orphan data/blob cleanup
+## GC, scavenge, and vacuum
 
-Orphans are data/blob files that were written to disk but never published by manifest metadata
-(for example, crash between rewrite output sync and metadata commit).
+GC thread (`gc_timeout` periodic + manual trigger):
 
-`clean_orphans` is intentionally scoped to **file-level orphan closure only**. It does not repair
-runtime references.
+1. `process_data` (victim selection + rewrite)
+2. `process_blob` (victim selection + rewrite)
+3. `process_pending_buckets` (physical cleanup for `pending_del`)
+4. `scavenge` (bounded in-memory page compaction)
+5. `delete_files` (idempotent obsolete file unlink + metadata ack)
 
-Current protocol:
+Rewrite crash safety:
 
-1. GC rewrite stages per-file orphan intent markers in `numerics` before writing new output files.
-   - data marker key: `odf_{file_id}`
-   - blob marker key: `obf_{file_id}`
-2. Rewrite output is written and synced.
-3. In the same metadata txn that publishes the new file, GC clears the corresponding marker.
-4. During startup, `clean_orphans` scans marker keys in `numerics`, removes corresponding files,
-   then removes cleaned markers.
+- rewrite stages orphan marker before file build.
+- metadata txn publishes new intervals/stats + delete intents + clears marker.
+- old files are then physically deleted through obsolete-file pipeline.
 
-Important boundaries:
+Scavenge:
 
-- Recovery uses marker scan only.
-  - no data directory traversal
-  - no max-id tail probing
-- file ids can be sparse; cleanup is marker-driven and idempotent.
-- orphan marker update failure is fatal (`expect("orphan marker update failed")`), because a
-  partial marker cleanup makes recovery boundary ambiguous.
-
-Crash safety:
-
-- Crash after marker stage but before metadata publish: marker survives, startup cleanup removes
-  uncommitted output file.
-- Crash after metadata publish and marker clear commit: file is already part of durable metadata
-  state and is not treated as orphan.
-
-#### Obsolete file deletion (crash-safe)
-
-Obsolete files are normal GC outputs (not orphans). Deletion is handled by `Manifest::delete_files`:
-
-- `obsolete_data` / `obsolete_blob` lists are kept in manifest.
-- If a file is missing or deleted successfully, its id is recorded as `DataDeleteDone` / `BlobDeleteDone` in a manifest txn.
-- If a crash happens mid-delete, the remaining entries stay in the obsolete lists and will be retried at the next run.
-
-This makes file deletion idempotent across crashes.
-
-
-## Observability design
+- scans loaded bucket page tables in bounded batches.
+- skips deleting/dropped/vacuuming buckets.
+- enforces per-tick compaction quota to cap IO impact.
 
-### Goals and non-goals
+Manual vacuum APIs:
 
-- Provide low-overhead, in-process signals for correctness and performance diagnosis
-- Keep observability decoupled from engine behavior (metrics must not change durability or concurrency semantics)
-- Avoid dynamic label cardinality and allocator-heavy hot-path reporting
-- Non-goal: built-in exporter/protocol integration (Prometheus/OpenTelemetry adapters are external)
+- `vacuum_bucket(name)`
+  - serialized per bucket using `vacuum_inflight`/`vacuum_epoch`.
+  - returns `VacuumStats { scanned, compacted }`.
+- `vacuum_meta()`
+  - compacts manifest btree (`btree_store::compact`).
 
-### API and lifecycle
+## Observability model
 
-- `Options::observer: Arc<dyn Observer>` is the injection point
-- Default is `NoopObserver`, so observability is opt-in and zero-cost by default
-- Public API is re-exported as `mace::observe`
-- `Observer` interface is push-based:
-  - `counter(CounterMetric, delta)`
-  - `gauge(GaugeMetric, value)`
-  - `histogram(HistogramMetric, value)`
-  - `event(ObserveEvent)`
-- Callbacks can run concurrently from writer threads, recovery, and GC thread, so implementations must be `Send + Sync`, non-blocking, and panic-free
+Injection point:
 
-Built-in utility implementation:
+- `Options::observer: Arc<dyn Observer>` (`NoopObserver` by default).
 
-- `InMemoryObserver` keeps fixed metric arrays (atomics) and a bounded FIFO event buffer (`event_cap`)
-- Snapshot API (`snapshot()`) is intended for tests, local debugging, and example/demo usage
+API shape:
 
-### Metric and event model
+- `counter(CounterMetric, delta)`
+- `gauge(GaugeMetric, value)`
+- `histogram(HistogramMetric, value)`
+- `event(ObserveEvent)`
 
-- `CounterMetric`: monotonic `u64` process-local counters
-- `GaugeMetric`: point-in-time `i64` gauges
-- `HistogramMetric`: reduced summary (`count`, `sum`, `max`) per metric
-- `EventKind` + `ObserveEvent { kind, bucket_id, txid, file_id, value }`: sparse structured events for critical lifecycle points
+Built-in helper:
 
-All metric dimensions are encoded in enums (fixed cardinality, no runtime label map).
+- `InMemoryObserver` with fixed arrays and bounded FIFO events.
 
-### Coverage by subsystem
+Latency sampling:
 
-- Transaction/MVCC (`TxnKV`):
-  - counters: begin/commit/abort/conflict-abort/rollback/retry
-  - histograms: commit latency, rollback latency
-  - events: conflict-abort, rollback-complete
-- Index tree (`Tree::link`, retry loops):
-  - counters: tree retry-again
-  - histograms: link lock-hold latency
-- WAL (`cc/log.rs`):
-  - counters: append count, sync count
-  - histograms: append bytes, sync latency
-- Flush/manifest orphan protocol (`meta/mod.rs`):
-  - counters: orphan data/blob staged and cleared
-  - counters: retire recorded
-  - events: orphan stage/clear transitions
-- Recovery (`store/recovery.rs`):
-  - counters: redo record count, undo txn count, wal truncate count
-  - gauges: dirty entries, undo entries
-  - histograms: phase2/analyze/redo/undo latency
-  - events: phase2 begin/end
-- GC (`store/gc.rs`):
-  - counters:
-    - gc run count
-    - retire data/blob applied and retire cleared
-    - wal recycle file count
-    - pending bucket clean count
-    - scavenge scanned/compacted page count
-    - data/blob rewrite count
-    - data/blob obsolete file count
-  - histograms:
-    - gc run latency
-    - scavenge latency
-    - data/blob rewrite latency
-    - data/blob rewrite victim-file count
-  - events:
-    - pending bucket cleaned
-    - data rewrite complete
-    - blob rewrite complete
-- Flow control (`map/flow.rs`):
-  - counters:
-    - foreground delay count
-    - pacing sleep count
-    - pacing bypass count (high debt / teardown / arena starvation)
-  - histograms:
-    - foreground delay micros
-    - pacing sleep micros
-
-### Hot-path overhead control
-
-- Latency metrics in high-frequency paths are sampled via `should_sample(seed, LATENCY_SAMPLE_SHIFT)`
-- Current default sample rate is `1 / 64` (`LATENCY_SAMPLE_SHIFT = 6`) for:
-  - txn commit latency
-  - txn rollback latency
-  - tree link lock-hold latency
-  - wal sync latency
-- Low-frequency paths (recovery/GC) report full latency without sampling
-- Metric emission is inline (no background dispatch queue), so observer implementations should keep per-call work O(1)
-
-### Validation and usage
-
-- Example usage: `examples/observer.rs`
-- Baseline observer unit test: `src/utils/observe.rs` (`snapshot_counts`)
-- GC observability regression test: `tests/gc.rs` (`gc_observer_metrics`)
-
-
-## Disk GC and rewrite
-
-### Data and blob stats
-
-- `DataStatInner` tracks `active_size`, `total_size`, `up1`, `up2`, and counts
-- `BlobStatInner` tracks active size/count
-- Bitmaps mark inactive entries for GC filtering
-
-### MDC-based victim selection
-
-- `Score` computes a decline rate based on `(active_size, total_size, up2, tick)`
-- Lower decline rate implies higher priority for compaction
-- Victims are chosen until they can form a compacted file
-
-### Rewrite flow
-
-- Load relocations and intervals, filter by bitmap
-- Rewrite live frames into new data/blob files
-- Update intervals and stats in manifest
-- Mark old files obsolete and delete them in background
-
-### Pending bucket cleanup
-
-- `delete_bucket` records bucket id in `pending_del`
-- GC cleans page tables and interval tables in batches
-- After cleanup, `nr_buckets` is decremented and metadata is dropped
-
-### Scavenge
-
-- GC periodically scans a small batch of pids per **loaded** bucket
-- Compacts pages with long delta chains or garbage
-- Uses I/O quota per tick to limit impact
-
-## Memory safety model
-
-- `BoxRef` uses a plain atomic refcount with direct alloc/dealloc (no chunk/MSB allocation flag)
-- `Handle<T>` is a manual owner and requires explicit `reclaim()`
-- `MutRef<T>` is intrusive refcounted and reclaimed by clone/drop lifecycle (not manual `reclaim()`)
-- Bucket shutdown order ensures background threads stop before reclaiming arenas and page maps
-
-## Key invariants to preserve
-
-- Data must be flushed before manifest commits
-- PageMap entries must be consistent with map tables written in the same flush txn
-- Multi-version leaf rebuild allocates sibling chains before base allocation
-- Leaf base with `has_multiple_versions` must carry sibling-head hints during flush scan
-- Pending sibling records must be durable before arena release
-- Base publish and pending-sibling clear must be committed in the same manifest txn
-- Startup pending-sibling recovery must be idempotent (safe on retry/replay)
-- Pending retire records must be committed in the same manifest txn as the flush publish that makes replacements durable
-- Pending retire clear must not happen unless the corresponding stat apply is part of the same committed txn
-- Pending retire `NotFound` clear is allowed only for truly deleted buckets; unloaded buckets must keep intents for retry
-- Bucket deletion must be two-phase; do not decrement `nr_buckets` early
-- WAL files can only be deleted up to the safe checkpoint boundary
-- Foreground backpressure delay must not run in tree leaf lock critical sections
-- spill-cap `Again` must be retried inside tree to avoid user-visible retry storms
-
-## Operational validation pipeline
-
-To keep production behavior aligned with crash-safety and performance invariants:
-
-- `scripts/prod_test.sh`
-  - `fast` for quick correctness checks
-  - `stress` for long-run pressure
-  - `chaos` for failpoint crash/fault windows
-  - `all` for full matrix (`fast + stress + chaos`)
-  - crash-window coverage includes `after_data_sync`, `before_manifest_commit`, `after_manifest_commit`, and `retire_after_apply_before_clear`
-- `scripts/perf_gate.sh`
-  - `snapshot` captures current benchmark summary
-  - `compare` gates regressions against a baseline ref (`MACE_PERF_BASE_REF`)
-- `scripts/prod_soak.sh`
-  - loops stress/chaos with periodic perf snapshots
-  - writes trend data into `target/prod_soak/perf_cycles.csv`
-- `scripts/perf_thresholds.env`
-  - central threshold/profile knobs for local runs and CI
-
-CI integration:
-
-- `.github/workflows/ci.yml`
-  - `test-prod-all` runs `prod_test.sh all` on `ubuntu-latest` `x86_64` only
-  - `perf-regression` runs `perf_gate.sh compare`
-- `.github/workflows/prod-soak.yml`
-  - scheduled + manual soak workflow with artifact upload
-- test child-process spawning in prod recovery suites honors `CARGO_TARGET_*_RUNNER`
+- `LATENCY_SAMPLE_SHIFT = 6` (`1/64`) for hot metrics such as:
+  - txn commit/rollback latency,
+  - tree link lock-hold latency,
+  - WAL sync latency.
+
+Low-frequency recovery/GC metrics are reported without sampling.
+
+## Key invariants
+
+- Data/blob files referenced by metadata must be written before metadata commit.
+- Orphan marker stage/clear is the only startup orphan cleanup source of truth.
+- Checkpoint epoch cut must atomically rotate hot/sealed generation handles.
+- Writers must not straddle checkpoint cut (`epochs.gate` + inflight wait-zero).
+- Sealed generations must be uniquely owned when checkpoint finishes.
+- Bucket durable frontier must monotonically advance per group.
+- Map publish and bucket frontier publish must be in the same manifest txn.
+- Recovery correctness must be gated by bucket frontier, not by group checkpoint alone.
+- Recovery analyze must ignore updates already <= durable frontier.
+- Bucket delete is two-phase (`pending_del`), and `nr_buckets` decrements only after physical cleanup.
+- WAL recycling must stay below min(active-txn boundary, last checkpoint boundary).
+- Foreground admission wait must happen before entering `tree.update` critical mutation path.
+
+## Operational validation
+
+- `./scripts/prod_test.sh fast|stress|chaos|all`
+- `./scripts/perf_gate.sh snapshot|compare`
+- tuning defaults in `scripts/perf_thresholds.env`
+- CI wiring in `.github/workflows/ci.yml`

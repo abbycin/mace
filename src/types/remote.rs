@@ -15,9 +15,7 @@ impl RemoteView {
     ) -> crate::types::refbox::BoxRef {
         use crate::types::header::{RemoteHeader, TagKind};
 
-        let mut p = a
-            .try_alloc((size + size_of::<RemoteHeader>()) as u32)
-            .unwrap();
+        let mut p = a.alloc((size + size_of::<RemoteHeader>()) as u32);
         p.header_mut().kind = TagKind::Remote;
         p.view().as_remote().header_mut().size = size;
         p

@@ -16,6 +16,9 @@ use libc::__error;
 #[cfg(target_os = "linux")]
 use libc::__errno_location;
 
+#[cfg(not(target_os = "macos"))]
+use libc::fdatasync;
+
 use crate::io::{GatherIO, IoVec, OpenOptions};
 
 pub struct File {
@@ -59,6 +62,19 @@ fn errno() -> i32 {
 #[inline]
 fn errno() -> i32 {
     unsafe { *__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn sync_data_impl(fd: c_int) -> c_int {
+    // macOS does not expose `fdatasync` in libc; fall back to `fsync`.
+    unsafe { fsync(fd) }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+fn sync_data_impl(fd: c_int) -> c_int {
+    unsafe { fdatasync(fd) }
 }
 
 impl File {
@@ -167,6 +183,14 @@ impl GatherIO for File {
 
     fn sync(&mut self) -> Result<(), std::io::Error> {
         let rc = unsafe { fsync(self.file) };
+        if rc < 0 {
+            return Err(io::Error::from_raw_os_error(errno()));
+        }
+        Ok(())
+    }
+
+    fn sync_data(&mut self) -> Result<(), std::io::Error> {
+        let rc = sync_data_impl(self.file);
         if rc < 0 {
             return Err(io::Error::from_raw_os_error(errno()));
         }

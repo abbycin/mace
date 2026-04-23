@@ -10,13 +10,14 @@ const DB_ROOT_FLAG: &str = "MACE_PROD_RECOVERY_DB_ROOT";
 
 fn spawn_child(
     current_exe: &Path,
+    test_name: &str,
     mode: &str,
     db_root: &str,
     failpoint: Option<&str>,
 ) -> ExitStatus {
     let mut cmd = child_test_command(current_exe);
     cmd.arg("--exact")
-        .arg("fast_process_crash_window")
+        .arg(test_name)
         .arg("--nocapture")
         .env(MODE_FLAG, mode)
         .env(DB_ROOT_FLAG, db_root);
@@ -28,14 +29,14 @@ fn spawn_child(
     cmd.status().expect("spawn child failed")
 }
 
-fn run_crash_verify_once(current_exe: &Path, db_root: &str) {
-    let crash_status = spawn_child(current_exe, "crash", db_root, None);
+fn run_crash_verify_once(current_exe: &Path, test_name: &str, db_root: &str) {
+    let crash_status = spawn_child(current_exe, test_name, "crash", db_root, None);
     assert!(
         !crash_status.success(),
         "crash child should exit abnormally"
     );
 
-    let verify_status = spawn_child(current_exe, "verify", db_root, None);
+    let verify_status = spawn_child(current_exe, test_name, "verify", db_root, None);
     assert!(verify_status.success(), "verify child should pass");
 }
 
@@ -85,6 +86,97 @@ fn child_verify_path() {
         b"ok"
     );
     assert!(view.get("uncommitted").is_err());
+}
+
+fn child_update_chain_crash_path() -> ! {
+    let db_root = std::env::var(DB_ROOT_FLAG).expect("missing child db root");
+    let engine = Mace::new(Options::new(&db_root).validate().expect("bad options"))
+        .expect("open engine failed");
+
+    let bucket = match engine.get_bucket("prod_recovery_update_chain") {
+        Ok(bucket) => bucket,
+        Err(OpCode::NotFound) => engine
+            .new_bucket("prod_recovery_update_chain")
+            .expect("create bucket failed"),
+        Err(err) => panic!("open bucket failed: {err:?}"),
+    };
+
+    let committed = bucket.begin().expect("begin committed txn failed");
+    committed.put("k", "base").expect("put committed failed");
+    committed.commit().expect("commit failed");
+
+    let pending = bucket.begin().expect("begin pending txn failed");
+    pending.update("k", "v1").expect("first update failed");
+    pending.update("k", "v2").expect("second update failed");
+
+    std::process::abort();
+}
+
+fn child_update_chain_verify_path() {
+    let db_root = std::env::var(DB_ROOT_FLAG).expect("missing verify db root");
+    let engine = Mace::new(
+        Options::new(&db_root)
+            .validate()
+            .expect("bad verify options"),
+    )
+    .expect("reopen engine failed");
+
+    let bucket = engine
+        .get_bucket("prod_recovery_update_chain")
+        .expect("bucket should exist");
+    let view = bucket.view().expect("open view failed");
+    assert_eq!(view.get("k").expect("missing key").slice(), b"base");
+}
+
+fn child_delete_chain_crash_path() -> ! {
+    let db_root = std::env::var(DB_ROOT_FLAG).expect("missing child db root");
+    let engine = Mace::new(Options::new(&db_root).validate().expect("bad options"))
+        .expect("open engine failed");
+
+    let bucket = match engine.get_bucket("prod_recovery_delete_chain") {
+        Ok(bucket) => bucket,
+        Err(OpCode::NotFound) => engine
+            .new_bucket("prod_recovery_delete_chain")
+            .expect("create bucket failed"),
+        Err(err) => panic!("open bucket failed: {err:?}"),
+    };
+
+    let committed = bucket.begin().expect("begin committed txn failed");
+    committed.put("k", "base").expect("put committed failed");
+    committed.commit().expect("commit failed");
+
+    let pending = bucket.begin().expect("begin pending txn failed");
+    pending.del("k").expect("delete failed");
+
+    std::process::abort();
+}
+
+fn child_delete_chain_verify_path() {
+    let db_root = std::env::var(DB_ROOT_FLAG).expect("missing verify db root");
+    let engine = Mace::new(
+        Options::new(&db_root)
+            .validate()
+            .expect("bad verify options"),
+    )
+    .expect("reopen engine failed");
+
+    let bucket = engine
+        .get_bucket("prod_recovery_delete_chain")
+        .expect("bucket should exist");
+    let view = bucket.view().expect("open view failed");
+    assert_eq!(view.get("k").expect("missing key").slice(), b"base");
+}
+
+#[cfg(feature = "failpoints")]
+fn child_update_chain_verify_failpoint_path() -> ! {
+    let db_root = std::env::var(DB_ROOT_FLAG).expect("missing verify db root");
+    let _engine = Mace::new(
+        Options::new(&db_root)
+            .validate()
+            .expect("bad verify options"),
+    )
+    .expect("reopen engine failed");
+    panic!("undo-after-clr-before-put failpoint did not fire")
 }
 
 #[cfg(feature = "failpoints")]
@@ -195,6 +287,16 @@ fn fast_process_crash_window() {
             child_verify_path();
             return;
         }
+        Some("crash_update_chain") => child_update_chain_crash_path(),
+        Some("verify_update_chain") => {
+            child_update_chain_verify_path();
+            return;
+        }
+        Some("crash_delete_chain") => child_delete_chain_crash_path(),
+        Some("verify_delete_chain") => {
+            child_delete_chain_verify_path();
+            return;
+        }
         #[cfg(feature = "failpoints")]
         Some("failpoint_io_write") => {
             child_failpoint_io_write_path();
@@ -219,7 +321,87 @@ fn fast_process_crash_window() {
     let db_root_text = db_root.to_string_lossy().to_string();
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
-    run_crash_verify_once(&current_exe, &db_root_text);
+    run_crash_verify_once(&current_exe, "fast_process_crash_window", &db_root_text);
+
+    std::fs::remove_dir_all(&db_root_text).expect("cleanup db root failed");
+}
+
+#[test]
+fn fast_process_crash_update_chain() {
+    match std::env::var(MODE_FLAG).ok().as_deref() {
+        Some("crash_update_chain") => child_update_chain_crash_path(),
+        Some("verify_update_chain") => {
+            child_update_chain_verify_path();
+            return;
+        }
+        #[cfg(feature = "failpoints")]
+        Some("verify_update_chain_failpoint") => child_update_chain_verify_failpoint_path(),
+        _ => {}
+    }
+
+    let db_root = RandomPath::new();
+    let db_root_text = db_root.to_string_lossy().to_string();
+    let current_exe = std::env::current_exe().expect("load current exe failed");
+
+    let crash_status = spawn_child(
+        &current_exe,
+        "fast_process_crash_update_chain",
+        "crash_update_chain",
+        &db_root_text,
+        None,
+    );
+    assert!(
+        !crash_status.success(),
+        "crash child should exit abnormally"
+    );
+
+    let verify_status = spawn_child(
+        &current_exe,
+        "fast_process_crash_update_chain",
+        "verify_update_chain",
+        &db_root_text,
+        None,
+    );
+    assert!(verify_status.success(), "verify child should pass");
+
+    std::fs::remove_dir_all(&db_root_text).expect("cleanup db root failed");
+}
+
+#[test]
+fn fast_process_crash_delete_chain() {
+    match std::env::var(MODE_FLAG).ok().as_deref() {
+        Some("crash_delete_chain") => child_delete_chain_crash_path(),
+        Some("verify_delete_chain") => {
+            child_delete_chain_verify_path();
+            return;
+        }
+        _ => {}
+    }
+
+    let db_root = RandomPath::new();
+    let db_root_text = db_root.to_string_lossy().to_string();
+    let current_exe = std::env::current_exe().expect("load current exe failed");
+
+    let crash_status = spawn_child(
+        &current_exe,
+        "fast_process_crash_delete_chain",
+        "crash_delete_chain",
+        &db_root_text,
+        None,
+    );
+    assert!(
+        !crash_status.success(),
+        "crash child should exit abnormally"
+    );
+
+    let verify_status = spawn_child(
+        &current_exe,
+        "fast_process_crash_delete_chain",
+        "verify_delete_chain",
+        &db_root_text,
+        None,
+    );
+    assert!(verify_status.success(), "verify child should pass");
 
     std::fs::remove_dir_all(&db_root_text).expect("cleanup db root failed");
 }
@@ -234,7 +416,7 @@ fn stress_crash_reopen_loop() {
         let db_root = RandomPath::new();
         let db_root_text = db_root.to_string_lossy().to_string();
 
-        run_crash_verify_once(&current_exe, &db_root_text);
+        run_crash_verify_once(&current_exe, "fast_process_crash_window", &db_root_text);
         std::fs::remove_dir_all(&db_root_text).expect("cleanup stress db root failed");
 
         if round % 16 == 0 {
@@ -253,13 +435,20 @@ fn chaos_failpoint_txn_commit_io() {
 
     let write_status = spawn_child(
         &current_exe,
+        "fast_process_crash_window",
         "failpoint_io_write",
         &db_root_text,
         Some("mace_txn_commit_begin=io@1"),
     );
     assert!(write_status.success(), "io child should handle io error");
 
-    let verify_status = spawn_child(&current_exe, "failpoint_io_verify", &db_root_text, None);
+    let verify_status = spawn_child(
+        &current_exe,
+        "fast_process_crash_window",
+        "failpoint_io_verify",
+        &db_root_text,
+        None,
+    );
     assert!(verify_status.success(), "io verify child should pass");
 
     std::fs::remove_dir_all(&db_root_text).expect("cleanup io db root failed");
@@ -275,6 +464,7 @@ fn chaos_failpoint_txn_commit_abort() {
 
     let abort_status = spawn_child(
         &current_exe,
+        "fast_process_crash_window",
         "failpoint_abort_write",
         &db_root_text,
         Some("mace_txn_commit_begin=abort@1"),
@@ -284,8 +474,58 @@ fn chaos_failpoint_txn_commit_abort() {
         "abort child should exit abnormally"
     );
 
-    let verify_status = spawn_child(&current_exe, "failpoint_abort_verify", &db_root_text, None);
+    let verify_status = spawn_child(
+        &current_exe,
+        "fast_process_crash_window",
+        "failpoint_abort_verify",
+        &db_root_text,
+        None,
+    );
     assert!(verify_status.success(), "abort verify child should pass");
 
     std::fs::remove_dir_all(&db_root_text).expect("cleanup abort db root failed");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+#[ignore]
+fn chaos_failpoint_undo_after_clr_before_put() {
+    let db_root = RandomPath::new();
+    let db_root_text = db_root.to_string_lossy().to_string();
+    let current_exe = std::env::current_exe().expect("load current exe failed");
+
+    let crash_status = spawn_child(
+        &current_exe,
+        "fast_process_crash_update_chain",
+        "crash_update_chain",
+        &db_root_text,
+        None,
+    );
+    assert!(
+        !crash_status.success(),
+        "seed crash child should exit abnormally"
+    );
+
+    let fail_status = spawn_child(
+        &current_exe,
+        "fast_process_crash_update_chain",
+        "verify_update_chain_failpoint",
+        &db_root_text,
+        Some("mace_undo_after_clr_before_put=abort@1"),
+    );
+    assert!(
+        !fail_status.success(),
+        "undo-after-clr-before-put failpoint child should abort"
+    );
+
+    let verify_status = spawn_child(
+        &current_exe,
+        "fast_process_crash_update_chain",
+        "verify_update_chain",
+        &db_root_text,
+        None,
+    );
+    assert!(verify_status.success(), "post-clr verify child should pass");
+
+    std::fs::remove_dir_all(&db_root_text).expect("cleanup db root failed");
 }

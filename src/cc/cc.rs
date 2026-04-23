@@ -240,7 +240,7 @@ impl CommitTree {
         log.push((commit, start));
     }
 
-    pub fn compact(&self, ctx: &Context, _this_group: u8) {
+    pub fn compact(&self, ctx: &Context) {
         if self.log.read().len() < self.cap {
             return;
         }

@@ -858,7 +858,7 @@ mod test {
         types::{
             data::{IntlKey, Record, Val, Ver},
             refbox::{BoxRef, BoxView, RemoteView},
-            traits::{ICodec, IDecode, IFrameAlloc, IHeader, ILoader, IRetireSink},
+            traits::{ICodec, IDecode, IFrameAlloc, IHeader, ILoader},
         },
         utils::NULL_ADDR,
     };
@@ -979,32 +979,20 @@ mod test {
         }
 
         impl IFrameAlloc for L {
-            fn try_alloc(&mut self, size: u32) -> Result<BoxRef, OpCode> {
+            fn alloc(&mut self, size: u32) -> BoxRef {
                 let addr = self.addr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let b = BoxRef::alloc(size, addr);
                 self.m.borrow_mut().insert(addr, b.clone());
-                Ok(b)
+                b
             }
 
-            fn try_alloc_pair(
-                &mut self,
-                size1: u32,
-                size2: u32,
-            ) -> Result<(BoxRef, BoxRef), OpCode> {
-                Ok((self.try_alloc(size1)?, self.try_alloc(size2)?))
-            }
-
-            fn arena_size(&mut self) -> usize {
+            fn frame_budget(&mut self) -> usize {
                 64 << 20
             }
 
             fn inline_size(&self) -> usize {
                 Options::MIN_INLINE_SIZE
             }
-        }
-
-        impl IRetireSink for L {
-            fn collect(&mut self, _addr: &[u64]) {}
         }
 
         impl ILoader for L {
@@ -1024,11 +1012,11 @@ mod test {
                 self.m.borrow_mut().insert(data.header().addr, data);
             }
 
-            fn shallow_copy(&self) -> Self {
+            fn copy_with_pin(&self) -> Self {
                 self.clone()
             }
 
-            fn deep_copy(&self) -> Self {
+            fn copy_without_pin(&self) -> Self {
                 self.clone()
             }
 

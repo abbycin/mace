@@ -1,6 +1,6 @@
 use std::sync::atomic::AtomicU32;
 
-use crate::static_assert;
+use crate::{static_assert, utils::data::Position};
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[repr(u8)]
@@ -18,12 +18,10 @@ pub(crate) enum NodeType {
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
-#[repr(u16)]
+#[repr(u8)]
 pub(crate) enum TagFlag {
     Normal = 1,
-    TombStone = 2,
-    Sibling = 3,
-    Unmap = 4,
+    Sibling = 2,
 }
 
 #[derive(Debug)]
@@ -33,6 +31,7 @@ pub struct BoxHeader {
     pub(crate) kind: TagKind,
     pub(crate) node_type: NodeType,
     pub(crate) flag: TagFlag,
+    pub(crate) group: u8,
     pub(crate) total_size: u32,
     pub(crate) payload_size: u32,
     pub(crate) pid: u64,
@@ -41,6 +40,7 @@ pub struct BoxHeader {
     pub(crate) addr: u64,
     /// logical address link to next BoxRef
     pub(crate) link: u64,
+    pub(crate) lsn: Position,
 }
 
 #[derive(Debug)]
@@ -62,12 +62,14 @@ pub(crate) struct BaseHeader {
     pub(crate) size: u32,
     /// pid of right sibling, when it the right most node, it should be 0
     pub(crate) right_sibling: u64,
+    pub(crate) merging_child: u64,
     pub(crate) lo_len: u32,
     pub(crate) hi_len: u32,
     pub(crate) prefix_len: u32,
+    pub(crate) merging: bool,
     pub(crate) is_index: bool,
     pub(crate) has_multiple_versions: bool,
-    pub(crate) padding: u16,
+    pub(crate) padding: u8,
 } // sst
 
 #[repr(C, align(8))]

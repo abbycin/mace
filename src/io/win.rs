@@ -66,6 +66,10 @@ impl GatherIO for File {
         self.file.sync_all()
     }
 
+    fn sync_data(&mut self) -> Result<(), io::Error> {
+        self.file.sync_data()
+    }
+
     fn truncate(&self, to: u64) -> Result<(), io::Error> {
         self.file.set_len(to)
     }

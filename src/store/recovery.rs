@@ -241,6 +241,13 @@ impl Recovery {
 
         debug_assert!(!self.dirty_table.contains_key(&ver));
 
+        // correctness gate: if this WAL record is already covered by bucket durable frontier,
+        // it has been materialized in persisted page image and must not enter redo.
+        let durable_lsn = store.manifest.durable_frontier_lsn(u.bucket_id, u.group_id);
+        if loc.pos <= durable_lsn {
+            return Ok(true);
+        }
+
         let raw = u.key();
         let target_tree = self.get_tree(u.bucket_id, store);
         if let Some(target_tree) = &target_tree.0 {

@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use crate::utils::lru::LRU_SHARD;
 use crate::utils::observe::{NoopObserver, Observer};
 
 use super::OpCode;
@@ -12,164 +11,150 @@ use super::OpCode;
 /// Configuration options for the Mace storage engine.
 #[derive(Clone)]
 pub struct Options {
-    /// force sync data to disk for every log write, the default value is `true`, turning it off may
-    /// result in data loss, while turning it on may result in performance degradation
-    pub sync_on_write: bool,
-    /// pre-allocated arena count per bucket
+    /// Force-sync data to disk for every log write.
     ///
-    /// this controls the size of the reusable arena queue for each bucket
-    /// must be >= 2 and power of two, default is 16
-    pub default_arenas: u32,
-    /// max extra arenas that can be created during starvation
-    pub arena_spill_limit: u32,
-    /// default is hardware concurrency count, it must be power of 2
+    /// The default value is `true`. Turning it off may result in data loss,
+    /// while turning it on may reduce performance.
+    pub sync_on_write: bool,
+    /// Defaults to the hardware concurrency count and must be a power of two.
     ///
     /// **Once set, it cannot be modified**
     pub concurrent_write: u8,
-    /// garbage collection cycle (milliseconds)
+    /// Garbage collection cycle interval (milliseconds).
     pub gc_timeout: u64,
-    /// perform compaction when garbage ratio exceed this value, range [0, 100]
+    /// Proactive page-checkpoint trigger interval (milliseconds).
+    ///
+    /// When a bucket has pending dirty pages but no foreground write reaches checkpoint thresholds,
+    /// the evictor triggers checkpoint near this interval to prevent WAL checkpoint stalling.
+    ///
+    /// Set to 0 to disable proactive triggering.
+    pub checkpoint_nudge_ms: u64,
+    /// Perform compaction when the garbage ratio exceeds this value, in the range [0, 100].
     pub data_garbage_ratio: u32,
-    /// perform compaction when [`Self::gc_ratio`] is reached
+    /// If true, compact immediately when [`Self::data_garbage_ratio`] is reached.
     pub gc_eager: bool,
-    /// if [`Self::gc_eager`] is not set, the compaction will only be triggered when active data
-    /// size can be compacted into [`Self::gc_compacted_size`], the default setting is [`Self::data_file_size`]
+    /// If [`Self::gc_eager`] is false, compaction is triggered only when active data
+    /// can be compacted into [`Self::gc_compacted_size`].
+    ///
+    /// The default value is [`Self::data_file_size`].
     pub gc_compacted_size: usize,
-    /// the size limit of blob file
-    pub blob_max_size: usize,
-    /// trigger blob gc when garbage ratio exceed this value, range [0, 100]
+    /// Size limit of a blob file.
+    pub blob_file_size: usize,
+    /// Trigger blob GC when the garbage ratio exceeds this value, in the range [0, 100].
     pub blob_garbage_ratio: usize,
-    /// choose [`Self::blob_gc_ratio`] oldest blob files to perform everytime then gc timeout
+    /// At each blob GC cycle, pick the oldest [`Self::blob_gc_ratio`]% of blob files as candidates.
     pub blob_gc_ratio: usize,
-    /// is temperary storage, if true, db_root will be unlinked on exit
+    /// Whether this is temporary storage.
+    ///
+    /// If true, `db_root` will be removed on exit.
     pub tmp_store: bool,
-    /// where to store database files
+    /// Directory where database files are stored.
     pub(crate) db_root: PathBuf,
-    /// where to store log files, the default value is `db_root/log`
+    /// Directory where log files are stored.
+    ///
+    /// The default value is `db_root/log`.
     pub log_root: PathBuf,
-    /// node cache memory size
+    /// Per-bucket logical-address page/blob cache capacity in bytes.
+    ///
+    /// This cache holds data by logical address for the loader fast path.
+    /// Trimming is best-effort and happens in small rounds, so short-term overshoot is possible.
+    ///
+    /// Entries here can overlap with [`Self::cache_capacity`] and [`Self::pool_capacity`]
+    /// because all three may point to the same ref-counted allocation.
+    pub lru_capacity: usize,
+    /// Per-bucket pool target bytes.
+    ///
+    /// Exceeding this does not block allocation directly; it triggers checkpoint scheduling.
+    /// Therefore, this is a pressure threshold, not a strict memory ceiling.
+    ///
+    /// When set to 0, it is derived as `checkpoint_size * 2` during validation.
+    pub pool_capacity: usize,
+    /// Per-bucket target resident bytes for mapped B+Tree pages.
+    ///
+    /// This is a soft pressure threshold instead of a hard cap:
+    /// - Evictor is nudged at ~80% usage (by default).
+    /// - Eviction is activity-based and asynchronous.
+    ///
+    /// This is not an independent memory pool. The same data may also be referenced by
+    /// [`Self::pool_capacity`] (dirty pages) and/or [`Self::lru_capacity`] (cold data),
+    /// so byte accounting among these three knobs overlaps by design.
     pub cache_capacity: usize,
-    /// percent of items will be evicted at once, default is 10%
+    /// Percentage of items evicted per round. Default is 10%.
     pub cache_evict_pct: usize,
-    /// delta cache count, shard into 32 slots, which act as a secondary cache to node cache
-    /// which has two priority: High and Low, the Low priority is used for big value only
-    pub cache_count: usize,
-    /// stat bitmap cache count for data and blob
+    /// Optional hard fuse for per-bucket page/blob LRU entry count. 0 means unlimited.
+    pub lru_max_entries: usize,
+    /// Bitmap-cache entry count for data and blob stats.
     pub stat_mask_cache_count: usize,
-    /// the High priority cache ratio of [`Self::cache_count`], range from [0, 100]
+    /// Ratio of high-priority cache (for non-blob data) within [`Self::lru_capacity`], in [0, 100].
     pub high_priority_ratio: usize,
-    /// max cache count for open data file concurrently, which is used for load pages from data file
+    /// Maximum number of open data-file handles cached concurrently, used for loading data pages.
     pub data_handle_cache_capacity: usize,
-    /// max cache count for open blob file concurrently, which is used for load pages from blob file
+    /// Maximum number of open blob-file handles cached concurrently, used for loading blob pages.
     pub blob_handle_cache_capacity: usize,
-    /// for branch node, the key and index are always inlined, for leaf node, the key and val header
-    /// and value that less than [`Self::INLINE_SIZE`] are always inlined too
+    /// For branch nodes, keys and indexes are always inlined.
+    ///
+    /// For leaf nodes, keys, value headers, and values smaller than [`Self::INLINE_SIZE`]
+    /// are also always inlined.
     pub inline_size: usize,
-    /// a size limit to trigger data file flushed
-    ///
-    /// NOTE:
-    /// - too large a file size will cause the flushing to be slow
-    /// - this option will be affected by [`Self::max_log_size`], a checkpoint will cause unfull data buffer to be flushed
-    /// - backpressure calibration should treat one data_file_size as the baseline flush unit
+    /// Size limit of a data file.
     pub data_file_size: usize,
-    /// if wal log file size large than this value times [`Self::concurrent_write`], a checkpoint will be created
+    /// Maximum bytes a single checkpoint round should emit.
     ///
-    /// for example: set [`Self::max_log_size`] to 10MB and there are 10 concurrent writers, then a checkpoint
-    /// will be created when log size are exceed 100MB
+    /// 0 means use `data_file_size`.
+    pub checkpoint_size: usize,
+    /// Threshold for consolidating delta chains.
     ///
-    /// this value should be larger than [`Self::data_file_size`]
-    pub max_log_size: usize,
-    /// when should we consolidate delta chain, the default value is set to half [`Self::split_elems`]
-    /// and it also the maximum value, shrink this value may get better query performance (especially
-    /// in large key-value workload)
+    /// The default is half of [`Self::split_elems`], which is also the maximum.
+    /// Lower values may improve query performance, especially for large key-value workloads.
     pub consolidate_threshold: u16,
-    /// WAL ring buffer size, must greater than [`Self::page_size`] and must be power of 2
+    /// WAL ring buffer size. Must be greater than the page size and a power of two.
     pub wal_buffer_size: usize,
-    /// the count of checkpoints that a txn can span, ie, the length limit of a txn, if a txn length
-    /// exceed the limit, it will be forcibly aborted
+    /// Number of checkpoints a transaction can span (i.e., transaction length limit).
     ///
-    /// NOTE: checkpoint was taken when a buffer was flushed, however, the real data in arena may be
-    /// scarce, so this option is an estimated value
+    /// If a transaction exceeds this limit, it is forcibly aborted.
+    ///
+    /// NOTE: checkpoints are taken when a buffer is flushed; however, real arena data may be sparse,
+    /// so this is an estimated limit.
     pub max_ckpt_per_txn: usize,
-    /// WAL file size limit which will trigger switch to new WAL file, at most 2GB
+    /// WAL file size limit that triggers switching to a new WAL file, up to 2GB.
     pub wal_file_size: u32,
-    /// if set to true, the unused stable wal file (never used in recovery) will be removed, default
-    /// value is `false`
+    /// If true, remove unused stable WAL files (never used in recovery).
+    ///
+    /// Default is `false`.
     pub keep_stable_wal_file: bool,
-    /// control max elements in sst (B+ Tree Node), the default value is 512, the sst size is around
-    /// [`Self::INLINE_SIZE`] * [`Self::split_elems`], big KVs will be stored outside of sst
+    /// Maximum number of elements in an SST (B+Tree node).
+    ///
+    /// The default is 512. SST size is roughly [`Self::INLINE_SIZE`] * [`Self::split_elems`].
+    /// Large key-values are stored outside SST.
     ///
     /// **Once set, it cannot be modified**
     pub split_elems: u16,
-    /// if true, corrupted WAL will be truncated during recovery, otherwise it will panic
-    /// default is true
+    /// If true, corrupted WAL is truncated during recovery; otherwise recovery panics.
+    ///
+    /// Default is true.
     pub truncate_corrupted_wal: bool,
-    /// observability callback, default is noop
+    /// Observability callback. Default is no-op.
     pub observer: Arc<dyn Observer>,
-    /// enable foreground write backpressure
+    /// Enable foreground write backpressure.
     pub enable_backpressure: bool,
-    /// enable flush pacing in flusher thread
-    pub enable_flush_pacing: bool,
-    /// soft backlog threshold in flush units to start delaying foreground writes
-    ///
-    /// calibrate it against the count of typical flush units rather than a time budget
-    pub bp_soft_debt_units: u32,
-    /// backlog threshold in flush units to increase delay aggressively
-    ///
-    /// calibrate it to allow multiple flush units of backlog before entering strong throttling
-    pub bp_hard_debt_units: u32,
-    /// backlog threshold in flush units to cap delay at max
-    ///
-    /// calibrate it to cap runaway backlog rather than to police a single flush unit
-    pub bp_stop_debt_units: u32,
-    /// fail-safe backlog threshold in flush units used before io samples are ready
-    ///
-    /// cold start should collect disk samples first and only throttle when backlog grows beyond this bound
-    pub bp_cold_start_fail_safe_units: u32,
-    /// maximum backlog in flush units where flush pacing is still allowed
-    ///
-    /// pacing should only smooth very low backlog and must bypass once the system enters catch-up mode
-    pub bp_pacing_soft_debt_units: u32,
-    /// baseline flush unit used to convert bytes into backlog units
-    ///
-    /// for arena-backed writes, use one `data_file_size` as the starting point
-    pub bp_flush_unit_bytes: u64,
-    /// minimum ratio (percent) of disk bps when debt is high
-    pub bp_min_ratio_pct: u32,
-    /// minimum fail-safe throughput in bytes/sec used before io samples are ready
-    ///
-    /// calibrate it to a conservative sustained flush throughput instead of peak device bandwidth
-    pub bp_floor_bps: u64,
-    /// minimum count of real flush io samples required before steady-state backpressure activates
-    pub bp_warmup_min_samples: u32,
-    /// minimum ratio (percent) applied when publish path lags behind disk io
-    pub bp_publish_guard_min_ratio_pct: u32,
-    /// if debt stays zero beyond this duration, decay historical bps
-    pub bp_idle_reset_ms: u64,
-    /// maximum sleep duration for a single backpressure decision
-    pub bp_max_delay_us: u64,
 }
 
 impl Options {
     pub const DATA_FILE_SIZE: usize = 64 << 20; // 64MB
+    pub const BLOB_FILE_SIZE: usize = 256 << 20; // 256MB
     pub const MAX_CONCURRENT_WRITE: u8 = 128;
     pub const MIN_CACHE_CAP: usize = Self::DATA_FILE_SIZE;
     pub const CACHE_CAP: usize = 1 << 30; // 1GB
-    pub const CACHE_CNT: usize = 16384;
-    // Assuming a MemData/BlobStat is 32 KB, 16,384 stats will use 512 MB of memory, which is a reasonable value
+    pub const LRU_CAPACITY: usize = 256 << 20; // 256MB
+    // Assuming a MemData/BlobStat is 32 KB, 16,384 stats use ~512 MB of memory, which is reasonable.
     pub const STAT_MASK_CACHE_CNT: usize = 16384;
     pub const FILE_CACHE: usize = 512;
-    pub const WAL_BUF_SZ: usize = 8 << 20; // 8MB
+    pub const WAL_BUF_SZ: usize = 4 << 20; // 4MB
     pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
     pub const MIN_INLINE_SIZE: usize = 8192;
     pub const MAX_INLINE_SIZE: usize = 64 << 10;
     pub const MAX_SPLIT_ELEMS: u16 = 512;
-    pub const MAX_LOG_SIZE: usize = 72 << 20;
     const MIN_SPLIT_ELEMS: u16 = 64;
-    const MIN_DEFAULT_ARENAS: u32 = 2;
-    const MAX_DEFAULT_ARENAS: u32 = 1024;
-    const MIN_ARENA_SPILL: u32 = 1;
-    const MAX_ARENA_SPILL: u32 = Self::MAX_DEFAULT_ARENAS;
     pub(crate) const MAX_KEY_SIZE: usize = 64 << 10;
     pub(crate) const MAX_KV_SIZE: usize = 1 << 30; // 1GB
 
@@ -182,29 +167,31 @@ impl Options {
             .next_power_of_two() as u8;
         Self {
             sync_on_write: true,
-            default_arenas: 16,
-            arena_spill_limit: 1,
             concurrent_write: cores,
             tmp_store: false,
-            gc_timeout: 60 * 1000,  // 1min
-            data_garbage_ratio: 20, // 20%
+            gc_timeout: 60 * 1000,          // 1min
+            checkpoint_nudge_ms: 60 * 1000, // 1min
+            data_garbage_ratio: 20,         // 20%
             gc_eager: true,
             gc_compacted_size: Self::DATA_FILE_SIZE,
-            blob_max_size: 256 << 20, // 256MB
-            blob_garbage_ratio: 50,   // 50%
-            blob_gc_ratio: 25,        // 25%
+            blob_file_size: Self::BLOB_FILE_SIZE,
+            blob_garbage_ratio: 50, // 50%
+            blob_gc_ratio: 25,      // 25%
             db_root: db_root.as_ref().to_path_buf(),
             log_root: db_root.as_ref().to_path_buf(),
             cache_capacity: Self::CACHE_CAP,
             cache_evict_pct: 10, // 10%
-            cache_count: Self::CACHE_CNT,
+            lru_capacity: Self::LRU_CAPACITY,
+            lru_max_entries: 0,
             stat_mask_cache_count: Self::STAT_MASK_CACHE_CNT,
             high_priority_ratio: 80, // 80%
             data_handle_cache_capacity: 128,
             blob_handle_cache_capacity: 128,
             inline_size: Self::MIN_INLINE_SIZE,
             data_file_size: Self::DATA_FILE_SIZE,
-            max_log_size: Self::MAX_LOG_SIZE,
+            // Derived during validation so later tuning of `data_file_size` is reflected automatically.
+            checkpoint_size: 0,
+            pool_capacity: 0,
             consolidate_threshold: Self::MAX_SPLIT_ELEMS / 2,
             wal_buffer_size: Self::WAL_BUF_SZ,
             max_ckpt_per_txn: 1_000_000, // 1 million
@@ -214,19 +201,6 @@ impl Options {
             truncate_corrupted_wal: true,
             observer: Arc::new(NoopObserver),
             enable_backpressure: false,
-            enable_flush_pacing: false,
-            bp_soft_debt_units: 8,
-            bp_hard_debt_units: 24,
-            bp_stop_debt_units: 48,
-            bp_cold_start_fail_safe_units: 8,
-            bp_pacing_soft_debt_units: 2,
-            bp_flush_unit_bytes: Self::DATA_FILE_SIZE as u64,
-            bp_min_ratio_pct: 5,
-            bp_floor_bps: 16 << 20, // 16MB/s
-            bp_warmup_min_samples: 4,
-            bp_publish_guard_min_ratio_pct: 50,
-            bp_idle_reset_ms: 5_000,
-            bp_max_delay_us: 10_000,
         }
     }
 
@@ -237,12 +211,6 @@ impl Options {
     /// Validates the options and returns a ParsedOptions instance.
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
         self.concurrent_write = self.concurrent_write.clamp(1, Self::MAX_CONCURRENT_WRITE);
-        if self.default_arenas < Self::MIN_DEFAULT_ARENAS
-            || self.default_arenas > Self::MAX_DEFAULT_ARENAS
-            || !self.default_arenas.is_power_of_two()
-        {
-            return Err(OpCode::Invalid);
-        }
         self.split_elems = self
             .split_elems
             .clamp(Self::MIN_SPLIT_ELEMS, Self::MAX_SPLIT_ELEMS);
@@ -250,55 +218,30 @@ impl Options {
             .inline_size
             .clamp(Self::MIN_INLINE_SIZE, Self::MAX_INLINE_SIZE);
 
-        self.arena_spill_limit = self
-            .arena_spill_limit
-            .clamp(Self::MIN_ARENA_SPILL, Self::MAX_ARENA_SPILL);
         if self.consolidate_threshold > self.split_elems / 2 {
             self.consolidate_threshold = self.split_elems / 2;
-        }
-        if self.cache_count / LRU_SHARD < 10 {
-            self.cache_count = Self::CACHE_CNT;
         }
         if self.stat_mask_cache_count == 0 {
             self.stat_mask_cache_count = Self::STAT_MASK_CACHE_CNT;
         }
         if self.cache_capacity < Self::MIN_CACHE_CAP {
-            self.cache_capacity = Self::CACHE_CAP;
+            self.cache_capacity = Self::MIN_CACHE_CAP;
         }
-        self.bp_min_ratio_pct = self.bp_min_ratio_pct.clamp(1, 100);
-        self.bp_publish_guard_min_ratio_pct = self.bp_publish_guard_min_ratio_pct.clamp(1, 100);
-        if self.bp_soft_debt_units == 0 {
-            self.bp_soft_debt_units = 1;
+        if self.lru_capacity == 0 {
+            self.lru_capacity = Self::LRU_CAPACITY;
         }
-        if self.bp_hard_debt_units <= self.bp_soft_debt_units {
-            self.bp_hard_debt_units = self.bp_soft_debt_units + 1;
+        self.high_priority_ratio = self.high_priority_ratio.min(100);
+
+        if self.checkpoint_size == 0 {
+            self.checkpoint_size = self.data_file_size;
         }
-        if self.bp_stop_debt_units <= self.bp_hard_debt_units {
-            self.bp_stop_debt_units = self.bp_hard_debt_units + 1;
+
+        if self.pool_capacity == 0 {
+            self.pool_capacity = self.checkpoint_size.saturating_mul(2);
         }
-        if self.bp_cold_start_fail_safe_units < self.bp_soft_debt_units {
-            self.bp_cold_start_fail_safe_units = self.bp_soft_debt_units;
-        }
-        if self.bp_pacing_soft_debt_units == 0 {
-            self.bp_pacing_soft_debt_units = 1;
-        }
-        if self.bp_pacing_soft_debt_units > self.bp_soft_debt_units {
-            self.bp_pacing_soft_debt_units = self.bp_soft_debt_units;
-        }
-        if self.bp_flush_unit_bytes == 0 {
-            self.bp_flush_unit_bytes = self.data_file_size as u64;
-        }
-        if self.bp_floor_bps == 0 {
-            self.bp_floor_bps = 8 << 20;
-        }
-        if self.bp_warmup_min_samples == 0 {
-            self.bp_warmup_min_samples = 4;
-        }
-        if self.bp_idle_reset_ms == 0 {
-            self.bp_idle_reset_ms = 5_000;
-        }
-        if self.bp_max_delay_us == 0 {
-            self.bp_max_delay_us = 10_000;
+
+        if self.checkpoint_size > self.pool_capacity {
+            self.checkpoint_size = self.pool_capacity;
         }
 
         self.create_dir().map_err(|e| {

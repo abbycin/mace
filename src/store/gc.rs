@@ -1,4 +1,5 @@
 use crc32c::Crc32cHasher;
+use dashmap::mapref::multiple::RefMulti;
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
@@ -8,7 +9,7 @@ use std::{
         Arc,
         atomic::{
             AtomicU64,
-            Ordering::{AcqRel, Acquire, Relaxed},
+            Ordering::{AcqRel, Relaxed},
         },
         mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     },
@@ -117,11 +118,11 @@ impl GCHandle {
     }
 
     pub(crate) fn data_gc_count(&self) -> u64 {
-        self.data_runs.load(Acquire)
+        self.data_runs.load(Relaxed)
     }
 
     pub(crate) fn blob_gc_count(&self) -> u64 {
-        self.blob_runs.load(Acquire)
+        self.blob_runs.load(Relaxed)
     }
 }
 
@@ -215,8 +216,6 @@ impl GarbageCollector {
     fn run(&mut self) {
         let started = Instant::now();
         self.store.opt.observer.counter(CounterMetric::GcRun, 1);
-        self.store.manifest.recover_pending_retires_to_stats();
-        self.process_wal();
         self.process_data();
         self.process_blob();
         self.process_pending_buckets();
@@ -403,17 +402,20 @@ impl GarbageCollector {
                 lo: Vec::new(),
                 bucket_id,
             };
-            obsoleted.iter().for_each(|&x| {
-                let mut loader = MetaReader::<BlobFooter>::new(self.store.opt.blob_file(x))
-                    .expect("never happen");
-                let ivls = loader.get_interval().unwrap();
-                for i in ivls {
-                    if i.lo <= i.hi {
-                        del_intervals.push(i.lo);
+            obsoleted
+                .iter()
+                .filter(|x| !self.store.manifest.is_unsynced_blob_file(**x))
+                .for_each(|&x| {
+                    let mut loader = MetaReader::<BlobFooter>::new(self.store.opt.blob_file(x))
+                        .expect("never happen");
+                    let ivls = loader.get_interval().unwrap();
+                    for i in ivls {
+                        if i.lo <= i.hi {
+                            del_intervals.push(i.lo);
+                        }
                     }
-                }
-                unlinked.push(x);
-            });
+                    unlinked.push(x);
+                });
             let mut txn = self.store.manifest.begin();
             txn.record(MetaKind::BlobDelete, &unlinked);
             txn.record(MetaKind::BlobDelInterval, &del_intervals);
@@ -422,33 +424,37 @@ impl GarbageCollector {
             self.store
                 .manifest
                 .blob_stat
-                .remove_stat_interval(obsoleted);
-            self.store.manifest.save_obsolete_blob(obsoleted);
+                .remove_stat_interval(&unlinked);
+            self.store.manifest.save_obsolete_blob(&unlinked);
             self.store.manifest.delete_files();
             self.store
                 .opt
                 .observer
-                .counter(CounterMetric::GcBlobObsoleteFile, obsoleted.len() as u64);
+                .counter(CounterMetric::GcBlobObsoleteFile, unlinked.len() as u64);
+            self.blob_runs.fetch_add(1, Relaxed);
         }
     }
 
-    fn process_obsoleted_data(&self, obsoleted: Vec<u64>, bucket_id: u64) {
+    fn process_obsoleted_data(&self, obsoleted: &[u64], bucket_id: u64) {
         if !obsoleted.is_empty() {
             let mut unlinked = Delete::default();
             let mut del_intervals = DelInterval {
                 lo: Vec::new(),
                 bucket_id,
             };
-            obsoleted.iter().for_each(|&x| {
-                let mut loader = MetaReader::<DataFooter>::new(self.store.opt.data_file(x))
-                    .expect("never happen");
-                let ivls = loader.get_interval().unwrap();
-                for i in ivls {
-                    // keep deleting legacy sentinel keys from old empty data files
-                    del_intervals.push(i.lo);
-                }
-                unlinked.push(x);
-            });
+            obsoleted
+                .iter()
+                .filter(|x| !self.store.manifest.is_unsynced_data_file(**x))
+                .for_each(|&x| {
+                    let mut loader = MetaReader::<DataFooter>::new(self.store.opt.data_file(x))
+                        .expect("never happen");
+                    let ivls = loader.get_interval().unwrap();
+                    for i in ivls {
+                        // keep deleting legacy sentinel keys from old empty data files
+                        del_intervals.push(i.lo);
+                    }
+                    unlinked.push(x);
+                });
             let mut txn = self.store.manifest.begin();
             txn.record(MetaKind::DataDelete, &unlinked);
             txn.record(MetaKind::DataDelInterval, &del_intervals);
@@ -457,20 +463,22 @@ impl GarbageCollector {
             self.store
                 .manifest
                 .data_stat
-                .remove_stat_interval(&obsoleted);
-            self.store.manifest.save_obsolete_data(&obsoleted);
+                .remove_stat_interval(&unlinked);
+            self.store.manifest.save_obsolete_data(&unlinked);
             self.store.manifest.delete_files();
             self.store
                 .opt
                 .observer
-                .counter(CounterMetric::GcDataObsoleteFile, obsoleted.len() as u64);
+                .counter(CounterMetric::GcDataObsoleteFile, unlinked.len() as u64);
+            self.data_runs.fetch_add(1, Relaxed);
         }
     }
 
     fn process_blob(&mut self) {
-        let (obsoleted, victims) = self.store.manifest.blob_stat.get_victims(
+        let (obsoleted, victims) = self.store.manifest.blob_stat.get_blob_victims(
             self.store.opt.blob_gc_ratio,
             self.store.opt.blob_garbage_ratio,
+            |x| self.store.manifest.is_unsynced_blob_file(x),
         );
 
         // NOTE: obsoleted blobs may come from different buckets,
@@ -500,7 +508,7 @@ impl GarbageCollector {
             for (file_id, size) in list {
                 dst_size += size;
                 dst.push(file_id);
-                if dst_size >= self.store.opt.blob_max_size && dst.len() >= 2 {
+                if dst_size >= self.store.opt.blob_file_size && dst.len() >= 2 {
                     self.rewrite_blob(&dst, bucket_id);
                     dst.clear();
                     dst_size = 0;
@@ -524,13 +532,19 @@ impl GarbageCollector {
             .data_stat
             .bucket_files()
             .iter()
-            .map(|x: dashmap::mapref::multiple::RefMulti<'_, u64, Vec<u64>>| *x.key())
+            .map(|x: RefMulti<'_, u64, Vec<u64>>| *x.key())
             .collect();
         let tick = self.numerics.next_data_id.load(Relaxed);
 
         for bucket_id in buckets {
-            let files = match self.store.manifest.data_stat.bucket_files().get(&bucket_id) {
-                Some(f) => f,
+            let files: Vec<u64> = match self.store.manifest.data_stat.bucket_files().get(&bucket_id)
+            {
+                Some(f) => f
+                    .value()
+                    .iter()
+                    .filter(|x| !self.store.manifest.is_unsynced_data_file(**x))
+                    .copied()
+                    .collect(),
                 None => continue,
             };
 
@@ -539,21 +553,21 @@ impl GarbageCollector {
             let mut obsoleted = Vec::new();
             let mut candidates = Vec::new();
 
-            for &fid in files.value() {
+            for fid in files {
                 if let Some(s) = self.store.manifest.data_stat.get(&fid) {
-                    total += s.total_size as u64;
-                    active += s.active_size as u64;
                     if s.active_elems == 0 {
                         obsoleted.push(fid);
                     } else {
+                        total += s.total_size as u64;
+                        active += s.active_size as u64;
                         // copy the inner value (DataStatInner is Copy)
                         candidates.push(s.inner);
                     }
                 }
             }
 
-            // drop the lock on bucket_files before calling rewrite_data to avoid borrow conflicts
-            drop(files);
+            // fully obsolete files should be reclaimed immediately, independent of ratio gate
+            self.process_obsoleted_data(&obsoleted, bucket_id);
 
             if total == 0 {
                 continue;
@@ -577,8 +591,6 @@ impl GarbageCollector {
                 }
             }
 
-            self.process_obsoleted_data(obsoleted, bucket_id);
-
             let mut victims = vec![];
             let mut sum = 0;
             let mut tmp = Vec::from_iter(heap);
@@ -597,59 +609,6 @@ impl GarbageCollector {
                 self.rewrite_data(victims, bucket_id);
             }
         }
-    }
-
-    fn process_wal(&mut self) {
-        for g in self.store.context.groups().iter() {
-            let mut checkpoint_id = g.active_txns.min_position_file_id();
-            let (oldest_id, last_ckpt_file) = {
-                let logging = g.logging.lock();
-                (logging.oldest_wal_id(), logging.last_ckpt().file_id)
-            };
-            checkpoint_id = std::cmp::min(checkpoint_id, last_ckpt_file);
-
-            if oldest_id >= checkpoint_id {
-                continue;
-            }
-
-            // [oldest_id, checkpoint_id)
-            let recycled =
-                Self::process_one_wal(&self.store.opt, g.id as u8, oldest_id, checkpoint_id);
-            if recycled > 0 {
-                self.store
-                    .opt
-                    .observer
-                    .counter(CounterMetric::GcWalRecycleFile, recycled);
-            }
-            g.logging.lock().advance_oldest_wal_id(checkpoint_id);
-        }
-    }
-
-    fn process_one_wal(opt: &Options, id: u8, beg: u64, end: u64) -> u64 {
-        let mut recycled = 0;
-        // NOTE: not including `end`
-        for seq in beg..end {
-            let from = opt.wal_file(id, seq);
-            if !from.exists() {
-                continue;
-            }
-            let to = opt.wal_backup(id, seq);
-            if opt.keep_stable_wal_file {
-                log::info!("rename {from:?} to {to:?}");
-                std::fs::rename(&from, &to)
-                    .inspect_err(|e| {
-                        log::error!("can't rename {from:?} to {to:?}, error {e:?}");
-                    })
-                    .unwrap();
-            } else {
-                log::info!("unlink {from:?}");
-                std::fs::remove_file(&from)
-                    .inspect_err(|e| log::error!("can't remove {from:?}, error {e:?}"))
-                    .unwrap();
-            }
-            recycled += 1;
-        }
-        recycled
     }
 
     fn rewrite_data(&mut self, candidate: Vec<Score>, bucket_id: u64) {
@@ -727,7 +686,7 @@ impl GarbageCollector {
         let victim_count = victims.len() as u64;
 
         // it's possible that other thread deactived all data in data file while we are procesing
-        self.process_obsoleted_data(obsoleted, bucket_id);
+        self.process_obsoleted_data(&obsoleted, bucket_id);
 
         // 1. perform disk I/O (build data file)
         let (mut fstat, relocs) = builder

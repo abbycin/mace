@@ -55,7 +55,6 @@ impl Context {
                 boot.checkpoint,
                 boot.latest_id,
                 boot.oldest_id,
-                numerics.clone(),
                 opt.clone(),
             );
             groups.push(g);

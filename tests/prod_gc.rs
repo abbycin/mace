@@ -42,6 +42,8 @@ fn fast_manual_data_cycle() -> Result<(), OpCode> {
     })?;
 
     let bucket = engine.new_bucket("prod_gc_data")?;
+    let seed_payload = vec![b's'; 1024];
+    let updated_payload = vec![b'u'; 1024];
 
     let mut keys = Vec::new();
     for index in 0..512 {
@@ -50,16 +52,17 @@ fn fast_manual_data_cycle() -> Result<(), OpCode> {
 
     for key in &keys {
         let txn = bucket.begin()?;
-        txn.put(key, "seed_data_payload")?;
+        txn.put(key, &seed_payload)?;
         txn.commit()?;
     }
 
     for key in &keys {
         let txn = bucket.begin()?;
-        let updated = format!("updated_{key}");
-        txn.update(key, updated.as_bytes())?;
+        txn.update(key, &updated_payload)?;
         txn.commit()?;
     }
+
+    bucket.checkpoint();
 
     let gc_done = wait_until(Duration::from_secs(6), Duration::from_millis(50), || {
         engine.start_gc();
@@ -70,8 +73,8 @@ fn fast_manual_data_cycle() -> Result<(), OpCode> {
 
     let view = bucket.view()?;
     for key in &keys {
-        let expected = format!("updated_{key}");
-        assert_eq!(view.get(key)?.slice(), expected.as_bytes());
+        let value = view.get(key)?;
+        assert_eq!(value.slice(), updated_payload.as_slice());
     }
 
     let mut count = 0u32;
@@ -116,10 +119,9 @@ fn stress_blob_cycle() -> Result<(), OpCode> {
         options.gc_eager = true;
         options.gc_timeout = 60_000;
         options.inline_size = 512;
-        options.max_log_size = 1 << 20;
         options.blob_garbage_ratio = 1;
         options.blob_gc_ratio = 100;
-        options.blob_max_size = 1 << 20;
+        options.blob_file_size = 1 << 20;
     })?;
 
     let bucket = engine.new_bucket("prod_gc_blob")?;

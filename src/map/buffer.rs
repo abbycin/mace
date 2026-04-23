@@ -1,62 +1,40 @@
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{
-        AtomicBool, AtomicIsize, AtomicPtr, AtomicU64,
-        Ordering::{AcqRel, Acquire, Relaxed},
+        AtomicBool, AtomicIsize, AtomicU64, AtomicUsize,
+        Ordering::{AcqRel, Acquire, Relaxed, Release},
     },
     mpsc::{Receiver, Sender},
 };
 use std::time::{Duration, Instant};
 
+use crate::utils::data::init_group_pos;
 use crate::{
+    Options,
     cc::context::Context,
     map::{
-        SharedState,
+        DataReader, JunksMap, Loader, PagesMap, RetiredChain, SharedState, SparseFrontier,
         cache::{CANDIDATE_RING_SIZE, CANDIDATE_SAMPLE_RATE, CacheState, CandidateRing, NodeCache},
-        data::Arena,
+        data::{CheckpointTask, EpochInflight, PidMap, PidSet},
         table::Swip,
     },
-    meta::Numerics,
-    types::{
-        page::Page,
-        refbox::BoxView,
-        traits::{IHeader, ILoader},
-    },
+    types::{page::Page, traits::IHeader},
     utils::{
-        Backoff, Handle, MutRef, OpCode, ROOT_PID,
-        countblock::Countblock,
-        data::Position,
+        Handle, MutRef, OpCode, ROOT_PID,
+        data::{GroupPositions, Position},
         interval::IntervalMap,
-        lru::{CachePriority, ShardPriorityLru},
-        observe::{CounterMetric, HistogramMetric},
+        lru::ShardPriorityLru,
         options::ParsedOptions,
-        queue::Queue,
     },
 };
-use dashmap::{DashMap, Entry};
+use crossbeam_epoch::Guard;
+use dashmap::DashMap;
 
-use super::data::FlushData;
-use super::flow::FlowController;
-use super::flush::{Flush, FlushObserver};
+use super::flow::{FlowController, ForegroundWritePermit};
+use super::flush::{Checkpoint, CheckpointObserver};
 use crate::map::table::{BucketState, PageMap};
-use crate::types::refbox::BoxRef;
-
-pub trait DataReader: Send + Sync {
-    fn load_data(
-        &self,
-        bucket_id: u64,
-        addr: u64,
-        cache: &dyn Fn(BoxRef),
-    ) -> Result<BoxRef, OpCode>;
-    fn load_blob(
-        &self,
-        bucket_id: u64,
-        addr: u64,
-        cache: &dyn Fn(BoxRef),
-    ) -> Result<BoxRef, OpCode>;
-    fn load_blob_uncached(&self, bucket_id: u64, addr: u64) -> Result<BoxRef, OpCode>;
-}
+use crate::types::refbox::{BoxRef, RemoteView};
 
 struct DummyDataReader;
 
@@ -84,547 +62,618 @@ impl DataReader for DummyDataReader {
     }
 }
 
-struct Ids {
-    addr: u64,
-    arena: u64,
+fn merge_header_frontier(dst: &mut SparseFrontier, page: &BoxRef) {
+    let h = page.header();
+    dst.merge_group(h.group, h.lsn);
 }
 
-impl Ids {
-    const fn new(addr: u64, arena: u64) -> Self {
-        Self { addr, arena }
-    }
+fn mono_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
-struct Iim {
-    map: RwLock<(Vec<Ids>, usize)>,
+pub(crate) struct Current {
+    pub(crate) pages: Arc<PagesMap>,
+    pub(crate) bytes: Arc<AtomicUsize>,
+    pub(crate) retired: Arc<JunksMap>,
+    pub(crate) dirty_roots: Arc<PidMap>,
+    pub(crate) unmap_pid: Arc<PidSet>,
+    pub(crate) inflight: Arc<EpochInflight>,
 }
 
-impl Iim {
-    fn new(addr: u64, arena: u64, init_arena: usize) -> Self {
-        let mut ids = Vec::with_capacity(init_arena);
-        ids.push(Ids::new(addr, arena));
-        Self {
-            map: RwLock::new((ids, 0)),
-        }
-    }
+pub(crate) struct WriteEpoch {
+    inner: Option<Arc<Current>>,
+    inflight: Arc<EpochInflight>,
+}
 
-    fn find(&self, addr: u64) -> Option<u64> {
-        let lk = self.map.read();
-        let (ids, head) = &*lk;
-        if *head >= ids.len() {
-            return None;
-        }
-        let active = &ids[*head..];
-        let pos = match active.binary_search_by(|x| x.addr.cmp(&addr)) {
-            Ok(pos) => pos,
-            Err(pos) => {
-                if pos == 0 {
-                    return None;
-                }
-                pos - 1
-            }
-        };
-        Some(active[pos].arena)
-    }
+impl std::ops::Deref for WriteEpoch {
+    type Target = Current;
 
-    fn push(&self, addr: u64, arena: u64) {
-        let mut lk = self.map.write();
-        lk.0.push(Ids::new(addr, arena));
-    }
-
-    fn pop(&self) {
-        let mut lk = self.map.write();
-        let (ids, head) = &mut *lk;
-        if *head >= ids.len() {
-            return;
-        }
-        *head += 1;
-        // compact prefix occasionally to keep binary-search cache friendly
-        if *head >= 64 && *head * 2 >= ids.len() {
-            ids.drain(..*head);
-            *head = 0;
-        }
+    fn deref(&self) -> &Self::Target {
+        self.inner
+            .as_deref()
+            .expect("write epoch inner must exist before drop")
     }
 }
 
-#[derive(Default)]
-struct RetireBatch {
-    data: Vec<u64>,
-    blob: Vec<u64>,
+impl Drop for WriteEpoch {
+    fn drop(&mut self) {
+        // drop generation Arc first, then publish inflight leave to close the
+        // tiny window where cnt can reach zero while the generation Arc is
+        // still held by this WriteEpoch during drop glue.
+        let _ = self.inner.take();
+        self.inflight.leave();
+    }
+}
+
+pub(crate) struct PageSlot {
+    // current writable generation
+    pub(crate) hot: Arc<PagesMap>,
+    pub(crate) hot_bytes: Arc<AtomicUsize>,
+    // last swapped generation kept visible while checkpoint is in-flight
+    pub(crate) sealed: Option<Arc<PagesMap>>,
+    pub(crate) sealed_bytes: Option<Arc<AtomicUsize>>,
+}
+
+pub(crate) struct JunkSlot {
+    // current writable retired-chain generation
+    pub(crate) hot: Arc<JunksMap>,
+    // last swapped retired-chain generation visible to concurrent writers
+    pub(crate) sealed: Option<Arc<JunksMap>>,
+}
+
+pub(crate) struct PidSlot {
+    // pid->addr roots and pid-unmap marks for the current writable generation
+    pub(crate) root_map: Arc<PidMap>,
+    pub(crate) unmap_pid: Arc<PidSet>,
+    // tracks writers holding the current generation
+    pub(crate) inflight: Arc<EpochInflight>,
+}
+
+// groups all epoch-state handles to keep Pool fields readable
+struct EpochRegistry {
+    // mutable per-generation slots (hot/sealed)
+    page: Arc<RwLock<PageSlot>>,
+    retired: Arc<RwLock<JunkSlot>>,
+    root: Arc<RwLock<PidSlot>>,
+    // fast writer snapshot to avoid cloning 3 locks in capture_epoch()
+    hot: RwLock<Arc<Current>>,
+    // barrier that forms a complete epoch cut with checkpoint()
+    gate: RwLock<()>,
+}
+
+// recyclable containers reused across checkpoints
+struct RecycleBins {
+    pages: Arc<Mutex<Vec<PagesMap>>>,
+    retired: Arc<Mutex<Vec<JunksMap>>>,
 }
 
 pub(crate) struct Pool {
-    flush: Flush,
+    max_hot_size: usize,
+    max_mem_size: usize,
+    table: MutRef<PageMap>,
+    chkpt: Checkpoint,
+    last_chkpt_lsn: MutRef<GroupPositions>,
     flow: Arc<FlowController>,
-    map: Arc<Iim>,
-    pending_retire: Arc<DashMap<u64, RetireBatch>>,
-    free: Arc<Queue<Handle<Arena>>>,
-    wait: Arc<DashMap<u64, Handle<Arena>>>,
-    cur: AtomicPtr<Arena>,
-    pub(crate) ctx: Handle<Context>,
-    state: MutRef<BucketState>,
-    arena_groups: u8,
-    max_live_arenas: u64,
-    live_arenas: Arc<AtomicU64>,
-    max_log_size: usize,
+    epochs: EpochRegistry,
+    // pages pending EBR reclamation after retire_junks()
+    retired_pages: Arc<PagesMap>,
+    recycle: RecycleBins,
+    pub(crate) state: MutRef<BucketState>,
     pub(crate) bucket_id: u64,
     flush_in: AtomicU64,
     flush_out: Arc<AtomicU64>,
-    flush_wait: Arc<Countblock>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FlushReason {
-    Normal,
-    Teardown,
+    last_checkpoint_ms: AtomicU64,
 }
 
 impl Pool {
-    const WAIT_WARN_SECS: u64 = 5;
-    const SPILL_WAIT_MICROS: u64 = 200;
-    const SPILL_FAILFAST_WAIT_MICROS: u64 = 20_000;
+    const DIRTY_PAGE_INIT_CAP: usize = 16 << 10;
 
-    pub(crate) fn new(
-        opt: Arc<ParsedOptions>,
+    fn new(
         ctx: Handle<Context>,
+        table: MutRef<PageMap>,
         state: MutRef<BucketState>,
         flow: Arc<FlowController>,
-        flush: Flush,
+        flush: Checkpoint,
         bucket_id: u64,
-        next_addr: u64,
     ) -> Self {
-        let groups = ctx.groups().len() as u8;
-        let init_arena = opt.default_arenas as u64;
-        let id = Self::get_id(&ctx.numerics);
-        let q = Queue::new(init_arena as usize);
-        for _ in 0..init_arena {
-            let h = Handle::new(Arena::new(opt.data_file_size, groups));
-            q.push(h).unwrap();
-        }
+        let hot_pages = Arc::new(PagesMap::with_capacity_and_hasher(
+            Self::DIRTY_PAGE_INIT_CAP,
+            Default::default(),
+        ));
+        let hot_bytes = Arc::new(AtomicUsize::new(0));
+        let hot_retired = Arc::new(JunksMap::default());
+        let dirty_roots = Arc::new(PidMap::new());
+        let unmap_pid = Arc::new(PidSet::new());
+        let inflight = Arc::new(EpochInflight::new());
+        let hot_epoch = Arc::new(Current {
+            pages: hot_pages.clone(),
+            bytes: hot_bytes.clone(),
+            retired: hot_retired.clone(),
+            dirty_roots: dirty_roots.clone(),
+            unmap_pid: unmap_pid.clone(),
+            inflight: inflight.clone(),
+        });
 
-        let h = q.pop().unwrap();
-        let max_log_size = opt.max_log_size * opt.concurrent_write as usize;
-        let max_live_arenas = init_arena.saturating_add(opt.arena_spill_limit as u64);
-
-        let this = Self {
-            flush,
+        Self {
+            // trigger checkpoint by hot generation size; sealed generation may coexist while flushing
+            max_hot_size: ctx.opt.checkpoint_size,
+            // total dirty memory hard cap (hot + sealed) as a safety net
+            max_mem_size: ctx.opt.pool_capacity,
+            table,
+            chkpt: flush,
+            last_chkpt_lsn: MutRef::new(init_group_pos()),
             flow,
-            map: Arc::new(Iim::new(next_addr, id, init_arena as usize)),
-            pending_retire: Arc::new(DashMap::new()),
-            free: Arc::new(q),
-            wait: Arc::new(DashMap::new()),
-            cur: AtomicPtr::new(h.inner()),
-            ctx,
+            epochs: EpochRegistry {
+                page: Arc::new(RwLock::new(PageSlot {
+                    hot: hot_pages,
+                    hot_bytes,
+                    sealed: None,
+                    sealed_bytes: None,
+                })),
+                retired: Arc::new(RwLock::new(JunkSlot {
+                    hot: hot_retired,
+                    sealed: None,
+                })),
+                root: Arc::new(RwLock::new(PidSlot {
+                    root_map: dirty_roots,
+                    unmap_pid,
+                    inflight,
+                })),
+                hot: RwLock::new(hot_epoch),
+                gate: RwLock::new(()),
+            },
+            retired_pages: Arc::new(PagesMap::with_capacity_and_hasher(
+                Self::DIRTY_PAGE_INIT_CAP,
+                Default::default(),
+            )),
+            recycle: RecycleBins {
+                pages: Arc::new(Mutex::new(Vec::new())),
+                retired: Arc::new(Mutex::new(Vec::new())),
+            },
             state,
-            arena_groups: groups,
-            max_live_arenas,
-            live_arenas: Arc::new(AtomicU64::new(init_arena)),
-            max_log_size,
             bucket_id,
             flush_in: AtomicU64::new(0),
             flush_out: Arc::new(AtomicU64::new(0)),
-            flush_wait: Arc::new(Countblock::new(0)),
-        };
-
-        h.reset(id);
-        this
+            last_checkpoint_ms: AtomicU64::new(mono_ms()),
+        }
     }
 
-    fn get_id(numerics: &Numerics) -> u64 {
-        numerics.next_data_id.fetch_add(1, Relaxed)
+    fn next_addr(&self) -> u64 {
+        self.state.next_addr.fetch_add(1, Relaxed)
     }
 
-    pub(crate) fn current(&self) -> Handle<Arena> {
-        self.cur.load(Relaxed).into()
+    pub(crate) fn capture_epoch(&self) -> WriteEpoch {
+        // sync with checkpoint's write lock so a writer never straddles two generations
+        let _gate = self.epochs.gate.read();
+        let epoch = self.epochs.hot.read().clone();
+        let inflight = epoch.inflight.clone();
+        inflight.enter();
+        WriteEpoch {
+            inner: Some(epoch),
+            inflight,
+        }
     }
 
-    pub(crate) fn arena_id_of(&self, addr: u64) -> Option<u64> {
-        self.map.find(addr)
+    fn take_recycled_pages(&self) -> PagesMap {
+        self.recycle.pages.lock().pop().unwrap_or_else(|| {
+            PagesMap::with_capacity_and_hasher(Self::DIRTY_PAGE_INIT_CAP, Default::default())
+        })
     }
 
-    pub(crate) fn stage_retire(&self, arena_id: u64, data: &[u64], blob: &[u64]) {
-        if data.is_empty() && blob.is_empty() {
+    fn take_recycled_retired(&self) -> JunksMap {
+        self.recycle.retired.lock().pop().unwrap_or_default()
+    }
+
+    pub(crate) fn alloc_in(&self, pages: &PagesMap, bytes: &AtomicUsize, size: u32) -> BoxRef {
+        let addr = self.next_addr();
+        let b = BoxRef::alloc(size, addr);
+        let sz = b.header().total_size as usize;
+        bytes.fetch_add(sz, Relaxed);
+        pages.insert(addr, b.clone());
+        b
+    }
+
+    fn dirty_bytes_snapshot(&self) -> (usize, usize) {
+        let epoch = self.epochs.page.read();
+        let hot = epoch.hot_bytes.load(Acquire);
+        // include in-flight sealed bytes to keep memory pressure conservative
+        let sealed = epoch
+            .sealed_bytes
+            .as_ref()
+            .map(|x| x.load(Acquire))
+            .unwrap_or(0);
+        (hot, hot.saturating_add(sealed))
+    }
+
+    pub(crate) fn try_checkpoint(&self) {
+        let (hot_bytes, dirty_bytes) = self.dirty_bytes_snapshot();
+        if hot_bytes >= self.max_hot_size || dirty_bytes >= self.max_mem_size {
+            self.checkpoint();
+        }
+    }
+
+    fn collect_junks_impl(map: &JunksMap, base_addr: u64, dst: &mut Vec<u64>) {
+        if let Some(v) = map.get(&base_addr) {
+            dst.extend(v.addrs.iter().copied());
+        }
+    }
+
+    fn append_chain(dst: &mut RetiredChain, mut src: RetiredChain) {
+        dst.frontier.merge_sparse(&src.frontier);
+        if dst.addrs.is_empty() {
+            dst.addrs = src.addrs;
+        } else {
+            dst.addrs.append(&mut src.addrs);
+        }
+    }
+
+    fn merge_chain_frontier_impl(
+        map: &JunksMap,
+        base_addr: u64,
+        frontier: &mut SparseFrontier,
+    ) -> bool {
+        if let Some(v) = map.get(&base_addr) {
+            frontier.merge_sparse(&v.frontier);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn merge_chain_impl(map: &JunksMap, base_addr: u64, dst: &mut RetiredChain) -> bool {
+        if let Some(v) = map.get(&base_addr) {
+            dst.addrs.extend(v.addrs.iter().copied());
+            dst.frontier.merge_sparse(&v.frontier);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn take_hot_chain_impl(map: &JunksMap, base_addr: u64, dst: &mut RetiredChain) -> bool {
+        if let Some((_, v)) = map.remove(&base_addr) {
+            Self::append_chain(dst, v);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn collect_page_frontier_impl(map: &PagesMap, addr: u64, dst: &mut SparseFrontier) -> bool {
+        if let Some(v) = map.get(&addr) {
+            merge_header_frontier(dst, v.value());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn collect_junks(
+        &self,
+        retired: &Arc<JunksMap>,
+        base_addr: u64,
+        dst: &mut Vec<u64>,
+    ) {
+        Self::collect_junks_impl(retired, base_addr, dst);
+
+        let retired_epoch = self.epochs.retired.read();
+        if let Some(map) = retired_epoch.sealed.as_ref()
+            && !Arc::ptr_eq(map, retired)
+        {
+            Self::collect_junks_impl(map, base_addr, dst);
+        }
+    }
+
+    pub(crate) fn transfer_junks(
+        &self,
+        w: &WriteEpoch,
+        g: &Guard,
+        old_base_addr: u64,
+        new_base_addr: u64,
+        mut junks: Vec<u64>,
+    ) {
+        #[cfg(feature = "extra_check")]
+        {
+            let mut h = std::collections::HashSet::new();
+            for &i in junks.iter() {
+                let x = if crate::types::refbox::RemoteView::is_tagged(i) {
+                    crate::types::refbox::RemoteView::untagged(i)
+                } else {
+                    i
+                };
+                assert!(h.insert(x), "duplicated");
+            }
+        }
+
+        let mut frontier_junks = Vec::with_capacity(junks.len());
+        for &x in &junks {
+            if !RemoteView::is_tagged(x) {
+                frontier_junks.push(x);
+            }
+        }
+        let mut inherited = RetiredChain::default();
+
+        {
+            // keep lock order consistent with checkpoint(): page -> retired
+            // borrow sealed generations under lock instead of cloning Arc to preserve
+            // "sealed generation uniquely owned by checkpoint task" invariant
+            let page_epoch = self.epochs.page.read();
+            let retired_epoch = self.epochs.retired.read();
+            let sealed_pages = page_epoch.sealed.as_ref();
+            let sealed_retired = retired_epoch.sealed.as_ref();
+            let hot_has_chain = !w.retired.is_empty();
+            let sealed_has_chain =
+                sealed_retired.is_some_and(|map| !Arc::ptr_eq(map, &w.retired) && !map.is_empty());
+
+            // phase 1. collect_inherited
+            let mut has_old_base_chain = if hot_has_chain {
+                Self::take_hot_chain_impl(&w.retired, old_base_addr, &mut inherited)
+            } else {
+                false
+            };
+            if sealed_has_chain && let Some(map) = sealed_retired {
+                has_old_base_chain |= Self::merge_chain_impl(map, old_base_addr, &mut inherited);
+            }
+
+            if !inherited.addrs.is_empty() {
+                assert!(
+                    !inherited.frontier.is_empty(),
+                    "retired chain for base {} missing frontier",
+                    old_base_addr
+                );
+            }
+
+            if junks.is_empty() && inherited.addrs.is_empty() {
+                return;
+            }
+
+            // phase 2 + phase 3. classify_new_junks + fold_frontier
+            for &logical in &frontier_junks {
+                // old_base may have no inherited retired chain on its first replacement
+                // in that case we still need to fold old_base's page frontier, otherwise
+                // this group's checkpoint frontier can lag behind
+                if logical == old_base_addr && has_old_base_chain {
+                    continue;
+                }
+                if hot_has_chain
+                    && Self::merge_chain_frontier_impl(&w.retired, logical, &mut inherited.frontier)
+                {
+                    continue;
+                }
+                if sealed_has_chain
+                    && let Some(map) = sealed_retired
+                    && Self::merge_chain_frontier_impl(map, logical, &mut inherited.frontier)
+                {
+                    continue;
+                }
+                if Self::collect_page_frontier_impl(&w.pages, logical, &mut inherited.frontier) {
+                    continue;
+                }
+                if let Some(map) = sealed_pages {
+                    let _ = Self::collect_page_frontier_impl(map, logical, &mut inherited.frontier);
+                }
+            }
+
+            if !Self::collect_page_frontier_impl(&w.pages, new_base_addr, &mut inherited.frontier)
+                && let Some(map) = sealed_pages
+            {
+                let _ =
+                    Self::collect_page_frontier_impl(map, new_base_addr, &mut inherited.frontier);
+            }
+        }
+
+        // phase 4. retire_now
+        self.retire_junks(&w.pages, &w.bytes, g, &junks);
+
+        // append current-round junks after inherited lineage
+        //
+        // duplicate-free expectation:
+        // - inherited chain for old_base is moved once (take/remove from hot map)
+        // - this round's junks are logical-unique (extra_check above)
+        // - replace/evict publication is single-winner CAS under node lock
+        //
+        // so `RetiredChain.addrs` should not accumulate duplicates in normal flow
+        inherited.addrs.append(&mut junks);
+
+        // phase 5. attach_new_base
+        if let Some(mut cur) = w.retired.get_mut(&new_base_addr) {
+            cur.frontier.merge_sparse(&inherited.frontier);
+            cur.addrs.append(&mut inherited.addrs);
+        } else {
+            w.retired.insert(new_base_addr, inherited);
+        }
+    }
+
+    fn retire_junks(
+        &self,
+        pages: &Arc<PagesMap>,
+        bytes: &Arc<AtomicUsize>,
+        g: &Guard,
+        junks: &[u64],
+    ) {
+        let mut retired_addrs = Vec::new();
+        for &raw in junks {
+            let logical = if RemoteView::is_tagged(raw) {
+                RemoteView::untagged(raw)
+            } else {
+                raw
+            };
+            if let Some((_, page)) = pages.remove(&logical) {
+                let sz = page.header().total_size as usize;
+                let old_bytes = bytes.fetch_sub(sz, AcqRel);
+                assert!(old_bytes >= sz);
+                self.retired_pages.insert(logical, page);
+                retired_addrs.push(logical);
+            }
+        }
+        if retired_addrs.is_empty() {
             return;
         }
-        let mut batch = self.pending_retire.entry(arena_id).or_default();
-        batch.data.extend_from_slice(data);
-        batch.blob.extend_from_slice(blob);
+        let retired_pages = self.retired_pages.clone();
+        g.defer(move || {
+            for addr in retired_addrs {
+                let _ = retired_pages.remove(&addr);
+            }
+        });
     }
 
-    pub(crate) fn load(&self, addr: u64) -> Option<BoxRef> {
-        let arena_id = self.map.find(addr)?;
-        let cur = self.current();
-        if cur.id() == arena_id {
-            return cur.load(addr);
+    pub(crate) fn get_dirty_page(&self, addr: u64) -> Option<BoxRef> {
+        let pages = self.epochs.page.read();
+        if let Some(x) = pages.hot.get(&addr) {
+            return Some(x.value().clone());
         }
-        if let Some(h) = self.wait.get(&arena_id)
-            && matches!(h.state(), Arena::WARM | Arena::COLD)
-            && h.id() == arena_id
+        if let Some(sealed) = pages.sealed.as_ref()
+            && let Some(x) = sealed.get(&addr)
         {
-            return h.load(addr);
+            return Some(x.value().clone());
+        }
+        if let Some(x) = self.retired_pages.get(&addr) {
+            return Some(x.value().clone());
         }
         None
     }
 
-    fn pending_flush(&self) -> u64 {
-        self.flush_in
-            .load(Acquire)
-            .saturating_sub(self.flush_out.load(Acquire))
+    pub(crate) fn checkpoint_lsn(&self, group: u8) -> Position {
+        let idx = group as usize;
+        debug_assert!(idx < Options::MAX_CONCURRENT_WRITE as usize);
+        self.last_chkpt_lsn[idx]
     }
 
-    fn wait_flush_signal(&self) {
-        let ok = self
-            .flush_wait
-            .wait_timeout(Duration::from_secs(Self::WAIT_WARN_SECS));
-        if !ok {
-            log::warn!(
-                "bucket {} flush wait timeout, pending_flush {}",
-                self.bucket_id,
-                self.pending_flush(),
+    fn checkpoint(&self) {
+        // allow at most one checkpoint entry at a time
+        let flushed = self.flush_out.load(Acquire);
+        if self
+            .flush_in
+            .compare_exchange(flushed, flushed + 1, AcqRel, Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.last_checkpoint_ms.store(mono_ms(), Release);
+        let (pages, sealed_bytes, retired, dirty_roots, unmap_pid, epoch_inflight, snap_addr) = {
+            // single critical section that performs a full epoch cut:
+            // swap hot generations, publish sealed generations, and rotate writer roots/inflight
+            let _gate = self.epochs.gate.write();
+            let mut page_epoch = self.epochs.page.write();
+            let mut retired_epoch = self.epochs.retired.write();
+            let mut root_epoch = self.epochs.root.write();
+            let old_pages =
+                std::mem::replace(&mut page_epoch.hot, Arc::new(self.take_recycled_pages()));
+            let old_hot_bytes =
+                std::mem::replace(&mut page_epoch.hot_bytes, Arc::new(AtomicUsize::new(0)));
+            let old_retired = std::mem::replace(
+                &mut retired_epoch.hot,
+                Arc::new(self.take_recycled_retired()),
             );
-        }
-    }
-
-    fn wait_alloc_drain(&self, arena: Handle<Arena>) {
-        let mut sched = Backoff::new(0);
-        while arena.alloc_inflight() != 0 {
-            sched.shape();
-        }
-    }
-
-    fn wait_install_handoff(&self, observed: Handle<Arena>) {
-        let mut sched = Backoff::new(0);
-        loop {
-            let cur = self.current();
-            if cur.inner() != observed.inner() {
-                break;
-            }
-            if cur.state() == Arena::HOT {
-                break;
-            }
-            sched.shape();
-        }
-    }
-
-    fn handle_log_limit(&self, observed: Handle<Arena>, cur_log: usize) -> Result<(), OpCode> {
-        if self.install_new()? {
-            let _ = self
-                .ctx
-                .numerics
-                .log_size
-                .fetch_update(Relaxed, Relaxed, |x| Some(x.saturating_sub(cur_log)));
-        } else {
-            self.wait_install_handoff(observed);
-        }
-        Ok(())
-    }
-
-    fn handle_no_space(&self, observed: Handle<Arena>) -> Result<(), OpCode> {
-        if !self.install_new()? {
-            self.wait_install_handoff(observed);
-        }
-        Ok(())
-    }
-
-    fn observe_starving_wait(&self, started: Option<Instant>) {
-        if let Some(started) = started {
-            let waited = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-            self.ctx
-                .opt
-                .observer
-                .histogram(HistogramMetric::FlowArenaStarvingWaitMicros, waited);
-        }
-    }
-
-    fn try_create_spill(&self) -> Option<Handle<Arena>> {
-        let mut cur = self.live_arenas.load(Acquire);
-        loop {
-            if cur >= self.max_live_arenas {
-                return None;
-            }
-            match self
-                .live_arenas
-                .compare_exchange_weak(cur, cur + 1, AcqRel, Acquire)
-            {
-                Ok(_) => {
-                    self.ctx
-                        .opt
-                        .observer
-                        .counter(CounterMetric::FlowArenaSpillCreate, 1);
-                    return Some(Handle::new(Arena::new(
-                        self.ctx.opt.data_file_size,
-                        self.arena_groups,
-                    )));
-                }
-                Err(next) => cur = next,
-            }
-        }
-    }
-
-    fn acquire_next_arena(&self) -> Result<Handle<Arena>, OpCode> {
-        let mut sched = Backoff::new(20);
-        let mut starving_marked = false;
-        let mut starving_since = None;
-        let mut cap_hit_reported = false;
-        loop {
-            if let Some(p) = self.free.pop() {
-                if starving_marked {
-                    self.flow.leave_arena_starving();
-                    self.observe_starving_wait(starving_since.take());
-                }
-                return Ok(p);
-            }
-            if !starving_marked {
-                self.flow.enter_arena_starving();
-                starving_marked = true;
-                starving_since = Some(Instant::now());
-            }
-
-            if let Some(started) = starving_since
-                && started.elapsed().as_micros() >= Self::SPILL_WAIT_MICROS as u128
-            {
-                if let Some(h) = self.try_create_spill() {
-                    self.flow.leave_arena_starving();
-                    self.observe_starving_wait(starving_since.take());
-                    return Ok(h);
-                }
-                if !cap_hit_reported {
-                    self.ctx
-                        .opt
-                        .observer
-                        .counter(CounterMetric::FlowArenaSpillCapHit, 1);
-                    cap_hit_reported = true;
-                }
-                if started.elapsed().as_micros() >= Self::SPILL_FAILFAST_WAIT_MICROS as u128 {
-                    self.flow.leave_arena_starving();
-                    self.observe_starving_wait(starving_since.take());
-                    return Err(OpCode::Again);
-                }
-            }
-            sched.shape();
-        }
-    }
-
-    fn release_or_reclaim_spill(&self, h: Handle<Arena>) {
-        if self.free.push(h).is_err() {
-            h.reclaim();
-            let old = self.live_arenas.fetch_sub(1, AcqRel);
-            debug_assert!(old > 0);
-            self.ctx
-                .opt
-                .observer
-                .counter(CounterMetric::FlowArenaSpillReclaim, 1);
-        }
-    }
-
-    fn install_new(&self) -> Result<bool, OpCode> {
-        // acquire the next arena before warming current one, so allocation can fail-fast safely
-        let next = self.acquire_next_arena()?;
-        let cur = self.current();
-        if !cur.mark_warm() {
-            self.release_or_reclaim_spill(next);
-            return Ok(false);
-        }
-        self.wait_alloc_drain(cur);
-
-        let id = Self::get_id(&self.ctx.numerics);
-        self.wait.insert(cur.id(), cur);
-        self.flush(cur, FlushReason::Normal);
-
-        let next_addr = self.state.next_addr.load(Relaxed);
-        self.map.push(next_addr, id);
-
-        next.reset(id);
-
-        self.cur
-            .compare_exchange(cur.inner(), next.inner(), Relaxed, Relaxed)
-            .expect("never happen");
-        Ok(true)
-    }
-
-    fn flush(&self, h: Handle<Arena>, reason: FlushReason) {
-        let wait = self.wait.clone();
-        let free = self.free.clone();
-        let map = self.map.clone();
-        let out = self.flush_out.clone();
-        let flush_wait = self.flush_wait.clone();
-        let flow = self.flow.clone();
-        let live_arenas = self.live_arenas.clone();
-        let observer = self.ctx.opt.observer.clone();
-        let flow_task = self.flow.on_enqueue_est(h.real_size.load(Relaxed));
-        let flow_task_done = flow_task.clone();
-        let pending_retire = self.pending_retire.clone();
-        if reason == FlushReason::Teardown {
-            flow_task.mark_force_bypass();
-        }
-
-        let release = move || {
-            map.pop();
-            wait.remove(&h.id());
-
-            h.clear();
-            h.set_state(Arena::COLD, Arena::FLUSH);
-            if free.push(h).is_err() {
-                h.reclaim();
-                let old = live_arenas.fetch_sub(1, AcqRel);
-                debug_assert!(old > 0);
-                observer.counter(CounterMetric::FlowArenaSpillReclaim, 1);
-            }
+            let old_dirty = std::mem::replace(&mut root_epoch.root_map, Arc::new(PidMap::new()));
+            let old_unmap = std::mem::replace(&mut root_epoch.unmap_pid, Arc::new(PidSet::new()));
+            let old_inflight =
+                std::mem::replace(&mut root_epoch.inflight, Arc::new(EpochInflight::new()));
+            let snap_addr = self.state.next_addr.load(Acquire).saturating_sub(1);
+            page_epoch.sealed = Some(old_pages.clone());
+            page_epoch.sealed_bytes = Some(old_hot_bytes.clone());
+            retired_epoch.sealed = Some(old_retired.clone());
+            let next_hot_epoch = Arc::new(Current {
+                pages: page_epoch.hot.clone(),
+                bytes: page_epoch.hot_bytes.clone(),
+                retired: retired_epoch.hot.clone(),
+                dirty_roots: root_epoch.root_map.clone(),
+                unmap_pid: root_epoch.unmap_pid.clone(),
+                inflight: root_epoch.inflight.clone(),
+            });
+            *self.epochs.hot.write() = next_hot_epoch;
+            (
+                old_pages,
+                old_hot_bytes,
+                old_retired,
+                old_dirty,
+                old_unmap,
+                old_inflight,
+                snap_addr,
+            )
         };
-        let done = move || {
-            out.fetch_add(1, Relaxed);
-            flow.on_mark_done(flow_task_done.as_ref());
-            flush_wait.post();
+        let sealed_init = sealed_bytes.load(Acquire);
+        let est_bytes = sealed_init.max(1) as u64;
+        let flow = self.flow.begin_checkpoint(est_bytes);
+
+        let task = CheckpointTask {
+            bucket_id: self.bucket_id,
+            table: self.table.clone(),
+            dirty_roots,
+            unmap_pid,
+            epoch_inflight,
+            pages,
+            sealed_bytes,
+            sealed_bytes_init: sealed_init,
+            retired,
+            page_epoch: self.epochs.page.clone(),
+            retired_epoch: self.epochs.retired.clone(),
+            root_epoch: self.epochs.root.clone(),
+            snap_addr,
+            page_recycle: self.recycle.pages.clone(),
+            retired_recycle: self.recycle.retired.clone(),
+            count: self.flush_out.clone(),
+            last_chkpt_lsn: self.last_chkpt_lsn.clone(),
+            flow,
         };
 
-        let data = FlushData::new(
-            h,
-            self.bucket_id,
-            Box::new(move |arena_id| {
-                pending_retire
-                    .remove(&arena_id)
-                    .map(|(_, batch)| (batch.data, batch.blob))
-                    .unwrap_or_default()
-            }),
-            Box::new(release),
-            Box::new(done),
-            flow_task,
-            self.flow.clone(),
-        );
-        self.flush_in.fetch_add(1, AcqRel);
-        self.flush
+        self.chkpt
             .tx
-            .send(data)
+            .send(task)
             .expect("flusher channel disconnected before flush publish");
     }
 
-    pub(crate) fn flush_all(&self) {
-        let ptr = self.cur.swap(std::ptr::null_mut(), Relaxed);
-        if !ptr.is_null() {
-            let h = Handle::from(ptr);
-            self.wait.insert(h.id(), h);
-            if h.state() == Arena::HOT {
-                let old = h.set_state(Arena::HOT, Arena::WARM);
-                debug_assert_eq!(old, Arena::HOT);
-            }
-            self.wait_alloc_drain(h);
-            self.flush(h, FlushReason::Teardown);
-        }
-    }
-
-    pub(crate) fn wait_flush(&self) {
+    fn wait_checkpoint(&self) {
         while self.flush_in.load(Acquire) != self.flush_out.load(Acquire) {
-            self.wait_flush_signal();
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
-    pub(crate) fn before_foreground_write(&self, bytes: u64) {
-        self.flow.before_foreground_write(bytes);
-    }
-
-    pub(crate) fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
-        loop {
-            let a = self.current();
-            let cur = self.ctx.numerics.log_size.load(Relaxed);
-            if cur >= self.max_log_size {
-                self.handle_log_limit(a, cur)?;
-                continue;
-            }
-            if !a.try_enter_hot_alloc() {
-                self.wait_install_handoff(a);
-                continue;
-            }
-            let ret = a.alloc(&self.state.next_addr, size);
-            a.leave_hot_alloc();
-
-            match ret {
-                Ok(x) => return Ok((a, x)),
-                Err(OpCode::Again) => {
-                    self.wait_install_handoff(a);
-                    continue;
-                }
-                Err(OpCode::NoSpace) => {
-                    self.handle_no_space(a)?;
-                }
-                _ => unreachable!(),
-            }
+    pub(crate) fn before_foreground_write(&self, bytes: u64) -> ForegroundWritePermit {
+        if self.flow.is_enabled() {
+            let snapshot = || {
+                let (hot_bytes, dirty_bytes) = self.dirty_bytes_snapshot();
+                let checkpoint_inflight =
+                    self.flush_in.load(Acquire) != self.flush_out.load(Acquire);
+                (hot_bytes, dirty_bytes, checkpoint_inflight)
+            };
+            self.flow
+                .acquire_foreground_permit(bytes, snapshot, || self.checkpoint())
+        } else {
+            self.flow.noop()
         }
     }
 
-    pub(crate) fn alloc_pair(
-        &self,
-        size1: u32,
-        size2: u32,
-    ) -> Result<((Handle<Arena>, BoxRef), (Handle<Arena>, BoxRef)), OpCode> {
-        let total_real_size = BoxRef::real_size(size1) + BoxRef::real_size(size2);
-        loop {
-            let a = self.current();
-            let cur = self.ctx.numerics.log_size.load(Relaxed);
-            if cur >= self.max_log_size {
-                self.handle_log_limit(a, cur)?;
-                continue;
-            }
-            if !a.try_enter_hot_alloc() {
-                self.wait_install_handoff(a);
-                continue;
-            }
-            let ret = (|| {
-                a.reserve_batch(total_real_size, 2)?;
-                let start = self.state.reserve_addr_span(2);
-                let b1 = a.alloc_at_addr(start, BoxRef::real_size(size1));
-                let b2 = a.alloc_at_addr(start + 1, BoxRef::real_size(size2));
-                Ok(((a, b1), (a, b2)))
-            })();
-            a.leave_hot_alloc();
-            match ret {
-                Ok(v) => return Ok(v),
-                Err(OpCode::Again) => {
-                    self.wait_install_handoff(a);
-                    continue;
-                }
-                Err(OpCode::NoSpace) => {
-                    self.handle_no_space(a)?;
-                }
-                Err(e) => return Err(e),
-            }
+    pub(crate) fn has_pending_flush_data(&self) -> bool {
+        if self.dirty_bytes_snapshot().1 != 0 {
+            return true;
         }
+        self.flush_in.load(Acquire) != self.flush_out.load(Acquire)
     }
 
-    pub(crate) fn recycle<F>(&self, addr: &[u64], mut gc: F)
-    where
-        F: FnMut(u64),
-    {
-        let a = self.current();
-        a.inc_ref();
-        for &i in addr {
-            if !a.recycle(i) {
-                gc(i);
-            }
+    pub(crate) fn nudge_checkpoint(&self, min_interval_ms: u64) {
+        if self.dirty_bytes_snapshot().1 == 0 {
+            return;
         }
-        a.dec_ref();
+        if self.flush_in.load(Acquire) != self.flush_out.load(Acquire) {
+            return;
+        }
+        let last = self.last_checkpoint_ms.load(Acquire);
+        if mono_ms().saturating_sub(last) < min_interval_ms {
+            return;
+        }
+        self.checkpoint();
     }
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        // wait for pending flushes
-        while self.flush_in.load(Acquire) != self.flush_out.load(Acquire) {
-            self.wait_flush_signal();
-        }
-        // take all waiting arenas
-        for entry in self.wait.iter() {
-            let h = *entry.value();
-            h.reclaim();
-        }
-        // free arenas in queue
-        while let Some(h) = self.free.pop() {
-            h.reclaim();
-        }
-        // reclaim cur
-        let ptr = self.cur.swap(std::ptr::null_mut(), Relaxed);
-        if !ptr.is_null() {
-            Handle::from(ptr).reclaim();
-        }
+        self.wait_checkpoint();
     }
 }
 
@@ -637,10 +686,12 @@ pub(crate) struct BucketContext {
     pub(crate) lru: Handle<ShardPriorityLru<BoxRef>>,
     pub(crate) bucket_id: u64,
     pub(crate) reader: Arc<dyn DataReader>,
+    ctx: Handle<Context>,
     cache: NodeCache,
     candidates: CandidateRing,
     tx: Sender<SharedState>,
     candidate_tick: AtomicU64,
+    final_checkpointed: AtomicBool,
     reclaimed: AtomicBool,
 }
 
@@ -649,24 +700,22 @@ impl BucketContext {
     pub(crate) fn new(
         ctx: Handle<Context>,
         state: MutRef<BucketState>,
-        flow: Arc<FlowController>,
         bucket_id: u64,
-        next_addr: u64,
         table: MutRef<PageMap>,
-        flush: Flush,
+        flush: Checkpoint,
         lru: Handle<ShardPriorityLru<BoxRef>>,
         reader: Arc<dyn DataReader>,
         used: Arc<AtomicIsize>,
         tx: Sender<SharedState>,
     ) -> Self {
+        let flow = Arc::new(FlowController::new(ctx.opt.as_ref()));
         let pool = Handle::new(Pool::new(
-            ctx.opt.clone(),
             ctx,
+            table.clone(),
             state.clone(),
             flow,
             flush,
             bucket_id,
-            next_addr,
         ));
 
         Self {
@@ -678,47 +727,30 @@ impl BucketContext {
             lru,
             bucket_id,
             reader,
+            ctx,
             cache: NodeCache::new(used),
             candidates: CandidateRing::new(CANDIDATE_RING_SIZE),
             tx,
             candidate_tick: AtomicU64::new(0),
+            final_checkpointed: AtomicBool::new(false),
             reclaimed: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn alloc(&self, size: u32) -> Result<(Handle<Arena>, BoxRef), OpCode> {
-        self.pool.alloc(size)
+    pub(crate) fn before_foreground_write(&self, bytes: u64) -> ForegroundWritePermit {
+        self.pool.before_foreground_write(bytes)
     }
 
-    pub(crate) fn before_foreground_write(&self, bytes: u64) {
-        self.pool.before_foreground_write(bytes);
+    pub(crate) fn has_pending_flush_data(&self) -> bool {
+        self.pool.has_pending_flush_data()
     }
 
-    pub(crate) fn alloc_pair(
-        &self,
-        size1: u32,
-        size2: u32,
-    ) -> Result<((Handle<Arena>, BoxRef), (Handle<Arena>, BoxRef)), OpCode> {
-        self.pool.alloc_pair(size1, size2)
+    pub(crate) fn nudge_checkpoint(&self, min_interval_ms: u64) {
+        self.pool.nudge_checkpoint(min_interval_ms)
     }
 
-    pub(crate) fn arena_id_of(&self, addr: u64) -> Option<u64> {
-        self.pool.arena_id_of(addr)
-    }
-
-    pub(crate) fn stage_retire(&self, arena_id: u64, data: &[u64], blob: &[u64]) {
-        self.pool.stage_retire(arena_id, data, blob);
-    }
-
-    pub(crate) fn record_lsn(&self, group_id: usize, pos: Position) {
-        self.pool.current().record_lsn(group_id, pos);
-    }
-
-    pub(crate) fn recycle<F>(&self, addr: &[u64], gc: F)
-    where
-        F: FnMut(u64),
-    {
-        self.pool.recycle(addr, gc);
+    pub(crate) fn checkpoint(&self) {
+        self.pool.checkpoint();
     }
 
     pub(crate) fn loader(&self, ctx: Handle<Context>) -> Loader {
@@ -754,7 +786,7 @@ impl BucketContext {
                 // we delay cache warm up when the value of page map entry was updated
                 return Ok(Some(Page::<Loader>::from_swip(swip.raw())));
             }
-            let new = Page::load(self.loader(self.pool.ctx), swip.untagged())?;
+            let new = Page::load(self.loader(self.ctx), swip.untagged())?;
             if self.table.cas(pid, swip.raw(), new.swip()).is_ok() {
                 self.cache(new);
                 return Ok(Some(new));
@@ -768,7 +800,7 @@ impl BucketContext {
         self.cache.touch(pid, size as isize);
         // avoid sampling when cache is far from pressure to reduce atomic contention
         let used = self.cache.used();
-        if used >= (self.pool.ctx.opt.cache_capacity as isize >> 2) {
+        if used >= (self.ctx.opt.cache_capacity as isize >> 2) {
             self.maybe_push_candidate(pid);
         }
         self.maybe_evict();
@@ -786,10 +818,6 @@ impl BucketContext {
         self.cache.evict(pid)
     }
 
-    pub(crate) fn update_cache_size(&self, pid: u64, size: usize) {
-        let _ = self.cache.update_size(pid, size as isize);
-    }
-
     pub(crate) fn candidate_snapshot(&self) -> Vec<u64> {
         self.candidates.snapshot()
     }
@@ -802,7 +830,7 @@ impl BucketContext {
     }
 
     fn maybe_evict(&self) {
-        let threshold = self.pool.ctx.opt.cache_capacity as isize * 80 / 100;
+        let threshold = self.ctx.opt.cache_capacity as isize * 80 / 100;
         if self.cache.used() >= threshold {
             let _ = self.tx.send(SharedState::Evict);
         }
@@ -821,11 +849,17 @@ impl BucketContext {
         }
     }
 
-    pub(crate) fn flush_and_wait(&self) {
-        self.pool.flow.enter_teardown_bypass();
-        self.pool.flush_all();
-        self.pool.wait_flush();
-        self.pool.flow.leave_teardown_bypass();
+    fn flush_and_wait(&self) {
+        self.pool.checkpoint();
+        self.pool.wait_checkpoint();
+    }
+
+    pub(crate) fn checkpoint_before_reclaim(&self) {
+        if self.reclaimed.load(Acquire) {
+            return;
+        }
+        self.flush_and_wait();
+        self.final_checkpointed.store(true, Release);
     }
 
     pub(crate) fn reclaim(&self) {
@@ -836,8 +870,10 @@ impl BucketContext {
         {
             return;
         }
-        // this is necessary, because the bucket maybe dropped/deleted without exit the process
-        self.flush_and_wait();
+        // buckets may still be reclaimed without an explicit final checkpoint path
+        if !self.final_checkpointed.swap(false, AcqRel) {
+            self.flush_and_wait();
+        }
         self.reclaim_pages();
         Handle::reclaim(&self.pool);
     }
@@ -853,8 +889,7 @@ pub(crate) struct BucketMgr {
     pub(crate) buckets: DashMap<u64, Arc<BucketContext>>,
     pub(crate) lru: Handle<ShardPriorityLru<BoxRef>>,
     pub(crate) used: Arc<AtomicIsize>,
-    pub(crate) flow: Arc<FlowController>,
-    pub(crate) flush: Option<Flush>,
+    pub(crate) flush: Option<Checkpoint>,
     pub(crate) tx: Sender<SharedState>,
     pub(crate) rx: Receiver<()>,
     pub(crate) ctx: Handle<Context>,
@@ -870,15 +905,14 @@ impl BucketMgr {
     ) -> Self {
         let reader = Arc::new(DummyDataReader);
         let used = Arc::new(AtomicIsize::new(0));
-        let flow = Arc::new(FlowController::new(opt.as_ref()));
         Self {
             buckets: DashMap::new(),
             lru: Handle::new(ShardPriorityLru::new(
-                opt.cache_count,
+                opt.lru_capacity,
                 opt.high_priority_ratio,
+                opt.lru_max_entries,
             )),
             used,
-            flow,
             flush: None,
             tx,
             rx,
@@ -896,10 +930,10 @@ impl BucketMgr {
         &mut self,
         ctx: Handle<Context>,
         reader: Arc<dyn DataReader>,
-        observer: Arc<dyn FlushObserver>,
+        observer: Arc<dyn CheckpointObserver>,
     ) {
         self.set_context(ctx, reader);
-        self.flush = Some(Flush::new(ctx, observer));
+        self.flush = Some(Checkpoint::new(ctx, observer));
     }
 
     pub(crate) fn quit(&self) {
@@ -907,9 +941,9 @@ impl BucketMgr {
         let _ = self.tx.send(SharedState::Quit);
         let _ = self.rx.recv();
 
-        // 2) flush all buckets while flusher thread is still alive
+        // 2) do the final checkpoint for each bucket while flusher is still alive
         for ctx in self.buckets.iter() {
-            ctx.flush_and_wait();
+            ctx.checkpoint_before_reclaim();
         }
 
         // 3) stop flusher after outstanding flush tasks are drained
@@ -917,8 +951,7 @@ impl BucketMgr {
             f.quit();
         }
 
-        // 4) release bucket contexts after flushers are gone to avoid races
-        // reclaim is deferred to BucketContext::drop when the last Arc goes away
+        // 4) release bucket contexts after the final checkpoint is already done
         self.buckets.clear();
 
         // 5) release shared lru
@@ -927,7 +960,7 @@ impl BucketMgr {
 
     pub(crate) fn del_bucket(&self, bucket_id: u64) {
         if let Some(ctx) = self.buckets.get(&bucket_id).map(|x| x.value().clone()) {
-            ctx.flush_and_wait();
+            ctx.checkpoint_before_reclaim();
         }
         let _ = self.buckets.remove(&bucket_id);
     }
@@ -944,101 +977,5 @@ impl BucketMgr {
                 }
             })
             .collect()
-    }
-}
-
-pub struct Loader {
-    pub(crate) pool: Handle<Pool>,
-    ctx: Handle<Context>,
-    lru: Handle<ShardPriorityLru<BoxRef>>,
-    pinned: MutRef<DashMap<u64, BoxRef>>,
-    bucket_id: u64,
-    reader: Arc<dyn DataReader>,
-}
-
-impl Drop for Loader {
-    fn drop(&mut self) {}
-}
-
-impl Loader {
-    const PIN_CAP: usize = 64;
-
-    pub fn find(&self, addr: u64) -> Result<BoxRef, OpCode> {
-        if let Some(x) = self.lru.get(addr) {
-            return Ok(x.clone());
-        }
-        if let Some(x) = self.pool.load(addr) {
-            self.lru.add(CachePriority::High, addr, x.clone());
-            return Ok(x);
-        }
-        self.reader.load_data(self.bucket_id, addr, &|b| {
-            self.lru.add(CachePriority::High, addr, b);
-        })
-    }
-}
-
-impl ILoader for Loader {
-    fn deep_copy(&self) -> Self {
-        Self {
-            pool: self.pool,
-            ctx: self.ctx,
-            lru: self.lru,
-            pinned: MutRef::new(DashMap::new()),
-            bucket_id: self.bucket_id,
-            reader: self.reader.clone(),
-        }
-    }
-
-    fn shallow_copy(&self) -> Self {
-        Self {
-            pool: self.pool,
-            ctx: self.ctx,
-            lru: self.lru,
-            pinned: self.pinned.clone(),
-            bucket_id: self.bucket_id,
-            reader: self.reader.clone(),
-        }
-    }
-
-    fn pin(&self, data: BoxRef) {
-        self.pinned.insert(data.header().addr, data);
-    }
-
-    fn load(&self, addr: u64) -> Result<BoxView, OpCode> {
-        if let Some(p) = self.pinned.get(&addr) {
-            return Ok(p.view());
-        }
-        let x = self.find(addr)?;
-        let e = self.pinned.entry(addr);
-        match e {
-            Entry::Occupied(o) => Ok(o.get().view()),
-            Entry::Vacant(v) => {
-                let r = x.view();
-                v.insert(x);
-                Ok(r)
-            }
-        }
-    }
-
-    fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
-        if let Some(x) = self.lru.get(addr) {
-            return Ok(x.clone());
-        }
-        if let Some(x) = self.pool.load(addr) {
-            self.lru.add(CachePriority::Low, addr, x.clone());
-            return Ok(x.clone());
-        }
-        self.reader.load_blob(self.bucket_id, addr, &|b| {
-            self.lru.add(CachePriority::Low, addr, b);
-        })
-    }
-
-    fn load_remote_uncached(&self, addr: u64) -> BoxRef {
-        if let Some(x) = self.pool.load(addr) {
-            return x;
-        }
-        self.reader
-            .load_blob_uncached(self.bucket_id, addr)
-            .expect("must exist")
     }
 }

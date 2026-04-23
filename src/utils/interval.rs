@@ -15,7 +15,14 @@ impl IntervalMap {
     /// the range must not overlap
     pub fn insert(&mut self, lo: u64, hi: u64, val: u64) {
         #[cfg(feature = "extra_check")]
-        assert_eq!(self.find(lo), None);
+        assert!(
+            self.find(lo).is_none(),
+            "interval overlap: lo={} hi={} val={} hit={:?}",
+            lo,
+            hi,
+            val,
+            self.find(lo)
+        );
         self.map.insert(lo, (hi, val));
     }
 
@@ -60,6 +67,13 @@ impl IntervalMap {
             return Some(*val);
         }
         None
+    }
+
+    #[allow(dead_code)]
+    pub fn show(&self) {
+        for (lo, (hi, val)) in self.map.iter() {
+            println!("[{}, {}] => {}", lo, hi, val);
+        }
     }
 }
 

@@ -1,6 +1,5 @@
 use super::wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate};
 use crate::OpCode;
-use crate::meta::Numerics;
 use crate::types::data::Key;
 use crate::utils::MutRef;
 use crate::utils::block::Ring;
@@ -60,7 +59,6 @@ pub struct Logging {
     ops: usize,
     pub(crate) writer: MutRef<GatherWriter>,
     opt: Arc<ParsedOptions>,
-    numerics: Arc<Numerics>,
 }
 
 unsafe impl Sync for Logging {}
@@ -75,7 +73,6 @@ impl Logging {
         latest_id: u64,
         oldest_id: u64,
         checkpoint: Position,
-        numerics: Arc<Numerics>,
         opt: Arc<ParsedOptions>,
         ckpt_cnt: Arc<AtomicUsize>,
     ) -> Self {
@@ -98,7 +95,6 @@ impl Logging {
             group,
             writer: MutRef::new(writer),
             opt,
-            numerics,
         }
     }
 
@@ -150,10 +146,6 @@ impl Logging {
         self.log_pos
     }
 
-    pub fn flushed_pos(&self) -> Position {
-        self.flushed_pos
-    }
-
     pub fn last_ckpt(&self) -> Position {
         self.last_ckpt
     }
@@ -173,10 +165,6 @@ impl Logging {
             self.last_ckpt = pos;
         }
         self.checkpoint()
-    }
-
-    pub fn should_durable(&mut self, target: Position) -> bool {
-        target > self.durable_pos
     }
 
     #[cold]
@@ -216,7 +204,6 @@ impl Logging {
         if self.opt.sync_on_write {
             self.durable_pos = self.flushed_pos;
         }
-        self.numerics.log_size.fetch_add(size, Relaxed);
         Ok(())
     }
 
@@ -351,9 +338,6 @@ impl Logging {
         self.ckpt_cnt.fetch_add(1, Relaxed);
         self.flushed_pos = self.log_pos;
         self.durable_pos = self.flushed_pos;
-        self.numerics
-            .log_size
-            .fetch_add(ckpt.encoded_len(), Relaxed);
         true
     }
 
@@ -364,7 +348,6 @@ impl Logging {
             self.ring.cons(len);
 
             self.flushed_pos = self.log_pos;
-            self.numerics.log_size.fetch_add(len, Relaxed);
         }
         if force || self.opt.sync_on_write {
             let sync_started = sampled_instant(

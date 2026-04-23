@@ -2,13 +2,7 @@ use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::{
     cmp::Ordering::{self, Equal, Greater, Less},
     ops::{Bound, Deref, DerefMut},
-    sync::{
-        Arc,
-        atomic::{
-            AtomicU8, AtomicU64,
-            Ordering::{AcqRel, Acquire, Relaxed},
-        },
-    },
+    sync::Arc,
 };
 
 use crate::{
@@ -20,47 +14,39 @@ use crate::{
         },
         header::{BoxHeader, NodeType},
         refbox::{BaseView, BoxView, DeltaView, RemoteView},
-        traits::{
-            IAsBoxRef, IBoxHeader, IDecode, IFrameAlloc, IHeader, IKey, ILoader, IRetireSink, IVal,
-        },
+        traits::{IAsBoxRef, IBoxHeader, IDecode, IFrameAlloc, IHeader, IKey, ILoader, IVal},
     },
     utils::{
-        Handle, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, OpCode,
+        Handle, INIT_ORACLE, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, OpCode,
+        data::Position,
         imtree::{ImTree, Iter, RangeIter},
     },
 };
 
 use super::{header::TagKind, refbox::BoxRef};
 
+pub(crate) type Junk = Vec<u64>;
+
+pub(crate) enum MergeOp {
+    Merged,
+    MarkChild,
+    MarkParent(u64),
+}
+
 pub(crate) struct NodeState {
     addr: u64,
     total_size: usize,
     max_txid: u64,
+    group: u8,
+    /// for smo/compact use
+    latest_lsn: Position,
     delta: ImTree<DeltaView>,
-}
-
-pub(crate) struct NodeSmoState {
-    merge_state: AtomicU8,
-    merging_child: AtomicU64,
-}
-
-impl NodeSmoState {
-    const MERGE_IDLE: u8 = 0;
-    const MERGE_ACTIVE: u8 = 1;
-
-    fn new() -> Self {
-        Self {
-            merge_state: AtomicU8::new(Self::MERGE_IDLE),
-            merging_child: AtomicU64::new(NULL_PID),
-        }
-    }
 }
 
 pub(crate) struct Node<L: ILoader> {
     /// the loader is remote/sibling loader, not node loader
     pub(crate) loader: L,
     mtx: Arc<Mutex<()>>,
-    smo: Arc<NodeSmoState>,
     pub(crate) state: RwLock<NodeState>,
     inner: BaseView,
 }
@@ -83,8 +69,6 @@ fn null_cmp(_x: &DeltaView, _y: &DeltaView) -> Ordering {
     unimplemented!()
 }
 
-pub type Junks = Vec<u64>;
-
 impl<L: ILoader> Drop for Node<L> {
     fn drop(&mut self) {}
 }
@@ -93,23 +77,20 @@ impl<L> Node<L>
 where
     L: ILoader,
 {
-    pub(crate) fn new(loader: L, b: BoxRef) -> Self {
-        Self::new_with_mtx(loader, b, Arc::new(Mutex::new(())))
-    }
-
-    fn new_with_mtx(loader: L, b: BoxRef, mtx: Arc<Mutex<()>>) -> Self {
+    pub(crate) fn new(loader: L, b: BoxRef, group: u8, latest_lsn: Position) -> Self {
         let h = b.header();
         let (addr, total_size, max_txid) = (h.addr, h.total_size as usize, h.txid);
         let base = b.view().as_base();
         loader.pin(b);
-        Self {
+        let this = Self {
             loader,
-            mtx,
-            smo: Arc::new(NodeSmoState::new()),
+            mtx: Arc::new(Mutex::new(())),
             state: RwLock::new(NodeState {
                 addr,
                 total_size,
                 max_txid,
+                group,
+                latest_lsn,
                 delta: ImTree::new(if base.header().is_index {
                     intl_cmp
                 } else {
@@ -117,7 +98,29 @@ where
                 }),
             }),
             inner: base,
-        }
+        };
+        this.pin_leaf_pages_unchecked();
+        this
+    }
+
+    pub(crate) fn load(addr: u64, loader: L) -> Result<Self, OpCode> {
+        let d = loader.load(addr)?;
+        let mut l = Self {
+            loader,
+            mtx: Arc::new(Mutex::new(())),
+            state: RwLock::new(NodeState {
+                addr: d.addr,
+                total_size: d.total_size as usize,
+                max_txid: d.header().txid,
+                group: 0,
+                latest_lsn: Position::MIN,
+                delta: ImTree::new(null_cmp),
+            }),
+            inner: BaseView::null(),
+        };
+        Self::load_inner(&mut l, d)?;
+        l.try_pin_leaf_pages()?;
+        Ok(l)
     }
 
     /// a DeltaView's owner
@@ -130,18 +133,21 @@ where
 
     pub(crate) fn reference(&self) -> Self {
         let state = self.state.read();
-        Self {
-            loader: self.loader.shallow_copy(),
+        let this = Self {
+            loader: self.loader.copy_with_pin(),
             mtx: self.mtx.clone(),
-            smo: self.smo.clone(),
             state: RwLock::new(NodeState {
                 addr: state.addr,
                 total_size: state.total_size,
                 max_txid: state.max_txid,
+                group: state.group,
+                latest_lsn: state.latest_lsn,
                 delta: state.delta.clone(),
             }),
             inner: self.inner,
-        }
+        };
+        this.pin_leaf_pages_unchecked();
+        this
     }
 
     pub(crate) fn pid(&self) -> u64 {
@@ -152,31 +158,54 @@ where
         self.inner.box_header_mut().pid = pid;
     }
 
-    pub(crate) fn new_leaf<A: IFrameAlloc>(a: &mut A, loader: L) -> Node<L> {
-        Self::try_new_leaf(a, loader).expect("node leaf alloc fail")
-    }
-
-    pub(crate) fn try_new_leaf<A: IFrameAlloc>(a: &mut A, loader: L) -> Result<Node<L>, OpCode> {
+    pub(crate) fn new_leaf<A: IFrameAlloc>(
+        a: &mut A,
+        loader: L,
+        group: u8,
+        lsn: Position,
+    ) -> Node<L> {
         let empty: &[(LeafSeg, Val)] = &[];
         let mut iter = empty.iter().map(|x| (x.0, x.1));
-        let b = BaseView::try_new_leaf(a, &loader, [].as_slice(), None, NULL_PID, &mut iter, 0)?;
-        Ok(Self::new(loader, b))
+        let b = BaseView::new_leaf(
+            a,
+            &loader,
+            [].as_slice(),
+            None,
+            NULL_PID,
+            &mut iter,
+            INIT_ORACLE,
+            group,
+            lsn,
+        );
+        let (group, lsn) = {
+            let h = b.header();
+            (h.group, h.lsn)
+        };
+        Self::new(loader, b, group, lsn)
     }
 
-    pub(crate) fn try_new_root<A: IFrameAlloc>(
+    pub(crate) fn new_root<A: IFrameAlloc>(
         a: &mut A,
         loader: L,
         item: &[(IntlKey, Index)],
-    ) -> Result<Node<L>, OpCode> {
-        let b = BaseView::try_new_intl(
+        group: u8,
+        lsn: Position,
+    ) -> Node<L> {
+        let b = BaseView::new_intl(
             a,
             [].as_slice(),
             None,
             NULL_PID,
             || item.iter().map(|&(x, y)| (IntlSeg::new(&[], x.raw), y)),
-            0,
-        )?;
-        Ok(Self::new(loader, b))
+            INIT_ORACLE,
+            group,
+            lsn,
+        );
+        let (group, lsn) = {
+            let h = b.header();
+            (h.group, h.lsn)
+        };
+        Self::new(loader, b, group, lsn)
     }
 
     /// the length of delta + base
@@ -192,34 +221,17 @@ where
         self.inner.as_box()
     }
 
-    pub(crate) fn garbage_collect<A: IRetireSink>(&self, a: &mut A, junks: &[u64]) {
-        // collect key-value addr, if value is remote and invisible, it has been collected in junks
+    pub(crate) fn collect_junk<F>(&self, mut f: F)
+    where
+        F: FnMut(u64),
+    {
         self.state
             .read()
             .delta
+            .clone()
             .iter()
-            .for_each(|x| a.collect(&[x.box_header().addr]));
-
-        a.collect(junks);
-        a.collect(&[self.base_addr()]);
-    }
-
-    pub(crate) fn load(addr: u64, loader: L) -> Result<Self, OpCode> {
-        let d = loader.load(addr)?;
-        let mut l = Self {
-            loader,
-            mtx: Arc::new(Mutex::new(())),
-            smo: Arc::new(NodeSmoState::new()),
-            state: RwLock::new(NodeState {
-                addr: d.addr,
-                total_size: d.total_size as usize,
-                max_txid: d.header().txid,
-                delta: ImTree::new(null_cmp),
-            }),
-            inner: BaseView::null(),
-        };
-        Self::load_inner(&mut l, d)?;
-        Ok(l)
+            .for_each(|x| f(x.box_header().addr));
+        f(self.base_addr());
     }
 
     fn set_comparator(&mut self, nt: NodeType) {
@@ -231,10 +243,15 @@ where
         }
     }
 
+    pub(crate) fn get_group_lsn(&self) -> (u8, Position) {
+        let state = self.state.read();
+        (state.group, state.latest_lsn)
+    }
+
     pub(crate) fn should_split(&self, split_elem: u16) -> bool {
         let h = self.header();
         let size_limited = h.elems >= split_elem;
-        let no_conflict = !self.is_smo_busy() && h.elems >= 2;
+        let no_conflict = !h.merging && h.merging_child == NULL_PID && h.elems >= 2;
 
         size_limited && no_conflict
     }
@@ -243,19 +260,16 @@ where
         let h = self.header();
         // `split_elems` is the post-split size snapshot, <= 25% means merge candidate
         let size_limited = h.split_elems >= h.elems * 4;
-        size_limited && !self.is_smo_busy()
+        let no_conflict = !h.merging && h.merging_child == NULL_PID;
+        size_limited && no_conflict
     }
 
-    pub(crate) fn can_merge_child_runtime(&self, child_lo: &[u8], child_pid: u64) -> bool {
+    pub(crate) fn can_merge_child(&self, child_lo: &[u8], child_pid: u64) -> bool {
         debug_assert_eq!(self.box_header().node_type, NodeType::Intl);
-        if self.runtime_merging_child() != NULL_PID || self.runtime_merging() {
-            return false;
-        }
-        if self.delta_len() > 0 {
-            // runtime merge precheck relies on compacted parent routing
-            return false;
-        }
         let h = self.header();
+        if h.merging_child != NULL_PID || h.merging {
+            return false;
+        }
         if h.elems == 0 || child_lo < self.lo() {
             return false;
         }
@@ -265,84 +279,34 @@ where
             return false;
         }
 
-        let (_, pid) = self.child_index(child_lo);
-        pid == child_pid
+        let (is_left_most, pid) = self.child_index(child_lo);
+        !is_left_most && pid == child_pid
     }
 
-    pub(crate) fn runtime_merging(&self) -> bool {
-        self.smo.merge_state.load(Acquire) == NodeSmoState::MERGE_ACTIVE
-    }
-
-    pub(crate) fn runtime_merging_child(&self) -> u64 {
-        self.smo.merging_child.load(Acquire)
-    }
-
-    pub(crate) fn try_mark_runtime_merging(&self) -> bool {
-        let cur = self.smo.merge_state.load(Acquire);
-        if cur == NodeSmoState::MERGE_ACTIVE {
-            return true;
-        }
-        if cur != NodeSmoState::MERGE_IDLE {
-            return false;
-        }
-        self.smo
-            .merge_state
-            .compare_exchange(
-                NodeSmoState::MERGE_IDLE,
-                NodeSmoState::MERGE_ACTIVE,
-                AcqRel,
-                Acquire,
-            )
-            .is_ok()
-    }
-
-    pub(crate) fn clear_runtime_merging(&self) {
-        self.smo
-            .merge_state
-            .store(NodeSmoState::MERGE_IDLE, Relaxed);
-    }
-
-    pub(crate) fn try_mark_runtime_merging_child(&self, pid: u64) -> bool {
-        let cur = self.smo.merging_child.load(Acquire);
-        if cur == pid {
-            return true;
-        }
-        if cur != NULL_PID {
-            return false;
-        }
-        self.smo
-            .merging_child
-            .compare_exchange(NULL_PID, pid, AcqRel, Acquire)
-            .is_ok()
-    }
-
-    pub(crate) fn clear_runtime_merging_child(&self, pid: u64) -> bool {
-        self.smo
-            .merging_child
-            .compare_exchange(pid, NULL_PID, AcqRel, Acquire)
-            .is_ok()
-    }
-
-    pub(crate) fn is_smo_busy(&self) -> bool {
-        self.runtime_merging() || self.runtime_merging_child() != NULL_PID
-    }
-
-    pub(crate) fn try_merge_node<A: IFrameAlloc>(
+    pub(crate) fn merge_node<A: IFrameAlloc>(
         &self,
         a: &mut A,
         other: &Node<L>,
         safe_txid: u64,
-    ) -> Result<(Node<L>, Junks, Junks), OpCode> {
-        let (lb, lj) = self.try_merge_to_base(a, safe_txid)?;
-        let (rb, rj) = other.try_merge_to_base(a, safe_txid)?;
+    ) -> (Node<L>, Junk) {
+        let mut junks = Vec::new();
+        let lb = self.merge_to_base(a, &mut junks, safe_txid);
+        let rb = other.merge_to_base(a, &mut junks, safe_txid);
         let (lhs, rhs) = (lb.view().as_base(), rb.view().as_base());
 
         #[cfg(feature = "extra_check")]
         assert_ne!(self.base_addr(), other.base_addr());
-        let merged = lhs.try_merge(a, &self.loader, rhs, safe_txid)?;
-        let mut node = Self::new(self.loader.deep_copy(), merged);
+        // because we merge right node into the left one, which means the right node has been modified
+        // before, so it has the latest group and lsn
+        let (group, lsn) = other.get_group_lsn();
+        let merged = lhs.merge(a, &self.loader, rhs, safe_txid, group, lsn);
+        let (group, lsn) = {
+            let h = merged.header();
+            (h.group, h.lsn)
+        };
+        let mut node = Self::new(self.loader.copy_without_pin(), merged, group, lsn);
         node.header_mut().split_elems = self.header().split_elems;
-        Ok((node, lj, rj))
+        (node, junks)
     }
 
     pub(crate) fn child_index(&self, k: &[u8]) -> (bool, u64) {
@@ -367,13 +331,13 @@ where
 
     /// NOTE: before we add lock, it will search key in current node and return None if find, after
     /// add lock, the search is useless, so it was removed, but we keep return an Option<Node<L>>
-    pub(crate) fn try_insert_index<A: IFrameAlloc>(
+    pub(crate) fn insert_index<A: IFrameAlloc>(
         &self,
         a: &mut A,
         key: &[u8],
         pid: u64,
         safe_txid: u64,
-    ) -> Result<Option<(Node<L>, Junks)>, OpCode> {
+    ) -> Option<(Node<L>, Junk)> {
         #[cfg(feature = "extra_check")]
         if key < self.lo()
             || if let Some(hi) = self.hi() {
@@ -385,9 +349,10 @@ where
             panic!("somehow it happens");
         }
 
-        let b = DeltaView::try_from_key_index(a, IntlKey::new(key), Index::new(pid), safe_txid)?;
-        let view = b.view().as_delta();
-        Ok(Some(self.insert(view).try_compact(a, safe_txid)?)) // 1/SPLIT_ELEMS chance to run
+        let (group, lsn) = self.get_group_lsn();
+        let b =
+            DeltaView::from_key_index(a, IntlKey::new(key), Index::new(pid), safe_txid, group, lsn);
+        Some(self.insert(b).compact(a, safe_txid)) // 1/SPLIT_ELEMS chance to run
     }
 
     fn decode_pefix<K>(
@@ -411,12 +376,9 @@ where
         (sep, new_prefix_len)
     }
 
-    /// split base entries only
-    /// callers should use `split_overlay` when delta may be present
-    pub(crate) fn try_split<A: IFrameAlloc>(
-        &self,
-        a: &mut A,
-    ) -> Result<(Node<L>, Node<L>), OpCode> {
+    /// NOTE: no need to compact, since we check `should_split` is not use the delta size, i.e, when
+    /// `should_split`, the node must have been compacted, and any insert to node will check first
+    pub(crate) fn split<A: IFrameAlloc>(&self, a: &mut A) -> (Node<L>, Node<L>) {
         let h = self.inner.header();
         let prefix_len = h.prefix_len as usize;
         let elems = h.elems as usize;
@@ -426,6 +388,7 @@ where
         // both lhs and rhs keep current sibling, caller rewires lhs after rhs is mapped
         let sibling = self.header().right_sibling;
         let txid = self.box_header().txid;
+        let (group, lsn) = self.get_group_lsn();
 
         let (l, r) = if h.is_index {
             let (sep_key, (llen, rlen)) = self.decode_pefix::<IntlKey>(sep, prefix_len, lo, &hi);
@@ -434,7 +397,7 @@ where
             // prefix never shrinks in split
             let (ld, rd) = (lhs_prefix.len() - prefix_len, rhs_prefix.len() - prefix_len);
             (
-                BaseView::try_new_intl(
+                BaseView::new_intl(
                     a,
                     lo,
                     Some(sep_key.as_slice()),
@@ -445,8 +408,10 @@ where
                             .map(|(k, v)| (IntlSeg::new(lhs_prefix, &k.raw[ld..]), v))
                     },
                     txid,
-                )?,
-                BaseView::try_new_intl(
+                    group,
+                    lsn,
+                ),
+                BaseView::new_intl(
                     a,
                     sep_key.as_slice(),
                     hi,
@@ -457,7 +422,9 @@ where
                             .map(|(k, v)| (IntlSeg::new(rhs_prefix, &k.raw[rd..]), v))
                     },
                     txid,
-                )?,
+                    group,
+                    lsn,
+                ),
             )
         } else {
             let (sep_key, (llen, rlen)) = self.decode_pefix::<Key>(sep, prefix_len, lo, &hi);
@@ -473,7 +440,7 @@ where
                 .range_iter::<L, Key>(&self.loader, sep, elems)
                 .map(|(k, v)| (LeafSeg::new(&sep_key[..rlen], &k.raw[rd..], k.ver), v));
             (
-                BaseView::try_new_leaf(
+                BaseView::new_leaf(
                     a,
                     &self.loader,
                     lo,
@@ -481,8 +448,10 @@ where
                     sibling,
                     &mut liter,
                     txid,
-                )?,
-                BaseView::try_new_leaf(
+                    group,
+                    lsn,
+                ),
+                BaseView::new_leaf(
                     a,
                     &self.loader,
                     sep_key.as_slice(),
@@ -490,33 +459,27 @@ where
                     sibling,
                     &mut riter,
                     txid,
-                )?,
+                    group,
+                    lsn,
+                ),
             )
         };
 
+        let (lgroup, llsn) = {
+            let h = l.header();
+            (h.group, h.lsn)
+        };
+        let (rgroup, rlsn) = {
+            let h = r.header();
+            (h.group, h.lsn)
+        };
         let (mut lhs, mut rhs) = (
-            Self::new(self.loader.deep_copy(), l),
-            Self::new(self.loader.deep_copy(), r),
+            Self::new(self.loader.copy_without_pin(), l, lgroup, llsn),
+            Self::new(self.loader.copy_without_pin(), r, rgroup, rlsn),
         );
         lhs.header_mut().split_elems = sep as u16;
         rhs.header_mut().split_elems = (elems - sep) as u16;
-        Ok((lhs, rhs))
-    }
-
-    pub(crate) fn try_split_overlay<A: IFrameAlloc>(
-        &self,
-        a: &mut A,
-        safe_txid: u64,
-    ) -> Result<(Node<L>, Node<L>, Junks), OpCode> {
-        // fast path: split base directly when there is no overlay delta
-        if self.delta_len() == 0 {
-            let (lhs, rhs) = self.try_split(a)?;
-            return Ok((lhs, rhs, Junks::new()));
-        }
-        // slow path: compact overlay into base first so split sees a stable ordered view
-        let (node, junks) = self.try_compact(a, safe_txid)?;
-        let (lhs, rhs) = node.try_split(a)?;
-        Ok((lhs, rhs, junks))
+        (lhs, rhs)
     }
 
     #[allow(clippy::iter_skip_zero)]
@@ -536,7 +499,7 @@ where
     }
 
     #[allow(clippy::iter_skip_zero)]
-    fn leaf_iter(&'_ self, safe_txid: u64) -> LeafIter<'_, L> {
+    fn leaf_iter<'b>(&'b self, j: &'b mut Junk, safe_txid: u64) -> LeafIter<'b, L> {
         debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
         let len = self.header().prefix_len as usize;
         let lo = self.lo();
@@ -551,45 +514,51 @@ where
             filter: LeafFilter {
                 txid: safe_txid,
                 last: None,
-                junks: Vec::new(),
+                junks: j,
                 skip_dup: false,
             },
         }
     }
 
-    pub(crate) fn try_compact<A: IFrameAlloc>(
-        &self,
-        a: &mut A,
-        safe_txid: u64,
-    ) -> Result<(Node<L>, Junks), OpCode> {
-        let (b, j) = self.try_merge_to_base(a, safe_txid)?;
-        let node = Self::new(self.loader.deep_copy(), b);
-        node.smo
-            .merge_state
-            .store(self.smo.merge_state.load(Acquire), Relaxed);
-        node.smo
-            .merging_child
-            .store(self.smo.merging_child.load(Acquire), Relaxed);
-        Ok((node, j))
+    pub(crate) fn compact<A: IFrameAlloc>(&self, a: &mut A, safe_txid: u64) -> (Node<L>, Junk) {
+        let mut junks = Junk::new();
+        let b = self.merge_to_base(a, &mut junks, safe_txid);
+        let mut base = b.view().as_base();
+        let h = base.header_mut();
+        let old = self.header();
+        h.merging = old.merging;
+        h.merging_child = old.merging_child;
+        let (group, lsn) = {
+            let h = b.header();
+            (h.group, h.lsn)
+        };
+        (
+            Self::new(self.loader.copy_without_pin(), b, group, lsn),
+            junks,
+        )
     }
 
-    fn try_merge_to_base<A: IFrameAlloc>(
-        &self,
-        a: &mut A,
-        safe_txid: u64,
-    ) -> Result<(BoxRef, Junks), OpCode> {
+    fn merge_to_base<A: IFrameAlloc>(&self, a: &mut A, j: &mut Junk, safe_txid: u64) -> BoxRef {
         let h = self.header();
         let lo = self.lo();
         let hi = self.hi();
 
         if h.is_index {
-            Ok((
-                BaseView::try_new_intl(a, lo, hi, h.right_sibling, || self.intl_iter(), safe_txid)?,
-                Vec::new(),
-            ))
+            let (group, lsn) = self.get_group_lsn();
+            BaseView::new_intl(
+                a,
+                lo,
+                hi,
+                h.right_sibling,
+                || self.intl_iter(),
+                safe_txid,
+                group,
+                lsn,
+            )
         } else {
-            let mut iter = self.leaf_iter(safe_txid);
-            let b = BaseView::try_new_leaf(
+            let mut iter = self.leaf_iter(j, safe_txid);
+            let (group, lsn) = self.get_group_lsn();
+            BaseView::new_leaf(
                 a,
                 &self.loader,
                 lo,
@@ -597,33 +566,62 @@ where
                 h.right_sibling,
                 &mut iter,
                 safe_txid,
-            )?;
-            Ok((b, iter.filter.junks))
+                group,
+                lsn,
+            )
         }
     }
 
-    pub(crate) fn try_remove_index<A: IFrameAlloc>(
+    pub(crate) fn process_merge<A: IFrameAlloc>(
         &self,
         a: &mut A,
-        child_pid: u64,
+        op: MergeOp,
         safe_txid: u64,
-    ) -> Result<Option<(Node<L>, Junks)>, OpCode> {
-        assert_eq!(self.box_header().node_type, NodeType::Intl);
-        let key = self
-            .intl_iter()
-            .find(|(_, idx)| idx.pid == child_pid)
-            .map(|(k, _)| k);
-        let Some(key) = key else {
-            return Ok(None);
-        };
-        let b = DeltaView::try_from_key_index(a, key, Index::null(), safe_txid)?;
-        let tmp = self.insert(b.view().as_delta());
-        let (mut p, j) = tmp.try_compact(a, safe_txid)?;
-        p.header_mut().split_elems = self.header().split_elems + 1;
-        Ok(Some((p, j)))
+    ) -> (Node<L>, Junk) {
+        match op {
+            MergeOp::Merged => {
+                assert_eq!(self.box_header().node_type, NodeType::Intl);
+                let mut key = None;
+                let h = self.header();
+                let merging_child = h.merging_child;
+                for (k, v) in self.intl_iter() {
+                    if v.pid == merging_child {
+                        key = Some(k);
+                        break;
+                    }
+                }
+                let (group, lsn) = self.get_group_lsn();
+                let b = DeltaView::from_key_index(
+                    a,
+                    key.unwrap(),
+                    Index::null(),
+                    safe_txid,
+                    group,
+                    lsn,
+                );
+                let tmp = self.insert(b);
+                let (mut p, j) = tmp.compact(a, safe_txid);
+                p.header_mut().merging_child = NULL_PID;
+                p.header_mut().split_elems = h.split_elems + 1;
+                (p, j)
+            }
+            MergeOp::MarkParent(pid) => {
+                assert_eq!(self.box_header().node_type, NodeType::Intl);
+                let (mut p, j) = self.compact(a, safe_txid);
+                p.header_mut().merging_child = pid;
+                (p, j)
+            }
+            MergeOp::MarkChild => {
+                assert_eq!(self.box_header().node_type, NodeType::Leaf);
+                let (mut p, j) = self.compact(a, safe_txid);
+                p.header_mut().merging = true;
+                (p, j)
+            }
+        }
     }
 
-    pub(crate) fn insert(&self, mut k: DeltaView) -> Node<L> {
+    pub(crate) fn insert(&self, b: BoxRef) -> Node<L> {
+        let mut k = b.view().as_delta();
         let h = k.box_header_mut();
         let th = self.box_header();
         let state = self.state.read();
@@ -631,15 +629,20 @@ where
         h.link = state.addr;
         h.node_type = th.node_type;
         h.pid = th.pid;
+        let addr = h.addr;
+
+        // must save in pinned, because checkpoint may concurrently happen
+        self.loader.pin(b);
 
         Node {
-            loader: self.loader.shallow_copy(),
+            loader: self.loader.copy_with_pin(),
             mtx: self.mtx.clone(),
-            smo: self.smo.clone(),
             state: RwLock::new(NodeState {
-                addr: h.addr,
+                addr,
                 total_size: state.total_size + h.total_size as usize,
                 max_txid: h.txid,
+                group: h.group,
+                latest_lsn: h.lsn,
                 delta: state.delta.update(k),
             }),
             inner: self.inner,
@@ -647,19 +650,23 @@ where
     }
 
     // NOTE: it must be protected by lock
-    fn insert_inplace(&self, mut k: DeltaView) {
+    fn insert_inplace(&self, mut k: DeltaView, remote_size: usize) -> u64 {
         let h = k.box_header_mut();
         let th = self.box_header();
+        let addr = h.addr;
 
         let mut state = self.state.write();
         h.link = state.addr;
         h.node_type = th.node_type;
         h.pid = th.pid;
 
-        state.addr = h.addr;
-        state.total_size += h.total_size as usize;
+        state.addr = addr;
+        state.total_size += h.total_size as usize + remote_size;
         state.max_txid = h.txid;
+        state.group = h.group;
+        state.latest_lsn = h.lsn;
         state.delta.put(k);
+        addr
     }
 
     pub(crate) fn lock(&'_ self) -> NodeGuard<'_, L> {
@@ -786,6 +793,27 @@ where
         self.inner.box_header()
     }
 
+    fn try_pin_leaf_pages(&self) -> Result<(), OpCode> {
+        if self.box_header().node_type != NodeType::Leaf {
+            return Ok(());
+        }
+        let mut siblings = Vec::new();
+        if self.inner.load_sibling_heads_hint(&mut siblings) {
+            for mut addr in siblings {
+                while addr != NULL_ADDR {
+                    let p = self.loader.load(addr)?;
+                    addr = p.link;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn pin_leaf_pages_unchecked(&self) {
+        self.try_pin_leaf_pages().expect("must exist")
+    }
+
     pub(crate) fn delta_len(&self) -> usize {
         self.state.read().delta.len()
     }
@@ -797,6 +825,11 @@ where
         loop {
             let h = d.header();
             let state = l.state.get_mut();
+            if last_type.is_none() {
+                state.group = h.group;
+                state.latest_lsn = h.lsn;
+            }
+            // the head page carries the latest group/lsn for future base rebuilds
             state.total_size += d.total_size as usize;
             state.max_txid = state.max_txid.max(h.txid);
             if let Some(t) = last_type {
@@ -911,9 +944,14 @@ impl<L> NodeGuard<'_, L>
 where
     L: ILoader,
 {
-    pub(crate) fn insert(&self, k: BoxRef, v: Option<BoxRef>) {
-        self.node.insert_inplace(k.view().as_delta());
+    pub(crate) fn insert(&self, k: BoxRef, v: Option<BoxRef>) -> u64 {
+        let remote_size = v
+            .as_ref()
+            .map(|x| x.header().total_size as usize)
+            .unwrap_or(0);
+        let addr = self.node.insert_inplace(k.view().as_delta(), remote_size);
         self.node.save(k, v); // save the delta itself until page is reclaimed
+        addr
     }
 }
 
@@ -1119,6 +1157,15 @@ where
     type Item = IterItem<'a, L>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.try_next().expect("must exist")
+    }
+}
+
+impl<'a, L> RawLeafIter<'a, L>
+where
+    L: ILoader,
+{
+    pub(crate) fn try_next(&mut self) -> Result<Option<IterItem<'a, L>>, OpCode> {
         if self.next_l.is_none()
             && let Some(x) = self.delta_iter.next()
         {
@@ -1133,7 +1180,7 @@ where
         }
 
         if self.next_r.is_none()
-            && let Some((k, val)) = self.sst_iter.next()
+            && let Some((k, val)) = self.sst_iter.try_next_with_sibling(|_| {})?
         {
             self.next_r = Some(IterItem::new(
                 self.cached_key,
@@ -1144,7 +1191,7 @@ where
             ));
         }
 
-        return match (self.next_l.take(), self.next_r.take()) {
+        Ok(match (self.next_l.take(), self.next_r.take()) {
             (None, None) => None,
             (None, Some(r)) => Some(r),
             (Some(l), None) => Some(l),
@@ -1171,14 +1218,14 @@ where
                     }
                 }
             }
-        };
+        })
     }
 }
 
 struct LeafFilter<'a> {
     txid: u64,
     last: Option<&'a [u8]>,
-    junks: Junks,
+    junks: &'a mut Vec<u64>,
     skip_dup: bool,
 }
 
@@ -1241,19 +1288,18 @@ mod test {
     use crate::{
         Options,
         types::{
-            data::{Key, LeafSeg, Record, Val, Ver},
-            node::Node,
-            refbox::{BaseView, BoxRef, BoxView, DeltaView},
-            traits::{ICodec, IFrameAlloc, IHeader, ILoader, IRetireSink},
+            data::{Key, LeafSeg, Record, Ver},
+            node::{Junk, Node},
+            refbox::{BoxRef, BoxView, DeltaView},
+            traits::{IFrameAlloc, IHeader, ILoader},
         },
-        utils::{NULL_ADDR, NULL_PID, OpCode},
+        utils::{OpCode, data::Position},
     };
 
     struct AInner {
         map: Mutex<HashMap<u64, BoxRef>>,
         off: AtomicU64,
-        collected: Mutex<Vec<u64>>,
-        arena_size: usize,
+        frame_budget: usize,
     }
 
     #[derive(Clone)]
@@ -1263,16 +1309,15 @@ mod test {
 
     impl A {
         fn new() -> Self {
-            Self::new_with_arena_size(64 << 20)
+            Self::new_with_frame_budget(64 << 20)
         }
 
-        fn new_with_arena_size(arena_size: usize) -> Self {
+        fn new_with_frame_budget(frame_budget: usize) -> Self {
             Self {
                 inner: Rc::new(AInner {
                     map: Mutex::new(HashMap::new()),
                     off: AtomicU64::new(0),
-                    collected: Mutex::new(Vec::new()),
-                    arena_size,
+                    frame_budget,
                 }),
             }
         }
@@ -1281,15 +1326,10 @@ mod test {
             let lk = self.inner.map.lock();
             lk.get(&addr).unwrap().clone()
         }
-
-        fn take_collected(&self) -> Vec<u64> {
-            let mut lk = self.inner.collected.lock();
-            std::mem::take(&mut *lk)
-        }
     }
 
     impl IFrameAlloc for A {
-        fn try_alloc(&mut self, size: u32) -> Result<BoxRef, OpCode> {
+        fn alloc(&mut self, size: u32) -> BoxRef {
             let addr = self
                 .inner
                 .off
@@ -1297,26 +1337,15 @@ mod test {
             let p = BoxRef::alloc(size, addr);
             let mut lk = self.inner.map.lock();
             lk.insert(addr, p.clone());
-            Ok(p)
+            p
         }
 
-        fn try_alloc_pair(&mut self, size1: u32, size2: u32) -> Result<(BoxRef, BoxRef), OpCode> {
-            Ok((self.try_alloc(size1)?, self.try_alloc(size2)?))
-        }
-
-        fn arena_size(&mut self) -> usize {
-            self.inner.arena_size
+        fn frame_budget(&mut self) -> usize {
+            self.inner.frame_budget
         }
 
         fn inline_size(&self) -> usize {
             Options::MIN_INLINE_SIZE
-        }
-    }
-
-    impl IRetireSink for A {
-        fn collect(&mut self, addr: &[u64]) {
-            let mut lk = self.inner.collected.lock();
-            lk.extend_from_slice(addr);
         }
     }
 
@@ -1330,11 +1359,11 @@ mod test {
             lk.insert(data.header().addr, data);
         }
 
-        fn shallow_copy(&self) -> Self {
+        fn copy_with_pin(&self) -> Self {
             self.clone()
         }
 
-        fn deep_copy(&self) -> Self {
+        fn copy_without_pin(&self) -> Self {
             self.clone()
         }
 
@@ -1344,130 +1373,88 @@ mod test {
     }
 
     #[test]
-    fn split_overlay_keeps_delta_changes() {
-        let mut a = A::new();
-        let txid = AtomicU64::new(1);
-        let l = a.clone();
-        let mut node = Node::new_leaf(&mut a, l);
-
-        for raw in ["a", "b", "c", "d"] {
-            let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
-            let v = Record::normal(1, raw.as_bytes());
-            let (d, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
-            node.insert_inplace(d.view().as_delta());
-            node.save(d, r);
-        }
-
-        (node, _) = node.try_compact(&mut a, u64::MAX).unwrap();
-
-        let k = Key::new("zz".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
-        let v = Record::normal(1, "zz".as_bytes());
-        let (d, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
-        node.insert_inplace(d.view().as_delta());
-        node.save(d, r);
-
-        let probe = Key::new("zz".as_bytes(), Ver::new(u64::MAX, 0));
-        let (l_new, r_new, _) = node.try_split_overlay(&mut a, u64::MAX).unwrap();
-        let (l_old, r_old) = node.try_split(&mut a).unwrap();
-        assert!(l_old.find_latest(&probe).is_none());
-        assert!(r_old.find_latest(&probe).is_none());
-        assert!(l_new.find_latest(&probe).is_some() || r_new.find_latest(&probe).is_some());
-    }
-
-    #[test]
-    fn merge_overlay_keeps_delta_changes() {
-        let mut a = A::new();
-        let txid = AtomicU64::new(1);
-        let l = a.clone();
-        let mut node = Node::new_leaf(&mut a, l);
-
-        for raw in ["a", "b", "c", "d"] {
-            let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
-            let v = Record::normal(1, raw.as_bytes());
-            let (d, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
-            node.insert_inplace(d.view().as_delta());
-            node.save(d, r);
-        }
-        (node, _) = node.try_compact(&mut a, u64::MAX).unwrap();
-        let (left, right) = node.try_split(&mut a).unwrap();
-
-        let kl = Key::new("aa".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
-        let vl = Record::normal(1, "aa".as_bytes());
-        let (dl, rl) = DeltaView::try_from_key_val(&mut a, &kl, &vl).unwrap();
-        left.insert_inplace(dl.view().as_delta());
-        left.save(dl, rl);
-
-        let kr = Key::new("zz".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
-        let vr = Record::normal(1, "zz".as_bytes());
-        let (dr, rr) = DeltaView::try_from_key_val(&mut a, &kr, &vr).unwrap();
-        right.insert_inplace(dr.view().as_delta());
-        right.save(dr, rr);
-
-        let (merged, _, _) = left.try_merge_node(&mut a, &right, u64::MAX).unwrap();
-        let probe_l = Key::new("aa".as_bytes(), Ver::new(u64::MAX, 0));
-        let probe_r = Key::new("zz".as_bytes(), Ver::new(u64::MAX, 0));
-        assert!(merged.find_latest(&probe_l).is_some());
-        assert!(merged.find_latest(&probe_r).is_some());
-    }
-
-    #[test]
     fn leaf_iter() {
         let mut a = A::new();
         let txid = AtomicU64::new(1);
         const CONSOLIDATE_THRESHOLD: usize = 64;
+        let lsn = Position::default();
+        let mut j = Junk::new();
 
         {
             let l = a.clone();
-            let mut node = Node::new_leaf(&mut a, l);
+            let mut node = Node::new_leaf(&mut a, l, 0, Position::MIN);
 
-            let (d1, r1) = DeltaView::try_from_key_val(
+            let (d1, r1) = DeltaView::from_key_val(
                 &mut a,
                 &Key::new("foo".as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1)),
                 &Record::normal(1, "1".as_bytes()),
-            )
-            .unwrap();
-            let (d2, r2) = DeltaView::try_from_key_val(
+                0,
+                lsn,
+            );
+            let (d2, r2) = DeltaView::from_key_val(
                 &mut a,
                 &Key::new("foo".as_bytes(), Ver::new(txid.load(Relaxed), 2)),
                 &Record::normal(1, "2".as_bytes()),
-            )
-            .unwrap();
+                0,
+                lsn,
+            );
 
-            let (d3, r3) = DeltaView::try_from_key_val(
+            let (d3, r3) = DeltaView::from_key_val(
                 &mut a,
                 &Key::new("foo".as_bytes(), Ver::new(txid.load(Relaxed), 3)),
                 &Record::remove(1),
-            )
-            .unwrap();
+                0,
+                lsn,
+            );
 
-            node.insert_inplace(d1.view().as_delta());
+            node.insert_inplace(
+                d1.view().as_delta(),
+                r1.as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
             node.save(d1, r1);
-            node.insert_inplace(d2.view().as_delta());
+            node.insert_inplace(
+                d2.view().as_delta(),
+                r2.as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
             node.save(d2, r2);
-            (node, _) = node.try_compact(&mut a, 1).unwrap();
+            (node, _) = node.compact(&mut a, 1);
 
-            let iter = node.leaf_iter(1);
+            let iter = node.leaf_iter(&mut j, 1);
             assert_eq!(iter.count(), 2);
 
-            node.insert_inplace(d3.view().as_delta());
+            node.insert_inplace(
+                d3.view().as_delta(),
+                r3.as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
             node.save(d3, r3);
-            let iter = node.leaf_iter(3);
+            let iter = node.leaf_iter(&mut j, 3);
             assert_eq!(iter.count(), 0);
         }
 
         let l = a.clone();
-        let mut node = Node::new_leaf(&mut a, l);
+        let mut node = Node::new_leaf(&mut a, l, 0, Position::MIN);
 
         for i in 0..30 {
             let raw = format!("key_{i}");
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 1));
             let v = Record::normal(1, raw.as_bytes());
-            let (delta, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
-            node.insert_inplace(delta.view().as_delta());
+            let (delta, r) = DeltaView::from_key_val(&mut a, &k, &v, 0, lsn);
+            node.insert_inplace(
+                delta.view().as_delta(),
+                r.as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
             node.save(delta, r);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                (node, _) = node.try_compact(&mut a, 3).unwrap();
+                (node, _) = node.compact(&mut a, 3);
             }
         }
 
@@ -1476,12 +1463,17 @@ mod test {
             let raw = format!("key_{i}");
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 0));
             let v = Record::remove(1);
-            let (delta, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
-            node.insert_inplace(delta.view().as_delta());
+            let (delta, r) = DeltaView::from_key_val(&mut a, &k, &v, 0, lsn);
+            node.insert_inplace(
+                delta.view().as_delta(),
+                r.as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
             node.save(delta, r);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                (node, _) = node.try_compact(&mut a, 3).unwrap();
+                (node, _) = node.compact(&mut a, 3);
             }
         }
 
@@ -1490,17 +1482,22 @@ mod test {
             let raw = format!("key_{i}");
             let k = Key::new(raw.as_bytes(), Ver::new(txid.fetch_add(1, Relaxed), 0));
             let v = Record::normal(1, raw.as_bytes());
-            let (delta, r) = DeltaView::try_from_key_val(&mut a, &k, &v).unwrap();
-            node.insert_inplace(delta.view().as_delta());
+            let (delta, r) = DeltaView::from_key_val(&mut a, &k, &v, 0, lsn);
+            node.insert_inplace(
+                delta.view().as_delta(),
+                r.as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
             node.save(delta, r);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
-                (node, _) = node.try_compact(&mut a, 3).unwrap();
+                (node, _) = node.compact(&mut a, 3);
             }
         }
 
-        let mut last: Option<crate::types::data::LeafSeg<'_>> = None;
-        let iter = node.leaf_iter(3);
+        let mut last: Option<LeafSeg<'_>> = None;
+        let iter = node.leaf_iter(&mut j, 3);
 
         // make sure the iterator produce ascending sorted value
         for (k, _) in iter {
@@ -1508,54 +1505,6 @@ mod test {
                 assert!(old.cmp(&k).is_lt());
             }
             last = Some(k);
-        }
-    }
-
-    #[test]
-    fn garbage_collect_collects_whole_sibling_chain() {
-        let mut a = A::new_with_arena_size(96);
-        let l = a.clone();
-
-        fn gen_val(a: &mut A, r: Record) -> Val<'static> {
-            let sz = Val::calc_size(false, a.inline_size(), r.packed_size());
-            let mut b = a.try_alloc(sz as u32).unwrap();
-            Val::encode_inline(b.data_slice_mut::<u8>(), NULL_ADDR, &r);
-            Val::from_raw(unsafe { std::mem::transmute::<&[u8], &[u8]>(b.data_slice::<u8>()) })
-        }
-
-        let mut items = Vec::new();
-        for i in (0..16u64).rev() {
-            items.push((
-                LeafSeg::new(&[], "hot_key".as_bytes(), Ver::new(i + 1, 1)),
-                gen_val(&mut a, Record::normal(1, format!("v{i}").as_bytes())),
-            ));
-        }
-        let mut iter = items.iter().map(|x| (x.0, x.1));
-        let base = BaseView::try_new_leaf(&mut a, &l, &[], None, NULL_PID, &mut iter, 1).unwrap();
-        let node = Node::new(l, base);
-
-        let mut sst_iter = node.range_iter::<A, Key>(&node.loader, 0, node.header().elems as usize);
-        let (_, val) = sst_iter.next().expect("must exist");
-        let head = val.get_sibling().expect("must have sibling");
-
-        let mut sibling_chain = Vec::new();
-        let mut cur = head;
-        while cur != NULL_ADDR {
-            sibling_chain.push(cur);
-            let view = node.loader.load_unchecked(cur);
-            cur = view.header().link;
-        }
-        assert!(sibling_chain.len() > 1);
-
-        let (_next, junks) = node.try_compact(&mut a, u64::MAX).unwrap();
-        for addr in &sibling_chain {
-            assert!(junks.contains(addr));
-        }
-
-        node.garbage_collect(&mut a, &junks);
-        let collected = a.take_collected();
-        for addr in sibling_chain {
-            assert!(collected.contains(&addr));
         }
     }
 }
