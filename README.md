@@ -42,18 +42,17 @@ fn main() -> Result<(), OpCode> {
 
     // 2. Perform a write transaction
     let txn = bkt.begin()?;
-    txn.put("user:1", "alice")?;
-    txn.put("user:2", "bob")?;
+    txn.put("moha", "+1s")?;
     txn.commit()?;
 
     // 3. Read data using a consistent view
     let view = bkt.view()?;
-    let value = view.get("user:1")?;
-    println!("Value for user:1: {:?}", std::str::from_utf8(value.slice()));
+    let value = view.get("moha")?;
+    println!("moha => {:?}", std::str::from_utf8(value.slice()));
 
     // 4. Remove data
     let txn = bkt.begin()?;
-    txn.del("user:2")?;
+    txn.del("moha")?;
     txn.commit()?;
 
     Ok(())

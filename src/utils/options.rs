@@ -33,12 +33,7 @@ pub struct Options {
     pub data_garbage_ratio: u32,
     /// If true, compact immediately when [`Self::data_garbage_ratio`] is reached.
     pub gc_eager: bool,
-    /// If [`Self::gc_eager`] is false, compaction is triggered only when active data
-    /// can be compacted into [`Self::gc_compacted_size`].
-    ///
-    /// The default value is [`Self::data_file_size`].
-    pub gc_compacted_size: usize,
-    /// Size limit of a blob file.
+    /// Size limit of a blob file. default value [`Self::BLOB_FILE_SIZE`]
     pub blob_file_size: usize,
     /// Trigger blob GC when the garbage ratio exceeds this value, in the range [0, 100].
     pub blob_garbage_ratio: usize,
@@ -93,14 +88,14 @@ pub struct Options {
     pub blob_handle_cache_capacity: usize,
     /// For branch nodes, keys and indexes are always inlined.
     ///
-    /// For leaf nodes, keys, value headers, and values smaller than [`Self::INLINE_SIZE`]
+    /// For leaf nodes, keys, value headers, and values smaller than [`Self::MIN_INLINE_SIZE`]
     /// are also always inlined.
     pub inline_size: usize,
-    /// Size limit of a data file.
+    /// Size limit of a data file. at least [`Self::DATA_FILE_SIZE`]
     pub data_file_size: usize,
     /// Maximum bytes a single checkpoint round should emit.
     ///
-    /// 0 means use `data_file_size`.
+    /// 0 means use `data_file_size * 2`.
     pub checkpoint_size: usize,
     /// Threshold for consolidating delta chains.
     ///
@@ -124,7 +119,7 @@ pub struct Options {
     pub keep_stable_wal_file: bool,
     /// Maximum number of elements in an SST (B+Tree node).
     ///
-    /// The default is 512. SST size is roughly [`Self::INLINE_SIZE`] * [`Self::split_elems`].
+    /// The default is 512. SST size is roughly [`Self::MAX_INLINE_SIZE`] * [`Self::split_elems`].
     /// Large key-values are stored outside SST.
     ///
     /// **Once set, it cannot be modified**
@@ -173,7 +168,6 @@ impl Options {
             checkpoint_nudge_ms: 60 * 1000, // 1min
             data_garbage_ratio: 20,         // 20%
             gc_eager: true,
-            gc_compacted_size: Self::DATA_FILE_SIZE,
             blob_file_size: Self::BLOB_FILE_SIZE,
             blob_garbage_ratio: 50, // 50%
             blob_gc_ratio: 25,      // 25%
@@ -189,7 +183,6 @@ impl Options {
             blob_handle_cache_capacity: 128,
             inline_size: Self::MIN_INLINE_SIZE,
             data_file_size: Self::DATA_FILE_SIZE,
-            // Derived during validation so later tuning of `data_file_size` is reflected automatically.
             checkpoint_size: 0,
             pool_capacity: 0,
             consolidate_threshold: Self::MAX_SPLIT_ELEMS / 2,
@@ -231,9 +224,15 @@ impl Options {
             self.lru_capacity = Self::LRU_CAPACITY;
         }
         self.high_priority_ratio = self.high_priority_ratio.min(100);
+        if self.data_file_size == 0 {
+            self.data_file_size = Self::DATA_FILE_SIZE;
+        }
+        if self.blob_file_size == 0 {
+            self.blob_file_size = Self::BLOB_FILE_SIZE;
+        }
 
         if self.checkpoint_size == 0 {
-            self.checkpoint_size = self.data_file_size;
+            self.checkpoint_size = self.data_file_size * 2;
         }
 
         if self.pool_capacity == 0 {

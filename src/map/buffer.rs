@@ -16,7 +16,7 @@ use crate::{
     map::{
         DataReader, JunksMap, Loader, PagesMap, RetiredChain, SharedState, SparseFrontier,
         cache::{CANDIDATE_RING_SIZE, CANDIDATE_SAMPLE_RATE, CacheState, CandidateRing, NodeCache},
-        data::{CheckpointTask, EpochInflight, PidMap, PidSet},
+        data::{AddrSet, CheckpointTask, EpochInflight, PidMap, PidSet},
         table::Swip,
     },
     types::{page::Page, traits::IHeader},
@@ -80,6 +80,7 @@ pub(crate) struct Current {
     pub(crate) pages: Arc<PagesMap>,
     pub(crate) bytes: Arc<AtomicUsize>,
     pub(crate) retired: Arc<JunksMap>,
+    pub(crate) new_junks: Arc<AddrSet>,
     pub(crate) dirty_roots: Arc<PidMap>,
     pub(crate) unmap_pid: Arc<PidSet>,
     pub(crate) inflight: Arc<EpochInflight>,
@@ -126,6 +127,13 @@ pub(crate) struct JunkSlot {
     pub(crate) sealed: Option<Arc<JunksMap>>,
 }
 
+pub(crate) struct JunkAddrSlot {
+    // current writable generation of newly produced junk addrs
+    pub(crate) hot: Arc<AddrSet>,
+    // last swapped generation visible to checkpoint snapshot
+    pub(crate) sealed: Option<Arc<AddrSet>>,
+}
+
 pub(crate) struct PidSlot {
     // pid->addr roots and pid-unmap marks for the current writable generation
     pub(crate) root_map: Arc<PidMap>,
@@ -139,6 +147,7 @@ struct EpochRegistry {
     // mutable per-generation slots (hot/sealed)
     page: Arc<RwLock<PageSlot>>,
     retired: Arc<RwLock<JunkSlot>>,
+    junk_addr: Arc<RwLock<JunkAddrSlot>>,
     root: Arc<RwLock<PidSlot>>,
     // fast writer snapshot to avoid cloning 3 locks in capture_epoch()
     hot: RwLock<Arc<Current>>,
@@ -160,7 +169,6 @@ pub(crate) struct Pool {
     last_chkpt_lsn: MutRef<GroupPositions>,
     flow: Arc<FlowController>,
     epochs: EpochRegistry,
-    // pages pending EBR reclamation after retire_junks()
     retired_pages: Arc<PagesMap>,
     recycle: RecycleBins,
     pub(crate) state: MutRef<BucketState>,
@@ -187,6 +195,7 @@ impl Pool {
         ));
         let hot_bytes = Arc::new(AtomicUsize::new(0));
         let hot_retired = Arc::new(JunksMap::default());
+        let hot_new_junks = Arc::new(AddrSet::new());
         let dirty_roots = Arc::new(PidMap::new());
         let unmap_pid = Arc::new(PidSet::new());
         let inflight = Arc::new(EpochInflight::new());
@@ -194,6 +203,7 @@ impl Pool {
             pages: hot_pages.clone(),
             bytes: hot_bytes.clone(),
             retired: hot_retired.clone(),
+            new_junks: hot_new_junks.clone(),
             dirty_roots: dirty_roots.clone(),
             unmap_pid: unmap_pid.clone(),
             inflight: inflight.clone(),
@@ -217,6 +227,10 @@ impl Pool {
                 })),
                 retired: Arc::new(RwLock::new(JunkSlot {
                     hot: hot_retired,
+                    sealed: None,
+                })),
+                junk_addr: Arc::new(RwLock::new(JunkAddrSlot {
+                    hot: hot_new_junks,
                     sealed: None,
                 })),
                 root: Arc::new(RwLock::new(PidSlot {
@@ -375,8 +389,11 @@ impl Pool {
         g: &Guard,
         old_base_addr: u64,
         new_base_addr: u64,
-        mut junks: Vec<u64>,
+        structural_junks: Vec<u64>,
+        mut compaction_junks: Vec<u64>,
     ) {
+        let mut junks = structural_junks.clone();
+        junks.append(&mut compaction_junks);
         #[cfg(feature = "extra_check")]
         {
             let mut h = std::collections::HashSet::new();
@@ -387,6 +404,17 @@ impl Pool {
                     i
                 };
                 assert!(h.insert(x), "duplicated");
+            }
+        }
+        for &raw in &junks {
+            let logical = if RemoteView::is_tagged(raw) {
+                RemoteView::untagged(raw)
+            } else {
+                raw
+            };
+            // only new junk produced in this write generation should be tracked here
+            if w.pages.contains_key(&logical) {
+                w.new_junks.mark(logical);
             }
         }
 
@@ -467,8 +495,9 @@ impl Pool {
             }
         }
 
-        // phase 4. retire_now
-        self.retire_junks(&w.pages, &w.bytes, g, &junks);
+        // phase 4. only structural junk is retired at publish time; compaction junk can still
+        // be reached by the post-publish live graph and must stay in dirty generations.
+        self.retire_junks(&w.pages, &w.bytes, g, &structural_junks);
 
         // append current-round junks after inherited lineage
         //
@@ -555,12 +584,22 @@ impl Pool {
             return;
         }
         self.last_checkpoint_ms.store(mono_ms(), Release);
-        let (pages, sealed_bytes, retired, dirty_roots, unmap_pid, epoch_inflight, snap_addr) = {
+        let (
+            pages,
+            sealed_bytes,
+            retired,
+            new_junks,
+            dirty_roots,
+            unmap_pid,
+            epoch_inflight,
+            snap_addr,
+        ) = {
             // single critical section that performs a full epoch cut:
             // swap hot generations, publish sealed generations, and rotate writer roots/inflight
             let _gate = self.epochs.gate.write();
             let mut page_epoch = self.epochs.page.write();
             let mut retired_epoch = self.epochs.retired.write();
+            let mut junk_addr_epoch = self.epochs.junk_addr.write();
             let mut root_epoch = self.epochs.root.write();
             let old_pages =
                 std::mem::replace(&mut page_epoch.hot, Arc::new(self.take_recycled_pages()));
@@ -570,6 +609,8 @@ impl Pool {
                 &mut retired_epoch.hot,
                 Arc::new(self.take_recycled_retired()),
             );
+            let old_new_junks =
+                std::mem::replace(&mut junk_addr_epoch.hot, Arc::new(AddrSet::new()));
             let old_dirty = std::mem::replace(&mut root_epoch.root_map, Arc::new(PidMap::new()));
             let old_unmap = std::mem::replace(&mut root_epoch.unmap_pid, Arc::new(PidSet::new()));
             let old_inflight =
@@ -578,10 +619,12 @@ impl Pool {
             page_epoch.sealed = Some(old_pages.clone());
             page_epoch.sealed_bytes = Some(old_hot_bytes.clone());
             retired_epoch.sealed = Some(old_retired.clone());
+            junk_addr_epoch.sealed = Some(old_new_junks.clone());
             let next_hot_epoch = Arc::new(Current {
                 pages: page_epoch.hot.clone(),
                 bytes: page_epoch.hot_bytes.clone(),
                 retired: retired_epoch.hot.clone(),
+                new_junks: junk_addr_epoch.hot.clone(),
                 dirty_roots: root_epoch.root_map.clone(),
                 unmap_pid: root_epoch.unmap_pid.clone(),
                 inflight: root_epoch.inflight.clone(),
@@ -591,6 +634,7 @@ impl Pool {
                 old_pages,
                 old_hot_bytes,
                 old_retired,
+                old_new_junks,
                 old_dirty,
                 old_unmap,
                 old_inflight,
@@ -611,8 +655,10 @@ impl Pool {
             sealed_bytes,
             sealed_bytes_init: sealed_init,
             retired,
+            new_junks,
             page_epoch: self.epochs.page.clone(),
             retired_epoch: self.epochs.retired.clone(),
+            junk_epoch: self.epochs.junk_addr.clone(),
             root_epoch: self.epochs.root.clone(),
             snap_addr,
             page_recycle: self.recycle.pages.clone(),

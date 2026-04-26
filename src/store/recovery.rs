@@ -225,13 +225,13 @@ impl Recovery {
         g: &Guard,
         f: &mut File,
         loc: &mut Location,
-        buf: &mut [u8],
+        block: &mut Block,
         store: MutRef<Store>,
     ) -> Result<bool, OpCode> {
-        assert!((loc.len as usize) < buf.len());
-        f.read(&mut buf[0..loc.len as usize], loc.pos.offset)?;
+        assert!((loc.len as usize) <= block.len());
+        f.read(block.mut_slice(0, loc.len as usize), loc.pos.offset)?;
 
-        let u = ptr_to::<WalUpdate>(buf.as_ptr());
+        let u = ptr_to::<WalUpdate>(block.data());
 
         if !u.is_intact() {
             return Ok(false);
@@ -294,7 +294,6 @@ impl Recovery {
             if end == 0 {
                 break; // empty wal file
             }
-            let buf = block.mut_slice(0, block.len());
             static_assert!(size_of::<EntryType>() == 1);
 
             loc.pos.file_id = i;
@@ -305,7 +304,7 @@ impl Recovery {
             while pos < end {
                 let start_pos = pos;
                 let hdr = {
-                    let hdr = &mut buf[0..1];
+                    let hdr = block.mut_slice(0, 1);
                     f.read(hdr, pos)?;
                     hdr[0]
                 };
@@ -318,10 +317,10 @@ impl Recovery {
                 debug_assert!(sz < Self::INIT_BLOCK_SIZE);
 
                 log::trace!("pos {pos} sz {sz} {et:?}");
-                f.read(&mut buf[0..sz], pos)?;
+                f.read(block.mut_slice(0, sz), pos)?;
 
                 pos += sz as u64;
-                let ptr = buf.as_ptr();
+                let ptr = block.data();
                 match et {
                     EntryType::Commit => {
                         let a = ptr_to::<WalCommit>(ptr);
@@ -371,27 +370,29 @@ impl Recovery {
                     }
                     EntryType::Update => {
                         let u = ptr_to::<WalUpdate>(ptr);
-                        if pos + u.payload_len() as u64 > end {
+                        let payload_len = u.payload_len();
+                        if pos + payload_len as u64 > end {
                             pos = start_pos;
                             break;
                         }
-                        loc.len = (sz + u.payload_len()) as u32;
+                        loc.len = (sz + payload_len) as u32;
+                        let txid = u.txid;
                         if block.len() < loc.len as usize {
                             block.realloc(loc.len as usize);
                         }
-                        log::trace!("{pos} => {u:?}");
+                        log::trace!("{pos} => update txid={txid}");
                         loc.pos.offset = pos - sz as u64;
 
-                        if let Some(l) = self.undo_table.get_mut(&{ u.txid }) {
+                        if let Some(l) = self.undo_table.get_mut(&{ txid }) {
                             // update to latest record position
                             l.pos.file_id = i;
                             l.pos.offset = loc.pos.offset;
                         }
-                        if !self.handle_update(g, &mut f, &mut loc, buf, store.clone())? {
+                        if !self.handle_update(g, &mut f, &mut loc, block, store.clone())? {
                             pos = start_pos;
                             break;
                         }
-                        pos += u.payload_len() as u64;
+                        pos += payload_len as u64;
                     }
                     _ => {
                         return Err(OpCode::Corruption);

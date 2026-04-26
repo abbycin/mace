@@ -38,7 +38,6 @@ fn fast_manual_data_cycle() -> Result<(), OpCode> {
         options.gc_timeout = 60_000;
         options.data_garbage_ratio = 1;
         options.data_file_size = 16 << 10;
-        options.gc_compacted_size = options.data_file_size;
     })?;
 
     let bucket = engine.new_bucket("prod_gc_data")?;

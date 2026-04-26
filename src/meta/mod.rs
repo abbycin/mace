@@ -1185,7 +1185,6 @@ where
         self.common.junk.start();
     }
 
-    // see comment in `try_get_reloc`
     fn load(&self, addr: u64, ctx: &BucketContext) -> Result<BoxRef, OpCode> {
         let file_id = {
             let ivl_map = K::intervals(ctx).read();

@@ -10,6 +10,7 @@ use std::{
     },
 };
 
+pub(crate) mod addr_trace;
 pub(crate) mod bitmap;
 pub(crate) mod block;
 pub(crate) mod countblock;

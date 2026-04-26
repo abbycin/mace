@@ -61,9 +61,11 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                     Ok(x) => match x {
                         GC_PAUSE => {
                             pause = true;
+                            sem.post();
                         }
                         GC_RESUME => {
                             pause = false;
+                            sem.post();
                         }
                         GC_START => {
                             gc.run();
@@ -106,10 +108,12 @@ impl GCHandle {
 
     pub(crate) fn pause(&self) {
         self.tx.send(GC_PAUSE).unwrap();
+        self.sem.wait();
     }
 
     pub(crate) fn resume(&self) {
         self.tx.send(GC_RESUME).unwrap();
+        self.sem.wait();
     }
 
     pub(crate) fn start(&self) {
@@ -523,7 +527,7 @@ impl GarbageCollector {
 
     fn process_data(&mut self) {
         let tgt_ratio = self.store.opt.data_garbage_ratio as u64;
-        let tgt_size = self.store.opt.gc_compacted_size;
+        let tgt_size = self.store.opt.data_file_size;
         let eager = self.store.opt.gc_eager;
 
         let buckets: Vec<u64> = self

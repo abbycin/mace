@@ -64,31 +64,43 @@ impl<'a> Publish<'a> {
         self.g.defer(move || old.reclaim());
     }
 
-    pub(crate) fn evict(&mut self, old: Page, mut node: Node, mut junks: Vec<u64>, addr: u64) {
+    pub(crate) fn evict(&mut self, old: Page, mut node: Node, junks: Vec<u64>, addr: u64) {
         let pid = old.pid();
         let old_base = old.base_addr();
         // compact/merge may pass extra junks, but old base/delta must always be retired
-        old.collect_junk(|x| junks.push(x));
+        let mut structural_junks = Vec::new();
+        old.collect_junk(|x| structural_junks.push(x));
         node.set_pid(pid);
         let new_base = node.base_addr();
         debug_assert_eq!(Swip::new(addr).untagged(), node.latest_addr());
         self.evict_simple(pid, old, addr);
-        self.bucket
-            .pool
-            .transfer_junks(&self.epoch, self.g, old_base, new_base, junks);
+        self.bucket.pool.transfer_junks(
+            &self.epoch,
+            self.g,
+            old_base,
+            new_base,
+            structural_junks,
+            junks,
+        );
     }
 
-    pub(crate) fn replace(&mut self, old: Page, mut node: Node, mut junks: Vec<u64>) -> Page {
+    pub(crate) fn replace(&mut self, old: Page, mut node: Node, junks: Vec<u64>) -> Page {
         let pid = old.pid();
         let old_base = old.base_addr();
         let new_base = node.base_addr();
-        old.collect_junk(|x| junks.push(x));
+        let mut structural_junks = Vec::new();
+        old.collect_junk(|x| structural_junks.push(x));
         node.set_pid(pid);
         let new = Page::new(node);
         if self.table.cas(pid, old.swip(), new.swip()).is_ok() {
-            self.bucket
-                .pool
-                .transfer_junks(&self.epoch, self.g, old_base, new_base, junks);
+            self.bucket.pool.transfer_junks(
+                &self.epoch,
+                self.g,
+                old_base,
+                new_base,
+                structural_junks,
+                junks,
+            );
             self.bucket.warm(pid, new.size());
             self.touch_pid(pid, new_base);
             self.g.defer(move || old.reclaim());

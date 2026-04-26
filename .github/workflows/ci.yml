@@ -112,4 +112,4 @@ jobs:
       # Note: Running tests for ARM64 on x86_64 requires QEMU via cross.
       # If you want to actually run the tests:
       - name: Run tests for ARM64
-        run: cross test --target aarch64-unknown-linux-gnu --verbose -- --nocapture
+        run: cross test --features extra_check --target aarch64-unknown-linux-gnu --verbose -- --nocapture

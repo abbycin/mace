@@ -172,6 +172,9 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
     crate::utils::failpoint::crash("mace_flush_after_data_sync");
 
     task.mark_io_built(actual_bytes, io_started.elapsed());
+    // all data has been fushed, the rest are junk pages that will never be accessed, clear them before
+    // sync file to release memory
+    task.pages.clear();
     observer.on_flush(FlushResult {
         sync_all: ctx.opt.sync_on_write,
         bucket_id,

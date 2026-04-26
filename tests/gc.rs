@@ -13,7 +13,6 @@ fn gc_data() -> Result<(), OpCode> {
     opt.gc_timeout = 20;
     opt.data_garbage_ratio = 1;
     opt.data_file_size = 512 << 10;
-    opt.gc_compacted_size = opt.data_file_size;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x").unwrap();
     let cap = 20000;
@@ -169,6 +168,7 @@ fn abort_txn() {
     for i in 0..50000 {
         let x = format!("key_{i}");
         let _ = kv.put(&x, &x);
+        db.checkpoint();
     }
     let r = kv.commit();
 
@@ -242,7 +242,6 @@ fn gc_observer_metrics() -> Result<(), OpCode> {
     opt.sync_on_write = false;
     opt.data_garbage_ratio = 1;
     opt.data_file_size = 128 << 10;
-    opt.gc_compacted_size = opt.data_file_size;
     opt.observer = observer.clone();
 
     let mace = Mace::new(opt.validate().unwrap()).unwrap();

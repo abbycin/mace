@@ -1,5 +1,5 @@
 use crate::io::{File, GatherIO};
-use crate::map::buffer::{JunkSlot, PageSlot, PidSlot};
+use crate::map::buffer::{JunkAddrSlot, JunkSlot, PageSlot, PidSlot};
 use crate::map::flow::CheckpointFlow;
 use crate::map::table::PageMap;
 use crc32c::Crc32cHasher;
@@ -9,7 +9,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use crate::map::{IFooter, JunksMap, PagesMap};
 use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, PageTable};
 use crate::types::header::{NodeType, TagFlag, TagKind};
-use crate::types::refbox::{BoxRef, RemoteView};
+use crate::types::refbox::{BaseView, BoxRef, RemoteView};
 use crate::types::traits::{IAsSlice, IHeader};
 use crate::utils::bitmap::BitMap;
 use crate::utils::block::Block;
@@ -118,6 +118,35 @@ impl Default for PidSet {
     }
 }
 
+pub(crate) struct AddrSet {
+    live: FastSet<u64>,
+}
+
+impl AddrSet {
+    pub(crate) fn new() -> Self {
+        Self {
+            live: FastSet::with_hasher(BuildHasherDefault::default()),
+        }
+    }
+
+    pub(crate) fn mark(&self, addr: u64) {
+        self.live.insert(addr);
+    }
+}
+
+impl Default for AddrSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deref for AddrSet {
+    type Target = FastSet<u64>;
+    fn deref(&self) -> &Self::Target {
+        &self.live
+    }
+}
+
 impl Deref for PidSet {
     type Target = FastSet<u64>;
     fn deref(&self) -> &Self::Target {
@@ -135,8 +164,10 @@ pub(crate) struct CheckpointTask {
     pub(crate) sealed_bytes: Arc<AtomicUsize>,
     pub(crate) sealed_bytes_init: usize,
     pub(crate) retired: Arc<JunksMap>,
+    pub(crate) new_junks: Arc<AddrSet>,
     pub(crate) page_epoch: Arc<RwLock<PageSlot>>,
     pub(crate) retired_epoch: Arc<RwLock<JunkSlot>>,
+    pub(crate) junk_epoch: Arc<RwLock<JunkAddrSlot>>,
     pub(crate) root_epoch: Arc<RwLock<PidSlot>>,
     pub(crate) snap_addr: u64,
     pub(crate) page_recycle: Arc<Mutex<Vec<PagesMap>>>,
@@ -224,6 +255,27 @@ impl CheckpointTask {
         }
     }
 
+    fn enqueue_leaf_refs(
+        base: BaseView,
+        q: &mut VecDeque<u64>,
+        siblings: &mut Vec<u64>,
+        remotes: &mut Vec<u64>,
+    ) {
+        siblings.clear();
+        if base.load_sibling_heads_hint(siblings) {
+            for &addr in siblings.iter() {
+                q.push_back(addr);
+            }
+        }
+
+        remotes.clear();
+        if base.load_remote_hints(remotes) {
+            for &addr in remotes.iter() {
+                q.push_back(addr);
+            }
+        }
+    }
+
     pub(crate) fn snapshot(&mut self) -> Snapshot {
         self.epoch_inflight.wait_zero();
         // old-generation writers can still append to sealed_bytes between epoch cut and wait_zero
@@ -249,6 +301,13 @@ impl CheckpointTask {
             if unmap_pid.contains(&pid) {
                 continue;
             }
+            #[cfg(feature = "extra_check")]
+            assert!(
+                !self.new_junks.contains(&addr),
+                "dirty root {} unexpectedly points to new junk addr {}",
+                pid,
+                addr
+            );
             if addr > self.snap_addr {
                 hot_dirty_roots.mark(pid, addr);
                 self.rehot_page(addr, &hot_pages, &hot_bytes);
@@ -267,6 +326,9 @@ impl CheckpointTask {
             if !seen.insert(addr) {
                 continue;
             }
+            if self.new_junks.contains(&addr) {
+                continue;
+            }
 
             if addr > self.snap_addr {
                 self.rehot_page(addr, &hot_pages, &hot_bytes);
@@ -278,6 +340,14 @@ impl CheckpointTask {
             } else if let Some(x) = hot_pages.get(&addr) {
                 (x.value().clone(), false)
             } else {
+                if addr > self.snap_addr {
+                    assert!(
+                        addr <= self.snap_addr,
+                        "checkpoint snapshot lost unpersisted addr {} above snap_addr {}",
+                        addr,
+                        self.snap_addr,
+                    );
+                }
                 // the addr is no longer dirty in this generation, treat it as
                 // already persisted or reclaimed
                 continue;
@@ -307,10 +377,12 @@ impl CheckpointTask {
                                 } else {
                                     x
                                 };
-                                // only emit junks that are no longer dirty in either generation
-                                if self.pages.contains_key(&logical)
-                                    || hot_pages.contains_key(&logical)
-                                {
+                                if logical > self.snap_addr {
+                                    continue;
+                                }
+                                // current-generation junk that is still in sealed pages has not
+                                // been persisted, so metadata has nothing to retire yet
+                                if self.new_junks.contains(&logical) {
                                     continue;
                                 }
                                 if RemoteView::is_tagged(x) {
@@ -323,14 +395,12 @@ impl CheckpointTask {
                             chain_frontier = true;
                         }
                         if h.node_type == NodeType::Leaf {
-                            siblings.clear();
-                            if base.load_sibling_heads_hint(&mut siblings) {
-                                queue.extend(siblings.iter().copied());
-                            }
-                            remote_hints.clear();
-                            if base.load_remote_hints(&mut remote_hints) {
-                                queue.extend(remote_hints.iter().copied());
-                            }
+                            Self::enqueue_leaf_refs(
+                                base,
+                                &mut queue,
+                                &mut siblings,
+                                &mut remote_hints,
+                            );
                         }
                     } else if h.kind == TagKind::Delta && h.node_type == NodeType::Leaf {
                         let remote = b.view().as_delta().val().get_remote();
@@ -383,11 +453,14 @@ impl CheckpointTask {
     }
 
     fn finish(self) {
-        let mut page_epoch = self.page_epoch.write();
-        page_epoch.sealed = None;
-        page_epoch.sealed_bytes = None;
-        drop(page_epoch);
-        self.retired_epoch.write().sealed = None;
+        {
+            let mut page_epoch = self.page_epoch.write();
+            page_epoch.sealed = None;
+            page_epoch.sealed_bytes = None;
+            drop(page_epoch);
+            self.retired_epoch.write().sealed = None;
+            self.junk_epoch.write().sealed = None;
+        }
 
         Self::recycle_generation(
             self.pages,

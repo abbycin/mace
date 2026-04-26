@@ -1,3 +1,10 @@
+## [0.0.30] 2026-04-26
+### Bug Fixes
+- Fixed a reachable-junk lifecycle regression that could cause `addr not in interval` / false `NotFound` reads during checkpoint churn.
+  - Junk handling now distinguishes structural junk from compaction junk: only structural junk is retired at publish time, while compaction junk remains readable in dirty generations until checkpoint durability closure.
+  - Checkpoint snapshot now tracks and filters newly produced junk addresses per epoch, and keeps sibling/remote-hint reachability traversal intact, preventing interval lookup holes for still-reachable addresses.
+  - Added a regression test (`reachable_junk_regression_guard`) to verify lagging-view reads remain correct across split/consolidate/checkpoint churn.
+
 ## [0.0.29] 2026-04-23 (AI-Assisted)
 ### Changes
 - Refactored Pool from an arena/batch-oriented flush pipeline to a page-checkpoint pipeline: checkpoint now snapshots sealed page generations, frozen dirty roots, and retired chains directly from page state.

@@ -57,7 +57,6 @@ fn child_setup_common(db_root: &Path) -> (Mace, Bucket) {
         opt.gc_timeout = 20;
         opt.gc_eager = true;
         opt.data_garbage_ratio = 1;
-        opt.gc_compacted_size = opt.data_file_size;
         opt.inline_size = 512;
     });
 
@@ -80,7 +79,6 @@ fn child_setup_gc(db_root: &Path) -> (Mace, Bucket) {
         opt.gc_timeout = 20;
         opt.gc_eager = true;
         opt.data_garbage_ratio = 1;
-        opt.gc_compacted_size = opt.data_file_size;
         opt.inline_size = 256;
         opt.blob_garbage_ratio = 1;
         opt.blob_gc_ratio = 100;
@@ -105,7 +103,6 @@ fn child_setup_retire(db_root: &Path) -> (Mace, Bucket) {
         opt.gc_timeout = 60_000;
         opt.gc_eager = false;
         opt.data_garbage_ratio = 1;
-        opt.gc_compacted_size = opt.data_file_size;
         opt.inline_size = 512;
     });
 

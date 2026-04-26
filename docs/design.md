@@ -131,6 +131,26 @@ Checkpoint cut (`Pool::checkpoint`):
 - recycles maps for reuse.
 - signals flow-controller completion.
 
+### Reachable-junk lifecycle constraints
+
+This is the regression boundary introduced by prior reachable-junk lifecycle changes.
+
+- `junk` produced during publish is not one class:
+  - structural junk: old base/delta retired by replace/evict itself.
+  - compaction junk: intermediate sibling/remote addresses collected during merge/compact.
+- only structural junk may be retired from hot pages at publish time (with EBR deferral).
+- compaction junk must stay discoverable in dirty generations until checkpoint durability closure.
+- any address still reachable from live graph traversal (`link` / sibling hints / remote hints)
+  must not enter the state "not in dirty memory and not yet in interval metadata".
+
+If these constraints are violated:
+
+- read path can hit interval lookup hole (`ivl_map.find(addr)` miss / `NotFound`) for still-reachable
+  old addresses.
+- long-lived views can observe false missing keys during checkpoint churn.
+- durability/visibility closure is broken: runtime may treat an address as persistent while metadata
+  has no mapping for it yet.
+
 ## Frontier design (durable boundary)
 
 Background issue solved by the frontier design:
@@ -354,6 +374,8 @@ Low-frequency recovery/GC metrics are reported without sampling.
 - Checkpoint epoch cut must atomically rotate hot/sealed generation handles.
 - Writers must not straddle checkpoint cut (`epochs.gate` + inflight wait-zero).
 - Sealed generations must be uniquely owned when checkpoint finishes.
+- Reachable addresses (including sibling/remote-referenced old pages) must stay readable from memory
+  until they are either durably published or proven unreachable by lifecycle closure.
 - Bucket durable frontier must monotonically advance per group.
 - Map publish and bucket frontier publish must be in the same manifest txn.
 - Recovery correctness must be gated by bucket frontier, not by group checkpoint alone.
@@ -361,6 +383,12 @@ Low-frequency recovery/GC metrics are reported without sampling.
 - Bucket delete is two-phase (`pending_del`), and `nr_buckets` decrements only after physical cleanup.
 - WAL recycling must stay below min(active-txn boundary, last checkpoint boundary).
 - Foreground admission wait must happen before entering `tree.update` critical mutation path.
+
+Invariant-break consequences to watch for:
+
+- `NotFound`/interval-miss on addresses that should still be reachable.
+- snapshot/read visibility regression under concurrent checkpoint (false key loss).
+- frontier/map correctness no longer matching actual durability boundary.
 
 ## Operational validation
 
