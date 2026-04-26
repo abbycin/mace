@@ -171,6 +171,7 @@ impl Tree {
             .nth(merge_index)
             .map(|(_, x)| x.pid)
             .unwrap();
+        let mut child_unmapped = false;
 
         loop {
             let cursor_ptr = if let Some(x) = self.load_node(g, cursor_pid)? {
@@ -207,8 +208,12 @@ impl Tree {
                 child_ptr.collect_junk(|x| junks.push(x));
                 build.collect_retired(child_ptr.base_addr(), &mut junks);
                 let mut publish = build.into_publish(g);
+                // NOTE: keep replace and mark_unmap in one publish to avoid checkpoint cutting across
+                // two write epochs and making one base addr appear in both dirty roots and junk pages
                 publish.replace(cursor_ptr, new_node, junks);
+                publish.mark_unmap(child_pid, child_ptr.swip());
                 publish.commit();
+                child_unmapped = true;
                 break;
             }
             let hi = cursor_ptr.hi();
@@ -232,7 +237,9 @@ impl Tree {
         // checkpoint will later make this NULL mapping durable and only then recycle child_pid into
         // the free list. otherwise readers/gc can still load child_pid and observe a reclaimed page.
         debug_assert_eq!(child_ptr.box_header().pid, child_pid);
-        self.begin_build().mark_unmap(child_pid, child_ptr.swip()); // child's junks were already collected
+        if !child_unmapped {
+            self.begin_build().mark_unmap(child_pid, child_ptr.swip()); // child's junks were already collected
+        }
         self.bucket.evict_cache(child_pid);
         g.defer(move || child_ptr.reclaim());
 

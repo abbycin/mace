@@ -304,6 +304,12 @@ impl ManifestBuilder {
             return;
         }
 
+        self.inner.opt.sync_data_dir();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash(
+            "mace_recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear",
+        );
+
         self.inner
             .btree
             .exec(BUCKET_NUMERICS, |txn| {

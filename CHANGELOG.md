@@ -1,3 +1,12 @@
+## [0.0.31] 2026-04-28
+### Bug Fixes
+- Deleted incorrect assertionsn
+- Fixed merge-path epoch split where `replace` and child `mark_unmap` could cross checkpoint cut and classify one addr as both dirty root and junk
+- Fixed durability closure around directory metadata updates and expanded crash-window validation:
+  - Added cross-platform `sync_dir` and used it for data/log directory sync after flush, WAL rotate/recycle, GC rewrite, delete-files, and recovery orphan cleanup
+  - Added failpoints for file-sync/dir-sync boundaries and corresponding production recovery chaos tests
+  - Recovery now rejects sparse WAL gaps after checkpoint frontier instead of silently continuing replay
+
 ## [0.0.30] 2026-04-26
 ### Bug Fixes
 - Fixed a reachable-junk lifecycle regression that could cause `addr not in interval` / false `NotFound` reads during checkpoint churn.

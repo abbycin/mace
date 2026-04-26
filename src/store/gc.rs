@@ -48,6 +48,7 @@ const GC_QUIT: i32 = -1;
 const GC_PAUSE: i32 = 3;
 const GC_RESUME: i32 = 5;
 const GC_START: i32 = 7;
+const GC_WAL: i32 = 11;
 
 fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) -> JoinHandle<()> {
     std::thread::Builder::new()
@@ -55,9 +56,15 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
         .spawn(move || {
             let timeout = Duration::from_millis(gc.store.opt.gc_timeout);
             let mut pause = false;
+            let mut next_run_at = Instant::now() + timeout;
 
             loop {
-                match rx.recv_timeout(timeout) {
+                let wait_timeout = if pause {
+                    timeout
+                } else {
+                    next_run_at.saturating_duration_since(Instant::now())
+                };
+                match rx.recv_timeout(wait_timeout) {
                     Ok(x) => match x {
                         GC_PAUSE => {
                             pause = true;
@@ -65,24 +72,32 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                         }
                         GC_RESUME => {
                             pause = false;
+                            next_run_at = Instant::now() + timeout;
                             sem.post();
                         }
                         GC_START => {
                             gc.run();
+                            if !pause {
+                                next_run_at = Instant::now() + timeout;
+                            }
                             sem.post();
+                        }
+                        GC_WAL => {
+                            GarbageCollector::process_wal_clean(gc.ctx);
                         }
                         GC_QUIT => break,
                         _ => unreachable!("invalid instruction  {}", x),
                     },
-                    Err(RecvTimeoutError::Timeout) => {
-                        if !pause {
-                            gc.run();
-                        }
-                    }
+                    Err(RecvTimeoutError::Timeout) => {}
                     Err(e) => {
                         log::error!("gc receive error {e}");
                         break;
                     }
+                }
+
+                if !pause && Instant::now() >= next_run_at {
+                    gc.run();
+                    next_run_at = Instant::now() + timeout;
                 }
             }
 
@@ -119,6 +134,12 @@ impl GCHandle {
     pub(crate) fn start(&self) {
         self.tx.send(GC_START).unwrap();
         self.sem.wait();
+    }
+
+    pub(crate) fn wal_clean(&self, ctx: Handle<Context>) {
+        if self.tx.send(GC_WAL).is_err() {
+            GarbageCollector::process_wal_clean(ctx);
+        }
     }
 
     pub(crate) fn data_gc_count(&self) -> u64 {
@@ -220,6 +241,7 @@ impl GarbageCollector {
     fn run(&mut self) {
         let started = Instant::now();
         self.store.opt.observer.counter(CounterMetric::GcRun, 1);
+        Self::process_wal_clean(self.ctx);
         self.process_data();
         self.process_blob();
         self.process_pending_buckets();
@@ -229,6 +251,71 @@ impl GarbageCollector {
             HistogramMetric::GcRunMicros,
             started.elapsed().as_micros() as u64,
         );
+    }
+
+    fn process_wal_clean(ctx: Handle<Context>) {
+        let mut log_dir_dirty = false;
+        for g in ctx.groups().iter() {
+            let mut checkpoint_id = g.active_txns.min_position_file_id();
+            let (oldest_id, last_ckpt_file) = {
+                let mut logging = g.logging.lock();
+                if ctx.opt.sync_on_write
+                    && let Err(e) = logging.sync(false)
+                {
+                    log::error!("wal sync fail, group {}, error {:?}", g.id, e);
+                    continue;
+                }
+                (logging.oldest_wal_id(), logging.last_ckpt().file_id)
+            };
+            checkpoint_id = checkpoint_id.min(last_ckpt_file);
+            if oldest_id >= checkpoint_id {
+                continue;
+            }
+
+            // [oldest_id, checkpoint_id)
+            let recycled = Self::process_one_wal(ctx, g.id as u8, oldest_id, checkpoint_id);
+            if recycled > 0 {
+                log_dir_dirty = true;
+                ctx.opt
+                    .observer
+                    .counter(CounterMetric::GcWalRecycleFile, recycled);
+            }
+            g.logging.lock().advance_oldest_wal_id(checkpoint_id);
+        }
+        if log_dir_dirty {
+            ctx.opt.sync_log_dir();
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync");
+        }
+    }
+
+    fn process_one_wal(ctx: Handle<Context>, group: u8, beg: u64, end: u64) -> u64 {
+        let mut recycled = 0;
+        // NOTE: not including `end`
+        for seq in beg..end {
+            let from = ctx.opt.wal_file(group, seq);
+            if !from.exists() {
+                continue;
+            }
+            let to = ctx.opt.wal_backup(group, seq);
+            if ctx.opt.keep_stable_wal_file {
+                log::info!("rename {from:?} to {to:?}");
+                std::fs::rename(&from, &to)
+                    .inspect_err(|e| {
+                        log::error!("can't rename {from:?} to {to:?}, error {e:?}");
+                    })
+                    .unwrap();
+            } else {
+                log::info!("unlink {from:?}");
+                std::fs::remove_file(&from)
+                    .inspect_err(|e| log::error!("can't remove {from:?}, error {e:?}"))
+                    .unwrap();
+            }
+            recycled += 1;
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_wal_recycle_after_remove_before_dir_sync");
+        }
+        recycled
     }
 
     fn process_pending_buckets(&mut self) {
@@ -700,6 +787,9 @@ impl GarbageCollector {
             })
             .unwrap();
         fstat.inner.bucket_id = bucket_id;
+        self.store.opt.sync_data_dir();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_data_rewrite_after_data_dir_sync");
 
         // 2. commit metadata transaction
         let mut txn = self.store.manifest.begin();
@@ -846,6 +936,9 @@ impl GarbageCollector {
             })
             .unwrap();
         bstat.inner.bucket_id = bucket_id;
+        self.store.opt.sync_data_dir();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_gc_blob_rewrite_after_data_dir_sync");
 
         // 2. commit metadata transaction
         let mut txn = self.store.manifest.begin();
@@ -1025,7 +1118,7 @@ impl<'a> DataReWriter<'a> {
         let mut seq = 0;
         let mut off = 0;
         let path = self.opt.data_file(self.file_id);
-        let mut writer = GatherWriter::append(&path, 128);
+        let mut writer = GatherWriter::trunc(&path, 128);
         let mut reloc: Vec<u8> = Vec::new();
         let mut reloc_map = HashMap::new();
         let buf = block.mut_slice(0, block.len());

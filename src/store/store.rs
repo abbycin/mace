@@ -1,3 +1,5 @@
+use parking_lot::Mutex;
+
 use crate::cc::context::Context;
 use crate::index::tree::Tree;
 pub use crate::index::txn::{TxnKV, TxnView};
@@ -27,6 +29,7 @@ use std::sync::mpsc::channel;
 struct StoreFlushObserver {
     manifest: Handle<Manifest>,
     ctx: Handle<Context>,
+    handle: Mutex<Option<GCHandle>>,
 }
 
 struct StoreDataReader {
@@ -87,7 +90,11 @@ impl DataReader for StoreDataReader {
 
 impl StoreFlushObserver {
     fn new(manifest: Handle<Manifest>, ctx: Handle<Context>) -> Self {
-        Self { manifest, ctx }
+        Self {
+            manifest,
+            ctx,
+            handle: Mutex::new(None),
+        }
     }
 
     #[cfg(feature = "failpoints")]
@@ -95,6 +102,10 @@ impl StoreFlushObserver {
     fn abort_flush_publish(stage: &str, err: OpCode) -> ! {
         log::error!("flush publish {} failed: {:?}", stage, err);
         std::process::abort()
+    }
+
+    fn attach_handle(&self, handle: GCHandle) {
+        self.handle.lock().replace(handle);
     }
 
     fn update_stat_interval(
@@ -154,7 +165,12 @@ impl StoreFlushObserver {
     }
 
     fn publish(&self, mut result: FlushResult) {
+        let has_new_files = !result.data_ivls.is_empty() || !result.blob_ivls.is_empty();
         result.sync(); // must be called before updatin manifest
+        if has_new_files {
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_flush_after_data_dir_sync");
+        }
         let bucket_id = result.bucket_id;
         let frontier_delta = *result.latest_chkpoint_lsn.deref();
         let bucket_frontier = self
@@ -254,8 +270,15 @@ impl CheckpointObserver for StoreFlushObserver {
         self.manifest.add_blob_stat(stat, ivl);
     }
 
-    fn on_flush(&self, result: FlushResult) {
+    fn on_checkpoint(&self, result: FlushResult) {
         self.publish(result)
+    }
+
+    fn finish_checkpoint(&self) {
+        let h = self.handle.lock();
+        if let Some(h) = h.as_ref() {
+            h.wal_clean(self.ctx);
+        }
     }
 }
 
@@ -441,13 +464,14 @@ impl Mace {
         let (wal_boot, ctx) = recover.phase1(manifest.numerics.clone())?;
         let observer = Arc::new(StoreFlushObserver::new(manifest, ctx));
         let reader = Arc::new(StoreDataReader::new(manifest));
-        manifest.set_context(ctx, reader, observer);
+        manifest.set_context(ctx, reader, observer.clone());
 
         let store = MutRef::new(Store::new(opt.clone(), manifest, ctx));
 
         recover.phase2(&wal_boot, store.clone())?;
         store.start();
         let handle = start_gc(store.clone(), store.context);
+        observer.attach_handle(handle.clone());
         let evictor = Evictor::new(
             opt.clone(),
             manifest.buckets,

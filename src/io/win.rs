@@ -1,10 +1,42 @@
 use std::{
     io::{self, Write},
-    os::windows::fs::FileExt,
+    os::windows::fs::{FileExt, OpenOptionsExt},
     path::Path,
 };
 
 use crate::io::{GatherIO, IoVec, OpenOptions};
+
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const ERROR_ACCESS_DENIED: i32 = 5;
+const ERROR_INVALID_HANDLE: i32 = 6;
+const ERROR_INVALID_FUNCTION: i32 = 1;
+const ERROR_NOT_SUPPORTED: i32 = 50;
+
+pub fn sync_dir<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        // windows does not provide a portable directory fsync, so once the directory
+        // handle is validated we treat the unsupported flush error as a no-op
+        Err(err)
+            if matches!(
+                err.raw_os_error(),
+                Some(
+                    ERROR_ACCESS_DENIED
+                        | ERROR_INVALID_HANDLE
+                        | ERROR_INVALID_FUNCTION
+                        | ERROR_NOT_SUPPORTED
+                )
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
 
 pub struct File {
     file: std::fs::File,

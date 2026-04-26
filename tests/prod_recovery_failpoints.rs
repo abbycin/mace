@@ -115,6 +115,27 @@ fn child_setup_retire(db_root: &Path) -> (Mace, Bucket) {
     (mace, bucket)
 }
 
+fn child_setup_wal_recycle(db_root: &Path) -> (Mace, Bucket) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 16 << 10;
+        opt.wal_buffer_size = 8 << 10;
+        opt.wal_file_size = 4 << 10;
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = false;
+        opt.inline_size = 512;
+    });
+
+    let bucket = match mace.get_bucket("prod") {
+        Ok(bucket) => bucket,
+        Err(OpCode::NotFound) => mace.new_bucket("prod").expect("create prod bucket failed"),
+        Err(err) => panic!("open prod bucket failed: {err:?}"),
+    };
+
+    (mace, bucket)
+}
+
 fn seed_committed_and_uncommitted(bucket: &Bucket, committed: usize, uncommitted: usize) {
     let txn = bucket.begin().expect("begin committed txn failed");
     for idx in 0..committed {
@@ -291,6 +312,28 @@ fn data_blob_files(db_root: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn wal_files(db_root: &Path, group: u8) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let root = db_root.join("log");
+    let prefix = format!("wal_{group}_");
+    let entries = std::fs::read_dir(&root).expect("read log dir failed");
+    for entry in entries {
+        let entry = entry.expect("read log dir entry failed");
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
 fn wait_for_data_dir_quiet(db_root: &Path, quiet: Duration, timeout: Duration) {
     let root = db_root.join("data");
     let fingerprint = || -> (u64, u64) {
@@ -437,6 +480,35 @@ fn child_case_manifest_before_multi_commit(db_root: &Path) -> ! {
     wait_for_crash(Duration::from_secs(20))
 }
 
+fn child_case_wal_recycle_before_dir_sync(db_root: &Path) -> ! {
+    let (mace, bucket) = child_setup_wal_recycle(db_root);
+    seed_committed_and_uncommitted(&bucket, 64, 24);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let payload = vec![b'w'; 1024];
+    let mut round = 0usize;
+
+    while Instant::now() < deadline {
+        let txn = bucket.begin().expect("begin wal recycle txn failed");
+        for idx in 0..64 {
+            txn.upsert(format!("rw_{round}_{idx}"), &payload)
+                .expect("upsert wal recycle key failed");
+        }
+        txn.commit().expect("commit wal recycle txn failed");
+        if round.is_multiple_of(4) {
+            bucket.checkpoint();
+            mace.start_gc();
+        }
+        round += 1;
+    }
+
+    panic!("wal recycle failpoint did not fire")
+}
+
+fn child_case_reopen_common(db_root: &Path) -> ! {
+    let _ = child_setup_common(db_root);
+    panic!("recovery failpoint did not fire")
+}
+
 fn child_case_txn_commit_abort_window(db_root: &Path) -> ! {
     let (_mace, bucket) = child_setup_common(db_root);
     seed_committed_and_uncommitted(&bucket, 64, 24);
@@ -525,6 +597,7 @@ fn failpoint_child() {
 
     match case.as_str() {
         "flush_after_data_sync" => child_case_flush_after_data_sync(&db_root),
+        "flush_after_data_dir_sync" => child_case_manifest_before_multi_commit(&db_root),
         "flush_before_manifest_commit" => child_case_manifest_before_multi_commit(&db_root),
         "flush_after_manifest_commit" => child_case_manifest_before_multi_commit(&db_root),
         "flush_after_manifest_commit_before_wal_checkpoint" => {
@@ -538,14 +611,29 @@ fn failpoint_child() {
         }
         "wal_after_checkpoint_write" => child_case_wal_after_checkpoint_write(&db_root),
         "manifest_before_multi_commit" => child_case_manifest_before_multi_commit(&db_root),
+        "wal_recycle_after_remove_before_dir_sync" => {
+            child_case_wal_recycle_before_dir_sync(&db_root)
+        }
+        "wal_recycle_after_dir_sync" => child_case_wal_recycle_before_dir_sync(&db_root),
         "gc_data_rewrite_before_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_stage_marker" => child_case_gc_data_before_meta_commit(&db_root),
+        "gc_data_rewrite_after_data_dir_sync" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_blob_rewrite_before_meta_commit" => child_case_gc_blob_before_meta_commit(&db_root),
         "gc_blob_rewrite_after_stage_marker" => child_case_gc_blob_before_meta_commit(&db_root),
+        "gc_blob_rewrite_after_data_dir_sync" => child_case_gc_blob_before_meta_commit(&db_root),
         "gc_blob_rewrite_after_meta_commit" => child_case_gc_blob_before_meta_commit(&db_root),
+        "delete_files_after_dir_sync_before_meta_commit" => {
+            child_case_gc_data_before_meta_commit(&db_root)
+        }
+        "recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear" => {
+            child_case_reopen_common(&db_root)
+        }
         "txn_commit_after_record_commit" => child_case_txn_commit_abort_window(&db_root),
         "txn_commit_after_wal_sync" => child_case_txn_commit_abort_window(&db_root),
+        "txn_commit_after_wal_file_sync_before_dir_sync" => {
+            child_case_txn_commit_abort_window(&db_root)
+        }
         "evictor_before_evict_once" => child_case_evictor_before_evict_once(&db_root),
         _ => panic!("unknown failpoint case: {case}"),
     }
@@ -561,6 +649,33 @@ fn chaos_failpoint_flush_after_data_sync() {
         "mace_flush_after_data_sync=abort@1",
     );
     assert_child_aborted(status, "flush failpoint child should abort");
+    let crashed_files = data_blob_files(&path);
+    assert!(
+        !crashed_files.is_empty(),
+        "expected flush crash to leave data/blob files before recovery"
+    );
+    assert_visibility_after_reopen(&path, 512, 64, 24);
+    for file in crashed_files {
+        assert!(
+            !file.exists(),
+            "flush orphan file should be cleaned on reopen: {file:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_flush_after_data_dir_sync() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "flush_after_data_dir_sync",
+        &path,
+        "mace_flush_after_data_dir_sync=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "flush-after-data-dir-sync failpoint child should abort",
+    );
     let crashed_files = data_blob_files(&path);
     assert!(
         !crashed_files.is_empty(),
@@ -713,6 +828,54 @@ fn chaos_failpoint_manifest_before_multi_commit() {
 
 #[test]
 #[ignore]
+fn chaos_failpoint_wal_recycle_after_remove_before_dir_sync() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "wal_recycle_after_remove_before_dir_sync",
+        &path,
+        "mace_wal_recycle_after_remove_before_dir_sync=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "wal-recycle-after-remove-before-dir-sync failpoint child should abort",
+    );
+    assert_visibility_after_reopen(&path, 512, 64, 24);
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_wal_recycle_after_dir_sync() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "wal_recycle_after_dir_sync",
+        &path,
+        "mace_wal_recycle_after_dir_sync=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "wal-recycle-after-dir-sync failpoint child should abort",
+    );
+    assert_visibility_after_reopen(&path, 512, 64, 24);
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_txn_commit_after_wal_file_sync_before_dir_sync() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "txn_commit_after_wal_file_sync_before_dir_sync",
+        &path,
+        "mace_wal_after_file_sync_before_dir_sync=abort@2",
+    );
+    assert_child_aborted(
+        status,
+        "txn-after-wal-file-sync-before-dir-sync failpoint child should abort",
+    );
+    assert_visibility_after_reopen(&path, 512, 64, 24);
+}
+
+#[test]
+#[ignore]
 fn chaos_failpoint_txn_commit_after_record_commit() {
     let path = RandomPath::new();
     let status = spawn_child(
@@ -768,6 +931,22 @@ fn chaos_failpoint_gc_data_rewrite_after_stage_marker() {
 
 #[test]
 #[ignore]
+fn chaos_failpoint_gc_data_rewrite_after_data_dir_sync() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "gc_data_rewrite_after_data_dir_sync",
+        &path,
+        "mace_gc_data_rewrite_after_data_dir_sync=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "gc-data-after-data-dir-sync failpoint child should abort",
+    );
+    assert_bucket_readable(&path, 256);
+}
+
+#[test]
+#[ignore]
 fn chaos_failpoint_gc_data_rewrite_after_meta_commit() {
     let path = RandomPath::new();
     let status = spawn_child(
@@ -807,6 +986,22 @@ fn chaos_failpoint_gc_blob_rewrite_after_stage_marker() {
 
 #[test]
 #[ignore]
+fn chaos_failpoint_gc_blob_rewrite_after_data_dir_sync() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "gc_blob_rewrite_after_data_dir_sync",
+        &path,
+        "mace_gc_blob_rewrite_after_data_dir_sync=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "gc-blob-after-data-dir-sync failpoint child should abort",
+    );
+    assert_bucket_readable(&path, 256);
+}
+
+#[test]
+#[ignore]
 fn chaos_failpoint_gc_blob_rewrite_after_meta_commit() {
     let path = RandomPath::new();
     let status = spawn_child(
@@ -816,6 +1011,119 @@ fn chaos_failpoint_gc_blob_rewrite_after_meta_commit() {
     );
     assert_child_aborted(status, "gc-blob-after-meta failpoint child should abort");
     assert_bucket_readable(&path, 256);
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_delete_files_after_dir_sync_before_meta_commit() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "delete_files_after_dir_sync_before_meta_commit",
+        &path,
+        "mace_delete_files_after_dir_sync_before_meta_commit=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "delete-files-after-dir-sync-before-meta-commit failpoint child should abort",
+    );
+    assert_bucket_readable(&path, 256);
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "flush_before_manifest_commit",
+        &path,
+        "mace_flush_before_manifest_commit=abort@1",
+    );
+    assert_child_aborted(status, "flush-before-manifest failpoint child should abort");
+    let crashed_files = data_blob_files(&path);
+    assert!(
+        !crashed_files.is_empty(),
+        "expected flush crash to leave orphan files before recovery"
+    );
+
+    let status = spawn_child(
+        "recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear",
+        &path,
+        "mace_recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "recovery-orphan-cleanup-after-data-dir-sync-before-marker-clear child should abort",
+    );
+
+    assert_visibility_after_reopen(&path, 512, 64, 24);
+    for file in crashed_files {
+        assert!(
+            !file.exists(),
+            "orphan file should be cleaned after recovery retry: {file:?}"
+        );
+    }
+}
+
+#[test]
+fn recovery_rejects_sparse_wal_gap_after_checkpoint() {
+    let path = RandomPath::new();
+    {
+        let mace = open_with_tune(&path, |opt| {
+            opt.concurrent_write = 1;
+            opt.sync_on_write = true;
+            opt.data_file_size = 64 << 20;
+            opt.checkpoint_size = 64 << 20;
+            opt.pool_capacity = 128 << 20;
+            opt.wal_buffer_size = 8 << 10;
+            opt.wal_file_size = 4 << 10;
+            opt.inline_size = 512;
+        });
+        let bucket = mace
+            .new_bucket("prod")
+            .expect("create prod bucket for sparse wal test failed");
+
+        let txn = bucket.begin().expect("begin seed txn failed");
+        for idx in 0..32 {
+            txn.upsert(format!("k_{idx}"), format!("seed_{idx}"))
+                .expect("seed put failed");
+        }
+        txn.commit().expect("seed commit failed");
+
+        // create a durable checkpoint first
+        bucket.checkpoint();
+
+        // append many wal records after checkpoint without dirtying data pages
+        // this keeps checkpoint position stable while still spanning multiple wal files
+        for _ in 0..5000 {
+            let txn = bucket
+                .begin()
+                .expect("begin post-checkpoint wal-only txn failed");
+            txn.commit()
+                .expect("commit post-checkpoint wal-only txn failed");
+        }
+    }
+
+    let mut files = wal_files(&path, 0);
+    assert!(
+        files.len() >= 3,
+        "need at least 3 wal files to form a sparse sequence, got {}",
+        files.len()
+    );
+    let hole = files.remove(files.len() - 2);
+    std::fs::remove_file(&hole).expect("remove middle wal file failed");
+
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = false;
+    opt.concurrent_write = 1;
+    opt.sync_on_write = true;
+    opt.data_file_size = 16 << 10;
+    opt.wal_buffer_size = 8 << 10;
+    opt.wal_file_size = 4 << 10;
+    opt.inline_size = 512;
+    match Mace::new(opt.validate().expect("validate options failed")) {
+        Err(err) => assert_eq!(err, OpCode::Corruption),
+        Ok(_) => panic!("recovery should reject sparse wal gap after checkpoint"),
+    }
 }
 
 #[test]

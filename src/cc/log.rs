@@ -58,6 +58,7 @@ pub struct Logging {
     flushed_pos: Position,
     ops: usize,
     pub(crate) writer: MutRef<GatherWriter>,
+    log_dir_dirty: bool,
     opt: Arc<ParsedOptions>,
 }
 
@@ -76,7 +77,9 @@ impl Logging {
         opt: Arc<ParsedOptions>,
         ckpt_cnt: Arc<AtomicUsize>,
     ) -> Self {
-        let writer = GatherWriter::append(&opt.wal_file(group, latest_id), 16);
+        let path = opt.wal_file(group, latest_id);
+        let log_dir_dirty = !path.exists();
+        let writer = GatherWriter::append(&path, 16);
         let pos = Position {
             file_id: latest_id,
             offset: writer.pos(),
@@ -94,6 +97,7 @@ impl Logging {
             ops: 0,
             group,
             writer: MutRef::new(writer),
+            log_dir_dirty,
             opt,
         }
     }
@@ -122,10 +126,10 @@ impl Logging {
             self.log_pos.offset = 0;
 
             self.sync(false)?;
-            self.writer.reset(GatherWriter::append(
-                &self.opt.wal_file(self.group, self.log_pos.file_id),
-                16,
-            ));
+            let path = self.opt.wal_file(self.group, self.log_pos.file_id);
+            let created = !path.exists();
+            self.writer.reset(GatherWriter::append(&path, 16));
+            self.log_dir_dirty |= created;
         }
 
         self.ops = self.ops.wrapping_add(1);
@@ -190,7 +194,7 @@ impl Logging {
                     self.log_pos.file_id ^ self.log_pos.offset,
                     LATENCY_SAMPLE_SHIFT,
                 );
-                self.writer.sync();
+                self.sync_writer_and_dir();
                 self.opt.observer.counter(CounterMetric::WalSync, 1);
                 observe_elapsed(
                     self.opt.observer.as_ref(),
@@ -341,6 +345,17 @@ impl Logging {
         true
     }
 
+    #[inline]
+    fn sync_writer_and_dir(&mut self) {
+        self.writer.sync();
+        if self.log_dir_dirty {
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_wal_after_file_sync_before_dir_sync");
+            self.opt.sync_log_dir();
+            self.log_dir_dirty = false;
+        }
+    }
+
     pub fn sync(&mut self, force: bool) -> Result<(), OpCode> {
         let len = self.ring.distance();
         if len != 0 {
@@ -354,7 +369,7 @@ impl Logging {
                 self.log_pos.file_id ^ self.log_pos.offset,
                 LATENCY_SAMPLE_SHIFT,
             );
-            self.writer.sync();
+            self.sync_writer_and_dir();
             self.durable_pos = self.flushed_pos;
             self.opt.observer.counter(CounterMetric::WalSync, 1);
             observe_elapsed(

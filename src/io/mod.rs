@@ -82,9 +82,9 @@ impl OpenOptions {
 #[cfg(windows)]
 pub mod win;
 #[cfg(windows)]
-pub use win::File;
+pub use win::{File, sync_dir};
 
 #[cfg(unix)]
 pub mod unix;
 #[cfg(unix)]
-pub use unix::File;
+pub use unix::{File, sync_dir};

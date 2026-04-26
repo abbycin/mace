@@ -110,6 +110,13 @@ impl<'a> Publish<'a> {
             "replace has been protected by Mutex and caller must check if mapping has been changed"
         );
     }
+
+    pub(crate) fn mark_unmap(&mut self, pid: u64, old: u64) {
+        self.table
+            .cas(pid, old, NULL_ADDR)
+            .expect("unmapped pid must still be mapped before recycle");
+        self.epoch.unmap_pid.mark(pid);
+    }
 }
 
 pub(crate) struct AllocGuard<'a> {

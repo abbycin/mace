@@ -140,7 +140,6 @@ impl Recovery {
             value: wal_boot.len() as u64,
         });
 
-        let g = crossbeam_epoch::pin();
         let mut oracle = store.manifest.numerics.oracle.load(Relaxed);
         let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
 
@@ -148,9 +147,10 @@ impl Recovery {
             // analyze and redo starts from latest checkpoint
             let analyze_started = Instant::now();
             let cur_oracle = self.analyze(
-                &g,
                 group_id as u8,
                 boot.checkpoint,
+                boot.oldest_id,
+                boot.latest_id,
                 &mut block,
                 store.clone(),
             )?;
@@ -159,7 +159,6 @@ impl Recovery {
                 analyze_started.elapsed().as_micros() as u64,
             );
             oracle = max(oracle, cur_oracle);
-            g.flush();
         }
 
         let recovered = !self.dirty_table.is_empty() || !self.undo_table.is_empty();
@@ -173,7 +172,7 @@ impl Recovery {
         );
         if !self.dirty_table.is_empty() {
             let redo_started = Instant::now();
-            let count = self.redo(&mut block, &g, store.clone())?;
+            let count = self.redo(&mut block, store.clone())?;
             self.opt
                 .observer
                 .counter(CounterMetric::RecoveryRedoRecord, count);
@@ -184,7 +183,7 @@ impl Recovery {
         }
         if !self.undo_table.is_empty() {
             let undo_started = Instant::now();
-            let count = self.undo(&mut block, &g, store.clone())?;
+            let count = self.undo(&mut block, store.clone())?;
             self.opt
                 .observer
                 .counter(CounterMetric::RecoveryUndoTxn, count);
@@ -266,16 +265,14 @@ impl Recovery {
 
     fn analyze(
         &mut self,
-        g: &Guard,
         group_id: u8,
         addr: Position,
+        oldest_file_id: u64,
+        latest_file_id: u64,
         block: &mut Block,
         store: MutRef<Store>,
     ) -> Result<u64, OpCode> {
-        let Position {
-            file_id,
-            mut offset,
-        } = addr;
+        let Position { file_id, offset } = addr;
         let mut pos;
         let mut oracle = 0;
         let mut loc = Location {
@@ -283,22 +280,28 @@ impl Recovery {
             pos: Position::default(),
             len: 0,
         };
+        let g = crossbeam_epoch::pin();
 
-        for i in file_id.. {
+        for i in file_id..=latest_file_id {
             let path = self.opt.wal_file(group_id, i);
             if !path.exists() {
-                break; // no more wal file
+                if i < oldest_file_id {
+                    continue;
+                }
+                log::error!(
+                    "wal gap detected after recycled prefix, group={group_id} file_id={i} oldest={oldest_file_id} latest={latest_file_id}"
+                );
+                return Err(OpCode::Corruption);
             }
             let mut f = File::options().read(true).write(true).open(&path)?;
             let end = f.size()?;
             if end == 0 {
-                break; // empty wal file
+                continue;
             }
             static_assert!(size_of::<EntryType>() == 1);
 
             loc.pos.file_id = i;
-            pos = offset;
-            offset = 0;
+            pos = if i == file_id { offset } else { 0 };
 
             log::trace!("{path:?} pos {pos} end {end}");
             while pos < end {
@@ -388,7 +391,7 @@ impl Recovery {
                             l.pos.file_id = i;
                             l.pos.offset = loc.pos.offset;
                         }
-                        if !self.handle_update(g, &mut f, &mut loc, block, store.clone())? {
+                        if !self.handle_update(&g, &mut f, &mut loc, block, store.clone())? {
                             pos = start_pos;
                             break;
                         }
@@ -439,10 +442,11 @@ impl Recovery {
         }
     }
 
-    fn redo(&mut self, block: &mut Block, g: &Guard, store: MutRef<Store>) -> Result<u64, OpCode> {
+    fn redo(&mut self, block: &mut Block, store: MutRef<Store>) -> Result<u64, OpCode> {
         let cache = Lru::new();
         let cap = 32;
         let mut applied = 0u64;
+        let g = crossbeam_epoch::pin();
 
         // NOTE: because the `Ver` is descending ordered by txid first, we call `rev` here to make
         //  smaller txid to apply first
@@ -466,16 +470,16 @@ impl Recovery {
                 PayloadType::Insert => {
                     let i = c.put();
                     let val = Record::normal(c.group_id, i.val());
-                    target_tree.put(g, key, val)
+                    target_tree.put(&g, key, val)
                 }
                 PayloadType::Update => {
                     let u = c.update();
                     let val = Record::normal(c.group_id, u.new_val());
-                    target_tree.put(g, key, val)
+                    target_tree.put(&g, key, val)
                 }
                 PayloadType::Delete => {
                     let val = Record::remove(c.group_id);
-                    target_tree.put(g, key, val)
+                    target_tree.put(&g, key, val)
                 }
                 PayloadType::Clr => {
                     let r = c.clr();
@@ -484,7 +488,7 @@ impl Recovery {
                     } else {
                         Record::normal(c.group_id, r.val())
                     };
-                    target_tree.put(g, key, val)
+                    target_tree.put(&g, key, val)
                 }
             };
             applied += 1;
@@ -492,8 +496,9 @@ impl Recovery {
         Ok(applied)
     }
 
-    fn undo(&self, block: &mut Block, g: &Guard, store: MutRef<Store>) -> Result<u64, OpCode> {
-        let reader = WalReader::new(&store.context, g);
+    fn undo(&self, block: &mut Block, store: MutRef<Store>) -> Result<u64, OpCode> {
+        let g = crossbeam_epoch::pin();
+        let reader = WalReader::new(&store.context, &g);
         let mut rolled_back = 0u64;
         for (txid, addr) in &self.undo_table {
             reader.rollback(block, *txid, *addr, |bucket_id| {

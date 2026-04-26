@@ -100,7 +100,9 @@ Write-side flow:
 
 1. writer captures `WriteEpoch` (`capture_epoch`) and increments inflight counter.
 2. allocation uses `BoxRef::alloc` and inserts into hot page map.
-3. publish path marks dirty roots (`pid -> latest addr`) and optional unmap marks.
+3. publish path marks dirty roots (`pid -> latest addr`) and unmap marks.
+   merge path requirement: `replace(cursor)` and `mark_unmap(child_pid)` must be done in the same
+   `Publish` / `WriteEpoch` commit to avoid one addr being observed as both live root and junk.
 4. page replacement/evict paths move retired logical addresses into lineage chains (`RetiredChain`).
 
 Checkpoint trigger conditions:
@@ -120,7 +122,8 @@ Checkpoint cut (`Pool::checkpoint`):
 
 - waits old-generation writers to leave (`EpochInflight::wait_zero`).
 - walks dirty roots and reachable chains (link/sibling/remote hints).
-- carries `addr > snap_addr` mutations back to new hot generation.
+- carries reachable `addr > snap_addr` mutations back to new hot generation only when they are still
+  present in dirty generations; missing addresses are treated as already persisted/reclaimed.
 - computes per-group checkpoint frontier delta.
 - emits data/blob junk candidates for stat apply.
 
@@ -376,6 +379,8 @@ Low-frequency recovery/GC metrics are reported without sampling.
 - Sealed generations must be uniquely owned when checkpoint finishes.
 - Reachable addresses (including sibling/remote-referenced old pages) must stay readable from memory
   until they are either durably published or proven unreachable by lifecycle closure.
+- Merge publish must apply `replace` and child `mark_unmap` in the same epoch commit, so checkpoint
+  snapshot never classifies one addr as both dirty root and newly retired junk.
 - Bucket durable frontier must monotonically advance per group.
 - Map publish and bucket frontier publish must be in the same manifest txn.
 - Recovery correctness must be gated by bucket frontier, not by group checkpoint alone.

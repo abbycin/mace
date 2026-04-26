@@ -5,7 +5,7 @@ use crate::meta::{BlobStat, DataStat, IntervalPair, MemBlobStat, MemDataStat, Pa
 use crate::utils::NULL_ADDR;
 use crate::utils::countblock::Countblock;
 use crate::utils::data::{GatherWriter, GroupPositions, Interval};
-use crate::utils::observe::CounterMetric;
+use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, MutRef};
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
@@ -26,7 +26,7 @@ pub enum FlushDirective {
 }
 
 pub struct FlushResult {
-    sync_all: bool,
+    opt: Arc<ParsedOptions>,
     pub bucket_id: u64,
     pub map_table: PageTable,
     pub data_ivls: Vec<IntervalPair>,
@@ -41,7 +41,8 @@ pub struct FlushResult {
 
 impl FlushResult {
     pub fn sync(&mut self) {
-        if self.sync_all {
+        let has_outputs = !self.writers.is_empty();
+        if self.opt.sync_on_write {
             for mut x in self.writers.drain(..) {
                 x.sync();
             }
@@ -49,6 +50,9 @@ impl FlushResult {
             for mut x in self.writers.drain(..) {
                 x.sync_data();
             }
+        }
+        if has_outputs {
+            self.opt.sync_data_dir();
         }
     }
 }
@@ -61,7 +65,8 @@ pub trait CheckpointObserver: Send + Sync {
     fn stage_orphan_blob_file(&self, file_id: u64);
     fn update_data_mem_interval_stat(&self, ivl: IntervalPair, stat: MemDataStat);
     fn update_blob_mem_interval_stat(&self, ivl: IntervalPair, stat: MemBlobStat);
-    fn on_flush(&self, result: FlushResult);
+    fn on_checkpoint(&self, result: FlushResult);
+    fn finish_checkpoint(&self);
 }
 
 fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn CheckpointObserver) {
@@ -89,8 +94,8 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
     }
 
     if file_builder.is_empty() {
-        observer.on_flush(FlushResult {
-            sync_all: false,
+        observer.on_checkpoint(FlushResult {
+            opt: ctx.opt.clone(),
             bucket_id,
             map_table: mapping,
             data_ivls: Vec::new(),
@@ -172,11 +177,8 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
     crate::utils::failpoint::crash("mace_flush_after_data_sync");
 
     task.mark_io_built(actual_bytes, io_started.elapsed());
-    // all data has been fushed, the rest are junk pages that will never be accessed, clear them before
-    // sync file to release memory
-    task.pages.clear();
-    observer.on_flush(FlushResult {
-        sync_all: ctx.opt.sync_on_write,
+    observer.on_checkpoint(FlushResult {
+        opt: ctx.opt.clone(),
         bucket_id,
         map_table: mapping,
         data_ivls,
@@ -197,9 +199,8 @@ fn process_task(
     ctx: Handle<Context>,
     observer: &dyn CheckpointObserver,
 ) {
-    let mut flushed = false;
+    let mut processed_checkpoint = false;
     while let Some(task) = q.pop_front() {
-        flushed = true;
         let directive = observer.flush_directive(task.bucket_id);
         if let FlushDirective::Skip = directive {
             // Skip is only used for unload/delete bucket
@@ -210,60 +211,11 @@ fn process_task(
             continue;
         }
         checkpoint(task, ctx, observer);
+        processed_checkpoint = true;
     }
-    if flushed {
-        process_wal_clean(ctx);
+    if processed_checkpoint {
+        observer.finish_checkpoint();
     }
-}
-
-fn process_wal_clean(ctx: Handle<Context>) {
-    for g in ctx.groups().iter() {
-        let mut checkpoint_id = g.active_txns.min_position_file_id();
-        let (oldest_id, last_ckpt_file) = {
-            let logging = g.logging.lock();
-            (logging.oldest_wal_id(), logging.last_ckpt().file_id)
-        };
-        checkpoint_id = std::cmp::min(checkpoint_id, last_ckpt_file);
-        if oldest_id >= checkpoint_id {
-            continue;
-        }
-
-        // [oldest_id, checkpoint_id)
-        let recycled = process_one_wal(ctx, g.id as u8, oldest_id, checkpoint_id);
-        if recycled > 0 {
-            ctx.opt
-                .observer
-                .counter(CounterMetric::GcWalRecycleFile, recycled);
-        }
-        g.logging.lock().advance_oldest_wal_id(checkpoint_id);
-    }
-}
-
-fn process_one_wal(ctx: Handle<Context>, group: u8, beg: u64, end: u64) -> u64 {
-    let mut recycled = 0;
-    // NOTE: not including `end`
-    for seq in beg..end {
-        let from = ctx.opt.wal_file(group, seq);
-        if !from.exists() {
-            continue;
-        }
-        let to = ctx.opt.wal_backup(group, seq);
-        if ctx.opt.keep_stable_wal_file {
-            log::info!("rename {from:?} to {to:?}");
-            std::fs::rename(&from, &to)
-                .inspect_err(|e| {
-                    log::error!("can't rename {from:?} to {to:?}, error {e:?}");
-                })
-                .unwrap();
-        } else {
-            log::info!("unlink {from:?}");
-            std::fs::remove_file(&from)
-                .inspect_err(|e| log::error!("can't remove {from:?}, error {e:?}"))
-                .unwrap();
-        }
-        recycled += 1;
-    }
-    recycled
 }
 
 fn checkpoint_thread(

@@ -4,19 +4,56 @@ use std::{
     sync::Arc,
 };
 
-use crate::utils::observe::{NoopObserver, Observer};
+use crate::{
+    io,
+    utils::observe::{NoopObserver, Observer},
+};
 
 use super::OpCode;
+
+fn dir_parent_for_sync(path: &Path) -> Option<&Path> {
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+        Some(parent) => Some(parent),
+        None => None,
+    }
+}
+
+fn create_dir_all_and_sync(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    let mut created = Vec::new();
+    let mut cursor = Some(path);
+    while let Some(dir) = cursor {
+        if dir.exists() {
+            break;
+        }
+        created.push(dir.to_path_buf());
+        cursor = dir.parent();
+    }
+
+    std::fs::create_dir_all(path)?;
+
+    created.reverse();
+    for dir in created {
+        if let Some(parent) = dir_parent_for_sync(&dir) {
+            io::sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
 
 /// Configuration options for the Mace storage engine.
 #[derive(Clone)]
 pub struct Options {
-    /// Force-sync data to disk for every log write.
+    /// Force-sync data to disk for every wal/data write.
     ///
-    /// The default value is `true`. Turning it off may result in data loss,
-    /// while turning it on may reduce performance.
+    /// The default value is `true` (use fsync or else use fdatasync). Turning it off may result in
+    /// data loss, while turning it on may reduce performance.
     pub sync_on_write: bool,
-    /// Defaults to the hardware concurrency count and must be a power of two.
+    /// Writer Group count, default value is [`Self::CONCURRENT_WRITE`] and must in the range \[1, 128\]
     ///
     /// **Once set, it cannot be modified**
     pub concurrent_write: u8,
@@ -29,13 +66,13 @@ pub struct Options {
     ///
     /// Set to 0 to disable proactive triggering.
     pub checkpoint_nudge_ms: u64,
-    /// Perform compaction when the garbage ratio exceeds this value, in the range [0, 100].
+    /// Perform compaction when the garbage ratio exceeds this value, in the range \[0, 100\].
     pub data_garbage_ratio: u32,
     /// If true, compact immediately when [`Self::data_garbage_ratio`] is reached.
     pub gc_eager: bool,
     /// Size limit of a blob file. default value [`Self::BLOB_FILE_SIZE`]
     pub blob_file_size: usize,
-    /// Trigger blob GC when the garbage ratio exceeds this value, in the range [0, 100].
+    /// Trigger blob GC when the garbage ratio exceeds this value, in the range \[0, 100\].
     pub blob_garbage_ratio: usize,
     /// At each blob GC cycle, pick the oldest [`Self::blob_gc_ratio`]% of blob files as candidates.
     pub blob_gc_ratio: usize,
@@ -80,7 +117,7 @@ pub struct Options {
     pub lru_max_entries: usize,
     /// Bitmap-cache entry count for data and blob stats.
     pub stat_mask_cache_count: usize,
-    /// Ratio of high-priority cache (for non-blob data) within [`Self::lru_capacity`], in [0, 100].
+    /// Ratio of high-priority cache (for non-blob data) within [`Self::lru_capacity`], in \[0, 100\].
     pub high_priority_ratio: usize,
     /// Maximum number of open data-file handles cached concurrently, used for loading data pages.
     pub data_handle_cache_capacity: usize,
@@ -107,9 +144,6 @@ pub struct Options {
     /// Number of checkpoints a transaction can span (i.e., transaction length limit).
     ///
     /// If a transaction exceeds this limit, it is forcibly aborted.
-    ///
-    /// NOTE: checkpoints are taken when a buffer is flushed; however, real arena data may be sparse,
-    /// so this is an estimated limit.
     pub max_ckpt_per_txn: usize,
     /// WAL file size limit that triggers switching to a new WAL file, up to 2GB.
     pub wal_file_size: u32,
@@ -135,17 +169,18 @@ pub struct Options {
 }
 
 impl Options {
+    pub const CONCURRENT_WRITE: u8 = 16;
+    pub const MAX_CONCURRENT_WRITE: u8 = 128;
     pub const DATA_FILE_SIZE: usize = 64 << 20; // 64MB
     pub const BLOB_FILE_SIZE: usize = 256 << 20; // 256MB
-    pub const MAX_CONCURRENT_WRITE: u8 = 128;
     pub const MIN_CACHE_CAP: usize = Self::DATA_FILE_SIZE;
     pub const CACHE_CAP: usize = 1 << 30; // 1GB
     pub const LRU_CAPACITY: usize = 256 << 20; // 256MB
     // Assuming a MemData/BlobStat is 32 KB, 16,384 stats use ~512 MB of memory, which is reasonable.
     pub const STAT_MASK_CACHE_CNT: usize = 16384;
     pub const FILE_CACHE: usize = 512;
-    pub const WAL_BUF_SZ: usize = 4 << 20; // 4MB
-    pub const WAL_FILE_SZ: usize = 24 << 20; // 24MB
+    pub const WAL_BUF_SZ: usize = 16 << 20; // 16MB
+    pub const WAL_FILE_SZ: usize = 64 << 20; // 64MB
     pub const MIN_INLINE_SIZE: usize = 8192;
     pub const MAX_INLINE_SIZE: usize = 64 << 10;
     pub const MAX_SPLIT_ELEMS: u16 = 512;
@@ -155,14 +190,9 @@ impl Options {
 
     /// Creates a new Options instance with default values and the given database root.
     pub fn new<P: AsRef<Path>>(db_root: P) -> Self {
-        let cores = std::thread::available_parallelism()
-            .unwrap()
-            .get()
-            .min(Self::MAX_CONCURRENT_WRITE as usize)
-            .next_power_of_two() as u8;
         Self {
             sync_on_write: true,
-            concurrent_write: cores,
+            concurrent_write: Self::CONCURRENT_WRITE,
             tmp_store: false,
             gc_timeout: 60 * 1000,          // 1min
             checkpoint_nudge_ms: 60 * 1000, // 1min
@@ -203,7 +233,10 @@ impl Options {
 
     /// Validates the options and returns a ParsedOptions instance.
     pub fn validate(mut self) -> Result<ParsedOptions, OpCode> {
-        self.concurrent_write = self.concurrent_write.clamp(1, Self::MAX_CONCURRENT_WRITE);
+        self.concurrent_write = self
+            .concurrent_write
+            .clamp(1, Self::MAX_CONCURRENT_WRITE)
+            .next_power_of_two();
         self.split_elems = self
             .split_elems
             .clamp(Self::MIN_SPLIT_ELEMS, Self::MAX_SPLIT_ELEMS);
@@ -255,13 +288,13 @@ impl Options {
         let (db_root, data_root, log_root) = (self.db_root(), self.data_root(), self.log_root());
 
         if !db_root.exists() {
-            std::fs::create_dir_all(db_root)?;
+            create_dir_all_and_sync(&db_root)?;
         }
         if !data_root.exists() {
-            std::fs::create_dir_all(data_root)?;
+            create_dir_all_and_sync(&data_root)?;
         }
         if !log_root.exists() {
-            std::fs::create_dir_all(log_root)?;
+            create_dir_all_and_sync(&log_root)?;
         }
         Ok(())
     }
@@ -336,6 +369,14 @@ impl Options {
 
     pub fn manifest(&self) -> PathBuf {
         self.log_root().join(Self::MANIFEST)
+    }
+
+    pub(crate) fn sync_data_dir(&self) {
+        io::sync_dir(self.data_root()).unwrap_or_else(|e| panic!("can't fail, {:?}", e));
+    }
+
+    pub(crate) fn sync_log_dir(&self) {
+        io::sync_dir(self.log_root()).unwrap_or_else(|e| panic!("can't fail, {:?}", e));
     }
 }
 

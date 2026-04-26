@@ -77,6 +77,42 @@ fn sync_data_impl(fd: c_int) -> c_int {
     unsafe { fdatasync(fd) }
 }
 
+pub fn sync_dir<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
+    let osstr = path.as_ref().as_os_str();
+    let c_string = CString::new(osstr.as_bytes()).expect("can't translate path to c string");
+    let fd = unsafe { open(c_string.as_ptr(), O_RDONLY, 0) };
+    if fd < 0 {
+        return Err(io::Error::from_raw_os_error(errno()));
+    }
+
+    let sync_err = loop {
+        let rc = unsafe { fsync(fd) };
+        if rc < 0 {
+            if errno() == EINTR {
+                continue;
+            }
+            break Some(io::Error::from_raw_os_error(errno()));
+        }
+        break None;
+    };
+
+    let close_err = if unsafe { close(fd) } < 0 {
+        Some(io::Error::from_raw_os_error(errno()))
+    } else {
+        None
+    };
+
+    if let Some(err) = sync_err {
+        return Err(err);
+    }
+
+    if let Some(err) = close_err {
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 impl File {
     pub fn options() -> OpenOptions {
         OpenOptions::new()

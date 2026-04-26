@@ -340,14 +340,6 @@ impl CheckpointTask {
             } else if let Some(x) = hot_pages.get(&addr) {
                 (x.value().clone(), false)
             } else {
-                if addr > self.snap_addr {
-                    assert!(
-                        addr <= self.snap_addr,
-                        "checkpoint snapshot lost unpersisted addr {} above snap_addr {}",
-                        addr,
-                        self.snap_addr,
-                    );
-                }
                 // the addr is no longer dirty in this generation, treat it as
                 // already persisted or reclaimed
                 continue;

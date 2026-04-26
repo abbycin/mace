@@ -1072,10 +1072,9 @@ impl Manifest {
         }
 
         if !data_ids.is_empty() || !blob_ids.is_empty() {
-            #[cfg(unix)]
-            if let Ok(f) = std::fs::File::open(self.opt.data_root()) {
-                let _ = f.sync_all();
-            }
+            self.opt.sync_data_dir();
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_delete_files_after_dir_sync_before_meta_commit");
 
             let mut txn = self.begin();
             if !data_ids.is_empty() {
