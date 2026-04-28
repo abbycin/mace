@@ -3,6 +3,16 @@ use mace::{Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn counter_value(observer: &InMemoryObserver, metric: CounterMetric) -> u64 {
+    observer
+        .snapshot()
+        .counters
+        .iter()
+        .find(|(m, _)| *m == metric)
+        .map(|(_, v)| *v)
+        .unwrap_or(0)
+}
+
 #[test]
 fn gc_data() -> Result<(), OpCode> {
     let path = RandomPath::new();
@@ -293,6 +303,82 @@ fn gc_observer_metrics() -> Result<(), OpCode> {
     assert!(
         run_hist_count >= 1,
         "expected at least one gc runtime histogram sample"
+    );
+    Ok(())
+}
+
+#[test]
+fn abort_clean_checkpoint_dedup_per_bucket_per_gc_round() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let observer = Arc::new(InMemoryObserver::new(512));
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 60_000;
+    opt.concurrent_write = 1;
+    opt.observer = observer.clone();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let seed = db.begin().unwrap();
+    seed.put("k", "seed")?;
+    seed.commit()?;
+
+    for i in 0..4 {
+        let tx = db.begin().unwrap();
+        tx.update("k", format!("v{i:02}"))?;
+        drop(tx);
+    }
+
+    let before = counter_value(&observer, CounterMetric::GcAbortCleanCheckpointBucket);
+    mace.start_gc();
+    let after = counter_value(&observer, CounterMetric::GcAbortCleanCheckpointBucket);
+    let delta = after.saturating_sub(before);
+
+    assert_eq!(
+        delta, 1,
+        "expected exactly one abort-clean checkpoint for one bucket in one gc round"
+    );
+    Ok(())
+}
+
+#[test]
+fn abort_clean_wal_open_is_bounded_by_file_count() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let observer = Arc::new(InMemoryObserver::new(512));
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 60_000;
+    opt.concurrent_write = 1;
+    opt.wal_file_size = 4096;
+    opt.observer = observer.clone();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let seed = db.begin().unwrap();
+    seed.put("k", "seed")?;
+    seed.commit()?;
+
+    let updates = 80u64;
+    let payload = vec![b'x'; 900];
+    {
+        let tx = db.begin().unwrap();
+        for _ in 0..updates {
+            tx.update("k", &payload)?;
+        }
+        drop(tx);
+    }
+
+    let before = counter_value(&observer, CounterMetric::GcAbortCleanWalFileOpen);
+    mace.start_gc();
+    let after = counter_value(&observer, CounterMetric::GcAbortCleanWalFileOpen);
+    let delta = after.saturating_sub(before);
+
+    assert!(delta > 1, "expected abort clean to span multiple wal files");
+    assert!(
+        delta < updates,
+        "expected wal file opens ({delta}) fewer than update records ({updates})"
     );
     Ok(())
 }

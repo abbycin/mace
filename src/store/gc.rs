@@ -1,8 +1,9 @@
 use crc32c::Crc32cHasher;
+use crossbeam_epoch::Guard;
 use dashmap::mapref::multiple::RefMulti;
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     hash::Hasher,
     ops::Deref,
     sync::{
@@ -19,7 +20,10 @@ use std::{
 
 use crate::{
     OpCode, Options, Store,
-    cc::context::Context,
+    cc::{
+        context::{AbortCleanState, AbortCleanTask, Context},
+        wal::{EntryType, WalBegin, WalCommit, WalUpdate, ptr_to, wal_record_sz},
+    },
     index::tree::Tree,
     io::{File, GatherIO},
     map::{
@@ -33,13 +37,13 @@ use crate::{
         data_interval_name, page_table_name,
     },
     store::VacuumStats,
-    types::traits::IAsSlice,
+    types::{data::Ver, traits::IAsSlice},
     utils::{
         Handle, MutRef, ROOT_PID,
         bitmap::BitMap,
         block::Block,
         countblock::Countblock,
-        data::{AddrPair, GatherWriter, Interval, LenSeq},
+        data::{AddrPair, GatherWriter, Interval, LenSeq, Position},
         observe::{CounterMetric, EventKind, HistogramMetric, ObserveEvent},
     },
 };
@@ -241,6 +245,7 @@ impl GarbageCollector {
     fn run(&mut self) {
         let started = Instant::now();
         self.store.opt.observer.counter(CounterMetric::GcRun, 1);
+        self.process_abort_clean();
         Self::process_wal_clean(self.ctx);
         self.process_data();
         self.process_blob();
@@ -257,6 +262,9 @@ impl GarbageCollector {
         let mut log_dir_dirty = false;
         for g in ctx.groups().iter() {
             let mut checkpoint_id = g.active_txns.min_position_file_id();
+            if let Some(min_pending_file) = ctx.min_abort_clean_file_id(g.id as u8) {
+                checkpoint_id = checkpoint_id.min(min_pending_file);
+            }
             let (oldest_id, last_ckpt_file) = {
                 let mut logging = g.logging.lock();
                 if ctx.opt.sync_on_write
@@ -316,6 +324,234 @@ impl GarbageCollector {
             crate::utils::failpoint::crash("mace_wal_recycle_after_remove_before_dir_sync");
         }
         recycled
+    }
+
+    fn process_abort_clean(&mut self) {
+        for txid in self.ctx.drain_abort_clean_events() {
+            self.ctx.mark_abort_clean_quiesced(txid);
+        }
+
+        let tasks = self.ctx.pending_abort_clean_tasks();
+        if tasks.is_empty() {
+            return;
+        }
+
+        let mut block = Block::alloc(1024);
+        let mut trees = HashMap::<u64, Option<Tree>>::new();
+        let g = crossbeam_epoch::pin();
+        let mut queued_quiesce = false;
+        let mut round_dirty_buckets = HashSet::new();
+        let mut cleaned_txids = Vec::new();
+        for task in tasks {
+            match task.state {
+                AbortCleanState::Pending => {
+                    match self.clean_one_abort_task(&g, task, &mut trees, &mut block) {
+                        Ok(touched_buckets) => {
+                            round_dirty_buckets.extend(touched_buckets);
+                            cleaned_txids.push(task.txid);
+                        }
+                        Err(OpCode::Again) => {}
+                        Err(e) => {
+                            log::error!("abort clean failed, txid={} error={:?}", task.txid, e);
+                        }
+                    }
+                }
+                AbortCleanState::WaitingQuiesce => {
+                    if task.quiesced {
+                        self.ctx.remove_abort_clean(task.txid);
+                        self.ctx.clear_tx_outcome(task.txid);
+                    }
+                }
+            }
+        }
+
+        let checkpoint_ok = if round_dirty_buckets.is_empty() {
+            true
+        } else {
+            match self.checkpoint_abort_clean_buckets(&round_dirty_buckets, &mut trees) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::error!(
+                        "abort clean checkpoint batch failed, tasks={}, buckets={}, error={:?}",
+                        cleaned_txids.len(),
+                        round_dirty_buckets.len(),
+                        e
+                    );
+                    false
+                }
+            }
+        };
+
+        if checkpoint_ok {
+            let sink = self.ctx.abort_clean_event_sink();
+            for txid in cleaned_txids {
+                self.ctx.mark_abort_clean_wait_quiesce(txid);
+                let sink = sink.clone();
+                g.defer(move || {
+                    sink.lock().push(txid);
+                });
+                queued_quiesce = true;
+            }
+        }
+
+        if queued_quiesce {
+            g.flush();
+        }
+    }
+
+    fn checkpoint_abort_clean_buckets(
+        &self,
+        dirty_buckets: &HashSet<u64>,
+        trees: &mut HashMap<u64, Option<Tree>>,
+    ) -> Result<(), OpCode> {
+        for &bucket_id in dirty_buckets {
+            let tree = match trees.get(&bucket_id) {
+                Some(tree) => tree.clone(),
+                None => self.get_abort_clean_tree(trees, bucket_id)?,
+            };
+            if let Some(tree) = tree {
+                tree.bucket.checkpoint_and_wait();
+                self.ctx
+                    .opt
+                    .observer
+                    .counter(CounterMetric::GcAbortCleanCheckpointBucket, 1);
+            }
+        }
+        Ok(())
+    }
+
+    fn get_abort_clean_tree(
+        &self,
+        cache: &mut HashMap<u64, Option<Tree>>,
+        bucket_id: u64,
+    ) -> Result<Option<Tree>, OpCode> {
+        if let Some(tree) = cache.get(&bucket_id) {
+            return Ok(tree.clone());
+        }
+
+        let tree = if self
+            .store
+            .manifest
+            .bucket_metas_by_id
+            .get(&bucket_id)
+            .is_none()
+        {
+            None
+        } else {
+            match self.store.manifest.load_bucket_context(bucket_id) {
+                Ok(ctx) => Some(Tree::new(self.store.clone(), ROOT_PID, ctx)),
+                Err(OpCode::NotFound) => None,
+                Err(e) => return Err(e),
+            }
+        };
+        cache.insert(bucket_id, tree.clone());
+        Ok(tree)
+    }
+
+    fn clean_one_abort_task(
+        &self,
+        g: &Guard,
+        task: AbortCleanTask,
+        trees: &mut HashMap<u64, Option<Tree>>,
+        block: &mut Block,
+    ) -> Result<HashSet<u64>, OpCode> {
+        let mut cursor = task.tail_lsn;
+        let mut touched_buckets = HashSet::new();
+        let mut wal_files = HashMap::<u64, (File, u64)>::new();
+
+        loop {
+            if !wal_files.contains_key(&cursor.file_id) {
+                let path = self.ctx.opt.wal_file(task.group_id, cursor.file_id);
+                if !path.exists() {
+                    return Err(OpCode::Corruption);
+                }
+                let file = File::options().read(true).open(&path)?;
+                let end = file.size()?;
+                wal_files.insert(cursor.file_id, (file, end));
+                self.ctx
+                    .opt
+                    .observer
+                    .counter(CounterMetric::GcAbortCleanWalFileOpen, 1);
+            }
+
+            let (file, end) = wal_files
+                .get(&cursor.file_id)
+                .map(|(file, end)| (file, *end))
+                .ok_or(OpCode::Corruption)?;
+            if cursor.offset >= end {
+                return Err(OpCode::Corruption);
+            }
+
+            let header = block.mut_slice(0, 1);
+            file.read(header, cursor.offset)?;
+            let et: EntryType = header[0].try_into()?;
+            let sz = wal_record_sz(et)?;
+            if cursor.offset + sz as u64 > end {
+                return Err(OpCode::Corruption);
+            }
+            if block.len() < sz {
+                block.realloc(sz);
+            }
+            file.read(block.mut_slice(0, sz), cursor.offset)?;
+
+            match et {
+                EntryType::Update => {
+                    let u = ptr_to::<WalUpdate>(block.data());
+                    let payload_len = u.payload_len();
+                    let total = sz + payload_len;
+                    if cursor.offset + total as u64 > end {
+                        return Err(OpCode::Corruption);
+                    }
+                    if block.len() < total {
+                        block.realloc(total);
+                    }
+                    file.read(block.mut_slice(sz, payload_len), cursor.offset + sz as u64)?;
+                    let u = ptr_to::<WalUpdate>(block.data());
+                    if !u.is_intact() {
+                        return Err(OpCode::Corruption);
+                    }
+
+                    let txid = { u.txid };
+                    if txid != task.txid {
+                        return Err(OpCode::Corruption);
+                    }
+
+                    let bucket_id = { u.bucket_id };
+                    if let Some(tree) = self.get_abort_clean_tree(trees, bucket_id)? {
+                        touched_buckets.insert(bucket_id);
+                        let ver = Ver::new(txid, u.cmd_id);
+                        let raw = u.key();
+                        loop {
+                            match tree.remove_version(g, raw, ver) {
+                                Ok(_) => break,
+                                Err(OpCode::Again) => g.flush(),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+
+                    cursor = Position {
+                        file_id: { u.prev_id },
+                        offset: { u.prev_off },
+                    };
+                }
+                EntryType::Begin => {
+                    let b = ptr_to::<WalBegin>(block.data());
+                    if !b.is_intact() || { b.txid } != task.txid {
+                        return Err(OpCode::Corruption);
+                    }
+                    return Ok(touched_buckets);
+                }
+                EntryType::Abort | EntryType::Commit => {
+                    let c = ptr_to::<WalCommit>(block.data());
+                    if !c.is_intact() || { c.txid } != task.txid {
+                        return Err(OpCode::Corruption);
+                    }
+                    return Ok(touched_buckets);
+                }
+                _ => return Err(OpCode::Corruption),
+            }
+        }
     }
 
     fn process_pending_buckets(&mut self) {

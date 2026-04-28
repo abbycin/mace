@@ -9,12 +9,11 @@ use crate::io::{File, GatherIO};
 
 use crate::cc::context::{Context, GroupBoot};
 use crate::cc::wal::{
-    EntryType, Location, PayloadType, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalReader,
-    WalUpdate, ptr_to, wal_record_sz,
+    EntryType, Location, PayloadType, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate,
+    ptr_to, wal_record_sz,
 };
 use crate::index::tree::Tree;
 use crate::types::data::{Key, Record, Ver};
-use crate::types::traits::{IKey, ITree, IVal};
 use crate::utils::block::Block;
 use crate::utils::data::Position;
 use crate::utils::lru::Lru;
@@ -25,20 +24,6 @@ use crate::{Options, Store, static_assert};
 use crossbeam_epoch::Guard;
 use std::time::Instant;
 
-struct RecoveryTree(Option<Tree>);
-
-impl ITree for RecoveryTree {
-    fn put<K, V>(&self, g: &Guard, k: K, v: V)
-    where
-        K: IKey,
-        V: IVal,
-    {
-        if let Some(tree) = &self.0 {
-            tree.put(g, k, v).unwrap();
-        }
-    }
-}
-
 /// there are some cases can't recover:
 /// 1. manifest file missing or corrupted
 /// 2. data file lost
@@ -48,8 +33,10 @@ impl ITree for RecoveryTree {
 pub(crate) struct Recovery {
     opt: Arc<ParsedOptions>,
     dirty_table: BTreeMap<Ver, Location>,
-    /// txid, last lsn
-    undo_table: BTreeMap<u64, Location>,
+    committed_txns: HashSet<u64>,
+    in_progress_txns: HashSet<u64>,
+    tx_last_update: BTreeMap<u64, Location>,
+    tx_pin_file: BTreeMap<u64, u64>,
     bucket_cache_cap: usize,
     trees: Lru<u64, Tree>,
     loaded_buckets: RefCell<HashSet<u64>>,
@@ -63,16 +50,50 @@ impl Recovery {
         Self {
             opt,
             dirty_table: BTreeMap::new(),
-            undo_table: BTreeMap::new(),
+            committed_txns: HashSet::new(),
+            in_progress_txns: HashSet::new(),
+            tx_last_update: BTreeMap::new(),
+            tx_pin_file: BTreeMap::new(),
             bucket_cache_cap: Self::BUCKET_CACHE_CAP,
             trees: Lru::new(),
             loaded_buckets: RefCell::new(HashSet::new()),
         }
     }
 
-    fn get_tree(&self, bucket_id: u64, store: MutRef<Store>) -> RecoveryTree {
+    fn mark_tx_aborted_and_enqueue_clean(&mut self, store: MutRef<Store>, txid: u64) {
+        let tail = self.tx_last_update.remove(&txid);
+        self.in_progress_txns.remove(&txid);
+        self.committed_txns.remove(&txid);
+
+        if let Some(tail) = tail {
+            let pin_file_id = self
+                .tx_pin_file
+                .remove(&txid)
+                .unwrap_or(tail.pos.file_id)
+                .min(tail.pos.file_id);
+            store.context.mark_tx_aborted(txid);
+            store
+                .context
+                .enqueue_abort_clean(txid, tail.group_id as u8, tail.pos, pin_file_id);
+        } else {
+            store.context.clear_tx_outcome(txid);
+            store.context.remove_abort_clean(txid);
+            self.tx_pin_file.remove(&txid);
+        }
+    }
+
+    fn mark_tx_committed(&mut self, store: MutRef<Store>, txid: u64) {
+        self.in_progress_txns.remove(&txid);
+        self.committed_txns.insert(txid);
+        self.tx_last_update.remove(&txid);
+        self.tx_pin_file.remove(&txid);
+        store.context.clear_tx_outcome(txid);
+        store.context.remove_abort_clean(txid);
+    }
+
+    fn get_tree(&self, bucket_id: u64, store: MutRef<Store>) -> Option<Tree> {
         if let Some(tree) = self.trees.get(&bucket_id) {
-            return RecoveryTree(Some(tree.clone()));
+            return Some(tree.clone());
         }
 
         // it's possible that bucket has been logically removed, we simply skip process wal entry in redo/undo for that
@@ -98,9 +119,9 @@ impl Recovery {
                 self.evict_bucket(evicted_id, store.clone());
             }
             self.loaded_buckets.borrow_mut().insert(bucket_id);
-            RecoveryTree(Some(tree))
+            Some(tree)
         } else {
-            RecoveryTree(None)
+            None
         }
     }
 
@@ -144,11 +165,15 @@ impl Recovery {
         let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
 
         for (group_id, boot) in wal_boot.iter().enumerate() {
-            // analyze and redo starts from latest checkpoint
+            // redo correctness depends on rebuilding transaction outcomes and pending abort-clean chains
+            // from all retained WAL files, not just latest checkpoint window
             let analyze_started = Instant::now();
             let cur_oracle = self.analyze(
                 group_id as u8,
-                boot.checkpoint,
+                Position {
+                    file_id: boot.oldest_id,
+                    offset: 0,
+                },
                 boot.oldest_id,
                 boot.latest_id,
                 &mut block,
@@ -158,18 +183,27 @@ impl Recovery {
                 HistogramMetric::RecoveryAnalyzeMicros,
                 analyze_started.elapsed().as_micros() as u64,
             );
-            oracle = max(oracle, cur_oracle);
+            // txid allocation starts from 1, so zero means no txn record observed in this group
+            if cur_oracle != 0 {
+                oracle = max(oracle, cur_oracle.saturating_add(1));
+            }
         }
 
-        let recovered = !self.dirty_table.is_empty() || !self.undo_table.is_empty();
+        let in_progress: Vec<u64> = self.in_progress_txns.iter().copied().collect();
+        for txid in in_progress {
+            self.mark_tx_aborted_and_enqueue_clean(store.clone(), txid);
+        }
+
+        self.dirty_table
+            .retain(|ver, _| self.committed_txns.contains(&ver.txid));
+
+        let recovered =
+            !self.dirty_table.is_empty() || !store.context.pending_abort_clean_tasks().is_empty();
         self.opt.observer.gauge(
             GaugeMetric::RecoveryDirtyEntries,
             self.dirty_table.len() as i64,
         );
-        self.opt.observer.gauge(
-            GaugeMetric::RecoveryUndoEntries,
-            self.undo_table.len() as i64,
-        );
+        self.opt.observer.gauge(GaugeMetric::RecoveryUndoEntries, 0);
         if !self.dirty_table.is_empty() {
             let redo_started = Instant::now();
             let count = self.redo(&mut block, store.clone())?;
@@ -180,21 +214,6 @@ impl Recovery {
                 HistogramMetric::RecoveryRedoMicros,
                 redo_started.elapsed().as_micros() as u64,
             );
-        }
-        if !self.undo_table.is_empty() {
-            let undo_started = Instant::now();
-            let count = self.undo(&mut block, store.clone())?;
-            self.opt
-                .observer
-                .counter(CounterMetric::RecoveryUndoTxn, count);
-            self.opt.observer.histogram(
-                HistogramMetric::RecoveryUndoMicros,
-                undo_started.elapsed().as_micros() as u64,
-            );
-        }
-        if recovered {
-            // that's why we call it oracle, or else keep using the intact oracle in numerics
-            oracle += 1;
         }
         log::trace!("oracle {oracle}");
         store.manifest.numerics.oracle.store(oracle, Relaxed);
@@ -249,7 +268,7 @@ impl Recovery {
 
         let raw = u.key();
         let target_tree = self.get_tree(u.bucket_id, store);
-        if let Some(target_tree) = &target_tree.0 {
+        if let Some(target_tree) = &target_tree {
             let r = target_tree
                 .get(g, Key::new(raw, Ver::new(NULL_ORACLE, NULL_CMD)))
                 .map(|(k, _)| *k.ver());
@@ -331,8 +350,10 @@ impl Recovery {
                             pos = start_pos;
                             break;
                         }
+                        let txid = { a.txid };
                         log::trace!("{a:?}");
-                        self.undo_table.remove(&{ a.txid });
+                        self.mark_tx_committed(store.clone(), txid);
+                        oracle = max(txid, oracle);
                     }
                     EntryType::Abort => {
                         let a = ptr_to::<WalAbort>(ptr);
@@ -340,8 +361,10 @@ impl Recovery {
                             pos = start_pos;
                             break;
                         }
+                        let txid = { a.txid };
                         log::trace!("{a:?}");
-                        self.undo_table.remove(&{ a.txid });
+                        self.mark_tx_aborted_and_enqueue_clean(store.clone(), txid);
+                        oracle = max(txid, oracle);
                     }
                     EntryType::Begin => {
                         let b = ptr_to::<WalBegin>(ptr);
@@ -349,19 +372,16 @@ impl Recovery {
                             pos = start_pos;
                             break;
                         }
+                        let txid = { b.txid };
                         log::trace!("{b:?}");
-                        self.undo_table.insert(
-                            b.txid,
-                            Location {
-                                group_id: group_id as u32,
-                                pos: Position {
-                                    file_id: i,
-                                    offset: pos - sz as u64,
-                                },
-                                len: 0,
-                            },
-                        );
-                        oracle = max(b.txid, oracle);
+                        self.in_progress_txns.insert(txid);
+                        self.committed_txns.remove(&txid);
+                        self.tx_pin_file
+                            .entry(txid)
+                            .and_modify(|x| *x = (*x).min(i))
+                            .or_insert(i);
+                        store.context.mark_tx_in_progress(txid);
+                        oracle = max(txid, oracle);
                     }
                     EntryType::CheckPoint => {
                         use crate::cc::wal::WalCheckpoint;
@@ -386,15 +406,31 @@ impl Recovery {
                         log::trace!("{pos} => update txid={txid}");
                         loc.pos.offset = pos - sz as u64;
 
-                        if let Some(l) = self.undo_table.get_mut(&{ txid }) {
-                            // update to latest record position
-                            l.pos.file_id = i;
-                            l.pos.offset = loc.pos.offset;
-                        }
                         if !self.handle_update(&g, &mut f, &mut loc, block, store.clone())? {
                             pos = start_pos;
                             break;
                         }
+                        oracle = max(txid, oracle);
+                        self.tx_last_update.insert(
+                            txid,
+                            Location {
+                                group_id: group_id as u32,
+                                pos: loc.pos,
+                                len: 0,
+                            },
+                        );
+                        self.tx_pin_file
+                            .entry(txid)
+                            .and_modify(|x| *x = (*x).min(i))
+                            .or_insert(i);
+
+                        if !self.committed_txns.contains(&txid)
+                            && self.in_progress_txns.insert(txid)
+                        {
+                            // txn may have begun before the last checkpoint and therefore has no begin record in this scan range
+                            store.context.mark_tx_in_progress(txid);
+                        }
+
                         pos += payload_len as u64;
                     }
                     _ => {
@@ -461,12 +497,19 @@ impl Recovery {
             if !c.is_intact() {
                 return Err(OpCode::Corruption);
             }
+            let txid = { c.txid };
+            if !self.committed_txns.contains(&txid) {
+                continue;
+            }
             let ok = c.key();
             let key = Key::new(ok, Ver::new(c.txid, c.cmd_id));
 
             let target_tree = self.get_tree(c.bucket_id, store.clone());
+            let Some(target_tree) = target_tree else {
+                continue;
+            };
 
-            match c.sub_type() {
+            let apply_res = match c.sub_type() {
                 PayloadType::Insert => {
                     let i = c.put();
                     let val = Record::normal(c.group_id, i.val());
@@ -481,32 +524,11 @@ impl Recovery {
                     let val = Record::remove(c.group_id);
                     target_tree.put(&g, key, val)
                 }
-                PayloadType::Clr => {
-                    let r = c.clr();
-                    let val = if r.is_tombstone() {
-                        Record::remove(c.group_id)
-                    } else {
-                        Record::normal(c.group_id, r.val())
-                    };
-                    target_tree.put(&g, key, val)
-                }
             };
+            apply_res?;
             applied += 1;
         }
         Ok(applied)
-    }
-
-    fn undo(&self, block: &mut Block, store: MutRef<Store>) -> Result<u64, OpCode> {
-        let g = crossbeam_epoch::pin();
-        let reader = WalReader::new(&store.context, &g);
-        let mut rolled_back = 0u64;
-        for (txid, addr) in &self.undo_table {
-            reader.rollback(block, *txid, *addr, |bucket_id| {
-                self.get_tree(bucket_id, store.clone())
-            })?;
-            rolled_back += 1;
-        }
-        Ok(rolled_back)
     }
 
     fn wal_file_range(&self, group: u8) -> Option<(u64, u64)> {

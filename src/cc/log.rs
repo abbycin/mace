@@ -172,21 +172,13 @@ impl Logging {
     }
 
     #[cold]
-    fn record_large(
-        &mut self,
-        u: &WalUpdate,
-        k: &[u8],
-        w: &[u8],
-        ov: &[u8],
-        nv: &[u8],
-    ) -> Result<(), OpCode> {
-        let size = u.encoded_len() + k.len() + w.len() + ov.len() + nv.len();
+    fn record_large(&mut self, u: &WalUpdate, k: &[u8], w: &[u8], nv: &[u8]) -> Result<(), OpCode> {
+        let size = u.encoded_len() + k.len() + w.len() + nv.len();
         self.sync(false)?; // flush queued first, make sure log record is sequentail
         {
             self.writer.queue(u.to_slice());
             self.writer.queue(k);
             self.writer.queue(w);
-            self.writer.queue(ov);
             self.writer.queue(nv);
             self.writer.flush();
             if self.opt.sync_on_write {
@@ -216,7 +208,6 @@ impl Logging {
         &mut self,
         k: &Key,
         w: T,
-        ov: &[u8],
         nv: &[u8],
         prev_lsn: Position,
         bucket_id: u64,
@@ -224,7 +215,7 @@ impl Logging {
     where
         T: IWalCodec + IWalPayload,
     {
-        let payload_size = w.encoded_len() + k.raw.len() + ov.len() + nv.len();
+        let payload_size = w.encoded_len() + k.raw.len() + nv.len();
         let current_pos = self.current_pos();
 
         let mut u = WalUpdate {
@@ -253,7 +244,6 @@ impl Logging {
 
         h.write(k.raw);
         h.write(w.to_slice());
-        h.write(ov);
         h.write(nv);
 
         u.checksum = h.finish() as u32;
@@ -263,9 +253,9 @@ impl Logging {
             let a = self.alloc(total_sz)?;
 
             let mut b = LogBuilder::new(a);
-            b.add(u).add(k.raw).add(w).add(ov).add(nv).build(self)?;
+            b.add(u).add(k.raw).add(w).add(nv).build(self)?;
         } else {
-            self.record_large(&u, k.raw, w.to_slice(), ov, nv)?;
+            self.record_large(&u, k.raw, w.to_slice(), nv)?;
         }
         self.opt.observer.counter(CounterMetric::WalAppend, 1);
         self.opt

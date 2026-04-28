@@ -1,5 +1,3 @@
-use crossbeam_epoch::Guard;
-
 use crate::types::{
     header::BoxHeader,
     refbox::{BoxRef, BoxView},
@@ -87,13 +85,6 @@ pub trait IVal: ICodec + Clone {
     fn group_id(&self) -> u8 {
         unimplemented!()
     }
-}
-
-pub trait ITree {
-    fn put<K, V>(&self, g: &Guard, k: K, v: V)
-    where
-        K: IKey,
-        V: IVal;
 }
 
 pub trait IAsSlice: Sized {

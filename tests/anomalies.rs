@@ -121,6 +121,48 @@ fn no_g1_a() {
     s2.commit();
 }
 
+#[test]
+fn aborted_head_allows_followup_update() {
+    let (mut s1, mut s2, mut s3, _e) = prelude!(1, 2, 3);
+
+    s1.begin();
+    let old = s1.replace("1", "11").unwrap();
+    assert_eq!(old.as_slice(), "10".as_bytes());
+    s1.rollback();
+
+    s2.begin();
+    let old = s2.replace("1", "12").unwrap();
+    assert_eq!(old.as_slice(), "10".as_bytes());
+    s2.commit();
+
+    s3.begin();
+    let now = s3.get("1").unwrap();
+    assert_eq!(now.as_slice(), "12".as_bytes());
+    s3.commit();
+}
+
+#[test]
+fn aborted_head_must_not_hide_newer_write_conflict() {
+    let (mut s1, mut s2, mut s3, _e) = prelude!(1, 2, 3);
+
+    s2.begin();
+    s3.begin();
+    s1.begin();
+
+    let old = s3.replace("1", "13").unwrap();
+    assert_eq!(old.as_slice(), "10".as_bytes());
+
+    let old = s2.replace("1", "12").unwrap();
+    assert_eq!(old.as_slice(), "10".as_bytes());
+    s2.commit();
+
+    s3.rollback();
+
+    let r = s1.replace("1", "11");
+    assert_eq!(r, Err(OpCode::AbortTx));
+    s1.rollback();
+}
+
 // intermediate reads
 #[test]
 fn no_g1_b() {

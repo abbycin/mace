@@ -1,5 +1,6 @@
 use crate::cc::cc::ConcurrencyControl;
 use crate::cc::log::Logging;
+use crate::utils::INIT_CMD;
 use crate::utils::data::Position;
 use crate::utils::options::ParsedOptions;
 use parking_lot::{Mutex, RwLock};
@@ -173,6 +174,7 @@ impl WriterGroup {
 pub struct TxnState {
     pub start_ts: u64,
     pub modified: bool,
+    pub begin_lsn: Position,
     pub prev_lsn: Position,
     pub group_id: usize,
     pub cmd_id: u32,
@@ -184,9 +186,10 @@ impl TxnState {
         Self {
             start_ts,
             modified: false,
+            begin_lsn: Position::default(),
             prev_lsn: Position::default(),
             group_id,
-            cmd_id: 0,
+            cmd_id: INIT_CMD,
             start_ckpt,
         }
     }

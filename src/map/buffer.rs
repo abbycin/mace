@@ -674,6 +674,22 @@ impl Pool {
             .expect("flusher channel disconnected before flush publish");
     }
 
+    fn checkpoint_and_wait_fresh(&self) {
+        // first wait any existing checkpoint round to finish
+        self.wait_checkpoint();
+        // then force observing at least one completed round after this barrier
+        let mut seen = self.flush_out.load(Acquire);
+        loop {
+            self.checkpoint();
+            self.wait_checkpoint();
+            let now = self.flush_out.load(Acquire);
+            if now > seen {
+                break;
+            }
+            seen = now;
+        }
+    }
+
     fn wait_checkpoint(&self) {
         while self.flush_in.load(Acquire) != self.flush_out.load(Acquire) {
             std::thread::sleep(Duration::from_millis(1));
@@ -898,6 +914,13 @@ impl BucketContext {
     fn flush_and_wait(&self) {
         self.pool.checkpoint();
         self.pool.wait_checkpoint();
+    }
+
+    pub(crate) fn checkpoint_and_wait(&self) {
+        if self.reclaimed.load(Acquire) {
+            return;
+        }
+        self.pool.checkpoint_and_wait_fresh();
     }
 
     pub(crate) fn checkpoint_before_reclaim(&self) {

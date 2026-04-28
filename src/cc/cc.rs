@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 use crate::utils::{NULL_ORACLE, rand_range};
 
-use super::context::Context;
+use super::context::{Context, TxOutcome};
 
 #[derive(Debug)]
 struct CacheEntry {
@@ -94,6 +94,12 @@ impl ConcurrencyControl {
 
         if record_txid > start_ts {
             return false;
+        }
+
+        if let Some(outcome) = ctx.tx_outcome(record_txid) {
+            match outcome {
+                TxOutcome::InProgress | TxOutcome::Aborted => return false,
+            }
         }
 
         // safe watermark can advance while a range iterator is still alive, so visibility must read it at check time

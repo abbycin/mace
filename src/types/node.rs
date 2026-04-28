@@ -511,12 +511,30 @@ where
                 .inner
                 .range_iter(&self.loader, 0, self.inner.header().elems as usize),
             delta_iter: IterAdaptor::Iter(self.state.read().delta.iter().skip(0)),
-            filter: LeafFilter {
-                txid: safe_txid,
-                last: None,
-                junks: j,
-                skip_dup: false,
-            },
+            filter: LeafFilter::new(safe_txid, j),
+        }
+    }
+
+    #[allow(clippy::iter_skip_zero)]
+    fn leaf_iter_drop_version<'b>(
+        &'b self,
+        j: &'b mut Junk,
+        safe_txid: u64,
+        target_raw: &'b [u8],
+        target_ver: Ver,
+    ) -> LeafIter<'b, L> {
+        debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
+        let len = self.header().prefix_len as usize;
+        let lo = self.lo();
+        LeafIter {
+            prefix: &lo[..len],
+            next_l: None,
+            next_r: None,
+            sst_iter: self
+                .inner
+                .range_iter(&self.loader, 0, self.inner.header().elems as usize),
+            delta_iter: IterAdaptor::Iter(self.state.read().delta.iter().skip(0)),
+            filter: LeafFilter::with_drop(safe_txid, j, target_raw, target_ver),
         }
     }
 
@@ -535,6 +553,32 @@ where
         (
             Self::new(self.loader.copy_without_pin(), b, group, lsn),
             junks,
+        )
+    }
+
+    pub(crate) fn compact_remove_version<A: IFrameAlloc>(
+        &self,
+        a: &mut A,
+        safe_txid: u64,
+        target_raw: &[u8],
+        target_ver: Ver,
+    ) -> (Node<L>, Junk, bool) {
+        let mut junks = Junk::new();
+        let (b, removed) =
+            self.merge_to_base_remove(a, &mut junks, safe_txid, target_raw, target_ver);
+        let mut base = b.view().as_base();
+        let h = base.header_mut();
+        let old = self.header();
+        h.merging = old.merging;
+        h.merging_child = old.merging_child;
+        let (group, lsn) = {
+            let h = b.header();
+            (h.group, h.lsn)
+        };
+        (
+            Self::new(self.loader.copy_without_pin(), b, group, lsn),
+            junks,
+            removed,
         )
     }
 
@@ -570,6 +614,35 @@ where
                 lsn,
             )
         }
+    }
+
+    fn merge_to_base_remove<A: IFrameAlloc>(
+        &self,
+        a: &mut A,
+        j: &mut Junk,
+        safe_txid: u64,
+        target_raw: &[u8],
+        target_ver: Ver,
+    ) -> (BoxRef, bool) {
+        let h = self.header();
+        let lo = self.lo();
+        let hi = self.hi();
+
+        debug_assert!(!h.is_index);
+        let mut iter = self.leaf_iter_drop_version(j, safe_txid, target_raw, target_ver);
+        let (group, lsn) = self.get_group_lsn();
+        let base = BaseView::new_leaf(
+            a,
+            &self.loader,
+            lo,
+            hi,
+            h.right_sibling,
+            &mut iter,
+            safe_txid,
+            group,
+            lsn,
+        );
+        (base, iter.filter.removed)
     }
 
     pub(crate) fn process_merge<A: IFrameAlloc>(
@@ -1227,10 +1300,45 @@ struct LeafFilter<'a> {
     last: Option<&'a [u8]>,
     junks: &'a mut Vec<u64>,
     skip_dup: bool,
+    drop_raw: Option<&'a [u8]>,
+    drop_ver: Option<Ver>,
+    removed: bool,
 }
 
 impl<'a> LeafFilter<'a> {
+    fn new(txid: u64, junks: &'a mut Vec<u64>) -> Self {
+        Self {
+            txid,
+            last: None,
+            junks,
+            skip_dup: false,
+            drop_raw: None,
+            drop_ver: None,
+            removed: false,
+        }
+    }
+
+    fn with_drop(txid: u64, junks: &'a mut Vec<u64>, raw: &'a [u8], ver: Ver) -> Self {
+        Self {
+            txid,
+            last: None,
+            junks,
+            skip_dup: false,
+            drop_raw: Some(raw),
+            drop_ver: Some(ver),
+            removed: false,
+        }
+    }
+
     fn check_impl(&mut self, k: &LeafSeg<'a>, v: &Val) -> bool {
+        if let (Some(raw), Some(ver)) = (self.drop_raw, self.drop_ver)
+            && k.ver == ver
+            && k.raw() == raw
+        {
+            self.removed = true;
+            return false;
+        }
+
         if let Some(last) = self.last
             && last == k.raw()
         {

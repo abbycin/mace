@@ -17,7 +17,7 @@ use crate::{
     types::{
         data::{Index, IntlKey, Key, Ver},
         refbox::BoxRef,
-        traits::{ICodec, IKey, ITree, IVal},
+        traits::{ICodec, IKey, IVal},
     },
     utils::{NULL_CMD, NULL_PID},
 };
@@ -35,7 +35,7 @@ pub struct ValRef {
 }
 
 impl ValRef {
-    fn new(raw: Record, owner: BoxRef) -> Self {
+    pub(crate) fn new(raw: Record, owner: BoxRef) -> Self {
         Self { raw, _owner: owner }
     }
 
@@ -103,7 +103,7 @@ impl Tree {
     }
 
     fn txid(&self) -> u64 {
-        self.store.context.safe_txid()
+        self.store.context.compact_safe_txid()
     }
 
     pub(crate) fn bucket_id(&self) -> u64 {
@@ -464,7 +464,7 @@ impl Tree {
                     // current page is lhs and rhs is already mapped but new root is not installed yet
                     // complete root installation cooperatively
                     assert_eq!(cursor, self.root_index.pid);
-                    let safe_txid = self.store.context.numerics.safe_tixd();
+                    let safe_txid = self.txid();
                     let _ = self.split_root(g, node_ptr, rpid, hi.unwrap(), safe_txid);
                     return Err(OpCode::Again);
                 }
@@ -552,7 +552,7 @@ impl Tree {
             return Ok(false);
         }
 
-        let safe_txid = self.store.context.safe_txid();
+        let safe_txid = self.txid();
         let delta_len = page.delta_len();
         let threshold = self.store.opt.consolidate_threshold as usize;
 
@@ -682,7 +682,7 @@ impl Tree {
     ) -> Result<Option<ValRef>, OpCode>
     where
         V: IVal,
-        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, Position), OpCode>,
+        F: FnMut(Page, &Option<(Key, ValRef)>) -> Result<(u8, Position), OpCode>,
     {
         let page = self.find_leaf(g, key.raw)?;
         let mut r = None;
@@ -691,7 +691,7 @@ impl Tree {
             let tmp = pg.find_latest(k);
             // use the full key from input argument and the version from the exists latest one
             r = tmp.map(|(x, y, b)| (Key::new(k.raw, x.ver), ValRef::new(y, b)));
-            visible(&r)
+            visible(pg, &r)
         })?;
 
         Ok(r.map(|x| x.1))
@@ -707,7 +707,7 @@ impl Tree {
     ) -> Result<Option<ValRef>, OpCode>
     where
         V: IVal,
-        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, Position), OpCode>,
+        F: FnMut(Page, &Option<(Key, ValRef)>) -> Result<(u8, Position), OpCode>,
     {
         let ksz = key.packed_size();
         if ksz > Options::MAX_KEY_SIZE || ksz + val.packed_size() > Options::MAX_KV_SIZE {
@@ -731,6 +731,36 @@ impl Tree {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    pub(crate) fn remove_version(&self, g: &Guard, raw: &[u8], ver: Ver) -> Result<bool, OpCode> {
+        let page = self.find_leaf(g, raw)?;
+        let Some(_lk) = page.try_lock() else {
+            return Err(OpCode::Again);
+        };
+        if self.bucket.table.get(page.pid()) != page.swip() {
+            return Err(OpCode::Again);
+        }
+
+        let prefix = {
+            let lo = page.lo();
+            let len = page.header().prefix_len as usize;
+            if raw.len() < len || lo[..len] != raw[..len] {
+                return Err(OpCode::Again);
+            }
+            &raw[len..]
+        };
+
+        let mut build = self.begin_build();
+        let (new_node, junk, removed) =
+            page.compact_remove_version(&mut build, self.txid(), prefix, ver);
+        if !removed {
+            return Ok(false);
+        }
+        let mut publish = build.into_publish(g);
+        publish.replace(page, new_node, junk);
+        publish.commit();
+        Ok(true)
     }
 
     /// return the latest key-val pair, by using Ikey::raw(), thanks to MVCC, the first match one is
@@ -834,11 +864,11 @@ impl Tree {
                     return true;
                 }
                 let val = x.val();
-                if val.is_tombstone() {
-                    result = Some(Err(OpCode::NotFound));
-                    return true;
-                }
                 if visible(k.txid, val.group_id()) {
+                    if val.is_tombstone() {
+                        result = Some(Err(OpCode::NotFound));
+                        return true;
+                    }
                     let (r, v) = val.get_record(&page.loader, true);
                     result = Some(Ok(ValRef::new(r, v.unwrap_or_else(|| x.as_box()))));
                     return true;
@@ -853,10 +883,10 @@ impl Tree {
 
         // Key::raw is unique in sst
         let (k, val) = page.search_sst(&key).ok_or(OpCode::NotFound)?;
-        if val.is_tombstone() {
-            return Err(OpCode::NotFound);
-        }
         if visible(k.txid, val.group_id()) {
+            if val.is_tombstone() {
+                return Err(OpCode::NotFound);
+            }
             let (record, r) = val.get_record(&page.loader, true);
             return Ok(ValRef::new(record, r.unwrap_or_else(|| page.base_box())));
         }
@@ -864,16 +894,6 @@ impl Tree {
             return self.traverse_sibling(&page.loader, key.txid, addr, &mut visible);
         }
         Err(OpCode::NotFound)
-    }
-}
-
-impl ITree for Tree {
-    fn put<K, V>(&self, g: &Guard, k: K, v: V)
-    where
-        K: crate::types::traits::IKey,
-        V: crate::types::traits::IVal,
-    {
-        self.put(g, k, v).unwrap()
     }
 }
 

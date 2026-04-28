@@ -1,5 +1,6 @@
 use crossbeam_epoch::Guard;
 use parking_lot::{Mutex, RwLock};
+use std::collections::BTreeMap;
 
 use crate::OpCode;
 use crate::cc::cc::ConcurrencyControl;
@@ -25,6 +26,28 @@ pub(crate) struct GroupBoot {
     pub checkpoint: Position,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxOutcome {
+    InProgress,
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AbortCleanTask {
+    pub txid: u64,
+    pub group_id: u8,
+    pub tail_lsn: Position,
+    pub pin_file_id: u64,
+    pub state: AbortCleanState,
+    pub quiesced: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AbortCleanState {
+    Pending,
+    WaitingQuiesce,
+}
+
 pub struct Context {
     pub(crate) opt: Arc<ParsedOptions>,
     /// maybe a bottleneck
@@ -36,13 +59,41 @@ pub struct Context {
     group_rr: CachePad<AtomicUsize>,
     /// this value is advanced by collect_thread based on active view snapshots
     min_view_txid: Arc<AtomicU64>,
+    tx_outcomes: Vec<RwLock<BTreeMap<u64, TxOutcome>>>,
+    tx_outcome_mask: usize,
+    pending_abort_clean: Vec<RwLock<BTreeMap<u64, AbortCleanTask>>>,
+    abort_clean_mask: usize,
+    pending_abort_clean_nr: CachePad<AtomicUsize>,
+    pending_abort_clean_floor: CachePad<AtomicU64>,
+    pending_abort_clean_seq: CachePad<AtomicU64>,
+    pending_abort_clean_meta: Mutex<()>,
+    abort_clean_events: Arc<Mutex<Vec<u64>>>,
     tx: Sender<()>,
     collector: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Context {
+    const MAX_SHARDS: usize = 32;
+    const MIN_SHARDS: usize = 4;
+
+    #[inline]
+    fn shard_of(txid: u64, mask: usize) -> usize {
+        (txid as usize) & mask
+    }
+
+    #[inline]
+    fn shard_count_for(concurrent_write: usize) -> usize {
+        concurrent_write
+            .clamp(Self::MIN_SHARDS, Self::MAX_SHARDS)
+            .next_power_of_two()
+    }
+
     pub fn new(opt: Arc<ParsedOptions>, numerics: Arc<Numerics>, group_boot: &[GroupBoot]) -> Self {
         let cores = opt.concurrent_write as usize;
+        let tx_outcome_shards = Self::shard_count_for(cores);
+        let tx_outcome_mask = tx_outcome_shards - 1;
+        let abort_clean_shards = Self::shard_count_for(cores);
+        let abort_clean_mask = abort_clean_shards - 1;
         let mut groups = Vec::with_capacity(cores);
         for i in 0..cores {
             let boot = group_boot.get(i).copied().unwrap_or(GroupBoot {
@@ -74,9 +125,46 @@ impl Context {
             nr_view: CachePad::default(),
             group_rr: CachePad::default(),
             min_view_txid,
+            tx_outcomes: (0..tx_outcome_shards)
+                .map(|_| RwLock::new(BTreeMap::new()))
+                .collect(),
+            tx_outcome_mask,
+            pending_abort_clean: (0..abort_clean_shards)
+                .map(|_| RwLock::new(BTreeMap::new()))
+                .collect(),
+            abort_clean_mask,
+            pending_abort_clean_nr: CachePad::default(),
+            pending_abort_clean_floor: CachePad::from(AtomicU64::new(u64::MAX)),
+            pending_abort_clean_seq: CachePad::default(),
+            pending_abort_clean_meta: Mutex::default(),
+            abort_clean_events: Arc::new(Mutex::new(Vec::new())),
             tx,
             collector: Mutex::new(Some(collector)),
         }
+    }
+
+    #[inline]
+    fn update_pending_abort_clean_floor(&self, txid: u64) {
+        let mut floor = self.pending_abort_clean_floor.load(Relaxed);
+        while txid < floor {
+            match self
+                .pending_abort_clean_floor
+                .compare_exchange_weak(floor, txid, Relaxed, Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => floor = actual,
+            }
+        }
+    }
+
+    fn recompute_pending_abort_clean_floor(&self) {
+        let mut floor = u64::MAX;
+        for shard in &self.pending_abort_clean {
+            if let Some((txid, _)) = shard.read().first_key_value() {
+                floor = floor.min(*txid);
+            }
+        }
+        self.pending_abort_clean_floor.store(floor, Relaxed);
     }
 
     pub fn oldest_view_txid(&self) -> Option<u64> {
@@ -162,6 +250,150 @@ impl Context {
 
     pub(crate) fn alloc_oracle(&self) -> u64 {
         self.numerics.oracle.fetch_add(1, Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn mark_tx_in_progress(&self, txid: u64) {
+        let shard = Self::shard_of(txid, self.tx_outcome_mask);
+        self.tx_outcomes[shard]
+            .write()
+            .insert(txid, TxOutcome::InProgress);
+    }
+
+    #[inline]
+    pub(crate) fn mark_tx_aborted(&self, txid: u64) {
+        let shard = Self::shard_of(txid, self.tx_outcome_mask);
+        self.tx_outcomes[shard]
+            .write()
+            .insert(txid, TxOutcome::Aborted);
+    }
+
+    #[inline]
+    pub(crate) fn clear_tx_outcome(&self, txid: u64) {
+        let shard = Self::shard_of(txid, self.tx_outcome_mask);
+        self.tx_outcomes[shard].write().remove(&txid);
+    }
+
+    #[inline]
+    pub(crate) fn tx_outcome(&self, txid: u64) -> Option<TxOutcome> {
+        let shard = Self::shard_of(txid, self.tx_outcome_mask);
+        self.tx_outcomes[shard].read().get(&txid).copied()
+    }
+
+    #[inline]
+    pub(crate) fn enqueue_abort_clean(
+        &self,
+        txid: u64,
+        group_id: u8,
+        tail_lsn: Position,
+        pin_file_id: u64,
+    ) {
+        let task = AbortCleanTask {
+            txid,
+            group_id,
+            tail_lsn,
+            pin_file_id: pin_file_id.min(tail_lsn.file_id),
+            state: AbortCleanState::Pending,
+            quiesced: false,
+        };
+        let _meta = self.pending_abort_clean_meta.lock();
+        self.pending_abort_clean_seq.fetch_add(1, AcqRel);
+        let shard = Self::shard_of(txid, self.abort_clean_mask);
+        let old = self.pending_abort_clean[shard].write().insert(txid, task);
+        if old.is_none() {
+            self.pending_abort_clean_nr.fetch_add(1, Relaxed);
+            self.update_pending_abort_clean_floor(txid);
+        }
+        self.pending_abort_clean_seq.fetch_add(1, Release);
+    }
+
+    #[inline]
+    pub(crate) fn remove_abort_clean(&self, txid: u64) {
+        let _meta = self.pending_abort_clean_meta.lock();
+        self.pending_abort_clean_seq.fetch_add(1, AcqRel);
+        let shard = Self::shard_of(txid, self.abort_clean_mask);
+        let old = self.pending_abort_clean[shard].write().remove(&txid);
+        if old.is_some() {
+            self.pending_abort_clean_nr.fetch_sub(1, Relaxed);
+            if self.pending_abort_clean_nr.load(Relaxed) == 0 {
+                self.pending_abort_clean_floor.store(u64::MAX, Relaxed);
+            } else if txid <= self.pending_abort_clean_floor.load(Relaxed) {
+                self.recompute_pending_abort_clean_floor();
+            }
+        }
+        self.pending_abort_clean_seq.fetch_add(1, Release);
+    }
+
+    pub(crate) fn pending_abort_clean_tasks(&self) -> Vec<AbortCleanTask> {
+        let mut tasks = Vec::new();
+        for shard in &self.pending_abort_clean {
+            tasks.extend(shard.read().values().copied());
+        }
+        tasks
+    }
+
+    pub(crate) fn mark_abort_clean_wait_quiesce(&self, txid: u64) {
+        let shard = Self::shard_of(txid, self.abort_clean_mask);
+        if let Some(task) = self.pending_abort_clean[shard].write().get_mut(&txid) {
+            task.state = AbortCleanState::WaitingQuiesce;
+            task.quiesced = false;
+        }
+    }
+
+    pub(crate) fn mark_abort_clean_quiesced(&self, txid: u64) {
+        let shard = Self::shard_of(txid, self.abort_clean_mask);
+        if let Some(task) = self.pending_abort_clean[shard].write().get_mut(&txid) {
+            task.quiesced = true;
+        }
+    }
+
+    pub(crate) fn abort_clean_event_sink(&self) -> Arc<Mutex<Vec<u64>>> {
+        self.abort_clean_events.clone()
+    }
+
+    pub(crate) fn drain_abort_clean_events(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.abort_clean_events.lock())
+    }
+
+    pub(crate) fn min_abort_clean_file_id(&self, group_id: u8) -> Option<u64> {
+        let mut min_id = None;
+        for shard in &self.pending_abort_clean {
+            let candidate = shard
+                .read()
+                .values()
+                .filter(|x| x.group_id == group_id)
+                .map(|x| x.pin_file_id)
+                .min();
+            if let Some(candidate) = candidate {
+                min_id = Some(min_id.map_or(candidate, |v: u64| v.min(candidate)));
+            }
+        }
+        min_id
+    }
+
+    #[inline]
+    pub(crate) fn compact_safe_txid(&self) -> u64 {
+        let safe = self.safe_txid();
+        loop {
+            let seq1 = self.pending_abort_clean_seq.load(Acquire);
+            if seq1 & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let pending_floor = self.pending_abort_clean_floor.load(Relaxed);
+            let seq2 = self.pending_abort_clean_seq.load(Acquire);
+            if seq1 == seq2 {
+                if pending_floor == u64::MAX {
+                    return safe;
+                }
+                return safe.min(pending_floor.saturating_sub(1));
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn has_pending_abort_clean(&self) -> bool {
+        self.pending_abort_clean_nr.load(Relaxed) > 0
     }
 
     pub(crate) fn start(&self) {
@@ -438,8 +670,22 @@ impl Drop for CCPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CCPOOL_SHARD, CCPool};
+    use super::{CCPOOL_SHARD, CCPool, Context, TxOutcome};
+    use crate::meta::Numerics;
+    use crate::utils::data::Position;
+    use crate::{Options, RandomPath};
+    use std::sync::Arc;
     use std::sync::atomic::Ordering::Relaxed;
+    use std::thread;
+
+    fn test_context() -> Arc<Context> {
+        let mut opts = Options::new(&*RandomPath::new());
+        opts.tmp_store = true;
+        opts.concurrent_write = 4;
+        let opts = Arc::new(opts.validate().unwrap());
+        let numerics = Arc::new(Numerics::default());
+        Arc::new(Context::new(opts, numerics, &[]))
+    }
 
     #[test]
     fn ccpool_shrink_reclaims_idle_nodes() {
@@ -474,5 +720,167 @@ mod tests {
         let h2 = pool.alloc(11);
         assert_eq!(h2.start_ts, 11);
         pool.free(h2);
+    }
+
+    #[test]
+    fn context_tx_outcome_shards_keep_expected_state_after_churn() {
+        let ctx = test_context();
+        const WORKERS: usize = 8;
+        const SPAN: usize = 128;
+        let mut handles = Vec::with_capacity(WORKERS);
+
+        for wid in 0..WORKERS {
+            let ctx = ctx.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..SPAN {
+                    let txid = (wid * SPAN + i + 1) as u64;
+                    ctx.mark_tx_in_progress(txid);
+                    if txid % 3 == 0 {
+                        ctx.mark_tx_aborted(txid);
+                    }
+                    if txid % 2 == 0 {
+                        ctx.clear_tx_outcome(txid);
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for txid in 1..=(WORKERS * SPAN) as u64 {
+            if txid % 2 == 0 {
+                assert_eq!(ctx.tx_outcome(txid), None);
+            } else if txid % 3 == 0 {
+                assert_eq!(ctx.tx_outcome(txid), Some(TxOutcome::Aborted));
+            } else {
+                assert_eq!(ctx.tx_outcome(txid), Some(TxOutcome::InProgress));
+            }
+        }
+    }
+
+    #[test]
+    fn context_pending_abort_clean_shards_aggregate_consistently() {
+        let ctx = test_context();
+        let mut expected = 0usize;
+        let mut min_group0 = None;
+        let mut min_group1 = None;
+
+        for txid in 1u64..=96 {
+            let group_id = (txid % 2) as u8;
+            let pin = 10_000 - txid;
+            ctx.enqueue_abort_clean(
+                txid,
+                group_id,
+                Position {
+                    file_id: pin + 7,
+                    offset: txid,
+                },
+                pin,
+            );
+
+            if txid % 5 == 0 {
+                ctx.remove_abort_clean(txid);
+                continue;
+            }
+
+            expected += 1;
+            if group_id == 0 {
+                min_group0 = Some(min_group0.map_or(pin, |x: u64| x.min(pin)));
+            } else {
+                min_group1 = Some(min_group1.map_or(pin, |x: u64| x.min(pin)));
+            }
+        }
+
+        assert_eq!(ctx.pending_abort_clean_tasks().len(), expected);
+        assert_eq!(ctx.min_abort_clean_file_id(0), min_group0);
+        assert_eq!(ctx.min_abort_clean_file_id(1), min_group1);
+        assert!(ctx.has_pending_abort_clean());
+    }
+
+    #[test]
+    fn context_compact_safe_txid_tracks_pending_floor_cache() {
+        let ctx = test_context();
+        ctx.numerics.wmk_oldest.store(200, Relaxed);
+
+        assert_eq!(ctx.compact_safe_txid(), 200);
+
+        ctx.enqueue_abort_clean(
+            150,
+            0,
+            Position {
+                file_id: 300,
+                offset: 1,
+            },
+            150,
+        );
+        assert_eq!(ctx.compact_safe_txid(), 149);
+
+        ctx.enqueue_abort_clean(
+            120,
+            1,
+            Position {
+                file_id: 301,
+                offset: 2,
+            },
+            120,
+        );
+        assert_eq!(ctx.compact_safe_txid(), 119);
+
+        ctx.remove_abort_clean(120);
+        assert_eq!(ctx.compact_safe_txid(), 149);
+
+        ctx.remove_abort_clean(150);
+        assert_eq!(ctx.compact_safe_txid(), 200);
+    }
+
+    #[test]
+    fn context_pending_abort_floor_remains_safe_under_remove_enqueue_race() {
+        let ctx = test_context();
+        ctx.numerics.wmk_oldest.store(1_000_000, Relaxed);
+
+        for i in 0..256u64 {
+            let high = 10_000 + i * 2;
+            let low = high - 1;
+
+            ctx.enqueue_abort_clean(
+                high,
+                0,
+                Position {
+                    file_id: high + 7,
+                    offset: high,
+                },
+                high,
+            );
+
+            let ctx1 = ctx.clone();
+            let ctx2 = ctx.clone();
+            let t1 = thread::spawn(move || {
+                ctx1.remove_abort_clean(high);
+            });
+            let t2 = thread::spawn(move || {
+                ctx2.enqueue_abort_clean(
+                    low,
+                    1,
+                    Position {
+                        file_id: low + 9,
+                        offset: low,
+                    },
+                    low,
+                );
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert!(
+                ctx.compact_safe_txid() <= low.saturating_sub(1),
+                "compact floor moved above pending minimum for txid={low}"
+            );
+
+            ctx.remove_abort_clean(high);
+            ctx.remove_abort_clean(low);
+            assert_eq!(ctx.compact_safe_txid(), 1_000_000);
+        }
     }
 }

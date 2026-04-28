@@ -1,25 +1,11 @@
 use crc32c::Crc32cHasher;
+use std::fmt::Debug;
 use std::hash::Hasher;
-use std::{
-    cell::RefCell,
-    cmp::max,
-    collections::{BTreeMap, btree_map::Entry},
-    fmt::Debug,
-    rc::Rc,
-};
 
 use crate::{
-    io::{File, GatherIO},
     static_assert,
-    types::{
-        data::{Key, Record, Ver},
-        traits::ITree,
-    },
-    utils::{INIT_CMD, OpCode, block::Block, data::Position},
+    utils::{OpCode, data::Position},
 };
-use crossbeam_epoch::Guard;
-
-use super::context::Context;
 
 pub(crate) trait IWalCodec {
     fn encoded_len(&self) -> usize;
@@ -61,13 +47,12 @@ pub(crate) enum PayloadType {
     Insert,
     Update,
     Delete,
-    Clr,
 }
 
 impl TryFrom<u8> for PayloadType {
     type Error = OpCode;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        if value <= PayloadType::Clr as u8 {
+        if value <= PayloadType::Delete as u8 {
             unsafe { Ok(std::mem::transmute::<u8, PayloadType>(value)) }
         } else {
             Err(OpCode::Corruption)
@@ -80,7 +65,6 @@ pub(crate) struct WalUpdate {
     pub(crate) wal_type: EntryType,
     pub(crate) sub_type: PayloadType,
     pub(crate) bucket_id: u64,
-    /// meaningful in txn rollback, unnecessary in recovery
     pub(crate) group_id: u8,
     /// payload size
     pub(crate) size: u32,
@@ -203,14 +187,6 @@ impl WalUpdate {
         self.cast_to::<WalReplace>()
     }
 
-    pub(crate) fn del(&self) -> &WalDel {
-        self.cast_to::<WalDel>()
-    }
-
-    pub(crate) fn clr(&self) -> &WalClr {
-        self.cast_to::<WalClr>()
-    }
-
     pub(crate) fn calc_checksum(&self) -> u32 {
         let ptr = self as *const Self as *const u8;
         let header_size = self.encoded_len();
@@ -290,14 +266,12 @@ impl_codec!(WalPut);
 #[repr(C, packed(1))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WalReplace {
-    pub(crate) ov_len: u32,
     pub(crate) nv_len: u32,
 }
 
 impl WalReplace {
-    pub(crate) fn new(ov_len: usize, nv_len: usize) -> Self {
+    pub(crate) fn new(nv_len: usize) -> Self {
         Self {
-            ov_len: ov_len as u32,
             nv_len: nv_len as u32,
         }
     }
@@ -309,75 +283,24 @@ impl WalReplace {
         }
     }
 
-    pub(crate) fn old_val(&self) -> &[u8] {
-        self.get(size_of::<Self>(), self.ov_len as usize)
-    }
-
     pub(crate) fn new_val(&self) -> &[u8] {
-        self.get(
-            size_of::<Self>() + self.ov_len as usize,
-            self.nv_len as usize,
-        )
+        self.get(size_of::<Self>(), self.nv_len as usize)
     }
 }
 
 impl_codec!(WalReplace);
 
 #[repr(C, packed(1))]
-#[derive(Debug)]
-pub(crate) struct WalDel {
-    pub(crate) vlen: u32,
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WalDel {}
 
 impl WalDel {
-    pub fn new(vlen: usize) -> Self {
-        Self { vlen: vlen as u32 }
-    }
-
-    fn get(&self, pos: usize, len: usize) -> &[u8] {
-        unsafe {
-            let ptr = self as *const Self as *const u8;
-            std::slice::from_raw_parts(ptr.add(pos), len)
-        }
-    }
-
-    pub(crate) fn val(&self) -> &[u8] {
-        self.get(size_of::<Self>(), self.vlen as usize)
+    pub fn new() -> Self {
+        Self {}
     }
 }
 
 impl_codec!(WalDel);
-
-#[derive(Debug)]
-#[repr(C, packed(1))]
-pub(crate) struct WalClr {
-    tombstone: bool,
-    vlen: u32,
-    pub(crate) undo_id: u64,
-    pub(crate) undo_off: u64,
-}
-
-impl WalClr {
-    pub(crate) fn new(tombstone: bool, vlen: usize, undo_id: u64, undo_off: u64) -> Self {
-        Self {
-            tombstone,
-            vlen: vlen as u32,
-            undo_id,
-            undo_off,
-        }
-    }
-
-    pub(crate) fn is_tombstone(&self) -> bool {
-        self.tombstone
-    }
-
-    pub(crate) fn val(&self) -> &[u8] {
-        let ptr = self as *const Self;
-        unsafe { std::slice::from_raw_parts(ptr.add(1).cast::<u8>(), self.vlen as usize) }
-    }
-}
-
-impl_codec!(WalClr);
 
 impl IWalPayload for WalPut {
     fn sub_type(&self) -> PayloadType {
@@ -394,12 +317,6 @@ impl IWalPayload for WalReplace {
 impl IWalPayload for WalDel {
     fn sub_type(&self) -> PayloadType {
         PayloadType::Delete
-    }
-}
-
-impl IWalPayload for WalClr {
-    fn sub_type(&self) -> PayloadType {
-        PayloadType::Clr
     }
 }
 
@@ -431,194 +348,6 @@ pub(crate) struct Location {
     pub(crate) group_id: u32,
     pub(crate) len: u32,
     pub(crate) pos: Position,
-}
-
-pub(crate) struct WalReader<'a> {
-    map: RefCell<BTreeMap<(u8, u64), (Rc<File>, u64)>>,
-    ctx: &'a Context,
-    guard: &'a Guard,
-}
-
-impl<'a> WalReader<'a> {
-    pub(crate) fn new(ctx: &'a Context, guard: &'a Guard) -> Self {
-        Self {
-            map: RefCell::new(BTreeMap::new()),
-            ctx,
-            guard,
-        }
-    }
-
-    fn get_file(&self, id: u8, seq: u64) -> Option<(Rc<File>, u64)> {
-        const MAX_OPEN_FILES: usize = 10;
-        let mut map = self.map.borrow_mut();
-        while map.len() > MAX_OPEN_FILES {
-            map.pop_first();
-        }
-        let key = (id, seq);
-        if let Entry::Vacant(e) = map.entry(key) {
-            let path = self.ctx.opt.wal_file(id, seq);
-            if !path.exists() {
-                return None;
-            }
-            let f = File::options().read(true).open(&path).unwrap();
-            let len = f.size().unwrap();
-            e.insert((Rc::new(f), len));
-        }
-        map.get(&key).map(|(x, y)| (x.clone(), *y))
-    }
-
-    // for rollback, the group should be same to caller, but can be arbitrary for recovery
-    pub(crate) fn rollback<T: ITree, F>(
-        &self,
-        block: &mut Block,
-        txid: u64,
-        mut addr: Location,
-        get_tree: F,
-    ) -> Result<(), OpCode>
-    where
-        F: Fn(u64) -> T,
-    {
-        let group_id = addr.group_id;
-        let mut cmd = INIT_CMD;
-        let mut pos = addr.pos.offset;
-
-        'outer: loop {
-            let (f, end) = match self.get_file(group_id as u8, addr.pos.file_id) {
-                None => {
-                    log::error!(
-                        "rollback source wal file missing, group={} file_id={} txid={} current={:?}",
-                        group_id,
-                        addr.pos.file_id,
-                        txid,
-                        addr.pos
-                    );
-                    return Err(OpCode::Corruption);
-                }
-                Some(f) => {
-                    if f.1 == 0 {
-                        break; // empty file
-                    }
-                    f
-                }
-            };
-
-            loop {
-                let s = block.mut_slice(0, block.len());
-                f.read(&mut s[0..1], pos).unwrap();
-                let h: EntryType = s[0].try_into()?;
-                let sz = wal_record_sz(h)?;
-                assert!(pos + sz as u64 <= end);
-                assert!(sz <= block.len());
-
-                f.read(&mut s[0..sz], pos).unwrap();
-                match h {
-                    EntryType::Abort | EntryType::Commit => {
-                        let r = ptr_to::<WalCommit>(s.as_ptr());
-                        if !r.is_intact() {
-                            return Err(OpCode::Corruption);
-                        }
-                        break 'outer;
-                    }
-                    EntryType::Begin => {
-                        let r = ptr_to::<WalBegin>(s.as_ptr());
-                        if !r.is_intact() {
-                            return Err(OpCode::Corruption);
-                        }
-                        // we use the same group in the UPDATE record or else any group is ok, so
-                        // that we can make sure these records will be flushed with the same order
-                        // as they were queued
-                        let g = self.ctx.group(group_id as usize);
-                        g.logging.lock().record_abort(txid)?;
-                        break 'outer;
-                    }
-                    EntryType::Update => {
-                        let u = ptr_to::<WalUpdate>(s.as_ptr());
-                        let usz = sz + u.payload_len();
-                        assert_eq!({ u.txid }, txid);
-                        assert!(pos + usz as u64 <= end);
-                        if block.len() < usz {
-                            block.realloc(usz);
-                        }
-                        let s = block.mut_slice(sz, usz - sz);
-                        f.read(s, pos + sz as u64).unwrap();
-
-                        let u = ptr_to::<WalUpdate>(block.data());
-                        if !u.is_intact() {
-                            return Err(OpCode::Corruption);
-                        }
-
-                        let (prev_id, prev_off) =
-                            self.undo(u, &mut cmd, &get_tree, group_id as usize, addr.pos)?;
-                        pos = prev_off;
-                        if prev_id != addr.pos.file_id {
-                            addr.pos.file_id = prev_id;
-                            break;
-                        }
-                    }
-                    _ => return Err(OpCode::Corruption),
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn undo<T: ITree, F>(
-        &self,
-        c: &WalUpdate,
-        cmd: &mut u32,
-        get_tree: F,
-        group_id: usize,
-        current_pos: Position,
-    ) -> Result<(u64, u64), OpCode>
-    where
-        F: Fn(u64) -> T,
-    {
-        let (tombstone, data) = match c.sub_type() {
-            PayloadType::Insert => {
-                let i = c.put();
-                (true, i.val())
-            }
-            PayloadType::Update => {
-                let u = c.update();
-                (false, u.old_val())
-            }
-            PayloadType::Delete => {
-                let d = c.del();
-                (false, d.val())
-            }
-            PayloadType::Clr => {
-                let x = c.clr();
-                return Ok((x.undo_id, x.undo_off));
-            }
-        };
-
-        *cmd = max(c.cmd_id, *cmd);
-        *cmd += 1; // make sure that cmd is increasing in same txn
-        let raw = c.key();
-        let val = if tombstone {
-            Record::remove(c.group_id)
-        } else {
-            Record::normal(c.group_id, data)
-        };
-
-        let g = self.ctx.group(group_id);
-        let key = Key::new(raw, Ver::new(c.txid, *cmd));
-        g.logging.lock().record_update(
-            &key,
-            WalClr::new(tombstone, data.len(), c.prev_id, c.prev_off),
-            [].as_slice(),
-            data,
-            current_pos,
-            c.bucket_id,
-        )?;
-
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_undo_after_clr_before_put");
-
-        let tree = get_tree(c.bucket_id);
-        tree.put(self.guard, key, val);
-        Ok((c.prev_id, c.prev_off))
-    }
 }
 
 pub(crate) fn ptr_to<T>(x: *const u8) -> &'static T {
