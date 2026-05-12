@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 use crate::utils::{NULL_ORACLE, rand_range};
 
-use super::context::Context;
+use super::context::{Context, TxOutcome};
 
 #[derive(Debug)]
 struct CacheEntry {
@@ -96,6 +96,25 @@ impl ConcurrencyControl {
             return false;
         }
 
+        let record_group = ctx.group(gid);
+        let in_progress = if let Some(min_active_txid) = record_group.active_txns.min_txid_hint() {
+            if record_txid < min_active_txid {
+                false
+            } else {
+                record_group.active_txns.contains(record_txid)
+            }
+        } else {
+            // min hint may be stale-max right after removing previous min while newer active txns still exist
+            record_group.active_txns.contains(record_txid)
+        };
+        if in_progress {
+            return false;
+        }
+
+        if ctx.is_aborted(record_txid) && ctx.get_aborted(record_txid) == Some(TxOutcome::Aborted) {
+            return false;
+        }
+
         // safe watermark can advance while a range iterator is still alive, so visibility must read it at check time
         // freezing safe_txid at iterator creation can cause stale checks and false negatives when commit tree history is compacted
         if ctx.safe_txid() > record_txid {
@@ -109,7 +128,7 @@ impl ConcurrencyControl {
         }
 
         // slow path
-        let lcb = ctx.group(gid).cc.commit_tree.lcb(start_ts);
+        let lcb = record_group.cc.commit_tree.lcb(start_ts);
         if lcb != 0 {
             self.cached[gid].store(start_ts, lcb);
             return lcb >= record_txid;

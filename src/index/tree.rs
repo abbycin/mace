@@ -1,10 +1,10 @@
 use crate::Options;
-use crate::cc::context::Context;
+use crate::cc::context::{Context, TxOutcome};
 use crate::map::buffer::BucketContext;
 use crate::map::publish::AllocGuard;
 use crate::map::{Loader, Node, Page};
-use crate::types::data::{IterItem, Record, Val};
-use crate::types::node::{Junk, MergeOp, RawLeafIter};
+use crate::types::data::{HistRef, IterItem, Record, Val};
+use crate::types::node::{Junk, MergeOp, RawLeafIter, RawLeafRevIter};
 use crate::types::refbox::DeltaView;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::data::Position;
@@ -17,7 +17,7 @@ use crate::{
     types::{
         data::{Index, IntlKey, Key, Ver},
         refbox::BoxRef,
-        traits::{ICodec, IKey, ITree, IVal},
+        traits::{ICodec, IKey, IVal},
     },
     utils::{NULL_CMD, NULL_PID},
 };
@@ -35,7 +35,7 @@ pub struct ValRef {
 }
 
 impl ValRef {
-    fn new(raw: Record, owner: BoxRef) -> Self {
+    pub(crate) fn new(raw: Record, owner: BoxRef) -> Self {
         Self { raw, _owner: owner }
     }
 
@@ -103,7 +103,7 @@ impl Tree {
     }
 
     fn txid(&self) -> u64 {
-        self.store.context.safe_txid()
+        self.store.context.compact_safe_txid()
     }
 
     pub(crate) fn bucket_id(&self) -> u64 {
@@ -464,7 +464,7 @@ impl Tree {
                     // current page is lhs and rhs is already mapped but new root is not installed yet
                     // complete root installation cooperatively
                     assert_eq!(cursor, self.root_index.pid);
-                    let safe_txid = self.store.context.numerics.safe_tixd();
+                    let safe_txid = self.txid();
                     let _ = self.split_root(g, node_ptr, rpid, hi.unwrap(), safe_txid);
                     return Err(OpCode::Again);
                 }
@@ -522,6 +522,98 @@ impl Tree {
         }
     }
 
+    fn find_prev_leaf(&self, g: &Guard, key: &[u8]) -> Result<Option<Page>, OpCode> {
+        let mut cursor = self.root_index.pid;
+        let mut path: Vec<(u64, u64, usize)> = Vec::new();
+
+        loop {
+            let Some(node) = self.load_node(g, cursor)? else {
+                return Err(OpCode::Again);
+            };
+            if node.header().merging {
+                return Err(OpCode::Again);
+            }
+            if key < node.lo() {
+                return Err(OpCode::Again);
+            }
+            if let Some(hi) = node.hi()
+                && key >= hi
+            {
+                return Err(OpCode::Again);
+            }
+
+            if !node.is_intl() {
+                break;
+            }
+
+            let sst = node.sst::<IntlKey>();
+            let pos = match sst.search_by(&IntlKey::new(key), |x, y| x.raw.cmp(y.raw)) {
+                Ok(pos) => pos,
+                Err(pos) => pos.max(1) - 1,
+            };
+            let (_, idx) = sst.kv_at::<Index>(pos);
+            path.push((node.pid(), node.swip(), pos));
+            cursor = idx.pid;
+        }
+
+        while let Some((parent_pid, parent_swip, child_pos)) = path.pop() {
+            if child_pos == 0 {
+                continue;
+            }
+
+            let Some(parent) = self.load_node(g, parent_pid)? else {
+                return Err(OpCode::Again);
+            };
+            if parent.swip() != parent_swip {
+                return Err(OpCode::Again);
+            }
+            if !parent.is_intl() {
+                return Err(OpCode::Again);
+            }
+
+            let sst = parent.sst::<IntlKey>();
+            if child_pos >= parent.header().elems as usize {
+                return Err(OpCode::Again);
+            }
+            let (_, idx) = sst.kv_at::<Index>(child_pos - 1);
+            let mut pid = idx.pid;
+
+            loop {
+                let Some(node) = self.load_node(g, pid)? else {
+                    return Err(OpCode::Again);
+                };
+                if node.header().merging {
+                    return Err(OpCode::Again);
+                }
+                if let Some(hi) = node.hi()
+                    && key > hi
+                {
+                    let rpid = node.header().right_sibling;
+                    if rpid == NULL_PID {
+                        return Err(OpCode::Again);
+                    }
+                    pid = rpid;
+                    continue;
+                }
+                if key <= node.lo() {
+                    return Err(OpCode::Again);
+                }
+                if !node.is_intl() {
+                    return Ok(Some(node));
+                }
+
+                let elems = node.header().elems as usize;
+                if elems == 0 {
+                    return Err(OpCode::Again);
+                }
+                let (_, rightmost) = node.sst::<IntlKey>().kv_at::<Index>(elems - 1);
+                pid = rightmost.pid;
+            }
+        }
+
+        Ok(None)
+    }
+
     fn try_compact(&self, g: &Guard, page: Page) {
         let _lk = page.lock();
         if self.bucket.table.get(page.pid()) != page.swip() {
@@ -552,7 +644,7 @@ impl Tree {
             return Ok(false);
         }
 
-        let safe_txid = self.store.context.safe_txid();
+        let safe_txid = self.txid();
         let delta_len = page.delta_len();
         let threshold = self.store.opt.consolidate_threshold as usize;
 
@@ -690,7 +782,7 @@ impl Tree {
         self.link(g, page, key, val, |pg, k| {
             let tmp = pg.find_latest(k);
             // use the full key from input argument and the version from the exists latest one
-            r = tmp.map(|(x, y, b)| (Key::new(k.raw, x.ver), ValRef::new(y, b)));
+            r = tmp.map(|(ver, y, b)| (Key::new(k.raw, ver), ValRef::new(y, b)));
             visible(&r)
         })?;
 
@@ -733,16 +825,73 @@ impl Tree {
         }
     }
 
+    // background abort-clean uses page-wide compaction so non-head aborted versions are also purged
+    // this keeps cleanup crash-safe even when newer committed versions already cover the same key
+    pub(crate) fn remove_aborted(&self, g: &Guard, raw: &[u8]) -> Result<bool, OpCode> {
+        let page = self.find_leaf(g, raw)?;
+        let Some(_lk) = page.try_lock() else {
+            return Err(OpCode::Again);
+        };
+        if self.bucket.table.get(page.pid()) != page.swip() {
+            return Err(OpCode::Again);
+        }
+        self.rewrite_node(g, page)
+    }
+
+    // foreground retry uses head-gated cleanup to avoid no-op page compaction under concurrent updates
+    // if the aborted version is no longer the key head, gc path will handle full cleanup later
+    pub(crate) fn remove_aborted_head(
+        &self,
+        g: &Guard,
+        raw: &[u8],
+        aborted_txid: u64,
+    ) -> Result<bool, OpCode> {
+        let page = self.find_leaf(g, raw)?;
+        let Some(_lk) = page.try_lock() else {
+            return Err(OpCode::Again);
+        };
+        if self.bucket.table.get(page.pid()) != page.swip() {
+            return Err(OpCode::Again);
+        }
+
+        let Some((head_ver, _, _)) = page.find_latest(&Key::new(raw, Ver::new(u64::MAX, u32::MAX)))
+        else {
+            return Ok(false);
+        };
+        if head_ver.txid != aborted_txid {
+            return Ok(false);
+        }
+        if self.store.context.get_aborted(aborted_txid) != Some(TxOutcome::Aborted) {
+            return Ok(false);
+        }
+
+        self.rewrite_node(g, page)
+    }
+
+    #[inline]
+    fn rewrite_node(&self, g: &Guard, page: Page) -> Result<bool, OpCode> {
+        let mut build = self.begin_build();
+        let (new_node, junk, removed) =
+            page.remove_aborted(&mut build, self.txid(), self.store.context);
+        if !removed {
+            return Ok(false);
+        }
+        let mut publish = build.into_publish(g);
+        publish.replace(page, new_node, junk);
+        publish.commit();
+        Ok(true)
+    }
+
     /// return the latest key-val pair, by using Ikey::raw(), thanks to MVCC, the first match one is
     /// the latest one
     pub fn get<'b>(&'b self, g: &Guard, key: Key<'b>) -> Result<(Key<'b>, ValRef), OpCode> {
         let page = self.find_leaf(g, key.raw())?;
 
-        let Some((k, v, b)) = page.find_latest(&key) else {
+        let Some((ver, v, b)) = page.find_latest(&key) else {
             return Err(OpCode::NotFound);
         };
 
-        Ok((k, ValRef::new(v, b)))
+        Ok((Key::new(key.raw, ver), ValRef::new(v, b)))
     }
 
     pub fn range<'a, K, R, F>(&'a self, range: R, visible: F) -> Iter<'a>
@@ -769,6 +918,7 @@ impl Tree {
             lo,
             hi,
             iter: None,
+            rev_iter: None,
             cache: None,
             iter_bound: None,
             checker: Box::new(visible),
@@ -777,25 +927,46 @@ impl Tree {
         }
     }
 
-    fn traverse_sibling<L, F>(
+    fn traverse_hist<L, F>(
         &self,
         l: &L,
         start_ts: u64,
-        mut addr: u64,
+        hist: HistRef,
         visible: &mut F,
     ) -> Result<ValRef, OpCode>
     where
         L: ILoader,
         F: FnMut(u64, u8) -> bool,
     {
-        let ver = Ver::new(start_ts, NULL_CMD);
+        let mut addr = hist.page_addr;
+        let mut pos = hist.slot as usize;
+        let mut remaining = hist.count as usize;
+        let mut first_segment = true;
+        let target = Ver::new(start_ts, NULL_CMD);
 
-        while addr != NULL_PID {
+        while addr != NULL_PID && remaining > 0 {
             let ptr = l.load(addr)?.as_base();
             let sst = ptr.sst::<Ver>();
-            let mut pos = sst.lower_bound(&ver).unwrap_or_else(|pos| pos);
-            // pos is the first possible visible
-            while pos < sst.header().elems as usize {
+            let elems = sst.header().elems as usize;
+            if pos >= elems {
+                addr = ptr.box_header().link;
+                pos = 0;
+                continue;
+            }
+
+            // history is key-local contiguous region, so only binary-search the active subrange
+            // on the first page and then continue linearly across the bounded region
+            let mut page_end = elems.min(pos.saturating_add(remaining));
+            if first_segment {
+                first_segment = false;
+                let begin = Self::lower_bound_hist_subrange(&sst, pos, page_end, &target);
+                let skipped = begin - pos;
+                pos = begin;
+                remaining = remaining.saturating_sub(skipped);
+                page_end = elems.min(pos.saturating_add(remaining));
+            }
+
+            while pos < page_end && remaining > 0 {
                 let (k, v) = sst.kv_at::<Val>(pos);
                 if visible(k.txid, v.group_id()) {
                     if v.is_tombstone() {
@@ -805,10 +976,34 @@ impl Tree {
                     return Ok(ValRef::new(v, r.map_or(ptr.as_box(), |x| x)));
                 }
                 pos += 1;
+                remaining -= 1;
+            }
+
+            if remaining == 0 {
+                break;
             }
             addr = ptr.box_header().link;
+            pos = 0;
         }
         Err(OpCode::NotFound)
+    }
+
+    fn lower_bound_hist_subrange(
+        sst: &crate::types::sst::Sst<Ver>,
+        mut lo: usize,
+        mut hi: usize,
+        target: &Ver,
+    ) -> usize {
+        while lo < hi {
+            let mid = lo + ((hi - lo) >> 1);
+            let key = sst.key_at(mid);
+            if key.cmp(target).is_lt() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     pub fn traverse<F>(&self, g: &Guard, key: Key, mut visible: F) -> Result<ValRef, OpCode>
@@ -834,11 +1029,11 @@ impl Tree {
                     return true;
                 }
                 let val = x.val();
-                if val.is_tombstone() {
-                    result = Some(Err(OpCode::NotFound));
-                    return true;
-                }
                 if visible(k.txid, val.group_id()) {
+                    if val.is_tombstone() {
+                        result = Some(Err(OpCode::NotFound));
+                        return true;
+                    }
                     let (r, v) = val.get_record(&page.loader, true);
                     result = Some(Ok(ValRef::new(r, v.unwrap_or_else(|| x.as_box()))));
                     return true;
@@ -853,27 +1048,17 @@ impl Tree {
 
         // Key::raw is unique in sst
         let (k, val) = page.search_sst(&key).ok_or(OpCode::NotFound)?;
-        if val.is_tombstone() {
-            return Err(OpCode::NotFound);
-        }
         if visible(k.txid, val.group_id()) {
+            if val.is_tombstone() {
+                return Err(OpCode::NotFound);
+            }
             let (record, r) = val.get_record(&page.loader, true);
             return Ok(ValRef::new(record, r.unwrap_or_else(|| page.base_box())));
         }
-        if let Some(addr) = val.get_sibling() {
-            return self.traverse_sibling(&page.loader, key.txid, addr, &mut visible);
+        if let Some(hist) = val.get_hist() {
+            return self.traverse_hist(&page.loader, key.txid, hist, &mut visible);
         }
         Err(OpCode::NotFound)
-    }
-}
-
-impl ITree for Tree {
-    fn put<K, V>(&self, g: &Guard, k: K, v: V)
-    where
-        K: crate::types::traits::IKey,
-        V: crate::types::traits::IVal,
-    {
-        self.put(g, k, v).unwrap()
     }
 }
 
@@ -884,6 +1069,7 @@ pub struct Iter<'a> {
     lo: Bound<Vec<u8>>,
     hi: Bound<Vec<u8>>,
     iter: Option<RawLeafIter<'a, Loader>>,
+    rev_iter: Option<RawLeafRevIter<'a, Loader>>,
     cache: Option<Box<Node>>,
     iter_bound: Option<Box<Bound<Vec<u8>>>>,
     checker: Box<dyn FnMut(&Context, u64, u8) -> bool + 'a>,
@@ -893,6 +1079,11 @@ pub struct Iter<'a> {
 
 impl Drop for Iter<'_> {
     fn drop(&mut self) {
+        // release iterator state before reclaiming shared key scratch
+        self.iter.take();
+        self.rev_iter.take();
+        self.cache.take();
+        self.iter_bound.take();
         self.cached_key.reclaim();
     }
 }
@@ -902,6 +1093,13 @@ impl Iter<'_> {
         match self.lo {
             Bound::Unbounded => &[],
             Bound::Excluded(ref x) | Bound::Included(ref x) => x,
+        }
+    }
+
+    fn high_key(&self) -> Option<&[u8]> {
+        match self.hi {
+            Bound::Unbounded => None,
+            Bound::Excluded(ref x) | Bound::Included(ref x) => Some(x),
         }
     }
 
@@ -915,7 +1113,34 @@ impl Iter<'_> {
         }
     }
 
+    fn find_leaf_for_next_back(&self) -> Result<Page, OpCode> {
+        if let Some(k) = self.high_key() {
+            let node = self.tree.find_leaf(&self.guard, k)?;
+            if matches!(self.hi, Bound::Excluded(_)) && node.lo() >= k {
+                return self
+                    .tree
+                    .find_prev_leaf(&self.guard, k)?
+                    .ok_or(OpCode::NotFound);
+            }
+            return Ok(node);
+        }
+
+        let mut node = self.tree.find_leaf(&self.guard, self.low_key())?;
+        loop {
+            let rpid = node.header().right_sibling;
+            if rpid == NULL_PID {
+                return Ok(node);
+            }
+            let Some(next) = self.tree.load_node(&self.guard, rpid)? else {
+                return Err(OpCode::Again);
+            };
+            node = next;
+        }
+    }
+
     fn get_next(&mut self) -> Option<<Self as Iterator>::Item> {
+        self.rev_iter.take();
+
         'retry: while !self.collapsed() {
             if self.iter.is_none() {
                 let node = match self.tree.find_leaf(&self.guard, self.low_key()) {
@@ -1028,6 +1253,103 @@ impl<'a> Iterator for Iter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.get_next()
+    }
+}
+
+impl<'a> DoubleEndedIterator for Iter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.iter.take();
+
+        'retry: while !self.collapsed() {
+            if self.rev_iter.is_none() {
+                let node = match self.find_leaf_for_next_back() {
+                    Ok(node) => node,
+                    Err(OpCode::Again) => {
+                        self.guard.flush();
+                        continue;
+                    }
+                    Err(OpCode::NotFound) => return None,
+                    Err(e) => panic!("iter find_leaf failed: {e:?}"),
+                };
+                let next_node = node.ref_node();
+                if let Some(cache) = self.cache.as_mut() {
+                    **cache = next_node;
+                } else {
+                    self.cache = Some(Box::new(next_node));
+                }
+                self.rev_iter = Some(unsafe {
+                    std::mem::transmute::<RawLeafRevIter<'_, Loader>, RawLeafRevIter<'_, Loader>>(
+                        self.cache.as_ref().expect("must valid").predecessor(
+                            &self.lo,
+                            &self.hi,
+                            self.cached_key,
+                        ),
+                    )
+                });
+            }
+
+            let res = loop {
+                let next = {
+                    let iter = self.rev_iter.as_mut().expect("must valid");
+                    iter.try_next_back()
+                };
+                match next {
+                    Ok(Some(item)) => {
+                        let lo_ok = match &self.lo {
+                            Bound::Unbounded => true,
+                            Bound::Included(b) => item.cmp_key(b.as_slice()).is_ge(),
+                            Bound::Excluded(b) => item.cmp_key(b.as_slice()).is_gt(),
+                        };
+                        let hi_ok = match &self.hi {
+                            Bound::Unbounded => true,
+                            Bound::Included(h) => item.cmp_key(h.as_slice()).is_le(),
+                            Bound::Excluded(h) => item.cmp_key(h.as_slice()).is_lt(),
+                        };
+                        if lo_ok
+                            && hi_ok
+                            && (self.checker)(
+                                &self.tree.store.context,
+                                item.txid(),
+                                item.group_id(),
+                            )
+                            && self.filter.check(&item)
+                        {
+                            break Some(item);
+                        }
+                    }
+                    Ok(None) => break None,
+                    Err(OpCode::Again | OpCode::NotFound) => {
+                        self.rev_iter.take();
+                        continue 'retry;
+                    }
+                    Err(e) => panic!("iter load failed: {e:?}"),
+                }
+            };
+
+            if let Some(item) = res {
+                let key = item.key();
+                match &mut self.hi {
+                    Bound::Included(v) | Bound::Excluded(v) => {
+                        v.clear();
+                        v.extend_from_slice(key);
+                        self.hi = Bound::Excluded(std::mem::take(v));
+                    }
+                    Bound::Unbounded => {
+                        self.hi = Bound::Excluded(key.to_vec());
+                    }
+                }
+                return Some(item);
+            }
+
+            self.rev_iter.take();
+            let lo = self.cache.as_ref().expect("must valid").lo();
+            if lo.is_empty() {
+                return None;
+            }
+            self.hi = Bound::Excluded(lo.to_vec());
+        }
+
+        None
     }
 }
 

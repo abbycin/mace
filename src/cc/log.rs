@@ -171,22 +171,40 @@ impl Logging {
         self.checkpoint()
     }
 
+    pub fn sync_checkpoint_barrier(&mut self) -> Result<(), OpCode> {
+        if self.durable_pos >= self.log_pos && !self.log_dir_dirty {
+            return Ok(());
+        }
+
+        self.flush_ring_to_writer();
+
+        let sync_started = sampled_instant(
+            self.log_pos.file_id ^ self.log_pos.offset,
+            LATENCY_SAMPLE_SHIFT,
+        );
+        if self.opt.sync_on_write {
+            self.sync_writer_and_dir();
+        } else {
+            self.sync_writer_data_and_dir();
+        }
+        self.durable_pos = self.flushed_pos;
+        self.opt.observer.counter(CounterMetric::WalSync, 1);
+        observe_elapsed(
+            self.opt.observer.as_ref(),
+            HistogramMetric::WalSyncMicros,
+            sync_started,
+        );
+        Ok(())
+    }
+
     #[cold]
-    fn record_large(
-        &mut self,
-        u: &WalUpdate,
-        k: &[u8],
-        w: &[u8],
-        ov: &[u8],
-        nv: &[u8],
-    ) -> Result<(), OpCode> {
-        let size = u.encoded_len() + k.len() + w.len() + ov.len() + nv.len();
+    fn record_large(&mut self, u: &WalUpdate, k: &[u8], w: &[u8], nv: &[u8]) -> Result<(), OpCode> {
+        let size = u.encoded_len() + k.len() + w.len() + nv.len();
         self.sync(false)?; // flush queued first, make sure log record is sequentail
         {
             self.writer.queue(u.to_slice());
             self.writer.queue(k);
             self.writer.queue(w);
-            self.writer.queue(ov);
             self.writer.queue(nv);
             self.writer.flush();
             if self.opt.sync_on_write {
@@ -216,7 +234,6 @@ impl Logging {
         &mut self,
         k: &Key,
         w: T,
-        ov: &[u8],
         nv: &[u8],
         prev_lsn: Position,
         bucket_id: u64,
@@ -224,7 +241,7 @@ impl Logging {
     where
         T: IWalCodec + IWalPayload,
     {
-        let payload_size = w.encoded_len() + k.raw.len() + ov.len() + nv.len();
+        let payload_size = w.encoded_len() + k.raw.len() + nv.len();
         let current_pos = self.current_pos();
 
         let mut u = WalUpdate {
@@ -253,7 +270,6 @@ impl Logging {
 
         h.write(k.raw);
         h.write(w.to_slice());
-        h.write(ov);
         h.write(nv);
 
         u.checksum = h.finish() as u32;
@@ -263,9 +279,9 @@ impl Logging {
             let a = self.alloc(total_sz)?;
 
             let mut b = LogBuilder::new(a);
-            b.add(u).add(k.raw).add(w).add(ov).add(nv).build(self)?;
+            b.add(u).add(k.raw).add(w).add(nv).build(self)?;
         } else {
-            self.record_large(&u, k.raw, w.to_slice(), ov, nv)?;
+            self.record_large(&u, k.raw, w.to_slice(), nv)?;
         }
         self.opt.observer.counter(CounterMetric::WalAppend, 1);
         self.opt
@@ -348,6 +364,17 @@ impl Logging {
     #[inline]
     fn sync_writer_and_dir(&mut self) {
         self.writer.sync();
+        self.sync_log_dir_if_dirty();
+    }
+
+    #[inline]
+    fn sync_writer_data_and_dir(&mut self) {
+        self.writer.sync_data();
+        self.sync_log_dir_if_dirty();
+    }
+
+    #[inline]
+    fn sync_log_dir_if_dirty(&mut self) {
         if self.log_dir_dirty {
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_wal_after_file_sync_before_dir_sync");
@@ -356,7 +383,8 @@ impl Logging {
         }
     }
 
-    pub fn sync(&mut self, force: bool) -> Result<(), OpCode> {
+    #[inline]
+    fn flush_ring_to_writer(&mut self) {
         let len = self.ring.distance();
         if len != 0 {
             self.writer.write(self.ring.slice(self.ring.head(), len));
@@ -364,6 +392,10 @@ impl Logging {
 
             self.flushed_pos = self.log_pos;
         }
+    }
+
+    pub fn sync(&mut self, force: bool) -> Result<(), OpCode> {
+        self.flush_ring_to_writer();
         if force || self.opt.sync_on_write {
             let sync_started = sampled_instant(
                 self.log_pos.file_id ^ self.log_pos.offset,

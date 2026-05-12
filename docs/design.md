@@ -22,7 +22,7 @@ It is focused on behavior that affects correctness, crash safety, and operationa
 - `src/index`
   - Bw-Tree style index, delta chains, split/merge/compact paths, iterator paths.
 - `src/cc`
-  - Concurrency control, writer groups, commit tree, WAL encode/decode, rollback.
+  - Concurrency control, writer groups, commit tree, WAL encode/decode, abort-aware visibility.
 - `src/utils/observe.rs`
   - Fixed-cardinality observability model.
 
@@ -74,6 +74,8 @@ Loading (`load_bucket_context`):
 Unload (`unload_bucket`):
 
 - runtime-only operation.
+- blocked while bucket-local abort-clean is still in `Pending`, because that phase may still rewrite
+  or checkpoint bucket pages.
 - unpublish from in-memory maps, checkpoint-and-reclaim loaded context.
 - persisted bucket metadata/data are kept.
 
@@ -126,6 +128,7 @@ Checkpoint cut (`Pool::checkpoint`):
   present in dirty generations; missing addresses are treated as already persisted/reclaimed.
 - computes per-group checkpoint frontier delta.
 - emits data/blob junk candidates for stat apply.
+- normalizes junk candidate streams to unique logical addresses before stat/metadata apply.
 
 `CheckpointTask::finish`:
 
@@ -143,6 +146,8 @@ This is the regression boundary introduced by prior reachable-junk lifecycle cha
   - compaction junk: intermediate sibling/remote addresses collected during merge/compact.
 - only structural junk may be retired from hot pages at publish time (with EBR deferral).
 - compaction junk must stay discoverable in dirty generations until checkpoint durability closure.
+- lineage accumulation may temporarily contain duplicate junk addresses.
+- duplicate cleanup boundary is checkpoint snapshot output, not foreground publish accumulation.
 - any address still reachable from live graph traversal (`link` / sibling hints / remote hints)
   must not enter the state "not in dirty memory and not yet in interval metadata".
 
@@ -153,6 +158,18 @@ If these constraints are violated:
 - long-lived views can observe false missing keys during checkpoint churn.
 - durability/visibility closure is broken: runtime may treat an address as persistent while metadata
   has no mapping for it yet.
+
+## MVCC history-region model
+
+- old versions are stored in history pages that may be shared by multiple keys.
+- each key maps to an explicit history region descriptor (`head_page`, `start_slot`, `count`).
+- a key's history region is logically contiguous and may span linked history pages.
+- ordering guarantee is per-key region only; there is no global version order across different keys
+  inside the same shared history page.
+- point/range history traversal must stay inside the key's declared region window and stop exactly
+  at `count` entries, even when the region crosses page links.
+- retiring a history page and reclaiming blob addresses are separate decisions.
+  history-page retirement never implies all referenced blobs are reclaimable.
 
 ## Frontier design (durable boundary)
 
@@ -257,7 +274,8 @@ Current flow metrics:
 Drop of uncommitted `TxnKV`:
 
 - no writes: log `Abort`.
-- with writes: rollback through WAL chain (`WalReader::rollback`), logging CLR records and inverse versions.
+- with writes: log `Abort`, sync the abort chain, mark txn outcome as aborted, and enqueue
+  background abort-clean from the WAL tail.
 
 `TxnView`:
 
@@ -267,15 +285,29 @@ Visibility (`ConcurrencyControl::is_visible_to`):
 
 - own uncommitted version visible only in same writer group.
 - future txid invisible.
-- `safe_txid` fast path from global watermark.
+- active writer-group membership is checked before any committed fast path.
+- aborted txns are filtered by abort outcome before `safe_txid` fast path can expose them.
+- `safe_txid` fast path is only for versions that are neither active nor aborted.
 - fallback to per-group `CommitTree::lcb(start_ts)`.
+
+Abort-aware write path:
+
+- `WalUpdate` is redo-only:
+  - insert/update log the new value image.
+  - delete logs only the tombstone operation, not the deleted value image.
+- foreground write conflict resolution is abort-aware:
+  - if the latest conflicting version belongs to an aborted txn, foreground retry may remove an
+    aborted head and retry instead of treating it as a committed conflict.
+  - if the latest conflicting version is active or committed-invisible, the txn aborts by SI rules.
+- aborted versions may remain physically present on pages until foreground retry or background
+  abort-clean compacts them away; visibility rules must hide them during that interval.
 
 WAL payload semantics:
 
 - `Insert`: new value image.
-- `Update`: old value + new value.
-- `Delete`: old value image.
-- `Clr`: tombstone/value + undo pointer (`undo_id`, `undo_off`).
+- `Update`: new value image.
+- `Delete`: tombstone operation only.
+- no CLR/physical undo records exist in the current design.
 
 ## Recovery
 
@@ -285,15 +317,19 @@ Startup sequence:
 2. `clean_orphans` scans orphan markers (`odf_*`, `obf_*`), removes stray files, deletes markers.
 3. WAL phase1 scans wal files per group and finds latest valid checkpoint as conservative scan start.
 4. context is created with per-group bootstrap info.
-5. phase2 runs `analyze -> redo -> undo`.
+5. phase2 runs `analyze -> redo`, while rebuilding abort outcomes and pending abort-clean state.
 
 Analyze stage:
 
 - reads WAL from checkpoint position.
 - truncates tail on corruption if `truncate_corrupted_wal=true`.
+- rebuilds transaction outcome state:
+  - committed txns enter commit-tree replay inputs only.
+  - aborted or in-progress txns are reconstructed as aborted outcome + abort-clean candidates if
+    they have uncommitted updates beyond durable frontier.
 - checks bucket durable frontier first (`durable_frontier_lsn`):
   - if `record_lsn <= frontier[bucket][group]`, treat as already durable and skip dirty-table enrollment.
-  - only records beyond frontier continue to redo/undo candidate logic.
+  - only records beyond frontier continue to redo/abort-clean candidate logic.
 
 Boundary split (important semantic change):
 
@@ -303,11 +339,9 @@ Boundary split (important semantic change):
 
 Redo stage:
 
-- reapplies remaining update/insert/delete/clr records in version order.
-
-Undo stage:
-
-- rolls back incomplete txns using same WAL rollback path used at runtime.
+- reapplies remaining committed update/insert/delete records in version order.
+- recovery does not perform physical undo of incomplete txns.
+- incomplete txns are made invisible by abort-aware visibility and later cleaned by abort-clean.
 
 Post recovery:
 
@@ -323,6 +357,18 @@ GC thread (`gc_timeout` periodic + manual trigger):
 3. `process_pending_buckets` (physical cleanup for `pending_del`)
 4. `scavenge` (bounded in-memory page compaction)
 5. `delete_files` (idempotent obsolete file unlink + metadata ack)
+
+Abort-clean:
+
+- walks aborted txn WAL chains from `tail_lsn` backward through `prev_lsn`.
+- removes aborted versions by page rewrite/compaction rather than inverse-value undo.
+- any bucket whose pages were touched by abort-clean must pass a durability barrier before the
+  abort-clean task can retire.
+- task retirement is split:
+  - `Pending`: page-touching cleanup may still occur, so the bucket is pinned against unload.
+  - `WaitingQuiesce`: page cleanup is already durable; only post-EBR retirement bookkeeping remains.
+- GC must not reload a bucket that the user has explicitly unloaded.
+  unload is blocked while `Pending` abort-clean exists instead of letting GC recreate runtime state.
 
 Rewrite crash safety:
 
@@ -379,14 +425,25 @@ Low-frequency recovery/GC metrics are reported without sampling.
 - Sealed generations must be uniquely owned when checkpoint finishes.
 - Reachable addresses (including sibling/remote-referenced old pages) must stay readable from memory
   until they are either durably published or proven unreachable by lifecycle closure.
+- History traversal must be region-bounded for each key (`head_page`, `start_slot`, `count`) and must
+  not spill into neighboring key regions when history pages are shared.
 - Merge publish must apply `replace` and child `mark_unmap` in the same epoch commit, so checkpoint
   snapshot never classifies one addr as both dirty root and newly retired junk.
+- Duplicate junk addresses may exist before checkpoint snapshot, but the junk set consumed by
+  metadata/stat publish must be logically unique per address.
+- Retiring shared history pages must not imply page-level bulk retirement of referenced blob
+  addresses.
 - Bucket durable frontier must monotonically advance per group.
 - Map publish and bucket frontier publish must be in the same manifest txn.
 - Recovery correctness must be gated by bucket frontier, not by group checkpoint alone.
 - Recovery analyze must ignore updates already <= durable frontier.
+- Aborted/in-progress versions may become durable in page images before physical cleanup, but must
+  remain invisible until abort-clean retires them.
+- Abort-clean retirement requires page durability closure before dropping abort outcome state.
+- Unload must not succeed while bucket-local abort-clean is still in `Pending`.
 - Bucket delete is two-phase (`pending_del`), and `nr_buckets` decrements only after physical cleanup.
 - WAL recycling must stay below min(active-txn boundary, last checkpoint boundary).
+- WAL recycling must also stay below any file pinned by pending abort-clean tasks.
 - Foreground admission wait must happen before entering `tree.update` critical mutation path.
 
 Invariant-break consequences to watch for:

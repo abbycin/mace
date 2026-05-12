@@ -6,8 +6,9 @@ use std::{
 };
 
 use crate::{
+    cc::context::{Context, TxOutcome},
     types::{
-        base::BaseIter,
+        base::{BaseIter, BaseRevIter},
         data::{
             Index, IntlKey, IntlSeg, IterItem, Key, LeafSeg, Record, Val, Ver,
             cmp_raw_with_prefixed_tail,
@@ -511,12 +512,29 @@ where
                 .inner
                 .range_iter(&self.loader, 0, self.inner.header().elems as usize),
             delta_iter: IterAdaptor::Iter(self.state.read().delta.iter().skip(0)),
-            filter: LeafFilter {
-                txid: safe_txid,
-                last: None,
-                junks: j,
-                skip_dup: false,
-            },
+            filter: LeafFilter::new(safe_txid, j),
+        }
+    }
+
+    #[allow(clippy::iter_skip_zero)]
+    fn leaf_iter_drop_aborted<'b>(
+        &'b self,
+        j: &'b mut Junk,
+        safe_txid: u64,
+        ctx: Handle<Context>,
+    ) -> LeafIter<'b, L> {
+        debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
+        let len = self.header().prefix_len as usize;
+        let lo = self.lo();
+        LeafIter {
+            prefix: &lo[..len],
+            next_l: None,
+            next_r: None,
+            sst_iter: self
+                .inner
+                .range_iter(&self.loader, 0, self.inner.header().elems as usize),
+            delta_iter: IterAdaptor::Iter(self.state.read().delta.iter().skip(0)),
+            filter: LeafFilter::with_drop_aborted(safe_txid, j, ctx),
         }
     }
 
@@ -535,6 +553,30 @@ where
         (
             Self::new(self.loader.copy_without_pin(), b, group, lsn),
             junks,
+        )
+    }
+
+    pub(crate) fn remove_aborted<A: IFrameAlloc>(
+        &self,
+        a: &mut A,
+        safe_txid: u64,
+        ctx: Handle<Context>,
+    ) -> (Node<L>, Junk, bool) {
+        let mut junks = Junk::new();
+        let (b, removed) = self.merge_to_base_drop_aborted(a, &mut junks, safe_txid, ctx);
+        let mut base = b.view().as_base();
+        let h = base.header_mut();
+        let old = self.header();
+        h.merging = old.merging;
+        h.merging_child = old.merging_child;
+        let (group, lsn) = {
+            let h = b.header();
+            (h.group, h.lsn)
+        };
+        (
+            Self::new(self.loader.copy_without_pin(), b, group, lsn),
+            junks,
+            removed,
         )
     }
 
@@ -570,6 +612,34 @@ where
                 lsn,
             )
         }
+    }
+
+    fn merge_to_base_drop_aborted<A: IFrameAlloc>(
+        &self,
+        a: &mut A,
+        j: &mut Junk,
+        safe_txid: u64,
+        ctx: Handle<Context>,
+    ) -> (BoxRef, bool) {
+        let h = self.header();
+        let lo = self.lo();
+        let hi = self.hi();
+
+        debug_assert!(!h.is_index);
+        let mut iter = self.leaf_iter_drop_aborted(j, safe_txid, ctx);
+        let (group, lsn) = self.get_group_lsn();
+        let base = BaseView::new_leaf(
+            a,
+            &self.loader,
+            lo,
+            hi,
+            h.right_sibling,
+            &mut iter,
+            safe_txid,
+            group,
+            lsn,
+        );
+        (base, iter.filter.removed)
     }
 
     pub(crate) fn process_merge<A: IFrameAlloc>(
@@ -704,22 +774,19 @@ where
     }
 
     /// when value is inlined return node (or delta) or else retuen remote, the node (or delta) is
-    /// always valid when node is valid, the returned key is valid too
-    pub(crate) fn find_latest<K>(&self, key: &K) -> Option<(K, Record, BoxRef)>
-    where
-        K: IKey,
-    {
+    /// always valid when node is valid
+    pub(crate) fn find_latest(&self, key: &Key) -> Option<(Ver, Record, BoxRef)> {
         debug_assert!(!self.inner.header().is_index);
         let mut result = None;
         self.visit_versions(
             *key,
-            |x, y| K::decode_from(x.key()).cmp(y),
+            |x, y| Key::decode_from(x.key()).cmp(y),
             |x| {
-                let k = K::decode_from(x.key());
+                let k = Key::decode_from(x.key());
                 if k.raw() == key.raw() {
                     let v = x.val();
                     let (v, r) = v.get_record(&self.loader, true);
-                    result = Some((k, v, r.unwrap_or_else(|| self.base_box())));
+                    result = Some((k.ver, v, r.unwrap_or_else(|| self.base_box())));
                     return true;
                 }
                 false
@@ -732,14 +799,14 @@ where
 
         self.search_sst(key).map(|(k, v)| {
             let (v, r) = v.get_record(&self.loader, true);
-            (k, v, r.unwrap_or_else(|| self.base_box()))
+            (k.ver, v, r.unwrap_or_else(|| self.base_box()))
         })
     }
 
-    pub(crate) fn search_sst<'a, K: IKey>(&self, key: &K) -> Option<(K, Val<'a>)> {
+    pub(crate) fn search_sst<'a>(&self, key: &Key) -> Option<(Key<'a>, Val<'a>)> {
         debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
         if self.header().elems > 0 {
-            let sst = self.inner.sst::<K>();
+            let sst = self.inner.sst::<Key>();
             let pos = sst.search_by(key, |x, y| x.raw().cmp(y.raw())).ok()?;
             Some(sst.kv_at(pos))
         } else {
@@ -912,7 +979,10 @@ where
                     self.sst::<Key>().lower_bound(&key)
                 };
                 let pos = match inner_pos {
-                    Ok(x) => x + 1, // exclude
+                    Ok(x) => {
+                        let (k, _) = self.sst::<Key>().kv_at::<Val>(x);
+                        if k.raw == b.as_slice() { x + 1 } else { x }
+                    }
                     Err(x) => x,
                 };
                 (IterAdaptor::Range(delta), pos)
@@ -931,6 +1001,96 @@ where
             sst_iter: self
                 .inner
                 .range_iter(&self.loader, pos, self.header().elems as usize),
+        }
+    }
+
+    pub(crate) fn predecessor<'a>(
+        &'a self,
+        lo: &'a Bound<Vec<u8>>,
+        hi: &'a Bound<Vec<u8>>,
+        cached_key: Handle<Vec<u8>>,
+    ) -> RawLeafRevIter<'a, L> {
+        fn cmp_fn(x: &DeltaView, y: &&[u8]) -> Ordering {
+            Key::decode_from(x.key()).raw.cmp(y)
+        }
+
+        let state = self.state.read();
+        let delta = match lo {
+            Bound::Unbounded => IterAdaptorRev::IterRev {
+                iter: state.delta.iter(),
+                excluded: None,
+                pending: None,
+                group: Vec::new(),
+            },
+            Bound::Included(b) => IterAdaptorRev::RangeRev {
+                iter: state.delta.range_from(b.as_slice(), cmp_fn, |_x, _y| true),
+                excluded: None,
+                pending: None,
+                group: Vec::new(),
+            },
+            Bound::Excluded(b) => IterAdaptorRev::RangeRev {
+                iter: state.delta.range_from(b.as_slice(), cmp_fn, |_x, _y| true),
+                excluded: Some(b.as_slice()),
+                pending: None,
+                group: Vec::new(),
+            },
+        };
+
+        let sst = self.sst::<Key>();
+        let elems = self.header().elems as usize;
+        let beg = match hi {
+            Bound::Unbounded => elems,
+            Bound::Included(h) => {
+                let key = Key::new(h, Ver::new(NULL_ORACLE, NULL_CMD));
+                match sst.lower_bound(&key) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                }
+            }
+            Bound::Excluded(h) => {
+                let key = Key::new(h, Ver::new(u64::MAX, u32::MAX));
+                match sst.lower_bound(&key) {
+                    Ok(i) | Err(i) => i,
+                }
+            }
+        };
+        let cur = if beg == 0 { -1 } else { beg as isize - 1 };
+        let end = match lo {
+            Bound::Unbounded => 0,
+            Bound::Included(b) => {
+                let pos = if b.as_slice() < self.lo() {
+                    0
+                } else {
+                    sst.lower_bound(&Key::new(b, Ver::new(u64::MAX, u32::MAX)))
+                        .unwrap_or_else(|x| x)
+                };
+                pos as isize
+            }
+            Bound::Excluded(b) => {
+                let pos = if b.as_slice() < self.lo() {
+                    0
+                } else {
+                    let key = Key::new(b, Ver::new(NULL_ORACLE, NULL_CMD));
+                    match sst.lower_bound(&key) {
+                        Ok(i) => {
+                            let (k, _) = sst.kv_at::<Val>(i);
+                            if k.raw == b.as_slice() { i + 1 } else { i }
+                        }
+                        Err(i) => i,
+                    }
+                };
+                pos as isize
+            }
+        };
+
+        let prefix = &self.lo()[..self.header().prefix_len as usize];
+        RawLeafRevIter {
+            cached_key,
+            prefix,
+            next_l: None,
+            next_r: None,
+            sst_iter: BaseRevIter::new(&self.loader, sst, cur, end),
+            delta_iter: delta,
         }
     }
 }
@@ -991,6 +1151,93 @@ impl<'a, T> Iterator for IterAdaptor<'a, T> {
     }
 }
 
+enum IterAdaptorRev<'a> {
+    IterRev {
+        iter: Iter<'a, DeltaView>,
+        excluded: Option<&'a [u8]>,
+        pending: Option<DeltaView>,
+        group: Vec<DeltaView>,
+    },
+    RangeRev {
+        iter: RangeIter<'a, DeltaView, &'a [u8]>,
+        excluded: Option<&'a [u8]>,
+        pending: Option<DeltaView>,
+        group: Vec<DeltaView>,
+    },
+}
+
+impl IterAdaptorRev<'_> {
+    fn next(&mut self) -> Option<DeltaView> {
+        match self {
+            IterAdaptorRev::IterRev {
+                iter,
+                excluded,
+                pending,
+                group,
+            } => {
+                if let Some(x) = group.pop() {
+                    return Some(x);
+                }
+
+                let first = loop {
+                    let x = pending.take().or_else(|| iter.next_back())?;
+                    if excluded.is_none_or(|b| Key::decode_from(x.key()).raw != b) {
+                        break x;
+                    }
+                };
+                let raw = Key::decode_from(first.key()).raw;
+                group.push(first);
+                while let Some(x) = iter.next_back() {
+                    let k = Key::decode_from(x.key());
+                    if excluded.is_some_and(|b| k.raw == b) {
+                        continue;
+                    }
+                    if k.raw == raw {
+                        // reverse walk yields older->newer, keep full group then emit newest->older
+                        group.push(x);
+                        continue;
+                    }
+                    *pending = Some(x);
+                    break;
+                }
+                group.pop()
+            }
+            IterAdaptorRev::RangeRev {
+                iter,
+                excluded,
+                pending,
+                group,
+            } => {
+                if let Some(x) = group.pop() {
+                    return Some(x);
+                }
+
+                let first = loop {
+                    let x = pending.take().or_else(|| iter.next_back())?;
+                    if excluded.is_none_or(|b| Key::decode_from(x.key()).raw != b) {
+                        break x;
+                    }
+                };
+                let raw = Key::decode_from(first.key()).raw;
+                group.push(first);
+                while let Some(x) = iter.next_back() {
+                    let k = Key::decode_from(x.key());
+                    if excluded.is_some_and(|b| k.raw == b) {
+                        continue;
+                    }
+                    if k.raw == raw {
+                        group.push(x);
+                        continue;
+                    }
+                    *pending = Some(x);
+                    break;
+                }
+                group.pop()
+            }
+        }
+    }
+}
+
 pub(crate) struct IntlIter<'a, L>
 where
     L: ILoader,
@@ -1024,6 +1271,18 @@ where
     next_r: Option<IterItem<'a, L>>,
     sst_iter: BaseIter<'a, L, Key<'a>>,
     delta_iter: IterAdaptor<'a, &'a [u8]>,
+}
+
+pub(crate) struct RawLeafRevIter<'a, L>
+where
+    L: ILoader,
+{
+    cached_key: Handle<Vec<u8>>,
+    prefix: &'a [u8],
+    next_l: Option<IterItem<'a, L>>,
+    next_r: Option<IterItem<'a, L>>,
+    sst_iter: BaseRevIter<'a, L, Key<'a>>,
+    delta_iter: IterAdaptorRev<'a>,
 }
 
 impl<'a, L> Iterator for IntlIter<'a, L>
@@ -1222,15 +1481,105 @@ where
     }
 }
 
+impl<'a, L> RawLeafRevIter<'a, L>
+where
+    L: ILoader,
+{
+    pub(crate) fn try_next_back(&mut self) -> Result<Option<IterItem<'a, L>>, OpCode> {
+        if self.next_l.is_none()
+            && let Some(x) = self.delta_iter.next()
+        {
+            let k = Key::decode_from(x.key());
+            self.next_l = Some(IterItem::new(
+                self.cached_key,
+                &[],
+                k,
+                x.val(),
+                self.sst_iter.loader,
+            ));
+        }
+
+        if self.next_r.is_none()
+            && let Some((k, val)) = self.sst_iter.try_next_back_with_sibling(|_| {})?
+        {
+            self.next_r = Some(IterItem::new(
+                self.cached_key,
+                self.prefix,
+                k,
+                val,
+                self.sst_iter.loader,
+            ));
+        }
+
+        Ok(match (self.next_l.take(), self.next_r.take()) {
+            (None, None) => None,
+            (None, Some(r)) => Some(r),
+            (Some(l), None) => Some(l),
+            (Some(l), Some(r)) => {
+                let ord = if self.prefix.is_empty() {
+                    l.cmp(&r)
+                } else {
+                    cmp_raw_with_prefixed_tail(l.base.raw, self.prefix, r.base.raw)
+                };
+                match ord {
+                    Less => {
+                        self.next_l = Some(l);
+                        Some(r)
+                    }
+                    Greater => {
+                        self.next_r = Some(r);
+                        Some(l)
+                    }
+                    Equal => {
+                        self.next_r = Some(r);
+                        Some(l)
+                    }
+                }
+            }
+        })
+    }
+}
+
 struct LeafFilter<'a> {
     txid: u64,
     last: Option<&'a [u8]>,
     junks: &'a mut Vec<u64>,
     skip_dup: bool,
+    drop_aborted_ctx: Option<Handle<Context>>,
+    removed: bool,
 }
 
 impl<'a> LeafFilter<'a> {
+    fn new(txid: u64, junks: &'a mut Vec<u64>) -> Self {
+        Self {
+            txid,
+            last: None,
+            junks,
+            skip_dup: false,
+            drop_aborted_ctx: None,
+            removed: false,
+        }
+    }
+
+    fn with_drop_aborted(txid: u64, junks: &'a mut Vec<u64>, ctx: Handle<Context>) -> Self {
+        Self {
+            txid,
+            last: None,
+            junks,
+            skip_dup: false,
+            drop_aborted_ctx: Some(ctx),
+            removed: false,
+        }
+    }
+
     fn check_impl(&mut self, k: &LeafSeg<'a>, v: &Val) -> bool {
+        if let Some(ctx) = self.drop_aborted_ctx
+            && ctx.get_aborted(k.txid()) == Some(TxOutcome::Aborted)
+        {
+            self.removed = true;
+            return false;
+        }
+
         if let Some(last) = self.last
             && last == k.raw()
         {
@@ -1299,7 +1648,6 @@ mod test {
     struct AInner {
         map: Mutex<HashMap<u64, BoxRef>>,
         off: AtomicU64,
-        frame_budget: usize,
     }
 
     #[derive(Clone)]
@@ -1309,15 +1657,10 @@ mod test {
 
     impl A {
         fn new() -> Self {
-            Self::new_with_frame_budget(64 << 20)
-        }
-
-        fn new_with_frame_budget(frame_budget: usize) -> Self {
             Self {
                 inner: Rc::new(AInner {
                     map: Mutex::new(HashMap::new()),
                     off: AtomicU64::new(0),
-                    frame_budget,
                 }),
             }
         }
@@ -1338,10 +1681,6 @@ mod test {
             let mut lk = self.inner.map.lock();
             lk.insert(addr, p.clone());
             p
-        }
-
-        fn frame_budget(&mut self) -> usize {
-            self.inner.frame_budget
         }
 
         fn inline_size(&self) -> usize {

@@ -412,11 +412,11 @@ impl IKeyCodec for LeafSeg<'_> {
 /// | HDR | WID | DATA LEN | DATA |
 /// +-----+-----+----------+------+
 ///```
-/// 2. inline data with sibling
+/// 2. inline data with history region
 ///```text
-/// +-----+-----+----------+----------+------+
-/// | HDR | WID | DATA LEN | SIB ADDR | DATA |
-/// +-----+-----+----------+----------+------+
+/// +-----+-----+----------+-----------+------+-------+------+
+/// | HDR | WID | DATA LEN | HIST ADDR | SLOT | COUNT | DATA |
+/// +-----+-----+----------+-----------+------+-------+------+
 ///```
 /// 3. remote data
 ///```text
@@ -424,12 +424,29 @@ impl IKeyCodec for LeafSeg<'_> {
 /// | HDR | WID | DATA LEN | REMOTE ADDR |
 /// +-----+-----+----------+-------------+
 ///```
-/// 4. remote data with sibling
+/// 4. remote data with history region
 ///```text
-/// +-----+-----+----------+----------+-------------+
-/// | HDR | WID | DATA LEN | SIB ADDR | REMOTE ADDR |
-/// +-----+-----+----------+----------+-------------+
+/// +-----+-----+----------+-----------+------+-------+-------------+
+/// | HDR | WID | DATA LEN | HIST ADDR | SLOT | COUNT | REMOTE ADDR |
+/// +-----+-----+----------+-----------+------+-------+-------------+
 /// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistRef {
+    pub page_addr: u64,
+    pub slot: u16,
+    pub count: u32,
+}
+
+impl HistRef {
+    pub const fn new(page_addr: u64, slot: u16, count: u32) -> Self {
+        Self {
+            page_addr,
+            slot,
+            count,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Val<'a> {
     data: &'a [u8],
@@ -437,9 +454,11 @@ pub struct Val<'a> {
 
 impl<'a> Val<'a> {
     const DEL_BIT: u8 = 0b0000_0001;
-    const SIB_BIT: u8 = 0b1000_0000;
+    const HIST_BIT: u8 = 0b1000_0000;
     const REMOTE_BIT: u8 = 0b0001_0000;
-    const SIB_LEN: usize = ADDR_LEN;
+    const HIST_SLOT_LEN: usize = size_of::<u16>();
+    const HIST_COUNT_LEN: usize = size_of::<u32>();
+    const HIST_LEN: usize = ADDR_LEN + Self::HIST_SLOT_LEN + Self::HIST_COUNT_LEN;
     const DATA_LEN: usize = size_of::<u32>();
     const HDR_LEN: usize = 1;
     const GID_LEN: usize = 1;
@@ -448,8 +467,8 @@ impl<'a> Val<'a> {
         self.data[0] & Self::DEL_BIT != 0
     }
 
-    pub fn is_sibling(&self) -> bool {
-        self.data[0] & Self::SIB_BIT != 0
+    pub fn has_hist(&self) -> bool {
+        self.data[0] & Self::HIST_BIT != 0
     }
 
     fn is_inline(&self) -> bool {
@@ -457,7 +476,7 @@ impl<'a> Val<'a> {
     }
 
     fn data_offset(&self) -> usize {
-        Self::HDR_LEN + Self::GID_LEN + Self::DATA_LEN + self.is_sibling() as usize * Self::SIB_LEN
+        Self::HDR_LEN + Self::GID_LEN + Self::DATA_LEN + self.has_hist() as usize * Self::HIST_LEN
     }
 
     pub fn from_raw(data: &'a [u8]) -> Self {
@@ -485,11 +504,13 @@ impl<'a> Val<'a> {
         (Record::decode_from(&src[..len]), r)
     }
 
-    pub fn get_sibling(&self) -> Option<u64> {
-        if self.is_sibling() {
-            Some(Self::read::<u64>(
-                self.data,
-                Self::HDR_LEN + Self::GID_LEN + Self::DATA_LEN,
+    pub fn get_hist(&self) -> Option<HistRef> {
+        if self.has_hist() {
+            let off = Self::HDR_LEN + Self::GID_LEN + Self::DATA_LEN;
+            Some(HistRef::new(
+                Self::read::<u64>(self.data, off),
+                Self::read::<u16>(self.data, off + ADDR_LEN),
+                Self::read::<u32>(self.data, off + ADDR_LEN + Self::HIST_SLOT_LEN),
             ))
         } else {
             None
@@ -505,11 +526,11 @@ impl<'a> Val<'a> {
         }
     }
 
-    pub fn calc_size(is_sib: bool, min_blob_size: usize, val_size: usize) -> usize {
+    pub fn calc_size(has_hist: bool, min_blob_size: usize, val_size: usize) -> usize {
         Self::HDR_LEN
             + Self::GID_LEN
             + Self::DATA_LEN
-            + if is_sib { Self::SIB_LEN } else { 0 }
+            + if has_hist { Self::HIST_LEN } else { 0 }
             + if min_blob_size < val_size {
                 ADDR_LEN
             } else {
@@ -517,31 +538,39 @@ impl<'a> Val<'a> {
             }
     }
 
-    pub fn encode_inline<V: IVal>(dst: &mut [u8], sib: u64, v: &V) {
+    pub fn encode_inline<V: IVal>(dst: &mut [u8], hist: Option<HistRef>, v: &V) {
         dst[0] = v.is_tombstone() as u8;
         dst[1] = v.group_id();
         let mut off = Self::HDR_LEN + Self::GID_LEN;
         Self::write::<u32>(dst, off, v.packed_size() as u32);
         off += Self::DATA_LEN;
-        if sib != NULL_ADDR {
-            dst[0] |= Self::SIB_BIT;
-            Self::write::<u64>(dst, off, sib);
-            off += Self::SIB_LEN;
+        if let Some(hist) = hist {
+            dst[0] |= Self::HIST_BIT;
+            Self::write::<u64>(dst, off, hist.page_addr);
+            off += ADDR_LEN;
+            Self::write::<u16>(dst, off, hist.slot);
+            off += Self::HIST_SLOT_LEN;
+            Self::write::<u32>(dst, off, hist.count);
+            off += Self::HIST_COUNT_LEN;
         }
         v.encode_to(&mut dst[off..]);
     }
 
-    pub fn encode_remote<V: IVal>(dst: &mut [u8], sib: u64, remote: u64, v: &V) {
+    pub fn encode_remote<V: IVal>(dst: &mut [u8], hist: Option<HistRef>, remote: u64, v: &V) {
         dst[0] = v.is_tombstone() as u8;
         dst[0] |= Self::REMOTE_BIT;
         dst[1] = v.group_id();
         let mut off = Self::HDR_LEN + Self::GID_LEN;
         Self::write::<u32>(dst, off, v.packed_size() as u32);
         off += Self::DATA_LEN;
-        if sib != NULL_ADDR {
-            dst[0] |= Self::SIB_BIT;
-            Self::write::<u64>(dst, off, sib);
-            off += Self::SIB_LEN;
+        if let Some(hist) = hist {
+            dst[0] |= Self::HIST_BIT;
+            Self::write::<u64>(dst, off, hist.page_addr);
+            off += ADDR_LEN;
+            Self::write::<u16>(dst, off, hist.slot);
+            off += Self::HIST_SLOT_LEN;
+            Self::write::<u32>(dst, off, hist.count);
+            off += Self::HIST_COUNT_LEN;
         }
         Self::write::<u64>(dst, off, remote);
     }
@@ -856,11 +885,10 @@ mod test {
     use crate::{
         OpCode, Options,
         types::{
-            data::{IntlKey, Record, Val, Ver},
+            data::{HistRef, IntlKey, Record, Val, Ver},
             refbox::{BoxRef, BoxView, RemoteView},
             traits::{ICodec, IDecode, IFrameAlloc, IHeader, ILoader},
         },
-        utils::NULL_ADDR,
     };
 
     use super::{Index, Key, LeafSeg};
@@ -986,10 +1014,6 @@ mod test {
                 b
             }
 
-            fn frame_budget(&mut self) -> usize {
-                64 << 20
-            }
-
             fn inline_size(&self) -> usize {
                 Options::MIN_INLINE_SIZE
             }
@@ -1030,7 +1054,7 @@ mod test {
         let sib = Record::normal(1, "1145141919810".as_bytes());
 
         let mut inline_size = 1 << 20;
-        let sib_addr = 192608;
+        let hist = HistRef::new(192608, 12, 128);
 
         {
             let l = L::new();
@@ -1038,9 +1062,9 @@ mod test {
             let mut del_buf = vec![0u8; Val::calc_size(false, inline_size, del.packed_size())];
             let mut sib_buf = vec![0u8; Val::calc_size(true, inline_size, sib.packed_size())];
 
-            Val::encode_inline(&mut put_buf, NULL_ADDR, &put);
-            Val::encode_inline(&mut del_buf, NULL_ADDR, &del);
-            Val::encode_inline(&mut sib_buf, sib_addr, &sib);
+            Val::encode_inline(&mut put_buf, None, &put);
+            Val::encode_inline(&mut del_buf, None, &del);
+            Val::encode_inline(&mut sib_buf, Some(hist), &sib);
 
             let vp = Val::from_raw(&put_buf);
             let vd = Val::from_raw(&del_buf);
@@ -1054,9 +1078,9 @@ mod test {
             assert!(dd.eq(&del));
             assert!(ds.eq(&sib));
 
-            assert!(vp.get_sibling().is_none());
-            assert!(vd.get_sibling().is_none());
-            assert_eq!(vs.get_sibling(), Some(sib_addr));
+            assert!(vp.get_hist().is_none());
+            assert!(vd.get_hist().is_none());
+            assert_eq!(vs.get_hist(), Some(hist));
         }
 
         inline_size = 0;
@@ -1077,9 +1101,9 @@ mod test {
             let da = encode_to(&mut l, &del);
             let sa = encode_to(&mut l, &sib);
 
-            Val::encode_remote(&mut put_buf, NULL_ADDR, pa, &put);
-            Val::encode_remote(&mut del_buf, NULL_ADDR, da, &del);
-            Val::encode_remote(&mut sib_buf, sib_addr, sa, &sib);
+            Val::encode_remote(&mut put_buf, None, pa, &put);
+            Val::encode_remote(&mut del_buf, None, da, &del);
+            Val::encode_remote(&mut sib_buf, Some(hist), sa, &sib);
 
             let vp = Val::from_raw(&put_buf);
             let vd = Val::from_raw(&del_buf);
@@ -1104,9 +1128,9 @@ mod test {
             assert_eq!(vd.get_remote(), da);
             assert_eq!(vs.get_remote(), sa);
 
-            assert!(vp.get_sibling().is_none());
-            assert!(vd.get_sibling().is_none());
-            assert_eq!(vs.get_sibling(), Some(sib_addr));
+            assert!(vp.get_hist().is_none());
+            assert!(vd.get_hist().is_none());
+            assert_eq!(vs.get_hist(), Some(hist));
         }
     }
 

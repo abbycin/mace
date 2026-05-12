@@ -21,8 +21,6 @@ Built for modern storage hardware, Mace employs a flash-optimized log-structured
 
 ## Installation
 
-Add mace-kv to your Cargo.toml:
-
 ```bash
 cargo add mace-kv
 ```
@@ -77,6 +75,7 @@ Mace is engineered for heavy workloads. For detailed performance analysis and co
 | `W6` (100% scan) | 16 / 16 | **4.6x** | 15 / 16 | **0.2x** |
 
 > Note: for `ops` median ratio (`Mace/RocksDB`), larger means higher Mace throughput. For `p99` median ratio (`Mace/RocksDB`), smaller means lower Mace tail latency.
+> Recent complete benchmark results: https://o2c.fun/benchmark.html
 
 ### Test Environment
 
@@ -99,7 +98,11 @@ Architecture and crash-safety notes are in [docs/design.md](./docs/design.md).
 
 ## Status
 
-`mace-kv` is still pre-1.0. Storage format and APIs can change between minor versions.
+`mace` is still pre-1.0. Storage format and APIs can change between minor versions.
+
+## Discussion
+
+If you want to join the discussion, you are welcome to join the QQ group: `1023032506`.
 
 ## License
 

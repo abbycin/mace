@@ -18,6 +18,7 @@ use crate::utils::Handle;
 use crate::utils::MutRef;
 pub use crate::utils::OpCode;
 use crate::utils::ROOT_PID;
+use crate::utils::data::init_group_pos;
 pub use crate::utils::options::Options;
 use crate::utils::options::ParsedOptions;
 use std::collections::BTreeMap;
@@ -166,13 +167,35 @@ impl StoreFlushObserver {
 
     fn publish(&self, mut result: FlushResult) {
         let has_new_files = !result.data_ivls.is_empty() || !result.blob_ivls.is_empty();
+        let bucket_id = result.bucket_id;
+        let frontier_delta = *result.latest_chkpoint_lsn.deref();
+        let previous_frontier = self
+            .manifest
+            .bucket_frontier
+            .get(&bucket_id)
+            .map(|x| *x.value())
+            .unwrap_or_else(init_group_pos);
+        let groups = self.ctx.groups();
+
+        // page checkpoint can fold uncleaned txn versions into durable pages, recovery still needs
+        // the corresponding WAL tail to rebuild tx outcomes before safe_txid can expose them
+        for (i, g) in groups.iter().enumerate() {
+            if i < frontier_delta.len() && frontier_delta[i] > previous_frontier[i] {
+                let mut log = g.logging.lock();
+
+                log.sync_checkpoint_barrier()
+                    .inspect_err(|e| {
+                        log::error!("can't sync WAL checkpoint barrier, {:?}", e);
+                    })
+                    .expect("can't fail");
+            }
+        }
+
         result.sync(); // must be called before updatin manifest
         if has_new_files {
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_flush_after_data_dir_sync");
         }
-        let bucket_id = result.bucket_id;
-        let frontier_delta = *result.latest_chkpoint_lsn.deref();
         let bucket_frontier = self
             .manifest
             .merge_bucket_frontier(bucket_id, &frontier_delta);

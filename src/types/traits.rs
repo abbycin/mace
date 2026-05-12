@@ -1,5 +1,3 @@
-use crossbeam_epoch::Guard;
-
 use crate::types::{
     header::BoxHeader,
     refbox::{BoxRef, BoxView},
@@ -50,8 +48,6 @@ pub trait IHeader<T> {
 pub trait IFrameAlloc {
     fn alloc(&mut self, size: u32) -> BoxRef;
 
-    fn frame_budget(&mut self) -> usize;
-
     fn inline_size(&self) -> usize;
 
     fn checkpoint_lsn(&self, _group: u8) -> Position {
@@ -87,13 +83,6 @@ pub trait IVal: ICodec + Clone {
     fn group_id(&self) -> u8 {
         unimplemented!()
     }
-}
-
-pub trait ITree {
-    fn put<K, V>(&self, g: &Guard, k: K, v: V)
-    where
-        K: IKey,
-        V: IVal;
 }
 
 pub trait IAsSlice: Sized {

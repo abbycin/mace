@@ -549,31 +549,55 @@ impl<T, const N: usize> PodChunk<T, N> {
 }
 
 pub(crate) struct Iter<'a, K: Copy> {
-    cursor: Cursor<K>,
-    runout: bool,
-    is_yield: bool,
+    fwd: Cursor<K>,
+    bwd: Cursor<K>,
+    fwd_yielded: bool,
+    bwd_yielded: bool,
+    exhausted: bool,
     _marker: PhantomData<&'a K>,
 }
 
 impl<'a, K: Copy> Iter<'a, K> {
     fn new(node: Option<Node<K>>) -> Self {
-        let mut cursor = Cursor::new(node);
-        cursor.seek_to_first();
+        let mut fwd = Cursor::new(node.clone());
+        let mut bwd = Cursor::new(node);
+        let has_fwd = fwd.seek_to_first().is_some();
+        let has_bwd = bwd.seek_to_last().is_some();
+
         Self {
-            cursor,
-            runout: false,
-            is_yield: false,
+            fwd,
+            bwd,
+            fwd_yielded: false,
+            bwd_yielded: false,
+            exhausted: !(has_fwd && has_bwd),
             _marker: PhantomData,
         }
+    }
+
+    #[inline]
+    fn update_exhausted(&mut self, has_next: bool, other_side_yielded: bool) -> bool {
+        let done = should_exhaust(
+            has_next,
+            other_side_yielded,
+            self.fwd.leaf_pos(),
+            self.bwd.leaf_pos(),
+        );
+        if done {
+            self.exhausted = true;
+        }
+        done
     }
 }
 
 pub(crate) struct RangeIter<'a, K: Copy, T> {
-    cursor: Cursor<K>,
+    fwd: Cursor<K>,
+    bwd: Cursor<K>,
     key: T,
+    cmp: fn(&K, &T) -> Ordering,
     equal: fn(&K, &T) -> bool,
-    runout: bool,
-    is_yield: bool,
+    exhausted: bool,
+    fwd_yielded: bool,
+    bwd_yielded: bool,
     _marker: PhantomData<&'a K>,
 }
 
@@ -584,26 +608,80 @@ impl<'a, K: Copy, T> RangeIter<'a, K, T> {
         cmp: fn(&K, &T) -> Ordering,
         equal: fn(&K, &T) -> bool,
     ) -> Self {
-        let mut cursor = Cursor::new(node);
-        let runout = cursor.seek_to_key(&key, cmp);
+        let mut fwd = Cursor::new(node.clone());
+        let mut bwd = Cursor::new(node);
+        let has_fwd = fwd.seek_to_key(&key, cmp).is_some();
+        let has_bwd = bwd.seek_to_last().is_some();
 
-        Self {
-            cursor,
+        let mut this = Self {
+            fwd,
+            bwd,
             key,
+            cmp,
             equal,
-            runout,
-            is_yield: false,
+            exhausted: !(has_fwd && has_bwd),
+            fwd_yielded: false,
+            bwd_yielded: false,
             _marker: std::marker::PhantomData,
+        };
+
+        if !this.exhausted
+            && let Some(k) = this.fwd.peek()
+            && !this.in_range(&k)
+        {
+            this.exhausted = true;
         }
+
+        this
     }
 
     pub(crate) fn peek(&self) -> Option<K> {
-        if self.runout {
+        if self.exhausted {
             None
         } else {
-            self.cursor.peek()
+            self.fwd.peek()
         }
     }
+
+    #[inline]
+    fn in_range(&self, k: &K) -> bool {
+        (self.cmp)(k, &self.key) != Less && (self.equal)(k, &self.key)
+    }
+
+    #[inline]
+    fn update_exhausted(&mut self, has_next: bool, other_side_yielded: bool) -> bool {
+        let done = should_exhaust(
+            has_next,
+            other_side_yielded,
+            self.fwd.leaf_pos(),
+            self.bwd.leaf_pos(),
+        );
+        if done {
+            self.exhausted = true;
+        }
+        done
+    }
+}
+
+#[inline]
+fn should_exhaust<K>(
+    has_next: bool,
+    other_side_yielded: bool,
+    fwd: Option<(usize, *const Leaf<K>)>,
+    bwd: Option<(usize, *const Leaf<K>)>,
+) -> bool {
+    if !has_next {
+        return true;
+    }
+
+    if let (Some((fi, f)), Some((bi, b))) = (fwd, bwd)
+        && std::ptr::eq(f, b)
+        && fi >= bi
+    {
+        return fi != bi || other_side_yielded;
+    }
+
+    false
 }
 
 struct Cursor<K: Copy> {
@@ -630,7 +708,7 @@ impl<K: Copy> Cursor<K> {
         this
     }
 
-    fn seek_to_key<T, C>(&mut self, k: &T, cmp: C) -> bool
+    fn seek_to_key<T, C>(&mut self, k: &T, cmp: C) -> Option<K>
     where
         C: Fn(&K, &T) -> Ordering,
     {
@@ -644,14 +722,12 @@ impl<K: Copy> Cursor<K> {
                 *pos = r.unwrap_or_else(|x| x);
 
                 if r == Err(leaf.keys.len()) {
-                    self.next();
+                    return self.next();
                 }
-                return r.is_ok();
+                return self.peek();
             }
 
-            let Some((pos, intl)) = self.path.last_mut() else {
-                return false;
-            };
+            let (pos, intl) = self.path.last_mut()?;
             *pos = intl
                 .keys
                 .binary_search_by(|x| cmp(x, k))
@@ -692,6 +768,29 @@ impl<K: Copy> Cursor<K> {
         self.seek_to_first()
     }
 
+    fn prev(&mut self) -> Option<K> {
+        loop {
+            if let Some((pos, leaf)) = &mut self.leaf {
+                if *pos > 0 {
+                    *pos -= 1;
+                    return leaf.keys.get(*pos).copied();
+                }
+                self.leaf = None;
+            }
+            let Some((pos, intl)) = self.path.last_mut() else {
+                break;
+            };
+            if *pos > 0 {
+                *pos -= 1;
+                let (pos, intl) = (*pos, intl.clone());
+                self.push_child(pos, intl);
+                break;
+            }
+            self.path.pop();
+        }
+        self.seek_to_last()
+    }
+
     fn peek(&self) -> Option<K> {
         if let Some((i, leaf)) = &self.leaf {
             leaf.keys.get(*i).copied()
@@ -710,6 +809,25 @@ impl<K: Copy> Cursor<K> {
             debug_assert_eq!(pos, 0);
             self.push_child(pos, intl);
         }
+    }
+
+    fn seek_to_last(&mut self) -> Option<K> {
+        loop {
+            if let Some((pos, leaf)) = &mut self.leaf {
+                *pos = leaf.keys.len().saturating_sub(1);
+                return leaf.keys.get(*pos).copied();
+            }
+            let (pos, intl) = self.path.last_mut()?;
+            *pos = intl.children.len().saturating_sub(1);
+            let (pos, intl) = (*pos, intl.clone());
+            self.push_child(pos, intl);
+        }
+    }
+
+    fn leaf_pos(&self) -> Option<(usize, *const Leaf<K>)> {
+        self.leaf
+            .as_ref()
+            .map(|(idx, leaf)| (*idx, Arc::as_ptr(leaf)))
     }
 }
 
@@ -871,16 +989,20 @@ impl<'a, K: Copy> Iterator for Iter<'a, K> {
     type Item = K;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.runout {
+        if self.exhausted {
             return None;
         }
 
-        if self.is_yield {
-            self.cursor.next()
+        let next = if self.fwd_yielded {
+            self.fwd.next()
         } else {
-            self.is_yield = true;
-            self.cursor.peek()
+            self.fwd_yielded = true;
+            self.fwd.peek()
+        };
+        if self.update_exhausted(next.is_some(), self.bwd_yielded) {
+            return None;
         }
+        next
     }
 }
 
@@ -888,25 +1010,86 @@ impl<'a, K: Copy, T> Iterator for RangeIter<'a, K, T> {
     type Item = K;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.runout {
+        if self.exhausted {
             return None;
         }
 
-        let k = if self.is_yield {
-            self.cursor.next()
+        let next = if self.fwd_yielded {
+            self.fwd.next()
         } else {
-            self.is_yield = true;
-            self.cursor.peek()
+            self.fwd_yielded = true;
+            self.fwd.peek()
         };
 
-        if let Some(k) = k
-            && (self.equal)(&k, &self.key)
-        {
-            return Some(k);
+        let Some(k) = next else {
+            self.exhausted = true;
+            return None;
+        };
+
+        if !self.in_range(&k) {
+            self.exhausted = true;
+            return None;
         }
 
-        self.runout = true;
-        None
+        if self.update_exhausted(true, self.bwd_yielded) {
+            return None;
+        }
+
+        Some(k)
+    }
+}
+
+impl<'a, K: Copy> DoubleEndedIterator for Iter<'a, K> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.exhausted {
+            return None;
+        }
+
+        let next = if self.bwd_yielded {
+            self.bwd.prev()
+        } else {
+            self.bwd_yielded = true;
+            self.bwd.peek()
+        };
+        if self.update_exhausted(next.is_some(), self.fwd_yielded) {
+            return None;
+        }
+        next
+    }
+}
+
+impl<'a, K: Copy, T> DoubleEndedIterator for RangeIter<'a, K, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.exhausted {
+            return None;
+        }
+
+        loop {
+            let next = if self.bwd_yielded {
+                self.bwd.prev()
+            } else {
+                self.bwd_yielded = true;
+                self.bwd.peek()
+            };
+            let Some(k) = next else {
+                self.exhausted = true;
+                return None;
+            };
+
+            if !self.in_range(&k) {
+                if (self.cmp)(&k, &self.key) == Less {
+                    self.exhausted = true;
+                    return None;
+                }
+                continue;
+            }
+
+            if self.update_exhausted(true, self.fwd_yielded) {
+                return None;
+            }
+
+            return Some(k);
+        }
     }
 }
 
@@ -921,7 +1104,7 @@ mod test {
     use crate::types::refbox::{BoxRef, DeltaView};
     use crate::types::traits::IFrameAlloc;
     use crate::utils::data::Position;
-    use crate::utils::imtree::ImTree;
+    use crate::utils::imtree::{ImTree, NODE_SIZE};
 
     struct Allocator;
 
@@ -931,10 +1114,6 @@ mod test {
         fn alloc(&mut self, size: u32) -> BoxRef {
             let addr = G_OFF.fetch_add(size as u64, Relaxed);
             BoxRef::alloc(size, addr)
-        }
-
-        fn frame_budget(&mut self) -> usize {
-            1 << 20
         }
 
         fn inline_size(&self) -> usize {
@@ -996,6 +1175,13 @@ mod test {
         }
     }
 
+    fn alloc_key(owned: &mut Vec<Box<[u8]>>, key: String) -> &'static [u8] {
+        let boxed = key.into_bytes().into_boxed_slice();
+        let key = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(boxed.as_ref()) };
+        owned.push(boxed);
+        key
+    }
+
     #[test]
     fn simple() {
         let mut m = ImTree::<Data>::new(|x, y| x.cmp(y));
@@ -1038,5 +1224,159 @@ mod test {
         im = im.update(delta.view().as_delta());
 
         assert_eq!(im.len(), 1);
+    }
+
+    #[test]
+    fn simple_rev_iter() {
+        let mut m = ImTree::<Data>::new(|x, y| x.cmp(y));
+        let mut owned = Vec::new();
+        for i in 0..(NODE_SIZE * 3) {
+            let k = format!("k{:03}", i);
+            let key = alloc_key(&mut owned, k);
+            m = m.update(Data {
+                key,
+                val: &[],
+                ver: 1,
+            });
+        }
+
+        let fwd: Vec<Data> = m.iter().collect();
+        let mut it = m.iter();
+        let mut rev = Vec::new();
+        while let Some(x) = it.next_back() {
+            rev.push(x);
+        }
+        let expected: Vec<Data> = fwd.iter().copied().rev().collect();
+        assert_eq!(rev, expected);
+    }
+
+    #[test]
+    fn iter_shrinking_window() {
+        use std::collections::HashSet;
+
+        let mut m = ImTree::<Data>::new(|x, y| x.cmp(y));
+        let mut owned = Vec::new();
+        let total = NODE_SIZE * 10 - 11;
+        for i in 0..total {
+            let k = format!("k{:03}", i);
+            let key = alloc_key(&mut owned, k);
+            m = m.update(Data {
+                key,
+                val: &[],
+                ver: 1,
+            });
+        }
+
+        let sorted: Vec<String> = m.iter().map(|x| to_str(x.key).to_string()).collect();
+        assert_eq!(sorted.len(), total);
+        let first = sorted.first().cloned().expect("non-empty");
+        let second = sorted.get(1).cloned().expect("at least two items");
+        let last = sorted.last().cloned().expect("non-empty");
+        let last_1 = sorted
+            .get(sorted.len().saturating_sub(2))
+            .cloned()
+            .expect("at least two items");
+
+        let mut it = m.iter();
+        let mut seen = HashSet::new();
+        let k = to_str(it.next().unwrap().key).to_string();
+        assert_eq!(k, first);
+        seen.insert(k);
+        let k = to_str(it.next_back().unwrap().key).to_string();
+        assert_eq!(k, last);
+        seen.insert(k);
+        let k = to_str(it.next().unwrap().key).to_string();
+        assert_eq!(k, second);
+        seen.insert(k);
+        let k = to_str(it.next_back().unwrap().key).to_string();
+        assert_eq!(k, last_1);
+        seen.insert(k);
+
+        loop {
+            let l = it.next();
+            let r = it.next_back();
+            match (l, r) {
+                (None, None) => break,
+                (Some(x), None) => {
+                    seen.insert(to_str(x.key).to_string());
+                }
+                (None, Some(x)) => {
+                    seen.insert(to_str(x.key).to_string());
+                }
+                (Some(x), Some(y)) => {
+                    seen.insert(to_str(x.key).to_string());
+                    seen.insert(to_str(y.key).to_string());
+                }
+            }
+        }
+
+        assert_eq!(seen.len(), total);
+        for i in 0..total {
+            let k = format!("k{:03}", i);
+            assert!(seen.contains(&k), "missing key {k}");
+        }
+        assert!(it.next_back().is_none());
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn next_back_keeps_same_raw_versions() {
+        let total = NODE_SIZE * 11 - 3;
+        let mut m = ImTree::<Data>::new(|x, y| x.cmp(y));
+        let mut owned = Vec::new();
+        for i in 0..total {
+            let k = format!("a{:03}", i);
+            let key = alloc_key(&mut owned, k);
+            m = m.update(Data {
+                key,
+                val: &[],
+                ver: 1,
+            });
+        }
+        m = m.update(Data::key("foo", 3));
+        m = m.update(Data::key("foo", 2));
+        m = m.update(Data::key("foo", 1));
+        for i in 0..total {
+            let k = format!("z{:03}", i);
+            let key = alloc_key(&mut owned, k);
+            m = m.update(Data {
+                key,
+                val: &[],
+                ver: 1,
+            });
+        }
+
+        let mut it = m.range_from(
+            Data::key("foo", usize::MAX),
+            |x, y| x.cmp(y),
+            |x, y| x.key == y.key,
+        );
+        assert_eq!(it.next_back().unwrap().ver, 1);
+        assert_eq!(it.next_back().unwrap().ver, 2);
+        assert_eq!(it.next_back().unwrap().ver, 3);
+        assert!(it.next_back().is_none());
+    }
+
+    #[test]
+    fn next_back_on_absent_start_is_empty() {
+        let mut m = ImTree::<Data>::new(|x, y| x.cmp(y));
+        let mut owned = Vec::new();
+        for i in 0..(NODE_SIZE * 2 - 7) {
+            let k = format!("k{:03}", i);
+            let key = alloc_key(&mut owned, k);
+            m = m.update(Data {
+                key,
+                val: &[],
+                ver: 1,
+            });
+        }
+
+        let mut it = m.range_from(
+            Data::key("m999", usize::MAX),
+            |x, y| x.cmp(y),
+            |x, y| x.key == y.key,
+        );
+        assert!(it.next_back().is_none());
+        assert!(it.next().is_none());
     }
 }

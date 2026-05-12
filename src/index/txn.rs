@@ -3,7 +3,7 @@ use crate::{
     OpCode,
     cc::{
         cc::ConcurrencyControl,
-        context::{CCNode, Context},
+        context::{CCNode, Context, TxOutcome},
         group::TxnState,
         wal::{WalDel, WalPut, WalReplace},
     },
@@ -19,7 +19,9 @@ use crate::{
         },
     },
 };
+use crossbeam_epoch::Guard;
 use std::cell::{Cell, UnsafeCell};
+use std::ops::RangeBounds;
 use std::sync::atomic::Ordering::Relaxed;
 
 fn get_impl<K: AsRef<[u8]>>(
@@ -68,6 +70,22 @@ where
     }
 }
 
+fn range_impl<'a, K, R>(
+    cc: &'a ConcurrencyControl,
+    tree: &'a Tree,
+    group_id: u8,
+    start_ts: u64,
+    range: R,
+) -> Iter<'a>
+where
+    K: AsRef<[u8]>,
+    R: RangeBounds<K>,
+{
+    tree.range(range, move |ctx, txid, record_gid| {
+        cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
+    })
+}
+
 fn prefix_upper_exclusive(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut upper = prefix.to_vec();
     for i in (0..upper.len()).rev() {
@@ -90,6 +108,12 @@ pub struct TxnKV<'a> {
     limit: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailCause {
+    Aborted,
+    Conflict,
+}
+
 impl<'a> TxnKV<'a> {
     pub(crate) fn new(ctx: &'a Context, tree: &'a Tree) -> Result<Self, OpCode> {
         let start_ts = ctx.alloc_oracle();
@@ -105,6 +129,7 @@ impl<'a> TxnKV<'a> {
         let begin_res = {
             let mut log = g.logging.lock();
             log.record_begin(start_ts).map(|lsn| {
+                state.begin_lsn = lsn;
                 state.prev_lsn = lsn;
                 g.active_txns.insert(start_ts, state.prev_lsn);
             })
@@ -178,6 +203,81 @@ impl<'a> TxnKV<'a> {
         OpCode::AbortTx
     }
 
+    #[inline]
+    fn write_abort(&self, start_ts: u64, cause: FailCause) -> OpCode {
+        match cause {
+            FailCause::Aborted => OpCode::AbortTx,
+            FailCause::Conflict => self.conflict_abort(start_ts),
+        }
+    }
+
+    #[inline]
+    fn is_visible_for_write(
+        &self,
+        group_id: usize,
+        start_ts: u64,
+        txid: u64,
+        record_gid: u8,
+    ) -> bool {
+        self.ctx.group(group_id).cc.is_visible_to(
+            self.ctx,
+            group_id as u8,
+            record_gid,
+            start_ts,
+            txid,
+        )
+    }
+
+    fn resolve_latest_for_write(
+        &self,
+        opt: &Option<(Key, ValRef)>,
+        state: &TxnState,
+    ) -> Result<Option<ValRef>, FailCause> {
+        let Some((rk, rv)) = opt else {
+            return Ok(None);
+        };
+        let gid = state.group_id;
+        let start_ts = state.start_ts;
+        if self.is_visible_for_write(gid, start_ts, rk.txid, rv.group_id()) {
+            return Ok(Some(rv.clone()));
+        }
+        if self.ctx.is_aborted(rk.txid) && self.ctx.get_aborted(rk.txid) == Some(TxOutcome::Aborted)
+        {
+            return Err(FailCause::Aborted);
+        }
+        Err(FailCause::Conflict)
+    }
+
+    fn clean_aborted(&self, g: &Guard, raw: &[u8]) -> Result<bool, OpCode> {
+        let latest = match self
+            .tree
+            .get(g, Key::new(raw, Ver::new(u64::MAX, u32::MAX)))
+        {
+            Ok((k, _)) => Some(k),
+            Err(OpCode::NotFound | OpCode::Again) => None,
+            Err(e) => return Err(e),
+        };
+        let Some(k) = latest else {
+            return Ok(false);
+        };
+        if self.ctx.get_aborted(k.ver().txid) != Some(TxOutcome::Aborted) {
+            return Ok(false);
+        }
+
+        match self.tree.remove_aborted_head(g, raw, k.ver().txid) {
+            Ok(true) => {
+                g.flush();
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(OpCode::Again) => {
+                g.flush();
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn modify<F>(
         &self,
         k: &[u8],
@@ -186,46 +286,61 @@ impl<'a> TxnKV<'a> {
         mut f: F,
     ) -> Result<Option<ValRef>, OpCode>
     where
-        F: FnMut(&Option<(Key, ValRef)>, Ver, &mut TxnState) -> Result<(u8, Position), OpCode>,
+        F: FnMut(
+            &Option<(Key, ValRef)>,
+            Ver,
+            &mut TxnState,
+            &mut FailCause,
+        ) -> Result<(u8, Position), OpCode>,
     {
         #[cfg(feature = "extra_check")]
         assert!(!k.as_ref().is_empty(), "key must be non-empty");
 
-        self.should_abort()?;
-        let g = crossbeam_epoch::pin();
-        let state = self.state_mut();
-        let start_ts = state.start_ts;
-        let gid = state.group_id;
+        loop {
+            self.should_abort()?;
+            let g = crossbeam_epoch::pin();
+            let state = self.state_mut();
+            let start_ts = state.start_ts;
+            let gid = state.group_id;
 
-        let cmd_id_val = state.cmd_id;
-        state.cmd_id += 1;
-        let key = Key::new(k, Ver::new(start_ts, cmd_id_val));
-        let val = Record::normal(gid as u8, v);
-        let _write_permit = self.before_write_budget(estimated_bytes);
+            let cmd_id_val = state.cmd_id;
+            state.cmd_id += 1;
+            let key = Key::new(k, Ver::new(start_ts, cmd_id_val));
+            let val = Record::normal(gid as u8, v);
+            let _write_permit = self.before_write_budget(estimated_bytes);
+            let mut abort_cause = FailCause::Conflict;
 
-        self.tree
-            .update(&g, key, val, |opt| f(opt, *key.ver(), state))
+            let res = self.tree.update(&g, key, val, |opt| {
+                f(opt, *key.ver(), state, &mut abort_cause)
+            });
+            match res {
+                Err(OpCode::AbortTx) if abort_cause == FailCause::Aborted => {
+                    let _ = self.clean_aborted(&g, k)?;
+                    continue;
+                }
+                _ => return res,
+            }
+        }
     }
 
     fn put_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<(), OpCode> {
         let estimated = k.len().saturating_add(v.len());
-        self.modify(k, v, estimated, |opt, ver, state| {
+        self.modify(k, v, estimated, |opt, ver, state, abort_cause| {
             let gid = state.group_id;
             let g = self.ctx.group(gid);
 
-            let r = match opt {
+            let current = match self.resolve_latest_for_write(opt, state) {
+                Ok(current) => current,
+                Err(cause) => {
+                    *abort_cause = cause;
+                    return Err(self.write_abort(state.start_ts, cause));
+                }
+            };
+            let r = match current {
                 None => Ok(()),
-                Some((rk, rv)) => {
-                    if rv.is_put()
-                        || !g.cc.is_visible_to(
-                            self.ctx,
-                            gid as u8,
-                            rv.group_id(),
-                            state.start_ts,
-                            rk.txid,
-                        )
-                    {
-                        Err(self.conflict_abort(state.start_ts))
+                Some(current) => {
+                    if current.is_put() {
+                        Err(OpCode::Exist)
                     } else {
                         Ok(())
                     }
@@ -239,7 +354,6 @@ impl<'a> TxnKV<'a> {
                 let new_pos = log.record_update(
                     &Key::new(k, ver),
                     WalPut::new(v.len()),
-                    [].as_slice(),
                     v,
                     state.prev_lsn,
                     self.bucket_id,
@@ -253,44 +367,41 @@ impl<'a> TxnKV<'a> {
 
     fn update_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<ValRef, OpCode> {
         let estimated = k.len().saturating_add(v.len().saturating_mul(2));
-        self.modify(k, v, estimated, |opt, ver, state| {
+        let mut old_visible = None;
+        self.modify(k, v, estimated, |opt, ver, state, abort_cause| {
             let gid = state.group_id;
             let g = self.ctx.group(gid);
-            match opt {
-                None => Err(OpCode::NotFound),
-                Some((rk, rv)) => {
-                    if rv.is_del() {
-                        return Err(OpCode::NotFound);
-                    }
-                    if !g.cc.is_visible_to(
-                        self.ctx,
-                        gid as u8,
-                        rv.group_id(),
-                        state.start_ts,
-                        rk.txid,
-                    ) {
-                        return Err(self.conflict_abort(state.start_ts));
-                    }
-
-                    if !*logged {
-                        state.modified = true;
-                        *logged = true;
-                        let mut log = g.logging.lock();
-                        let new_pos = log.record_update(
-                            &Key::new(rk.raw, ver),
-                            WalReplace::new(rv.slice().len(), v.len()),
-                            rv.slice(),
-                            v,
-                            state.prev_lsn,
-                            self.bucket_id,
-                        )?;
-                        state.prev_lsn = new_pos;
-                    }
-                    Ok((gid as u8, state.prev_lsn))
+            let current = match self.resolve_latest_for_write(opt, state) {
+                Ok(current) => current,
+                Err(cause) => {
+                    *abort_cause = cause;
+                    return Err(self.write_abort(state.start_ts, cause));
                 }
+            };
+            let Some(current) = current else {
+                return Err(OpCode::NotFound);
+            };
+            if current.is_del() {
+                return Err(OpCode::NotFound);
             }
+            old_visible = Some(current.clone());
+
+            if !*logged {
+                state.modified = true;
+                *logged = true;
+                let mut log = g.logging.lock();
+                let new_pos = log.record_update(
+                    &Key::new(k, ver),
+                    WalReplace::new(v.len()),
+                    v,
+                    state.prev_lsn,
+                    self.bucket_id,
+                )?;
+                state.prev_lsn = new_pos;
+            }
+            Ok((gid as u8, state.prev_lsn))
         })
-        .map(|x| x.unwrap())
+        .map(|_| old_visible.expect("visible value must exist for update"))
     }
 
     /// Puts a key-value pair into the bucket.
@@ -320,58 +431,45 @@ impl<'a> TxnKV<'a> {
         V: AsRef<[u8]>,
     {
         let mut logged = false;
+        let mut old_visible = None;
         let (k, v) = (k.as_ref(), v.as_ref());
         let estimated = k.len().saturating_add(v.len().saturating_mul(2));
-        self.modify(k, v, estimated, |opt, ver, state| {
+        self.modify(k, v, estimated, |opt, ver, state, abort_cause| {
             let gid = state.group_id;
             let g = self.ctx.group(gid);
-            match opt {
-                None => {
-                    if !logged {
-                        state.modified = true;
-                        logged = true;
-                        let mut log = g.logging.lock();
-                        let new_pos = log.record_update(
-                            &Key::new(k, ver),
-                            WalPut::new(v.len()),
-                            &[],
-                            v,
-                            state.prev_lsn,
-                            self.bucket_id,
-                        )?;
-                        state.prev_lsn = new_pos;
-                    }
-                    Ok((gid as u8, state.prev_lsn))
+            let current = match self.resolve_latest_for_write(opt, state) {
+                Ok(current) => current,
+                Err(cause) => {
+                    *abort_cause = cause;
+                    return Err(self.write_abort(state.start_ts, cause));
                 }
-                Some((rk, rv)) => {
-                    if !g.cc.is_visible_to(
-                        self.ctx,
-                        gid as u8,
-                        rv.group_id(),
-                        state.start_ts,
-                        rk.txid,
-                    ) {
-                        return Err(self.conflict_abort(state.start_ts));
-                    }
-
-                    if !logged {
-                        state.modified = true;
-                        logged = true;
-                        let mut log = g.logging.lock();
-                        let new_pos = log.record_update(
-                            &Key::new(rk.raw, ver),
-                            WalReplace::new(rv.slice().len(), v.len()),
-                            rv.slice(),
-                            v,
-                            state.prev_lsn,
-                            self.bucket_id,
-                        )?;
-                        state.prev_lsn = new_pos;
-                    }
-                    Ok((gid as u8, state.prev_lsn))
-                }
+            };
+            old_visible = current.clone();
+            if !logged {
+                state.modified = true;
+                logged = true;
+                let mut log = g.logging.lock();
+                let new_pos = match current {
+                    None => log.record_update(
+                        &Key::new(k, ver),
+                        WalPut::new(v.len()),
+                        v,
+                        state.prev_lsn,
+                        self.bucket_id,
+                    )?,
+                    Some(_) => log.record_update(
+                        &Key::new(k, ver),
+                        WalReplace::new(v.len()),
+                        v,
+                        state.prev_lsn,
+                        self.bucket_id,
+                    )?,
+                };
+                state.prev_lsn = new_pos;
             }
+            Ok((gid as u8, state.prev_lsn))
         })
+        .map(|_| old_visible)
     }
 
     /// Deletes a key-value pair from the bucket.
@@ -379,54 +477,63 @@ impl<'a> TxnKV<'a> {
     where
         T: AsRef<[u8]>,
     {
-        self.should_abort()?;
-        let state = self.state_mut();
-        let (gid, start_ts) = (state.group_id, state.start_ts);
+        loop {
+            self.should_abort()?;
+            let state = self.state_mut();
+            let (gid, start_ts) = (state.group_id, state.start_ts);
 
-        let cmd_id_val = state.cmd_id;
-        state.cmd_id += 1;
+            let cmd_id_val = state.cmd_id;
+            state.cmd_id += 1;
 
-        let key = Key::new(k.as_ref(), Ver::new(start_ts, cmd_id_val));
-        let val = Record::remove(gid as u8);
-        let mut logged = false;
-        let guard = crossbeam_epoch::pin();
-        let _write_permit = self.before_write_budget(key.raw.len());
+            let key = Key::new(k.as_ref(), Ver::new(start_ts, cmd_id_val));
+            let val = Record::remove(gid as u8);
+            let mut logged = false;
+            let mut old_visible = None;
+            let guard = crossbeam_epoch::pin();
+            let _write_permit = self.before_write_budget(key.raw.len());
+            let mut abort_cause = FailCause::Conflict;
 
-        let res = self.tree.update(&guard, key, val, |opt| {
-            let g = self.ctx.group(gid);
-            match opt {
-                None => Err(OpCode::NotFound),
-                Some((rk, rv)) => {
-                    if rv.is_del() {
-                        return Err(OpCode::NotFound);
+            let res = self.tree.update(&guard, key, val, |opt| {
+                let g = self.ctx.group(gid);
+                let current = match self.resolve_latest_for_write(opt, state) {
+                    Ok(current) => current,
+                    Err(cause) => {
+                        abort_cause = cause;
+                        return Err(self.write_abort(start_ts, cause));
                     }
-                    if !g
-                        .cc
-                        .is_visible_to(self.ctx, gid as u8, rv.group_id(), start_ts, rk.txid)
-                    {
-                        return Err(self.conflict_abort(start_ts));
-                    }
-
-                    if !logged {
-                        logged = true;
-                        state.modified = true;
-                        let mut log = g.logging.lock();
-                        let new_pos = log.record_update(
-                            &key,
-                            WalDel::new(rv.slice().len()),
-                            rv.slice(),
-                            [].as_slice(),
-                            state.prev_lsn,
-                            self.bucket_id,
-                        )?;
-                        state.prev_lsn = new_pos;
-                    }
-                    Ok((gid as u8, state.prev_lsn))
+                };
+                let Some(current) = current else {
+                    return Err(OpCode::NotFound);
+                };
+                if current.is_del() {
+                    return Err(OpCode::NotFound);
                 }
-            }
-        });
+                old_visible = Some(current);
 
-        res.map(|x| x.unwrap())
+                if !logged {
+                    logged = true;
+                    state.modified = true;
+                    let mut log = g.logging.lock();
+                    let new_pos = log.record_update(
+                        &key,
+                        WalDel::new(),
+                        [].as_slice(),
+                        state.prev_lsn,
+                        self.bucket_id,
+                    )?;
+                    state.prev_lsn = new_pos;
+                }
+                Ok((gid as u8, state.prev_lsn))
+            });
+
+            match res {
+                Err(OpCode::AbortTx) if abort_cause == FailCause::Aborted => {
+                    let _ = self.clean_aborted(&guard, key.raw)?;
+                    continue;
+                }
+                _ => return res.map(|_| old_visible.expect("visible value must exist for delete")),
+            }
+        }
     }
 
     /// Commits the transaction.
@@ -520,80 +627,61 @@ impl<'a> TxnKV<'a> {
             prefix,
         )
     }
+
+    #[inline]
+    pub fn range<K, R>(&self, range: R) -> Iter<'_>
+    where
+        K: AsRef<[u8]>,
+        R: RangeBounds<K>,
+    {
+        let state = self.state_ref();
+        let group_id = state.group_id;
+        range_impl(
+            &self.ctx.group(group_id).cc,
+            self.tree,
+            group_id as u8,
+            state.start_ts,
+            range,
+        )
+    }
 }
 
 impl Drop for TxnKV<'_> {
     fn drop(&mut self) {
         let group_id = self.state_ref().group_id;
         if !self.is_end.get() {
-            let g = crossbeam_epoch::pin();
             let state = self.state_ref();
             let grp = self.ctx.group(state.group_id);
+            let modified = state.modified;
 
-            if !state.modified {
-                let mut log = grp.logging.lock();
-                log.record_abort(state.start_ts)
-                    .inspect_err(|e| {
-                        log::error!("can't record abort, {:?}", e);
-                    })
-                    .expect("can't fail");
-                self.observe_counter(CounterMetric::TxnAbort, 1);
-            } else {
-                use crate::cc::wal::{Location, WalReader};
-                use crate::utils::block::Block;
-                let rollback_started = sampled_instant(state.start_ts, LATENCY_SAMPLE_SHIFT);
-
-                let mut log = grp.logging.lock();
+            let mut log = grp.logging.lock();
+            log.record_abort(state.start_ts)
+                .inspect_err(|e| {
+                    log::error!("can't record abort, {:?}", e);
+                })
+                .expect("can't fail");
+            if modified {
                 log.sync(false)
-                    .map_err(|e| {
-                        log::error!("can't stabilize rollback source WAL, {:?}", e);
-                    })
-                    .expect("can't fail");
-                drop(log);
-
-                const SMALL_SIZE: usize = 256;
-                let mut block = Block::alloc(SMALL_SIZE);
-                let reader = WalReader::new(self.ctx, &g);
-                let location = Location {
-                    group_id: state.group_id as u32,
-                    pos: state.prev_lsn,
-                    len: 0,
-                };
-
-                reader
-                    .rollback(&mut block, state.start_ts, location, |_| self.tree.clone())
                     .inspect_err(|e| {
-                        log::error!("can't rollback, {:?}", e);
+                        log::error!("can't sync abort chain before enqueue, {:?}", e);
                     })
                     .expect("can't fail");
-
-                let mut log = grp.logging.lock();
-                log.sync(false)
-                    .map_err(|e| {
-                        log::error!("can't stabilize rollback WAL, {:?}", e);
-                    })
-                    .expect("can't fail");
-                drop(log);
-
-                let commit_ts = self.ctx.alloc_oracle();
-                grp.cc.commit_tree.append(state.start_ts, commit_ts);
-                grp.cc.latest_cts.store(commit_ts, Relaxed);
-                grp.cc.collect_wmk(self.ctx);
-                self.observe_counter(CounterMetric::TxnAbort, 1);
-                self.observe_counter(CounterMetric::TxnRollback, 1);
-                observe_elapsed(
-                    self.ctx.opt.observer.as_ref(),
-                    HistogramMetric::TxnRollbackMicros,
-                    rollback_started,
-                );
-                self.observe_event(ObserveEvent {
-                    kind: EventKind::TxnRollbackComplete,
-                    bucket_id: self.bucket_id,
-                    txid: state.start_ts,
-                    file_id: state.prev_lsn.file_id,
-                    value: state.prev_lsn.offset,
-                });
             }
+            drop(log);
+
+            if modified {
+                self.ctx.add_aborted(state.start_ts);
+                self.ctx.enqueue_abort_clean(
+                    state.start_ts,
+                    self.bucket_id,
+                    state.group_id as u8,
+                    state.prev_lsn,
+                    state.begin_lsn.file_id,
+                );
+            } else {
+                // no tx-outcome mutation on clean readonly/empty-write abort path
+            }
+            self.observe_counter(CounterMetric::TxnAbort, 1);
             grp.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
         }
@@ -645,6 +733,15 @@ impl<'a> TxnView<'a> {
         K: AsRef<[u8]>,
     {
         seek_impl(&self.cc, self.tree, self.group_id, self.cc.start_ts, prefix)
+    }
+
+    #[inline]
+    pub fn range<K, R>(&self, range: R) -> Iter<'_>
+    where
+        K: AsRef<[u8]>,
+        R: RangeBounds<K>,
+    {
+        range_impl(&self.cc, self.tree, self.group_id, self.cc.start_ts, range)
     }
 }
 

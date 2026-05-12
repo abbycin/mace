@@ -189,6 +189,15 @@ pub(crate) struct Snapshot {
 impl CheckpointTask {
     const RECYCLE_BIN_MAX: usize = 2;
 
+    fn dedup_junks(junks: &mut Vec<u64>) {
+        if junks.len() < 2 {
+            return;
+        }
+
+        let mut seen = FxHashSet::default();
+        junks.retain(|addr| seen.insert(*addr));
+    }
+
     fn recycle_generation<T, F>(
         generation: Arc<T>,
         recycle: &Arc<Mutex<Vec<T>>>,
@@ -414,6 +423,11 @@ impl CheckpointTask {
             }
             pages.push(b);
         }
+
+        // keep checkpoint junk output logically unique even if retired lineage
+        // carries duplicates from shared history page references
+        Self::dedup_junks(&mut blob_junk);
+        Self::dedup_junks(&mut data_junk);
 
         *self.last_chkpt_lsn.raw_ref() = chkpt_lsn;
         Snapshot {

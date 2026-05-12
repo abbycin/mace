@@ -251,7 +251,9 @@ fn evictor_loop(mut e: Evictor) {
     loop {
         let r = e.rx.recv_timeout(Duration::from_millis(TMO_MS));
         let g = crossbeam_epoch::pin();
-        let safe_txid = e.numerics.safe_tixd();
+        // always use compact-safe watermark so consolidation does not prune committed history
+        // while there are pending aborted heads waiting for physical cleanup
+        let safe_txid = e.buckets.ctx.compact_safe_txid();
 
         match r {
             Ok(s) => match s {

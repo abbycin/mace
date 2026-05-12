@@ -242,6 +242,97 @@ fn rollback_multiple_updates_in_same_txn_restores_committed_value() -> Result<()
 }
 
 #[test]
+fn get_compacted_shared_hist_page_keeps_key_local_old_versions() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    opts.sync_on_write = false;
+    opts.consolidate_threshold = 4;
+    opts.split_elems = 64;
+    let mace = Mace::new(opts.validate().unwrap())?;
+    let db = mace.new_bucket("x")?;
+
+    let tx = db.begin()?;
+    tx.put("a", "a0")?;
+    tx.put("b", "b0")?;
+    tx.commit()?;
+
+    let tx = db.begin()?;
+    tx.update("a", "a1")?;
+    tx.commit()?;
+
+    let tx = db.begin()?;
+    tx.update("b", "b1")?;
+    tx.commit()?;
+
+    let tx = db.begin()?;
+    tx.update("a", "a2")?;
+    tx.commit()?;
+
+    let tx = db.begin()?;
+    tx.update("b", "b2")?;
+    tx.commit()?;
+
+    // force compaction so old versions go through shared hist-page path
+    for i in 0..64 {
+        let tx = db.begin()?;
+        let k = format!("pad_{i:03}");
+        tx.put(&k, &k)?;
+        tx.commit()?;
+    }
+
+    // snapshot between latest and old versions, must read key-local history only
+    let snapshot = db.view()?;
+    let got_a = snapshot.get("a")?;
+    let got_b = snapshot.get("b")?;
+    assert_eq!(got_a.slice(), b"a2");
+    assert_eq!(got_b.slice(), b"b2");
+    Ok(())
+}
+
+#[test]
+fn get_never_crosses_into_next_key_hist_region_when_own_hist_invisible() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    opts.sync_on_write = false;
+    opts.consolidate_threshold = 4;
+    opts.split_elems = 64;
+    let mace = Mace::new(opts.validate().unwrap())?;
+    let db = mace.new_bucket("x")?;
+
+    let tx = db.begin()?;
+    tx.put("a", "a0")?;
+    tx.put("b", "b0")?;
+    tx.commit()?;
+
+    // create extra history on b so shared hist pages are likely to contain both keys
+    let tx = db.begin()?;
+    tx.update("b", "b1")?;
+    tx.commit()?;
+    let tx = db.begin()?;
+    tx.update("b", "b2")?;
+    tx.commit()?;
+
+    // keep one uncommitted newer delta for a in another txn
+    let pending = db.begin()?;
+    pending.update("a", "a_pending")?;
+
+    // force compaction work on background writes
+    for i in 0..64 {
+        let tx = db.begin()?;
+        let k = format!("padx_{i:03}");
+        tx.put(&k, &k)?;
+        tx.commit()?;
+    }
+
+    let snapshot = db.view()?;
+    // must still return committed a0, never leak into b's hist values
+    let got_a = snapshot.get("a")?;
+    assert_eq!(got_a.slice(), b"a0");
+    drop(pending);
+    Ok(())
+}
+
+#[test]
 fn rollback_upsert_replace_on_tombstone_restores_delete() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
@@ -427,6 +518,448 @@ fn seek_stops_when_key_no_longer_matches_prefix() -> Result<(), OpCode> {
         ]
     );
 
+    Ok(())
+}
+
+#[test]
+fn seek_supports_next_back_in_descending_key_order() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    for key in ["foo", "food", "fool", "fop"] {
+        kv.put(key, key)?;
+    }
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<Vec<u8>> = view
+        .seek("fo")
+        .rev()
+        .map(|item| item.key().to_vec())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "fop".as_bytes().to_vec(),
+            "fool".as_bytes().to_vec(),
+            "food".as_bytes().to_vec(),
+            "foo".as_bytes().to_vec(),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn seek_next_back_crosses_binary_leaf_boundary_without_skipping() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    opts.split_elems = 4;
+    opts.consolidate_threshold = 4;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    for key in [
+        vec![0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        vec![0x01],
+        vec![0x01, 0x00],
+        vec![0x01, 0x01],
+        vec![0x02],
+        vec![0x03],
+    ] {
+        kv.put(&key, "v")?;
+    }
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<Vec<u8>> = view
+        .range::<_, _>(..=vec![0x01])
+        .rev()
+        .map(|item| item.key().to_vec())
+        .collect();
+    assert_eq!(
+        got,
+        vec![vec![0x01], vec![0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]]
+    );
+    Ok(())
+}
+
+#[test]
+fn seek_next_and_next_back_share_one_shrinking_range() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    for key in ["foo", "food", "fool", "fop"] {
+        kv.put(key, key)?;
+    }
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let mut iter = view.seek("fo");
+    assert_eq!(iter.next().unwrap().key(), "foo".as_bytes());
+    assert_eq!(iter.next_back().unwrap().key(), "fop".as_bytes());
+    assert_eq!(iter.next().unwrap().key(), "food".as_bytes());
+    assert_eq!(iter.next_back().unwrap().key(), "fool".as_bytes());
+    assert!(iter.next().is_none());
+    assert!(iter.next_back().is_none());
+    Ok(())
+}
+
+#[test]
+fn seek_next_back_keeps_prefix_upper_bound() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    for key in ["app", "apple", "apply", "apt", "aq"] {
+        kv.put(key, key)?;
+    }
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<Vec<u8>> = view
+        .seek("app")
+        .rev()
+        .map(|item| item.key().to_vec())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "apply".as_bytes().to_vec(),
+            "apple".as_bytes().to_vec(),
+            "app".as_bytes().to_vec(),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn seek_next_back_keeps_latest_visible_version_per_raw_key() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    kv.put("foo", "1")?;
+    kv.put("food", "1")?;
+    kv.commit()?;
+
+    let kv = db.begin().unwrap();
+    kv.update("foo", "2")?;
+    kv.del("food")?;
+    kv.put("fool", "3")?;
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<(Vec<u8>, Vec<u8>)> = view
+        .seek("fo")
+        .rev()
+        .map(|item| (item.key().to_vec(), item.val().to_vec()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("fool".as_bytes().to_vec(), "3".as_bytes().to_vec()),
+            ("foo".as_bytes().to_vec(), "2".as_bytes().to_vec()),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn seek_next_back_falls_back_to_older_visible_delta_version() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    kv.put("foo", "1")?;
+    kv.commit()?;
+
+    let kv = db.begin().unwrap();
+    kv.update("foo", "2")?;
+    kv.commit()?;
+
+    // keep a newer uncommitted delta version that should be invisible to another snapshot
+    let writer = db.begin().unwrap();
+    writer.update("foo", "3")?;
+
+    let view = db.view().unwrap();
+    let got: Vec<(Vec<u8>, Vec<u8>)> = view
+        .seek("fo")
+        .rev()
+        .map(|item| (item.key().to_vec(), item.val().to_vec()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![("foo".as_bytes().to_vec(), "2".as_bytes().to_vec())]
+    );
+
+    drop(writer);
+    Ok(())
+}
+
+#[test]
+fn txn_range_respects_view_and_own_write_visibility() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    kv.put("a1", "1")?;
+    kv.put("a2", "2")?;
+    kv.put("b1", "3")?;
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<(Vec<u8>, Vec<u8>)> = view
+        .range::<_, _>("a1".."b1")
+        .map(|item| (item.key().to_vec(), item.val().to_vec()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("a1".as_bytes().to_vec(), "1".as_bytes().to_vec()),
+            ("a2".as_bytes().to_vec(), "2".as_bytes().to_vec()),
+        ]
+    );
+
+    let kv = db.begin().unwrap();
+    kv.put("a0", "0")?;
+    kv.update("a2", "22")?;
+    kv.del("b1")?;
+    let got: Vec<(Vec<u8>, Vec<u8>)> = kv
+        .range::<_, _>("a0".."c0")
+        .map(|item| (item.key().to_vec(), item.val().to_vec()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("a0".as_bytes().to_vec(), "0".as_bytes().to_vec()),
+            ("a1".as_bytes().to_vec(), "1".as_bytes().to_vec()),
+            ("a2".as_bytes().to_vec(), "22".as_bytes().to_vec()),
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn txn_range_cross_node_respects_view_and_own_write_visibility() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    opts.split_elems = 20;
+    opts.consolidate_threshold = 8;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    for i in 0..80 {
+        let key = format!("k{:03}", i);
+        kv.put(&key, &key)?;
+    }
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<Vec<u8>> = view
+        .range::<_, _>("k010".."k070")
+        .map(|item| item.key().to_vec())
+        .collect();
+    let expected: Vec<Vec<u8>> = (10..70)
+        .map(|i| format!("k{:03}", i).into_bytes())
+        .collect();
+    assert_eq!(got, expected);
+
+    let kv = db.begin().unwrap();
+    kv.put("k080", "k080-new")?;
+    kv.update("k020", "k020-new")?;
+    kv.del("k030")?;
+    kv.put("k090", "k090-new")?;
+    let got: Vec<(Vec<u8>, Vec<u8>)> = kv
+        .range::<_, _>("k000".."k091")
+        .map(|item| (item.key().to_vec(), item.val().to_vec()))
+        .collect();
+
+    let mut expected = Vec::new();
+    for i in 0..20 {
+        let key = format!("k{:03}", i).into_bytes();
+        expected.push((key.clone(), key));
+    }
+    expected.push(("k020".as_bytes().to_vec(), "k020-new".as_bytes().to_vec()));
+    for i in 21..30 {
+        let key = format!("k{:03}", i).into_bytes();
+        expected.push((key.clone(), key));
+    }
+    for i in 31..80 {
+        let key = format!("k{:03}", i).into_bytes();
+        expected.push((key.clone(), key));
+    }
+    expected.push(("k080".as_bytes().to_vec(), "k080-new".as_bytes().to_vec()));
+    expected.push(("k090".as_bytes().to_vec(), "k090-new".as_bytes().to_vec()));
+
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+#[test]
+fn txn_range_cross_node_supports_reverse_iteration() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    opts.split_elems = 20;
+    opts.consolidate_threshold = 8;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    for i in 0..80 {
+        let key = format!("k{:03}", i);
+        kv.put(&key, &key)?;
+    }
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<Vec<u8>> = view
+        .range::<_, _>("k010".."k070")
+        .rev()
+        .map(|item| item.key().to_vec())
+        .collect();
+    let expected: Vec<Vec<u8>> = (10..70)
+        .rev()
+        .map(|i| format!("k{:03}", i).into_bytes())
+        .collect();
+    assert_eq!(got, expected);
+
+    let kv = db.begin().unwrap();
+    kv.update("k020", "k020-new")?;
+    kv.del("k030")?;
+    kv.put("k080", "k080-new")?;
+    kv.put("k090", "k090-new")?;
+
+    let got: Vec<(Vec<u8>, Vec<u8>)> = kv
+        .range::<_, _>("k000".."k091")
+        .rev()
+        .map(|item| (item.key().to_vec(), item.val().to_vec()))
+        .collect();
+
+    let mut expected = Vec::new();
+    expected.push(("k090".as_bytes().to_vec(), "k090-new".as_bytes().to_vec()));
+    expected.push(("k080".as_bytes().to_vec(), "k080-new".as_bytes().to_vec()));
+    for i in (31..80).rev() {
+        let key = format!("k{:03}", i).into_bytes();
+        expected.push((key.clone(), key));
+    }
+    for i in (21..30).rev() {
+        let key = format!("k{:03}", i).into_bytes();
+        expected.push((key.clone(), key));
+    }
+    expected.push(("k020".as_bytes().to_vec(), "k020-new".as_bytes().to_vec()));
+    for i in (0..20).rev() {
+        let key = format!("k{:03}", i).into_bytes();
+        expected.push((key.clone(), key));
+    }
+
+    assert_eq!(got, expected);
+
+    let mut iter = kv.range::<_, _>("k000".."k091");
+    assert_eq!(iter.next().unwrap().key(), "k000".as_bytes());
+    assert_eq!(iter.next_back().unwrap().key(), "k090".as_bytes());
+    assert_eq!(iter.next().unwrap().key(), "k001".as_bytes());
+    assert_eq!(iter.next_back().unwrap().key(), "k080".as_bytes());
+    Ok(())
+}
+
+#[test]
+fn txn_range_cross_node_reverse_respects_upper_bound() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    opts.split_elems = 20;
+    opts.consolidate_threshold = 8;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    for i in 0..80 {
+        let key = format!("k{:03}", i);
+        kv.put(&key, &key)?;
+    }
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<Vec<u8>> = view
+        .range::<_, _>("k015".."k065")
+        .rev()
+        .map(|item| item.key().to_vec())
+        .collect();
+    let expected: Vec<Vec<u8>> = (15..65)
+        .rev()
+        .map(|i| format!("k{:03}", i).into_bytes())
+        .collect();
+    assert_eq!(got, expected);
+    assert_eq!(got.first().unwrap().as_slice(), "k064".as_bytes());
+    assert_eq!(got.last().unwrap().as_slice(), "k015".as_bytes());
+    assert!(!got.iter().any(|k| k.as_slice() == "k065".as_bytes()));
+
+    let kv = db.begin().unwrap();
+    kv.put("k064a", "k064a-new")?;
+    kv.put("k065a", "k065a-new")?;
+    let got: Vec<Vec<u8>> = kv
+        .range::<_, _>("k015".."k065")
+        .rev()
+        .map(|item| item.key().to_vec())
+        .collect();
+    assert_eq!(got.first().unwrap().as_slice(), "k064a".as_bytes());
+    assert_eq!(got.last().unwrap().as_slice(), "k015".as_bytes());
+    assert!(!got.iter().any(|k| k.as_slice() == "k065".as_bytes()));
+    assert!(!got.iter().any(|k| k.as_slice() == "k065a".as_bytes()));
+    Ok(())
+}
+
+#[test]
+fn txn_range_excluded_start_keeps_first_in_range_key() -> Result<(), OpCode> {
+    let mut opts = Options::new(&*RandomPath::new());
+    opts.tmp_store = true;
+    opts.split_elems = 4;
+    opts.consolidate_threshold = 4;
+    let mace = Mace::new(opts.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x").unwrap();
+
+    let kv = db.begin().unwrap();
+    kv.put(vec![1, 1, 2, 255, 254], "v")?;
+    kv.put(vec![1, 1, 128, 127, 0], "v")?;
+    kv.put(vec![127, 254], "v")?;
+    kv.put(vec![128, 2], "v")?;
+    kv.put(vec![255, 128, 127, 0, 1], "v")?;
+    kv.commit()?;
+
+    let view = db.view().unwrap();
+    let got: Vec<Vec<u8>> = view
+        .range::<_, _>((
+            std::ops::Bound::Excluded(vec![1, 1, 128, 127, 0]),
+            std::ops::Bound::Excluded(vec![128, 2]),
+        ))
+        .map(|item| item.key().to_vec())
+        .collect();
+    assert_eq!(got, vec![vec![127, 254]]);
+
+    let got_absent_start: Vec<Vec<u8>> = view
+        .range::<_, _>((
+            std::ops::Bound::Excluded(vec![1, 1, 128, 127, 0, 0]),
+            std::ops::Bound::Excluded(vec![128, 2]),
+        ))
+        .map(|item| item.key().to_vec())
+        .collect();
+    assert_eq!(got_absent_start, vec![vec![127, 254]]);
     Ok(())
 }
 

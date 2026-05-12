@@ -1,3 +1,18 @@
+## [0.0.32] 2026-05-12
+### Changes
+- Removed undo replay path and moved transaction handling to abort-aware visibility with redo-only `WalUpdate`
+  - dropped rollback/undo payload fields and rollback replay flow from WAL/recovery paths
+  - added pending abort-clean tracking/state transitions and startup rebuild for unfinished abort cleanup
+  - foreground conflict handling can remove aborted heads before retry while readers always filter aborted versions
+- Implemented `DoubleEndedIterator` for seek/range iterators
+  - added `next_back()` with reverse leaf discovery (`find_prev_leaf` / `find_leaf_for_next_back`) and reverse raw-leaf iteration
+  - ensured mixed `next()` + `next_back()` consumes one shrinking key range with correct include/exclude bound semantics
+  - added cross-node reverse iteration and MVCC visibility regression coverage in `tests/cc.rs`
+- Reworked sibling/history layout from sibling-head chaining to key-local history region references
+  - introduced `HistRef` region descriptors (`page_addr`, `slot`, `count`) for bounded per-key history traversal
+  - updated compact/build paths to persist history regions safely across shared history pages
+  - hardened traversal correctness to avoid cross-key history leakage during history fallback
+
 ## [0.0.31] 2026-04-28
 ### Bug Fixes
 - Deleted incorrect assertionsn

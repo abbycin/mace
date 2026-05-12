@@ -1,7 +1,8 @@
 [package]
 name = "mace-kv"
-version = "0.0.31"
+version = "0.0.32"
 edition = "2024"
+rust-version = "1.95"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
 readme = "README.md"
 homepage = "https://github.com/abbycin/mace"
@@ -21,7 +22,7 @@ rand = "0.10.1"
 log = "0.4.29"
 crossbeam-epoch = "0.9.18"
 parking_lot = "0.12.5"
-btree-store = "0.1"
+btree-store = "0.1.7"
 rustc-hash = "2.1.2"
 
 [target.'cfg(not(windows))'.dependencies]

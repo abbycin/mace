@@ -5,7 +5,7 @@ use crate::{
         refbox::{BoxRef, DeltaView},
         traits::{IBoxHeader, ICodec, IFrameAlloc, IHeader, IKey, IVal},
     },
-    utils::{NULL_ADDR, data::Position},
+    utils::data::Position,
 };
 
 impl DeltaView {
@@ -45,7 +45,7 @@ impl DeltaView {
         };
         k.encode_to(delta.key_mut());
         if !is_remote {
-            Val::encode_inline(delta.val_mut(), NULL_ADDR, v);
+            Val::encode_inline(delta.val_mut(), None, v);
             d.header_mut().lsn = lsn;
             (d, None)
         } else {
@@ -57,7 +57,7 @@ impl DeltaView {
             let mut view = r.view().as_remote();
             view.header_mut().size = vsz;
             v.encode_to(view.raw_mut());
-            Val::encode_remote(delta.val_mut(), NULL_ADDR, view.addr(), v);
+            Val::encode_remote(delta.val_mut(), None, view.addr(), v);
             (d, Some(r))
         }
     }

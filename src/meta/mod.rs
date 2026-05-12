@@ -283,7 +283,7 @@ impl<'a> Txn<'a> {
             // in a single SuperBlock write, significantly reducing I/O overhead
             let res = self.btree.exec_multi(|multi_txn| {
                 for (bucket, bucket_ops) in &self.ops {
-                    multi_txn.execute(bucket, |tree_txn| {
+                    multi_txn.exec(bucket, |tree_txn| {
                         for op in bucket_ops {
                             match op {
                                 MetaOp::Put(k, v) => tree_txn.put(k, v)?,
@@ -633,6 +633,13 @@ impl Manifest {
     pub(crate) fn unload_bucket(&self, name: &str) -> Result<(), OpCode> {
         // serialize deletions and creations
         let _lock = self.structural_lock.lock();
+        let bucket_id = {
+            let meta = self.load_bucket_meta_locked(name)?;
+            meta.bucket_id
+        };
+        if self.buckets.ctx.has_pending_abort_clean_bucket(bucket_id) {
+            return Err(OpCode::Again);
+        }
 
         // remove from maps (unpublish)
         let bucket_id = self.begin_bucket_remove_locked(name, BucketRemoveMode::Drop)?;
@@ -1633,9 +1640,8 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
                 v.push((x.file_id, x.active_size, x.bucket_id));
             }
         }
-        if nr_total > 0 {
+        if let Some(ratio) = ((nr_total - nr_active) * 100).checked_div(nr_total) {
             assert!(!v.is_empty());
-            let ratio = (nr_total - nr_active) * 100 / nr_total;
             if (ratio as usize) < garbage_ratio {
                 v.clear();
             }

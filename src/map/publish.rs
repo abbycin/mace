@@ -172,10 +172,6 @@ impl IFrameAlloc for AllocGuard<'_> {
             .alloc_in(&self.epoch.pages, &self.epoch.bytes, size)
     }
 
-    fn frame_budget(&mut self) -> usize {
-        self.opt.data_file_size
-    }
-
     fn inline_size(&self) -> usize {
         self.opt.inline_size
     }

@@ -1,5 +1,7 @@
 use crossbeam_epoch::Guard;
 use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 
 use crate::OpCode;
 use crate::cc::cc::ConcurrencyControl;
@@ -25,6 +27,89 @@ pub(crate) struct GroupBoot {
     pub checkpoint: Position,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxOutcome {
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AbortCleanTask {
+    pub txid: u64,
+    pub bucket_id: u64,
+    pub group_id: u8,
+    pub tail_lsn: Position,
+    pub pin_file_id: u64,
+    pub state: AbortCleanState,
+    pub quiesced: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AbortCleanState {
+    Pending,
+    WaitingQuiesce,
+}
+
+struct SeqLock {
+    seq: CachePad<AtomicU64>,
+}
+
+struct SeqWriteGuard<'a> {
+    lock: &'a SeqLock,
+}
+
+impl SeqLock {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            seq: CachePad::default(),
+        }
+    }
+
+    #[inline]
+    fn write_lock(&self) -> SeqWriteGuard<'_> {
+        let mut seq = self.seq.load(Relaxed);
+        loop {
+            if seq & 1 == 1 {
+                std::hint::spin_loop();
+                seq = self.seq.load(Relaxed);
+                continue;
+            }
+            match self
+                .seq
+                .compare_exchange_weak(seq, seq + 1, AcqRel, Acquire)
+            {
+                Ok(_) => return SeqWriteGuard { lock: self },
+                Err(actual) => seq = actual,
+            }
+        }
+    }
+
+    #[inline]
+    fn read<T, F>(&self, mut f: F) -> T
+    where
+        F: FnMut() -> T,
+    {
+        loop {
+            let seq1 = self.seq.load(Acquire);
+            if seq1 & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let out = f();
+            let seq2 = self.seq.load(Acquire);
+            if seq1 == seq2 {
+                return out;
+            }
+        }
+    }
+}
+
+impl Drop for SeqWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.seq.fetch_add(1, Release);
+    }
+}
+
 pub struct Context {
     pub(crate) opt: Arc<ParsedOptions>,
     /// maybe a bottleneck
@@ -36,11 +121,25 @@ pub struct Context {
     group_rr: CachePad<AtomicUsize>,
     /// this value is advanced by collect_thread based on active view snapshots
     min_view_txid: Arc<AtomicU64>,
+    tx_outcomes: Vec<RwLock<FxHashMap<u64, TxOutcome>>>,
+    pending_abort_clean: Vec<RwLock<BTreeMap<u64, AbortCleanTask>>>,
+    pending_abort_clean_buckets: Vec<RwLock<FxHashMap<u64, usize>>>,
+    pending_abort_clean_nr: CachePad<AtomicUsize>,
+    pending_abort_clean_floor: CachePad<AtomicU64>,
+    pending_abort_clean_seqlock: SeqLock,
+    abort_clean_events: Arc<Mutex<Vec<u64>>>,
     tx: Sender<()>,
     collector: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Context {
+    const SHARDS: usize = 64;
+    const MASK: usize = Self::SHARDS - 1;
+
+    const fn shard_of(txid: u64) -> usize {
+        (txid as usize) & Self::MASK
+    }
+
     pub fn new(opt: Arc<ParsedOptions>, numerics: Arc<Numerics>, group_boot: &[GroupBoot]) -> Self {
         let cores = opt.concurrent_write as usize;
         let mut groups = Vec::with_capacity(cores);
@@ -74,9 +173,46 @@ impl Context {
             nr_view: CachePad::default(),
             group_rr: CachePad::default(),
             min_view_txid,
+            tx_outcomes: (0..Self::SHARDS)
+                .map(|_| RwLock::new(FxHashMap::default()))
+                .collect(),
+            pending_abort_clean: (0..Self::SHARDS)
+                .map(|_| RwLock::new(BTreeMap::new()))
+                .collect(),
+            pending_abort_clean_buckets: (0..Self::SHARDS)
+                .map(|_| RwLock::new(FxHashMap::default()))
+                .collect(),
+            pending_abort_clean_nr: CachePad::default(),
+            pending_abort_clean_floor: CachePad::from(AtomicU64::new(u64::MAX)),
+            pending_abort_clean_seqlock: SeqLock::new(),
+            abort_clean_events: Arc::new(Mutex::new(Vec::new())),
             tx,
             collector: Mutex::new(Some(collector)),
         }
+    }
+
+    #[inline]
+    fn update_pending_abort_clean_floor(&self, txid: u64) {
+        let mut floor = self.pending_abort_clean_floor.load(Relaxed);
+        while txid < floor {
+            match self
+                .pending_abort_clean_floor
+                .compare_exchange_weak(floor, txid, Relaxed, Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => floor = actual,
+            }
+        }
+    }
+
+    fn recompute_pending_abort_clean_floor(&self) {
+        let mut floor = u64::MAX;
+        for shard in &self.pending_abort_clean {
+            if let Some((txid, _)) = shard.read().first_key_value() {
+                floor = floor.min(*txid);
+            }
+        }
+        self.pending_abort_clean_floor.store(floor, Relaxed);
     }
 
     pub fn oldest_view_txid(&self) -> Option<u64> {
@@ -162,6 +298,158 @@ impl Context {
 
     pub(crate) fn alloc_oracle(&self) -> u64 {
         self.numerics.oracle.fetch_add(1, Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn add_aborted(&self, txid: u64) {
+        let shard = Self::shard_of(txid);
+        self.tx_outcomes[shard]
+            .write()
+            .insert(txid, TxOutcome::Aborted);
+    }
+
+    #[inline]
+    pub(crate) fn del_aborted(&self, txid: u64) {
+        let shard = Self::shard_of(txid);
+        self.tx_outcomes[shard].write().remove(&txid);
+    }
+
+    #[inline]
+    pub(crate) fn get_aborted(&self, txid: u64) -> Option<TxOutcome> {
+        let shard = Self::shard_of(txid);
+        self.tx_outcomes[shard].read().get(&txid).copied()
+    }
+
+    #[inline]
+    pub(crate) fn is_aborted(&self, txid: u64) -> bool {
+        let pending_floor = self
+            .pending_abort_clean_seqlock
+            .read(|| self.pending_abort_clean_floor.load(Relaxed));
+        pending_floor != u64::MAX && txid >= pending_floor
+    }
+
+    #[inline]
+    pub(crate) fn enqueue_abort_clean(
+        &self,
+        txid: u64,
+        bucket_id: u64,
+        group_id: u8,
+        tail_lsn: Position,
+        pin_file_id: u64,
+    ) {
+        let task = AbortCleanTask {
+            txid,
+            bucket_id,
+            group_id,
+            tail_lsn,
+            pin_file_id: pin_file_id.min(tail_lsn.file_id),
+            state: AbortCleanState::Pending,
+            quiesced: false,
+        };
+        let _seq = self.pending_abort_clean_seqlock.write_lock();
+        let shard = Self::shard_of(txid);
+        let old = self.pending_abort_clean[shard].write().insert(txid, task);
+        if old.is_none() {
+            self.pending_abort_clean_nr.fetch_add(1, Relaxed);
+            self.update_pending_abort_clean_floor(txid);
+            let bucket_shard = Self::shard_of(bucket_id);
+            let mut buckets = self.pending_abort_clean_buckets[bucket_shard].write();
+            *buckets.entry(bucket_id).or_insert(0) += 1;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn remove_abort_clean(&self, txid: u64) {
+        let _seq = self.pending_abort_clean_seqlock.write_lock();
+        let shard = Self::shard_of(txid);
+        let old = self.pending_abort_clean[shard].write().remove(&txid);
+        if old.is_some() {
+            self.pending_abort_clean_nr.fetch_sub(1, Relaxed);
+            if self.pending_abort_clean_nr.load(Relaxed) == 0 {
+                self.pending_abort_clean_floor.store(u64::MAX, Relaxed);
+            } else if txid <= self.pending_abort_clean_floor.load(Relaxed) {
+                self.recompute_pending_abort_clean_floor();
+            }
+        }
+    }
+
+    pub(crate) fn abort_clean_tasks(&self) -> Vec<AbortCleanTask> {
+        let mut tasks = Vec::new();
+        for shard in &self.pending_abort_clean {
+            tasks.extend(shard.read().values().copied());
+        }
+        tasks
+    }
+
+    pub(crate) fn mark_abort_clean_wait_quiesce(&self, txid: u64) {
+        let shard = Self::shard_of(txid);
+        if let Some(task) = self.pending_abort_clean[shard].write().get_mut(&txid)
+            && task.state == AbortCleanState::Pending
+        {
+            let bucket_id = task.bucket_id;
+            task.state = AbortCleanState::WaitingQuiesce;
+            task.quiesced = false;
+            let bucket_shard = Self::shard_of(bucket_id);
+            let mut buckets = self.pending_abort_clean_buckets[bucket_shard].write();
+            if let Some(cnt) = buckets.get_mut(&bucket_id) {
+                *cnt -= 1;
+                if *cnt == 0 {
+                    buckets.remove(&bucket_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn mark_abort_clean_quiesced(&self, txid: u64) {
+        let shard = Self::shard_of(txid);
+        if let Some(task) = self.pending_abort_clean[shard].write().get_mut(&txid) {
+            task.quiesced = true;
+        }
+    }
+
+    pub(crate) fn abort_clean_event_sink(&self) -> Arc<Mutex<Vec<u64>>> {
+        self.abort_clean_events.clone()
+    }
+
+    pub(crate) fn drain_abort_clean_events(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.abort_clean_events.lock())
+    }
+
+    pub(crate) fn min_file_id(&self, group_id: u8) -> Option<u64> {
+        let mut min_id = None;
+        for shard in &self.pending_abort_clean {
+            let candidate = shard
+                .read()
+                .values()
+                .filter(|x| x.group_id == group_id)
+                .map(|x| x.pin_file_id)
+                .min();
+            if let Some(candidate) = candidate {
+                min_id = Some(min_id.map_or(candidate, |v: u64| v.min(candidate)));
+            }
+        }
+        min_id
+    }
+
+    #[inline]
+    pub(crate) fn has_pending_abort_clean_bucket(&self, bucket_id: u64) -> bool {
+        let shard = Self::shard_of(bucket_id);
+        self.pending_abort_clean_buckets[shard]
+            .read()
+            .contains_key(&bucket_id)
+    }
+
+    #[inline]
+    pub(crate) fn compact_safe_txid(&self) -> u64 {
+        let safe = self.safe_txid();
+        let pending_floor = self
+            .pending_abort_clean_seqlock
+            .read(|| self.pending_abort_clean_floor.load(Relaxed));
+        if pending_floor == u64::MAX {
+            safe
+        } else {
+            safe.min(pending_floor.saturating_sub(1))
+        }
     }
 
     pub(crate) fn start(&self) {

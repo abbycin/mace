@@ -394,18 +394,6 @@ impl Pool {
     ) {
         let mut junks = structural_junks.clone();
         junks.append(&mut compaction_junks);
-        #[cfg(feature = "extra_check")]
-        {
-            let mut h = std::collections::HashSet::new();
-            for &i in junks.iter() {
-                let x = if crate::types::refbox::RemoteView::is_tagged(i) {
-                    crate::types::refbox::RemoteView::untagged(i)
-                } else {
-                    i
-                };
-                assert!(h.insert(x), "duplicated");
-            }
-        }
         for &raw in &junks {
             let logical = if RemoteView::is_tagged(raw) {
                 RemoteView::untagged(raw)
@@ -501,12 +489,7 @@ impl Pool {
 
         // append current-round junks after inherited lineage
         //
-        // duplicate-free expectation:
-        // - inherited chain for old_base is moved once (take/remove from hot map)
-        // - this round's junks are logical-unique (extra_check above)
-        // - replace/evict publication is single-winner CAS under node lock
-        //
-        // so `RetiredChain.addrs` should not accumulate duplicates in normal flow
+        // duplicates are tolerated here and normalized later in checkpoint snapshot
         inherited.addrs.append(&mut junks);
 
         // phase 5. attach_new_base
@@ -672,6 +655,22 @@ impl Pool {
             .tx
             .send(task)
             .expect("flusher channel disconnected before flush publish");
+    }
+
+    fn checkpoint_and_wait_fresh(&self) {
+        // first wait any existing checkpoint round to finish
+        self.wait_checkpoint();
+        // then force observing at least one completed round after this barrier
+        let mut seen = self.flush_out.load(Acquire);
+        loop {
+            self.checkpoint();
+            self.wait_checkpoint();
+            let now = self.flush_out.load(Acquire);
+            if now > seen {
+                break;
+            }
+            seen = now;
+        }
     }
 
     fn wait_checkpoint(&self) {
@@ -898,6 +897,13 @@ impl BucketContext {
     fn flush_and_wait(&self) {
         self.pool.checkpoint();
         self.pool.wait_checkpoint();
+    }
+
+    pub(crate) fn checkpoint_and_wait(&self) {
+        if self.reclaimed.load(Acquire) {
+            return;
+        }
+        self.pool.checkpoint_and_wait_fresh();
     }
 
     pub(crate) fn checkpoint_before_reclaim(&self) {

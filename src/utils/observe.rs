@@ -50,11 +50,13 @@ pub enum CounterMetric {
     GcBlobRewrite,
     GcDataObsoleteFile,
     GcBlobObsoleteFile,
+    GcAbortCleanCheckpointBucket,
+    GcAbortCleanWalFileOpen,
     FlowFgAdmissionWait,
 }
 
 impl CounterMetric {
-    pub const COUNT: usize = 29;
+    pub const COUNT: usize = 31;
     pub const ALL: [CounterMetric; Self::COUNT] = [
         CounterMetric::TxnBegin,
         CounterMetric::TxnCommit,
@@ -84,6 +86,8 @@ impl CounterMetric {
         CounterMetric::GcBlobRewrite,
         CounterMetric::GcDataObsoleteFile,
         CounterMetric::GcBlobObsoleteFile,
+        CounterMetric::GcAbortCleanCheckpointBucket,
+        CounterMetric::GcAbortCleanWalFileOpen,
         CounterMetric::FlowFgAdmissionWait,
     ];
 

@@ -95,13 +95,9 @@ impl SparseFrontier {
 pub(crate) struct RetiredChain {
     // append-only retired logical addresses carried with a base lineage
     //
-    // expected invariant: no duplicate logical addr inside one chain
-    // why this is valid:
-    // 1) each successful replace/evict moves one old_base lineage exactly once
-    // 2) old_base inheritance uses remove/take semantics from hot retired map
-    // 3) current-round junks are validated as logical-unique under extra_check
-    //
-    // if duplicates show up here, treat it as an upstream invariant violation
+    // duplicates may appear when shared history pages or inherited lineage
+    // contribute the same logical addr more than once
+    // checkpoint snapshot normalizes them before metadata updates
     pub(crate) addrs: Vec<u64>,
     pub(crate) frontier: SparseFrontier,
 }
