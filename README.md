@@ -6,8 +6,6 @@
 
 Mace is a high-performance, embedded key-value storage engine written in Rust. It is designed to combine the predictable read performance of B+ Trees with the high write throughput of LSM Trees.
 
-Built for modern storage hardware, Mace employs a flash-optimized log-structured architecture and implements Key-Value separation (Blob storage) to minimize write amplification and compaction overhead.
-
 ## Key Features
 
 - **Hybrid Performance**: Achieves B+ Tree-like read speeds alongside LSM-Tree-like write performance.
@@ -75,6 +73,7 @@ Mace is engineered for heavy workloads. For detailed performance analysis and co
 | `W6` (100% scan) | 16 / 16 | **4.6x** | 15 / 16 | **0.2x** |
 
 > Note: for `ops` median ratio (`Mace/RocksDB`), larger means higher Mace throughput. For `p99` median ratio (`Mace/RocksDB`), smaller means lower Mace tail latency.
+>
 > Recent complete benchmark results: https://o2c.fun/benchmark.html
 
 ### Test Environment
@@ -98,7 +97,7 @@ Architecture and crash-safety notes are in [docs/design.md](./docs/design.md).
 
 ## Status
 
-`mace` is still pre-1.0. Storage format and APIs can change between minor versions.
+`mace` is not stable yet. Storage format and APIs can change between minor versions.
 
 ## Discussion
 

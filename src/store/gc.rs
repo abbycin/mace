@@ -1284,7 +1284,6 @@ pub(crate) fn vacuum_bucket(
     }
 
     let g = crossbeam_epoch::pin();
-    let bucket_id = bucket_ctx.bucket_id;
     let table = bucket_ctx.table.clone();
     let max_pid = table.len();
     if max_pid == 0 {
@@ -1295,9 +1294,6 @@ pub(crate) fn vacuum_bucket(
 
     for pid in ROOT_PID..max_pid {
         if state.is_deleting() || state.is_drop() {
-            break;
-        }
-        if store.manifest.bucket_metas_by_id.get(&bucket_id).is_none() {
             break;
         }
 
