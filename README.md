@@ -59,18 +59,18 @@ Detailed usage can be found in [examples/demo.rs](./examples/demo.rs).
 
 ## Benchmarks
 
-Mace is engineered for heavy workloads. For detailed performance analysis and comparison with other engines, refer to the [kv_bench](https://github.com/abbycin/kv_bench) repository. The summary below is from `kv_bench`, comparing `Mace 0.0.29` with `RocksDB 10.4.2`.
+Mace is engineered for heavy workloads. For detailed performance analysis and comparison with other engines, refer to the [kv_bench](https://github.com/abbycin/kv_bench) repository. The summary below is from `kv_bench`, comparing `Mace 0.0.33` with `RocksDB 10.4.2`.
 
 ### Benchmark Summary
 
 | Workload | Mace wins (ops) | ops median ratio (Mace/RocksDB) | Mace wins (p99) | p99 median ratio (Mace/RocksDB) |
 |---|---:|---:|---:|--:|
-| `W1` (95R/5U, uniform) | 16 / 16 | **2.3x** | 5 / 16 | **1.0x** |
-| `W2` (95R/5U, zipf) | 16 / 16 | **1.5x** | 11 / 16 | **0.5x** |
-| `W3` (50R/50U) | 15 / 16 | **1.4x** | 9 / 16 | **0.5x** |
-| `W4` (5R/95U) | 12 / 16 | **1.3x** | 7 / 16 | **1.0x** |
-| `W5` (70R/25U/5S) | 15 / 16 | **2.1x** | 16 / 16 | **0.2x** |
-| `W6` (100% scan) | 16 / 16 | **4.6x** | 15 / 16 | **0.2x** |
+| `W1` (95R/5U, uniform) | 11 / 16 | **2.0x** | 7 / 16 | **1.0x** |
+| `W2` (95R/5U, zipf) | 11 / 16 | **1.4x** | 14 / 16 | **0.5x** |
+| `W3` (50R/50U) | 9 / 16 | **1.3x** | 7 / 16 | **1.0x** |
+| `W4` (5R/95U) | 8 / 16 | **1.0x** | 9 / 16 | **0.5x** |
+| `W5` (70R/25U/5S) | 14 / 16 | **1.8x** | 10 / 16 | **0.5x** |
+| `W6` (100% scan) | 15 / 16 | **2.9x** | 14 / 16 | **0.4x** |
 
 > Note: for `ops` median ratio (`Mace/RocksDB`), larger means higher Mace throughput. For `p99` median ratio (`Mace/RocksDB`), smaller means lower Mace tail latency.
 >
@@ -81,7 +81,7 @@ Mace is engineered for heavy workloads. For detailed performance analysis and co
 - OS: openSUSE Tumbleweed
 - CPU: AMD Ryzen 5 3600 (6 cores / 12 threads)
 - Memory: 32 GiB RAM
-- Kernel: Linux `6.19.12-1-default`
+- Kernel: Linux `7.0.10-2-default`
 - Filesystem: `xfs` (`/dev/nvme1n1p4`, mounted at `/nvme`)
 - SSD: ZHITAI TiPlus5000 1TB
 
