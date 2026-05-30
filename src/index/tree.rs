@@ -17,7 +17,7 @@ use crate::{
     types::{
         data::{Index, IntlKey, Key, Ver},
         refbox::BoxRef,
-        traits::{ICodec, IKey, IVal},
+        traits::{ICodec, IKey},
     },
     utils::{NULL_CMD, NULL_PID},
 };
@@ -34,6 +34,13 @@ pub struct ValRef {
     _owner: BoxRef,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct LatestValMeta {
+    pub(crate) ver: Ver,
+    pub(crate) group_id: u8,
+    pub(crate) is_del: bool,
+}
+
 impl ValRef {
     pub(crate) fn new(raw: Record, owner: BoxRef) -> Self {
         Self { raw, _owner: owner }
@@ -47,24 +54,6 @@ impl ValRef {
     /// Converts the reference into a owned Vec<u8>.
     pub fn to_vec(self) -> Vec<u8> {
         self.raw.data().to_vec()
-    }
-
-    pub(crate) fn group_id(&self) -> u8 {
-        self.raw.group_id()
-    }
-
-    pub(crate) fn is_put(&self) -> bool {
-        !self.is_del()
-    }
-
-    pub(crate) fn is_del(&self) -> bool {
-        self.raw.is_tombstone()
-    }
-}
-
-impl Drop for ValRef {
-    fn drop(&mut self) {
-        // explicitly impl Drop here to make sure lifetime chain work
     }
 }
 
@@ -686,18 +675,16 @@ impl Tree {
         Ok(())
     }
 
-    fn link<K, V, F>(
+    fn link<F>(
         &self,
         _g: &Guard,
         page: Page,
-        k: &K,
-        v: &V,
+        k: &Key,
+        v: &Record,
         mut check: F,
     ) -> Result<(), OpCode>
     where
-        K: IKey,
-        V: IVal,
-        F: FnMut(Page, &K) -> Result<(u8, Position), OpCode>,
+        F: FnMut(Page, &Key) -> Result<(u8, Position), OpCode>,
     {
         loop {
             let Some(node) = page.try_lock() else {
@@ -731,11 +718,7 @@ impl Tree {
         }
     }
 
-    fn try_put<K, V>(&self, g: &Guard, key: &K, val: &V) -> Result<(), OpCode>
-    where
-        K: IKey,
-        V: IVal,
-    {
+    fn try_put(&self, g: &Guard, key: &Key, val: &Record) -> Result<(), OpCode> {
         let page = self.find_leaf(g, key.raw())?;
 
         // it never write log, so use default value is always OK
@@ -744,13 +727,9 @@ impl Tree {
     }
 
     /// for non-txn use, such as registry and recovery
-    pub fn put<K, V>(&self, g: &Guard, key: K, val: V) -> Result<(), OpCode>
-    where
-        K: IKey,
-        V: IVal,
-    {
+    pub fn put(&self, g: &Guard, key: Key, val: Record) -> Result<(), OpCode> {
         loop {
-            match self.try_put::<K, V>(g, &key, &val) {
+            match self.try_put(g, &key, &val) {
                 Ok(_) => return Ok(()),
                 Err(OpCode::Again) => {
                     self.store
@@ -765,41 +744,42 @@ impl Tree {
         }
     }
 
-    fn try_update<V, F>(
+    fn try_update<F>(
         &self,
         g: &Guard,
         key: &Key,
-        val: &V,
+        val: &Record,
         visible: &mut F,
-    ) -> Result<Option<ValRef>, OpCode>
+    ) -> Result<Option<LatestValMeta>, OpCode>
     where
-        V: IVal,
-        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, Position), OpCode>,
+        F: FnMut(&Option<LatestValMeta>) -> Result<(u8, Position), OpCode>,
     {
         let page = self.find_leaf(g, key.raw)?;
         let mut r = None;
 
         self.link(g, page, key, val, |pg, k| {
-            let tmp = pg.find_latest(k);
-            // use the full key from input argument and the version from the exists latest one
-            r = tmp.map(|(ver, y, b)| (Key::new(k.raw, ver), ValRef::new(y, b)));
+            let tmp = pg.find_latest_meta(k);
+            r = tmp.map(|meta| LatestValMeta {
+                ver: meta.ver,
+                group_id: meta.group_id,
+                is_del: meta.is_del,
+            });
             visible(&r)
         })?;
 
-        Ok(r.map(|x| x.1))
+        Ok(r)
     }
 
     // NOTE: the `visible` function may be called multiple times
-    pub fn update<V, F>(
+    pub fn update<F>(
         &self,
         g: &Guard,
         key: Key,
-        val: V,
+        val: Record,
         mut visible: F,
-    ) -> Result<Option<ValRef>, OpCode>
+    ) -> Result<Option<LatestValMeta>, OpCode>
     where
-        V: IVal,
-        F: FnMut(&Option<(Key, ValRef)>) -> Result<(u8, Position), OpCode>,
+        F: FnMut(&Option<LatestValMeta>) -> Result<(u8, Position), OpCode>,
     {
         let ksz = key.packed_size();
         if ksz > Options::MAX_KEY_SIZE || ksz + val.packed_size() > Options::MAX_KV_SIZE {

@@ -1,9 +1,8 @@
 use crc32c::Crc32cHasher;
 use crossbeam_epoch::Guard;
-use dashmap::mapref::multiple::RefMulti;
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     hash::Hasher,
     ops::Deref,
     sync::{
@@ -183,6 +182,7 @@ struct Score {
     size: usize,
     rate: f64,
     up2: u64,
+    bucket_id: u64,
 }
 
 impl Score {
@@ -192,29 +192,62 @@ impl Score {
             size: stat.active_size,
             rate: Self::calc_decline_rate(stat, now),
             up2: stat.up2,
+            bucket_id: stat.bucket_id,
         }
     }
 
     fn calc_decline_rate(stat: DataStatInner, now: u64) -> f64 {
         let free = stat.total_size.saturating_sub(stat.active_size);
+        let live = stat.active_elems.max(1);
         // no junk has been applied yet, or
         // it's possible gc and flush thread get same tick
         if free == 0 || stat.up2 == now {
-            return f64::MIN;
+            return f64::INFINITY;
         }
 
-        -(stat.active_size as f64 / free as f64).powi(2)
-            / (stat.total_elems as f64 * (now - stat.up2) as f64)
+        (stat.active_size as f64 / free as f64).powi(2) / (live as f64 * (now - stat.up2) as f64)
+    }
+
+    fn cmp_priority(&self, other: &Self) -> Ordering {
+        self.rate
+            .total_cmp(&other.rate)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlobVictim {
+    file_id: u64,
+    active_size: usize,
+    bucket_id: u64,
+    nr_active: u32,
+    nr_total: u32,
+}
+
+impl BlobVictim {
+    fn from(inner: BlobStatInner) -> Self {
+        Self {
+            file_id: inner.file_id,
+            active_size: inner.active_size,
+            bucket_id: inner.bucket_id,
+            nr_active: inner.nr_active,
+            nr_total: inner.nr_total.max(1),
+        }
+    }
+
+    fn cmp_utilization(&self, other: &Self) -> Ordering {
+        let lhs = self.nr_active as u128 * other.nr_total as u128;
+        let rhs = other.nr_active as u128 * self.nr_total as u128;
+        lhs.cmp(&rhs)
+            .then_with(|| self.nr_active.cmp(&other.nr_active))
+            .then_with(|| self.nr_total.cmp(&other.nr_total))
+            .then_with(|| self.file_id.cmp(&other.file_id))
     }
 }
 
 impl Ord for Score {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match other.rate.partial_cmp(&self.rate) {
-            Some(Ordering::Equal) => self.id.cmp(&other.id),
-            Some(o) => o,
-            None => Ordering::Equal,
-        }
+        self.cmp_priority(other)
     }
 }
 
@@ -821,33 +854,16 @@ impl GarbageCollector {
     }
 
     fn process_blob(&mut self) {
-        let (obsoleted, victims) = self.store.manifest.blob_stat.get_blob_victims(
+        let (obsoleted, victims) = self.collect_blob_candidates(
             self.store.opt.blob_gc_ratio,
             self.store.opt.blob_garbage_ratio,
-            |x| self.store.manifest.is_unsynced_blob_file(x),
         );
 
-        // NOTE: obsoleted blobs may come from different buckets,
-        // but get_victims returns file_ids. We need to find their bucket_ids.
-        for fid in obsoleted {
-            // drop read-lock here, avoid dead-lock
-            let bucket_id = self
-                .store
-                .manifest
-                .blob_stat
-                .read()
-                .get(&fid)
-                .map(|s| s.bucket_id);
-            if let Some(bid) = bucket_id {
-                self.process_obsoleted_blob(&[fid], bid);
-            }
+        for (bucket_id, files) in obsoleted {
+            self.process_obsoleted_blob(&files, bucket_id);
         }
 
-        let mut groups: HashMap<u64, Vec<(u64, usize)>> = HashMap::new();
-        for (fid, sz, bid) in victims {
-            groups.entry(bid).or_default().push((fid, sz));
-        }
-
+        let groups = Self::group_blob_victims_by_bucket(victims);
         for (bucket_id, list) in groups {
             let mut dst_size = 0;
             let mut dst = Vec::new();
@@ -867,94 +883,257 @@ impl GarbageCollector {
         }
     }
 
+    fn collect_blob_candidates(
+        &self,
+        file_ratio: usize,
+        garbage_ratio: usize,
+    ) -> (HashMap<u64, Vec<u64>>, Vec<BlobVictim>) {
+        let lk = self.store.manifest.blob_stat.read();
+        let mut obsoleted = HashMap::<u64, Vec<u64>>::new();
+        let mut candidates = Vec::new();
+
+        for (_, stat) in lk.iter() {
+            if self.store.manifest.is_unsynced_blob_file(stat.file_id) {
+                continue;
+            }
+            if stat.nr_active == 0 {
+                obsoleted
+                    .entry(stat.bucket_id)
+                    .or_default()
+                    .push(stat.file_id);
+            } else {
+                candidates.push(BlobVictim::from(stat.inner));
+            }
+        }
+        drop(lk);
+
+        if candidates.len() < 2 {
+            return (obsoleted, Vec::new());
+        }
+        (
+            obsoleted,
+            Self::select_blob_victims(candidates, file_ratio, garbage_ratio),
+        )
+    }
+
+    fn select_blob_victims(
+        mut candidates: Vec<BlobVictim>,
+        file_ratio: usize,
+        garbage_ratio: usize,
+    ) -> Vec<BlobVictim> {
+        if candidates.len() < 2 {
+            return Vec::new();
+        }
+        candidates.sort_unstable_by(BlobVictim::cmp_utilization);
+        let selected = Self::pick_blob_candidate_count(candidates.len(), file_ratio);
+        if selected < 2 {
+            return Vec::new();
+        }
+        candidates.truncate(selected);
+        if !Self::blob_ratio_gate_passed(&candidates, garbage_ratio) {
+            return Vec::new();
+        }
+        candidates
+    }
+
+    fn blob_ratio_gate_passed(candidates: &[BlobVictim], garbage_ratio: usize) -> bool {
+        let mut nr_total = 0u64;
+        let mut nr_active = 0u64;
+        for c in candidates {
+            nr_total += c.nr_total as u64;
+            nr_active += c.nr_active as u64;
+        }
+        if nr_total == 0 {
+            return false;
+        }
+        let ratio = (nr_total - nr_active) * 100 / nr_total;
+        (ratio as usize) >= garbage_ratio
+    }
+
+    fn pick_blob_candidate_count(total: usize, ratio: usize) -> usize {
+        if total < 2 {
+            return 0;
+        }
+        let ratio = ratio.min(100);
+        if ratio == 0 {
+            return 0;
+        }
+        total.saturating_mul(ratio) / 100
+    }
+
+    fn group_blob_victims_by_bucket(victims: Vec<BlobVictim>) -> Vec<(u64, Vec<(u64, usize)>)> {
+        let mut groups: HashMap<u64, Vec<(u64, usize)>> = HashMap::new();
+        for v in victims {
+            groups
+                .entry(v.bucket_id)
+                .or_default()
+                .push((v.file_id, v.active_size));
+        }
+        let mut out: Vec<(u64, Vec<(u64, usize)>)> = groups.into_iter().collect();
+        out.sort_by_key(|x| x.0);
+        out
+    }
+
     fn process_data(&mut self) {
         let tgt_ratio = self.store.opt.data_garbage_ratio as u64;
         let tgt_size = self.store.opt.data_file_size;
         let eager = self.store.opt.gc_eager;
-
-        let buckets: Vec<u64> = self
-            .store
-            .manifest
-            .data_stat
-            .bucket_files()
-            .iter()
-            .map(|x: RefMulti<'_, u64, Vec<u64>>| *x.key())
-            .collect();
         let tick = self.numerics.next_data_id.load(Relaxed);
+        let mut bucket_usage = HashMap::<u64, (u64, u64)>::new();
+        let mut bucket_obsoleted: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut candidates = Vec::new();
 
-        for bucket_id in buckets {
-            let files: Vec<u64> = match self.store.manifest.data_stat.bucket_files().get(&bucket_id)
-            {
-                Some(f) => f
-                    .value()
-                    .iter()
-                    .filter(|x| !self.store.manifest.is_unsynced_data_file(**x))
-                    .copied()
-                    .collect(),
-                None => continue,
-            };
-
-            let mut total = 0;
-            let mut active = 0;
-            let mut obsoleted = Vec::new();
-            let mut candidates = Vec::new();
-
-            for fid in files {
+        for x in self.store.manifest.data_stat.bucket_files().iter() {
+            let bucket_id = *x.key();
+            for &fid in x.value().iter() {
+                if self.store.manifest.is_unsynced_data_file(fid) {
+                    continue;
+                }
                 if let Some(s) = self.store.manifest.data_stat.get(&fid) {
                     if s.active_elems == 0 {
-                        obsoleted.push(fid);
+                        bucket_obsoleted.entry(bucket_id).or_default().push(fid);
                     } else {
-                        total += s.total_size as u64;
-                        active += s.active_size as u64;
+                        let e = bucket_usage.entry(bucket_id).or_insert((0, 0));
+                        e.0 += s.total_size as u64;
+                        e.1 += s.active_size as u64;
                         // copy the inner value (DataStatInner is Copy)
                         candidates.push(s.inner);
                     }
                 }
             }
+        }
 
-            // fully obsolete files should be reclaimed immediately, independent of ratio gate
-            self.process_obsoleted_data(&obsoleted, bucket_id);
+        // fully obsolete files should be reclaimed immediately, independent of ratio gate
+        for (bucket_id, files) in bucket_obsoleted {
+            self.process_obsoleted_data(&files, bucket_id);
+        }
 
-            if total == 0 {
+        let ranked = Self::rank_data_candidates(candidates, tick);
+        if ranked.is_empty() {
+            return;
+        }
+
+        let plans =
+            Self::plan_data_rewrite_from_global(ranked, &bucket_usage, tgt_ratio, tgt_size, eager);
+        for (bucket_id, victim) in plans {
+            if !self.should_run_data_rewrite_live(bucket_id, tgt_ratio) {
                 continue;
             }
-            let ratio = (total - active) * 100 / total;
-            if ratio < tgt_ratio {
+            self.rewrite_data(victim, bucket_id);
+        }
+    }
+
+    fn plan_data_rewrite_from_global(
+        ranked: Vec<Score>,
+        bucket_usage: &HashMap<u64, (u64, u64)>,
+        tgt_ratio: u64,
+        tgt_size: usize,
+        eager: bool,
+    ) -> Vec<(u64, Vec<Score>)> {
+        let mut by_bucket: HashMap<u64, Vec<Score>> = HashMap::new();
+        for score in ranked {
+            by_bucket.entry(score.bucket_id).or_default().push(score);
+        }
+
+        let mut bucket_ids: Vec<u64> = by_bucket.keys().copied().collect();
+        bucket_ids.sort_unstable();
+        let mut plans = Vec::new();
+        for bucket_id in bucket_ids {
+            let ranked = by_bucket.remove(&bucket_id).unwrap_or_default();
+            if !Self::should_run_data_rewrite_for_bucket(bucket_id, tgt_ratio, bucket_usage) {
                 continue;
             }
-
-            let mut heap = BinaryHeap::new();
-            for s in candidates {
-                let score = Score::from(s, tick);
-                if heap.len() < Self::MAX_ELEMS {
-                    heap.push(score);
-                } else {
-                    let top = heap.peek().unwrap();
-                    if top.cmp(&score).is_gt() {
-                        heap.pop();
-                        heap.push(score);
-                    }
-                }
-            }
-
-            let mut victims = vec![];
-            let mut sum = 0;
-            let mut tmp = Vec::from_iter(heap);
-            let mut rewritten = false;
-            while let Some(x) = tmp.pop() {
-                sum += x.size;
-                victims.push(x);
-
-                if sum >= tgt_size && victims.len() > 1 {
-                    self.rewrite_data(victims.clone(), bucket_id);
-                    rewritten = true;
-                    break;
-                }
-            }
-            if !rewritten && eager && victims.len() > 1 {
-                self.rewrite_data(victims, bucket_id);
+            if let Some(p) = Self::select_data_rewrite_batch_for_bucket(ranked, tgt_size, eager) {
+                plans.push((bucket_id, p));
             }
         }
+        plans
+    }
+
+    fn select_data_rewrite_batch_for_bucket(
+        ranked: Vec<Score>,
+        tgt_size: usize,
+        eager: bool,
+    ) -> Option<Vec<Score>> {
+        let mut current = Vec::new();
+        let mut current_size = 0usize;
+        for s in ranked {
+            current_size += s.size;
+            current.push(s);
+            if current_size >= tgt_size && current.len() > 1 {
+                return Some(current);
+            }
+        }
+        if eager && current.len() > 1 {
+            return Some(current);
+        }
+        None
+    }
+
+    fn rank_data_candidates(candidates: Vec<DataStatInner>, tick: u64) -> Vec<Score> {
+        let mut ranked: Vec<Score> = candidates
+            .into_iter()
+            .map(|s| Score::from(s, tick))
+            .filter(|s| s.rate.is_finite())
+            .collect();
+        ranked.sort_unstable_by(Score::cmp_priority);
+        if ranked.len() > Self::MAX_ELEMS {
+            ranked.truncate(Self::MAX_ELEMS);
+        }
+        ranked
+    }
+
+    fn should_run_data_rewrite(ratio: u64, tgt_ratio: u64) -> bool {
+        ratio >= tgt_ratio
+    }
+
+    fn should_run_data_rewrite_for_bucket(
+        bucket_id: u64,
+        tgt_ratio: u64,
+        bucket_usage: &HashMap<u64, (u64, u64)>,
+    ) -> bool {
+        let Some((total, active)) = bucket_usage.get(&bucket_id).copied() else {
+            return false;
+        };
+        if total == 0 {
+            return false;
+        }
+        let ratio = (total - active) * 100 / total;
+        Self::should_run_data_rewrite(ratio, tgt_ratio)
+    }
+
+    fn should_run_data_rewrite_live(&self, bucket_id: u64, tgt_ratio: u64) -> bool {
+        let Some(ratio) = self.current_bucket_data_ratio(bucket_id) else {
+            return false;
+        };
+        Self::should_run_data_rewrite(ratio, tgt_ratio)
+    }
+
+    fn current_bucket_data_ratio(&self, bucket_id: u64) -> Option<u64> {
+        let files = self
+            .store
+            .manifest
+            .data_stat
+            .bucket_files()
+            .get(&bucket_id)?;
+        let mut total = 0u64;
+        let mut active = 0u64;
+        for &fid in files.value().iter() {
+            if self.store.manifest.is_unsynced_data_file(fid) {
+                continue;
+            }
+            if let Some(s) = self.store.manifest.data_stat.get(&fid) {
+                if s.active_elems == 0 {
+                    continue;
+                }
+                total += s.total_size as u64;
+                active += s.active_size as u64;
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+        Some((total - active) * 100 / total)
     }
 
     fn rewrite_data(&mut self, candidate: Vec<Score>, bucket_id: u64) {
@@ -1473,8 +1652,7 @@ impl<'a> BlobRewriter<'a> {
         let block = Block::alloc(4 << 20);
         let buf = block.mut_slice(0, block.len());
 
-        #[cfg(feature = "extra_check")]
-        assert!(self.items.is_sorted_by_key(|x| x.id));
+        self.items.sort_unstable_by_key(|x| x.id);
 
         let mut beg = u64::MAX;
         let mut end = u64::MIN;

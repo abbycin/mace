@@ -5,8 +5,6 @@
 Production-validation-related scripts currently under `scripts/`:
 
 - `prod_test.sh`: correctness and crash-recovery test orchestration (`fast` / `stress` / `chaos` / `all`)
-- `perf_gate.sh`: performance snapshot and regression gate (`snapshot` / `compare`)
-- `perf_thresholds.env`: default template for performance gate thresholds and quick benchmark knobs
 
 ---
 
@@ -56,76 +54,7 @@ Examples:
 
 ---
 
-## 2) `perf_gate.sh`
-
-### Purpose
-
-Provides baseline sampling and regression gating:
-
-- `snapshot`: capture performance snapshot for current branch only
-- `compare`: compare current branch against a baseline (default `origin/master`) and enforce threshold rules
-
-### Basic Usage
-
-```bash
-./scripts/perf_gate.sh snapshot
-./scripts/perf_gate.sh compare
-```
-
-### Key Environment Variables
-
-- `MACE_PERF_THRESHOLD_FILE`: threshold file, default `scripts/perf_thresholds.env`
-- `MACE_PERF_BASE_REF`: baseline ref, default `origin/master`
-- `MACE_PERF_BENCH_ARGS`: arguments forwarded to Criterion
-- `MACE_PERF_COMPARE_FILTERS`: case filters for compare mode (comma-separated)
-- `MACE_PERF_REGRESS_PCT`: per-case regression threshold (%)
-- `MACE_PERF_MAX_REGRESS_CASES`: max allowed regressed case count
-- `MACE_PERF_MIN_COMPARE_CASES`: minimum valid comparable case count
-- `MACE_PERF_MIN_BASE_NS`: ignores ultra-small baseline noise
-
-### Outputs and Metric Definitions
-
-Default output directory: `target/perf_gate`
-
-Common files:
-
-- `base_summary.json` / `head_summary.json`
-- `head_snapshot.json`
-- `base.bench.log` / `head.bench.log` / `snapshot.bench.log`
-
-Core metric fields:
-
-- `median_ns`: Criterion median point estimate in nanoseconds (lower is better)
-- `mean_ns`: Criterion mean point estimate in nanoseconds (lower is better)
-- `delta_pct` (from compare output):
-  - formula: `(head - base) / base * 100%`
-  - positive means slower, negative means faster
-
-Gate rule:
-
-- compare fails when count of cases with `delta_pct > MACE_PERF_REGRESS_PCT` is greater than `MACE_PERF_MAX_REGRESS_CASES`.
-
----
-
-## 3) `perf_thresholds.env`
-
-### Purpose
-
-Central place for default perf gate and quick benchmark parameters, reused locally and in CI.
-
-### Maintenance Recommendations
-
-- First run 3–5 rounds on target production-equivalent hardware to establish a stable baseline
-- Then tighten:
-  - `MACE_PERF_REGRESS_PCT`
-  - `MACE_PERF_MAX_REGRESS_CASES`
-  - `MACE_PERF_COMPARE_FILTERS`
-- If CI noise is high, start with looser thresholds and narrower case filters, then tighten gradually
-
----
-
 ## CI Mapping
 
 - `.github/workflows/ci.yml`
   - `test-prod-all`: `./scripts/prod_test.sh all 8`
-  - `perf-regression`: `./scripts/perf_gate.sh compare`

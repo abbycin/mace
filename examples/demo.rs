@@ -18,8 +18,8 @@ fn main() -> Result<(), OpCode> {
     assert_eq!(r.unwrap(), OpCode::AbortTx);
 
     // use `update` for exist key or use `upsert` when unsure
-    let r = kv.update("foolish", "114514").unwrap();
-    assert_eq!(r.slice(), "elder".as_bytes());
+    let r = kv.update("foolish", "114514");
+    assert!(r.is_ok());
 
     let r = kv.get("foo")?;
     assert_eq!(r.slice(), "bar".as_bytes());

@@ -41,9 +41,8 @@ fn put_get() -> Result<(), OpCode> {
             barrier.wait();
             for i in &elems {
                 let kv = db.begin().unwrap();
-                if let Ok(x) = kv.del(i) {
-                    assert_eq!(x.slice(), i.as_bytes());
-                    del1.write().unwrap().insert(x.slice().to_vec());
+                if kv.del(i).is_ok() {
+                    del1.write().unwrap().insert(i.as_bytes().to_vec());
                 }
                 kv.commit().unwrap();
             }
@@ -53,9 +52,8 @@ fn put_get() -> Result<(), OpCode> {
             barrier.wait();
             for i in &elems {
                 let kv = db.begin().unwrap();
-                if let Ok(x) = kv.del(i) {
-                    assert_eq!(x.slice(), i.as_bytes());
-                    del2.write().unwrap().insert(x.slice().to_vec());
+                if kv.del(i).is_ok() {
+                    del2.write().unwrap().insert(i.as_bytes().to_vec());
                 }
                 kv.commit().unwrap();
             }
@@ -370,8 +368,7 @@ fn rollback_delete_restores_committed_value() -> Result<(), OpCode> {
 
     {
         let txn = db.begin()?;
-        let deleted = txn.del("k")?;
-        assert_eq!(deleted.slice(), b"base");
+        txn.del("k")?;
     }
 
     let view = db.view()?;

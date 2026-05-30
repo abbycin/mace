@@ -295,12 +295,17 @@ Abort-aware write path:
 - `WalUpdate` is redo-only:
   - insert/update log the new value image.
   - delete logs only the tombstone operation, not the deleted value image.
+- foreground conflict checks for `put/update/upsert/del` are metadata-only:
+  - write path reads latest `(txid, group_id, tombstone)` via `find_latest_meta`.
+  - old value bytes are not loaded for conflict resolution.
 - foreground write conflict resolution is abort-aware:
   - if the latest conflicting version belongs to an aborted txn, foreground retry may remove an
     aborted head and retry instead of treating it as a committed conflict.
   - if the latest conflicting version is active or committed-invisible, the txn aborts by SI rules.
 - aborted versions may remain physically present on pages until foreground retry or background
   abort-clean compacts them away; visibility rules must hide them during that interval.
+- `TxnKV::update`, `TxnKV::upsert`, and `TxnKV::del` return operation status only.
+  callers that need old value must read it explicitly before mutation.
 
 WAL payload semantics:
 
@@ -357,6 +362,21 @@ GC thread (`gc_timeout` periodic + manual trigger):
 3. `process_pending_buckets` (physical cleanup for `pending_del`)
 4. `scavenge` (bounded in-memory page compaction)
 5. `delete_files` (idempotent obsolete file unlink + metadata ack)
+
+Victim selection policy:
+
+- fully obsolete data/blob files are reclaimed immediately, independent of rewrite ratio gates.
+- blob rewrite candidates:
+  - sampled from non-obsolete, synced files only.
+  - sorted by utilization (`nr_active / nr_total`) ascending, then truncated by `blob_gc_ratio`.
+  - rewrite runs only when sampled garbage ratio passes `blob_garbage_ratio`, and each rewrite
+    batch still requires at least 2 files.
+- data rewrite candidates:
+  - globally ranked by decline score and capped by `MAX_ELEMS`.
+  - rewrite plans are executed per bucket only when live bucket garbage ratio still exceeds
+    `data_garbage_ratio`.
+  - each bucket batch requires at least 2 files and normally waits for cumulative active bytes to
+    reach `data_file_size` (or `gc_eager` short-circuits size threshold).
 
 Abort-clean:
 
@@ -455,6 +475,4 @@ Invariant-break consequences to watch for:
 ## Operational validation
 
 - `./scripts/prod_test.sh fast|stress|chaos|all`
-- `./scripts/perf_gate.sh snapshot|compare`
-- tuning defaults in `scripts/perf_thresholds.env`
 - CI wiring in `.github/workflows/ci.yml`

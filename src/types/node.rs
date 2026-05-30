@@ -34,6 +34,13 @@ pub(crate) enum MergeOp {
     MarkParent(u64),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct LatestMeta {
+    pub(crate) ver: Ver,
+    pub(crate) group_id: u8,
+    pub(crate) is_del: bool,
+}
+
 pub(crate) struct NodeState {
     addr: u64,
     total_size: usize,
@@ -100,7 +107,6 @@ where
             }),
             inner: base,
         };
-        this.pin_leaf_pages_unchecked();
         this
     }
 
@@ -120,7 +126,6 @@ where
             inner: BaseView::null(),
         };
         Self::load_inner(&mut l, d)?;
-        l.try_pin_leaf_pages()?;
         Ok(l)
     }
 
@@ -147,7 +152,6 @@ where
             }),
             inner: self.inner,
         };
-        this.pin_leaf_pages_unchecked();
         this
     }
 
@@ -793,13 +797,45 @@ where
             },
         );
 
-        if let Some(res) = result {
-            return Some(res);
+        if result.is_some() {
+            return result;
         }
 
         self.search_sst(key).map(|(k, v)| {
             let (v, r) = v.get_record(&self.loader, true);
             (k.ver, v, r.unwrap_or_else(|| self.base_box()))
+        })
+    }
+
+    pub(crate) fn find_latest_meta(&self, key: &Key) -> Option<LatestMeta> {
+        debug_assert!(!self.inner.header().is_index);
+        let mut result = None;
+        self.visit_versions(
+            *key,
+            |x, y| Key::decode_from(x.key()).cmp(y),
+            |x| {
+                let k = Key::decode_from(x.key());
+                if k.raw() == key.raw() {
+                    let v = x.val();
+                    result = Some(LatestMeta {
+                        ver: k.ver,
+                        group_id: v.group_id(),
+                        is_del: v.is_tombstone(),
+                    });
+                    return true;
+                }
+                false
+            },
+        );
+
+        if result.is_some() {
+            return result;
+        }
+
+        self.search_sst(key).map(|(k, v)| LatestMeta {
+            ver: k.ver,
+            group_id: v.group_id(),
+            is_del: v.is_tombstone(),
         })
     }
 
@@ -858,27 +894,6 @@ where
 
     pub(crate) fn box_header(&self) -> &BoxHeader {
         self.inner.box_header()
-    }
-
-    fn try_pin_leaf_pages(&self) -> Result<(), OpCode> {
-        if self.box_header().node_type != NodeType::Leaf {
-            return Ok(());
-        }
-        let mut siblings = Vec::new();
-        if self.inner.load_sibling_heads_hint(&mut siblings) {
-            for mut addr in siblings {
-                while addr != NULL_ADDR {
-                    let p = self.loader.load(addr)?;
-                    addr = p.link;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn pin_leaf_pages_unchecked(&self) {
-        self.try_pin_leaf_pages().expect("must exist")
     }
 
     pub(crate) fn delta_len(&self) -> usize {
@@ -1631,7 +1646,7 @@ mod test {
     use std::{
         collections::HashMap,
         rc::Rc,
-        sync::atomic::{AtomicU64, Ordering::Relaxed},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
     };
 
     use crate::{
@@ -1648,6 +1663,7 @@ mod test {
     struct AInner {
         map: Mutex<HashMap<u64, BoxRef>>,
         off: AtomicU64,
+        remote_loads: AtomicUsize,
     }
 
     #[derive(Clone)]
@@ -1661,6 +1677,7 @@ mod test {
                 inner: Rc::new(AInner {
                     map: Mutex::new(HashMap::new()),
                     off: AtomicU64::new(0),
+                    remote_loads: AtomicUsize::new(0),
                 }),
             }
         }
@@ -1707,8 +1724,42 @@ mod test {
         }
 
         fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
+            self.inner.remote_loads.fetch_add(1, Relaxed);
             Ok(self.load(addr))
         }
+    }
+
+    #[test]
+    fn find_latest_meta_skips_remote_value_load() {
+        let mut a = A::new();
+        let l = a.clone();
+        let node = Node::new_leaf(&mut a, l.clone(), 0, Position::MIN);
+        let key = Key::new("blob".as_bytes(), Ver::new(1, 1));
+        let value = vec![7u8; Options::MIN_INLINE_SIZE + 16];
+        let record = Record::normal(1, &value);
+        let (delta, remote) = DeltaView::from_key_val(&mut a, &key, &record, 0, Position::MIN);
+        node.insert_inplace(
+            delta.view().as_delta(),
+            remote
+                .as_ref()
+                .map(|x| x.header().total_size as usize)
+                .unwrap_or(0),
+        );
+        node.save(delta, remote);
+        let (node, _) = node.compact(&mut a, 1);
+
+        a.inner.remote_loads.store(0, Relaxed);
+        let meta = node
+            .find_latest_meta(&key)
+            .expect("latest meta should exist");
+        assert_eq!(meta.ver, *key.ver());
+        assert_eq!(meta.group_id, 1);
+        assert!(!meta.is_del);
+        assert_eq!(a.inner.remote_loads.load(Relaxed), 0);
+
+        let latest = node.find_latest(&key).expect("latest value should exist");
+        assert_eq!(latest.1.data(), value.as_slice());
+        assert_eq!(a.inner.remote_loads.load(Relaxed), 1);
     }
 
     #[test]

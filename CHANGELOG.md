@@ -1,3 +1,8 @@
+## [0.0.33] 2026-05-30
+### Changes
+- Refactored transaction write path to metadata-only visibility checks
+- Align GC victim selection and gates with intended semantics
+
 ## [0.0.32] 2026-05-12
 ### Changes
 - Removed undo replay path and moved transaction handling to abort-aware visibility with redo-only `WalUpdate`

@@ -1611,44 +1611,6 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
         Ok(stat.mask.as_ref().expect("mask loaded").clone())
     }
 
-    pub(crate) fn get_blob_victims<F: Fn(u64) -> bool>(
-        &self,
-        file_ratio: usize,
-        garbage_ratio: usize,
-        filter_out: F,
-    ) -> (Vec<u64>, Vec<(u64, usize, u64)>) {
-        let lk = self.map.read();
-        let n = lk.len() * file_ratio / 100;
-        let mut v = Vec::new();
-        let mut o = Vec::new();
-        let mut nr_total = 0;
-        let mut nr_active = 0;
-
-        // always collect fully obsolete blob files, regardless of victim sampling ratio
-        for (_, x) in lk.iter() {
-            if x.nr_active == 0 && !filter_out(x.file_id) {
-                o.push(x.file_id);
-            }
-        }
-
-        for (_, x) in lk.iter().take(n) {
-            if x.nr_active == 0 {
-                continue;
-            } else if !filter_out(x.file_id) {
-                nr_total += x.nr_total;
-                nr_active += x.nr_active;
-                v.push((x.file_id, x.active_size, x.bucket_id));
-            }
-        }
-        if let Some(ratio) = ((nr_total - nr_active) * 100).checked_div(nr_total) {
-            assert!(!v.is_empty());
-            if (ratio as usize) < garbage_ratio {
-                v.clear();
-            }
-        }
-        (o, v)
-    }
-
     pub(crate) fn remove_stat_interval(&self, blobs: &[u64]) {
         let mut lk_map = self.map.write();
         for x in blobs {

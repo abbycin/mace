@@ -170,8 +170,7 @@ fn aborted_delete_head_allows_followup_update() {
     let (mut s1, mut s2, mut s3, _e) = prelude!(1, 2, 3);
 
     s1.begin();
-    let old = s1.del("1").unwrap();
-    assert_eq!(old.as_slice(), "10".as_bytes());
+    s1.del("1").unwrap();
     s1.rollback();
 
     s2.begin();
@@ -727,8 +726,11 @@ impl Session {
         let (k, v) = (SyncPtr::from(k.as_ref()), SyncPtr::from(v.as_ref()));
         let mut rv = None;
         self.cond.set_fn(Closure::new(|| {
-            let r = kv.update(k.data(), v.data());
-            rv = Some(r.map(|x| x.slice().to_vec()));
+            let r = kv
+                .get(k.data())
+                .map(|x| x.slice().to_vec())
+                .and_then(|old| kv.update(k.data(), v.data()).map(|_| old));
+            rv = Some(r);
         }));
         self.sync();
         rv.unwrap()
@@ -751,11 +753,13 @@ impl Session {
 
         self.cond.set_fn(Closure::new(|| {
             let r = if is_del {
-                kv.del(k.data())
-            } else {
                 kv.get(k.data())
+                    .map(|x| x.slice().to_vec())
+                    .and_then(|old| kv.del(k.data()).map(|_| old))
+            } else {
+                kv.get(k.data()).map(|x| x.slice().to_vec())
             };
-            v = Some(r.map(|x| x.slice().to_vec()));
+            v = Some(r);
         }));
         self.sync();
         v.unwrap()

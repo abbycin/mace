@@ -74,7 +74,7 @@ pub struct Options {
     pub blob_file_size: usize,
     /// Trigger blob GC when the garbage ratio exceeds this value, in the range \[0, 100\].
     pub blob_garbage_ratio: usize,
-    /// At each blob GC cycle, pick the oldest [`Self::blob_gc_ratio`]% of blob files as candidates.
+    /// At each blob GC cycle, pick the lowest-utilization [`Self::blob_gc_ratio`]% of blob files as candidates.
     pub blob_gc_ratio: usize,
     /// Whether this is temporary storage.
     ///

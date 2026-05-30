@@ -1,9 +1,9 @@
 use crate::{
     types::{
-        data::Val,
+        data::{Record, Val},
         header::{DeltaHeader, NodeType, RemoteHeader, TagKind},
         refbox::{BoxRef, DeltaView},
-        traits::{IBoxHeader, ICodec, IFrameAlloc, IHeader, IKey, IVal},
+        traits::{IBoxHeader, ICodec, IFrameAlloc, IHeader, IKey},
     },
     utils::data::Position,
 };
@@ -11,10 +11,10 @@ use crate::{
 impl DeltaView {
     pub(crate) const HDR_LEN: usize = size_of::<DeltaHeader>();
 
-    pub(crate) fn from_key_val<A: IFrameAlloc, K: IKey, V: IVal>(
+    pub(crate) fn from_key_val<A: IFrameAlloc, K: IKey>(
         a: &mut A,
         k: &K,
-        v: &V,
+        v: &Record,
         group: u8,
         lsn: Position,
     ) -> (BoxRef, Option<BoxRef>) {

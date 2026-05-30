@@ -538,7 +538,7 @@ impl<'a> Val<'a> {
             }
     }
 
-    pub fn encode_inline<V: IVal>(dst: &mut [u8], hist: Option<HistRef>, v: &V) {
+    pub fn encode_inline(dst: &mut [u8], hist: Option<HistRef>, v: &Record) {
         dst[0] = v.is_tombstone() as u8;
         dst[1] = v.group_id();
         let mut off = Self::HDR_LEN + Self::GID_LEN;
@@ -556,7 +556,7 @@ impl<'a> Val<'a> {
         v.encode_to(&mut dst[off..]);
     }
 
-    pub fn encode_remote<V: IVal>(dst: &mut [u8], hist: Option<HistRef>, remote: u64, v: &V) {
+    pub fn encode_remote(dst: &mut [u8], hist: Option<HistRef>, remote: u64, v: &Record) {
         dst[0] = v.is_tombstone() as u8;
         dst[0] |= Self::REMOTE_BIT;
         dst[1] = v.group_id();
@@ -717,10 +717,6 @@ impl IDecode for Record {
 impl IVal for Record {
     fn is_tombstone(&self) -> bool {
         self.data.is_empty()
-    }
-
-    fn group_id(&self) -> u8 {
-        self.group_id
     }
 }
 

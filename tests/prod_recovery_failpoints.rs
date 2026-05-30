@@ -94,6 +94,33 @@ fn child_setup_gc(db_root: &Path) -> (Mace, Bucket) {
     (mace, bucket)
 }
 
+fn child_setup_data_gc(db_root: &Path) -> (Mace, Bucket) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 16 << 10;
+        opt.wal_buffer_size = 1 << 20;
+        opt.wal_file_size = 1 << 20;
+        opt.gc_timeout = 20;
+        opt.gc_eager = true;
+        // keep data rewrite gate always open in this failpoint harness
+        // the test target here is crash-window closure after entering rewrite path
+        opt.data_garbage_ratio = 0;
+        opt.inline_size = 256;
+        opt.blob_garbage_ratio = 1;
+        opt.blob_gc_ratio = 100;
+        opt.blob_file_size = 128 << 10;
+    });
+
+    let bucket = match mace.get_bucket("prod") {
+        Ok(bucket) => bucket,
+        Err(OpCode::NotFound) => mace.new_bucket("prod").expect("create prod bucket failed"),
+        Err(err) => panic!("open prod bucket failed: {err:?}"),
+    };
+
+    (mace, bucket)
+}
+
 fn child_setup_retire(db_root: &Path) -> (Mace, Bucket) {
     let mace = open_with_tune(db_root, |opt| {
         opt.sync_on_write = true;
@@ -528,9 +555,9 @@ fn child_case_txn_commit_abort_window(db_root: &Path) -> ! {
 }
 
 fn child_case_gc_data_before_meta_commit(db_root: &Path) -> ! {
-    let (mace, bucket) = child_setup_gc(db_root);
+    let (mace, bucket) = child_setup_data_gc(db_root);
     seed_committed_and_uncommitted(&bucket, 64, 0);
-    drive_gc_pressure(&bucket, 64);
+    drive_gc_pressure(&bucket, 256);
     mace.sync().expect("sync before data gc failed");
     wait_for_data_dir_quiet(db_root, Duration::from_millis(300), Duration::from_secs(20));
 

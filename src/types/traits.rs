@@ -79,10 +79,6 @@ pub trait IKeyCodec: ICodec {
 
 pub trait IVal: ICodec + Clone {
     fn is_tombstone(&self) -> bool;
-
-    fn group_id(&self) -> u8 {
-        unimplemented!()
-    }
 }
 
 pub trait IAsSlice: Sized {

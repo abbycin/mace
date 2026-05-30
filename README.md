@@ -88,7 +88,6 @@ Mace is engineered for heavy workloads. For detailed performance analysis and co
 ## Validation
 
 - Correctness/crash matrix: `./scripts/prod_test.sh all 8`
-- Perf regression gate: `./scripts/perf_gate.sh compare`
 - Script details: [scripts/README.md](./scripts/README.md)
 
 ## Design Notes
