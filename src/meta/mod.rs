@@ -33,7 +33,7 @@ use crate::{
     utils::{
         Handle, MutRef, OpCode,
         bitmap::BitMap,
-        data::{GroupPositions, LenSeq, Position, Reloc, init_group_pos},
+        data::{AddrPair, GroupPositions, LenSeq, Position, Reloc, init_group_pos},
         interval::IntervalMap,
         lru::{Lru, ShardLru},
         observe::{CounterMetric, EventKind, ObserveEvent},
@@ -324,24 +324,34 @@ impl<'a> Txn<'a> {
 
 struct FileReader {
     file: File,
-    map: HashMap<u64, Reloc>,
+    relocs: Box<[AddrPair]>,
 }
 
 fn new_reader<T: IFooter>(path: PathBuf) -> Result<Arc<FileReader>, OpCode> {
     let mut loader = MetaReader::<T>::new(&path).expect("not such path");
     let relocs = loader.get_reloc().expect("must exist");
-    let mut map = HashMap::with_capacity(relocs.len());
-    for x in relocs {
-        map.insert(x.key, x.val);
-    }
-
+    let relocs = {
+        #[cfg(feature = "extra_check")]
+        for w in relocs.windows(2) {
+            let prev = w[0].key;
+            let next = w[1].key;
+            debug_assert!(prev <= next, "reloc table must be sorted by addr");
+        }
+        relocs
+    };
     let file = loader.take();
-    Ok(Arc::new(FileReader { file, map }))
+    Ok(Arc::new(FileReader { file, relocs }))
 }
 
 impl FileReader {
+    #[inline]
+    fn find_reloc(&self, pos: u64) -> Option<Reloc> {
+        let idx = self.relocs.binary_search_by_key(&pos, |x| x.key).ok()?;
+        Some(self.relocs[idx].val)
+    }
+
     fn read_at(&self, pos: u64) -> Result<BoxRef, OpCode> {
-        let m = self.map.get(&pos).expect("can't find addr in reloc");
+        let m = self.find_reloc(pos).expect("can't find addr in reloc");
         let real_size = BoxRef::real_size_from_dump(m.len);
         let mut p = BoxRef::alloc_exact(real_size, pos);
         let mut crc = Crc32cHasher::default();
@@ -1213,7 +1223,7 @@ where
     fn try_get_reloc(&self, file_id: u64, pos: u64) -> Option<Reloc> {
         loop {
             if let Some(reader) = self.common.cache.get(file_id).map(|x| x.clone()) {
-                return reader.map.get(&pos).copied();
+                return reader.find_reloc(pos);
             }
 
             let lk = self.common.cache.lock_shard(file_id);

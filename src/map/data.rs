@@ -12,7 +12,6 @@ use crate::types::header::{NodeType, TagFlag, TagKind};
 use crate::types::refbox::{BaseView, BoxRef, RemoteView};
 use crate::types::traits::{IAsSlice, IHeader};
 use crate::utils::bitmap::BitMap;
-use crate::utils::block::Block;
 use crate::utils::data::{AddrPair, GatherWriter, GroupPositions, Interval};
 use crate::utils::{MutRef, NULL_ADDR};
 use crate::utils::{NULL_PID, OpCode};
@@ -21,6 +20,7 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::hash::BuildHasherDefault;
 use std::hash::Hasher;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
@@ -949,8 +949,6 @@ impl FileBuilder {
 
 pub(crate) struct MetaReader<T: IFooter> {
     file: File,
-    ivl_buf: Option<Block>,
-    reloc_buf: Option<Block>,
     footer: T,
     end: u64,
 }
@@ -980,52 +978,31 @@ where
         file.read(tmp, end - T::LEN as u64)
             .map_err(|_| OpCode::IoError)?;
 
-        Ok(Self {
-            file,
-            ivl_buf: None,
-            reloc_buf: None,
-            footer,
-            end,
-        })
+        Ok(Self { file, footer, end })
     }
 
-    pub(crate) fn get_reloc<'a>(&mut self) -> Result<&'a [AddrPair], OpCode> {
-        if let Some(b) = self.reloc_buf.as_ref() {
-            return Ok(b.slice(0, self.footer.nr_reloc()));
-        }
+    pub(crate) fn get_reloc(&mut self) -> Result<Box<[AddrPair]>, OpCode> {
         let len = self.footer.reloc_len();
-        self.reloc_buf = Some(Block::alloc(len));
-        let s = self.reloc_buf.as_ref().unwrap().mut_slice(0, len);
         self.read_meta(
-            s,
             self.end - (len + T::LEN) as u64,
             self.footer.nr_reloc(),
             self.footer.reloc_crc(),
         )
     }
 
-    pub(crate) fn get_interval<'a>(&mut self) -> Result<&'a [Interval], OpCode> {
-        if let Some(b) = self.ivl_buf.as_ref() {
-            return Ok(b.slice(0, self.footer.nr_interval()));
-        }
+    pub(crate) fn get_interval(&mut self) -> Result<Box<[Interval]>, OpCode> {
         let len = self.footer.interval_len();
-        self.ivl_buf = Some(Block::alloc(len));
-        let s = self.ivl_buf.as_ref().unwrap().mut_slice(0, len);
         self.read_meta(
-            s,
             self.end - (len + self.footer.reloc_len() + T::LEN) as u64,
             self.footer.nr_interval(),
             self.footer.interval_crc(),
         )
     }
 
-    fn read_meta<'a, U>(
-        &self,
-        dst: &mut [u8],
-        off: u64,
-        count: usize,
-        crc: u32,
-    ) -> Result<&'a [U], OpCode> {
+    fn read_meta<U>(&self, off: u64, count: usize, crc: u32) -> Result<Box<[U]>, OpCode> {
+        let len = size_of::<U>().checked_mul(count).ok_or(OpCode::NoSpace)?;
+        let mut data = Box::<[MaybeUninit<U>]>::new_uninit_slice(count);
+        let dst = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), len) };
         self.file.read(dst, off).map_err(|_| OpCode::IoError)?;
         let mut h = Crc32cHasher::default();
         h.write(dst);
@@ -1034,7 +1011,8 @@ where
             log::error!("checksum mismatch, expect {} get {}", crc, actual_crc);
             return Err(OpCode::Corruption);
         }
-        Ok(unsafe { std::slice::from_raw_parts(dst.as_ptr().cast::<U>(), count) })
+        let p = Box::into_raw(data) as *mut [U];
+        Ok(unsafe { Box::from_raw(p) })
     }
 
     pub(crate) fn take(self) -> File {

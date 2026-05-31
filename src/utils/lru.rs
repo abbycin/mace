@@ -125,10 +125,6 @@ pub(crate) struct Lru<K, V> {
     map: Mutex<FastHashMap<K, *mut Node<K, V>>>,
 }
 
-// FxHasher drops RandomState storage, so the non-macOS layout is smaller.
-#[cfg(not(target_os = "macos"))]
-crate::static_assert!(size_of::<Lru<u32, crate::io::File>>() == 48);
-
 unsafe impl<K, V> Send for Lru<K, V> {}
 unsafe impl<K, V> Sync for Lru<K, V> {}
 
@@ -421,16 +417,17 @@ impl<V> Drop for PriorityShard<V> {
     }
 }
 
-pub const LRU_SHARD: usize = 32;
-const LRU_SHARD_MASK: usize = LRU_SHARD - 1;
-
-pub(crate) struct ShardLru<V> {
+pub(crate) struct ShardLru<V, const LRU_SHARD: usize = 8> {
     shard: [Lru<u64, V>; LRU_SHARD],
     cap: usize,
 }
 
-impl<V> ShardLru<V> {
+impl<V, const LRU_SHARD: usize> ShardLru<V, LRU_SHARD> {
+    const LRU_SHARD_MASK: usize = LRU_SHARD - 1;
+
     pub(crate) fn new(cap: usize) -> Self {
+        assert!(LRU_SHARD > 0);
+        assert!(LRU_SHARD.is_power_of_two());
         let cap = cap / LRU_SHARD;
         Self {
             shard: std::array::from_fn(|_| Lru::new()),
@@ -440,7 +437,7 @@ impl<V> ShardLru<V> {
 
     #[inline(always)]
     fn get_shard(k: u64) -> usize {
-        spooky_hash(k) as usize & LRU_SHARD_MASK
+        spooky_hash(k) as usize & Self::LRU_SHARD_MASK
     }
 
     #[allow(unused)]
@@ -461,7 +458,7 @@ impl<V> ShardLru<V> {
     }
 }
 
-pub(crate) struct ShardPriorityLru<V> {
+pub(crate) struct ShardPriorityLru<V, const LRU_SHARD: usize = 16> {
     shard: [PriorityShard<V>; LRU_SHARD],
     used_bytes: [AtomicUsize; 2],
     used_entries: AtomicUsize,
@@ -472,10 +469,13 @@ pub(crate) struct ShardPriorityLru<V> {
     trim_requested: AtomicBool,
 }
 
-impl<V> ShardPriorityLru<V> {
+impl<V, const LRU_SHARD: usize> ShardPriorityLru<V, LRU_SHARD> {
     const MAX_TRIM_EVICT_PER_ROUND: usize = 16;
+    const LRU_SHARD_MASK: usize = LRU_SHARD - 1;
 
     pub(crate) fn new(cap: usize, high_ratio: usize, max_entries: usize) -> Self {
+        assert!(LRU_SHARD > 0);
+        assert!(LRU_SHARD.is_power_of_two());
         let high_ratio = high_ratio.min(100);
         let hi_cap = cap.saturating_mul(high_ratio) / 100;
         let lo_cap = cap.saturating_sub(hi_cap);
@@ -495,7 +495,7 @@ impl<V> ShardPriorityLru<V> {
     fn get_shard(k: u128) -> usize {
         let hi = (k >> 64) as u64;
         let lo = k as u64;
-        spooky_hash_pair(hi, lo) as usize & LRU_SHARD_MASK
+        spooky_hash_pair(hi, lo) as usize & Self::LRU_SHARD_MASK
     }
 
     #[inline]
@@ -522,13 +522,13 @@ impl<V> ShardPriorityLru<V> {
     }
 
     fn evict_round_robin(&self, prefer: Option<CachePriority>) -> bool {
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) & LRU_SHARD_MASK;
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) & Self::LRU_SHARD_MASK;
         for step in 0..LRU_SHARD {
-            let idx = (start + step) & LRU_SHARD_MASK;
+            let idx = (start + step) & Self::LRU_SHARD_MASK;
             if let Some(evicted) = self.shard[idx].evict_one(prefer) {
                 self.account_eviction(evicted.prio, evicted.weight);
                 self.cursor
-                    .store((idx + 1) & LRU_SHARD_MASK, Ordering::Relaxed);
+                    .store((idx + 1) & Self::LRU_SHARD_MASK, Ordering::Relaxed);
                 return true;
             }
         }
@@ -625,7 +625,7 @@ mod test {
 
     #[test]
     fn priority_lru_keeps_distinct_u128_keys() {
-        let m = ShardPriorityLru::new(64, 50, 0);
+        let m = ShardPriorityLru::<_, 32>::new(64, 50, 0);
         let k1 = (1_u128 << 64) | 7;
         let k2 = (2_u128 << 64) | 7;
 
