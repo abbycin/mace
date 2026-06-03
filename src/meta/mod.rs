@@ -23,13 +23,13 @@ use crate::{
     cc::context::Context,
     io::{File, GatherIO},
     map::{
-        DataReader, IFooter, SharedState,
+        IDataReader, IFooter, SharedState,
         buffer::{BucketContext, BucketMgr},
         data::{BlobFooter, DataFooter, MetaReader},
         flush::CheckpointObserver,
         table::{BucketState, PageMap},
     },
-    types::refbox::BoxRef,
+    types::refbox::{BoxRef, BoxView},
     utils::{
         Handle, MutRef, OpCode,
         bitmap::BitMap,
@@ -429,7 +429,7 @@ impl Manifest {
     pub(crate) fn set_context(
         &self,
         ctx: Handle<Context>,
-        reader: Arc<dyn DataReader>,
+        reader: Arc<dyn IDataReader>,
         observer: Arc<dyn CheckpointObserver>,
     ) {
         unsafe {
@@ -1036,21 +1036,16 @@ impl Manifest {
 
     pub(crate) fn load_blob<C>(&self, bucket_id: u64, addr: u64, cache: C) -> Result<BoxRef, OpCode>
     where
-        C: Fn(BoxRef),
+        C: Fn(BoxView),
     {
         let ctx = self.get_bucket_context_must_exist(bucket_id);
         match self.blob_stat.load(addr, &ctx) {
             Ok(b) => {
-                cache(b.clone());
+                cache(b.view());
                 Ok(b)
             }
             e => e,
         }
-    }
-
-    pub(crate) fn load_blob_uncached(&self, bucket_id: u64, addr: u64) -> Result<BoxRef, OpCode> {
-        let ctx = self.get_bucket_context_must_exist(bucket_id);
-        self.blob_stat.load(addr, &ctx)
     }
 
     pub(crate) fn save_obsolete_data(&self, id: &[u64]) {

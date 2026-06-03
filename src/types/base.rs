@@ -154,7 +154,7 @@ impl BaseView {
 
         pos = 0;
         while let Some((k, v)) = seekable.next() {
-            let (r, _) = v.get_record(l, true);
+            let (r, _) = v.get_record(l);
             let remote = v.get_remote();
             if remote != NULL_ADDR {
                 remote_hint_addrs.push(remote);
@@ -340,7 +340,7 @@ impl BaseView {
             builder.setup_boundary_keys(&[], None);
 
             for (k, v) in old_vers[start..end].iter() {
-                let (r, _) = v.get_record(l, true);
+                let (r, _) = v.get_record(l);
                 let remote = v.get_remote();
                 if remote != NULL_ADDR {
                     remote_hint_addrs.push(remote);
@@ -629,6 +629,7 @@ where
     beg: usize,
     end: usize,
     hist: Option<HistIter<'a>>,
+    keepalive: Vec<BoxRef>,
 }
 
 pub(crate) struct BaseRevIter<'a, L, K>
@@ -641,13 +642,21 @@ where
     cur: isize,
     end: isize,
     hist: Option<HistIter<'a>>,
+    keepalive: Vec<BoxRef>,
 }
 
 struct HistIter<'a> {
     key_raw: &'a [u8],
-    page: BaseView,
+    page: BoxRef,
     slot: usize,
     remaining: usize,
+}
+
+impl HistIter<'_> {
+    #[inline]
+    fn current_page(&self) -> BaseView {
+        self.page.view().as_base()
+    }
 }
 
 impl<'a, L, K> BaseIter<'a, L, K>
@@ -662,6 +671,7 @@ where
             beg,
             end,
             hist: None,
+            keepalive: Vec::new(),
         }
     }
 }
@@ -678,6 +688,7 @@ where
             cur: start,
             end,
             hist: None,
+            keepalive: Vec::new(),
         }
     }
 }
@@ -709,21 +720,24 @@ where
                 self.hist = None;
                 continue;
             }
+            let page = state.current_page();
 
-            let elems = state.page.header().elems as usize;
+            let elems = page.header().elems as usize;
             if state.slot >= elems {
-                let link = state.page.box_header().link;
+                let link = page.box_header().link;
                 if link == NULL_ADDR {
                     self.hist = None;
                     continue;
                 }
                 on_sibling(link);
-                state.page = self.loader.load(link)?.as_base();
+                let page = self.loader.load_sibling(link)?;
+                self.keepalive.push(page.clone());
+                state.page = page;
                 state.slot = 0;
                 continue;
             }
 
-            let (ver, val) = state.page.sst::<Ver>().kv_at(state.slot);
+            let (ver, val) = page.sst::<Ver>().kv_at(state.slot);
             state.slot += 1;
             state.remaining -= 1;
             let k = Key::new(state.key_raw, ver);
@@ -734,9 +748,11 @@ where
             self.beg += 1;
             if let Some(hist) = v.get_hist() {
                 on_sibling(hist.page_addr);
+                let page = self.loader.load_sibling(hist.page_addr)?;
+                self.keepalive.push(page.clone());
                 self.hist = Some(HistIter {
                     key_raw: k.raw,
-                    page: self.loader.load(hist.page_addr)?.as_base(),
+                    page,
                     slot: hist.slot as usize,
                     remaining: hist.count as usize,
                 });
@@ -775,21 +791,24 @@ where
                 self.hist = None;
                 continue;
             }
+            let page = state.current_page();
 
-            let elems = state.page.header().elems as usize;
+            let elems = page.header().elems as usize;
             if state.slot >= elems {
-                let link = state.page.box_header().link;
+                let link = page.box_header().link;
                 if link == NULL_ADDR {
                     self.hist = None;
                     continue;
                 }
                 on_sibling(link);
-                state.page = self.loader.load(link)?.as_base();
+                let page = self.loader.load_sibling(link)?;
+                self.keepalive.push(page.clone());
+                state.page = page;
                 state.slot = 0;
                 continue;
             }
 
-            let (ver, val) = state.page.sst::<Ver>().kv_at(state.slot);
+            let (ver, val) = page.sst::<Ver>().kv_at(state.slot);
             state.slot += 1;
             state.remaining -= 1;
             let k = Key::new(state.key_raw, ver);
@@ -802,9 +821,11 @@ where
             self.cur -= 1;
             if let Some(hist) = v.get_hist() {
                 on_sibling(hist.page_addr);
+                let page = self.loader.load_sibling(hist.page_addr)?;
+                self.keepalive.push(page.clone());
                 self.hist = Some(HistIter {
                     key_raw: k.raw,
-                    page: self.loader.load(hist.page_addr)?.as_base(),
+                    page,
                     slot: hist.slot as usize,
                     remaining: hist.count as usize,
                 });
@@ -1068,7 +1089,7 @@ mod test {
     }
 
     impl ILoader for Allocator {
-        fn load(&self, addr: u64) -> Result<BoxView, crate::OpCode> {
+        fn load_pinned(&self, addr: u64) -> Result<BoxView, crate::OpCode> {
             Ok(self.inner.map.get(&addr).unwrap().view())
         }
 
@@ -1076,15 +1097,19 @@ mod test {
             self.inner.raw_ref().map.insert(data.header().addr, data);
         }
 
-        fn copy_with_pin(&self) -> Self {
+        fn copy(&self) -> Self {
             self.clone()
         }
 
-        fn copy_without_pin(&self) -> Self {
+        fn copy_detached(&self) -> Self {
             self.clone()
         }
 
-        fn load_remote(&self, addr: u64) -> Result<BoxRef, crate::OpCode> {
+        fn load_sibling(&self, addr: u64) -> Result<BoxRef, crate::OpCode> {
+            Ok(self.inner.map.get(&addr).unwrap().clone())
+        }
+
+        fn load_blob(&self, addr: u64, _cache: bool) -> Result<BoxRef, crate::OpCode> {
             Ok(self.inner.map.get(&addr).unwrap().clone())
         }
     }
@@ -1150,7 +1175,7 @@ mod test {
             assert_eq!(k.raw, ks.as_bytes());
             assert_eq!(k.txid, txid);
             assert_eq!(k.cmd, cmd);
-            let (r, _) = v.get_record(l, true);
+            let (r, _) = v.get_record(l);
             assert_eq!(r.data(), vs.as_bytes());
             assert_eq!(r.group_id(), w);
         }
@@ -1330,7 +1355,7 @@ mod test {
             assert_eq!(k.raw, ks.as_bytes());
             assert_eq!(k.txid, txid);
             assert_eq!(k.cmd, cmd);
-            let (r, _) = v.get_record(l, true);
+            let (r, _) = v.get_record(l);
             assert_eq!(r.data(), vs.as_bytes());
             assert_eq!(r.group_id(), w);
         }
@@ -1385,7 +1410,11 @@ mod test {
         let hist = head_v.get_hist().expect("must have history");
         assert_eq!(hist.slot, 0);
         assert_eq!(hist.count, 19);
-        let head_page = l.load(hist.page_addr).expect("must load").as_base();
+        let head_page = l
+            .load_sibling(hist.page_addr)
+            .expect("must load")
+            .view()
+            .as_base();
         assert_ne!(head_page.box_header().link, NULL_ADDR);
 
         for txid in (1..20).rev() {

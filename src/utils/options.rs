@@ -86,13 +86,14 @@ pub struct Options {
     ///
     /// The default value is `db_root/log`.
     pub log_root: PathBuf,
-    /// Per-bucket logical-address page/blob cache capacity in bytes.
+    /// Shared logical-address cache capacity in bytes.
     ///
-    /// This cache holds data by logical address for the loader fast path.
+    /// This cache keeps file-loaded blob values and auxiliary history/sibling pages.
+    /// Resident tree pages and dirty pool pages are accounted elsewhere and are not inserted here.
     /// Trimming is best-effort and happens in small rounds, so short-term overshoot is possible.
     ///
-    /// Entries here can overlap with [`Self::cache_capacity`] and [`Self::pool_capacity`]
-    /// because all three may point to the same ref-counted allocation.
+    /// Entries here can still overlap with [`Self::cache_capacity`] and [`Self::pool_capacity`]
+    /// because different subsystems may transiently hold refs to the same allocation.
     pub lru_capacity: usize,
     /// Per-bucket pool target bytes.
     ///
@@ -108,17 +109,13 @@ pub struct Options {
     /// - Eviction is activity-based and asynchronous.
     ///
     /// This is not an independent memory pool. The same data may also be referenced by
-    /// [`Self::pool_capacity`] (dirty pages) and/or [`Self::lru_capacity`] (cold data),
+    /// [`Self::pool_capacity`] (dirty pages) and/or [`Self::lru_capacity`] (shared remote cache),
     /// so byte accounting among these three knobs overlaps by design.
     pub cache_capacity: usize,
     /// Percentage of items evicted per round. Default is 10%.
     pub cache_evict_pct: usize,
-    /// Optional hard fuse for per-bucket page/blob LRU entry count. 0 means unlimited.
-    pub lru_max_entries: usize,
     /// Bitmap-cache entry count for data and blob stats.
     pub stat_mask_cache_count: usize,
-    /// Ratio of high-priority cache (for non-blob data) within [`Self::lru_capacity`], in \[0, 100\].
-    pub high_priority_ratio: usize,
     /// Maximum number of open data-file handles cached concurrently, used for loading data pages.
     pub data_handle_cache_capacity: usize,
     /// Maximum number of open blob-file handles cached concurrently, used for loading blob pages.
@@ -206,9 +203,7 @@ impl Options {
             cache_capacity: Self::CACHE_CAP,
             cache_evict_pct: 10, // 10%
             lru_capacity: Self::LRU_CAPACITY,
-            lru_max_entries: 0,
             stat_mask_cache_count: Self::STAT_MASK_CACHE_CNT,
-            high_priority_ratio: 80, // 80%
             data_handle_cache_capacity: 128,
             blob_handle_cache_capacity: 128,
             inline_size: Self::MIN_INLINE_SIZE,
@@ -256,7 +251,6 @@ impl Options {
         if self.lru_capacity == 0 {
             self.lru_capacity = Self::LRU_CAPACITY;
         }
-        self.high_priority_ratio = self.high_priority_ratio.min(100);
         if self.data_file_size == 0 {
             self.data_file_size = Self::DATA_FILE_SIZE;
         }

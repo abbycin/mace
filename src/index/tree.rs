@@ -925,7 +925,8 @@ impl Tree {
         let target = Ver::new(start_ts, NULL_CMD);
 
         while addr != NULL_PID && remaining > 0 {
-            let ptr = l.load(addr)?.as_base();
+            let page = l.load_sibling(addr)?;
+            let ptr = page.view().as_base();
             let sst = ptr.sst::<Ver>();
             let elems = sst.header().elems as usize;
             if pos >= elems {
@@ -952,8 +953,8 @@ impl Tree {
                     if v.is_tombstone() {
                         return Err(OpCode::NotFound);
                     }
-                    let (v, r) = v.get_record(l, true);
-                    return Ok(ValRef::new(v, r.map_or(ptr.as_box(), |x| x)));
+                    let (v, r) = v.get_record(l);
+                    return Ok(ValRef::new(v, r.unwrap_or(page)));
                 }
                 pos += 1;
                 remaining -= 1;
@@ -1014,7 +1015,7 @@ impl Tree {
                         result = Some(Err(OpCode::NotFound));
                         return true;
                     }
-                    let (r, v) = val.get_record(&page.loader, true);
+                    let (r, v) = val.get_record(&page.loader);
                     result = Some(Ok(ValRef::new(r, v.unwrap_or_else(|| x.as_box()))));
                     return true;
                 }
@@ -1032,7 +1033,7 @@ impl Tree {
             if val.is_tombstone() {
                 return Err(OpCode::NotFound);
             }
-            let (record, r) = val.get_record(&page.loader, true);
+            let (record, r) = val.get_record(&page.loader);
             return Ok(ValRef::new(record, r.unwrap_or_else(|| page.base_box())));
         }
         if let Some(hist) = val.get_hist() {

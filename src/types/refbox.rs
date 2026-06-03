@@ -48,12 +48,13 @@ impl DerefMut for BoxView {
 }
 
 impl BoxView {
-    fn into_owned(self) -> BoxRef {
-        BoxRef(self.0)
-    }
-
     pub(crate) fn inc_ref(&self) {
         raw_ptr_to_ref_mut(self.0).refs.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn to_box(self) -> BoxRef {
+        self.inc_ref();
+        BoxRef(self.0)
     }
 
     fn dec_ref(&self) -> u32 {
@@ -232,8 +233,7 @@ macro_rules! impl_box {
             fn as_box(&self) -> BoxRef {
                 debug_assert!(!self.0.is_null());
                 let x = BoxView(unsafe { (self.0 as *mut BoxHeader).sub(1) });
-                x.inc_ref();
-                x.into_owned()
+                x.to_box()
             }
         }
     };

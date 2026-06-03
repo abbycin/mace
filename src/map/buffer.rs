@@ -9,12 +9,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::utils::data::init_group_pos;
 use crate::{
     Options,
     cc::context::Context,
     map::{
-        DataReader, JunksMap, Loader, PagesMap, RetiredChain, SharedState, SparseFrontier,
+        IDataReader, JunksMap, Loader, PagesMap, RetiredChain, SharedState, SparseFrontier,
         cache::{CANDIDATE_RING_SIZE, CANDIDATE_SAMPLE_RATE, CacheState, CandidateRing, NodeCache},
         data::{AddrSet, CheckpointTask, EpochInflight, PidMap, PidSet},
         table::Swip,
@@ -28,6 +27,7 @@ use crate::{
         options::ParsedOptions,
     },
 };
+use crate::{types::refbox::BoxView, utils::data::init_group_pos};
 use crossbeam_epoch::Guard;
 use dashmap::DashMap;
 
@@ -38,7 +38,7 @@ use crate::types::refbox::{BoxRef, RemoteView};
 
 struct DummyDataReader;
 
-impl DataReader for DummyDataReader {
+impl IDataReader for DummyDataReader {
     fn load_data(
         &self,
         _bucket_id: u64,
@@ -52,12 +52,8 @@ impl DataReader for DummyDataReader {
         &self,
         _bucket_id: u64,
         _addr: u64,
-        _cache: &dyn Fn(BoxRef),
+        _cache: &dyn Fn(BoxView),
     ) -> Result<BoxRef, OpCode> {
-        Err(OpCode::NotFound)
-    }
-
-    fn load_blob_uncached(&self, _bucket_id: u64, _addr: u64) -> Result<BoxRef, OpCode> {
         Err(OpCode::NotFound)
     }
 }
@@ -730,7 +726,7 @@ pub(crate) struct BucketContext {
     pub(crate) blob_intervals: RwLock<IntervalMap>,
     pub(crate) lru: Handle<ShardPriorityLru<BoxRef>>,
     pub(crate) bucket_id: u64,
-    pub(crate) reader: Arc<dyn DataReader>,
+    pub(crate) reader: Arc<dyn IDataReader>,
     ctx: Handle<Context>,
     cache: NodeCache,
     candidates: CandidateRing,
@@ -749,7 +745,7 @@ impl BucketContext {
         table: MutRef<PageMap>,
         flush: Checkpoint,
         lru: Handle<ShardPriorityLru<BoxRef>>,
-        reader: Arc<dyn DataReader>,
+        reader: Arc<dyn IDataReader>,
         used: Arc<AtomicIsize>,
         tx: Sender<SharedState>,
     ) -> Self {
@@ -803,7 +799,7 @@ impl BucketContext {
             pool: self.pool,
             ctx,
             lru: self.lru,
-            pinned: MutRef::new(DashMap::with_capacity(Loader::PIN_CAP)),
+            node_pins: MutRef::new(DashMap::with_capacity(Loader::PIN_CAP)),
             bucket_id: self.bucket_id,
             reader: self.reader.clone(),
         }
@@ -945,7 +941,7 @@ pub(crate) struct BucketMgr {
     pub(crate) tx: Sender<SharedState>,
     pub(crate) rx: Receiver<()>,
     pub(crate) ctx: Handle<Context>,
-    pub(crate) reader: Arc<dyn DataReader>,
+    pub(crate) reader: Arc<dyn IDataReader>,
 }
 
 impl BucketMgr {
@@ -959,11 +955,7 @@ impl BucketMgr {
         let used = Arc::new(AtomicIsize::new(0));
         Self {
             buckets: DashMap::new(),
-            lru: Handle::new(ShardPriorityLru::new(
-                opt.lru_capacity,
-                opt.high_priority_ratio,
-                opt.lru_max_entries,
-            )),
+            lru: Handle::new(ShardPriorityLru::new(opt.lru_capacity)),
             used,
             flush: None,
             tx,
@@ -973,7 +965,7 @@ impl BucketMgr {
         }
     }
 
-    pub(crate) fn set_context(&mut self, ctx: Handle<Context>, reader: Arc<dyn DataReader>) {
+    pub(crate) fn set_context(&mut self, ctx: Handle<Context>, reader: Arc<dyn IDataReader>) {
         self.ctx = ctx;
         self.reader = reader;
     }
@@ -981,7 +973,7 @@ impl BucketMgr {
     pub(crate) fn start(
         &mut self,
         ctx: Handle<Context>,
-        reader: Arc<dyn DataReader>,
+        reader: Arc<dyn IDataReader>,
         observer: Arc<dyn CheckpointObserver>,
     ) {
         self.set_context(ctx, reader);

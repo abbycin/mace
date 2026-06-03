@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use crate::cc::context::Context;
 use crate::index::tree::Tree;
 pub use crate::index::txn::{TxnKV, TxnView};
-use crate::map::DataReader;
+use crate::map::IDataReader;
 use crate::map::evictor::Evictor;
 use crate::map::flush::{CheckpointObserver, FlushDirective, FlushResult};
 use crate::meta::builder::ManifestBuilder;
@@ -13,7 +13,7 @@ use crate::meta::{
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
 use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats, VacuumStats};
-use crate::types::refbox::BoxRef;
+use crate::types::refbox::{BoxRef, BoxView};
 use crate::utils::Handle;
 use crate::utils::MutRef;
 pub use crate::utils::OpCode;
@@ -55,17 +55,13 @@ impl StoreDataReader {
         &self,
         bucket_id: u64,
         addr: u64,
-        cache: &dyn Fn(BoxRef),
+        cache: &dyn Fn(BoxView),
     ) -> Result<BoxRef, OpCode> {
         self.meta.load_blob(bucket_id, addr, cache)
     }
-
-    fn read_blob_uncached(&self, bucket_id: u64, addr: u64) -> Result<BoxRef, OpCode> {
-        self.meta.load_blob_uncached(bucket_id, addr)
-    }
 }
 
-impl DataReader for StoreDataReader {
+impl IDataReader for StoreDataReader {
     fn load_data(
         &self,
         bucket_id: u64,
@@ -79,13 +75,9 @@ impl DataReader for StoreDataReader {
         &self,
         bucket_id: u64,
         addr: u64,
-        cache: &dyn Fn(BoxRef),
+        cache: &dyn Fn(BoxView),
     ) -> Result<BoxRef, OpCode> {
         self.read_blob(bucket_id, addr, cache)
-    }
-
-    fn load_blob_uncached(&self, bucket_id: u64, addr: u64) -> Result<BoxRef, OpCode> {
-        self.read_blob_uncached(bucket_id, addr)
     }
 }
 
