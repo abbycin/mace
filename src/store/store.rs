@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use crate::cc::context::Context;
 use crate::index::tree::Tree;
 pub use crate::index::txn::{TxnKV, TxnView};
-use crate::map::DataReader;
+use crate::map::IDataReader;
 use crate::map::evictor::Evictor;
 use crate::map::flush::{CheckpointObserver, FlushDirective, FlushResult};
 use crate::meta::builder::ManifestBuilder;
@@ -13,14 +13,14 @@ use crate::meta::{
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
 use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats, VacuumStats};
-use crate::types::refbox::BoxRef;
+use crate::types::refbox::{BoxRef, BoxView};
 use crate::utils::Handle;
 use crate::utils::MutRef;
 pub use crate::utils::OpCode;
 use crate::utils::ROOT_PID;
 use crate::utils::data::init_group_pos;
 pub use crate::utils::options::Options;
-use crate::utils::options::ParsedOptions;
+use crate::utils::options::{BucketOptions, ParsedOptions};
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -55,17 +55,13 @@ impl StoreDataReader {
         &self,
         bucket_id: u64,
         addr: u64,
-        cache: &dyn Fn(BoxRef),
+        cache: &dyn Fn(BoxView),
     ) -> Result<BoxRef, OpCode> {
         self.meta.load_blob(bucket_id, addr, cache)
     }
-
-    fn read_blob_uncached(&self, bucket_id: u64, addr: u64) -> Result<BoxRef, OpCode> {
-        self.meta.load_blob_uncached(bucket_id, addr)
-    }
 }
 
-impl DataReader for StoreDataReader {
+impl IDataReader for StoreDataReader {
     fn load_data(
         &self,
         bucket_id: u64,
@@ -79,13 +75,9 @@ impl DataReader for StoreDataReader {
         &self,
         bucket_id: u64,
         addr: u64,
-        cache: &dyn Fn(BoxRef),
+        cache: &dyn Fn(BoxView),
     ) -> Result<BoxRef, OpCode> {
         self.read_blob(bucket_id, addr, cache)
-    }
-
-    fn load_blob_uncached(&self, bucket_id: u64, addr: u64) -> Result<BoxRef, OpCode> {
-        self.read_blob_uncached(bucket_id, addr)
     }
 }
 
@@ -350,11 +342,11 @@ pub struct Inner {
 impl Inner {
     const MAX_BUCKET_NAME_LEN: usize = 32;
 
-    fn new_bucket(this: &Arc<Inner>, name: &str) -> Result<Bucket, OpCode> {
+    fn new_bucket(this: &Arc<Inner>, name: &str, opt: BucketOptions) -> Result<Bucket, OpCode> {
         if name.len() >= Self::MAX_BUCKET_NAME_LEN {
             return Err(OpCode::TooLarge);
         }
-        let (meta, bucket_ctx) = this.store.manifest.create_bucket(name)?;
+        let (meta, bucket_ctx) = this.store.manifest.create_bucket(name, opt)?;
 
         Ok(Bucket {
             tree: Tree::new(this.store.clone(), ROOT_PID, bucket_ctx),
@@ -368,13 +360,20 @@ impl Inner {
             return Err(OpCode::TooLarge);
         }
         let meta = this.store.manifest.load_bucket_meta(name)?;
-        let bucket_ctx = this.store.manifest.load_bucket_context(meta.bucket_id)?;
+        let bucket_ctx = this.store.manifest.load_bucket_context(meta.id)?;
 
         Ok(Bucket {
             tree: Tree::new(this.store.clone(), ROOT_PID, bucket_ctx),
             _holder: meta,
             inner: this.clone(),
         })
+    }
+
+    fn update_bucket_opt(this: &Arc<Inner>, name: &str, opt: BucketOptions) -> Result<(), OpCode> {
+        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
+            return Err(OpCode::TooLarge);
+        }
+        this.store.manifest.update_bucket_options(name, opt)
     }
 
     /// manually unload bucket to release memory
@@ -392,7 +391,7 @@ impl Inner {
             return Err(OpCode::TooLarge);
         }
         let meta = self.store.manifest.load_bucket_meta(name)?;
-        let bucket_ctx = self.store.manifest.load_bucket_context(meta.bucket_id)?;
+        let bucket_ctx = self.store.manifest.load_bucket_context(meta.id)?;
         crate::store::gc::vacuum_bucket(self.store.clone(), bucket_ctx)
     }
 
@@ -401,7 +400,7 @@ impl Inner {
             return Err(OpCode::TooLarge);
         }
         let meta = self.store.manifest.load_bucket_meta(name)?;
-        let bucket_ctx = self.store.manifest.load_bucket_context(meta.bucket_id)?;
+        let bucket_ctx = self.store.manifest.load_bucket_context(meta.id)?;
         Ok(bucket_ctx.state.is_vacuuming())
     }
 
@@ -499,7 +498,6 @@ impl Mace {
             opt.clone(),
             manifest.buckets,
             manifest.numerics.clone(),
-            manifest.buckets.used.clone(),
             erx,
             etx,
         );
@@ -517,14 +515,28 @@ impl Mace {
 
     /// Creates a bucket with the given name.
     /// NOTE: name must be less than 32 bytes.
-    pub fn new_bucket<S: AsRef<str>>(&self, name: S) -> Result<Bucket, OpCode> {
-        Inner::new_bucket(&self.inner, name.as_ref())
+    pub fn new_bucket<S: AsRef<str>>(&self, name: S, opt: BucketOptions) -> Result<Bucket, OpCode> {
+        Inner::new_bucket(&self.inner, name.as_ref(), opt.validate())
     }
 
     /// Gets an existing bucket with the given name.
     /// NOTE: name must be less than 32 bytes.
     pub fn get_bucket<S: AsRef<str>>(&self, name: S) -> Result<Bucket, OpCode> {
         Inner::get_bucket(&self.inner, name.as_ref())
+    }
+
+    /// Updates the persisted bucket-scoped options of an existing bucket
+    ///
+    /// Returns [`OpCode::Again`] if the bucket is currently loaded
+    ///
+    /// Returns [`OpCode::Invalid`] if the requested [`BucketOptions`] conflict with
+    /// persisted compatibility-sensitive bucket options
+    pub fn update_bucket_opt<S: AsRef<str>>(
+        &self,
+        name: S,
+        opt: BucketOptions,
+    ) -> Result<(), OpCode> {
+        Inner::update_bucket_opt(&self.inner, name.as_ref(), opt.validate())
     }
 
     /// Returns a list of all active bucket names.

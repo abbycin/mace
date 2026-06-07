@@ -1,6 +1,6 @@
 use std::{ops::Deref, time::Instant};
 
-use mace::{Mace, Options, RandomPath};
+use mace::{BucketOptions, Mace, Options, RandomPath};
 
 #[test]
 fn bench() {
@@ -10,7 +10,9 @@ fn bench() {
     opt.sync_on_write = false;
     let mut copy = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let mut bopt = BucketOptions::new();
+    bopt.enable_backpressure = false;
+    let db = mace.new_bucket("x", bopt).unwrap();
 
     let cap = 100000;
     let mut pair = Vec::with_capacity(cap);

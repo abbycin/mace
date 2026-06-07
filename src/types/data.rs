@@ -487,21 +487,25 @@ impl<'a> Val<'a> {
         Self::read::<u32>(self.data, Self::HDR_LEN + Self::GID_LEN) as usize
     }
 
-    pub fn get_record<L: ILoader>(&self, l: &L, cache: bool) -> (Record, Option<BoxRef>) {
+    fn get_record_impl<L: ILoader>(&self, l: &L, cache: bool) -> (Record, Option<BoxRef>) {
         let off = self.data_offset();
         let len = self.data_size();
         let (src, r) = if self.is_inline() {
             (&self.data[off..], None)
         } else {
             let addr = Self::read::<u64>(self.data, off);
-            let r = if cache {
-                l.load_remote_unchecked(addr)
-            } else {
-                l.load_remote_uncached(addr)
-            };
+            let r = l.load_blob(addr, cache).expect("must exist");
             (r.view().as_remote().raw(), Some(r))
         };
         (Record::decode_from(&src[..len]), r)
+    }
+
+    pub fn get_record<L: ILoader>(&self, l: &L) -> (Record, Option<BoxRef>) {
+        self.get_record_impl(l, true)
+    }
+
+    pub fn get_record_uncached<L: ILoader>(&self, l: &L) -> (Record, Option<BoxRef>) {
+        self.get_record_impl(l, false)
     }
 
     pub fn get_hist(&self) -> Option<HistRef> {
@@ -863,7 +867,7 @@ where
 
     /// NOTE: the return Slice is valid only in current iteration
     pub fn val(&self) -> &[u8] {
-        let (r, v) = self.val.get_record(self.loader, false);
+        let (r, v) = self.val.get_record_uncached(self.loader);
         *self.val_ref.borrow_mut() = v;
         r.data
     }
@@ -879,7 +883,7 @@ mod test {
     };
 
     use crate::{
-        OpCode, Options,
+        BucketOptions, OpCode,
         types::{
             data::{HistRef, IntlKey, Record, Val, Ver},
             refbox::{BoxRef, BoxView, RemoteView},
@@ -1011,12 +1015,12 @@ mod test {
             }
 
             fn inline_size(&self) -> usize {
-                Options::MIN_INLINE_SIZE
+                BucketOptions::MIN_INLINE_SIZE
             }
         }
 
         impl ILoader for L {
-            fn load(&self, addr: u64) -> Result<BoxView, OpCode> {
+            fn load_pinned(&self, addr: u64) -> Result<BoxView, OpCode> {
                 self.m
                     .borrow()
                     .get(&addr)
@@ -1024,23 +1028,23 @@ mod test {
                     .ok_or(OpCode::NotFound)
             }
 
-            fn load_unchecked(&self, addr: u64) -> BoxView {
-                self.load(addr).unwrap()
-            }
-
             fn pin(&self, data: BoxRef) {
                 self.m.borrow_mut().insert(data.header().addr, data);
             }
 
-            fn copy_with_pin(&self) -> Self {
+            fn copy(&self) -> Self {
                 self.clone()
             }
 
-            fn copy_without_pin(&self) -> Self {
+            fn copy_detached(&self) -> Self {
                 self.clone()
             }
 
-            fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
+            fn load_sibling(&self, addr: u64) -> Result<BoxRef, OpCode> {
+                self.m.borrow().get(&addr).cloned().ok_or(OpCode::NotFound)
+            }
+
+            fn load_blob(&self, addr: u64, _cache: bool) -> Result<BoxRef, OpCode> {
                 self.m.borrow().get(&addr).cloned().ok_or(OpCode::NotFound)
             }
         }
@@ -1066,9 +1070,9 @@ mod test {
             let vd = Val::from_raw(&del_buf);
             let vs = Val::from_raw(&sib_buf);
 
-            let dp = vp.get_record(&l, true).0;
-            let dd = vd.get_record(&l, true).0;
-            let ds = vs.get_record(&l, true).0;
+            let dp = vp.get_record(&l).0;
+            let dd = vd.get_record(&l).0;
+            let ds = vs.get_record(&l).0;
 
             assert!(dp.eq(&put));
             assert!(dd.eq(&del));
@@ -1105,9 +1109,9 @@ mod test {
             let vd = Val::from_raw(&del_buf);
             let vs = Val::from_raw(&sib_buf);
 
-            let (dp, rp) = vp.get_record(&l, true);
-            let (dd, rd) = vd.get_record(&l, true);
-            let (ds, rs) = vs.get_record(&l, true);
+            let (dp, rp) = vp.get_record(&l);
+            let (dd, rd) = vd.get_record(&l);
+            let (ds, rs) = vs.get_record(&l);
 
             assert!(dp.eq(&put));
             assert!(dd.eq(&del));

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{TestEnv, child_test_command, env_usize};
-use mace::{Mace, OpCode, Options, RandomPath};
+use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::path::Path;
 use std::process::ExitStatus;
 
@@ -48,7 +48,7 @@ fn child_crash_path() -> ! {
     let bucket = match engine.get_bucket("prod_recovery") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => engine
-            .new_bucket("prod_recovery")
+            .new_bucket("prod_recovery", BucketOptions::default())
             .expect("create bucket failed"),
         Err(err) => panic!("open bucket failed: {err:?}"),
     };
@@ -96,7 +96,7 @@ fn child_update_chain_crash_path() -> ! {
     let bucket = match engine.get_bucket("prod_recovery_update_chain") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => engine
-            .new_bucket("prod_recovery_update_chain")
+            .new_bucket("prod_recovery_update_chain", BucketOptions::default())
             .expect("create bucket failed"),
         Err(err) => panic!("open bucket failed: {err:?}"),
     };
@@ -136,7 +136,7 @@ fn child_delete_chain_crash_path() -> ! {
     let bucket = match engine.get_bucket("prod_recovery_delete_chain") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => engine
-            .new_bucket("prod_recovery_delete_chain")
+            .new_bucket("prod_recovery_delete_chain", BucketOptions::default())
             .expect("create bucket failed"),
         Err(err) => panic!("open bucket failed: {err:?}"),
     };
@@ -185,7 +185,7 @@ fn child_failpoint_io_write_path() {
     let engine = Mace::new(Options::new(&db_root).validate().expect("bad io options"))
         .expect("open io engine failed");
     let bucket = engine
-        .new_bucket("prod_failpoint_io")
+        .new_bucket("prod_failpoint_io", BucketOptions::default())
         .expect("create io bucket failed");
 
     let txn = bucket.begin().expect("begin io txn failed");
@@ -222,7 +222,7 @@ fn child_failpoint_abort_write_path() -> ! {
     )
     .expect("open abort engine failed");
     let bucket = engine
-        .new_bucket("prod_failpoint_abort")
+        .new_bucket("prod_failpoint_abort", BucketOptions::default())
         .expect("create abort bucket failed");
 
     let txn = bucket.begin().expect("begin abort txn failed");
@@ -257,7 +257,7 @@ fn fast_reopen_visibility() -> Result<(), OpCode> {
 
     {
         let engine = env.open_default()?;
-        let bucket = engine.new_bucket("prod_reopen")?;
+        let bucket = engine.new_bucket("prod_reopen", BucketOptions::default())?;
 
         let committed = bucket.begin()?;
         committed.put("k1", "v1")?;

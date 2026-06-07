@@ -1,7 +1,7 @@
 mod common;
 
 use common::{TestEnv, env_usize, is_retryable_txn_err};
-use mace::{Bucket, OpCode};
+use mace::{Bucket, BucketOptions, OpCode};
 use std::thread;
 use std::time::Duration;
 
@@ -36,7 +36,7 @@ fn fast_active_view_blocks_drop() -> Result<(), OpCode> {
     let engine = env.open_default()?;
 
     let name = "prod_evict_view";
-    let bucket = engine.new_bucket(name)?;
+    let bucket = engine.new_bucket(name, BucketOptions::default())?;
 
     let txn = bucket.begin()?;
     txn.put("key", "value")?;
@@ -66,19 +66,26 @@ fn stress_drop_reload_loop() -> Result<(), OpCode> {
     let env = TestEnv::new();
     let engine = env.open_with(|options| {
         options.sync_on_write = false;
-        options.cache_evict_pct = 20;
     })?;
 
     let rounds = env_usize("MACE_PROD_EVICTOR_STRESS_ROUNDS", 2000);
 
     let name = "prod_evict_stress";
-    let bucket = engine.new_bucket(name).or_else(|err| {
-        if err == OpCode::Exist {
-            engine.get_bucket(name)
-        } else {
-            Err(err)
-        }
-    })?;
+    let bucket = engine
+        .new_bucket(
+            name,
+            BucketOptions {
+                cache_evict_pct: 20,
+                ..BucketOptions::default()
+            },
+        )
+        .or_else(|err| {
+            if err == OpCode::Exist {
+                engine.get_bucket(name)
+            } else {
+                Err(err)
+            }
+        })?;
     drop(bucket);
 
     for round in 0..rounds {

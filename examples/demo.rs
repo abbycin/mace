@@ -1,11 +1,11 @@
-use mace::{Mace, OpCode, Options};
+use mace::{BucketOptions, Mace, OpCode, Options};
 
 fn main() -> Result<(), OpCode> {
     let path = std::env::temp_dir().join("mace");
     let _ = std::fs::remove_dir_all(&path);
     let opt = Options::new(path).validate()?;
     let db = Mace::new(opt)?;
-    let bucket = db.new_bucket("test")?;
+    let bucket = db.new_bucket("test", BucketOptions::default())?;
 
     // start a read-write transaction
     let kv = bucket.begin()?;

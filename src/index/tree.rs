@@ -100,7 +100,7 @@ impl Tree {
     }
 
     pub(crate) fn begin_build(&self) -> AllocGuard<'_> {
-        AllocGuard::new(&self.store.opt, &self.bucket)
+        AllocGuard::new(&self.bucket)
     }
 
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
@@ -432,7 +432,7 @@ impl Tree {
                 return Err(OpCode::Again);
             }
 
-            if node_ptr.should_split(self.store.opt.split_elems) {
+            if node_ptr.should_split(self.bucket.opt.split_elems) {
                 self.split_node(node_ptr, parent_opt, g)?;
                 return Err(OpCode::Again);
             }
@@ -501,7 +501,7 @@ impl Tree {
                 parent_opt = Some(node_ptr);
                 cursor = pid;
             } else {
-                if node_ptr.delta_len() >= self.store.opt.consolidate_threshold as usize {
+                if node_ptr.delta_len() >= self.bucket.opt.consolidate_threshold as usize {
                     self.try_compact(g, node_ptr);
                     // it may need split
                     continue;
@@ -635,7 +635,7 @@ impl Tree {
 
         let safe_txid = self.txid();
         let delta_len = page.delta_len();
-        let threshold = self.store.opt.consolidate_threshold as usize;
+        let threshold = self.bucket.opt.consolidate_threshold as usize;
 
         if delta_len >= threshold {
             self.try_compact(g, page);
@@ -925,7 +925,8 @@ impl Tree {
         let target = Ver::new(start_ts, NULL_CMD);
 
         while addr != NULL_PID && remaining > 0 {
-            let ptr = l.load(addr)?.as_base();
+            let page = l.load_sibling(addr)?;
+            let ptr = page.view().as_base();
             let sst = ptr.sst::<Ver>();
             let elems = sst.header().elems as usize;
             if pos >= elems {
@@ -952,8 +953,8 @@ impl Tree {
                     if v.is_tombstone() {
                         return Err(OpCode::NotFound);
                     }
-                    let (v, r) = v.get_record(l, true);
-                    return Ok(ValRef::new(v, r.map_or(ptr.as_box(), |x| x)));
+                    let (v, r) = v.get_record(l);
+                    return Ok(ValRef::new(v, r.unwrap_or(page)));
                 }
                 pos += 1;
                 remaining -= 1;
@@ -1014,7 +1015,7 @@ impl Tree {
                         result = Some(Err(OpCode::NotFound));
                         return true;
                     }
-                    let (r, v) = val.get_record(&page.loader, true);
+                    let (r, v) = val.get_record(&page.loader);
                     result = Some(Ok(ValRef::new(r, v.unwrap_or_else(|| x.as_box()))));
                     return true;
                 }
@@ -1032,7 +1033,7 @@ impl Tree {
             if val.is_tombstone() {
                 return Err(OpCode::NotFound);
             }
-            let (record, r) = val.get_record(&page.loader, true);
+            let (record, r) = val.get_record(&page.loader);
             return Ok(ValRef::new(record, r.unwrap_or_else(|| page.base_box())));
         }
         if let Some(hist) = val.get_hist() {
@@ -1351,17 +1352,24 @@ impl Filter {
 
 #[cfg(test)]
 mod test {
-    use crate::{Mace, Options, RandomPath};
+    use crate::{BucketOptions, Mace, Options, RandomPath};
     use std::thread;
 
     #[test]
     fn concurrent_page_hit() {
         let path = RandomPath::tmp();
         let mut opt = Options::new(&*path);
-        opt.split_elems = 256;
         opt.tmp_store = true;
         let mace = Mace::new(opt.validate().unwrap()).unwrap();
-        let db = mace.new_bucket("default").unwrap();
+        let db = mace
+            .new_bucket(
+                "default",
+                BucketOptions {
+                    split_elems: 256,
+                    ..BucketOptions::default()
+                },
+            )
+            .unwrap();
 
         let num_readers = 4;
         let num_iterations = 1000;

@@ -6,27 +6,17 @@ use crate::utils::OpCode;
 use crate::utils::data::Position;
 
 pub trait ILoader {
-    fn copy_without_pin(&self) -> Self;
+    fn copy_detached(&self) -> Self;
 
-    fn copy_with_pin(&self) -> Self;
+    fn copy(&self) -> Self;
 
     fn pin(&self, data: BoxRef);
 
-    fn load(&self, addr: u64) -> Result<BoxView, OpCode>;
+    fn load_pinned(&self, addr: u64) -> Result<BoxView, OpCode>;
 
-    fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode>;
+    fn load_sibling(&self, addr: u64) -> Result<BoxRef, OpCode>;
 
-    fn load_remote_uncached(&self, _addr: u64) -> BoxRef {
-        unimplemented!()
-    }
-
-    fn load_unchecked(&self, addr: u64) -> BoxView {
-        self.load(addr).expect("must exist")
-    }
-
-    fn load_remote_unchecked(&self, addr: u64) -> BoxRef {
-        self.load_remote(addr).expect("must exist")
-    }
+    fn load_blob(&self, addr: u64, cache: bool) -> Result<BoxRef, OpCode>;
 }
 
 pub trait IAsBoxRef {

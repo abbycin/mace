@@ -146,7 +146,8 @@ pub fn rand_range(range: Range<usize>) -> usize {
     rand::random_range(range)
 }
 
-static_assert!(size_of::<usize>() == 8, "expect 64 bits pointer width");
+static_assert!(size_of::<usize>() == size_of::<u64>());
+static_assert!(size_of::<u8>() == size_of::<bool>());
 
 /// A utility for managing temporary paths that are deleted on drop.
 pub struct RandomPath {

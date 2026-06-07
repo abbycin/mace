@@ -1,0 +1,35 @@
+[package]
+name = "mace-kv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.mace-kv]
+path = ".."
+
+[[bin]]
+name = "publish_gc_reopen"
+path = "fuzz_targets/publish_gc_reopen.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "txn_checkpoint_reopen"
+path = "fuzz_targets/txn_checkpoint_reopen.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bucket_lifecycle"
+path = "fuzz_targets/bucket_lifecycle.rs"
+test = false
+doc = false
+bench = false

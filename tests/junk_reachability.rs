@@ -1,5 +1,5 @@
 use mace::observe::{CounterMetric, InMemoryObserver, ObserveSnapshot};
-use mace::{Bucket, Mace, OpCode, Options, RandomPath};
+use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
 
 // Regression guard for the reachable-junk lifecycle changes bug class:
@@ -82,19 +82,26 @@ fn reachable_junk_regression_guard() -> Result<(), OpCode> {
     opt.tmp_store = true;
     opt.sync_on_write = false;
     opt.concurrent_write = 1;
-    opt.inline_size = 128;
-    opt.split_elems = 16;
-    opt.consolidate_threshold = 4;
     opt.data_file_size = 64 << 10;
-    opt.checkpoint_size = 256 << 10;
-    opt.pool_capacity = 2 << 20;
     opt.max_ckpt_per_txn = 64;
     opt.gc_eager = false;
     opt.gc_timeout = 60_000;
     opt.observer = observer.clone();
 
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let bucket = mace.new_bucket("x").unwrap();
+    let bucket = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                inline_size: 128,
+                split_elems: 16,
+                consolidate_threshold: 4,
+                checkpoint_size: 256 << 10,
+                pool_capacity: 2 << 20,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
     let keys: Vec<String> = (0..KEYS).map(|i| format!("k_{i:04}")).collect();
 
     let seed_payload = vec![b'a'; VALUE_SIZE];

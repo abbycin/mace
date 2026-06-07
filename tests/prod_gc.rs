@@ -1,7 +1,7 @@
 mod common;
 
 use common::{TestEnv, wait_until};
-use mace::{OpCode, Options};
+use mace::{BucketOptions, OpCode, Options};
 use std::path::Path;
 use std::time::Duration;
 
@@ -40,7 +40,14 @@ fn fast_manual_data_cycle() -> Result<(), OpCode> {
         options.data_file_size = 16 << 10;
     })?;
 
-    let bucket = engine.new_bucket("prod_gc_data")?;
+    let bucket = engine.new_bucket(
+        "prod_gc_data",
+        BucketOptions {
+            checkpoint_size: 32 << 10,
+            pool_capacity: 64 << 10,
+            ..BucketOptions::default()
+        },
+    )?;
     let seed_payload = vec![b's'; 1024];
     let updated_payload = vec![b'u'; 1024];
 
@@ -117,13 +124,18 @@ fn stress_blob_cycle() -> Result<(), OpCode> {
         options.sync_on_write = false;
         options.gc_eager = true;
         options.gc_timeout = 60_000;
-        options.inline_size = 512;
         options.blob_garbage_ratio = 1;
         options.blob_gc_ratio = 100;
         options.blob_file_size = 1 << 20;
     })?;
 
-    let bucket = engine.new_bucket("prod_gc_blob")?;
+    let bucket = engine.new_bucket(
+        "prod_gc_blob",
+        BucketOptions {
+            inline_size: 512,
+            ..BucketOptions::default()
+        },
+    )?;
     let payload = vec![b'x'; 16 << 10];
 
     for index in 0..300 {

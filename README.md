@@ -28,13 +28,13 @@ cargo add mace-kv
 The following example demonstrates basic transaction management and data retrieval:
 
 ```rust
-use mace::{Mace, OpCode, Options};
+use mace::{BucketOptions, Mace, OpCode, Options};
 
 fn main() -> Result<(), OpCode> {
     // 1. Initialize the storage
     let opts = Options::new("./data_dir");
     let db = Mace::new(opts.validate().unwrap())?;
-    let bkt = db.new_bucket("tmp")?;
+    let bkt = db.new_bucket("tmp", BucketOptions::default())?;
 
     // 2. Perform a write transaction
     let txn = bkt.begin()?;
@@ -59,29 +59,15 @@ Detailed usage can be found in [examples/demo.rs](./examples/demo.rs).
 
 ## Benchmarks
 
-Mace is engineered for heavy workloads. For detailed performance analysis and comparison with other engines, refer to the [kv_bench](https://github.com/abbycin/kv_bench) repository. The summary below is from `kv_bench`, comparing `Mace 0.0.33` with `RocksDB 10.4.2`.
+Recent complete benchmark results: https://o2c.fun/benchmark.html
 
-### Benchmark Summary
-
-| Workload | Mace wins (ops) | ops median ratio (Mace/RocksDB) | Mace wins (p99) | p99 median ratio (Mace/RocksDB) |
-|---|---:|---:|---:|--:|
-| `W1` (95R/5U, uniform) | 11 / 16 | **2.0x** | 7 / 16 | **1.0x** |
-| `W2` (95R/5U, zipf) | 11 / 16 | **1.4x** | 14 / 16 | **0.5x** |
-| `W3` (50R/50U) | 9 / 16 | **1.3x** | 7 / 16 | **1.0x** |
-| `W4` (5R/95U) | 8 / 16 | **1.0x** | 9 / 16 | **0.5x** |
-| `W5` (70R/25U/5S) | 14 / 16 | **1.8x** | 10 / 16 | **0.5x** |
-| `W6` (100% scan) | 15 / 16 | **2.9x** | 14 / 16 | **0.4x** |
-
-> Note: for `ops` median ratio (`Mace/RocksDB`), larger means higher Mace throughput. For `p99` median ratio (`Mace/RocksDB`), smaller means lower Mace tail latency.
->
-> Recent complete benchmark results: https://o2c.fun/benchmark.html
+For detailed performance analysis and comparison with other engines, refer to the [kv_bench](https://github.com/abbycin/kv_bench) repository.
 
 ### Test Environment
 
 - OS: openSUSE Tumbleweed
 - CPU: AMD Ryzen 5 3600 (6 cores / 12 threads)
 - Memory: 32 GiB RAM
-- Kernel: Linux `7.0.10-2-default`
 - Filesystem: `xfs` (`/dev/nvme1n1p4`, mounted at `/nvme`)
 - SSD: ZHITAI TiPlus5000 1TB
 
@@ -89,6 +75,24 @@ Mace is engineered for heavy workloads. For detailed performance analysis and co
 
 - Correctness/crash matrix: `./scripts/prod_test.sh all 8`
 - Script details: [scripts/README.md](./scripts/README.md)
+
+### Stateful Fuzzing
+
+Mace uses `cargo-fuzz` for stateful lifecycle fuzzing.
+
+The goal here is not "feed invalid bytes into a decoder and see whether it crashes". For this
+project, the more important question is whether Mace's own write, checkpoint, GC, reopen, and
+bucket lifecycle can produce state that later becomes unreadable, invisible, or inconsistent for
+lagging views and recovery.
+
+The focus is on lifecycle closure:
+
+- lagging snapshot views must not lose versions that should still be visible
+- checkpoint and reopen must not make committed state disappear or change visibility
+- publish, GC, and bucket churn must not produce broken metadata, stale runtime state, or
+  self-inconsistent durable state
+
+Detailed usage, targets, and replay commands are in [fuzz/README.md](./fuzz/README.md).
 
 ## Design Notes
 

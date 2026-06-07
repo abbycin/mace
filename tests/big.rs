@@ -1,4 +1,4 @@
-use mace::{Mace, Options, RandomPath};
+use mace::{BucketOptions, Mace, Options, RandomPath};
 use rand::RngExt;
 
 #[test]
@@ -13,7 +13,7 @@ fn upsert_delete() {
     opt.wal_file_size = 32 << 20;
 
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let mut rng = rand::rng();
 
     const N: usize = 1200;
@@ -66,7 +66,7 @@ fn big_kv() {
     let mut saved = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
     const N: usize = 200;
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let kv = db.begin().unwrap();
     let val = vec![233; 56 << 10];
     let keys: Vec<String> = (0..N).map(|x| format!("key_{x}")).collect();
@@ -107,7 +107,7 @@ fn big_kv2() {
     opt.data_file_size = 4096;
     let mut saved = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
 
@@ -146,7 +146,7 @@ fn big_kv3() {
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let val = vec![b'0'; 10240];
     let ksz = 1024;
     let count = 10000;

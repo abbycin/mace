@@ -35,7 +35,7 @@ Main buckets:
 - `numerics`
   - global counters and orphan markers (`odf_*`, `obf_*`).
 - `bucket_metas`
-  - bucket name -> `BucketMeta { bucket_id }`.
+  - bucket name -> persisted `BucketMeta { bucket_id, options }`.
 - `bucket_frontier`
   - `BucketDurableFrontier` per bucket (per-writer-group durable LSN frontier).
 - `pending_del`
@@ -62,7 +62,8 @@ Creation (`Manifest::create_bucket`):
 
 1. Take `structural_lock`.
 2. Reject duplicates and enforce `MAX_BUCKETS` via `nr_buckets`.
-3. Allocate `bucket_id`, create runtime context/state lazily, initialize frontier.
+3. Validate and persist `BucketOptions`, allocate `bucket_id`, create runtime context/state lazily,
+   initialize frontier.
 4. Commit one metadata txn (`numerics`, `bucket_frontier`, `bucket_metas`).
 
 Loading (`load_bucket_context`):
@@ -84,6 +85,14 @@ Delete (`delete_bucket`):
 - logical delete txn removes `bucket_metas` entry, inserts `pending_del`, records obsolete files.
 - runtime context/state are removed first.
 - GC later performs physical cleanup (`pending_del`) and decrements `nr_buckets`.
+
+Bucket option update (`update_bucket_opt`):
+
+- only allowed while the bucket is not loaded.
+- persisted compatibility-sensitive fields currently include `inline_size` and `split_elems`;
+  changing them is rejected with `OpCode::Invalid`.
+- runtime policy fields can be updated in persisted `BucketOptions` and take effect on the next
+  load.
 
 `BucketState` (in-memory only):
 
@@ -236,7 +245,8 @@ Global frontier lower bound (`Manifest::global_frontier_lower_bound`):
 
 ## Foreground admission / backpressure
 
-`FlowController` exists for every bucket; enforcement is gated by `Options::enable_backpressure`.
+`FlowController` exists for every bucket; enforcement is gated by
+`BucketOptions::enable_backpressure`.
 
 Admission model:
 

@@ -106,9 +106,9 @@ pub struct Loader {
     pub(crate) pool: Handle<Pool>,
     pub(crate) ctx: Handle<Context>,
     pub(crate) lru: Handle<ShardPriorityLru<BoxRef>>,
-    pub(crate) pinned: MutRef<DashMap<u64, BoxRef>>,
+    pub(crate) node_pins: MutRef<DashMap<u64, BoxRef>>,
     pub(crate) bucket_id: u64,
-    pub(crate) reader: Arc<dyn DataReader>,
+    pub(crate) reader: Arc<dyn IDataReader>,
 }
 
 impl Drop for Loader {
@@ -123,61 +123,45 @@ impl Loader {
         // logical addr is only bucket-local, while this LRU is shared by all bucket contexts.
         CacheKey::new(self.bucket_id, addr).raw()
     }
-
-    pub fn find(&self, addr: u64) -> Result<BoxRef, OpCode> {
-        let key = self.cache_key(addr);
-        if let Some(x) = self.lru.get(key) {
-            return Ok(x.clone());
-        }
-        if let Some(x) = self.pool.get_dirty_page(addr) {
-            self.lru.add(
-                CachePriority::High,
-                key,
-                x.header().total_size as usize,
-                x.clone(),
-            );
-            return Ok(x);
-        }
-        self.reader.load_data(self.bucket_id, addr, &|b| {
-            self.lru
-                .add(CachePriority::High, key, b.header().total_size as usize, b);
-        })
-    }
 }
 
 impl ILoader for Loader {
-    fn copy_without_pin(&self) -> Self {
+    fn copy_detached(&self) -> Self {
         Self {
             pool: self.pool,
             ctx: self.ctx,
             lru: self.lru,
-            pinned: MutRef::new(DashMap::new()),
+            node_pins: MutRef::new(DashMap::new()),
             bucket_id: self.bucket_id,
             reader: self.reader.clone(),
         }
     }
 
-    fn copy_with_pin(&self) -> Self {
+    fn copy(&self) -> Self {
         Self {
             pool: self.pool,
             ctx: self.ctx,
             lru: self.lru,
-            pinned: self.pinned.clone(),
+            node_pins: self.node_pins.clone(),
             bucket_id: self.bucket_id,
             reader: self.reader.clone(),
         }
     }
 
     fn pin(&self, data: BoxRef) {
-        self.pinned.insert(data.header().addr, data);
+        self.node_pins.insert(data.header().addr, data);
     }
 
-    fn load(&self, addr: u64) -> Result<BoxView, OpCode> {
-        if let Some(p) = self.pinned.get(&addr) {
+    fn load_pinned(&self, addr: u64) -> Result<BoxView, OpCode> {
+        if let Some(p) = self.node_pins.get(&addr) {
             return Ok(p.view());
         }
-        let x = self.find(addr)?;
-        let e = self.pinned.entry(addr);
+        let x = if let Some(x) = self.pool.get_dirty_page(addr) {
+            x
+        } else {
+            self.reader.load_data(self.bucket_id, addr, &|_| {})?
+        };
+        let e = self.node_pins.entry(addr);
         match e {
             Entry::Occupied(o) => Ok(o.get().view()),
             Entry::Vacant(v) => {
@@ -188,45 +172,44 @@ impl ILoader for Loader {
         }
     }
 
-    fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
-        if let Some(x) = self.pinned.get(&addr) {
-            return Ok(x.value().clone());
-        }
+    fn load_sibling(&self, addr: u64) -> Result<BoxRef, OpCode> {
         let key = self.cache_key(addr);
         if let Some(x) = self.lru.get(key) {
             return Ok(x.clone());
         }
         if let Some(x) = self.pool.get_dirty_page(addr) {
-            self.lru.add(
-                CachePriority::Low,
-                key,
-                x.header().total_size as usize,
-                x.clone(),
-            );
             return Ok(x);
         }
-        self.reader.load_blob(self.bucket_id, addr, &|b| {
+        self.reader.load_data(self.bucket_id, addr, &|b| {
             self.lru
-                .add(CachePriority::Low, key, b.header().total_size as usize, b);
+                .add(CachePriority::High, key, b.header().total_size as usize, b);
         })
     }
 
-    fn load_remote_uncached(&self, addr: u64) -> BoxRef {
-        if let Some(x) = self.pinned.get(&addr) {
-            return x.value().clone();
+    fn load_blob(&self, addr: u64, cache: bool) -> Result<BoxRef, OpCode> {
+        let key = self.cache_key(addr);
+        if cache && let Some(x) = self.lru.get(key) {
+            return Ok(x.clone());
         }
         if let Some(x) = self.pool.get_dirty_page(addr) {
-            return x;
+            return Ok(x);
         }
-        self.reader
-            .load_blob_uncached(self.bucket_id, addr)
-            .expect("must exist")
+        self.reader.load_blob(self.bucket_id, addr, &|b| {
+            if cache {
+                self.lru.add(
+                    CachePriority::Low,
+                    key,
+                    b.header().total_size as usize,
+                    b.to_box(),
+                );
+            }
+        })
     }
 }
 
 pub(crate) enum SharedState {
     Quit,
-    Evict,
+    Evict(u64),
 }
 
 pub(crate) trait IFooter: Default {
@@ -249,7 +232,7 @@ pub(crate) trait IFooter: Default {
     }
 }
 
-pub trait DataReader: Send + Sync {
+pub trait IDataReader: Send + Sync {
     fn load_data(
         &self,
         bucket_id: u64,
@@ -261,8 +244,6 @@ pub trait DataReader: Send + Sync {
         &self,
         bucket_id: u64,
         addr: u64,
-        cache: &dyn Fn(BoxRef),
+        cache: &dyn Fn(BoxView),
     ) -> Result<BoxRef, OpCode>;
-
-    fn load_blob_uncached(&self, bucket_id: u64, addr: u64) -> Result<BoxRef, OpCode>;
 }

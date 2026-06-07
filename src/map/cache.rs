@@ -1,5 +1,4 @@
 use dashmap::DashMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Relaxed};
 use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize};
 
@@ -66,14 +65,14 @@ impl CacheItem {
 
 pub(crate) struct NodeCache {
     map: DashMap<u64, CacheItem>,
-    used: Arc<AtomicIsize>,
+    used: AtomicIsize,
 }
 
 impl NodeCache {
-    pub(crate) fn new(used: Arc<AtomicIsize>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             map: DashMap::new(),
-            used,
+            used: AtomicIsize::new(0),
         }
     }
 

@@ -2,19 +2,18 @@ use parking_lot::{Mutex, RwLock};
 use std::sync::{
     Arc, OnceLock,
     atomic::{
-        AtomicBool, AtomicIsize, AtomicU64, AtomicUsize,
+        AtomicBool, AtomicU64, AtomicUsize,
         Ordering::{AcqRel, Acquire, Relaxed, Release},
     },
     mpsc::{Receiver, Sender},
 };
 use std::time::{Duration, Instant};
 
-use crate::utils::data::init_group_pos;
 use crate::{
     Options,
     cc::context::Context,
     map::{
-        DataReader, JunksMap, Loader, PagesMap, RetiredChain, SharedState, SparseFrontier,
+        IDataReader, JunksMap, Loader, PagesMap, RetiredChain, SharedState, SparseFrontier,
         cache::{CANDIDATE_RING_SIZE, CANDIDATE_SAMPLE_RATE, CacheState, CandidateRing, NodeCache},
         data::{AddrSet, CheckpointTask, EpochInflight, PidMap, PidSet},
         table::Swip,
@@ -25,9 +24,10 @@ use crate::{
         data::{GroupPositions, Position},
         interval::IntervalMap,
         lru::ShardPriorityLru,
-        options::ParsedOptions,
+        options::{BucketOptions, ParsedOptions},
     },
 };
+use crate::{types::refbox::BoxView, utils::data::init_group_pos};
 use crossbeam_epoch::Guard;
 use dashmap::DashMap;
 
@@ -38,7 +38,7 @@ use crate::types::refbox::{BoxRef, RemoteView};
 
 struct DummyDataReader;
 
-impl DataReader for DummyDataReader {
+impl IDataReader for DummyDataReader {
     fn load_data(
         &self,
         _bucket_id: u64,
@@ -52,12 +52,8 @@ impl DataReader for DummyDataReader {
         &self,
         _bucket_id: u64,
         _addr: u64,
-        _cache: &dyn Fn(BoxRef),
+        _cache: &dyn Fn(BoxView),
     ) -> Result<BoxRef, OpCode> {
-        Err(OpCode::NotFound)
-    }
-
-    fn load_blob_uncached(&self, _bucket_id: u64, _addr: u64) -> Result<BoxRef, OpCode> {
         Err(OpCode::NotFound)
     }
 }
@@ -182,7 +178,7 @@ impl Pool {
     const DIRTY_PAGE_INIT_CAP: usize = 16 << 10;
 
     fn new(
-        ctx: Handle<Context>,
+        opt: &BucketOptions,
         table: MutRef<PageMap>,
         state: MutRef<BucketState>,
         flow: Arc<FlowController>,
@@ -211,9 +207,9 @@ impl Pool {
 
         Self {
             // trigger checkpoint by hot generation size; sealed generation may coexist while flushing
-            max_hot_size: ctx.opt.checkpoint_size,
+            max_hot_size: opt.checkpoint_size,
             // total dirty memory hard cap (hot + sealed) as a safety net
-            max_mem_size: ctx.opt.pool_capacity,
+            max_mem_size: opt.pool_capacity,
             table,
             chkpt: flush,
             last_chkpt_lsn: MutRef::new(init_group_pos()),
@@ -726,16 +722,18 @@ pub(crate) struct BucketContext {
     pub(crate) pool: Handle<Pool>,
     pub(crate) table: MutRef<PageMap>,
     pub(crate) state: MutRef<BucketState>,
+    pub(crate) opt: Arc<BucketOptions>,
     pub(crate) data_intervals: RwLock<IntervalMap>,
     pub(crate) blob_intervals: RwLock<IntervalMap>,
     pub(crate) lru: Handle<ShardPriorityLru<BoxRef>>,
     pub(crate) bucket_id: u64,
-    pub(crate) reader: Arc<dyn DataReader>,
+    pub(crate) reader: Arc<dyn IDataReader>,
     ctx: Handle<Context>,
     cache: NodeCache,
     candidates: CandidateRing,
     tx: Sender<SharedState>,
     candidate_tick: AtomicU64,
+    evict_pending: AtomicBool,
     final_checkpointed: AtomicBool,
     reclaimed: AtomicBool,
 }
@@ -744,18 +742,19 @@ impl BucketContext {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: Handle<Context>,
+        global: &ParsedOptions,
+        opt: Arc<BucketOptions>,
         state: MutRef<BucketState>,
         bucket_id: u64,
         table: MutRef<PageMap>,
         flush: Checkpoint,
         lru: Handle<ShardPriorityLru<BoxRef>>,
-        reader: Arc<dyn DataReader>,
-        used: Arc<AtomicIsize>,
+        reader: Arc<dyn IDataReader>,
         tx: Sender<SharedState>,
     ) -> Self {
-        let flow = Arc::new(FlowController::new(ctx.opt.as_ref()));
+        let flow = Arc::new(FlowController::new(global, opt.as_ref()));
         let pool = Handle::new(Pool::new(
-            ctx,
+            opt.as_ref(),
             table.clone(),
             state.clone(),
             flow,
@@ -767,16 +766,18 @@ impl BucketContext {
             pool,
             table,
             state,
+            opt,
             data_intervals: RwLock::new(IntervalMap::new()),
             blob_intervals: RwLock::new(IntervalMap::new()),
             lru,
             bucket_id,
             reader,
             ctx,
-            cache: NodeCache::new(used),
+            cache: NodeCache::new(),
             candidates: CandidateRing::new(CANDIDATE_RING_SIZE),
             tx,
             candidate_tick: AtomicU64::new(0),
+            evict_pending: AtomicBool::new(false),
             final_checkpointed: AtomicBool::new(false),
             reclaimed: AtomicBool::new(false),
         }
@@ -803,7 +804,7 @@ impl BucketContext {
             pool: self.pool,
             ctx,
             lru: self.lru,
-            pinned: MutRef::new(DashMap::with_capacity(Loader::PIN_CAP)),
+            node_pins: MutRef::new(DashMap::with_capacity(Loader::PIN_CAP)),
             bucket_id: self.bucket_id,
             reader: self.reader.clone(),
         }
@@ -845,7 +846,7 @@ impl BucketContext {
         self.cache.touch(pid, size as isize);
         // avoid sampling when cache is far from pressure to reduce atomic contention
         let used = self.cache.used();
-        if used >= (self.ctx.opt.cache_capacity as isize >> 2) {
+        if used >= (self.opt.cache_capacity as isize >> 2) {
             self.maybe_push_candidate(pid);
         }
         self.maybe_evict();
@@ -867,6 +868,30 @@ impl BucketContext {
         self.candidates.snapshot()
     }
 
+    pub(crate) fn almost_full(&self) -> bool {
+        let threshold = self.opt.cache_capacity as isize * 80 / 100;
+        self.cache.used() >= threshold
+    }
+
+    pub(crate) fn max_delta_len(&self) -> usize {
+        self.opt.max_delta_len()
+    }
+
+    pub(crate) fn evict_sample_target(&self, candidates: usize) -> usize {
+        if candidates == 0 {
+            return 0;
+        }
+        let pct = self.opt.cache_evict_pct.min(100);
+        if pct == 0 {
+            return 0;
+        }
+        (candidates * pct / 100).max(1).min(candidates)
+    }
+
+    pub(crate) fn begin_eviction(&self) -> bool {
+        self.evict_pending.swap(false, AcqRel)
+    }
+
     fn maybe_push_candidate(&self, pid: u64) {
         let tick = self.candidate_tick.fetch_add(1, Relaxed) + 1;
         if tick.is_multiple_of(CANDIDATE_SAMPLE_RATE) {
@@ -875,9 +900,14 @@ impl BucketContext {
     }
 
     fn maybe_evict(&self) {
-        let threshold = self.ctx.opt.cache_capacity as isize * 80 / 100;
-        if self.cache.used() >= threshold {
-            let _ = self.tx.send(SharedState::Evict);
+        if !self.almost_full() {
+            return;
+        }
+        if self.evict_pending.swap(true, AcqRel) {
+            return;
+        }
+        if self.tx.send(SharedState::Evict(self.bucket_id)).is_err() {
+            self.evict_pending.store(false, Release);
         }
     }
 
@@ -910,7 +940,7 @@ impl BucketContext {
         if self.reclaimed.load(Acquire) {
             return;
         }
-        self.flush_and_wait();
+        self.pool.checkpoint_and_wait_fresh();
         self.final_checkpointed.store(true, Release);
     }
 
@@ -940,12 +970,11 @@ impl Drop for BucketContext {
 pub(crate) struct BucketMgr {
     pub(crate) buckets: DashMap<u64, Arc<BucketContext>>,
     pub(crate) lru: Handle<ShardPriorityLru<BoxRef>>,
-    pub(crate) used: Arc<AtomicIsize>,
     pub(crate) flush: Option<Checkpoint>,
     pub(crate) tx: Sender<SharedState>,
     pub(crate) rx: Receiver<()>,
     pub(crate) ctx: Handle<Context>,
-    pub(crate) reader: Arc<dyn DataReader>,
+    pub(crate) reader: Arc<dyn IDataReader>,
 }
 
 impl BucketMgr {
@@ -956,15 +985,9 @@ impl BucketMgr {
         rx: Receiver<()>,
     ) -> Self {
         let reader = Arc::new(DummyDataReader);
-        let used = Arc::new(AtomicIsize::new(0));
         Self {
             buckets: DashMap::new(),
-            lru: Handle::new(ShardPriorityLru::new(
-                opt.lru_capacity,
-                opt.high_priority_ratio,
-                opt.lru_max_entries,
-            )),
-            used,
+            lru: Handle::new(ShardPriorityLru::new(opt.lru_capacity)),
             flush: None,
             tx,
             rx,
@@ -973,7 +996,7 @@ impl BucketMgr {
         }
     }
 
-    pub(crate) fn set_context(&mut self, ctx: Handle<Context>, reader: Arc<dyn DataReader>) {
+    pub(crate) fn set_context(&mut self, ctx: Handle<Context>, reader: Arc<dyn IDataReader>) {
         self.ctx = ctx;
         self.reader = reader;
     }
@@ -981,7 +1004,7 @@ impl BucketMgr {
     pub(crate) fn start(
         &mut self,
         ctx: Handle<Context>,
-        reader: Arc<dyn DataReader>,
+        reader: Arc<dyn IDataReader>,
         observer: Arc<dyn CheckpointObserver>,
     ) {
         self.set_context(ctx, reader);

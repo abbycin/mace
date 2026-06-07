@@ -3,7 +3,7 @@ use std::sync::Arc;
 use mace::observe::{
     CounterMetric, HistogramMetric, InMemoryObserver, ObserveEvent, ObserveSnapshot,
 };
-use mace::{Mace, OpCode, Options};
+use mace::{BucketOptions, Mace, OpCode, Options};
 
 fn main() -> Result<(), OpCode> {
     let path = std::env::temp_dir().join(format!("mace_observer_{}", std::process::id()));
@@ -14,7 +14,7 @@ fn main() -> Result<(), OpCode> {
     opt.observer = observer.clone();
 
     let db = Mace::new(opt.validate()?)?;
-    let bucket = db.new_bucket("observe")?;
+    let bucket = db.new_bucket("observe", BucketOptions::default())?;
 
     let tx = bucket.begin()?;
     tx.put("k1", "v1")?;

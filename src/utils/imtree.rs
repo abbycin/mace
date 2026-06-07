@@ -1099,7 +1099,7 @@ mod test {
     use std::sync::atomic::Ordering::Relaxed;
     use std::{cmp::Ordering::Equal, sync::atomic::AtomicU64};
 
-    use crate::Options;
+    use crate::BucketOptions;
     use crate::types::data::{Key, Record, Ver};
     use crate::types::refbox::{BoxRef, DeltaView};
     use crate::types::traits::IFrameAlloc;
@@ -1117,7 +1117,7 @@ mod test {
         }
 
         fn inline_size(&self) -> usize {
-            Options::MIN_INLINE_SIZE
+            BucketOptions::MIN_INLINE_SIZE
         }
     }
 

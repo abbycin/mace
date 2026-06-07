@@ -90,7 +90,7 @@ where
         let (addr, total_size, max_txid) = (h.addr, h.total_size as usize, h.txid);
         let base = b.view().as_base();
         loader.pin(b);
-        let this = Self {
+        Self {
             loader,
             mtx: Arc::new(Mutex::new(())),
             state: RwLock::new(NodeState {
@@ -106,12 +106,11 @@ where
                 }),
             }),
             inner: base,
-        };
-        this
+        }
     }
 
     pub(crate) fn load(addr: u64, loader: L) -> Result<Self, OpCode> {
-        let d = loader.load(addr)?;
+        let d = loader.load_pinned(addr)?;
         let mut l = Self {
             loader,
             mtx: Arc::new(Mutex::new(())),
@@ -129,18 +128,16 @@ where
         Ok(l)
     }
 
-    /// a DeltaView's owner
-    fn save(&self, b: BoxRef, r: Option<BoxRef>) {
+    /// keep node-owned pages alive until the page itself is reclaimed
+    /// NOTE: remote page are not saved and should be load from dirty pages or cache
+    fn save_delta(&self, b: BoxRef) {
         self.loader.pin(b);
-        if let Some(x) = r {
-            self.loader.pin(x);
-        }
     }
 
     pub(crate) fn reference(&self) -> Self {
         let state = self.state.read();
-        let this = Self {
-            loader: self.loader.copy_with_pin(),
+        Self {
+            loader: self.loader.copy(),
             mtx: self.mtx.clone(),
             state: RwLock::new(NodeState {
                 addr: state.addr,
@@ -151,8 +148,7 @@ where
                 delta: state.delta.clone(),
             }),
             inner: self.inner,
-        };
-        this
+        }
     }
 
     pub(crate) fn pid(&self) -> u64 {
@@ -309,7 +305,7 @@ where
             let h = merged.header();
             (h.group, h.lsn)
         };
-        let mut node = Self::new(self.loader.copy_without_pin(), merged, group, lsn);
+        let mut node = Self::new(self.loader.copy_detached(), merged, group, lsn);
         node.header_mut().split_elems = self.header().split_elems;
         (node, junks)
     }
@@ -479,8 +475,8 @@ where
             (h.group, h.lsn)
         };
         let (mut lhs, mut rhs) = (
-            Self::new(self.loader.copy_without_pin(), l, lgroup, llsn),
-            Self::new(self.loader.copy_without_pin(), r, rgroup, rlsn),
+            Self::new(self.loader.copy_detached(), l, lgroup, llsn),
+            Self::new(self.loader.copy_detached(), r, rgroup, rlsn),
         );
         lhs.header_mut().split_elems = sep as u16;
         rhs.header_mut().split_elems = (elems - sep) as u16;
@@ -554,10 +550,7 @@ where
             let h = b.header();
             (h.group, h.lsn)
         };
-        (
-            Self::new(self.loader.copy_without_pin(), b, group, lsn),
-            junks,
-        )
+        (Self::new(self.loader.copy_detached(), b, group, lsn), junks)
     }
 
     pub(crate) fn remove_aborted<A: IFrameAlloc>(
@@ -578,7 +571,7 @@ where
             (h.group, h.lsn)
         };
         (
-            Self::new(self.loader.copy_without_pin(), b, group, lsn),
+            Self::new(self.loader.copy_detached(), b, group, lsn),
             junks,
             removed,
         )
@@ -705,11 +698,11 @@ where
         h.pid = th.pid;
         let addr = h.addr;
 
-        // must save in pinned, because checkpoint may concurrently happen
+        // keep the delta page in node_pins, because checkpoint may concurrently happen
         self.loader.pin(b);
 
         Node {
-            loader: self.loader.copy_with_pin(),
+            loader: self.loader.copy(),
             mtx: self.mtx.clone(),
             state: RwLock::new(NodeState {
                 addr,
@@ -789,7 +782,7 @@ where
                 let k = Key::decode_from(x.key());
                 if k.raw() == key.raw() {
                     let v = x.val();
-                    let (v, r) = v.get_record(&self.loader, true);
+                    let (v, r) = v.get_record(&self.loader);
                     result = Some((k.ver, v, r.unwrap_or_else(|| self.base_box())));
                     return true;
                 }
@@ -802,7 +795,7 @@ where
         }
 
         self.search_sst(key).map(|(k, v)| {
-            let (v, r) = v.get_record(&self.loader, true);
+            let (v, r) = v.get_record(&self.loader);
             (k.ver, v, r.unwrap_or_else(|| self.base_box()))
         })
     }
@@ -884,7 +877,7 @@ where
             for x in it {
                 let k = Key::decode_from(x.key());
                 let val = x.val();
-                let (r, _) = val.get_record(&self.loader, true);
+                let (r, _) = val.get_record(&self.loader);
                 log::debug!("{} => {}", k.to_string(), r);
             }
             let sst = self.sst::<Key>();
@@ -936,7 +929,7 @@ where
             if d.link == NULL_ADDR {
                 break;
             }
-            d = l.loader.load(d.link)?;
+            d = l.loader.load_pinned(d.link)?;
         }
         assert!(!l.inner.is_null());
         Ok(())
@@ -1119,13 +1112,13 @@ impl<L> NodeGuard<'_, L>
 where
     L: ILoader,
 {
-    pub(crate) fn insert(&self, k: BoxRef, v: Option<BoxRef>) -> u64 {
-        let remote_size = v
+    pub(crate) fn insert(&self, k: BoxRef, remote: Option<BoxRef>) -> u64 {
+        let remote_size = remote
             .as_ref()
             .map(|x| x.header().total_size as usize)
             .unwrap_or(0);
         let addr = self.node.insert_inplace(k.view().as_delta(), remote_size);
-        self.node.save(k, v); // save the delta itself until page is reclaimed
+        self.node.save_delta(k); // keep the delta page itself alive until page reclamation
         addr
     }
 }
@@ -1650,7 +1643,7 @@ mod test {
     };
 
     use crate::{
-        Options,
+        BucketOptions,
         types::{
             data::{Key, LeafSeg, Record, Ver},
             node::{Junk, Node},
@@ -1701,12 +1694,12 @@ mod test {
         }
 
         fn inline_size(&self) -> usize {
-            Options::MIN_INLINE_SIZE
+            BucketOptions::MIN_INLINE_SIZE
         }
     }
 
     impl ILoader for A {
-        fn load(&self, addr: u64) -> Result<BoxView, OpCode> {
+        fn load_pinned(&self, addr: u64) -> Result<BoxView, OpCode> {
             Ok(self.load(addr).view())
         }
 
@@ -1715,15 +1708,19 @@ mod test {
             lk.insert(data.header().addr, data);
         }
 
-        fn copy_with_pin(&self) -> Self {
+        fn copy(&self) -> Self {
             self.clone()
         }
 
-        fn copy_without_pin(&self) -> Self {
+        fn copy_detached(&self) -> Self {
             self.clone()
         }
 
-        fn load_remote(&self, addr: u64) -> Result<BoxRef, OpCode> {
+        fn load_sibling(&self, addr: u64) -> Result<BoxRef, OpCode> {
+            Ok(self.load(addr))
+        }
+
+        fn load_blob(&self, addr: u64, _cache: bool) -> Result<BoxRef, OpCode> {
             self.inner.remote_loads.fetch_add(1, Relaxed);
             Ok(self.load(addr))
         }
@@ -1735,7 +1732,7 @@ mod test {
         let l = a.clone();
         let node = Node::new_leaf(&mut a, l.clone(), 0, Position::MIN);
         let key = Key::new("blob".as_bytes(), Ver::new(1, 1));
-        let value = vec![7u8; Options::MIN_INLINE_SIZE + 16];
+        let value = vec![7u8; BucketOptions::MIN_INLINE_SIZE + 16];
         let record = Record::normal(1, &value);
         let (delta, remote) = DeltaView::from_key_val(&mut a, &key, &record, 0, Position::MIN);
         node.insert_inplace(
@@ -1745,7 +1742,8 @@ mod test {
                 .map(|x| x.header().total_size as usize)
                 .unwrap_or(0),
         );
-        node.save(delta, remote);
+        let _ = remote;
+        node.save_delta(delta);
         let (node, _) = node.compact(&mut a, 1);
 
         a.inner.remote_loads.store(0, Relaxed);
@@ -1803,14 +1801,16 @@ mod test {
                     .map(|x| x.header().total_size as usize)
                     .unwrap_or(0),
             );
-            node.save(d1, r1);
+            let _ = r1;
+            node.save_delta(d1);
             node.insert_inplace(
                 d2.view().as_delta(),
                 r2.as_ref()
                     .map(|x| x.header().total_size as usize)
                     .unwrap_or(0),
             );
-            node.save(d2, r2);
+            let _ = r2;
+            node.save_delta(d2);
             (node, _) = node.compact(&mut a, 1);
 
             let iter = node.leaf_iter(&mut j, 1);
@@ -1822,7 +1822,8 @@ mod test {
                     .map(|x| x.header().total_size as usize)
                     .unwrap_or(0),
             );
-            node.save(d3, r3);
+            let _ = r3;
+            node.save_delta(d3);
             let iter = node.leaf_iter(&mut j, 3);
             assert_eq!(iter.count(), 0);
         }
@@ -1841,7 +1842,8 @@ mod test {
                     .map(|x| x.header().total_size as usize)
                     .unwrap_or(0),
             );
-            node.save(delta, r);
+            let _ = r;
+            node.save_delta(delta);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
                 (node, _) = node.compact(&mut a, 3);
@@ -1860,7 +1862,8 @@ mod test {
                     .map(|x| x.header().total_size as usize)
                     .unwrap_or(0),
             );
-            node.save(delta, r);
+            let _ = r;
+            node.save_delta(delta);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
                 (node, _) = node.compact(&mut a, 3);
@@ -1879,7 +1882,8 @@ mod test {
                     .map(|x| x.header().total_size as usize)
                     .unwrap_or(0),
             );
-            node.save(delta, r);
+            let _ = r;
+            node.save_delta(delta);
 
             if node.delta_len() >= CONSOLIDATE_THRESHOLD {
                 (node, _) = node.compact(&mut a, 3);

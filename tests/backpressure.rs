@@ -1,7 +1,7 @@
 use mace::observe::{
     CounterMetric, HistogramMetric, HistogramSample, InMemoryObserver, ObserveSnapshot,
 };
-use mace::{Mace, OpCode, Options, RandomPath};
+use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::{Arc, Barrier};
 
 fn counter(snapshot: &ObserveSnapshot, metric: CounterMetric) -> u64 {
@@ -30,13 +30,20 @@ fn write_backpressure_emits_observe_metrics() -> Result<(), OpCode> {
     opt.tmp_store = true;
     opt.sync_on_write = false;
     opt.concurrent_write = 4;
-    opt.checkpoint_size = 8 << 10;
-    opt.pool_capacity = 8 << 10;
-    opt.enable_backpressure = true;
     opt.observer = observer.clone();
 
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                checkpoint_size: 8 << 10,
+                pool_capacity: 8 << 10,
+                enable_backpressure: true,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
     let value = vec![b'v'; 64 << 10];
     let workers = 4;
     let rounds = 120;

@@ -23,21 +23,21 @@ use crate::{
     cc::context::Context,
     io::{File, GatherIO},
     map::{
-        DataReader, IFooter, SharedState,
+        IDataReader, IFooter, SharedState,
         buffer::{BucketContext, BucketMgr},
         data::{BlobFooter, DataFooter, MetaReader},
         flush::CheckpointObserver,
         table::{BucketState, PageMap},
     },
-    types::refbox::BoxRef,
+    types::refbox::{BoxRef, BoxView},
     utils::{
         Handle, MutRef, OpCode,
         bitmap::BitMap,
-        data::{GroupPositions, LenSeq, Position, Reloc, init_group_pos},
+        data::{AddrPair, GroupPositions, LenSeq, Position, Reloc, init_group_pos},
         interval::IntervalMap,
         lru::{Lru, ShardLru},
         observe::{CounterMetric, EventKind, ObserveEvent},
-        options::ParsedOptions,
+        options::{BucketOptions, ParsedOptions},
     },
 };
 use std::sync::mpsc::{Receiver, Sender};
@@ -324,24 +324,34 @@ impl<'a> Txn<'a> {
 
 struct FileReader {
     file: File,
-    map: HashMap<u64, Reloc>,
+    relocs: Box<[AddrPair]>,
 }
 
 fn new_reader<T: IFooter>(path: PathBuf) -> Result<Arc<FileReader>, OpCode> {
     let mut loader = MetaReader::<T>::new(&path).expect("not such path");
     let relocs = loader.get_reloc().expect("must exist");
-    let mut map = HashMap::with_capacity(relocs.len());
-    for x in relocs {
-        map.insert(x.key, x.val);
-    }
-
+    let relocs = {
+        #[cfg(feature = "extra_check")]
+        for w in relocs.windows(2) {
+            let prev = w[0].key;
+            let next = w[1].key;
+            debug_assert!(prev <= next, "reloc table must be sorted by addr");
+        }
+        relocs
+    };
     let file = loader.take();
-    Ok(Arc::new(FileReader { file, map }))
+    Ok(Arc::new(FileReader { file, relocs }))
 }
 
 impl FileReader {
+    #[inline]
+    fn find_reloc(&self, pos: u64) -> Option<Reloc> {
+        let idx = self.relocs.binary_search_by_key(&pos, |x| x.key).ok()?;
+        Some(self.relocs[idx].val)
+    }
+
     fn read_at(&self, pos: u64) -> Result<BoxRef, OpCode> {
-        let m = self.map.get(&pos).expect("can't find addr in reloc");
+        let m = self.find_reloc(pos).expect("can't find addr in reloc");
         let real_size = BoxRef::real_size_from_dump(m.len);
         let mut p = BoxRef::alloc_exact(real_size, pos);
         let mut crc = Crc32cHasher::default();
@@ -419,7 +429,7 @@ impl Manifest {
     pub(crate) fn set_context(
         &self,
         ctx: Handle<Context>,
-        reader: Arc<dyn DataReader>,
+        reader: Arc<dyn IDataReader>,
         observer: Arc<dyn CheckpointObserver>,
     ) {
         unsafe {
@@ -443,8 +453,8 @@ impl Manifest {
 
         let meta = meta.ok_or(OpCode::NotFound)?;
         self.bucket_metas.insert(name.to_string(), meta.clone());
-        self.bucket_metas_by_id.insert(meta.bucket_id, meta.clone());
-        self.ensure_bucket_state(meta.bucket_id);
+        self.bucket_metas_by_id.insert(meta.id, meta.clone());
+        self.ensure_bucket_state(meta.id);
         Ok(meta)
     }
 
@@ -460,6 +470,7 @@ impl Manifest {
     pub(crate) fn create_bucket(
         &self,
         name: &str,
+        opt: BucketOptions,
     ) -> Result<(Arc<BucketMeta>, Arc<BucketContext>), OpCode> {
         let _lock = self.structural_lock.lock();
 
@@ -476,7 +487,10 @@ impl Manifest {
         let bucket_id = self.numerics.next_bucket_id.fetch_add(1, Relaxed);
         self.nr_buckets.fetch_add(1, Relaxed);
 
-        let meta = Arc::new(BucketMeta { bucket_id });
+        let meta = Arc::new(BucketMeta {
+            id: bucket_id,
+            options: opt,
+        });
         // publish meta early so context creation sees it
         self.bucket_metas.insert(name.to_string(), meta.clone());
         self.bucket_metas_by_id.insert(bucket_id, meta.clone());
@@ -499,6 +513,71 @@ impl Manifest {
         txn.commit();
 
         Ok((meta, bucket_ctx))
+    }
+
+    fn bucket_option_conflicts(old: BucketOptions, new: BucketOptions) -> Vec<&'static str> {
+        let mut conflicts = Vec::new();
+        if old.inline_size != new.inline_size {
+            conflicts.push("inline_size");
+        }
+        if old.split_elems != new.split_elems {
+            conflicts.push("split_elems");
+        }
+        conflicts
+    }
+
+    pub(crate) fn update_bucket_options(
+        &self,
+        name: &str,
+        opt: BucketOptions,
+    ) -> Result<(), OpCode> {
+        let _lock = self.structural_lock.lock();
+        let meta = self.load_bucket_meta_locked(name)?;
+        let bucket_id = meta.id;
+
+        if self.buckets.buckets.contains_key(&bucket_id) {
+            log::info!(
+                "bucket {}({}) is loaded, reject bucket option update",
+                name,
+                bucket_id
+            );
+            return Err(OpCode::Again);
+        }
+
+        if meta.options == opt {
+            return Ok(());
+        }
+
+        let conflicts = Self::bucket_option_conflicts(meta.options, opt);
+        if !conflicts.is_empty() {
+            log::error!(
+                "bucket {}({}) option update conflicts on [{}], old: {:?}, new: {:?}",
+                name,
+                bucket_id,
+                conflicts.join(", "),
+                meta.options,
+                opt
+            );
+            return Err(OpCode::Invalid);
+        }
+
+        let new_meta = Arc::new(BucketMeta {
+            id: bucket_id,
+            options: opt,
+        });
+        let mut buf = vec![0u8; new_meta.as_ref().packed_size()];
+        new_meta.as_ref().encode(&mut buf);
+
+        let mut txn = self.begin();
+        txn.ops_mut()
+            .entry(BUCKET_METAS.to_string())
+            .or_default()
+            .push(MetaOp::Put(name.as_bytes().to_vec(), buf));
+        txn.commit();
+
+        self.bucket_metas.insert(name.to_string(), new_meta.clone());
+        self.bucket_metas_by_id.insert(bucket_id, new_meta);
+        Ok(())
     }
 
     pub(crate) fn load_bucket_context(&self, bucket_id: u64) -> Result<Arc<BucketContext>, OpCode> {
@@ -553,15 +632,21 @@ impl Manifest {
             .as_ref()
             .expect("flusher started")
             .clone();
+        let meta = self
+            .bucket_metas_by_id
+            .get(&bucket_id)
+            .expect("bucket meta must exist")
+            .clone();
         let ctx = Arc::new(BucketContext::new(
             self.buckets.ctx,
+            &self.opt,
+            Arc::new(meta.options),
             state,
             bucket_id,
             table,
             flush,
             self.buckets.lru,
             self.buckets.reader.clone(),
-            self.buckets.used.clone(),
             self.buckets.tx.clone(),
         ));
 
@@ -605,7 +690,7 @@ impl Manifest {
         mode: BucketRemoveMode,
     ) -> Result<u64, OpCode> {
         let meta = self.load_bucket_meta_locked(name)?;
-        let bucket_id = meta.bucket_id;
+        let bucket_id = meta.id;
 
         // remove from maps (unpublish)
         self.bucket_metas.remove(name);
@@ -635,7 +720,7 @@ impl Manifest {
         let _lock = self.structural_lock.lock();
         let bucket_id = {
             let meta = self.load_bucket_meta_locked(name)?;
-            meta.bucket_id
+            meta.id
         };
         if self.buckets.ctx.has_pending_abort_clean_bucket(bucket_id) {
             return Err(OpCode::Again);
@@ -1026,21 +1111,16 @@ impl Manifest {
 
     pub(crate) fn load_blob<C>(&self, bucket_id: u64, addr: u64, cache: C) -> Result<BoxRef, OpCode>
     where
-        C: Fn(BoxRef),
+        C: Fn(BoxView),
     {
         let ctx = self.get_bucket_context_must_exist(bucket_id);
         match self.blob_stat.load(addr, &ctx) {
             Ok(b) => {
-                cache(b.clone());
+                cache(b.view());
                 Ok(b)
             }
             e => e,
         }
-    }
-
-    pub(crate) fn load_blob_uncached(&self, bucket_id: u64, addr: u64) -> Result<BoxRef, OpCode> {
-        let ctx = self.get_bucket_context_must_exist(bucket_id);
-        self.blob_stat.load(addr, &ctx)
     }
 
     pub(crate) fn save_obsolete_data(&self, id: &[u64]) {
@@ -1213,7 +1293,7 @@ where
     fn try_get_reloc(&self, file_id: u64, pos: u64) -> Option<Reloc> {
         loop {
             if let Some(reader) = self.common.cache.get(file_id).map(|x| x.clone()) {
-                return reader.map.get(&pos).copied();
+                return reader.find_reloc(pos);
             }
 
             let lk = self.common.cache.lock_shard(file_id);

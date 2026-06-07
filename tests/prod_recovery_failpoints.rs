@@ -3,7 +3,7 @@
 mod common;
 
 use common::child_test_command;
-use mace::{Bucket, Mace, OpCode, Options, RandomPath};
+use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
@@ -57,12 +57,23 @@ fn child_setup_common(db_root: &Path) -> (Mace, Bucket) {
         opt.gc_timeout = 20;
         opt.gc_eager = true;
         opt.data_garbage_ratio = 1;
-        opt.inline_size = 512;
     });
 
     let bucket = match mace.get_bucket("prod") {
         Ok(bucket) => bucket,
-        Err(OpCode::NotFound) => mace.new_bucket("prod").expect("create prod bucket failed"),
+        Err(OpCode::NotFound) => mace
+            .new_bucket(
+                "prod",
+                BucketOptions {
+                    inline_size: 4096,
+                    cache_evict_pct: 10,
+                    checkpoint_size: 32 << 10,
+                    pool_capacity: 64 << 10,
+                    enable_backpressure: false,
+                    ..BucketOptions::default()
+                },
+            )
+            .expect("create prod bucket failed"),
         Err(err) => panic!("open prod bucket failed: {err:?}"),
     };
 
@@ -79,7 +90,6 @@ fn child_setup_gc(db_root: &Path) -> (Mace, Bucket) {
         opt.gc_timeout = 20;
         opt.gc_eager = true;
         opt.data_garbage_ratio = 1;
-        opt.inline_size = 256;
         opt.blob_garbage_ratio = 1;
         opt.blob_gc_ratio = 100;
         opt.blob_file_size = 128 << 10;
@@ -87,7 +97,19 @@ fn child_setup_gc(db_root: &Path) -> (Mace, Bucket) {
 
     let bucket = match mace.get_bucket("prod") {
         Ok(bucket) => bucket,
-        Err(OpCode::NotFound) => mace.new_bucket("prod").expect("create prod bucket failed"),
+        Err(OpCode::NotFound) => mace
+            .new_bucket(
+                "prod",
+                BucketOptions {
+                    inline_size: 8192,
+                    cache_evict_pct: 10,
+                    checkpoint_size: 32 << 10,
+                    pool_capacity: 64 << 10,
+                    enable_backpressure: false,
+                    ..BucketOptions::default()
+                },
+            )
+            .expect("create prod bucket failed"),
         Err(err) => panic!("open prod bucket failed: {err:?}"),
     };
 
@@ -106,7 +128,6 @@ fn child_setup_data_gc(db_root: &Path) -> (Mace, Bucket) {
         // keep data rewrite gate always open in this failpoint harness
         // the test target here is crash-window closure after entering rewrite path
         opt.data_garbage_ratio = 0;
-        opt.inline_size = 256;
         opt.blob_garbage_ratio = 1;
         opt.blob_gc_ratio = 100;
         opt.blob_file_size = 128 << 10;
@@ -114,7 +135,19 @@ fn child_setup_data_gc(db_root: &Path) -> (Mace, Bucket) {
 
     let bucket = match mace.get_bucket("prod") {
         Ok(bucket) => bucket,
-        Err(OpCode::NotFound) => mace.new_bucket("prod").expect("create prod bucket failed"),
+        Err(OpCode::NotFound) => mace
+            .new_bucket(
+                "prod",
+                BucketOptions {
+                    inline_size: 8192,
+                    cache_evict_pct: 10,
+                    checkpoint_size: 32 << 10,
+                    pool_capacity: 64 << 10,
+                    enable_backpressure: false,
+                    ..BucketOptions::default()
+                },
+            )
+            .expect("create prod bucket failed"),
         Err(err) => panic!("open prod bucket failed: {err:?}"),
     };
 
@@ -130,12 +163,23 @@ fn child_setup_retire(db_root: &Path) -> (Mace, Bucket) {
         opt.gc_timeout = 60_000;
         opt.gc_eager = false;
         opt.data_garbage_ratio = 1;
-        opt.inline_size = 512;
     });
 
     let bucket = match mace.get_bucket("prod") {
         Ok(bucket) => bucket,
-        Err(OpCode::NotFound) => mace.new_bucket("prod").expect("create prod bucket failed"),
+        Err(OpCode::NotFound) => mace
+            .new_bucket(
+                "prod",
+                BucketOptions {
+                    inline_size: 512,
+                    cache_evict_pct: 10,
+                    checkpoint_size: 32 << 10,
+                    pool_capacity: 64 << 10,
+                    enable_backpressure: false,
+                    ..BucketOptions::default()
+                },
+            )
+            .expect("create prod bucket failed"),
         Err(err) => panic!("open prod bucket failed: {err:?}"),
     };
 
@@ -151,12 +195,21 @@ fn child_setup_wal_recycle(db_root: &Path) -> (Mace, Bucket) {
         opt.wal_file_size = 4 << 10;
         opt.gc_timeout = 60_000;
         opt.gc_eager = false;
-        opt.inline_size = 512;
     });
 
     let bucket = match mace.get_bucket("prod") {
         Ok(bucket) => bucket,
-        Err(OpCode::NotFound) => mace.new_bucket("prod").expect("create prod bucket failed"),
+        Err(OpCode::NotFound) => mace
+            .new_bucket(
+                "prod",
+                BucketOptions {
+                    inline_size: 512,
+                    cache_evict_pct: 10,
+                    enable_backpressure: false,
+                    ..BucketOptions::default()
+                },
+            )
+            .expect("create prod bucket failed"),
         Err(err) => panic!("open prod bucket failed: {err:?}"),
     };
 
@@ -232,15 +285,8 @@ fn drive_blob_gc_pressure(bucket: &Bucket, rounds: usize, blob_size: usize) {
     }
 }
 
-fn assert_visibility_after_reopen(
-    db_root: &Path,
-    inline_size: usize,
-    committed: usize,
-    uncommitted: usize,
-) {
-    let mace = open_with_tune(db_root, |opt| {
-        opt.inline_size = inline_size;
-    });
+fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted: usize) {
+    let mace = open_with_tune(db_root, |_opt| {});
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
 
@@ -256,10 +302,8 @@ fn assert_visibility_after_reopen(
     }
 }
 
-fn assert_bucket_readable(db_root: &Path, inline_size: usize) {
-    let mace = open_with_tune(db_root, |opt| {
-        opt.inline_size = inline_size;
-    });
+fn assert_bucket_readable(db_root: &Path) {
+    let mace = open_with_tune(db_root, |_opt| {});
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
 
@@ -269,9 +313,8 @@ fn assert_bucket_readable(db_root: &Path, inline_size: usize) {
     }
 }
 
-fn assert_rewrite_visibility_after_reopen(db_root: &Path, inline_size: usize) {
+fn assert_rewrite_visibility_after_reopen(db_root: &Path) {
     let mace = open_with_tune(db_root, |opt| {
-        opt.inline_size = inline_size;
         opt.gc_timeout = 20;
         opt.gc_eager = true;
     });
@@ -289,9 +332,8 @@ fn assert_rewrite_visibility_after_reopen(db_root: &Path, inline_size: usize) {
     }
 }
 
-fn assert_rewrite_visibility_after_reopen_multi_bucket(db_root: &Path, inline_size: usize) {
+fn assert_rewrite_visibility_after_reopen_multi_bucket(db_root: &Path) {
     let mace = open_with_tune(db_root, |opt| {
-        opt.inline_size = inline_size;
         opt.gc_timeout = 20;
         opt.gc_eager = true;
     });
@@ -449,7 +491,7 @@ fn child_case_flush_after_manifest_commit_with_retire_multi_bucket(db_root: &Pat
     let bucket2 = match mace.get_bucket("prod2") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
-            .new_bucket("prod2")
+            .new_bucket("prod2", BucketOptions::default())
             .expect("create prod2 bucket failed"),
         Err(err) => panic!("open prod2 bucket failed: {err:?}"),
     };
@@ -584,13 +626,20 @@ fn child_case_gc_blob_before_meta_commit(db_root: &Path) -> ! {
 fn child_case_evictor_before_evict_once(db_root: &Path) -> ! {
     let mace = open_with_tune(db_root, |opt| {
         opt.sync_on_write = false;
-        opt.cache_capacity = Options::MIN_CACHE_CAP;
-        opt.cache_evict_pct = 100;
         opt.data_file_size = 16 << 10;
         opt.wal_buffer_size = 32 << 10;
         opt.wal_file_size = 8 << 10;
     });
-    let bucket = mace.new_bucket("prod").expect("create prod bucket failed");
+    let bucket = mace
+        .new_bucket(
+            "prod",
+            BucketOptions {
+                cache_capacity: 1 << 20,
+                cache_evict_pct: 100,
+                ..BucketOptions::default()
+            },
+        )
+        .expect("create prod bucket failed");
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let payload = vec![b'e'; 4 << 10];
@@ -681,7 +730,7 @@ fn chaos_failpoint_flush_after_data_sync() {
         !crashed_files.is_empty(),
         "expected flush crash to leave data/blob files before recovery"
     );
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
     for file in crashed_files {
         assert!(
             !file.exists(),
@@ -708,7 +757,7 @@ fn chaos_failpoint_flush_after_data_dir_sync() {
         !crashed_files.is_empty(),
         "expected flush crash to leave data/blob files before recovery"
     );
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
     for file in crashed_files {
         assert!(
             !file.exists(),
@@ -732,7 +781,7 @@ fn chaos_failpoint_flush_before_manifest_commit() {
         !crashed_files.is_empty(),
         "expected flush crash to leave data/blob files before recovery"
     );
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
     for file in crashed_files {
         assert!(
             !file.exists(),
@@ -756,7 +805,7 @@ fn chaos_failpoint_flush_after_manifest_commit() {
         !crashed_files.is_empty(),
         "expected committed flush files before recovery"
     );
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
     assert!(
         crashed_files.iter().any(|file| file.exists()),
         "flush files committed before crash should survive recovery"
@@ -776,7 +825,7 @@ fn chaos_failpoint_flush_after_manifest_commit_with_retire() {
         status,
         "flush-after-manifest-with-retire failpoint child should abort",
     );
-    assert_rewrite_visibility_after_reopen(&path, 512);
+    assert_rewrite_visibility_after_reopen(&path);
 }
 
 #[test]
@@ -792,7 +841,7 @@ fn chaos_failpoint_flush_after_data_sync_with_retire() {
         status,
         "flush-after-data-sync-with-retire failpoint child should abort",
     );
-    assert_rewrite_visibility_after_reopen(&path, 512);
+    assert_rewrite_visibility_after_reopen(&path);
 }
 
 #[test]
@@ -808,7 +857,7 @@ fn chaos_failpoint_flush_before_manifest_commit_with_retire() {
         status,
         "flush-before-manifest-with-retire failpoint child should abort",
     );
-    assert_rewrite_visibility_after_reopen(&path, 512);
+    assert_rewrite_visibility_after_reopen(&path);
 }
 
 #[test]
@@ -824,7 +873,7 @@ fn chaos_failpoint_flush_after_manifest_commit_with_retire_multi_bucket() {
         status,
         "flush-after-manifest-with-retire-multi-bucket failpoint child should abort",
     );
-    assert_rewrite_visibility_after_reopen_multi_bucket(&path, 512);
+    assert_rewrite_visibility_after_reopen_multi_bucket(&path);
 }
 
 #[test]
@@ -837,7 +886,7 @@ fn chaos_failpoint_wal_after_checkpoint_write() {
         "mace_wal_after_checkpoint_write=abort@1",
     );
     assert_child_aborted(status, "wal failpoint child should abort");
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
 }
 
 #[test]
@@ -850,7 +899,7 @@ fn chaos_failpoint_manifest_before_multi_commit() {
         "mace_manifest_before_multi_commit=abort@3",
     );
     assert_child_aborted(status, "manifest failpoint child should abort");
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
 }
 
 #[test]
@@ -866,7 +915,7 @@ fn chaos_failpoint_wal_recycle_after_remove_before_dir_sync() {
         status,
         "wal-recycle-after-remove-before-dir-sync failpoint child should abort",
     );
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
 }
 
 #[test]
@@ -882,7 +931,7 @@ fn chaos_failpoint_wal_recycle_after_dir_sync() {
         status,
         "wal-recycle-after-dir-sync failpoint child should abort",
     );
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
 }
 
 #[test]
@@ -898,7 +947,7 @@ fn chaos_failpoint_txn_commit_after_wal_file_sync_before_dir_sync() {
         status,
         "txn-after-wal-file-sync-before-dir-sync failpoint child should abort",
     );
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
 }
 
 #[test]
@@ -914,7 +963,7 @@ fn chaos_failpoint_txn_commit_after_record_commit() {
         status,
         "txn-after-record-commit failpoint child should abort",
     );
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
 }
 
 #[test]
@@ -927,7 +976,7 @@ fn chaos_failpoint_txn_commit_after_wal_sync() {
         "mace_txn_commit_after_wal_sync=abort@2",
     );
     assert_child_aborted(status, "txn-after-wal-sync failpoint child should abort");
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
 }
 
 #[test]
@@ -940,7 +989,7 @@ fn chaos_failpoint_gc_data_rewrite_before_meta_commit() {
         "mace_gc_data_rewrite_before_meta_commit=abort@1",
     );
     assert_child_aborted(status, "gc-data failpoint child should abort");
-    assert_bucket_readable(&path, 256);
+    assert_bucket_readable(&path);
 }
 
 #[test]
@@ -953,7 +1002,7 @@ fn chaos_failpoint_gc_data_rewrite_after_stage_marker() {
         "mace_gc_data_rewrite_after_stage_marker=abort@1",
     );
     assert_child_aborted(status, "gc-data-after-marker failpoint child should abort");
-    assert_bucket_readable(&path, 256);
+    assert_bucket_readable(&path);
 }
 
 #[test]
@@ -969,7 +1018,7 @@ fn chaos_failpoint_gc_data_rewrite_after_data_dir_sync() {
         status,
         "gc-data-after-data-dir-sync failpoint child should abort",
     );
-    assert_bucket_readable(&path, 256);
+    assert_bucket_readable(&path);
 }
 
 #[test]
@@ -982,7 +1031,7 @@ fn chaos_failpoint_gc_data_rewrite_after_meta_commit() {
         "mace_gc_data_rewrite_after_meta_commit=abort@1",
     );
     assert_child_aborted(status, "gc-data-after-meta failpoint child should abort");
-    assert_bucket_readable(&path, 256);
+    assert_bucket_readable(&path);
 }
 
 #[test]
@@ -995,7 +1044,7 @@ fn chaos_failpoint_gc_blob_rewrite_before_meta_commit() {
         "mace_gc_blob_rewrite_before_meta_commit=abort@1",
     );
     assert_child_aborted(status, "gc-blob failpoint child should abort");
-    assert_bucket_readable(&path, 256);
+    assert_bucket_readable(&path);
 }
 
 #[test]
@@ -1008,7 +1057,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_stage_marker() {
         "mace_gc_blob_rewrite_after_stage_marker=abort@1",
     );
     assert_child_aborted(status, "gc-blob-after-marker failpoint child should abort");
-    assert_bucket_readable(&path, 256);
+    assert_bucket_readable(&path);
 }
 
 #[test]
@@ -1024,7 +1073,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_data_dir_sync() {
         status,
         "gc-blob-after-data-dir-sync failpoint child should abort",
     );
-    assert_bucket_readable(&path, 256);
+    assert_bucket_readable(&path);
 }
 
 #[test]
@@ -1037,7 +1086,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_meta_commit() {
         "mace_gc_blob_rewrite_after_meta_commit=abort@1",
     );
     assert_child_aborted(status, "gc-blob-after-meta failpoint child should abort");
-    assert_bucket_readable(&path, 256);
+    assert_bucket_readable(&path);
 }
 
 #[test]
@@ -1053,7 +1102,7 @@ fn chaos_failpoint_delete_files_after_dir_sync_before_meta_commit() {
         status,
         "delete-files-after-dir-sync-before-meta-commit failpoint child should abort",
     );
-    assert_bucket_readable(&path, 256);
+    assert_bucket_readable(&path);
 }
 
 #[test]
@@ -1082,7 +1131,7 @@ fn chaos_failpoint_recovery_orphan_cleanup_after_data_dir_sync_before_marker_cle
         "recovery-orphan-cleanup-after-data-dir-sync-before-marker-clear child should abort",
     );
 
-    assert_visibility_after_reopen(&path, 512, 64, 24);
+    assert_visibility_after_reopen(&path, 64, 24);
     for file in crashed_files {
         assert!(
             !file.exists(),
@@ -1099,14 +1148,19 @@ fn recovery_rejects_sparse_wal_gap_after_checkpoint() {
             opt.concurrent_write = 1;
             opt.sync_on_write = true;
             opt.data_file_size = 64 << 20;
-            opt.checkpoint_size = 64 << 20;
-            opt.pool_capacity = 128 << 20;
             opt.wal_buffer_size = 8 << 10;
             opt.wal_file_size = 4 << 10;
-            opt.inline_size = 512;
         });
         let bucket = mace
-            .new_bucket("prod")
+            .new_bucket(
+                "prod",
+                BucketOptions {
+                    inline_size: 512,
+                    checkpoint_size: 64 << 20,
+                    pool_capacity: 128 << 20,
+                    ..BucketOptions::default()
+                },
+            )
             .expect("create prod bucket for sparse wal test failed");
 
         let txn = bucket.begin().expect("begin seed txn failed");
@@ -1146,7 +1200,6 @@ fn recovery_rejects_sparse_wal_gap_after_checkpoint() {
     opt.data_file_size = 16 << 10;
     opt.wal_buffer_size = 8 << 10;
     opt.wal_file_size = 4 << 10;
-    opt.inline_size = 512;
     match Mace::new(opt.validate().expect("validate options failed")) {
         Err(err) => assert_eq!(err, OpCode::Corruption),
         Ok(_) => panic!("recovery should reject sparse wal gap after checkpoint"),
@@ -1163,5 +1216,5 @@ fn chaos_failpoint_evictor_before_evict_once() {
         "mace_evictor_before_evict_once=abort@1",
     );
     assert_child_aborted(status, "evictor failpoint child should abort");
-    assert_bucket_readable(&path, Options::MIN_INLINE_SIZE);
+    assert_bucket_readable(&path);
 }

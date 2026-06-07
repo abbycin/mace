@@ -1,7 +1,7 @@
 mod common;
 
 use common::{TestEnv, env_usize, is_retryable_txn_err};
-use mace::{Bucket, OpCode};
+use mace::{Bucket, BucketOptions, OpCode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
@@ -41,7 +41,7 @@ fn run_mixed_hotspot(
         options.sync_on_write = false;
         options.gc_timeout = 10_000;
     })?;
-    let bucket = engine.new_bucket("prod_hot")?;
+    let bucket = engine.new_bucket("prod_hot", BucketOptions::default())?;
 
     let hotspot = env_usize("MACE_PROD_HOT_KEYS", 32).max(4);
     let write_checks = Arc::new(AtomicUsize::new(0));
