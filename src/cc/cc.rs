@@ -117,7 +117,7 @@ impl ConcurrencyControl {
 
         // safe watermark can advance while a range iterator is still alive, so visibility must read it at check time
         // freezing safe_txid at iterator creation can cause stale checks and false negatives when commit tree history is compacted
-        if ctx.safe_txid() > record_txid {
+        if ctx.watermark_txid() > record_txid {
             return true;
         }
 

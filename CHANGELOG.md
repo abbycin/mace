@@ -6,9 +6,11 @@
 - Refined cache ownership so the shared LRU only tracks file-loaded blob values and sibling/history helper pages
   - resident tree pages are no longer inserted into the shared LRU, reducing cache-role overlap between page residency and blob/helper-object caching
   - eviction sampling and per-bucket cache pressure continue to be driven by bucket-local cache settings
+- Added stateful `cargo-fuzz` lifecycle targets plus a bounded fuzz regression script for checkpoint/reopen, publish/GC/reopen, and bucket lifecycle churn
 
 ### Bug Fixes
 - Fixed bucket-scoped evictor pressure handling
+- Fixed read-view epoch handoff so lagging snapshot floor publication stays consistent across quiescent-view transitions and compaction does not miss live snapshot history
 
 ## [0.0.33] 2026-05-30
 ### Changes

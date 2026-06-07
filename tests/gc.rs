@@ -492,7 +492,7 @@ fn vacuum_bucket_blocks_delete() -> Result<(), OpCode> {
 fn vacuum_bucket_effect() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.tmp_store = false;
+    opt.tmp_store = true;
     opt.sync_on_write = false;
     opt.gc_timeout = 1000;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
@@ -555,7 +555,7 @@ fn vacuum_bucket_effect() -> Result<(), OpCode> {
 fn vacuum_meta_effect() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.tmp_store = false;
+    opt.tmp_store = true;
     opt.sync_on_write = false;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
 

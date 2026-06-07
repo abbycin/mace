@@ -3,7 +3,7 @@ use std::{
     fmt::Debug,
     ops::{Deref, DerefMut},
     ptr::addr_of_mut,
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
+    sync::atomic::AtomicU64,
 };
 
 use crate::{
@@ -479,12 +479,6 @@ pub struct Numerics {
     pub next_bucket_id: AtomicU64,
     pub oracle: AtomicU64,
     pub wmk_oldest: AtomicU64,
-}
-
-impl Numerics {
-    pub(crate) fn safe_tixd(&self) -> u64 {
-        self.wmk_oldest.load(Relaxed)
-    }
 }
 
 impl Default for Numerics {

@@ -76,6 +76,24 @@ For detailed performance analysis and comparison with other engines, refer to th
 - Correctness/crash matrix: `./scripts/prod_test.sh all 8`
 - Script details: [scripts/README.md](./scripts/README.md)
 
+### Stateful Fuzzing
+
+Mace uses `cargo-fuzz` for stateful lifecycle fuzzing.
+
+The goal here is not "feed invalid bytes into a decoder and see whether it crashes". For this
+project, the more important question is whether Mace's own write, checkpoint, GC, reopen, and
+bucket lifecycle can produce state that later becomes unreadable, invisible, or inconsistent for
+lagging views and recovery.
+
+The focus is on lifecycle closure:
+
+- lagging snapshot views must not lose versions that should still be visible
+- checkpoint and reopen must not make committed state disappear or change visibility
+- publish, GC, and bucket churn must not produce broken metadata, stale runtime state, or
+  self-inconsistent durable state
+
+Detailed usage, targets, and replay commands are in [fuzz/README.md](./fuzz/README.md).
+
 ## Design Notes
 
 Architecture and crash-safety notes are in [docs/design.md](./docs/design.md).

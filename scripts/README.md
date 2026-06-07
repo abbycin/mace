@@ -5,6 +5,7 @@
 Production-validation-related scripts currently under `scripts/`:
 
 - `prod_test.sh`: correctness and crash-recovery test orchestration (`fast` / `stress` / `chaos` / `all`)
+- `fuzz_regression.sh`: bounded stateful fuzz regression runner for the three lifecycle fuzz targets
 
 ---
 

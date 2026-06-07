@@ -135,6 +135,7 @@ pub struct Context {
 impl Context {
     const SHARDS: usize = 64;
     const MASK: usize = Self::SHARDS - 1;
+    const VIEW_HANDOFF: usize = usize::MAX;
 
     const fn shard_of(txid: u64) -> usize {
         (txid as usize) & Self::MASK
@@ -216,25 +217,64 @@ impl Context {
     }
 
     pub fn oldest_view_txid(&self) -> Option<u64> {
-        if self.nr_view.load(Relaxed) > 0 {
-            Some(self.min_view_txid.load(Relaxed))
-        } else {
-            None
+        loop {
+            let nr = self.nr_view.load(Acquire);
+            if nr == Self::VIEW_HANDOFF {
+                std::hint::spin_loop();
+                continue;
+            }
+            if nr > 0 {
+                return Some(self.min_view_txid.load(Relaxed));
+            }
+            return None;
         }
     }
 
     pub fn alloc_cc(&self) -> Handle<CCNode> {
         let start_ts = self.load_oracle();
-        self.nr_view.fetch_add(1, Relaxed);
-        // it's necessary for CommitTree's log compaction, before collect thread works
-        let _ = self
-            .min_view_txid
-            .compare_exchange(INIT_WMK, start_ts, Relaxed, Relaxed);
-        self.pool.alloc(start_ts)
+        loop {
+            let prev = self.nr_view.load(Acquire);
+            if prev == Self::VIEW_HANDOFF {
+                std::hint::spin_loop();
+                continue;
+            }
+            if prev == 0 {
+                // publish the new epoch floor before readers can observe active views again
+                if self
+                    .nr_view
+                    .compare_exchange(0, Self::VIEW_HANDOFF, AcqRel, Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                self.min_view_txid.store(start_ts, Relaxed);
+                self.nr_view.store(1, Release);
+                return self.pool.alloc(start_ts);
+            }
+            if self
+                .nr_view
+                .compare_exchange_weak(prev, prev + 1, AcqRel, Acquire)
+                .is_ok()
+            {
+                return self.pool.alloc(start_ts);
+            }
+        }
     }
 
     pub fn free_cc(&self, cc: Handle<CCNode>) {
-        self.nr_view.fetch_sub(1, Relaxed);
+        loop {
+            let prev = self.nr_view.load(Acquire);
+            debug_assert!(prev > 0 && prev != Self::VIEW_HANDOFF);
+            if self
+                .nr_view
+                .compare_exchange_weak(prev, prev - 1, Release, Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        // keep the previous floor until the next 0 -> 1 refresh so a racing handoff
+        // cannot publish a stale older epoch as active
         self.pool.free(cc);
     }
 
@@ -277,8 +317,8 @@ impl Context {
     }
 
     #[inline]
-    pub(crate) fn safe_txid(&self) -> u64 {
-        self.numerics.safe_tixd()
+    pub(crate) fn watermark_txid(&self) -> u64 {
+        self.numerics.wmk_oldest.load(Relaxed)
     }
 
     #[inline]
@@ -441,7 +481,12 @@ impl Context {
 
     #[inline]
     pub(crate) fn compact_safe_txid(&self) -> u64 {
-        let safe = self.safe_txid();
+        let mut safe = self.watermark_txid();
+        if let Some(view) = self.oldest_view_txid() {
+            // compaction must preserve one version strictly older than the oldest lagging view
+            // because records written at the same start_ts are only visible to that exact txn/group
+            safe = safe.min(view.saturating_sub(1));
+        }
         let pending_floor = self
             .pending_abort_clean_seqlock
             .read(|| self.pending_abort_clean_floor.load(Relaxed));
@@ -726,8 +771,22 @@ impl Drop for CCPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CCPOOL_SHARD, CCPool};
+    use super::{CCPOOL_SHARD, CCPool, Context};
+    use crate::{Options, RandomPath, meta::Numerics};
+    use std::sync::Arc;
     use std::sync::atomic::Ordering::Relaxed;
+
+    fn new_context() -> (RandomPath, Context) {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 1;
+        let ctx = Context::new(
+            Arc::new(opt.validate().expect("context options must validate")),
+            Arc::new(Numerics::default()),
+            &[],
+        );
+        (root, ctx)
+    }
 
     #[test]
     fn ccpool_shrink_reclaims_idle_nodes() {
@@ -762,5 +821,26 @@ mod tests {
         let h2 = pool.alloc(11);
         assert_eq!(h2.start_ts, 11);
         pool.free(h2);
+    }
+
+    #[test]
+    fn last_view_drop_keeps_floor_until_next_view_epoch() {
+        let (_root, ctx) = new_context();
+        let cc1 = ctx.alloc_cc();
+        let floor1 = cc1.start_ts;
+        assert_eq!(ctx.oldest_view_txid(), Some(floor1));
+
+        ctx.free_cc(cc1);
+        assert_eq!(ctx.oldest_view_txid(), None);
+        assert_eq!(ctx.min_view_txid.load(Relaxed), floor1);
+
+        ctx.alloc_oracle();
+        let cc2 = ctx.alloc_cc();
+        let floor2 = cc2.start_ts;
+        assert!(floor2 > floor1);
+        assert_eq!(ctx.oldest_view_txid(), Some(floor2));
+
+        ctx.free_cc(cc2);
+        ctx.quit();
     }
 }
