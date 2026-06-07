@@ -108,7 +108,7 @@ impl Recovery {
             .get(&bucket_id)
             .map(|m| m.clone())
         {
-            assert_eq!(meta.bucket_id, bucket_id);
+            assert_eq!(meta.id, bucket_id);
             let bucket_ctx = store
                 .manifest
                 .load_bucket_context(bucket_id)

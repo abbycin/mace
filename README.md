@@ -28,13 +28,13 @@ cargo add mace-kv
 The following example demonstrates basic transaction management and data retrieval:
 
 ```rust
-use mace::{Mace, OpCode, Options};
+use mace::{BucketOptions, Mace, OpCode, Options};
 
 fn main() -> Result<(), OpCode> {
     // 1. Initialize the storage
     let opts = Options::new("./data_dir");
     let db = Mace::new(opts.validate().unwrap())?;
-    let bkt = db.new_bucket("tmp")?;
+    let bkt = db.new_bucket("tmp", BucketOptions::default())?;
 
     // 2. Perform a write transaction
     let txn = bkt.begin()?;
@@ -59,16 +59,15 @@ Detailed usage can be found in [examples/demo.rs](./examples/demo.rs).
 
 ## Benchmarks
 
-Mace is engineered for heavy workloads. For detailed performance analysis and comparison with other engines, refer to the [kv_bench](https://github.com/abbycin/kv_bench) repository.
-
 Recent complete benchmark results: https://o2c.fun/benchmark.html
+
+For detailed performance analysis and comparison with other engines, refer to the [kv_bench](https://github.com/abbycin/kv_bench) repository.
 
 ### Test Environment
 
 - OS: openSUSE Tumbleweed
 - CPU: AMD Ryzen 5 3600 (6 cores / 12 threads)
 - Memory: 32 GiB RAM
-- Kernel: Linux `6.19.12-1-default`
 - Filesystem: `xfs` (`/dev/nvme1n1p4`, mounted at `/nvme`)
 - SSD: ZHITAI TiPlus5000 1TB
 

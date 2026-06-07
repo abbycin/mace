@@ -105,7 +105,7 @@ impl ManifestBuilder {
                     let name =
                         std::str::from_utf8(&k).map_err(|_| btree_store::Error::Corruption)?;
                     let meta = Arc::new(meta);
-                    let bucket_id = meta.bucket_id;
+                    let bucket_id = meta.id;
                     self.inner
                         .bucket_metas_by_id
                         .insert(bucket_id, meta.clone());

@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    OpCode,
+    BucketOptions, OpCode,
     meta::IMetaCodec,
     types::traits::IAsSlice,
     utils::{
@@ -695,21 +695,12 @@ impl IMetaCodec for DelInterval {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct BucketMeta {
-    pub bucket_id: u64,
+    pub id: u64,
+    pub options: BucketOptions,
 }
-
-impl Clone for BucketMeta {
-    fn clone(&self) -> Self {
-        Self {
-            bucket_id: self.bucket_id,
-        }
-    }
-}
-
-impl IAsSlice for BucketMeta {}
 
 impl IMetaCodec for BucketMeta {
     fn packed_size(&self) -> usize {
@@ -725,3 +716,5 @@ impl IMetaCodec for BucketMeta {
         unsafe { std::ptr::read(src.as_ptr() as *const Self) }
     }
 }
+
+impl IAsSlice for BucketMeta {}

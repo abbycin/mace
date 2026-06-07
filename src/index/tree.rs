@@ -100,7 +100,7 @@ impl Tree {
     }
 
     pub(crate) fn begin_build(&self) -> AllocGuard<'_> {
-        AllocGuard::new(&self.store.opt, &self.bucket)
+        AllocGuard::new(&self.bucket)
     }
 
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
@@ -432,7 +432,7 @@ impl Tree {
                 return Err(OpCode::Again);
             }
 
-            if node_ptr.should_split(self.store.opt.split_elems) {
+            if node_ptr.should_split(self.bucket.opt.split_elems) {
                 self.split_node(node_ptr, parent_opt, g)?;
                 return Err(OpCode::Again);
             }
@@ -501,7 +501,7 @@ impl Tree {
                 parent_opt = Some(node_ptr);
                 cursor = pid;
             } else {
-                if node_ptr.delta_len() >= self.store.opt.consolidate_threshold as usize {
+                if node_ptr.delta_len() >= self.bucket.opt.consolidate_threshold as usize {
                     self.try_compact(g, node_ptr);
                     // it may need split
                     continue;
@@ -635,7 +635,7 @@ impl Tree {
 
         let safe_txid = self.txid();
         let delta_len = page.delta_len();
-        let threshold = self.store.opt.consolidate_threshold as usize;
+        let threshold = self.bucket.opt.consolidate_threshold as usize;
 
         if delta_len >= threshold {
             self.try_compact(g, page);
@@ -1352,17 +1352,24 @@ impl Filter {
 
 #[cfg(test)]
 mod test {
-    use crate::{Mace, Options, RandomPath};
+    use crate::{BucketOptions, Mace, Options, RandomPath};
     use std::thread;
 
     #[test]
     fn concurrent_page_hit() {
         let path = RandomPath::tmp();
         let mut opt = Options::new(&*path);
-        opt.split_elems = 256;
         opt.tmp_store = true;
         let mace = Mace::new(opt.validate().unwrap()).unwrap();
-        let db = mace.new_bucket("default").unwrap();
+        let db = mace
+            .new_bucket(
+                "default",
+                BucketOptions {
+                    split_elems: 256,
+                    ..BucketOptions::default()
+                },
+            )
+            .unwrap();
 
         let num_readers = 4;
         let num_iterations = 1000;

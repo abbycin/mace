@@ -883,7 +883,7 @@ mod test {
     };
 
     use crate::{
-        OpCode, Options,
+        BucketOptions, OpCode,
         types::{
             data::{HistRef, IntlKey, Record, Val, Ver},
             refbox::{BoxRef, BoxView, RemoteView},
@@ -1015,7 +1015,7 @@ mod test {
             }
 
             fn inline_size(&self) -> usize {
-                Options::MIN_INLINE_SIZE
+                BucketOptions::MIN_INLINE_SIZE
             }
         }
 

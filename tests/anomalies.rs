@@ -12,7 +12,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use mace::{Bucket, Mace, OpCode, Options, RandomPath, TxnKV};
+use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath, TxnKV};
 
 macro_rules! prelude {
     ($($core:expr),+) => {
@@ -488,7 +488,7 @@ impl Executor {
         opt.tmp_store = tmp;
         opt.concurrent_write = workers.len().next_power_of_two() as u8;
         let db = Arc::new(Mace::new(opt.validate().unwrap()).unwrap());
-        db.new_bucket("xx").unwrap();
+        db.new_bucket("xx", BucketOptions::default()).unwrap();
 
         let mut map = HashMap::new();
         let mut handle = Vec::new();

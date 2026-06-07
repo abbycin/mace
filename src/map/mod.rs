@@ -209,7 +209,7 @@ impl ILoader for Loader {
 
 pub(crate) enum SharedState {
     Quit,
-    Evict,
+    Evict(u64),
 }
 
 pub(crate) trait IFooter: Default {

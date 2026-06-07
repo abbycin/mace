@@ -1,7 +1,7 @@
 use std::{cell::Cell, collections::VecDeque, ptr::null_mut};
 
 use crate::{
-    Options,
+    BucketOptions,
     types::{
         data::{HistRef, Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
         header::{BaseHeader, NodeType, SLOT_LEN, SlotType, TagFlag, TagKind},
@@ -1014,7 +1014,7 @@ struct SeekableIter<'a> {
 impl<'a> SeekableIter<'a> {
     fn new() -> Self {
         Self {
-            data: Vec::with_capacity(Options::MAX_SPLIT_ELEMS as usize * 2),
+            data: Vec::with_capacity(BucketOptions::MAX_SPLIT_ELEMS as usize * 2),
             index: Cell::new(0),
         }
     }
@@ -1041,14 +1041,13 @@ impl<'a> SeekableIter<'a> {
 #[cfg(test)]
 mod test {
     use crate::{
-        Options,
         types::{
             data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
             header::TagKind,
             refbox::{BaseView, BoxRef, BoxView},
             traits::{IBoxHeader, ICodec, IFrameAlloc, IHeader, ILoader},
         },
-        utils::{MutRef, NULL_ADDR, NULL_ORACLE, NULL_PID, data::Position},
+        utils::{MutRef, NULL_ADDR, NULL_ORACLE, NULL_PID, data::Position, options::BucketOptions},
     };
     use std::{cell::Cell, collections::HashMap};
 
@@ -1084,7 +1083,7 @@ mod test {
         }
 
         fn inline_size(&self) -> usize {
-            Options::MIN_INLINE_SIZE
+            BucketOptions::MIN_INLINE_SIZE
         }
     }
 

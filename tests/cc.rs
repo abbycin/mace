@@ -1,5 +1,5 @@
 use mace::observe::{CounterMetric, InMemoryObserver, ObserveSnapshot};
-use mace::{Bucket, Mace, OpCode, Options, RandomPath};
+use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use rand::seq::SliceRandom;
 use std::{
     collections::HashSet,
@@ -14,7 +14,9 @@ fn put_get() -> Result<(), OpCode> {
     let opt = Options::new(&*path);
     let mut saved = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("default").unwrap();
+    let db = mace
+        .new_bucket("default", BucketOptions::default())
+        .unwrap();
     let n = 100000;
     let mut elems = Vec::with_capacity(n);
     for i in 0..n {
@@ -113,7 +115,9 @@ fn get_del() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mace = Mace::new(opt.validate().unwrap())?;
-    let db = mace.new_bucket("default").unwrap();
+    let db = mace
+        .new_bucket("default", BucketOptions::default())
+        .unwrap();
     let n = 1000;
     let mut v = Vec::with_capacity(n);
 
@@ -168,7 +172,7 @@ fn rollback() {
     opts.concurrent_write = 16;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10000;
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     // multiple threads are trying to update the same key, some of them will pass the visibility check
     // and start updating the key, but only one of them may succeed, those failure threads will check the
     // visibility again and find the new key is invisible to them, they will abort the transaction
@@ -222,7 +226,7 @@ fn rollback_multiple_updates_in_same_txn_restores_committed_value() -> Result<()
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap())?;
-    let db = mace.new_bucket("x")?;
+    let db = mace.new_bucket("x", BucketOptions::default())?;
 
     let committed = db.begin()?;
     committed.put("k", "base")?;
@@ -244,10 +248,15 @@ fn get_compacted_shared_hist_page_keeps_key_local_old_versions() -> Result<(), O
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     opts.sync_on_write = false;
-    opts.consolidate_threshold = 4;
-    opts.split_elems = 64;
     let mace = Mace::new(opts.validate().unwrap())?;
-    let db = mace.new_bucket("x")?;
+    let db = mace.new_bucket(
+        "x",
+        BucketOptions {
+            consolidate_threshold: 4,
+            split_elems: 64,
+            ..BucketOptions::default()
+        },
+    )?;
 
     let tx = db.begin()?;
     tx.put("a", "a0")?;
@@ -292,10 +301,15 @@ fn get_never_crosses_into_next_key_hist_region_when_own_hist_invisible() -> Resu
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     opts.sync_on_write = false;
-    opts.consolidate_threshold = 4;
-    opts.split_elems = 64;
     let mace = Mace::new(opts.validate().unwrap())?;
-    let db = mace.new_bucket("x")?;
+    let db = mace.new_bucket(
+        "x",
+        BucketOptions {
+            consolidate_threshold: 4,
+            split_elems: 64,
+            ..BucketOptions::default()
+        },
+    )?;
 
     let tx = db.begin()?;
     tx.put("a", "a0")?;
@@ -335,7 +349,7 @@ fn rollback_upsert_replace_on_tombstone_restores_delete() -> Result<(), OpCode> 
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap())?;
-    let db = mace.new_bucket("x")?;
+    let db = mace.new_bucket("x", BucketOptions::default())?;
 
     let committed = db.begin()?;
     committed.put("k", "base")?;
@@ -360,7 +374,7 @@ fn rollback_delete_restores_committed_value() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap())?;
-    let db = mace.new_bucket("x")?;
+    let db = mace.new_bucket("x", BucketOptions::default())?;
 
     let committed = db.begin()?;
     committed.put("k", "base")?;
@@ -381,7 +395,7 @@ fn range_simple() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     kv.put("foo", "1")?;
@@ -437,7 +451,7 @@ fn range_simple() -> Result<(), OpCode> {
         let mut opts = Options::new(&*RandomPath::new());
         opts.tmp_store = true;
         let mace = Mace::new(opts.validate().unwrap()).unwrap();
-        let db = mace.new_bucket("x").unwrap();
+        let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
         let kv = db.begin().unwrap();
         kv.put([0], "bar")?;
@@ -471,7 +485,7 @@ fn seek_stops_when_key_no_longer_matches_prefix() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     for key in [
@@ -523,7 +537,7 @@ fn seek_supports_next_back_in_descending_key_order() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     for key in ["foo", "food", "fool", "fop"] {
@@ -553,10 +567,17 @@ fn seek_supports_next_back_in_descending_key_order() -> Result<(), OpCode> {
 fn seek_next_back_crosses_binary_leaf_boundary_without_skipping() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
-    opts.split_elems = 4;
-    opts.consolidate_threshold = 4;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 4,
+                consolidate_threshold: 4,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
 
     let kv = db.begin().unwrap();
     for key in [
@@ -589,7 +610,7 @@ fn seek_next_and_next_back_share_one_shrinking_range() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     for key in ["foo", "food", "fool", "fop"] {
@@ -613,7 +634,7 @@ fn seek_next_back_keeps_prefix_upper_bound() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     for key in ["app", "apple", "apply", "apt", "aq"] {
@@ -643,7 +664,7 @@ fn seek_next_back_keeps_latest_visible_version_per_raw_key() -> Result<(), OpCod
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     kv.put("foo", "1")?;
@@ -677,7 +698,7 @@ fn seek_next_back_falls_back_to_older_visible_delta_version() -> Result<(), OpCo
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     kv.put("foo", "1")?;
@@ -711,7 +732,7 @@ fn txn_range_respects_view_and_own_write_visibility() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     kv.put("a1", "1")?;
@@ -756,10 +777,17 @@ fn txn_range_respects_view_and_own_write_visibility() -> Result<(), OpCode> {
 fn txn_range_cross_node_respects_view_and_own_write_visibility() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
-    opts.split_elems = 20;
-    opts.consolidate_threshold = 8;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 20,
+                consolidate_threshold: 8,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
 
     let kv = db.begin().unwrap();
     for i in 0..80 {
@@ -813,10 +841,17 @@ fn txn_range_cross_node_respects_view_and_own_write_visibility() -> Result<(), O
 fn txn_range_cross_node_supports_reverse_iteration() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
-    opts.split_elems = 20;
-    opts.consolidate_threshold = 8;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 20,
+                consolidate_threshold: 8,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
 
     let kv = db.begin().unwrap();
     for i in 0..80 {
@@ -880,10 +915,17 @@ fn txn_range_cross_node_supports_reverse_iteration() -> Result<(), OpCode> {
 fn txn_range_cross_node_reverse_respects_upper_bound() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
-    opts.split_elems = 20;
-    opts.consolidate_threshold = 8;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 20,
+                consolidate_threshold: 8,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
 
     let kv = db.begin().unwrap();
     for i in 0..80 {
@@ -926,10 +968,17 @@ fn txn_range_cross_node_reverse_respects_upper_bound() -> Result<(), OpCode> {
 fn txn_range_excluded_start_keeps_first_in_range_key() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     opts.tmp_store = true;
-    opts.split_elems = 4;
-    opts.consolidate_threshold = 4;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 4,
+                consolidate_threshold: 4,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
 
     let kv = db.begin().unwrap();
     kv.put(vec![1, 1, 2, 255, 254], "v")?;
@@ -966,7 +1015,7 @@ fn range_in_one_node() -> Result<(), OpCode> {
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10;
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let check_app = || {
         let mut words = Vec::new();
@@ -1038,11 +1087,18 @@ fn range_in_one_node() -> Result<(), OpCode> {
 #[test]
 fn range_cross_node() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
-    opts.split_elems = 128; // force split
     opts.sync_on_write = false;
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 128,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
     const N: usize = 500;
     let mut h = HashSet::with_capacity(N);
 
@@ -1101,7 +1157,7 @@ fn cross_txn() {
     opt.tmp_store = true;
     opt.concurrent_write = 4;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let tx1 = db.begin().unwrap();
     let tx2 = db.begin().unwrap();
@@ -1159,10 +1215,16 @@ fn smo_during_scan() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
-    opt.split_elems = 128;
-
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 128,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
     let data: Vec<String> = (0..512).map(|x| format!("key_{x}")).collect();
     let mut target = Vec::new();
 
@@ -1284,11 +1346,18 @@ fn smo_merge_preserves_final_state() -> Result<(), OpCode> {
     opts.tmp_store = true;
     opts.sync_on_write = false;
     opts.concurrent_write = 8;
-    opts.split_elems = 20;
-    opts.consolidate_threshold = 8;
     opts.observer = observer.clone();
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 20,
+                consolidate_threshold: 8,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
 
     const WRITERS: usize = 4;
     const WINDOW: usize = 192;
@@ -1413,11 +1482,18 @@ fn smo_scan_remains_ordered_under_merge_churn() -> Result<(), OpCode> {
     opts.tmp_store = true;
     opts.sync_on_write = false;
     opts.concurrent_write = 8;
-    opts.split_elems = 20;
-    opts.consolidate_threshold = 8;
     opts.observer = observer.clone();
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 20,
+                consolidate_threshold: 8,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
 
     const WRITERS: usize = 6;
     const WINDOW: usize = 128;

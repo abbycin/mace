@@ -1,6 +1,6 @@
 [package]
 name = "mace-kv"
-version = "0.0.33"
+version = "0.0.34"
 edition = "2024"
 rust-version = "1.95"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
@@ -17,9 +17,9 @@ name = "mace"
 
 [dependencies]
 crc32c = "0.6.8"
-dashmap = "6.1.0"
+dashmap = "6.2.1"
 rand = "0.10.1"
-log = "0.4.29"
+log = "0.4.32"
 crossbeam-epoch = "0.9.18"
 parking_lot = "0.12.5"
 btree-store = "0.1.7"

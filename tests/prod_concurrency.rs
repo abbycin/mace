@@ -1,7 +1,7 @@
 mod common;
 
 use common::{TestEnv, env_usize, is_retryable_txn_err};
-use mace::{Bucket, OpCode};
+use mace::{Bucket, BucketOptions, OpCode};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -37,7 +37,7 @@ fn fast_snapshot_view_stable() -> Result<(), OpCode> {
     let engine = env.open_with(|options| {
         options.sync_on_write = false;
     })?;
-    let bucket = engine.new_bucket("prod_cc")?;
+    let bucket = engine.new_bucket("prod_cc", BucketOptions::default())?;
 
     let init_txn = bucket.begin()?;
     init_txn.put("anchor", "rev_0")?;
@@ -94,7 +94,7 @@ fn stress_bucket_churn() -> Result<(), OpCode> {
                     let name = format!("prod_churn_{worker_id}_{round}");
 
                     let bucket = loop {
-                        match local_engine.new_bucket(&name) {
+                        match local_engine.new_bucket(&name, BucketOptions::default()) {
                             Ok(bucket) => break bucket,
                             Err(OpCode::Exist) => match local_engine.get_bucket(&name) {
                                 Ok(bucket) => break bucket,

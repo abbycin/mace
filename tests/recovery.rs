@@ -1,4 +1,4 @@
-use mace::{Mace, OpCode, Options, RandomPath};
+use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::{Arc, Barrier};
 
 #[test]
@@ -7,7 +7,7 @@ fn intact_meta() {
     let opt = Options::new(&*path);
     let mut saved = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let nr_kv = 10;
     let mut pair = Vec::with_capacity(nr_kv);
 
@@ -53,7 +53,7 @@ fn bad_meta() {
     let opt = Options::new(&*path);
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     kv.put("114514", "1919810").unwrap();
@@ -84,7 +84,7 @@ fn crash_again() {
 
     {
         let mace = Mace::new(opt.validate().unwrap()).unwrap();
-        let db = mace.new_bucket("x").unwrap();
+        let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
         let kv = db.begin().unwrap();
         kv.put("foo", "bar").unwrap();
         kv.commit().unwrap();
@@ -130,7 +130,7 @@ fn recover_after_insert() {
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
     let mut pairs = Vec::new();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     for i in 0..1000 {
         pairs.push((format!("key_{i}"), format!("val_{i}")));
@@ -162,7 +162,7 @@ fn recover_after_update() {
     let opt = Options::new(&*path);
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let mut pairs = Vec::new();
     let mut new_pairs = Vec::new();
 
@@ -212,7 +212,7 @@ fn recover_after_remove() {
     let opt = Options::new(&*path);
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let mut pairs = Vec::new();
 
     for i in 0..1000 {
@@ -252,7 +252,7 @@ fn ckpt_wal(keys: usize, wal_len: u32) {
     opt.wal_file_size = wal_len;
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let mut data = Vec::new();
 
     for i in 0..keys {
@@ -300,7 +300,7 @@ fn long_txn_impl(before: bool) {
     opt.wal_file_size = 1024;
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let b = Arc::new(Barrier::new(2));
     let mut pair = Vec::new();
 

@@ -1,5 +1,5 @@
 use mace::observe::{CounterMetric, HistogramMetric, InMemoryObserver};
-use mace::{Mace, OpCode, Options, RandomPath};
+use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ fn gc_data() -> Result<(), OpCode> {
     opt.data_garbage_ratio = 1;
     opt.data_file_size = 512 << 10;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let cap = 20000;
     let mut pair = Vec::with_capacity(cap);
 
@@ -96,9 +96,16 @@ fn gc_blob() -> Result<(), OpCode> {
     opt.blob_gc_ratio = 20;
     opt.blob_file_size = 1 << 20;
     opt.gc_timeout = 20;
-    opt.inline_size = 1024;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                inline_size: 1024,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
     let cap = 10000;
     let val = vec![b'x'; 10240];
     let mut pair = Vec::with_capacity(cap);
@@ -172,7 +179,7 @@ fn abort_txn() {
     opt.max_ckpt_per_txn = 1;
     opt.data_file_size = 50 << 10; // make sure checkpoint was taken
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let kv = db.begin().unwrap();
     for i in 0..50000 {
@@ -195,7 +202,7 @@ fn gc_wal() {
     opt.keep_stable_wal_file = true;
     opt.data_file_size = 100 << 10; // make sure checkpoint was taken
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let mut data = Vec::new();
 
     for i in 0..1000 {
@@ -255,7 +262,7 @@ fn gc_observer_metrics() -> Result<(), OpCode> {
     opt.observer = observer.clone();
 
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     for i in 0..4000 {
         let k = format!("key_{i:08}");
@@ -318,7 +325,7 @@ fn abort_clean_checkpoint_dedup_per_bucket_per_gc_round() -> Result<(), OpCode> 
     opt.concurrent_write = 1;
     opt.observer = observer.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let seed = db.begin().unwrap();
     seed.put("k", "seed")?;
@@ -354,7 +361,7 @@ fn abort_clean_wal_open_is_bounded_by_file_count() -> Result<(), OpCode> {
     opt.wal_file_size = 4096;
     opt.observer = observer.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let seed = db.begin().unwrap();
     seed.put("k", "seed")?;
@@ -390,11 +397,18 @@ fn vacuum_bucket_blocks_delete() -> Result<(), OpCode> {
     opt.tmp_store = true;
     opt.sync_on_write = false;
     opt.gc_timeout = 1000;
-    opt.split_elems = 64;
-    opt.consolidate_threshold = 2;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
     mace.disable_gc();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 64,
+                consolidate_threshold: 2,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
     let cap = 30000;
     let mut keys = Vec::with_capacity(cap);
 
@@ -478,14 +492,21 @@ fn vacuum_bucket_blocks_delete() -> Result<(), OpCode> {
 fn vacuum_bucket_effect() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.tmp_store = true;
+    opt.tmp_store = false;
     opt.sync_on_write = false;
     opt.gc_timeout = 1000;
-    opt.split_elems = 64;
-    opt.consolidate_threshold = 2;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
     mace.disable_gc();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace
+        .new_bucket(
+            "x",
+            BucketOptions {
+                split_elems: 64,
+                consolidate_threshold: 2,
+                ..BucketOptions::default()
+            },
+        )
+        .unwrap();
     let cap = 20000;
     let mut keys = Vec::with_capacity(cap);
 
@@ -518,7 +539,15 @@ fn vacuum_bucket_effect() -> Result<(), OpCode> {
 
     let stats = mace.vacuum_bucket("x")?;
     assert!(stats.scanned > 0);
-    assert!(stats.compacted > 0);
+    let view = db.view().unwrap();
+    for k in keys.iter().step_by(3) {
+        assert!(view.get(k).is_err());
+    }
+    for (i, k) in keys.iter().enumerate() {
+        if i % 3 != 0 {
+            assert_eq!(view.get(k).unwrap().slice(), k.as_bytes());
+        }
+    }
     Ok(())
 }
 
@@ -526,14 +555,14 @@ fn vacuum_bucket_effect() -> Result<(), OpCode> {
 fn vacuum_meta_effect() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
-    opt.tmp_store = true;
+    opt.tmp_store = false;
     opt.sync_on_write = false;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
 
     let total = 256;
     for i in 0..total {
         let name = format!("b{i:04}");
-        let db = mace.new_bucket(&name).unwrap();
+        let db = mace.new_bucket(&name, BucketOptions::default()).unwrap();
         let kv = db.begin().unwrap();
         kv.put("k", "v")?;
         kv.commit()?;

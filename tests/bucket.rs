@@ -1,6 +1,27 @@
-use mace::{Mace, OpCode, Options, RandomPath};
+use btree_store::BTree;
+use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PersistedBucketMeta {
+    id: u64,
+    options: BucketOptions,
+}
+
+fn load_persisted_bucket_options(opt: &Options, name: &str) -> BucketOptions {
+    let tree = BTree::open(opt.manifest()).unwrap();
+    let mut raw = None;
+    tree.view("bucket_metas", |txn| {
+        raw = Some(txn.get(name.as_bytes())?.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    let raw = raw.unwrap();
+    let meta = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast::<PersistedBucketMeta>()) };
+    meta.options
+}
 
 #[test]
 fn bucket_concurrency_non_blocking() {
@@ -8,7 +29,7 @@ fn bucket_concurrency_non_blocking() {
     let opt = Options::new(&*path);
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
 
-    mace.new_bucket("stable").unwrap();
+    mace.new_bucket("stable", BucketOptions::default()).unwrap();
 
     let mace_clone = mace.clone();
     let stop = Arc::new(AtomicBool::new(false));
@@ -18,7 +39,9 @@ fn bucket_concurrency_non_blocking() {
         let mut count = 0;
         while !stop_clone.load(Ordering::Relaxed) {
             let name = format!("temp_{}", count);
-            let b = mace_clone.new_bucket(&name).unwrap();
+            let b = mace_clone
+                .new_bucket(&name, BucketOptions::default())
+                .unwrap();
             drop(b); // ensure count drops
             let _ = mace_clone.del_bucket(&name);
             count += 1;
@@ -60,7 +83,7 @@ fn bucket_limit_safety() {
     let mut buckets = Vec::new();
     for i in 0..10 {
         let name = format!("limit_test_{}", i);
-        buckets.push(mace.new_bucket(&name).unwrap());
+        buckets.push(mace.new_bucket(&name, BucketOptions::default()).unwrap());
     }
 
     let initial_count = mace.nr_buckets();
@@ -107,7 +130,9 @@ fn bucket_simple() {
     let opt = Options::new(&*path);
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
 
-    let b1 = mace.new_bucket("bucket1").unwrap();
+    let b1 = mace
+        .new_bucket("bucket1", BucketOptions::default())
+        .unwrap();
 
     {
         let tx = b1.begin().unwrap();
@@ -120,7 +145,9 @@ fn bucket_simple() {
     }
 
     {
-        let d = mace.new_bucket("default").unwrap();
+        let d = mace
+            .new_bucket("default", BucketOptions::default())
+            .unwrap();
         let tx = d.begin().unwrap();
         tx.put("key1", "default_val").unwrap();
         tx.commit().unwrap();
@@ -150,18 +177,24 @@ fn bucket_new_get_semantics() -> Result<(), OpCode> {
 
     assert_eq!(mace.get_bucket("missing").err(), Some(OpCode::NotFound));
 
-    let b1 = mace.new_bucket("x").unwrap();
-    assert_eq!(mace.new_bucket("x").err(), Some(OpCode::Exist));
+    let b1 = mace.new_bucket("x", BucketOptions::default()).unwrap();
+    assert_eq!(
+        mace.new_bucket("x", BucketOptions::default()).err(),
+        Some(OpCode::Exist)
+    );
 
     drop(b1);
     mace.drop_bucket("x")?;
-    assert_eq!(mace.new_bucket("x").err(), Some(OpCode::Exist));
+    assert_eq!(
+        mace.new_bucket("x", BucketOptions::default()).err(),
+        Some(OpCode::Exist)
+    );
 
     let b1 = mace.get_bucket("x")?;
     drop(b1);
 
     mace.del_bucket("x")?;
-    let _b2 = mace.new_bucket("x")?;
+    let _b2 = mace.new_bucket("x", BucketOptions::default())?;
 
     Ok(())
 }
@@ -173,7 +206,7 @@ fn bucket_persistence() {
 
     {
         let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
-        let db = mace.new_bucket("x").unwrap();
+        let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
         let b1 = db.begin().unwrap();
         b1.put("k", "v").unwrap();
         b1.commit().unwrap();
@@ -189,13 +222,75 @@ fn bucket_persistence() {
 }
 
 #[test]
+fn bucket_update_opt_persists_compatible_changes() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let bucket_opt = BucketOptions {
+        split_elems: 128,
+        consolidate_threshold: 16,
+        inline_size: 8192,
+        checkpoint_size: 64 << 10,
+        pool_capacity: 128 << 10,
+        cache_capacity: 256 << 10,
+        cache_evict_pct: 20,
+        enable_backpressure: true,
+        ..BucketOptions::default()
+    };
+    let updated = BucketOptions {
+        checkpoint_size: 32 << 10,
+        pool_capacity: 64 << 10,
+        cache_capacity: 128 << 10,
+        cache_evict_pct: 40,
+        enable_backpressure: false,
+        ..bucket_opt
+    };
+
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let bucket = mace.new_bucket("x", bucket_opt).unwrap();
+        assert_eq!(mace.update_bucket_opt("x", updated), Err(OpCode::Again));
+        drop(bucket);
+        mace.drop_bucket("x")?;
+        mace.update_bucket_opt("x", updated)?;
+    }
+
+    assert_eq!(load_persisted_bucket_options(&opt, "x"), updated);
+
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let bucket = mace.get_bucket("x")?;
+        drop(bucket);
+        mace.drop_bucket("x")?;
+        let conflict = BucketOptions {
+            split_elems: 64,
+            ..updated
+        };
+        assert_eq!(mace.update_bucket_opt("x", conflict), Err(OpCode::Invalid));
+        mace.update_bucket_opt("x", bucket_opt)?;
+    }
+
+    assert_eq!(load_persisted_bucket_options(&opt, "x"), bucket_opt);
+
+    {
+        let mace = Mace::new(opt.validate().unwrap()).unwrap();
+        let conflict = BucketOptions {
+            split_elems: 64,
+            ..bucket_opt
+        };
+        assert_eq!(mace.update_bucket_opt("x", conflict), Err(OpCode::Invalid));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn multiple_buckets() {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
 
-    let b1 = mace.new_bucket("b1").unwrap();
-    let b2 = mace.new_bucket("b2").unwrap();
+    let b1 = mace.new_bucket("b1", BucketOptions::default()).unwrap();
+    let b2 = mace.new_bucket("b2", BucketOptions::default()).unwrap();
 
     let tx1 = b1.begin().unwrap();
     let tx2 = b2.begin().unwrap();
@@ -216,7 +311,7 @@ fn bucket_deletion_safety() {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
 
     let tx1 = db.begin().unwrap();
     tx1.put("k", "v").unwrap();
@@ -236,7 +331,7 @@ fn bucket_deletion_cleanup() {
     let mut opt = Options::new(&*path);
     opt.data_file_size = 1024;
     let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
-    let db = mace.new_bucket("x").unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let b1 = db.begin().unwrap();
     let val = vec![0u8; 512];
     for i in 0..10 {
@@ -260,7 +355,7 @@ fn bucket_physical_cleanup_basic() {
     let opt = Options::new(&*path);
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
 
-    let b1 = mace.new_bucket("b1").unwrap();
+    let b1 = mace.new_bucket("b1", BucketOptions::default()).unwrap();
     let uid = b1.id();
     let tx = b1.begin().unwrap();
     tx.put("key", "val").unwrap();
@@ -271,7 +366,7 @@ fn bucket_physical_cleanup_basic() {
 
     mace.start_gc();
 
-    let b2 = mace.new_bucket("b1").unwrap();
+    let b2 = mace.new_bucket("b1", BucketOptions::default()).unwrap();
     assert_ne!(b2.id(), uid);
 }
 
@@ -284,7 +379,7 @@ fn bucket_physical_cleanup_recovery() {
 
     {
         let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
-        let bkt = mace.new_bucket("b1").unwrap();
+        let bkt = mace.new_bucket("b1", BucketOptions::default()).unwrap();
         bucket_id = bkt.id();
         let b1 = bkt.begin().unwrap();
         b1.put("k", "v").unwrap();
@@ -299,7 +394,7 @@ fn bucket_physical_cleanup_recovery() {
         mace.start_gc();
 
         assert!(mace.del_bucket("b1").is_err());
-        let bkt = mace.new_bucket("b1").unwrap();
+        let bkt = mace.new_bucket("b1", BucketOptions::default()).unwrap();
         assert_ne!(bkt.id(), bucket_id);
     }
 }
@@ -321,7 +416,7 @@ fn bucket_physical_file_cleanup() {
             .map(|e| e.unwrap().file_name())
             .collect();
 
-        let db = mace.new_bucket("b1").unwrap();
+        let db = mace.new_bucket("b1", BucketOptions::default()).unwrap();
         let big_val = vec![0u8; 2048];
         for i in 0..10 {
             let tx = db.begin().unwrap();
@@ -381,7 +476,7 @@ fn test_drop_bucket_safety() -> Result<(), OpCode> {
 
     // 1. test: cannot drop while bucket handle is held
     {
-        let bucket = db.new_bucket(bucket_name)?;
+        let bucket = db.new_bucket(bucket_name, BucketOptions::default())?;
         // should fail because 'bucket' holds an Arc<BucketMeta>
         let res = db.drop_bucket(bucket_name);
         assert_eq!(res.err(), Some(OpCode::Again));
@@ -415,7 +510,7 @@ fn test_drop_bucket_persistence() -> Result<(), OpCode> {
 
     let bucket_name = "persist_test";
     {
-        let bucket = db.new_bucket(bucket_name)?;
+        let bucket = db.new_bucket(bucket_name, BucketOptions::default())?;
         let kv = bucket.begin()?;
         kv.put("k", "v")?;
         kv.commit()?;

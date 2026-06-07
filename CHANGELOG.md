@@ -1,3 +1,15 @@
+## [0.0.34] 2026-06-07
+### Changes
+- Separated bucket-scoped runtime tuning from global `Options` into persisted `BucketOptions`
+  - `Mace::new_bucket` now takes `BucketOptions`, and `Mace::update_bucket_opt` allows updating persisted bucket policy while the bucket is unloaded
+  - bucket metadata now persists bucket options and rejects incompatible reopen-time changes to compatibility-sensitive fields such as `inline_size` and `split_elems`
+- Refined cache ownership so the shared LRU only tracks file-loaded blob values and sibling/history helper pages
+  - resident tree pages are no longer inserted into the shared LRU, reducing cache-role overlap between page residency and blob/helper-object caching
+  - eviction sampling and per-bucket cache pressure continue to be driven by bucket-local cache settings
+
+### Bug Fixes
+- Fixed bucket-scoped evictor pressure handling
+
 ## [0.0.33] 2026-05-30
 ### Changes
 - Refactored transaction write path to metadata-only visibility checks

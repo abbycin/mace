@@ -1,7 +1,7 @@
 mod common;
 
 use common::{TestEnv, env_usize, wait_until};
-use mace::OpCode;
+use mace::{BucketOptions, OpCode};
 use std::thread;
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ fn fast_lifecycle_quota_guard() -> Result<(), OpCode> {
 
     for round in 0..rounds {
         let name = format!("prod_bucket_{round}");
-        let bucket = engine.new_bucket(&name)?;
+        let bucket = engine.new_bucket(&name, BucketOptions::default())?;
 
         let txn = bucket.begin()?;
         txn.put("k", "v")?;
@@ -55,7 +55,7 @@ fn fast_pending_delete_counter() -> Result<(), OpCode> {
 
     for round in 0..rounds {
         let name = format!("prod_bucket_pending_{round}");
-        let bucket = engine.new_bucket(&name)?;
+        let bucket = engine.new_bucket(&name, BucketOptions::default())?;
 
         let txn = bucket.begin()?;
         txn.put("seed", "v")?;
@@ -109,7 +109,7 @@ fn stress_create_delete() -> Result<(), OpCode> {
     for round in 0..rounds {
         let name = format!("prod_bucket_stress_{round}");
         let bucket = loop {
-            match engine.new_bucket(&name) {
+            match engine.new_bucket(&name, BucketOptions::default()) {
                 Ok(bucket) => break bucket,
                 Err(OpCode::NoSpace) => {
                     engine.start_gc();

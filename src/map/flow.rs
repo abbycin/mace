@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 
 use crate::utils::observe::{CounterMetric, HistogramMetric, Observer};
-use crate::utils::options::ParsedOptions;
+use crate::utils::options::{BucketOptions, ParsedOptions};
 
 pub(crate) struct FlowTask {
     enqueue_at: Instant,
@@ -128,10 +128,10 @@ impl FlowController {
     const ADMISSION_WAKE_BURST_DIVISOR: u64 = 8;
     const ADMISSION_WAKE_MIN_BYTES: u64 = 1 << 20;
 
-    pub(crate) fn new(opt: &ParsedOptions) -> Self {
+    pub(crate) fn new(global: &ParsedOptions, opt: &BucketOptions) -> Self {
         let flush_unit_bytes = (opt.checkpoint_size as u64).max(1);
         Self {
-            observer: opt.observer.clone(),
+            observer: global.observer.clone(),
             backpressure_enabled: opt.enable_backpressure,
             flush_unit_bytes,
             pool_capacity_bytes: (opt.pool_capacity as u64).max(flush_unit_bytes),

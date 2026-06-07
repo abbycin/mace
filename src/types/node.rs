@@ -1643,7 +1643,7 @@ mod test {
     };
 
     use crate::{
-        Options,
+        BucketOptions,
         types::{
             data::{Key, LeafSeg, Record, Ver},
             node::{Junk, Node},
@@ -1694,7 +1694,7 @@ mod test {
         }
 
         fn inline_size(&self) -> usize {
-            Options::MIN_INLINE_SIZE
+            BucketOptions::MIN_INLINE_SIZE
         }
     }
 
@@ -1732,7 +1732,7 @@ mod test {
         let l = a.clone();
         let node = Node::new_leaf(&mut a, l.clone(), 0, Position::MIN);
         let key = Key::new("blob".as_bytes(), Ver::new(1, 1));
-        let value = vec![7u8; Options::MIN_INLINE_SIZE + 16];
+        let value = vec![7u8; BucketOptions::MIN_INLINE_SIZE + 16];
         let record = Record::normal(1, &value);
         let (delta, remote) = DeltaView::from_key_val(&mut a, &key, &record, 0, Position::MIN);
         node.insert_inplace(

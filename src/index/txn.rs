@@ -786,7 +786,7 @@ impl Drop for TxnView<'_> {
 #[cfg(test)]
 mod test {
     use super::prefix_upper_exclusive;
-    use crate::{Mace, OpCode, Options, RandomPath};
+    use crate::{BucketOptions, Mace, OpCode, Options, RandomPath};
 
     #[test]
     fn txnkv() {
@@ -814,7 +814,7 @@ mod test {
         let mace = Mace::new(opt)?;
         let (k1, k2) = ("beast".as_bytes(), "senpai".as_bytes());
         let (v1, v2) = ("114514".as_bytes(), "1919810".as_bytes());
-        let db = mace.new_bucket("default")?;
+        let db = mace.new_bucket("default", BucketOptions::default())?;
 
         let kv = db.begin()?;
         kv.put(k1, v1).expect("can't put");
@@ -955,10 +955,15 @@ mod test {
         let mut opt = Options::new(&*path);
         let consolidate_threshold = 256;
         opt.tmp_store = true;
-        opt.split_elems = consolidate_threshold * 2;
-        opt.consolidate_threshold = consolidate_threshold;
         let mace = Mace::new(opt.validate().unwrap())?;
-        let db = mace.new_bucket("default")?;
+        let db = mace.new_bucket(
+            "default",
+            BucketOptions {
+                split_elems: consolidate_threshold * 2,
+                consolidate_threshold,
+                ..BucketOptions::default()
+            },
+        )?;
 
         let kv = db.begin()?;
         kv.put("foo", "bar")?;

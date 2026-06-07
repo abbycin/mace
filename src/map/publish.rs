@@ -4,7 +4,6 @@ use crate::map::{Node, Page};
 use crate::types::refbox::BoxRef;
 use crate::types::traits::IFrameAlloc;
 use crate::utils::NULL_ADDR;
-use crate::utils::options::ParsedOptions;
 use crossbeam_epoch::Guard;
 use rustc_hash::FxHashMap;
 
@@ -120,15 +119,14 @@ impl<'a> Publish<'a> {
 }
 
 pub(crate) struct AllocGuard<'a> {
-    opt: &'a ParsedOptions,
     bucket: &'a BucketContext,
     epoch: WriteEpoch,
 }
 
 impl<'a> AllocGuard<'a> {
-    pub(crate) fn new(opt: &'a ParsedOptions, bucket: &'a BucketContext) -> Self {
+    pub(crate) fn new(bucket: &'a BucketContext) -> Self {
         let epoch = bucket.pool.capture_epoch();
-        Self { opt, bucket, epoch }
+        Self { bucket, epoch }
     }
 
     pub(crate) fn reserve_pid(&self) -> u64 {
@@ -173,7 +171,7 @@ impl IFrameAlloc for AllocGuard<'_> {
     }
 
     fn inline_size(&self) -> usize {
-        self.opt.inline_size
+        self.bucket.opt.inline_size
     }
 
     fn checkpoint_lsn(&self, group: u8) -> crate::utils::data::Position {

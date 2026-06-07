@@ -37,7 +37,7 @@ use crate::{
         interval::IntervalMap,
         lru::{Lru, ShardLru},
         observe::{CounterMetric, EventKind, ObserveEvent},
-        options::ParsedOptions,
+        options::{BucketOptions, ParsedOptions},
     },
 };
 use std::sync::mpsc::{Receiver, Sender};
@@ -453,8 +453,8 @@ impl Manifest {
 
         let meta = meta.ok_or(OpCode::NotFound)?;
         self.bucket_metas.insert(name.to_string(), meta.clone());
-        self.bucket_metas_by_id.insert(meta.bucket_id, meta.clone());
-        self.ensure_bucket_state(meta.bucket_id);
+        self.bucket_metas_by_id.insert(meta.id, meta.clone());
+        self.ensure_bucket_state(meta.id);
         Ok(meta)
     }
 
@@ -470,6 +470,7 @@ impl Manifest {
     pub(crate) fn create_bucket(
         &self,
         name: &str,
+        opt: BucketOptions,
     ) -> Result<(Arc<BucketMeta>, Arc<BucketContext>), OpCode> {
         let _lock = self.structural_lock.lock();
 
@@ -486,7 +487,10 @@ impl Manifest {
         let bucket_id = self.numerics.next_bucket_id.fetch_add(1, Relaxed);
         self.nr_buckets.fetch_add(1, Relaxed);
 
-        let meta = Arc::new(BucketMeta { bucket_id });
+        let meta = Arc::new(BucketMeta {
+            id: bucket_id,
+            options: opt,
+        });
         // publish meta early so context creation sees it
         self.bucket_metas.insert(name.to_string(), meta.clone());
         self.bucket_metas_by_id.insert(bucket_id, meta.clone());
@@ -509,6 +513,71 @@ impl Manifest {
         txn.commit();
 
         Ok((meta, bucket_ctx))
+    }
+
+    fn bucket_option_conflicts(old: BucketOptions, new: BucketOptions) -> Vec<&'static str> {
+        let mut conflicts = Vec::new();
+        if old.inline_size != new.inline_size {
+            conflicts.push("inline_size");
+        }
+        if old.split_elems != new.split_elems {
+            conflicts.push("split_elems");
+        }
+        conflicts
+    }
+
+    pub(crate) fn update_bucket_options(
+        &self,
+        name: &str,
+        opt: BucketOptions,
+    ) -> Result<(), OpCode> {
+        let _lock = self.structural_lock.lock();
+        let meta = self.load_bucket_meta_locked(name)?;
+        let bucket_id = meta.id;
+
+        if self.buckets.buckets.contains_key(&bucket_id) {
+            log::info!(
+                "bucket {}({}) is loaded, reject bucket option update",
+                name,
+                bucket_id
+            );
+            return Err(OpCode::Again);
+        }
+
+        if meta.options == opt {
+            return Ok(());
+        }
+
+        let conflicts = Self::bucket_option_conflicts(meta.options, opt);
+        if !conflicts.is_empty() {
+            log::error!(
+                "bucket {}({}) option update conflicts on [{}], old: {:?}, new: {:?}",
+                name,
+                bucket_id,
+                conflicts.join(", "),
+                meta.options,
+                opt
+            );
+            return Err(OpCode::Invalid);
+        }
+
+        let new_meta = Arc::new(BucketMeta {
+            id: bucket_id,
+            options: opt,
+        });
+        let mut buf = vec![0u8; new_meta.as_ref().packed_size()];
+        new_meta.as_ref().encode(&mut buf);
+
+        let mut txn = self.begin();
+        txn.ops_mut()
+            .entry(BUCKET_METAS.to_string())
+            .or_default()
+            .push(MetaOp::Put(name.as_bytes().to_vec(), buf));
+        txn.commit();
+
+        self.bucket_metas.insert(name.to_string(), new_meta.clone());
+        self.bucket_metas_by_id.insert(bucket_id, new_meta);
+        Ok(())
     }
 
     pub(crate) fn load_bucket_context(&self, bucket_id: u64) -> Result<Arc<BucketContext>, OpCode> {
@@ -563,15 +632,21 @@ impl Manifest {
             .as_ref()
             .expect("flusher started")
             .clone();
+        let meta = self
+            .bucket_metas_by_id
+            .get(&bucket_id)
+            .expect("bucket meta must exist")
+            .clone();
         let ctx = Arc::new(BucketContext::new(
             self.buckets.ctx,
+            &self.opt,
+            Arc::new(meta.options),
             state,
             bucket_id,
             table,
             flush,
             self.buckets.lru,
             self.buckets.reader.clone(),
-            self.buckets.used.clone(),
             self.buckets.tx.clone(),
         ));
 
@@ -615,7 +690,7 @@ impl Manifest {
         mode: BucketRemoveMode,
     ) -> Result<u64, OpCode> {
         let meta = self.load_bucket_meta_locked(name)?;
-        let bucket_id = meta.bucket_id;
+        let bucket_id = meta.id;
 
         // remove from maps (unpublish)
         self.bucket_metas.remove(name);
@@ -645,7 +720,7 @@ impl Manifest {
         let _lock = self.structural_lock.lock();
         let bucket_id = {
             let meta = self.load_bucket_meta_locked(name)?;
-            meta.bucket_id
+            meta.id
         };
         if self.buckets.ctx.has_pending_abort_clean_bucket(bucket_id) {
             return Err(OpCode::Again);
