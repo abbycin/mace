@@ -829,8 +829,9 @@ impl BucketContext {
                 return Ok(None);
             }
             if !swip.is_tagged() {
-                // we delay cache warm up when the value of page map entry was updated
-                return Ok(Some(Page::<Loader>::from_swip(swip.raw())));
+                let page = Page::<Loader>::from_swip(swip.raw());
+                page.mark_recent();
+                return Ok(Some(page));
             }
             let new = Page::load(self.loader(self.ctx), swip.untagged())?;
             if self.table.cas(pid, swip.raw(), new.swip()).is_ok() {
@@ -850,6 +851,10 @@ impl BucketContext {
             self.maybe_push_candidate(pid);
         }
         self.maybe_evict();
+    }
+
+    pub(crate) fn warm_state(&self, pid: u64) {
+        self.cache.warm(pid)
     }
 
     pub(crate) fn cool(&self, pid: u64) -> Option<CacheState> {

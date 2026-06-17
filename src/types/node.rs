@@ -2,7 +2,10 @@ use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::{
     cmp::Ordering::{self, Equal, Greater, Less},
     ops::{Bound, Deref, DerefMut},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
 };
 
 use crate::{
@@ -55,6 +58,7 @@ pub(crate) struct Node<L: ILoader> {
     /// the loader is remote/sibling loader, not node loader
     pub(crate) loader: L,
     mtx: Arc<Mutex<()>>,
+    recent: AtomicBool,
     pub(crate) state: RwLock<NodeState>,
     inner: BaseView,
 }
@@ -93,6 +97,7 @@ where
         Self {
             loader,
             mtx: Arc::new(Mutex::new(())),
+            recent: AtomicBool::new(false),
             state: RwLock::new(NodeState {
                 addr,
                 total_size,
@@ -114,6 +119,7 @@ where
         let mut l = Self {
             loader,
             mtx: Arc::new(Mutex::new(())),
+            recent: AtomicBool::new(false),
             state: RwLock::new(NodeState {
                 addr: d.addr,
                 total_size: d.total_size as usize,
@@ -139,6 +145,7 @@ where
         Self {
             loader: self.loader.copy(),
             mtx: self.mtx.clone(),
+            recent: AtomicBool::new(self.recent.load(Relaxed)),
             state: RwLock::new(NodeState {
                 addr: state.addr,
                 total_size: state.total_size,
@@ -212,6 +219,14 @@ where
     /// the length of delta + base
     pub(crate) fn size(&self) -> usize {
         self.state.read().total_size
+    }
+
+    pub(crate) fn mark_recent(&self) {
+        self.recent.store(true, Relaxed);
+    }
+
+    pub(crate) fn take_recent(&self) -> bool {
+        self.recent.swap(false, Relaxed)
     }
 
     pub(crate) fn base_addr(&self) -> u64 {
@@ -704,6 +719,7 @@ where
         Node {
             loader: self.loader.copy(),
             mtx: self.mtx.clone(),
+            recent: AtomicBool::new(self.recent.load(Relaxed)),
             state: RwLock::new(NodeState {
                 addr,
                 total_size: state.total_size + h.total_size as usize,

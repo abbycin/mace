@@ -1,4 +1,6 @@
 use dashmap::DashMap;
+use rustc_hash::FxHasher;
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::Ordering::{AcqRel, Relaxed};
 use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize};
 
@@ -40,12 +42,12 @@ struct CacheItem {
 }
 
 impl CacheItem {
-    fn warm(&self) -> CacheState {
+    fn warm(&self) {
         let mut cur = self.state.load(Relaxed);
         loop {
             let next = CacheState::from(cur).warm() as u32;
             match self.state.compare_exchange(cur, next, Relaxed, Relaxed) {
-                Ok(_) => return next.into(),
+                Ok(_) => return,
                 Err(v) => cur = v,
             }
         }
@@ -64,14 +66,14 @@ impl CacheItem {
 }
 
 pub(crate) struct NodeCache {
-    map: DashMap<u64, CacheItem>,
+    map: DashMap<u64, CacheItem, BuildHasherDefault<FxHasher>>,
     used: AtomicIsize,
 }
 
 impl NodeCache {
     pub(crate) fn new() -> Self {
         Self {
-            map: DashMap::new(),
+            map: DashMap::with_hasher(BuildHasherDefault::default()),
             used: AtomicIsize::new(0),
         }
     }
@@ -111,6 +113,12 @@ impl NodeCache {
                     size,
                 });
             }
+        }
+    }
+
+    pub(crate) fn warm(&self, pid: u64) {
+        if let Some(e) = self.map.get(&pid) {
+            e.warm();
         }
     }
 

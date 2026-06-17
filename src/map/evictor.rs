@@ -120,13 +120,20 @@ impl Evictor {
                     let Some(_lk) = old.try_lock() else {
                         continue;
                     };
+                    if old.take_recent() {
+                        bucket_ctx.warm_state(pid);
+                        break;
+                    }
                     if bucket_ctx.table.get(pid) != old.swip() {
                         // mapping changed after snapshot/read; it become warm again, so break
                         break;
                     }
+                    if bucket_ctx.cache_state(pid) != Some(CacheState::Cold) {
+                        break;
+                    }
 
                     let mut build = self.begin_build(&bucket_ctx);
-                    if old.delta_len() > bucket_ctx.max_delta_len() {
+                    if !old.is_intl() && old.delta_len() > 0 {
                         let (node, junk) = old.compact(&mut build, safe_txid);
                         let addr = node.latest_addr();
                         assert_eq!(addr, node.base_addr());
