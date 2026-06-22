@@ -1089,7 +1089,7 @@ where
             std::slice::from_raw_parts_mut(p.cast::<u8>(), T::LEN)
         };
         file.read(tmp, end - T::LEN as u64)
-            .map_err(|_| OpCode::IoError)?;
+            .map_err(|_| OpCode::Corruption)?;
 
         Ok(Self { file, footer, end })
     }

@@ -1,6 +1,6 @@
 [package]
 name = "mace-kv"
-version = "0.0.34"
+version = "0.0.35"
 edition = "2024"
 rust-version = "1.95"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
@@ -22,7 +22,7 @@ rand = "0.10.1"
 log = "0.4.32"
 crossbeam-epoch = "0.9.18"
 parking_lot = "0.12.5"
-btree-store = "0.1.7"
+btree-store = "0.1.9"
 rustc-hash = "2.1.2"
 zstd = { version = "0.13.3" }
 

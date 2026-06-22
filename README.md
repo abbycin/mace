@@ -12,6 +12,7 @@ Mace is a high-performance, embedded key-value storage engine written in Rust. I
 - **Concurrent MVCC**: Supports non-blocking concurrent reads and writes through Multi-Version Concurrency Control.
 - **Flash-Optimized**: Log-structured design specifically tailored for SSD/NVMe endurance and performance.
 - **Large Value Separation**: Efficiently handles large values by separating them from the indexing structure, significantly reducing I/O overhead during maintenance.
+- **Optional Zstd Compression**: Supports zstd compression for persisted data and blob records through bucket option `enable_compression` (default: `false`).
 - **ACID Transactions**: Full support for Atomicity, Consistency, Isolation, and Durability.
 - **Data Integrity**: Integrated CRC checksums ensure data remains uncorrupted across restarts and crashes.
 - **Flow Control**: Optional foreground write backpressure to prevent memory pressure spikes.

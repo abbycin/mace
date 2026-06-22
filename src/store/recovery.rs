@@ -13,6 +13,7 @@ use crate::cc::wal::{
     ptr_to, wal_record_sz,
 };
 use crate::index::tree::Tree;
+use crate::store::gc::drain_abort_clean_during_recovery;
 use crate::types::data::{Key, Record, Ver};
 use crate::utils::block::Block;
 use crate::utils::data::Position;
@@ -139,13 +140,16 @@ impl Recovery {
             self.trees.del(&bucket_id);
             self.evict_bucket(bucket_id, store.clone());
         }
+        store.manifest.buckets.unload_all();
     }
 
     pub(crate) fn phase1(
         &mut self,
+        manifest: Handle<crate::meta::Manifest>,
         numerics: Arc<crate::meta::Numerics>,
     ) -> Result<(Vec<GroupBoot>, Handle<Context>), OpCode> {
-        let wal_boot = self.load_wal_boot()?;
+        self.finish_pending_wal_recycle(manifest)?;
+        let wal_boot = self.load_wal_boot(manifest)?;
         let ctx = Handle::new(Context::new(self.opt.clone(), numerics, &wal_boot));
         Ok((wal_boot, ctx))
     }
@@ -219,6 +223,11 @@ impl Recovery {
                 redo_started.elapsed().as_micros() as u64,
             );
         }
+        if !store.context.abort_clean_tasks().is_empty() {
+            drain_abort_clean_during_recovery(store.clone(), store.context)?;
+        }
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_recovery_abort_clean_after_drain_before_start");
         log::trace!("oracle {oracle}");
         store.manifest.numerics.oracle.store(oracle, Relaxed);
         store.manifest.numerics.wmk_oldest.store(oracle, Relaxed);
@@ -571,31 +580,96 @@ impl Recovery {
         if found { Some((min_id, max_id)) } else { None }
     }
 
-    fn load_wal_boot(&self) -> Result<Vec<GroupBoot>, OpCode> {
+    fn load_wal_boot(
+        &self,
+        manifest: Handle<crate::meta::Manifest>,
+    ) -> Result<Vec<GroupBoot>, OpCode> {
         let mut out = Vec::with_capacity(self.opt.concurrent_write as usize);
         for group in 0..self.opt.concurrent_write {
             let group_id = group;
+            let recycle_state = manifest.load_wal_recycle_state(group_id);
             if let Some((min_id, max_id)) = self.wal_file_range(group_id) {
-                let checkpoint = self
-                    .find_latest_checkpoint(group_id, min_id, max_id)?
-                    .unwrap_or(Position {
-                        file_id: min_id,
+                let oldest_id = if recycle_state.is_done() {
+                    recycle_state.oldest_id()
+                } else {
+                    min_id
+                };
+                let latest_id = max_id.max(oldest_id);
+                let checkpoint = if max_id >= oldest_id {
+                    self.find_latest_checkpoint(group_id, oldest_id, max_id)?
+                        .unwrap_or(Position {
+                            file_id: oldest_id,
+                            offset: 0,
+                        })
+                } else {
+                    Position {
+                        file_id: oldest_id,
                         offset: 0,
-                    });
+                    }
+                };
                 out.push(GroupBoot {
-                    oldest_id: min_id,
-                    latest_id: max_id,
+                    oldest_id,
+                    latest_id,
                     checkpoint,
                 });
             } else {
+                let oldest_id = if recycle_state.is_done() {
+                    recycle_state.oldest_id()
+                } else {
+                    0
+                };
                 out.push(GroupBoot {
-                    oldest_id: 0,
-                    latest_id: 0,
+                    oldest_id,
+                    latest_id: oldest_id,
                     checkpoint: Position::default(),
                 });
             }
         }
         Ok(out)
+    }
+
+    fn finish_pending_wal_recycle(
+        &self,
+        manifest: Handle<crate::meta::Manifest>,
+    ) -> Result<(), OpCode> {
+        for group_id in 0..self.opt.concurrent_write {
+            let state = manifest.load_wal_recycle_state(group_id);
+            if state.is_none() || state.is_done() {
+                continue;
+            }
+            let intent = crate::meta::WalRecycleIntent {
+                group_id,
+                from_file_id: state.from_file_id,
+                to_file_id: state.to_file_id,
+            };
+            Self::remove_wal_prefix(&self.opt, intent)?;
+            self.opt.sync_log_dir();
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
+            manifest.commit_wal_recycle_done(intent);
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_wal_recycle_after_done_commit_before_publish");
+        }
+        Ok(())
+    }
+
+    fn remove_wal_prefix(
+        opt: &crate::utils::options::ParsedOptions,
+        intent: crate::meta::WalRecycleIntent,
+    ) -> Result<(), OpCode> {
+        for seq in intent.from_file_id..intent.to_file_id {
+            let path = opt.wal_file(intent.group_id, seq);
+            if !path.exists() {
+                continue;
+            }
+            if opt.keep_stable_wal_file {
+                let to = opt.wal_backup(intent.group_id, seq);
+                std::fs::rename(&path, &to)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        Ok(())
     }
 
     fn find_latest_checkpoint(

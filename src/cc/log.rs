@@ -165,6 +165,9 @@ impl Logging {
     }
 
     pub fn update_checkpoint(&mut self, pos: Position) -> bool {
+        if !self.enable_ckpt.load(Relaxed) {
+            return false;
+        }
         if pos > self.last_ckpt {
             self.last_ckpt = pos;
         }
@@ -411,5 +414,56 @@ impl Logging {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Logging;
+    use crate::utils::data::Position;
+    use crate::utils::options::Options;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    fn new_logging() -> (crate::RandomPath, Logging) {
+        let root = crate::RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 1;
+        let parsed = Arc::new(opt.validate().expect("log options must validate"));
+        let logging = Logging::new(
+            0,
+            0,
+            0,
+            Position::default(),
+            parsed,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        (root, logging)
+    }
+
+    #[test]
+    fn update_checkpoint_does_not_advance_before_checkpoint_is_enabled() {
+        let (_root, mut logging) = new_logging();
+        let newer = Position {
+            file_id: 7,
+            offset: 33,
+        };
+
+        assert!(!logging.update_checkpoint(newer));
+        assert_eq!(logging.last_ckpt(), Position::default());
+    }
+
+    #[test]
+    fn update_checkpoint_advances_after_checkpoint_is_enabled() {
+        let (_root, mut logging) = new_logging();
+        let newer = Position {
+            file_id: 7,
+            offset: 33,
+        };
+
+        logging.enable_checkpoint();
+        assert!(!logging.update_checkpoint(newer));
+        assert_eq!(logging.last_ckpt(), newer);
+        assert_eq!(logging.ckpt_cnt.load(Relaxed), 0);
     }
 }

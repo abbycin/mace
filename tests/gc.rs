@@ -590,6 +590,104 @@ fn abort_clean_wal_open_is_bounded_by_file_count() -> Result<(), OpCode> {
 }
 
 #[test]
+fn abort_clean_blocks_drop_until_task_is_fully_removed() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 60_000;
+    opt.concurrent_write = 1;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
+
+    let seed = db.begin().unwrap();
+    seed.put("k", "seed")?;
+    seed.commit()?;
+
+    let tx = db.begin().unwrap();
+    tx.update("k", "v1")?;
+    drop(tx);
+    drop(db);
+
+    assert_eq!(mace.drop_bucket("x"), Err(OpCode::Again));
+    mace.start_gc();
+    assert_eq!(mace.drop_bucket("x"), Err(OpCode::Again));
+    Ok(())
+}
+
+#[test]
+fn recovery_drains_abort_clean_before_startup_returns() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = false;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 60_000;
+    opt.concurrent_write = 1;
+
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
+
+        let seed = db.begin().unwrap();
+        seed.put("k", "seed")?;
+        seed.commit()?;
+
+        let tx = db.begin().unwrap();
+        tx.update("k", "v1")?;
+        drop(tx);
+    }
+
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let bucket = mace.get_bucket("x")?;
+    let view = bucket.view()?;
+    assert_eq!(view.get("k")?.slice(), b"seed");
+    drop(view);
+    drop(bucket);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match mace.drop_bucket("x") {
+            Ok(()) => return Ok(()),
+            Err(OpCode::Again) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => panic!("unexpected drop_bucket error after recovery drain: {e:?}"),
+        }
+    }
+    panic!("drop_bucket remained blocked after recovery should have drained abort clean");
+}
+
+#[test]
+fn recovery_abort_clean_does_not_leave_bucket_loaded_after_startup() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = false;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 60_000;
+    opt.concurrent_write = 1;
+
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
+
+        let seed = db.begin().unwrap();
+        seed.put("k", "seed")?;
+        seed.commit()?;
+
+        let tx = db.begin().unwrap();
+        tx.update("k", "v1")?;
+        drop(tx);
+    }
+
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    mace.update_bucket_opt(
+        "x",
+        BucketOptions {
+            cache_evict_pct: 30,
+            ..BucketOptions::default()
+        },
+    )?;
+    Ok(())
+}
+
+#[test]
 fn vacuum_bucket_blocks_delete() -> Result<(), OpCode> {
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);

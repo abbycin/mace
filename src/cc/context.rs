@@ -403,12 +403,20 @@ impl Context {
         let _seq = self.pending_abort_clean_seqlock.write_lock();
         let shard = Self::shard_of(txid);
         let old = self.pending_abort_clean[shard].write().remove(&txid);
-        if old.is_some() {
+        if let Some(task) = old {
             self.pending_abort_clean_nr.fetch_sub(1, Relaxed);
             if self.pending_abort_clean_nr.load(Relaxed) == 0 {
                 self.pending_abort_clean_floor.store(u64::MAX, Relaxed);
             } else if txid <= self.pending_abort_clean_floor.load(Relaxed) {
                 self.recompute_pending_abort_clean_floor();
+            }
+            let bucket_shard = Self::shard_of(task.bucket_id);
+            let mut buckets = self.pending_abort_clean_buckets[bucket_shard].write();
+            if let Some(cnt) = buckets.get_mut(&task.bucket_id) {
+                *cnt -= 1;
+                if *cnt == 0 {
+                    buckets.remove(&task.bucket_id);
+                }
             }
         }
     }
@@ -426,17 +434,8 @@ impl Context {
         if let Some(task) = self.pending_abort_clean[shard].write().get_mut(&txid)
             && task.state == AbortCleanState::Pending
         {
-            let bucket_id = task.bucket_id;
             task.state = AbortCleanState::WaitingQuiesce;
             task.quiesced = false;
-            let bucket_shard = Self::shard_of(bucket_id);
-            let mut buckets = self.pending_abort_clean_buckets[bucket_shard].write();
-            if let Some(cnt) = buckets.get_mut(&bucket_id) {
-                *cnt -= 1;
-                if *cnt == 0 {
-                    buckets.remove(&bucket_id);
-                }
-            }
         }
     }
 

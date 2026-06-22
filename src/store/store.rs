@@ -27,6 +27,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::channel;
 
+struct FlushStatDelta {
+    old_data_stats: Vec<DataStat>,
+    old_blob_stats: Vec<BlobStat>,
+    new_data_stats: Vec<DataStat>,
+    new_blob_stats: Vec<BlobStat>,
+}
+
 struct StoreFlushObserver {
     manifest: Handle<Manifest>,
     ctx: Handle<Context>,
@@ -101,11 +108,7 @@ impl StoreFlushObserver {
         self.handle.lock().replace(handle);
     }
 
-    fn update_stat_interval(
-        &self,
-        txn: &mut Txn,
-        result: &mut FlushResult,
-    ) -> (Vec<DataStat>, Vec<BlobStat>) {
+    fn update_stat_interval(&self, txn: &mut Txn, result: &mut FlushResult) -> FlushStatDelta {
         let bucket_id = result.bucket_id;
         let data_tick = result
             .data_ivls
@@ -124,42 +127,50 @@ impl StoreFlushObserver {
         for stat in self.manifest.apply_blob_junks(bucket_id, &result.blob_junk) {
             blob_by_file.insert(stat.file_id, stat);
         }
+        let old_data_stats: Vec<_> = data_by_file.into_values().collect();
+        let old_blob_stats: Vec<_> = blob_by_file.into_values().collect();
+
+        #[cfg(feature = "failpoints")]
+        if !old_data_stats.is_empty() || !old_blob_stats.is_empty() {
+            crate::utils::failpoint::crash("mace_flush_after_old_stat_delta");
+        }
 
         #[cfg(feature = "extra_check")]
         assert_eq!(result.data_stats.len(), result.data_ivls.len());
         #[cfg(feature = "extra_check")]
         assert_eq!(result.blob_stats.len(), result.blob_ivls.len());
 
+        let mut new_data_stats = Vec::with_capacity(result.data_stats.len());
         for (mem_stat, ivl) in result
             .data_stats
             .drain(..)
             .zip(result.data_ivls.iter().copied())
         {
-            data_by_file
-                .entry(mem_stat.file_id)
-                .or_insert_with(|| mem_stat);
+            new_data_stats.push(mem_stat);
             self.manifest.clear_orphan_data_file(txn, ivl.file_id);
         }
 
+        let mut new_blob_stats = Vec::with_capacity(result.blob_stats.len());
         for (mem_stat, ivl) in result
             .blob_stats
             .drain(..)
             .zip(result.blob_ivls.iter().copied())
         {
-            blob_by_file
-                .entry(mem_stat.file_id)
-                .or_insert_with(|| mem_stat);
+            new_blob_stats.push(mem_stat);
             self.manifest.clear_orphan_blob_file(txn, ivl.file_id);
         }
-        (
-            data_by_file.into_values().collect(),
-            blob_by_file.into_values().collect(),
-        )
+        FlushStatDelta {
+            old_data_stats,
+            old_blob_stats,
+            new_data_stats,
+            new_blob_stats,
+        }
     }
 
     fn publish(&self, mut result: FlushResult) {
         let has_new_files = !result.data_ivls.is_empty() || !result.blob_ivls.is_empty();
         let bucket_id = result.bucket_id;
+        let retired_stat_snapshot = self.manifest.snapshot_retired_stat_keys(bucket_id);
         let frontier_delta = *result.latest_chkpoint_lsn.deref();
         let previous_frontier = self
             .manifest
@@ -192,7 +203,7 @@ impl StoreFlushObserver {
             .manifest
             .merge_bucket_frontier(bucket_id, &frontier_delta);
         let mut txn = self.manifest.begin();
-        let (data_stats, blob_stats) = self.update_stat_interval(&mut txn, &mut result);
+        let stat_delta = self.update_stat_interval(&mut txn, &mut result);
 
         for ivl in &result.data_ivls {
             txn.record(MetaKind::DataInterval, ivl);
@@ -201,10 +212,24 @@ impl StoreFlushObserver {
             txn.record(MetaKind::BlobInterval, ivl);
         }
 
-        data_stats.iter().for_each(|x| {
+        stat_delta
+            .old_data_stats
+            .iter()
+            .filter(|x| !self.manifest.is_retired_data_stat(bucket_id, x.file_id))
+            .for_each(|x| {
+                txn.record_data_stat_update(x);
+            });
+        stat_delta
+            .old_blob_stats
+            .iter()
+            .filter(|x| !self.manifest.is_retired_blob_stat(bucket_id, x.file_id))
+            .for_each(|x| {
+                txn.record_blob_stat_update(x);
+            });
+        stat_delta.new_data_stats.iter().for_each(|x| {
             txn.record(MetaKind::DataStat, x);
         });
-        blob_stats.iter().for_each(|x| {
+        stat_delta.new_blob_stats.iter().for_each(|x| {
             txn.record(MetaKind::BlobStat, x);
         });
 
@@ -217,7 +242,7 @@ impl StoreFlushObserver {
             Self::abort_flush_publish("before manifest commit", e);
         }
         txn.commit();
-
+        self.manifest.clear_retired_stat_keys(retired_stat_snapshot);
         self.manifest.clear_synced_data();
         self.manifest.clear_synced_blob();
 
@@ -292,7 +317,7 @@ impl CheckpointObserver for StoreFlushObserver {
     fn finish_checkpoint(&self) {
         let h = self.handle.lock();
         if let Some(h) = h.as_ref() {
-            h.wal_clean(self.ctx);
+            h.wal_clean(self.manifest, self.ctx);
         }
     }
 }
@@ -483,7 +508,7 @@ impl Mace {
         let manifest = Handle::new(builder.finish());
 
         let mut recover = Recovery::new(opt.clone());
-        let (wal_boot, ctx) = recover.phase1(manifest.numerics.clone())?;
+        let (wal_boot, ctx) = recover.phase1(manifest, manifest.numerics.clone())?;
         let observer = Arc::new(StoreFlushObserver::new(manifest, ctx));
         let reader = Arc::new(StoreDataReader::new(manifest));
         manifest.set_context(ctx, reader, observer.clone());

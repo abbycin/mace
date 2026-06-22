@@ -1055,6 +1055,13 @@ impl BucketMgr {
         let _ = self.buckets.remove(&bucket_id);
     }
 
+    pub(crate) fn unload_all(&self) {
+        let bucket_ids: Vec<u64> = self.buckets.iter().map(|x| *x.key()).collect();
+        for bucket_id in bucket_ids {
+            self.del_bucket(bucket_id);
+        }
+    }
+
     pub(crate) fn active_contexts(&self) -> Vec<Arc<BucketContext>> {
         self.buckets
             .iter()

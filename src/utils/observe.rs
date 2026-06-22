@@ -52,11 +52,15 @@ pub enum CounterMetric {
     GcBlobObsoleteFile,
     GcAbortCleanCheckpointBucket,
     GcAbortCleanWalFileOpen,
+    FlushSkipRetiredDataStat,
+    FlushSkipRetiredBlobStat,
+    FlushConditionalDataStatPutMiss,
+    FlushConditionalBlobStatPutMiss,
     FlowFgAdmissionWait,
 }
 
 impl CounterMetric {
-    pub const COUNT: usize = 31;
+    pub const COUNT: usize = 35;
     pub const ALL: [CounterMetric; Self::COUNT] = [
         CounterMetric::TxnBegin,
         CounterMetric::TxnCommit,
@@ -88,6 +92,10 @@ impl CounterMetric {
         CounterMetric::GcBlobObsoleteFile,
         CounterMetric::GcAbortCleanCheckpointBucket,
         CounterMetric::GcAbortCleanWalFileOpen,
+        CounterMetric::FlushSkipRetiredDataStat,
+        CounterMetric::FlushSkipRetiredBlobStat,
+        CounterMetric::FlushConditionalDataStatPutMiss,
+        CounterMetric::FlushConditionalBlobStatPutMiss,
         CounterMetric::FlowFgAdmissionWait,
     ];
 
@@ -102,13 +110,15 @@ impl CounterMetric {
 pub enum GaugeMetric {
     RecoveryDirtyEntries,
     RecoveryUndoEntries,
+    RetiredStatKeysCurrent,
 }
 
 impl GaugeMetric {
-    pub const COUNT: usize = 2;
+    pub const COUNT: usize = 3;
     pub const ALL: [GaugeMetric; Self::COUNT] = [
         GaugeMetric::RecoveryDirtyEntries,
         GaugeMetric::RecoveryUndoEntries,
+        GaugeMetric::RetiredStatKeysCurrent,
     ];
 
     #[inline]

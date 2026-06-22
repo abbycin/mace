@@ -16,7 +16,7 @@ use std::{
 };
 
 use crc32c::Crc32cHasher;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 use crate::{
     Options,
@@ -37,7 +37,7 @@ use crate::{
         data::{AddrPair, GroupPositions, LenSeq, Position, Reloc, init_group_pos},
         interval::IntervalMap,
         lru::{Lru, ShardLru},
-        observe::{CounterMetric, EventKind, ObserveEvent},
+        observe::{CounterMetric, EventKind, GaugeMetric, ObserveEvent},
         options::{BucketOptions, ParsedOptions},
     },
 };
@@ -58,6 +58,7 @@ pub(crate) const VERSION_KEY: &str = "current_version";
 // keep marker keys short to reduce numerics bucket write amplification
 pub(crate) const ORPHAN_DATA_MARKER_PREFIX: &str = "odf_";
 pub(crate) const ORPHAN_BLOB_MARKER_PREFIX: &str = "obf_";
+pub(crate) const WAL_RECYCLE_PREFIX: &str = "wrc_";
 /// storage format version
 pub(crate) const CURRENT_VERSION: u64 = 1;
 
@@ -66,6 +67,7 @@ mod entry;
 pub use entry::{
     BlobStat, BlobStatInner, BucketDurableFrontier, BucketMeta, DataStat, DataStatInner,
     DelInterval, Delete, IntervalPair, MemBlobStat, MemDataStat, MetaKind, Numerics, PageTable,
+    WalRecycleState,
 };
 
 pub(crate) fn page_table_name(bucket_id: u64) -> String {
@@ -86,6 +88,17 @@ pub(crate) fn orphan_data_marker_key(file_id: u64) -> Vec<u8> {
 
 pub(crate) fn orphan_blob_marker_key(file_id: u64) -> Vec<u8> {
     format!("{}{}", ORPHAN_BLOB_MARKER_PREFIX, file_id).into_bytes()
+}
+
+pub(crate) fn wal_recycle_key(group_id: u8) -> Vec<u8> {
+    format!("{}{}", WAL_RECYCLE_PREFIX, group_id).into_bytes()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WalRecycleIntent {
+    pub(crate) group_id: u8,
+    pub(crate) from_file_id: u64,
+    pub(crate) to_file_id: u64,
 }
 
 pub(crate) trait IMetaCodec {
@@ -228,6 +241,7 @@ impl MetaRecord for DelInterval {
 #[derive(Clone)]
 pub(crate) enum MetaOp {
     Put(Vec<u8>, Vec<u8>),
+    Update(Vec<u8>, Vec<u8>, CounterMetric),
     Del(Vec<u8>),
 }
 
@@ -247,8 +261,81 @@ pub(crate) struct Manifest {
     pub(crate) obsolete_blob: Mutex<Vec<u64>>,
     pub(crate) data_unsync: RwLock<HashSet<u64>>,
     pub(crate) blob_unsync: RwLock<HashSet<u64>>,
+    retired_stat_keys: RetiredStatKeys,
     pub(crate) opt: Arc<ParsedOptions>,
     pub(crate) btree: BTree,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RetiredStatKind {
+    Data,
+    Blob,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RetiredStatKey {
+    kind: RetiredStatKind,
+    bucket_id: u64,
+    file_id: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct RetiredStatKeys {
+    keys: DashSet<RetiredStatKey>,
+}
+
+pub(crate) struct RetiredStatFlushSnapshot {
+    keys: Vec<RetiredStatKey>,
+}
+
+impl RetiredStatKeys {
+    fn mark(&self, kind: RetiredStatKind, bucket_id: u64, file_ids: &[u64]) -> usize {
+        let mut inserted = 0;
+        for &file_id in file_ids {
+            if self.keys.insert(RetiredStatKey {
+                kind,
+                bucket_id,
+                file_id,
+            }) {
+                inserted += 1;
+            }
+        }
+        inserted
+    }
+
+    fn contains(&self, kind: RetiredStatKind, bucket_id: u64, file_id: u64) -> bool {
+        self.keys.contains(&RetiredStatKey {
+            kind,
+            bucket_id,
+            file_id,
+        })
+    }
+
+    fn snapshot_bucket(&self, bucket_id: u64) -> RetiredStatFlushSnapshot {
+        let keys = self
+            .keys
+            .iter()
+            .filter_map(|entry| {
+                let key = *entry.key();
+                (key.bucket_id == bucket_id).then_some(key)
+            })
+            .collect();
+        RetiredStatFlushSnapshot { keys }
+    }
+
+    fn clear_snapshot(&self, snapshot: RetiredStatFlushSnapshot) -> usize {
+        let mut removed = 0;
+        for key in snapshot.keys {
+            if self.keys.remove(&key).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
 }
 
 enum BucketRemoveMode {
@@ -301,7 +388,6 @@ pub(crate) struct BucketRewritePermit {
 
 pub(crate) struct Txn<'a> {
     manifest: &'a Manifest,
-    btree: BTree,
     // bucket_name -> operations
     ops: BTreeMap<String, Vec<MetaOp>>,
 }
@@ -319,18 +405,21 @@ impl<'a> Txn<'a> {
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_manifest_before_multi_commit");
 
-            // btree-store supports SI. refresh handle to start a fresh session
-            self.btree = self.manifest.btree.clone();
-
+            let mut missed_updates = Vec::new();
             // perform an atomic multi-bucket commit
             // all updates across different buckets are applied and flushed to disk
             // in a single SuperBlock write, significantly reducing I/O overhead
-            let res = self.btree.exec_multi(|multi_txn| {
+            let res = self.manifest.btree.exec_multi(|multi_txn| {
                 for (bucket, bucket_ops) in &self.ops {
                     multi_txn.exec(bucket, |tree_txn| {
                         for op in bucket_ops {
                             match op {
                                 MetaOp::Put(k, v) => tree_txn.put(k, v)?,
+                                MetaOp::Update(k, v, miss_metric) => {
+                                    if !tree_txn.update(k, v)? {
+                                        missed_updates.push(*miss_metric);
+                                    }
+                                }
                                 MetaOp::Del(k) => tree_txn.del(k)?,
                             }
                         }
@@ -342,6 +431,9 @@ impl<'a> Txn<'a> {
 
             match res {
                 Ok(_) => {
+                    for metric in missed_updates {
+                        self.manifest.opt.observer.counter(metric, 1);
+                    }
                     self.ops.clear();
                     break;
                 }
@@ -363,6 +455,45 @@ impl<'a> Txn<'a> {
         T: MetaRecord,
     {
         x.record(kind, &mut self.ops);
+    }
+
+    pub(crate) fn record_data_stat_update(&mut self, x: &DataStat) {
+        self.record_stat_update(
+            BUCKET_DATA_STAT,
+            x.file_id,
+            x,
+            CounterMetric::FlushConditionalDataStatPutMiss,
+        );
+    }
+
+    pub(crate) fn record_blob_stat_update(&mut self, x: &BlobStat) {
+        self.record_stat_update(
+            BUCKET_BLOB_STAT,
+            x.file_id,
+            x,
+            CounterMetric::FlushConditionalBlobStatPutMiss,
+        );
+    }
+
+    fn record_stat_update<T>(
+        &mut self,
+        bucket: &str,
+        file_id: u64,
+        x: &T,
+        miss_metric: CounterMetric,
+    ) where
+        T: IMetaCodec,
+    {
+        let mut buf = vec![0u8; x.packed_size()];
+        x.encode(&mut buf);
+        self.ops
+            .entry(bucket.to_string())
+            .or_default()
+            .push(MetaOp::Update(
+                file_id.to_be_bytes().to_vec(),
+                buf,
+                miss_metric,
+            ));
     }
 }
 
@@ -487,6 +618,7 @@ impl Manifest {
             obsolete_blob: Mutex::new(Vec::new()),
             data_unsync: RwLock::new(HashSet::new()),
             blob_unsync: RwLock::new(HashSet::new()),
+            retired_stat_keys: RetiredStatKeys::default(),
             nr_buckets: AtomicU64::new(0),
             opt,
             btree,
@@ -577,7 +709,11 @@ impl Manifest {
             .entry(BUCKET_METAS.to_string())
             .or_default()
             .push(MetaOp::Put(name.as_bytes().to_vec(), buf));
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_bucket_create_before_manifest_commit");
         txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_bucket_create_after_manifest_commit");
 
         Ok((meta, bucket_ctx))
     }
@@ -891,13 +1027,19 @@ impl Manifest {
 
         // record obsolete files
         if !data_files.is_empty() {
+            // bucket delete is already unpublished and must not publish retired keys
             txn.record(MetaKind::DataDelete, &Delete::from(data_files.clone()));
         }
         if !blob_files.is_empty() {
+            // bucket delete is already unpublished and must not publish retired keys
             txn.record(MetaKind::BlobDelete, &Delete::from(blob_files.clone()));
         }
 
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_bucket_delete_before_manifest_commit");
         txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_bucket_delete_after_manifest_commit");
 
         // in-memory cleanup for stats
         // once a bucket enters pending-delete, its file metadata must no longer participate in
@@ -1006,7 +1148,16 @@ impl Manifest {
     ) -> Vec<DataStat> {
         if !junks.is_empty() {
             let ctx = self.get_bucket_context_must_exist(bucket_id);
-            self.data_stat.apply_junks(tick, junks, &ctx, &self.btree)
+            self.data_stat
+                .apply_junks(tick, junks, &ctx, &self.btree, |file_id| {
+                    let retired = self.is_retired_data_stat(bucket_id, file_id);
+                    if retired {
+                        self.opt
+                            .observer
+                            .counter(CounterMetric::FlushSkipRetiredDataStat, 1);
+                    }
+                    retired
+                })
         } else {
             Vec::new()
         }
@@ -1015,10 +1166,61 @@ impl Manifest {
     pub(crate) fn apply_blob_junks(&self, bucket_id: u64, junks: &[u64]) -> Vec<BlobStat> {
         if !junks.is_empty() {
             let ctx = self.get_bucket_context_must_exist(bucket_id);
-            self.blob_stat.apply_junks(junks, &ctx, &self.btree)
+            self.blob_stat
+                .apply_junks(junks, &ctx, &self.btree, |file_id| {
+                    let retired = self.is_retired_blob_stat(bucket_id, file_id);
+                    if retired {
+                        self.opt
+                            .observer
+                            .counter(CounterMetric::FlushSkipRetiredBlobStat, 1);
+                    }
+                    retired
+                })
         } else {
             Vec::new()
         }
+    }
+
+    pub(crate) fn mark_retired_data_stats(&self, bucket_id: u64, file_ids: &[u64]) {
+        self.mark_retired_stats(RetiredStatKind::Data, bucket_id, file_ids);
+    }
+
+    pub(crate) fn mark_retired_blob_stats(&self, bucket_id: u64, file_ids: &[u64]) {
+        self.mark_retired_stats(RetiredStatKind::Blob, bucket_id, file_ids);
+    }
+
+    fn mark_retired_stats(&self, kind: RetiredStatKind, bucket_id: u64, file_ids: &[u64]) {
+        if file_ids.is_empty() {
+            return;
+        }
+        self.retired_stat_keys.mark(kind, bucket_id, file_ids);
+        self.observe_retired_stat_keys();
+    }
+
+    pub(crate) fn is_retired_data_stat(&self, bucket_id: u64, file_id: u64) -> bool {
+        self.retired_stat_keys
+            .contains(RetiredStatKind::Data, bucket_id, file_id)
+    }
+
+    pub(crate) fn is_retired_blob_stat(&self, bucket_id: u64, file_id: u64) -> bool {
+        self.retired_stat_keys
+            .contains(RetiredStatKind::Blob, bucket_id, file_id)
+    }
+
+    pub(crate) fn snapshot_retired_stat_keys(&self, bucket_id: u64) -> RetiredStatFlushSnapshot {
+        self.retired_stat_keys.snapshot_bucket(bucket_id)
+    }
+
+    pub(crate) fn clear_retired_stat_keys(&self, snapshot: RetiredStatFlushSnapshot) {
+        self.retired_stat_keys.clear_snapshot(snapshot);
+        self.observe_retired_stat_keys();
+    }
+
+    fn observe_retired_stat_keys(&self) {
+        self.opt.observer.gauge(
+            GaugeMetric::RetiredStatKeysCurrent,
+            self.retired_stat_keys.len() as i64,
+        );
     }
 
     pub(crate) fn durable_frontier_lsn(&self, bucket_id: u64, group: u8) -> Position {
@@ -1082,10 +1284,8 @@ impl Manifest {
     }
 
     pub(crate) fn begin(&self) -> Txn<'_> {
-        let btree = self.btree.clone();
         Txn {
             manifest: self,
-            btree,
             ops: BTreeMap::new(),
         }
     }
@@ -1157,6 +1357,42 @@ impl Manifest {
 
     pub(crate) fn is_unsynced_blob_file(&self, file_id: u64) -> bool {
         self.blob_unsync.read().contains(&file_id)
+    }
+
+    pub(crate) fn load_wal_recycle_state(&self, group_id: u8) -> WalRecycleState {
+        let key = wal_recycle_key(group_id);
+        match self.btree.view(BUCKET_NUMERICS, |txn| txn.get(&key)) {
+            Ok(val) => WalRecycleState::decode(&val),
+            Err(btree_store::Error::NotFound) => WalRecycleState::none(group_id),
+            Err(err) => panic!("load wal recycle state failed for group {group_id}: {err:?}"),
+        }
+    }
+
+    pub(crate) fn record_wal_recycle_state(&self, txn: &mut Txn<'_>, state: WalRecycleState) {
+        let mut buf = vec![0u8; state.packed_size()];
+        state.encode(&mut buf);
+        txn.ops_mut()
+            .entry(BUCKET_NUMERICS.to_string())
+            .or_default()
+            .push(MetaOp::Put(wal_recycle_key(state.group_id), buf));
+    }
+
+    pub(crate) fn commit_wal_recycle_intent(&self, intent: WalRecycleIntent) {
+        let mut txn = self.begin();
+        self.record_wal_recycle_state(
+            &mut txn,
+            WalRecycleState::intent(intent.group_id, intent.from_file_id, intent.to_file_id),
+        );
+        txn.commit();
+    }
+
+    pub(crate) fn commit_wal_recycle_done(&self, intent: WalRecycleIntent) {
+        let mut txn = self.begin();
+        self.record_wal_recycle_state(
+            &mut txn,
+            WalRecycleState::done(intent.group_id, intent.from_file_id, intent.to_file_id),
+        );
+        txn.commit();
     }
 
     pub(crate) fn clear_orphan_blob_file(&self, txn: &mut Txn<'_>, file_id: u64) {
@@ -1376,7 +1612,6 @@ where
             let ivl_map = K::intervals(ctx).read();
             ivl_map.find(addr).expect("must exist")
         };
-
         loop {
             if let Some(reader) = self.common.cache.get(file_id).map(|r| r.clone()) {
                 return reader.read_at(addr);
@@ -1643,6 +1878,7 @@ impl StatCtx<DataKind, DashMap<u64, MemDataStat>> {
         junks: &[u64],
         ctx: &BucketContext,
         btree: &BTree,
+        is_retired: impl Fn(u64) -> bool,
     ) -> Vec<DataStat> {
         let grouped: BTreeMap<u64, Vec<u64>> = {
             let lk = ctx.data_intervals.read();
@@ -1664,6 +1900,9 @@ impl StatCtx<DataKind, DashMap<u64, MemDataStat>> {
         // generating many duplicate per-file meta puts in a single publish round.
         let mut v: Vec<DataStat> = Vec::with_capacity(grouped.len());
         for (file_id, addrs) in grouped {
+            if is_retired(file_id) {
+                continue;
+            }
             if self.ensure_mask(file_id, btree).is_err() {
                 continue;
             }
@@ -1848,7 +2087,13 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
         ret
     }
 
-    fn apply_junks(&self, junks: &[u64], ctx: &BucketContext, btree: &BTree) -> Vec<BlobStat> {
+    fn apply_junks(
+        &self,
+        junks: &[u64],
+        ctx: &BucketContext,
+        btree: &BTree,
+        is_retired: impl Fn(u64) -> bool,
+    ) -> Vec<BlobStat> {
         let grouped: BTreeMap<u64, Vec<u64>> = {
             let lk = ctx.blob_intervals.read();
             let mut grouped = BTreeMap::<u64, Vec<u64>>::new();
@@ -1866,6 +2111,9 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
         };
         let mut v: Vec<BlobStat> = Vec::with_capacity(grouped.len());
         for (file_id, addrs) in grouped {
+            if is_retired(file_id) {
+                continue;
+            }
             if self.ensure_mask(file_id, btree).is_err() {
                 continue;
             }

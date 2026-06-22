@@ -87,9 +87,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                             }
                             sem.post();
                         }
-                        GC_WAL => {
-                            GarbageCollector::process_wal_clean(gc.ctx);
-                        }
+                        GC_WAL => gc.process_wal_clean(),
                         GC_QUIT => break,
                         _ => unreachable!("invalid instruction  {}", x),
                     },
@@ -141,9 +139,16 @@ impl GCHandle {
         self.sem.wait();
     }
 
-    pub(crate) fn wal_clean(&self, ctx: Handle<Context>) {
+    pub(crate) fn wal_clean(&self, manifest: Handle<crate::meta::Manifest>, ctx: Handle<Context>) {
         if self.tx.send(GC_WAL).is_err() {
-            GarbageCollector::process_wal_clean(ctx);
+            let mut gc = GarbageCollector {
+                numerics: ctx.numerics.clone(),
+                ctx,
+                store: MutRef::default(),
+                data_runs: Arc::new(AtomicU64::new(0)),
+                blob_runs: Arc::new(AtomicU64::new(0)),
+            };
+            gc.process_wal_clean_with_manifest(manifest);
         }
     }
 
@@ -175,6 +180,26 @@ pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
         data_runs,
         blob_runs,
     }
+}
+
+pub(crate) fn drain_abort_clean_during_recovery(
+    store: MutRef<Store>,
+    ctx: Handle<Context>,
+) -> Result<(), OpCode> {
+    let mut gc = GarbageCollector {
+        numerics: ctx.numerics.clone(),
+        ctx,
+        store,
+        data_runs: Arc::new(AtomicU64::new(0)),
+        blob_runs: Arc::new(AtomicU64::new(0)),
+    };
+    gc.run_abort_clean_recovery()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AbortCleanLoadMode {
+    SteadyState,
+    Recovery,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -279,7 +304,7 @@ struct AbortCleanProgress {
 }
 
 impl GarbageCollector {
-    const MAX_ELEMS: usize = 1024;
+    const MAX_ELEMS: usize = 1024 * 100;
     const ABORT_CLEAN_TREE_CACHE_CAP: usize = 64;
     const ABORT_CLEAN_WAL_FILE_CACHE_CAP: usize = 16;
 
@@ -287,7 +312,7 @@ impl GarbageCollector {
         let started = Instant::now();
         self.store.opt.observer.counter(CounterMetric::GcRun, 1);
         self.process_abort_clean();
-        Self::process_wal_clean(self.ctx);
+        self.process_wal_clean();
         self.process_data();
         self.process_blob();
         self.process_pending_buckets();
@@ -299,8 +324,12 @@ impl GarbageCollector {
         );
     }
 
-    fn process_wal_clean(ctx: Handle<Context>) {
-        let mut log_dir_dirty = false;
+    fn process_wal_clean(&mut self) {
+        self.process_wal_clean_with_manifest(self.store.manifest);
+    }
+
+    fn process_wal_clean_with_manifest(&mut self, manifest: Handle<crate::meta::Manifest>) {
+        let ctx = self.ctx;
         for g in ctx.groups().iter() {
             let mut checkpoint_id = g.active_txns.min_position_file_id();
             if let Some(min_pending_file) = ctx.min_file_id(g.id as u8) {
@@ -321,32 +350,44 @@ impl GarbageCollector {
                 continue;
             }
 
+            let intent = crate::meta::WalRecycleIntent {
+                group_id: g.id as u8,
+                from_file_id: oldest_id,
+                to_file_id: checkpoint_id,
+            };
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_wal_recycle_before_intent_commit");
+            manifest.commit_wal_recycle_intent(intent);
+
             // [oldest_id, checkpoint_id)
-            let recycled = Self::process_one_wal(ctx, g.id as u8, oldest_id, checkpoint_id);
-            if recycled > 0 {
-                log_dir_dirty = true;
-                ctx.opt
-                    .observer
-                    .counter(CounterMetric::GcWalRecycleFile, recycled);
+            let recycled = Self::process_one_wal(ctx, intent);
+            if recycled == 0 {
+                manifest.commit_wal_recycle_done(intent);
+                g.logging.lock().advance_oldest_wal_id(checkpoint_id);
+                continue;
             }
-            g.logging.lock().advance_oldest_wal_id(checkpoint_id);
-        }
-        if log_dir_dirty {
             ctx.opt.sync_log_dir();
             #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync");
+            crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
+            manifest.commit_wal_recycle_done(intent);
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_wal_recycle_after_done_commit_before_publish");
+            g.logging.lock().advance_oldest_wal_id(checkpoint_id);
+            ctx.opt
+                .observer
+                .counter(CounterMetric::GcWalRecycleFile, recycled);
         }
     }
 
-    fn process_one_wal(ctx: Handle<Context>, group: u8, beg: u64, end: u64) -> u64 {
+    fn process_one_wal(ctx: Handle<Context>, intent: crate::meta::WalRecycleIntent) -> u64 {
         let mut recycled = 0;
         // NOTE: not including `end`
-        for seq in beg..end {
-            let from = ctx.opt.wal_file(group, seq);
+        for seq in intent.from_file_id..intent.to_file_id {
+            let from = ctx.opt.wal_file(intent.group_id, seq);
             if !from.exists() {
                 continue;
             }
-            let to = ctx.opt.wal_backup(group, seq);
+            let to = ctx.opt.wal_backup(intent.group_id, seq);
             if ctx.opt.keep_stable_wal_file {
                 log::info!("rename {from:?} to {to:?}");
                 std::fs::rename(&from, &to)
@@ -367,13 +408,69 @@ impl GarbageCollector {
         recycled
     }
 
+    fn run_abort_clean_recovery(&mut self) -> Result<(), OpCode> {
+        loop {
+            let tasks = self.ctx.abort_clean_tasks();
+            if tasks.is_empty() {
+                return Ok(());
+            }
+
+            let mut block = Block::alloc(1024);
+            let trees = Lru::<u64, Option<Tree>>::new();
+            let g = crossbeam_epoch::pin();
+            let mut round_stabilize_buckets = HashSet::new();
+            let mut cleaned_txids = Vec::new();
+
+            for task in tasks {
+                match task.state {
+                    AbortCleanState::Pending => match self.clean_one_abort_task(
+                        &g,
+                        task,
+                        &trees,
+                        &mut block,
+                        AbortCleanLoadMode::Recovery,
+                    ) {
+                        Ok(progress) => {
+                            round_stabilize_buckets.extend(progress.stabilize_buckets);
+                            cleaned_txids.push(task.txid);
+                        }
+                        Err(OpCode::Again) => {}
+                        Err(e) => return Err(e),
+                    },
+                    AbortCleanState::WaitingQuiesce => {
+                        self.ctx.remove_abort_clean(task.txid);
+                        self.ctx.del_aborted(task.txid);
+                    }
+                }
+            }
+
+            if !round_stabilize_buckets.is_empty() {
+                self.stabilize_cleaned_pages(
+                    &round_stabilize_buckets,
+                    &trees,
+                    AbortCleanLoadMode::Recovery,
+                )?;
+            }
+
+            for txid in cleaned_txids {
+                self.ctx.remove_abort_clean(txid);
+                self.ctx.del_aborted(txid);
+            }
+        }
+    }
+
     fn process_abort_clean(&mut self) {
-        for txid in self.ctx.drain_abort_clean_events() {
+        let drained_events = self.ctx.drain_abort_clean_events();
+        for &txid in &drained_events {
             self.ctx.mark_abort_clean_quiesced(txid);
         }
 
         let tasks = self.ctx.abort_clean_tasks();
         if tasks.is_empty() {
+            for txid in drained_events {
+                self.ctx.remove_abort_clean(txid);
+                self.ctx.del_aborted(txid);
+            }
             return;
         }
 
@@ -386,7 +483,13 @@ impl GarbageCollector {
         for task in tasks {
             match task.state {
                 AbortCleanState::Pending => {
-                    match self.clean_one_abort_task(&g, task, &trees, &mut block) {
+                    match self.clean_one_abort_task(
+                        &g,
+                        task,
+                        &trees,
+                        &mut block,
+                        AbortCleanLoadMode::SteadyState,
+                    ) {
                         Ok(progress) => {
                             round_stabilize_buckets.extend(progress.stabilize_buckets);
                             cleaned_txids.push(task.txid);
@@ -409,7 +512,11 @@ impl GarbageCollector {
         let checkpoint_ok = if round_stabilize_buckets.is_empty() {
             true
         } else {
-            match self.stabilize_cleaned_pages(&round_stabilize_buckets, &trees) {
+            match self.stabilize_cleaned_pages(
+                &round_stabilize_buckets,
+                &trees,
+                AbortCleanLoadMode::SteadyState,
+            ) {
                 Ok(()) => true,
                 Err(e) => {
                     log::error!(
@@ -438,17 +545,23 @@ impl GarbageCollector {
         if queued_quiesce {
             g.flush();
         }
+
+        for txid in drained_events {
+            self.ctx.remove_abort_clean(txid);
+            self.ctx.del_aborted(txid);
+        }
     }
 
     fn stabilize_cleaned_pages(
         &self,
         dirty_buckets: &HashSet<u64>,
         trees: &Lru<u64, Option<Tree>>,
+        mode: AbortCleanLoadMode,
     ) -> Result<(), OpCode> {
         for &bucket_id in dirty_buckets {
             let tree = match trees.get(&bucket_id) {
                 Some(tree) => tree.clone(),
-                None => self.get_tree(trees, bucket_id)?,
+                None => self.get_tree(trees, bucket_id, mode)?,
             };
             if let Some(tree) = tree {
                 tree.bucket.checkpoint_and_wait();
@@ -465,18 +578,21 @@ impl GarbageCollector {
         &self,
         cache: &Lru<u64, Option<Tree>>,
         bucket_id: u64,
+        mode: AbortCleanLoadMode,
     ) -> Result<Option<Tree>, OpCode> {
         if let Some(tree) = cache.get(&bucket_id) {
             return Ok(tree.clone());
         }
 
-        let tree = if self
+        let bucket_missing = self
             .store
             .manifest
             .bucket_metas_by_id
             .get(&bucket_id)
-            .is_none()
-        {
+            .is_none();
+        let unloaded_in_steady_state = mode == AbortCleanLoadMode::SteadyState
+            && !self.store.manifest.buckets.buckets.contains_key(&bucket_id);
+        let tree = if bucket_missing || unloaded_in_steady_state {
             None
         } else {
             match self.store.manifest.load_bucket_context(bucket_id) {
@@ -495,6 +611,7 @@ impl GarbageCollector {
         task: AbortCleanTask,
         trees: &Lru<u64, Option<Tree>>,
         block: &mut Block,
+        mode: AbortCleanLoadMode,
     ) -> Result<AbortCleanProgress, OpCode> {
         let mut cursor = task.tail_lsn;
         let mut stabilize_buckets = HashSet::new();
@@ -561,7 +678,7 @@ impl GarbageCollector {
                     }
 
                     let bucket_id = { u.bucket_id };
-                    if let Some(tree) = self.get_tree(trees, bucket_id)? {
+                    if let Some(tree) = self.get_tree(trees, bucket_id, mode)? {
                         // a foreground retry may have already removed the aborted head from memory
                         // without checkpointing it, so any live bucket touched by this abort chain
                         // still needs a durability barrier before we can retire the abort task
@@ -639,49 +756,70 @@ impl GarbageCollector {
         let bucket_table = page_table_name(bucket_id);
         let data_interval_table = data_interval_name(bucket_id);
         let blob_interval_table = blob_interval_name(bucket_id);
-        const PID_PER_ROUND: usize = 100000;
-        let mut removed_pages = 0;
 
-        loop {
-            let mut pids = Vec::with_capacity(PID_PER_ROUND);
-            let _ = self.store.manifest.btree.view(&bucket_table, |txn| {
-                let mut iter = txn.iter();
-                let mut k = Vec::new();
-                let mut v = Vec::new();
-                while iter.next_ref(&mut k, &mut v) && pids.len() < PID_PER_ROUND {
-                    let pid = <u64>::from_be_bytes(k[..8].try_into().unwrap());
-                    let addr = <u64>::from_be_bytes(v[..8].try_into().unwrap());
-                    pids.push((pid, addr));
-                }
-                Ok(())
-            });
-
-            if pids.is_empty() {
-                break;
-            }
-
-            let mut txn = self.store.manifest.begin();
-            let ops = txn.ops_mut().entry(bucket_table.clone()).or_default();
-            removed_pages += pids.len() as u64;
-            for (pid, _) in &pids {
-                ops.push(MetaOp::Del(pid.to_be_bytes().to_vec()));
-            }
-            txn.commit();
+        let removed_pages = self.delete_bucket_batch(&bucket_table);
+        if removed_pages != 0 {
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_pending_bucket_reap_after_batch_before_finalize");
+            return removed_pages as u64;
+        }
+        let removed_data_intervals = self.delete_bucket_batch(&data_interval_table);
+        if removed_data_intervals != 0 {
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_pending_bucket_reap_after_batch_before_finalize");
+            return removed_data_intervals as u64;
+        }
+        let removed_blob_intervals = self.delete_bucket_batch(&blob_interval_table);
+        if removed_blob_intervals != 0 {
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_pending_bucket_reap_after_batch_before_finalize");
+            return removed_blob_intervals as u64;
         }
 
         // table is now empty, destroy the btree bucket and remove pending record
         let _ = self.store.manifest.btree.del_bucket(&bucket_table);
         let _ = self.store.manifest.btree.del_bucket(&data_interval_table);
         let _ = self.store.manifest.btree.del_bucket(&blob_interval_table);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash(
+            "mace_pending_bucket_reap_after_finalize_before_meta_commit",
+        );
         let mut txn = self.store.manifest.begin();
         txn.ops_mut()
             .entry(BUCKET_PENDING_DEL.to_string())
             .or_default()
             .push(MetaOp::Del(bucket_id.to_be_bytes().to_vec()));
-        self.store.manifest.nr_buckets.fetch_sub(1, Relaxed);
         txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_pending_bucket_reap_after_manifest_commit");
+        self.store.manifest.nr_buckets.fetch_sub(1, Relaxed);
         self.store.manifest.bucket_runtimes.remove(&bucket_id);
-        removed_pages
+        0
+    }
+
+    fn delete_bucket_batch(&self, bucket: &str) -> usize {
+        let mut keys = Vec::with_capacity(Self::MAX_ELEMS);
+        let _ = self.store.manifest.btree.view(bucket, |txn| {
+            let mut iter = txn.iter();
+            let mut k = Vec::new();
+            let mut v = Vec::new();
+            while iter.next_ref(&mut k, &mut v) && keys.len() < Self::MAX_ELEMS {
+                keys.push(k.clone());
+            }
+            Ok(())
+        });
+
+        if keys.is_empty() {
+            return 0;
+        }
+
+        let mut txn = self.store.manifest.begin();
+        let ops = txn.ops_mut().entry(bucket.to_string()).or_default();
+        for key in &keys {
+            ops.push(MetaOp::Del(key.clone()));
+        }
+        txn.commit();
+        keys.len()
     }
 
     fn scavenge(&mut self) {
@@ -801,11 +939,21 @@ impl GarbageCollector {
             txn.record(MetaKind::BlobDelete, &unlinked);
             txn.record(MetaKind::BlobDelInterval, &del_intervals);
             txn.commit();
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_gc_blob_obsolete_after_meta_commit");
 
+            // only ordinary obsolete reclaim publishes retired keys for flush races
+            self.store
+                .manifest
+                .mark_retired_blob_stats(bucket_id, &unlinked);
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_gc_blob_obsolete_after_retired_mark");
             self.store
                 .manifest
                 .blob_stat
                 .remove_stat_interval(&unlinked);
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_gc_blob_obsolete_after_remove_stat");
             self.store.manifest.save_obsolete_blob(&unlinked);
             self.store.manifest.delete_files();
             self.store
@@ -840,11 +988,21 @@ impl GarbageCollector {
             txn.record(MetaKind::DataDelete, &unlinked);
             txn.record(MetaKind::DataDelInterval, &del_intervals);
             txn.commit();
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_gc_data_obsolete_after_meta_commit");
 
+            // only ordinary obsolete reclaim publishes retired keys for flush races
+            self.store
+                .manifest
+                .mark_retired_data_stats(bucket_id, &unlinked);
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_gc_data_obsolete_after_retired_mark");
             self.store
                 .manifest
                 .data_stat
                 .remove_stat_interval(&unlinked);
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_gc_data_obsolete_after_remove_stat");
             self.store.manifest.save_obsolete_data(&unlinked);
             self.store.manifest.delete_files();
             self.store
@@ -1263,6 +1421,7 @@ impl GarbageCollector {
         }
         // in case crash happens before/during deleting files
         let tmp: Delete = victims.into();
+        // rewrite owns victim deletion in the same transaction and must not publish retired keys
         txn.record(MetaKind::DataDelete, &tmp);
         // clear intent in the same metadata txn that publishes the new file
         self.store
@@ -1418,6 +1577,7 @@ impl GarbageCollector {
         }
 
         let tmp: Delete = victims.into();
+        // rewrite owns victim deletion in the same transaction and must not publish retired keys
         txn.record(MetaKind::BlobDelete, &tmp);
         // clear intent in the same metadata txn that publishes the new file
         self.store

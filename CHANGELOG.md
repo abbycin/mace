@@ -1,3 +1,16 @@
+## [0.0.35] 2026-06-29
+### New Features
+- Added optional zstd compression for persisted bucket data and blob records
+  - compression is controlled by bucket option `enable_compression` and defaults to `false`
+  - GC rewrite and recovery paths preserve compressed record layout correctly
+
+### Changes
+- Reworked bucket cleanup and abort recovery to use bounded GC cleanup, keep abort-clean buckets pinned, and finish pending abort cleanup during recovery
+
+### Bug Fixes
+- Added durable WAL recycle frontier metadata plus recovery/failpoint coverage for recycle crash windows
+- Fixed flush/GC stale-stat races by skipping retired old-file stats, delaying junk-stat publication until manifest commit, and using conditional btree updates for old stat writes
+
 ## [0.0.34] 2026-06-07
 ### Changes
 - Separated bucket-scoped runtime tuning from global `Options` into persisted `BucketOptions`

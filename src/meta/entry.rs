@@ -481,6 +481,84 @@ pub struct Numerics {
     pub wmk_oldest: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct WalRecycleState {
+    pub group_id: u8,
+    pub stage: u8,
+    pub _pad: [u8; 6],
+    pub from_file_id: u64,
+    pub to_file_id: u64,
+}
+
+impl WalRecycleState {
+    pub const STAGE_NONE: u8 = 0;
+    pub const STAGE_INTENT: u8 = 1;
+    pub const STAGE_DONE: u8 = 2;
+
+    pub const fn none(group_id: u8) -> Self {
+        Self {
+            group_id,
+            stage: Self::STAGE_NONE,
+            _pad: [0; 6],
+            from_file_id: 0,
+            to_file_id: 0,
+        }
+    }
+
+    pub const fn intent(group_id: u8, from_file_id: u64, to_file_id: u64) -> Self {
+        Self {
+            group_id,
+            stage: Self::STAGE_INTENT,
+            _pad: [0; 6],
+            from_file_id,
+            to_file_id,
+        }
+    }
+
+    pub const fn done(group_id: u8, from_file_id: u64, to_file_id: u64) -> Self {
+        Self {
+            group_id,
+            stage: Self::STAGE_DONE,
+            _pad: [0; 6],
+            from_file_id,
+            to_file_id,
+        }
+    }
+
+    pub const fn is_none(self) -> bool {
+        self.stage == Self::STAGE_NONE
+    }
+
+    pub const fn is_done(self) -> bool {
+        self.stage == Self::STAGE_DONE
+    }
+
+    pub const fn oldest_id(self) -> u64 {
+        match self.stage {
+            Self::STAGE_DONE => self.to_file_id,
+            _ => self.from_file_id,
+        }
+    }
+}
+
+impl IAsSlice for WalRecycleState {}
+
+impl IMetaCodec for WalRecycleState {
+    fn packed_size(&self) -> usize {
+        size_of::<Self>()
+    }
+
+    fn encode(&self, to: &mut [u8]) {
+        assert_eq!(to.len(), self.packed_size());
+        to.copy_from_slice(self.as_slice());
+    }
+
+    fn decode(src: &[u8]) -> Self {
+        Self::from_slice(src)
+    }
+}
+
 impl Default for Numerics {
     fn default() -> Self {
         Self {
