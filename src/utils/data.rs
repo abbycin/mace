@@ -7,13 +7,26 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
 pub struct LenSeq {
-    pub len: u32,
+    pub raw_len: u32,
+    pub compressed_len: u32,
     pub seq: u32,
 }
 
 impl LenSeq {
-    pub const fn new(len: u32, seq: u32) -> Self {
-        Self { len, seq }
+    pub const fn new(raw_len: u32, compressed_len: u32, seq: u32) -> Self {
+        Self {
+            raw_len,
+            compressed_len,
+            seq,
+        }
+    }
+
+    pub const fn active_len(self) -> u32 {
+        if self.compressed_len == 0 {
+            self.raw_len
+        } else {
+            self.compressed_len
+        }
     }
 }
 
@@ -22,12 +35,39 @@ impl LenSeq {
 pub struct Reloc {
     /// frame offset in page file
     pub(crate) off: usize,
-    /// frame length including header (excluding refcnt)
-    pub(crate) len: u32,
+    /// decoded record length
+    pub(crate) raw_len: u32,
+    /// stored compressed length, 0 means raw
+    pub(crate) compressed_len: u32,
     /// index in relocation table
     pub(crate) seq: u32,
     /// checksum of page
     pub(crate) crc: u32,
+}
+
+impl Reloc {
+    pub const fn active_len(self) -> u32 {
+        if self.compressed_len == 0 {
+            self.raw_len
+        } else {
+            self.compressed_len
+        }
+    }
+
+    #[inline]
+    pub const fn raw_len(self) -> u32 {
+        self.raw_len
+    }
+
+    #[inline]
+    pub const fn compressed_len(self) -> u32 {
+        self.compressed_len
+    }
+
+    #[inline]
+    pub const fn is_compressed(&self) -> bool {
+        self.compressed_len != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,10 +81,23 @@ pub struct AddrPair {
 
 impl AddrPair {
     pub const LEN: usize = size_of::<Self>();
-    pub fn new(key: u64, off: usize, len: u32, seq: u32, crc: u32) -> Self {
+    pub fn new(
+        key: u64,
+        off: usize,
+        raw_len: u32,
+        compressed_len: u32,
+        seq: u32,
+        crc: u32,
+    ) -> Self {
         Self {
             key,
-            val: Reloc { off, len, seq, crc },
+            val: Reloc {
+                off,
+                raw_len,
+                compressed_len,
+                seq,
+                crc,
+            },
         }
     }
 }
@@ -88,6 +141,7 @@ pub struct GatherWriter {
     path: PathBuf,
     file: io::File,
     queue: Vec<IoVec>,
+    owned: Vec<Vec<u8>>,
     queued_len: usize,
     max_iovcnt: usize,
 }
@@ -117,6 +171,7 @@ impl GatherWriter {
             path: path.clone(),
             file: Self::open(path, trunc),
             queue: Vec::with_capacity(max_iovcnt),
+            owned: Vec::new(),
             queued_len: 0,
             max_iovcnt: if max_iovcnt >= Self::MAX_IOVCNT {
                 Self::DEFAULT_IOVCNT
@@ -140,6 +195,20 @@ impl GatherWriter {
         }
         self.queue.push(data.into());
         self.queued_len += data.len();
+    }
+
+    pub fn queue_owned(&mut self, data: Vec<u8>) {
+        if self.queue.len() >= self.max_iovcnt {
+            self.flush();
+        }
+        self.queued_len += data.len();
+        self.owned.push(data);
+        let slice = self
+            .owned
+            .last()
+            .expect("owned payload must exist")
+            .as_slice();
+        self.queue.push(slice.into());
     }
 
     #[allow(unused)]
@@ -173,6 +242,7 @@ impl GatherWriter {
             .unwrap();
         self.queued_len = 0;
         self.queue.clear();
+        self.owned.clear();
     }
 
     pub fn sync(&mut self) {

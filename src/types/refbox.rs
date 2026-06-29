@@ -135,6 +135,20 @@ impl BoxRef {
         unsafe { std::slice::from_raw_parts(p.add(off), self.dump_len()) }
     }
 
+    pub(crate) fn with_dump_parts<T, F>(&self, f: F) -> T
+    where
+        F: FnOnce(&[u8], Option<&[u8]>) -> T,
+    {
+        if let Some(payload_len) = self.persist_payload_len() {
+            let mut hdr_buf = [0u8; Self::DUMP_HDR_LEN];
+            self.encode_dump_header(payload_len as u32, &mut hdr_buf);
+            let body = &self.data_slice::<u8>()[..payload_len];
+            f(&hdr_buf, Some(body))
+        } else {
+            f(self.dump_slice(), None)
+        }
+    }
+
     pub(crate) fn real_size_from_dump(size: u32) -> u32 {
         size + size_of::<AtomicU32>() as u32
     }
@@ -158,7 +172,7 @@ impl BoxRef {
         None
     }
 
-    pub(crate) fn encode_dump_header(&self, payload_size: u32, out: &mut [u8; Self::DUMP_HDR_LEN]) {
+    fn encode_dump_header(&self, payload_size: u32, out: &mut [u8; Self::DUMP_HDR_LEN]) {
         let src = self.header();
         let hdr = BoxHeader {
             refs: AtomicU32::new(0),

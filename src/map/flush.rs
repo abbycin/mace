@@ -73,7 +73,8 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
     let bucket_id = task.bucket_id;
     let mut snapshot = task.snapshot();
     let mut map_builder = MapBuilder::new(bucket_id, &snapshot.unmap_pid);
-    let mut file_builder = FileBuilder::new(bucket_id);
+    let mut file_builder =
+        FileBuilder::new(bucket_id, task.enable_compression, task.compressors.clone());
 
     let pages = std::mem::take(&mut snapshot.pages);
     for b in pages {

@@ -535,7 +535,7 @@ impl<'a> Val<'a> {
             + Self::GID_LEN
             + Self::DATA_LEN
             + if has_hist { Self::HIST_LEN } else { 0 }
-            + if min_blob_size < val_size {
+            + if min_blob_size <= val_size {
                 ADDR_LEN
             } else {
                 val_size

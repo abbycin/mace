@@ -1777,6 +1777,27 @@ mod test {
     }
 
     #[test]
+    fn inline_size_boundary_is_remote() {
+        let mut a = A::new();
+        let l = a.clone();
+        let node = Node::new_leaf(&mut a, l.clone(), 0, Position::MIN);
+        let key = Key::new("blob".as_bytes(), Ver::new(1, 1));
+        let value = vec![7u8; BucketOptions::MIN_INLINE_SIZE];
+        let record = Record::normal(1, &value);
+        let (delta, remote) = DeltaView::from_key_val(&mut a, &key, &record, 0, Position::MIN);
+        let remote = remote.expect("equal inline boundary must allocate remote");
+
+        node.insert_inplace(delta.view().as_delta(), remote.header().total_size as usize);
+        node.save_delta(delta);
+        let (node, _) = node.compact(&mut a, 1);
+
+        a.inner.remote_loads.store(0, Relaxed);
+        let latest = node.find_latest(&key).expect("latest value should exist");
+        assert_eq!(latest.1.data(), value.as_slice());
+        assert_eq!(a.inner.remote_loads.load(Relaxed), 1);
+    }
+
+    #[test]
     fn leaf_iter() {
         let mut a = A::new();
         let txid = AtomicU64::new(1);

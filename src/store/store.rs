@@ -250,9 +250,9 @@ impl StoreFlushObserver {
 
 impl CheckpointObserver for StoreFlushObserver {
     fn flush_directive(&self, bucket_id: u64) -> FlushDirective {
-        match self.manifest.bucket_states.get(&bucket_id) {
-            Some(state) => {
-                if state.is_deleting() {
+        match self.manifest.bucket_runtimes.get(&bucket_id) {
+            Some(runtime) => {
+                if runtime.state.is_deleting() {
                     return FlushDirective::Skip;
                 }
                 FlushDirective::Normal

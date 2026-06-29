@@ -987,7 +987,7 @@ impl<'a> Builder<'a> {
         let val_sz = Val::calc_size(hist.is_some(), limit, vsz);
 
         k.encode_to(self.slice(self.offset, ksz));
-        if vsz <= limit {
+        if vsz < limit {
             #[cfg(feature = "extra_check")]
             assert_eq!(remote, NULL_ADDR);
             Val::encode_inline(self.slice(self.offset + ksz, val_sz), hist, v);

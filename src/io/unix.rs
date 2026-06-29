@@ -168,20 +168,24 @@ impl GatherIO for File {
     }
 
     fn write(&mut self, data: &[u8]) -> Result<usize, io::Error> {
-        loop {
+        let mut written = 0;
+        while written < data.len() {
+            let buf = &data[written..];
             unsafe {
-                let rc = write(self.file, data.as_ptr().cast::<c_void>(), data.len());
-                if rc <= 0 {
+                let rc = write(self.file, buf.as_ptr().cast::<c_void>(), buf.len());
+                if rc < 0 {
                     if errno() == EINTR {
-                        // the call was interrupted by a signal before any data was written
                         continue;
                     }
                     return Err(io::Error::from_raw_os_error(errno()));
                 }
-                debug_assert_eq!(rc as usize, data.len());
-                return Ok(rc as usize);
+                if rc == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WriteZero));
+                }
+                written += rc as usize;
             }
         }
+        Ok(written)
     }
 
     fn writev(&mut self, data: &mut [IoVec], total_len: usize) -> Result<(), io::Error> {

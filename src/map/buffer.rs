@@ -21,6 +21,7 @@ use crate::{
     types::{page::Page, traits::IHeader},
     utils::{
         Handle, MutRef, OpCode, ROOT_PID,
+        compress::CompressorPool,
         data::{GroupPositions, Position},
         interval::IntervalMap,
         lru::ShardPriorityLru,
@@ -160,6 +161,8 @@ struct RecycleBins {
 pub(crate) struct Pool {
     max_hot_size: usize,
     max_mem_size: usize,
+    enable_compression: bool,
+    compressors: Arc<CompressorPool>,
     table: MutRef<PageMap>,
     chkpt: Checkpoint,
     last_chkpt_lsn: MutRef<GroupPositions>,
@@ -179,6 +182,7 @@ impl Pool {
 
     fn new(
         opt: &BucketOptions,
+        compressors: Arc<CompressorPool>,
         table: MutRef<PageMap>,
         state: MutRef<BucketState>,
         flow: Arc<FlowController>,
@@ -210,6 +214,8 @@ impl Pool {
             max_hot_size: opt.checkpoint_size,
             // total dirty memory hard cap (hot + sealed) as a safety net
             max_mem_size: opt.pool_capacity,
+            enable_compression: opt.enable_compression,
+            compressors,
             table,
             chkpt: flush,
             last_chkpt_lsn: MutRef::new(init_group_pos()),
@@ -626,6 +632,8 @@ impl Pool {
 
         let task = CheckpointTask {
             bucket_id: self.bucket_id,
+            enable_compression: self.enable_compression,
+            compressors: self.compressors.clone(),
             table: self.table.clone(),
             dirty_roots,
             unmap_pid,
@@ -751,10 +759,12 @@ impl BucketContext {
         lru: Handle<ShardPriorityLru<BoxRef>>,
         reader: Arc<dyn IDataReader>,
         tx: Sender<SharedState>,
+        compressors: Arc<CompressorPool>,
     ) -> Self {
         let flow = Arc::new(FlowController::new(global, opt.as_ref()));
         let pool = Handle::new(Pool::new(
             opt.as_ref(),
+            compressors.clone(),
             table.clone(),
             state.clone(),
             flow,

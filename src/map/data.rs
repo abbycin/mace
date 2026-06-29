@@ -12,6 +12,7 @@ use crate::types::header::{NodeType, TagFlag, TagKind};
 use crate::types::refbox::{BaseView, BoxRef, RemoteView};
 use crate::types::traits::{IAsSlice, IHeader};
 use crate::utils::bitmap::BitMap;
+use crate::utils::compress::{COMPRESS_MIN_LEN, CompressorPool};
 use crate::utils::data::{AddrPair, GatherWriter, GroupPositions, Interval};
 use crate::utils::{MutRef, NULL_ADDR};
 use crate::utils::{NULL_PID, OpCode};
@@ -156,6 +157,8 @@ impl Deref for PidSet {
 
 pub(crate) struct CheckpointTask {
     pub(crate) bucket_id: u64,
+    pub(crate) enable_compression: bool,
+    pub(crate) compressors: Arc<CompressorPool>,
     pub(crate) table: MutRef<PageMap>,
     pub(crate) dirty_roots: Arc<PidMap>,
     pub(crate) unmap_pid: Arc<PidSet>,
@@ -565,6 +568,8 @@ impl IFooter for BlobFooter {
 /// for SSD, because it's good at random read
 pub(crate) struct FileBuilder {
     bucket_id: u64,
+    enable_compression: bool,
+    compressors: Arc<CompressorPool>,
     data_active_size: usize,
     blob_active_size: usize,
     data: Vec<BoxRef>,
@@ -599,15 +604,33 @@ struct BlobChunkBuild {
     resident_size: usize,
 }
 
+struct RawRecordMeta {
+    raw_len: u32,
+    crc: u32,
+}
+
+struct ChunkRecordMeta {
+    raw_len: u32,
+    compressed_len: u32,
+    dump_len: usize,
+    crc: u32,
+}
+
 impl FileBuilder {
     fn update_addr(ivl: &mut Interval, addr: u64) {
         ivl.lo = ivl.lo.min(addr);
         ivl.hi = ivl.hi.max(addr);
     }
 
-    pub(crate) fn new(bucket_id: u64) -> Self {
+    pub(crate) fn new(
+        bucket_id: u64,
+        enable_compression: bool,
+        compressors: Arc<CompressorPool>,
+    ) -> Self {
         Self {
             bucket_id,
+            enable_compression,
+            compressors,
             data_active_size: 0,
             blob_active_size: 0,
             data: Vec::new(),
@@ -661,15 +684,67 @@ impl FileBuilder {
         }
     }
 
-    fn build_data_head_chunk(
+    fn queue_raw_parts(
+        head: &[u8],
+        tail: Option<&[u8]>,
+        w: &mut GatherWriter,
+        queued_iov: &mut usize,
+        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+    ) {
+        if let Some(body) = tail {
+            Self::ensure_iov_room(2, queued_iov, hdr_batch, w);
+            hdr_batch.push(head.try_into().expect("dump header must match fixed len"));
+            let hdr = hdr_batch.last().expect("queued dump header must exist");
+            w.queue(hdr);
+            w.queue(body);
+            *queued_iov += 2;
+        } else {
+            Self::ensure_iov_room(1, queued_iov, hdr_batch, w);
+            w.queue(head);
+            *queued_iov += 1;
+        }
+    }
+
+    fn queue_raw_record(
+        f: &BoxRef,
+        w: &mut GatherWriter,
+        queued_iov: &mut usize,
+        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+    ) {
+        f.with_dump_parts(|head, tail| Self::queue_raw_parts(head, tail, w, queued_iov, hdr_batch));
+    }
+
+    fn queue_raw_record_with_meta(
+        f: &BoxRef,
+        w: &mut GatherWriter,
+        queued_iov: &mut usize,
+        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+    ) -> RawRecordMeta {
+        f.with_dump_parts(|head, tail| {
+            let mut crc = Crc32cHasher::default();
+            crc.write(head);
+            if let Some(body) = tail {
+                crc.write(body);
+            }
+            Self::queue_raw_parts(head, tail, w, queued_iov, hdr_batch);
+            RawRecordMeta {
+                raw_len: (head.len() + tail.map_or(0, <[u8]>::len)) as u32,
+                crc: crc.finish() as u32,
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_head_chunk_records(
         &self,
         frames: &[BoxRef],
-        max_file_size: usize,
-        file_id: u64,
-        path: PathBuf,
-    ) -> DataChunkBuild {
-        assert!(!frames.is_empty());
-        let cap = max_file_size.max(1);
+        cap: usize,
+        w: &mut GatherWriter,
+        relocs: &mut Vec<u8>,
+        addrs: &mut Vec<u64>,
+        queued_iov: &mut usize,
+        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+    ) -> (usize, usize, usize, Interval) {
         #[cfg(feature = "extra_check")]
         for w in frames.windows(2) {
             assert!(
@@ -680,62 +755,129 @@ impl FileBuilder {
             );
         }
 
-        let mut pos: usize = 0;
-        let mut w = GatherWriter::trunc(&path, 64);
-        let mut relocs = Vec::new();
-        let mut addrs = Vec::new();
-        let mut queued_iov = 0usize;
-        let mut hdr_batch: Vec<[u8; BoxRef::DUMP_HDR_LEN]> =
-            Vec::with_capacity(GatherWriter::DEFAULT_IOVCNT / 2);
+        let mut pos = 0usize;
         let mut consumed = 0usize;
         let mut active_size = 0usize;
         let mut resident_size = 0usize;
         let mut interval = Interval::new(u64::MAX, 0);
+        let mut compressor = None;
+        let mut idx = 0;
+        while idx < frames.len() {
+            let f = &frames[idx];
+            let raw_len = f.dump_len();
 
-        for f in frames {
-            let h = f.header();
-            let dump_len = f.dump_len();
-            if consumed != 0 && active_size + dump_len > cap {
+            let raw_path = !self.enable_compression || raw_len < COMPRESS_MIN_LEN;
+            let mut encoded = None;
+            let meta = if raw_path {
+                ChunkRecordMeta {
+                    raw_len: raw_len as u32,
+                    compressed_len: 0,
+                    dump_len: raw_len,
+                    crc: 0,
+                }
+            } else {
+                let codec = compressor.get_or_insert_with(|| {
+                    self.compressors
+                        .borrow()
+                        .expect("record encode must succeed")
+                });
+                let data = codec.encode_box(f).expect("record encode must succeed");
+                let meta = ChunkRecordMeta {
+                    raw_len: data.raw_len,
+                    compressed_len: data.compressed_len,
+                    dump_len: data.active_len(),
+                    crc: data.crc,
+                };
+                encoded = Some(data);
+                meta
+            };
+
+            if consumed != 0 && active_size + meta.dump_len > cap {
                 break;
             }
+
+            let meta = if raw_path {
+                let raw = Self::queue_raw_record_with_meta(f, w, queued_iov, hdr_batch);
+                debug_assert_eq!(raw.raw_len as usize, raw_len);
+                ChunkRecordMeta {
+                    raw_len: raw.raw_len,
+                    compressed_len: 0,
+                    dump_len: raw_len,
+                    crc: raw.crc,
+                }
+            } else {
+                let encoded =
+                    encoded.expect("encoded payload must exist after compressed planning");
+                let dump_len = encoded.active_len();
+                let raw_len = encoded.raw_len;
+                let stored_len = encoded.compressed_len;
+                let crc = encoded.crc;
+                if let Some(bytes) = encoded.bytes {
+                    Self::ensure_iov_room(1, queued_iov, hdr_batch, w);
+                    w.queue_owned(bytes);
+                    *queued_iov += 1;
+                } else {
+                    Self::queue_raw_record(f, w, queued_iov, hdr_batch);
+                }
+                ChunkRecordMeta {
+                    raw_len,
+                    compressed_len: stored_len,
+                    dump_len,
+                    crc,
+                }
+            };
+            let h = f.header();
             let addr = h.addr;
             if consumed == 0 {
                 interval = Interval::new(addr, addr);
             } else {
                 Self::update_addr(&mut interval, addr);
             }
-            active_size += dump_len;
+            active_size += meta.dump_len;
             resident_size += h.total_size as usize;
             addrs.push(addr);
-
-            let mut crc = Crc32cHasher::default();
-            let len = if let Some(payload_len) = f.persist_payload_len() {
-                Self::ensure_iov_room(2, &mut queued_iov, &mut hdr_batch, &mut w);
-                hdr_batch.push([0u8; BoxRef::DUMP_HDR_LEN]);
-                let hdr_bytes = hdr_batch.last_mut().expect("must exist");
-                f.encode_dump_header(payload_len as u32, hdr_bytes);
-                let body_all = f.data_slice::<u8>();
-                let body = &body_all[..payload_len];
-                crc.write(hdr_bytes);
-                crc.write(body);
-                w.queue(hdr_bytes);
-                w.queue(body);
-                queued_iov += 2;
-                hdr_bytes.len() + body.len()
-            } else {
-                Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
-                let s = f.dump_slice();
-                crc.write(s);
-                w.queue(s);
-                queued_iov += 1;
-                s.len()
-            };
-            let reloc = AddrPair::new(addr, pos, len as u32, consumed as u32, crc.finish() as u32);
+            let reloc = AddrPair::new(
+                addr,
+                pos,
+                meta.raw_len,
+                meta.compressed_len,
+                consumed as u32,
+                meta.crc,
+            );
             relocs.extend_from_slice(reloc.as_slice());
-            pos += len;
+            pos += meta.dump_len;
             consumed += 1;
+            idx += 1;
         }
+
         debug_assert!(consumed > 0);
+        (consumed, active_size, resident_size, interval)
+    }
+
+    fn build_data_head_chunk(
+        &self,
+        frames: &[BoxRef],
+        max_file_size: usize,
+        file_id: u64,
+        path: PathBuf,
+    ) -> DataChunkBuild {
+        assert!(!frames.is_empty());
+        let cap = max_file_size.max(1);
+        let mut w = GatherWriter::trunc(&path, 64);
+        let mut relocs = Vec::new();
+        let mut addrs = Vec::new();
+        let mut queued_iov = 0usize;
+        let mut hdr_batch: Vec<[u8; BoxRef::DUMP_HDR_LEN]> =
+            Vec::with_capacity(GatherWriter::DEFAULT_IOVCNT / 2);
+        let (consumed, active_size, resident_size, interval) = self.fill_head_chunk_records(
+            frames,
+            cap,
+            &mut w,
+            &mut relocs,
+            &mut addrs,
+            &mut queued_iov,
+            &mut hdr_batch,
+        );
 
         let nr_intervals = 1;
         let mut h = Crc32cHasher::default();
@@ -801,65 +943,35 @@ impl FileBuilder {
     ) -> BlobChunkBuild {
         assert!(!frames.is_empty());
         let cap = max_file_size.max(1);
-        #[cfg(feature = "extra_check")]
-        for w in frames.windows(2) {
-            assert!(
-                w[0].header().addr < w[1].header().addr,
-                "flush frames must be strictly sorted by addr: {} then {}",
-                w[0].header().addr,
-                w[1].header().addr
-            );
-        }
-        let mut pos = 0;
         let mut w = GatherWriter::trunc(&path, 64);
         let mut relocs = Vec::new();
         let mut addrs = Vec::new();
-        let mut consumed = 0usize;
-        let mut active_size = 0usize;
-        let mut resident_size = 0usize;
-        let mut interval = Interval::new(u64::MAX, 0);
-
-        for f in frames {
-            let h = f.header();
-            let s = f.dump_slice();
-            if consumed != 0 && active_size + s.len() > cap {
-                break;
-            }
-            let addr = h.addr;
-            if consumed == 0 {
-                interval = Interval::new(addr, addr);
-            } else {
-                Self::update_addr(&mut interval, addr);
-            }
-            active_size += s.len();
-            resident_size += h.total_size as usize;
-            addrs.push(addr);
-
-            let mut crc = Crc32cHasher::default();
-            crc.write(s);
-            w.queue(s);
-            let reloc = AddrPair::new(
-                addr,
-                pos,
-                s.len() as u32,
-                consumed as u32,
-                crc.finish() as u32,
-            );
-            relocs.extend_from_slice(reloc.as_slice());
-            pos += s.len();
-            consumed += 1;
-        }
-        debug_assert!(consumed > 0);
+        let mut queued_iov = 0usize;
+        let mut hdr_batch: Vec<[u8; BoxRef::DUMP_HDR_LEN]> =
+            Vec::with_capacity(GatherWriter::DEFAULT_IOVCNT / 2);
+        let (consumed, active_size, resident_size, interval) = self.fill_head_chunk_records(
+            frames,
+            cap,
+            &mut w,
+            &mut relocs,
+            &mut addrs,
+            &mut queued_iov,
+            &mut hdr_batch,
+        );
 
         let mut interval_crc = Crc32cHasher::default();
         let is = interval.as_slice();
         interval_crc.write(is);
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(is);
+        queued_iov += 1;
 
         let mut reloc_crc = Crc32cHasher::default();
         let rs = relocs.as_slice();
         reloc_crc.write(rs);
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(rs);
+        queued_iov += 1;
 
         let hdr = BlobFooter {
             nr_reloc: consumed as u32,
@@ -868,6 +980,7 @@ impl FileBuilder {
             interval_crc: interval_crc.finish() as u32,
         };
 
+        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(hdr.as_slice());
         w.flush();
         let n = consumed as u32;
@@ -1070,7 +1183,7 @@ mod test {
             refbox::BoxRef,
             traits::IHeader,
         },
-        utils::INIT_ID,
+        utils::{INIT_ID, compress::CompressorPool},
     };
 
     use super::FileBuilder;
@@ -1095,7 +1208,7 @@ mod test {
         p1.header_mut().kind = TagKind::Delta;
         p1.header_mut().node_type = NodeType::Leaf;
 
-        let mut builder = FileBuilder::new(0);
+        let mut builder = FileBuilder::new(0, false, CompressorPool::new());
 
         builder.add(p.clone());
         builder.add(p1.clone());
@@ -1129,13 +1242,15 @@ mod test {
             .find(|x| x.key == addr)
             .expect("reloc for addr must exist");
         assert_eq!({ r.val.off }, p1.dump_len());
-        assert_eq!({ r.val.len }, p.dump_len() as u32);
+        assert_eq!({ r.val.raw_len }, p.dump_len() as u32);
+        assert_eq!({ r.val.compressed_len }, 0);
 
         let r1 = reloc
             .iter()
             .find(|x| x.key == addr1)
             .expect("reloc for addr1 must exist");
         assert_eq!({ r1.val.off }, 0);
-        assert_eq!({ r1.val.len }, p1.dump_len() as u32);
+        assert_eq!({ r1.val.raw_len }, p1.dump_len() as u32);
+        assert_eq!({ r1.val.compressed_len }, 0);
     }
 }

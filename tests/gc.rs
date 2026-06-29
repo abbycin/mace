@@ -120,11 +120,15 @@ fn gc_blob() -> Result<(), OpCode> {
         kv.commit()?;
     }
 
+    db.checkpoint();
+
     for k in &pair {
         let kv = db.begin().unwrap();
         kv.update(k, &val)?;
         kv.commit()?;
     }
+
+    db.checkpoint();
 
     let kv = db.begin().unwrap();
     let mut rest = vec![];
@@ -137,6 +141,8 @@ fn gc_blob() -> Result<(), OpCode> {
         }
     }
     kv.commit()?;
+
+    db.checkpoint();
 
     for i in rest {
         let k = &pair[i];
@@ -169,6 +175,199 @@ fn gc_blob() -> Result<(), OpCode> {
         assert!(count < max_id);
     }
 
+    Ok(())
+}
+
+#[test]
+fn gc_blob_with_compression() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.blob_garbage_ratio = 1;
+    opt.blob_gc_ratio = 100;
+    opt.blob_file_size = 256 << 10;
+    opt.gc_timeout = 20;
+    opt.gc_eager = true;
+    opt.tmp_store = true;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket(
+        "x",
+        BucketOptions {
+            inline_size: 1024,
+            enable_compression: true,
+            ..BucketOptions::default()
+        },
+    )?;
+    let v1 = vec![b'x'; 12 << 10];
+    let v2 = vec![b'y'; 12 << 10];
+    let v3 = vec![b'z'; 12 << 10];
+
+    let kv = db.begin()?;
+    kv.put("k1", &v1)?;
+    kv.put("k2", &v2)?;
+    kv.put("k3", &v3)?;
+    kv.commit()?;
+
+    let kv = db.begin()?;
+    kv.del("k2")?;
+    kv.commit()?;
+
+    {
+        let cap = 10000;
+        let val = vec![b'x'; 10240];
+        let mut pair = Vec::with_capacity(cap);
+
+        for i in 0..cap {
+            pair.push(format!("{i:08}"));
+        }
+
+        for k in &pair {
+            let kv = db.begin().unwrap();
+            kv.put(k, &val)?;
+            kv.commit()?;
+        }
+
+        db.checkpoint();
+
+        for k in &pair {
+            let kv = db.begin().unwrap();
+            kv.update(k, &val)?;
+            kv.commit()?;
+        }
+
+        db.checkpoint();
+
+        for k in &pair {
+            let kv = db.begin().unwrap();
+            kv.del(k)?;
+            kv.commit()?;
+        }
+        db.checkpoint();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        mace.start_gc();
+        if mace.blob_gc_count() > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        mace.blob_gc_count() > 0,
+        "blob gc rewrite did not complete in time"
+    );
+
+    let view = db.view()?;
+    assert_eq!(view.get("k1").unwrap().slice(), v1.as_slice());
+    assert_eq!(view.get("k3").unwrap().slice(), v3.as_slice());
+    assert!(view.get("k2").is_err());
+    Ok(())
+}
+
+#[test]
+fn gc_blob_toggle_compression() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.blob_garbage_ratio = 1;
+    opt.blob_gc_ratio = 100;
+    opt.blob_file_size = 256 << 10;
+    opt.gc_timeout = 20;
+
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let db = mace.new_bucket(
+            "x",
+            BucketOptions {
+                inline_size: 1024,
+                enable_compression: true,
+                ..BucketOptions::default()
+            },
+        )?;
+        let v1 = vec![b'x'; 12 << 10];
+        let v2 = vec![b'y'; 12 << 10];
+        let v3 = vec![b'z'; 12 << 10];
+        let kv = db.begin()?;
+        kv.put("k1", &v1)?;
+        kv.put("k2", &v2)?;
+        kv.put("k3", &v3)?;
+        kv.commit()?;
+
+        {
+            let cap = 10000;
+            let val = vec![b'x'; 10240];
+            let mut pair = Vec::with_capacity(cap);
+
+            for i in 0..cap {
+                pair.push(format!("{i:08}"));
+            }
+
+            for k in &pair {
+                let kv = db.begin()?;
+                kv.put(k, &val)?;
+                kv.commit()?;
+            }
+
+            db.checkpoint();
+
+            for k in &pair {
+                let kv = db.begin()?;
+                kv.update(k, &val)?;
+                kv.commit()?;
+            }
+
+            db.checkpoint();
+
+            for k in &pair {
+                let kv = db.begin()?;
+                kv.del(k)?;
+                kv.commit()?;
+            }
+            db.checkpoint();
+        }
+
+        mace.start_gc();
+        mace.disable_gc();
+
+        drop(db);
+        while let Err(e) = mace.drop_bucket("x") {
+            assert_eq!(e, OpCode::Again);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        while let Err(e) = mace.update_bucket_opt(
+            "x",
+            BucketOptions {
+                inline_size: 1024,
+                enable_compression: false,
+                ..BucketOptions::default()
+            },
+        ) {
+            assert_eq!(e, OpCode::Again);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.get_bucket("x")?;
+    let v1 = vec![b'x'; 12 << 10];
+    let v3 = vec![b'z'; 12 << 10];
+
+    let kv = db.begin()?;
+    kv.del("k2")?;
+    kv.commit()?;
+
+    mace.start_gc();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let view = db.view()?;
+    assert_eq!(view.get("k1").unwrap().slice(), v1.as_slice());
+    assert_eq!(view.get("k3").unwrap().slice(), v3.as_slice());
+    assert!(view.get("k2").is_err());
+
+    drop(view);
+    drop(db);
+    drop(mace);
+    drop(path);
     Ok(())
 }
 

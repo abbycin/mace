@@ -129,7 +129,7 @@ impl DerefMut for MemDataStat {
 impl MemDataStat {
     pub(super) fn update(&mut self, tick: u64, reloc: &Reloc) {
         self.active_elems -= 1;
-        self.active_size -= reloc.len as usize;
+        self.active_size -= reloc.active_len() as usize;
         self.mask.as_mut().expect("mask loaded").set(reloc.seq);
 
         if self.up1 < tick {
@@ -227,7 +227,7 @@ pub struct MemBlobStat {
 impl MemBlobStat {
     pub(super) fn update(&mut self, reloc: &Reloc) {
         self.nr_active -= 1;
-        self.active_size -= reloc.len as usize;
+        self.active_size -= reloc.active_len() as usize;
         self.mask.as_mut().expect("mask loaded").set(reloc.seq);
     }
 

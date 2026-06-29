@@ -327,8 +327,18 @@ impl BucketState {
         self.is_deleting.store(true, Ordering::Relaxed);
     }
 
+    #[inline]
+    pub(crate) fn clear_deleting(&self) {
+        self.is_deleting.store(false, Ordering::Relaxed);
+    }
+
     pub(crate) fn set_drop(&self) {
         self.is_drop.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn clear_drop(&self) {
+        self.is_drop.store(false, Ordering::Relaxed);
     }
 
     #[inline]

@@ -110,7 +110,7 @@ impl ManifestBuilder {
                         .bucket_metas_by_id
                         .insert(bucket_id, meta.clone());
                     self.inner.bucket_metas.insert(name.into(), meta);
-                    self.inner.ensure_bucket_state(bucket_id);
+                    self.inner.ensure_bucket_runtime(bucket_id);
                 }
                 Ok(())
             })

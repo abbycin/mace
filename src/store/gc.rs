@@ -41,6 +41,7 @@ use crate::{
         Handle, MutRef, ROOT_PID,
         bitmap::BitMap,
         block::Block,
+        compress::{COMPRESS_MIN_LEN, CompressorPool, RecordCompressor, RecordDecompressor},
         countblock::Countblock,
         data::{AddrPair, GatherWriter, Interval, LenSeq, Position},
         lru::Lru,
@@ -679,6 +680,7 @@ impl GarbageCollector {
             .push(MetaOp::Del(bucket_id.to_be_bytes().to_vec()));
         self.store.manifest.nr_buckets.fetch_sub(1, Relaxed);
         txn.commit();
+        self.store.manifest.bucket_runtimes.remove(&bucket_id);
         removed_pages
     }
 
@@ -1139,13 +1141,23 @@ impl GarbageCollector {
     fn rewrite_data(&mut self, candidate: Vec<Score>, bucket_id: u64) {
         let started = Instant::now();
         let opt = &self.store.opt;
+        let Some(permit) = self.store.manifest.try_acquire_rewrite(bucket_id) else {
+            return;
+        };
         let file_id = self.numerics.next_data_id.fetch_add(1, Relaxed);
         // stage orphan intent before rewrite output is flushed
         // crash can happen after file sync but before manifest commit
         self.store.manifest.stage_orphan_data_file(file_id);
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash("mace_gc_data_rewrite_after_stage_marker");
-        let mut builder = DataReWriter::new(file_id, opt, candidate.len(), bucket_id);
+        let mut builder = DataReWriter::new(
+            file_id,
+            opt,
+            candidate.len(),
+            bucket_id,
+            permit.enable_compression,
+            permit.compressors.clone(),
+        );
         let mut remap_intervals = Vec::with_capacity(candidate.len());
         let mut del_intervals = DelInterval {
             lo: Vec::new(),
@@ -1185,7 +1197,8 @@ impl GarbageCollector {
                         Entry {
                             key: m.key,
                             off: m.val.off,
-                            len: m.val.len,
+                            raw_len: m.val.raw_len(),
+                            compressed_len: m.val.compressed_len(),
                             crc: m.val.crc,
                         }
                     })
@@ -1289,12 +1302,20 @@ impl GarbageCollector {
     fn rewrite_blob(&mut self, candidate: &[u64], bucket_id: u64) {
         let started = Instant::now();
         let opt = &self.ctx.opt;
+        let Some(permit) = self.store.manifest.try_acquire_rewrite(bucket_id) else {
+            return;
+        };
         let mut remap_intervals = Vec::new();
         let mut del_intervals = DelInterval {
             lo: Vec::new(),
             bucket_id,
         };
-        let mut builder = BlobRewriter::new(opt, bucket_id);
+        let mut builder = BlobRewriter::new(
+            opt,
+            bucket_id,
+            permit.enable_compression,
+            permit.compressors.clone(),
+        );
         let blob_id = self.numerics.next_blob_id.fetch_add(1, Relaxed);
         // stage orphan intent before rewrite output is flushed
         // crash can happen after file sync but before manifest commit
@@ -1334,7 +1355,8 @@ impl GarbageCollector {
                         Entry {
                             key: x.key,
                             off: x.val.off,
-                            len: x.val.len,
+                            raw_len: x.val.raw_len(),
+                            compressed_len: x.val.compressed_len(),
                             crc: x.val.crc,
                         }
                     })
@@ -1506,6 +1528,68 @@ impl Drop for VacuumGuard {
     }
 }
 
+struct RewriteBuffers {
+    io: Block,
+}
+
+impl RewriteBuffers {
+    fn new(size: usize) -> Self {
+        Self {
+            io: Block::alloc(size),
+        }
+    }
+
+    fn ensure_io(&mut self, need: usize) {
+        if self.io.len() < need {
+            self.io.realloc(need);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingReloc {
+    key: u64,
+    off: usize,
+    raw_len: u32,
+    compressed_len: u32,
+    crc: u32,
+}
+
+impl PendingReloc {
+    const fn new(key: u64, off: usize, raw_len: u32, compressed_len: u32, crc: u32) -> Self {
+        Self {
+            key,
+            off,
+            raw_len,
+            compressed_len,
+            crc,
+        }
+    }
+}
+
+fn build_sorted_relocs(pending: &mut [PendingReloc]) -> (Vec<AddrPair>, HashMap<u64, LenSeq>) {
+    pending.sort_unstable_by_key(|x| x.key);
+    let mut relocs = Vec::with_capacity(pending.len());
+    let mut reloc_map = HashMap::with_capacity(pending.len());
+    for (seq, entry) in pending.iter().enumerate() {
+        let seq = seq as u32;
+        relocs.push(AddrPair::new(
+            entry.key,
+            entry.off,
+            entry.raw_len,
+            entry.compressed_len,
+            seq,
+            entry.crc,
+        ));
+        let old = reloc_map.insert(
+            entry.key,
+            LenSeq::new(entry.raw_len, entry.compressed_len, seq),
+        );
+        assert!(old.is_none(), "rewritten reloc key must be unique");
+    }
+    (relocs, reloc_map)
+}
+
 struct DataReWriter<'a> {
     file_id: u64,
     items: Vec<Item>,
@@ -1514,11 +1598,20 @@ struct DataReWriter<'a> {
     sum_up2: u64,
     total: u64,
     opt: &'a Options,
+    enable_compression: bool,
+    compressors: Arc<CompressorPool>,
     bucket_id: u64,
 }
 
 impl<'a> DataReWriter<'a> {
-    fn new(file_id: u64, opt: &'a Options, cap: usize, bucket_id: u64) -> Self {
+    fn new(
+        file_id: u64,
+        opt: &'a Options,
+        cap: usize,
+        bucket_id: u64,
+        enable_compression: bool,
+        compressors: Arc<CompressorPool>,
+    ) -> Self {
         Self {
             file_id,
             items: Vec::with_capacity(cap),
@@ -1527,6 +1620,8 @@ impl<'a> DataReWriter<'a> {
             sum_up2: 0,
             total: cap as u64,
             opt,
+            enable_compression,
+            compressors,
             bucket_id,
         }
     }
@@ -1544,32 +1639,63 @@ impl<'a> DataReWriter<'a> {
 
     fn build(&mut self) -> Result<(MemDataStat, HashMap<u64, LenSeq>), OpCode> {
         let up2 = self.sum_up2 / self.total;
-        let block = Block::alloc(1 << 20);
-        let mut seq = 0;
+        let mut buffers = RewriteBuffers::new(1 << 20);
+        let mut decoder = RecordDecompressor::new()?;
         let mut off = 0;
         let path = self.opt.data_file(self.file_id);
         let mut writer = GatherWriter::trunc(&path, 128);
         let mut reloc: Vec<u8> = Vec::new();
-        let mut reloc_map = HashMap::new();
-        let buf = block.mut_slice(0, block.len());
+        let mut pending_relocs = Vec::new();
 
         self.items.sort_unstable_by_key(|x| x.id);
-
+        let mut compressor = None;
         for item in &self.items {
             let reader = File::options()
                 .read(true)
                 .open(self.opt.data_file(item.id))
                 .unwrap();
             for e in &item.pos {
-                let len = e.len as usize;
-                let crc = copy(&reader, &mut writer, buf, len, e.off as u64)?;
-                assert_eq!(crc, e.crc);
-                let m = AddrPair::new(e.key, off, e.len, seq, crc);
-                reloc.extend_from_slice(m.as_slice());
-                reloc_map.insert(e.key, LenSeq::new(e.len, seq));
-                off += len;
-                seq += 1;
+                let codec = if self.enable_compression
+                    && e.compressed_len == 0
+                    && e.raw_len as usize >= COMPRESS_MIN_LEN
+                {
+                    Some(compressor.get_or_insert_with(|| {
+                        self.compressors
+                            .borrow()
+                            .expect("data rewrite compressor must exist")
+                    }) as &mut RecordCompressor)
+                } else {
+                    None
+                };
+                let encoded = rewrite_record(
+                    &reader,
+                    &mut writer,
+                    &mut buffers,
+                    &mut decoder,
+                    codec,
+                    e,
+                    self.enable_compression,
+                )?;
+                pending_relocs.push(PendingReloc::new(
+                    e.key,
+                    off,
+                    encoded.raw_len,
+                    encoded.compressed_len,
+                    encoded.crc,
+                ));
+                off += if encoded.compressed_len == 0 {
+                    encoded.raw_len as usize
+                } else {
+                    encoded.compressed_len as usize
+                };
             }
+        }
+
+        let nr_reloc = pending_relocs.len() as u32;
+        let (sorted_relocs, reloc_map) = build_sorted_relocs(&mut pending_relocs);
+        reloc.reserve(sorted_relocs.len() * AddrPair::LEN);
+        for entry in sorted_relocs {
+            reloc.extend_from_slice(entry.as_slice());
         }
 
         let mut interval_crc = Crc32cHasher::default();
@@ -1584,7 +1710,7 @@ impl<'a> DataReWriter<'a> {
 
         let footer = DataFooter {
             up2,
-            nr_reloc: seq,
+            nr_reloc,
             nr_intervals: self.nr_interval,
             reloc_crc: reloc_crc.finish() as u32,
             interval_crc: interval_crc.finish() as u32,
@@ -1601,13 +1727,13 @@ impl<'a> DataReWriter<'a> {
                 file_id: self.file_id,
                 up1: up2,
                 up2,
-                active_elems: seq,
-                total_elems: seq,
+                active_elems: nr_reloc,
+                total_elems: nr_reloc,
                 active_size: off,
                 total_size: off,
                 bucket_id: self.bucket_id,
             },
-            mask: Some(BitMap::new(seq)),
+            mask: Some(BitMap::new(nr_reloc)),
         };
         Ok((stat, reloc_map))
     }
@@ -1618,16 +1744,25 @@ struct BlobRewriter<'a> {
     items: Vec<BlobItem>,
     intervals: Vec<u8>,
     nr_interval: u32,
+    enable_compression: bool,
+    compressors: Arc<CompressorPool>,
     bucket_id: u64,
 }
 
 impl<'a> BlobRewriter<'a> {
-    fn new(opt: &'a Options, bucket_id: u64) -> Self {
+    fn new(
+        opt: &'a Options,
+        bucket_id: u64,
+        enable_compression: bool,
+        compressors: Arc<CompressorPool>,
+    ) -> Self {
         Self {
             opt,
             items: Vec::new(),
             intervals: Vec::new(),
             nr_interval: 0,
+            enable_compression,
+            compressors,
             bucket_id,
         }
     }
@@ -1646,16 +1781,16 @@ impl<'a> BlobRewriter<'a> {
         let path = self.opt.blob_file(file_id);
         let mut w = GatherWriter::trunc(&path, 8);
         let mut off = 0;
-        let mut seq = 0;
         let mut reloc = Vec::new();
-        let mut map = HashMap::new();
-        let block = Block::alloc(4 << 20);
-        let buf = block.mut_slice(0, block.len());
+        let mut pending_relocs = Vec::new();
+        let mut buffers = RewriteBuffers::new(1 << 20);
+        let mut decoder = RecordDecompressor::new()?;
 
         self.items.sort_unstable_by_key(|x| x.id);
 
         let mut beg = u64::MAX;
         let mut end = u64::MIN;
+        let mut compressor = None;
         for item in &self.items {
             beg = beg.min(item.id);
             end = end.max(item.id);
@@ -1666,15 +1801,47 @@ impl<'a> BlobRewriter<'a> {
                 .unwrap();
 
             for e in &item.pos {
-                let len = e.len as usize;
-                let crc = copy(&reader, &mut w, buf, len, e.off as u64)?;
-                assert_eq!(crc, e.crc);
-                let m = AddrPair::new(e.key, off, e.len, seq, crc);
-                reloc.extend_from_slice(m.as_slice());
-                map.insert(e.key, LenSeq::new(e.len, seq));
-                off += len;
-                seq += 1;
+                let codec = if self.enable_compression
+                    && e.compressed_len == 0
+                    && e.raw_len as usize >= COMPRESS_MIN_LEN
+                {
+                    Some(compressor.get_or_insert_with(|| {
+                        self.compressors
+                            .borrow()
+                            .expect("blob rewrite compressor must exist")
+                    }) as &mut RecordCompressor)
+                } else {
+                    None
+                };
+                let encoded = rewrite_record(
+                    &reader,
+                    &mut w,
+                    &mut buffers,
+                    &mut decoder,
+                    codec,
+                    e,
+                    self.enable_compression,
+                )?;
+                pending_relocs.push(PendingReloc::new(
+                    e.key,
+                    off,
+                    encoded.raw_len,
+                    encoded.compressed_len,
+                    encoded.crc,
+                ));
+                off += if encoded.compressed_len == 0 {
+                    encoded.raw_len as usize
+                } else {
+                    encoded.compressed_len as usize
+                };
             }
+        }
+
+        let nr_reloc = pending_relocs.len() as u32;
+        let (sorted_relocs, map) = build_sorted_relocs(&mut pending_relocs);
+        reloc.reserve(sorted_relocs.len() * AddrPair::LEN);
+        for entry in sorted_relocs {
+            reloc.extend_from_slice(entry.as_slice());
         }
 
         let mut interval_crc = Crc32cHasher::default();
@@ -1688,7 +1855,7 @@ impl<'a> BlobRewriter<'a> {
         w.queue(rs);
 
         let footer = BlobFooter {
-            nr_reloc: seq,
+            nr_reloc,
             nr_intervals: self.nr_interval,
             reloc_crc: reloc_crc.finish() as u32,
             interval_crc: interval_crc.finish() as u32,
@@ -1702,11 +1869,11 @@ impl<'a> BlobRewriter<'a> {
             inner: BlobStatInner {
                 file_id,
                 active_size: off,
-                nr_active: seq,
-                nr_total: seq,
+                nr_active: nr_reloc,
+                nr_total: nr_reloc,
                 bucket_id: self.bucket_id,
             },
-            mask: Some(BitMap::new(seq)),
+            mask: Some(BitMap::new(nr_reloc)),
         };
         Ok((stat, map))
     }
@@ -1740,8 +1907,10 @@ struct Entry {
     key: u64,
     /// offset in data file
     off: usize,
-    /// length of dumpped BoxRef
-    len: u32,
+    /// decoded or stored bytes to read
+    raw_len: u32,
+    /// stored compressed length, 0 means raw
+    compressed_len: u32,
     /// old checksum
     crc: u32,
 }
@@ -1789,7 +1958,14 @@ impl InactiveMap {
     }
 }
 
-fn copy<R>(
+struct RewrittenRecord {
+    raw_len: u32,
+    compressed_len: u32,
+    crc: u32,
+}
+
+#[inline]
+fn copy_exact<R>(
     r: &R,
     w: &mut GatherWriter,
     buf: &mut [u8],
@@ -1800,21 +1976,171 @@ where
     R: GatherIO,
 {
     let mut crc = Crc32cHasher::default();
-    let mut n = 0;
-    let buf_sz = buf.len();
-
-    while n < len {
-        let cnt = buf_sz.min(len - n);
-        let s = &mut buf[0..cnt];
-        r.read(s, off).map_err(|e| {
-            log::error!("can't read, {:?}", e);
-            OpCode::IoError
-        })?;
+    let mut done = 0;
+    while done < len {
+        let cnt = buf.len().min(len - done);
+        let s = &mut buf[..cnt];
+        read_exact_at(r, s, off)?;
         crc.write(s);
-        // the data will be reused next time, so we write data to file instead of queue it
         w.write(s);
+        done += cnt;
         off += cnt as u64;
-        n += cnt;
     }
     Ok(crc.finish() as u32)
+}
+
+fn read_exact_at<R>(r: &R, buf: &mut [u8], mut off: u64) -> Result<(), OpCode>
+where
+    R: GatherIO,
+{
+    let mut done = 0;
+    while done < buf.len() {
+        let got = r.read(&mut buf[done..], off).map_err(|_| OpCode::IoError)?;
+        if got == 0 {
+            return Err(OpCode::Corruption);
+        }
+        done += got;
+        off += got as u64;
+    }
+    Ok(())
+}
+
+fn rewrite_record<R>(
+    reader: &R,
+    writer: &mut GatherWriter,
+    buffers: &mut RewriteBuffers,
+    decoder: &mut RecordDecompressor,
+    codec: Option<&mut RecordCompressor>,
+    entry: &Entry,
+    enable_compression: bool,
+) -> Result<RewrittenRecord, OpCode>
+where
+    R: GatherIO,
+{
+    let raw_len = entry.raw_len as usize;
+    let stored_len = if entry.compressed_len == 0 {
+        raw_len
+    } else {
+        entry.compressed_len as usize
+    };
+
+    if entry.compressed_len == 0 && (!enable_compression || raw_len < COMPRESS_MIN_LEN) {
+        buffers.ensure_io(stored_len.clamp(1, 4 << 20));
+        let crc = copy_exact(
+            reader,
+            writer,
+            buffers.io.mut_slice(0, buffers.io.len()),
+            stored_len,
+            entry.off as u64,
+        )?;
+        assert_eq!(crc, entry.crc);
+        return Ok(RewrittenRecord {
+            raw_len: entry.raw_len,
+            compressed_len: 0,
+            crc,
+        });
+    }
+
+    if enable_compression && entry.compressed_len == 0 {
+        let codec =
+            codec.expect("compressor must exist when compression is enabled for large raw record");
+        buffers.ensure_io(stored_len);
+        let src = buffers.io.mut_slice::<u8>(0, stored_len);
+        read_exact_at(reader, src, entry.off as u64)?;
+        let crc = crc32c::crc32c(src);
+        assert_eq!(crc, entry.crc);
+
+        if let Some(compressed) = codec.try_compress(src)? {
+            let crc = crc32c::crc32c(&compressed);
+            let stored_len = compressed.len() as u32;
+            writer.write(&compressed);
+            return Ok(RewrittenRecord {
+                raw_len: entry.raw_len,
+                compressed_len: stored_len,
+                crc,
+            });
+        }
+
+        writer.write(src);
+        return Ok(RewrittenRecord {
+            raw_len: entry.raw_len,
+            compressed_len: 0,
+            crc,
+        });
+    }
+
+    if enable_compression && entry.compressed_len > 0 {
+        buffers.ensure_io(stored_len.clamp(1, 4 << 20));
+        let crc = copy_exact(
+            reader,
+            writer,
+            buffers.io.mut_slice(0, buffers.io.len()),
+            stored_len,
+            entry.off as u64,
+        )?;
+        assert_eq!(crc, entry.crc);
+        return Ok(RewrittenRecord {
+            raw_len: entry.raw_len,
+            compressed_len: entry.compressed_len,
+            crc,
+        });
+    }
+
+    debug_assert!(!enable_compression);
+    if entry.compressed_len == 0 {
+        buffers.ensure_io(stored_len);
+        let src = buffers.io.mut_slice::<u8>(0, stored_len);
+        read_exact_at(reader, src, entry.off as u64)?;
+        let crc = crc32c::crc32c(src);
+        assert_eq!(crc, entry.crc);
+        writer.write(src);
+        return Ok(RewrittenRecord {
+            raw_len: entry.raw_len,
+            compressed_len: 0,
+            crc,
+        });
+    }
+
+    let crc = decoder.decode_to_writer(reader, entry.off as u64, raw_len, stored_len, writer)?;
+    assert_eq!(crc.stored, entry.crc);
+    Ok(RewrittenRecord {
+        raw_len: entry.raw_len,
+        compressed_len: 0,
+        crc: crc.raw,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PendingReloc, build_sorted_relocs};
+
+    #[test]
+    fn build_sorted_relocs_orders_by_addr_and_reassigns_seq() {
+        let mut pending = vec![
+            PendingReloc::new(30, 300, 30, 0, 3),
+            PendingReloc::new(10, 100, 10, 4, 1),
+            PendingReloc::new(20, 200, 20, 0, 2),
+        ];
+
+        let (relocs, map) = build_sorted_relocs(&mut pending);
+
+        assert_eq!(relocs.len(), 3);
+        let key0 = relocs[0].key;
+        let seq0 = relocs[0].val.seq;
+        let key1 = relocs[1].key;
+        let seq1 = relocs[1].val.seq;
+        let key2 = relocs[2].key;
+        let seq2 = relocs[2].val.seq;
+        assert_eq!(key0, 10);
+        assert_eq!(seq0, 0);
+        assert_eq!(key1, 20);
+        assert_eq!(seq1, 1);
+        assert_eq!(key2, 30);
+        assert_eq!(seq2, 2);
+
+        assert_eq!(map.get(&10).unwrap().seq, 0);
+        assert_eq!(map.get(&10).unwrap().compressed_len, 4);
+        assert_eq!(map.get(&20).unwrap().seq, 1);
+        assert_eq!(map.get(&30).unwrap().seq, 2);
+    }
 }

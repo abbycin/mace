@@ -21,7 +21,7 @@ impl DeltaView {
         let ksz = k.packed_size();
         let vsz = v.packed_size();
         let inline_size = a.inline_size();
-        let is_remote = vsz > inline_size;
+        let is_remote = vsz >= inline_size;
 
         let sz = Val::calc_size(false, inline_size, vsz);
         let lsn = lsn.max(a.checkpoint_lsn(group));

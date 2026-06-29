@@ -24,6 +24,7 @@ crossbeam-epoch = "0.9.18"
 parking_lot = "0.12.5"
 btree-store = "0.1.7"
 rustc-hash = "2.1.2"
+zstd = { version = "0.13.3" }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2.186"

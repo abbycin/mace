@@ -9,7 +9,7 @@ use std::{
     sync::{
         Arc,
         atomic::{
-            AtomicBool, AtomicU64,
+            AtomicBool, AtomicU32, AtomicU64,
             Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
         },
     },
@@ -33,6 +33,7 @@ use crate::{
     utils::{
         Handle, MutRef, OpCode,
         bitmap::BitMap,
+        compress::{CompressorPool, DecompressorPool},
         data::{AddrPair, GroupPositions, LenSeq, Position, Reloc, init_group_pos},
         interval::IntervalMap,
         lru::{Lru, ShardLru},
@@ -238,7 +239,7 @@ pub(crate) struct Manifest {
     pub(crate) bucket_metas: DashMap<String, Arc<BucketMeta>>,
     pub(crate) bucket_metas_by_id: DashMap<u64, Arc<BucketMeta>>,
     pub(crate) bucket_frontier: DashMap<u64, GroupPositions>,
-    pub(crate) bucket_states: DashMap<u64, MutRef<BucketState>>,
+    pub(crate) bucket_runtimes: DashMap<u64, Arc<BucketRuntime>>,
     pub(crate) structural_lock: Mutex<()>,
     /// total bucket count including both active/pending_del
     pub(crate) nr_buckets: AtomicU64,
@@ -253,6 +254,49 @@ pub(crate) struct Manifest {
 enum BucketRemoveMode {
     Drop,
     Delete,
+}
+
+pub(crate) struct BucketRuntime {
+    pub(crate) state: MutRef<BucketState>,
+    pub(crate) compressors: Arc<CompressorPool>,
+    rewrite_inflight: AtomicU32,
+}
+
+impl BucketRuntime {
+    fn new() -> Self {
+        Self {
+            state: MutRef::new(BucketState::new()),
+            compressors: CompressorPool::new(),
+            rewrite_inflight: AtomicU32::new(0),
+        }
+    }
+
+    fn begin_rewrite(self: &Arc<Self>) -> BucketRewriteGuard {
+        self.rewrite_inflight.fetch_add(1, AcqRel);
+        BucketRewriteGuard {
+            runtime: self.clone(),
+        }
+    }
+
+    pub(crate) fn has_rewrite(&self) -> bool {
+        self.rewrite_inflight.load(Acquire) != 0
+    }
+}
+
+pub(crate) struct BucketRewriteGuard {
+    runtime: Arc<BucketRuntime>,
+}
+
+impl Drop for BucketRewriteGuard {
+    fn drop(&mut self) {
+        self.runtime.rewrite_inflight.fetch_sub(1, AcqRel);
+    }
+}
+
+pub(crate) struct BucketRewritePermit {
+    pub(crate) enable_compression: bool,
+    pub(crate) compressors: Arc<CompressorPool>,
+    _guard: BucketRewriteGuard,
 }
 
 pub(crate) struct Txn<'a> {
@@ -325,9 +369,13 @@ impl<'a> Txn<'a> {
 struct FileReader {
     file: File,
     relocs: Box<[AddrPair]>,
+    decoders: Arc<DecompressorPool>,
 }
 
-fn new_reader<T: IFooter>(path: PathBuf) -> Result<Arc<FileReader>, OpCode> {
+fn new_reader<T: IFooter>(
+    path: PathBuf,
+    decoders: Arc<DecompressorPool>,
+) -> Result<Arc<FileReader>, OpCode> {
     let mut loader = MetaReader::<T>::new(&path).expect("not such path");
     let relocs = loader.get_reloc().expect("must exist");
     let relocs = {
@@ -340,7 +388,11 @@ fn new_reader<T: IFooter>(path: PathBuf) -> Result<Arc<FileReader>, OpCode> {
         relocs
     };
     let file = loader.take();
-    Ok(Arc::new(FileReader { file, relocs }))
+    Ok(Arc::new(FileReader {
+        file,
+        relocs,
+        decoders,
+    }))
 }
 
 impl FileReader {
@@ -352,14 +404,29 @@ impl FileReader {
 
     fn read_at(&self, pos: u64) -> Result<BoxRef, OpCode> {
         let m = self.find_reloc(pos).expect("can't find addr in reloc");
-        let real_size = BoxRef::real_size_from_dump(m.len);
+        let real_size = BoxRef::real_size_from_dump(m.raw_len());
         let mut p = BoxRef::alloc_exact(real_size, pos);
-        let mut crc = Crc32cHasher::default();
-
         let dst = p.load_slice();
-        self.file.read(dst, m.off as u64).map_err(OpCode::from)?;
-        crc.write(dst);
-        let actual_crc = crc.finish() as u32;
+
+        if !m.is_compressed() {
+            let mut crc = Crc32cHasher::default();
+            self.file.read(dst, m.off as u64).map_err(OpCode::from)?;
+            crc.write(dst);
+            let actual_crc = crc.finish() as u32;
+            if actual_crc != m.crc {
+                log::error!(
+                    "checksum mismatch, expect {} get {}, key {pos}",
+                    { m.crc },
+                    actual_crc
+                );
+                return Err(OpCode::Corruption);
+            }
+            return Ok(p);
+        }
+
+        let actual_crc = self.decoders.with_decoder(|decoder| {
+            decoder.decode_reader_into(&self.file, m.off as u64, m.compressed_len() as usize, dst)
+        })?;
         if actual_crc != m.crc {
             log::error!(
                 "checksum mismatch, expect {} get {}, key {pos}",
@@ -414,7 +481,7 @@ impl Manifest {
             bucket_metas: DashMap::new(),
             bucket_metas_by_id: DashMap::new(),
             bucket_frontier: DashMap::new(),
-            bucket_states: DashMap::new(),
+            bucket_runtimes: DashMap::new(),
             structural_lock: Mutex::new(()),
             obsolete_data: Mutex::new(Vec::new()),
             obsolete_blob: Mutex::new(Vec::new()),
@@ -454,7 +521,7 @@ impl Manifest {
         let meta = meta.ok_or(OpCode::NotFound)?;
         self.bucket_metas.insert(name.to_string(), meta.clone());
         self.bucket_metas_by_id.insert(meta.id, meta.clone());
-        self.ensure_bucket_state(meta.id);
+        self.ensure_bucket_runtime(meta.id);
         Ok(meta)
     }
 
@@ -534,10 +601,11 @@ impl Manifest {
         let _lock = self.structural_lock.lock();
         let meta = self.load_bucket_meta_locked(name)?;
         let bucket_id = meta.id;
+        let runtime = self.get_bucket_runtime(bucket_id);
 
-        if self.buckets.buckets.contains_key(&bucket_id) {
+        if self.buckets.buckets.contains_key(&bucket_id) || runtime.has_rewrite() {
             log::info!(
-                "bucket {}({}) is loaded, reject bucket option update",
+                "bucket {}({}) is busy, reject bucket option update",
                 name,
                 bucket_id
             );
@@ -604,6 +672,21 @@ impl Manifest {
             .clone()
     }
 
+    pub(crate) fn try_acquire_rewrite(&self, bucket_id: u64) -> Option<BucketRewritePermit> {
+        let _lock = self.structural_lock.lock();
+        let meta = self.bucket_metas_by_id.get(&bucket_id)?;
+        let runtime = self.get_bucket_runtime(bucket_id);
+        if runtime.state.is_deleting() || runtime.state.is_drop() {
+            return None;
+        }
+        let enable_compression = meta.options.enable_compression;
+        Some(BucketRewritePermit {
+            enable_compression,
+            compressors: runtime.compressors.clone(),
+            _guard: runtime.begin_rewrite(),
+        })
+    }
+
     fn load_bucket_context_locked(&self, bucket_id: u64) -> Arc<BucketContext> {
         // double check
         if let Some(ctx) = self.buckets.buckets.get(&bucket_id) {
@@ -615,7 +698,8 @@ impl Manifest {
             panic!("bucket {bucket_id} not found");
         }
 
-        let state = self.ensure_bucket_state(bucket_id);
+        let runtime = self.ensure_bucket_runtime(bucket_id);
+        let state = runtime.state.clone();
 
         // PageMap lazy load
         let table = {
@@ -648,6 +732,7 @@ impl Manifest {
             self.buckets.lru,
             self.buckets.reader.clone(),
             self.buckets.tx.clone(),
+            runtime.compressors.clone(),
         ));
 
         self.recover_intervals(bucket_id, &ctx);
@@ -656,20 +741,19 @@ impl Manifest {
         ctx
     }
 
-    fn get_bucket_state(&self, bucket_id: u64) -> MutRef<BucketState> {
-        self.bucket_states
+    pub(crate) fn get_bucket_runtime(&self, bucket_id: u64) -> Arc<BucketRuntime> {
+        self.bucket_runtimes
             .get(&bucket_id)
-            .map(|state| state.value().clone())
+            .map(|runtime| runtime.value().clone())
             .expect("must exist")
     }
 
-    // bucket state is in-memory only and can be dropped during unload/delete or after restart.
-    // every published bucket meta must have a matching state entry; load/create paths call this
-    // to keep that invariant
-    fn ensure_bucket_state(&self, bucket_id: u64) -> MutRef<BucketState> {
-        self.bucket_states
+    // bucket runtime remains alive across load/unload so background GC can read lifecycle state
+    // and reuse compression contexts without recreating the full bucket context
+    pub(crate) fn ensure_bucket_runtime(&self, bucket_id: u64) -> Arc<BucketRuntime> {
+        self.bucket_runtimes
             .entry(bucket_id)
-            .or_insert_with(|| MutRef::new(BucketState::new()))
+            .or_insert_with(|| Arc::new(BucketRuntime::new()))
             .value()
             .clone()
     }
@@ -694,22 +778,39 @@ impl Manifest {
 
         // remove from maps (unpublish)
         self.bucket_metas.remove(name);
-        self.bucket_metas_by_id.remove(&bucket_id);
+        if matches!(mode, BucketRemoveMode::Delete) {
+            self.bucket_metas_by_id.remove(&bucket_id);
+        }
 
-        let state = self.get_bucket_state(bucket_id);
-        let mut busy = Arc::strong_count(&meta) > 1 || state.is_busy() || state.is_vacuuming();
+        let runtime = self.get_bucket_runtime(bucket_id);
+        let state = runtime.state.clone();
+        let holder_baseline = match mode {
+            BucketRemoveMode::Drop => 2,
+            BucketRemoveMode::Delete => 1,
+        };
+        let mut busy =
+            Arc::strong_count(&meta) > holder_baseline || state.is_busy() || state.is_vacuuming();
         if matches!(mode, BucketRemoveMode::Delete) && state.is_drop() {
             busy = true;
         }
         if busy {
             self.bucket_metas.insert(name.to_string(), meta.clone());
-            self.bucket_metas_by_id.insert(bucket_id, meta);
+            if matches!(mode, BucketRemoveMode::Delete) {
+                self.bucket_metas_by_id.insert(bucket_id, meta);
+            }
             return Err(OpCode::Again);
         }
 
         match mode {
             BucketRemoveMode::Drop => state.set_drop(),
             BucketRemoveMode::Delete => state.set_deleting(),
+        }
+
+        if matches!(mode, BucketRemoveMode::Delete) && runtime.has_rewrite() {
+            state.clear_deleting();
+            self.bucket_metas.insert(name.to_string(), meta.clone());
+            self.bucket_metas_by_id.insert(bucket_id, meta);
+            return Err(OpCode::Again);
         }
 
         Ok(bucket_id)
@@ -739,7 +840,7 @@ impl Manifest {
         }
         let _ = self.buckets.buckets.remove(&bucket_id);
 
-        self.bucket_states.remove(&bucket_id);
+        self.get_bucket_runtime(bucket_id).state.clear_drop();
         Ok(())
     }
 
@@ -752,7 +853,6 @@ impl Manifest {
 
         // cleanup page maps and resources via manager
         self.buckets.del_bucket(bucket_id);
-        self.bucket_states.remove(&bucket_id);
 
         // collect and record obsolete files
         let data_files = self
@@ -1283,7 +1383,10 @@ where
             }
 
             let lk = self.common.cache.lock_shard(file_id);
-            lk.add_if_missing(|| new_reader::<K::Footer>(K::file_path(&self.common.opt, file_id)))?;
+            let decoders = self.common.decoders.clone();
+            lk.add_if_missing(|| {
+                new_reader::<K::Footer>(K::file_path(&self.common.opt, file_id), decoders.clone())
+            })?;
         }
     }
 
@@ -1297,8 +1400,11 @@ where
             }
 
             let lk = self.common.cache.lock_shard(file_id);
-            lk.add_if_missing(|| new_reader::<K::Footer>(K::file_path(&self.common.opt, file_id)))
-                .expect("can't fail");
+            let decoders = self.common.decoders.clone();
+            lk.add_if_missing(|| {
+                new_reader::<K::Footer>(K::file_path(&self.common.opt, file_id), decoders.clone())
+            })
+            .expect("can't fail");
         }
     }
 }
@@ -1311,6 +1417,7 @@ struct JunkCollector {
 struct StatCommon {
     pub(crate) bucket_files: DashMap<u64, Vec<u64>>,
     cache: ShardLru<Arc<FileReader>>,
+    decoders: Arc<DecompressorPool>,
     mask_cache: Lru<u64, ()>,
     mask_capacity: usize,
     opt: Arc<ParsedOptions>,
@@ -1355,6 +1462,7 @@ impl StatCommon {
         Self {
             bucket_files: DashMap::new(),
             cache: ShardLru::new(cache_capacity),
+            decoders: DecompressorPool::new(),
             mask_cache: Lru::new(),
             mask_capacity,
             opt,
@@ -1488,7 +1596,7 @@ impl StatCtx<DataKind, DashMap<u64, MemDataStat>> {
         for (_, q) in junks.iter_mut() {
             for &addr in q.iter() {
                 if let Some(ls) = relocs.get(&addr) {
-                    fstat.active_size -= ls.len as usize;
+                    fstat.active_size -= ls.active_len() as usize;
                     fstat.active_elems -= 1;
                     fstat.mask.as_mut().expect("mask loaded").set(ls.seq);
                     seqs.push(ls.seq);
@@ -1586,7 +1694,8 @@ impl StatCtx<DataKind, DashMap<u64, MemDataStat>> {
     }
 
     pub(crate) fn update_stat(&self, stat: &mut MemDataStat, junk: u64, reloc: &Reloc, tick: u64) {
-        self.active_size.fetch_sub(reloc.len as u64, Release);
+        self.active_size
+            .fetch_sub(reloc.active_len() as u64, Release);
         stat.update(tick, reloc);
         self.common.junk.push_if_collecting(stat.file_id, junk);
     }
@@ -1719,7 +1828,7 @@ impl StatCtx<BlobKind, RwLock<BTreeMap<u64, MemBlobStat>>> {
         for (_, q) in junks.iter_mut() {
             for &addr in q.iter() {
                 if let Some(ls) = relocs.get(&addr) {
-                    bstat.active_size -= ls.len as usize;
+                    bstat.active_size -= ls.active_len() as usize;
                     bstat.nr_active -= 1;
                     seqs.push(ls.seq);
                 }
