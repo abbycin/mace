@@ -749,7 +749,7 @@ impl<'a> TxnView<'a> {
             &self.cc,
             self.tree,
             self.group_id,
-            self.cc.start_ts,
+            self.cc.start_ts(),
             k,
         )
     }
@@ -764,7 +764,13 @@ impl<'a> TxnView<'a> {
     where
         K: AsRef<[u8]>,
     {
-        seek_impl(&self.cc, self.tree, self.group_id, self.cc.start_ts, prefix)
+        seek_impl(
+            &self.cc,
+            self.tree,
+            self.group_id,
+            self.cc.start_ts(),
+            prefix,
+        )
     }
 
     #[inline]
@@ -773,7 +779,13 @@ impl<'a> TxnView<'a> {
         K: AsRef<[u8]>,
         R: RangeBounds<K>,
     {
-        range_impl(&self.cc, self.tree, self.group_id, self.cc.start_ts, range)
+        range_impl(
+            &self.cc,
+            self.tree,
+            self.group_id,
+            self.cc.start_ts(),
+            range,
+        )
     }
 }
 

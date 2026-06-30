@@ -230,8 +230,7 @@ impl Context {
         }
     }
 
-    pub fn alloc_cc(&self) -> Handle<CCNode> {
-        let start_ts = self.load_oracle();
+    pub(crate) fn alloc_cc(&self) -> Handle<CCNode> {
         loop {
             let prev = self.nr_view.load(Acquire);
             if prev == Self::VIEW_HANDOFF {
@@ -247,16 +246,26 @@ impl Context {
                 {
                     continue;
                 }
+                // reserve a node before publication so its start_ts can become the
+                // first visible active-view source before nr_view leaves handoff
+                let cc = self.pool.alloc();
+                let start_ts = self.load_oracle();
+                cc.set_start_ts(start_ts);
                 self.min_view_txid.store(start_ts, Relaxed);
                 self.nr_view.store(1, Release);
-                return self.pool.alloc(start_ts);
+                return cc;
             }
             if self
                 .nr_view
                 .compare_exchange_weak(prev, prev + 1, AcqRel, Acquire)
                 .is_ok()
             {
-                return self.pool.alloc(start_ts);
+                // reserve a node and publish its start_ts before the collector can
+                // observe this shared view through the registry scan
+                let cc = self.pool.alloc();
+                let start_ts = self.load_oracle();
+                cc.set_start_ts(start_ts);
+                return cc;
             }
         }
     }
@@ -489,11 +498,10 @@ impl Context {
         let pending_floor = self
             .pending_abort_clean_seqlock
             .read(|| self.pending_abort_clean_floor.load(Relaxed));
-        if pending_floor == u64::MAX {
-            safe
-        } else {
-            safe.min(pending_floor.saturating_sub(1))
+        if pending_floor != u64::MAX {
+            safe = safe.min(pending_floor.saturating_sub(1));
         }
+        safe
     }
 
     pub(crate) fn start(&self) {
@@ -546,7 +554,7 @@ fn collect_thread(
                         let mut min = NULL_ORACLE;
                         let r = pool.registry.read();
                         for h in r.iter() {
-                            min = min.min(h.start_ts);
+                            min = min.min(h.start_ts());
                         }
                         drop(r);
                         if min != NULL_ORACLE {
@@ -645,8 +653,8 @@ impl CCPool {
         }
     }
 
-    fn push_shard(&self, index: usize, mut cc: Handle<CCNode>) {
-        cc.start_ts = NULL_ORACLE;
+    fn push_shard(&self, index: usize, cc: Handle<CCNode>) {
+        cc.set_start_ts(NULL_ORACLE);
         let ptr = cc.inner();
         loop {
             let head = self.shards[index].load(Acquire);
@@ -660,11 +668,11 @@ impl CCPool {
         }
     }
 
-    fn alloc(&self, start_ts: u64) -> Handle<CCNode> {
+    fn alloc(&self) -> Handle<CCNode> {
         let shard = self.get_shard_idx();
         let guard = crossbeam_epoch::pin();
 
-        let mut h = if let Some(x) = self.try_pop_shard(shard, &guard) {
+        if let Some(x) = self.try_pop_shard(shard, &guard) {
             x
         } else {
             let mut popped = None;
@@ -681,16 +689,13 @@ impl CCPool {
             } else {
                 let mut cc = Handle::new(CCNode::new(self.concurrent_write));
                 cc.shard_index = shard;
-                cc.start_ts = start_ts;
                 let mut r = self.registry.write();
                 cc.registry_index = r.len();
                 r.push(cc);
                 self.registry_len.store(r.len(), Release);
                 cc
             }
-        };
-        h.start_ts = start_ts;
-        h
+        }
     }
 
     fn free(&self, cc: Handle<CCNode>) {
@@ -793,7 +798,9 @@ mod tests {
         let total = CCPOOL_SHARD + 8;
         let mut handles = Vec::with_capacity(total);
         for i in 0..total {
-            handles.push(pool.alloc(i as u64 + 1));
+            let h = pool.alloc();
+            h.set_start_ts(i as u64 + 1);
+            handles.push(h);
         }
         assert!(pool.registry_len.load(Relaxed) >= total);
 
@@ -813,12 +820,14 @@ mod tests {
     fn ccpool_alloc_free_fast_path_keeps_registry_len() {
         let pool = CCPool::new(4);
         let base_len = pool.registry_len.load(Relaxed);
-        let h = pool.alloc(10);
+        let h = pool.alloc();
+        h.set_start_ts(10);
         pool.free(h);
         assert_eq!(pool.registry_len.load(Relaxed), base_len);
 
-        let h2 = pool.alloc(11);
-        assert_eq!(h2.start_ts, 11);
+        let h2 = pool.alloc();
+        h2.set_start_ts(11);
+        assert_eq!(h2.start_ts(), 11);
         pool.free(h2);
     }
 
@@ -826,7 +835,7 @@ mod tests {
     fn last_view_drop_keeps_floor_until_next_view_epoch() {
         let (_root, ctx) = new_context();
         let cc1 = ctx.alloc_cc();
-        let floor1 = cc1.start_ts;
+        let floor1 = cc1.start_ts();
         assert_eq!(ctx.oldest_view_txid(), Some(floor1));
 
         ctx.free_cc(cc1);
@@ -835,7 +844,7 @@ mod tests {
 
         ctx.alloc_oracle();
         let cc2 = ctx.alloc_cc();
-        let floor2 = cc2.start_ts;
+        let floor2 = cc2.start_ts();
         assert!(floor2 > floor1);
         assert_eq!(ctx.oldest_view_txid(), Some(floor2));
 

@@ -58,7 +58,7 @@ pub struct ConcurrencyControl {
     pub(crate) latest_cts: AtomicU64,
     /// snapshot of latest_cts in gc
     pub(crate) last_latest_cts: AtomicU64,
-    pub(crate) start_ts: u64,
+    start_ts: AtomicU64,
 }
 
 unsafe impl Send for ConcurrencyControl {}
@@ -72,8 +72,18 @@ impl ConcurrencyControl {
             wmk_oldest_tx: AtomicU64::new(0),
             latest_cts: AtomicU64::new(0),
             last_latest_cts: AtomicU64::new(0),
-            start_ts: NULL_ORACLE, // it's required for CommitTree's log compaction
+            start_ts: AtomicU64::new(NULL_ORACLE), // it's required for CommitTree's log compaction
         }
+    }
+
+    #[inline]
+    pub(crate) fn start_ts(&self) -> u64 {
+        self.start_ts.load(Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn set_start_ts(&self, start_ts: u64) {
+        self.start_ts.store(start_ts, Release);
     }
 
     // NOTE: it's thread-safe
