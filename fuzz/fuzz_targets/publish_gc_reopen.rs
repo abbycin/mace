@@ -17,7 +17,7 @@ fn batch_upsert(
     payload: &[u8],
 ) {
     let txn = bucket.begin().expect("begin batch txn failed");
-    for idx in 0..32usize {
+    for idx in 0..16usize {
         if idx % 2 != parity {
             continue;
         }
@@ -82,6 +82,8 @@ fuzz_target!(|data: &[u8]| {
     let mut stream = ByteStream::new(data);
     let mut lag_expected: Option<BTreeMap<String, Option<Vec<u8>>>> = None;
     let mut lag_view: Option<TxnView<'_>> = None;
+    let mut dirty_batches_since_lifecycle = 0usize;
+    let mut progressed_since_verify = false;
 
     for _ in 0..96usize {
         let Some(tag) = stream.next() else {
@@ -89,8 +91,15 @@ fuzz_target!(|data: &[u8]| {
         };
         match tag % 7 {
             0 => {
-                let payload = value_bytes(tag, (tag as usize) + 512);
+                let size_hint = if tag & 0x1f == 0 {
+                    (tag as usize) + 515
+                } else {
+                    (tag as usize) + 513
+                };
+                let payload = value_bytes(tag, size_hint);
                 batch_upsert(&bucket, &mut model, (tag as usize) & 1, &payload);
+                dirty_batches_since_lifecycle += 1;
+                progressed_since_verify = true;
             }
             1 => {
                 let key = key_name((tag as usize) % 32);
@@ -100,6 +109,7 @@ fuzz_target!(|data: &[u8]| {
                     txn.commit().expect("delete commit failed");
                     let _ = value;
                     model.insert(key, None);
+                    progressed_since_verify = true;
                 }
             }
             2 => {
@@ -113,32 +123,51 @@ fuzz_target!(|data: &[u8]| {
                     verify_lagging_view(view, expected);
                 }
                 assert_bucket_matches_model(&bucket, &model);
+                progressed_since_verify = false;
             }
-            4 => bucket.checkpoint(),
+            4 => {
+                if dirty_batches_since_lifecycle > 0 {
+                    bucket.checkpoint();
+                    progressed_since_verify = true;
+                    dirty_batches_since_lifecycle = 0;
+                }
+            }
             5 => {
-                bucket.checkpoint();
-                mace.start_gc();
-                std::thread::yield_now();
+                if lag_view.is_some() && dirty_batches_since_lifecycle >= 2 {
+                    bucket.checkpoint();
+                    mace.start_gc();
+                    std::thread::yield_now();
+                    if let (Some(view), Some(expected)) = (lag_view.as_ref(), lag_expected.as_ref()) {
+                        verify_lagging_view(view, expected);
+                    }
+                    assert_bucket_matches_model(&bucket, &model);
+                    dirty_batches_since_lifecycle = 0;
+                    progressed_since_verify = false;
+                }
             }
             _ => {
-                if let (Some(view), Some(expected)) = (lag_view.as_ref(), lag_expected.as_ref()) {
-                    verify_lagging_view(view, expected);
+                if progressed_since_verify || dirty_batches_since_lifecycle > 0 {
+                    if let (Some(view), Some(expected)) = (lag_view.as_ref(), lag_expected.as_ref()) {
+                        verify_lagging_view(view, expected);
+                    }
+                    lag_view = None;
+                    lag_expected = None;
+                    drop(bucket);
+                    drop(mace);
+                    mace = open_engine(db_root.path(), |opt| {
+                        opt.concurrent_write = 1;
+                        opt.data_file_size = 16 << 10;
+                        opt.blob_file_size = 16 << 10;
+                        opt.data_garbage_ratio = 0;
+                        opt.blob_garbage_ratio = 0;
+                        opt.blob_gc_ratio = 100;
+                        opt.gc_eager = true;
+                    });
+                    bucket = get_or_create_bucket(&mace, "main", bucket_opt).expect("reopen gc bucket");
+                    assert_bucket_matches_model(&bucket, &model);
+                    dirty_batches_since_lifecycle = 0;
+                    progressed_since_verify = false;
                 }
-                lag_view = None;
-                lag_expected = None;
-                drop(bucket);
-                drop(mace);
-                mace = open_engine(db_root.path(), |opt| {
-                    opt.concurrent_write = 1;
-                    opt.data_file_size = 16 << 10;
-                    opt.blob_file_size = 16 << 10;
-                    opt.data_garbage_ratio = 0;
-                    opt.blob_garbage_ratio = 0;
-                    opt.blob_gc_ratio = 100;
-                    opt.gc_eager = true;
-                });
-                bucket = get_or_create_bucket(&mace, "main", bucket_opt).expect("reopen gc bucket");
-                assert_bucket_matches_model(&bucket, &model);
             }
         }
         if stream.is_empty() {

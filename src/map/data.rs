@@ -238,33 +238,69 @@ impl CheckpointTask {
         }
     }
 
-    fn rehot_page(&self, addr: u64, hot_pages: &PagesMap, hot_bytes: &AtomicUsize) {
-        // it's possible because of addr > snap_addr
-        if hot_pages.contains_key(&addr) {
+    // move live addr > snap_addr pages from sealed to hot under one publication boundary
+    // without this lock, readers can observe the remove-from-sealed before insert-into-hot
+    // and incorrectly conclude that the live page is no longer dirty, falling back to disk
+    // lookup even though the page is not durable yet
+    fn rehot_pages(&self, addrs: &[u64], hot_pages: &PagesMap, hot_bytes: &AtomicUsize) {
+        if addrs.is_empty() {
             return;
         }
+        let _epoch = self.page_epoch.write();
+        for &addr in addrs {
+            // it's possible because of addr > snap_addr
+            if hot_pages.contains_key(&addr) {
+                continue;
+            }
 
-        if let Some((_, page)) = self.pages.remove(&addr) {
-            let sz = page.header().total_size as usize;
-            let old = self.sealed_bytes.fetch_sub(sz, AcqRel);
-            assert!(
-                old >= sz,
-                "sealed bytes underflow while carrying over addr {addr}: old={old}, size={sz}"
-            );
-            hot_bytes.fetch_add(sz, AcqRel);
-            hot_pages.insert(addr, page);
+            if let Some((_, page)) = self.pages.remove(&addr) {
+                let sz = page.header().total_size as usize;
+                let old = self.sealed_bytes.fetch_sub(sz, AcqRel);
+                assert!(
+                    old >= sz,
+                    "sealed bytes underflow while carrying over addr {addr}: old={old}, size={sz}"
+                );
+                hot_bytes.fetch_add(sz, AcqRel);
+                hot_pages.insert(addr, page);
+            }
         }
     }
 
-    fn rehot_junk(&self, base_addr: u64, hot_retired: &JunksMap) {
-        if let Some((_, mut chain)) = self.retired.remove(&base_addr) {
-            if let Some(mut cur) = hot_retired.get_mut(&base_addr) {
-                cur.frontier.merge_sparse(&chain.frontier);
-                cur.addrs.append(&mut chain.addrs);
-            } else {
-                hot_retired.insert(base_addr, chain);
+    // move retired lineage for the same carry-over set under one publication boundary
+    // without this lock, readers can miss the retired chain while the page has already been
+    // re-published in hot, breaking the expectation that dirty-page visibility and retired
+    // metadata move together across generations
+    fn rehot_junks(&self, base_addrs: &[u64], hot_retired: &JunksMap) {
+        if base_addrs.is_empty() {
+            return;
+        }
+        let _epoch = self.retired_epoch.write();
+        for &base_addr in base_addrs {
+            if let Some((_, mut chain)) = self.retired.remove(&base_addr) {
+                if let Some(mut cur) = hot_retired.get_mut(&base_addr) {
+                    cur.frontier.merge_sparse(&chain.frontier);
+                    cur.addrs.append(&mut chain.addrs);
+                } else {
+                    hot_retired.insert(base_addr, chain);
+                }
             }
         }
+    }
+
+    fn carry_over_addrs(
+        &self,
+        addrs: &mut Vec<u64>,
+        hot_pages: &PagesMap,
+        hot_bytes: &AtomicUsize,
+        hot_retired: &JunksMap,
+    ) {
+        if addrs.is_empty() {
+            return;
+        }
+        Self::dedup_junks(addrs);
+        self.rehot_pages(addrs, hot_pages, hot_bytes);
+        self.rehot_junks(addrs, hot_retired);
+        addrs.clear();
     }
 
     fn enqueue_leaf_refs(
@@ -308,6 +344,7 @@ impl CheckpointTask {
         let hot_dirty_roots = self.root_epoch.read().root_map.clone();
 
         let mut queue = VecDeque::new();
+        let mut root_carry = Vec::new();
         for i in &self.dirty_roots.live {
             let (pid, addr) = (*i.key(), *i.value());
             if unmap_pid.contains(&pid) {
@@ -322,29 +359,38 @@ impl CheckpointTask {
             );
             if addr > self.snap_addr {
                 hot_dirty_roots.mark(pid, addr);
-                self.rehot_page(addr, &hot_pages, &hot_bytes);
-                self.rehot_junk(addr, &hot_retired);
+                root_carry.push(addr);
             }
             if self.pages.contains_key(&addr) || hot_pages.contains_key(&addr) {
                 queue.push_back(addr);
             }
         }
+        self.carry_over_addrs(&mut root_carry, &hot_pages, &hot_bytes, &hot_retired);
 
         let mut seen = FxHashSet::default();
         let mut siblings = Vec::new();
         let mut remote_hints = Vec::new();
+        let mut pending_carry = Vec::new();
 
         while let Some(addr) = queue.pop_front() {
             if !seen.insert(addr) {
                 continue;
             }
+            #[cfg(feature = "extra_check")]
+            assert!(
+                !self.new_junks.contains(&addr),
+                "checkpoint live graph reached new junk addr {}",
+                addr
+            );
             if self.new_junks.contains(&addr) {
                 continue;
             }
 
             if addr > self.snap_addr {
-                self.rehot_page(addr, &hot_pages, &hot_bytes);
-                self.rehot_junk(addr, &hot_retired);
+                pending_carry.push(addr);
+                if pending_carry.len() >= 64 {
+                    self.carry_over_addrs(&mut pending_carry, &hot_pages, &hot_bytes, &hot_retired);
+                }
             }
 
             let (b, from_sealed) = if let Some(x) = self.pages.get(&addr) {
@@ -352,6 +398,13 @@ impl CheckpointTask {
             } else if let Some(x) = hot_pages.get(&addr) {
                 (x.value().clone(), false)
             } else {
+                #[cfg(feature = "extra_check")]
+                assert!(
+                    addr <= self.snap_addr,
+                    "checkpoint live addr {} above snap_addr {} disappeared from dirty generations",
+                    addr,
+                    self.snap_addr
+                );
                 // the addr is no longer dirty in this generation, treat it as
                 // already persisted or reclaimed
                 continue;
@@ -427,10 +480,30 @@ impl CheckpointTask {
             pages.push(b);
         }
 
+        self.carry_over_addrs(&mut pending_carry, &hot_pages, &hot_bytes, &hot_retired);
+
         // keep checkpoint junk output logically unique even if retired lineage
         // carries duplicates from shared history page references
         Self::dedup_junks(&mut blob_junk);
         Self::dedup_junks(&mut data_junk);
+
+        #[cfg(feature = "extra_check")]
+        {
+            for &addr in &data_junk {
+                assert!(
+                    !seen.contains(&addr),
+                    "checkpoint emitted live data addr {} as junk",
+                    addr
+                );
+            }
+            for &addr in &blob_junk {
+                assert!(
+                    !seen.contains(&addr),
+                    "checkpoint emitted live blob addr {} as junk",
+                    addr
+                );
+            }
+        }
 
         *self.last_chkpt_lsn.raw_ref() = chkpt_lsn;
         Snapshot {

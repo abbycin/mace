@@ -1,4 +1,4 @@
-## [0.0.35] 2026-06-29
+## [0.0.35] 2026-07-02
 ### New Features
 - Added optional zstd compression for persisted bucket data and blob records
   - compression is controlled by bucket option `enable_compression` and defaults to `false`
@@ -10,6 +10,8 @@
 ### Bug Fixes
 - Added durable WAL recycle frontier metadata plus recovery/failpoint coverage for recycle crash windows
 - Fixed flush/GC stale-stat races by skipping retired old-file stats, delaying junk-stat publication until manifest commit, and using conditional btree updates for old stat writes
+- Fixed read-view `start_ts` publication so active snapshot floor tracking cannot observe half-published views during view allocation handoff
+- Fixed checkpoint carry-over visibility so live `addr > snap_addr` pages and retired lineage remain continuously visible across `sealed -> hot` handoff during concurrent GC reads
 
 ## [0.0.34] 2026-06-07
 ### Changes
