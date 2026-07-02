@@ -919,6 +919,11 @@ fn child_case_wal_recycle_before_dir_sync(db_root: &Path) -> ! {
     panic!("wal recycle failpoint did not fire")
 }
 
+fn child_case_wal_recycle_reopen(db_root: &Path) -> ! {
+    let _ = child_setup_wal_recycle(db_root);
+    panic!("recovery wal recycle failpoint did not fire")
+}
+
 fn child_case_reopen_common(db_root: &Path) -> ! {
     let _ = child_setup_common(db_root);
     panic!("recovery failpoint did not fire")
@@ -1169,6 +1174,7 @@ fn failpoint_child() {
             child_case_wal_recycle_before_dir_sync(&db_root)
         }
         "wal_recycle_done_windows" => child_case_wal_recycle_before_dir_sync(&db_root),
+        "recovery_wal_recycle_done_windows" => child_case_wal_recycle_reopen(&db_root),
         "gc_data_rewrite_before_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_stage_marker" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_data_dir_sync" => child_case_gc_data_before_meta_commit(&db_root),
@@ -1569,6 +1575,81 @@ fn chaos_failpoint_wal_recycle_after_done_commit_before_publish() {
         "done-commit crash must preserve durable recycle frontier",
     );
     assert_visibility_after_reopen(&path, 64, 24);
+}
+
+fn seed_wal_recycle_intent_after_dir_sync(db_root: &Path) {
+    let status = spawn_child(
+        "wal_recycle_done_windows",
+        db_root,
+        "mace_wal_recycle_after_dir_sync_before_done_commit=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "wal-recycle-after-dir-sync-before-done-commit child should abort",
+    );
+    assert_eq!(
+        wal_recycle_stage(db_root, 0),
+        Some(1),
+        "seed crash must leave durable recycle intent",
+    );
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_recovery_wal_recycle_after_dir_sync_before_done_commit() {
+    let path = RandomPath::new();
+    seed_wal_recycle_intent_after_dir_sync(&path);
+
+    let status = spawn_child(
+        "recovery_wal_recycle_done_windows",
+        &path,
+        "mace_wal_recycle_after_dir_sync_before_done_commit=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "recovery wal-recycle-after-dir-sync-before-done-commit child should abort",
+    );
+    assert_eq!(
+        wal_recycle_stage(&path, 0),
+        Some(1),
+        "recovery dir-sync-before-done crash must keep intent stage durable",
+    );
+
+    assert_visibility_after_reopen(&path, 64, 24);
+    assert_eq!(
+        wal_recycle_stage(&path, 0),
+        Some(2),
+        "clean reopen should finish pending recycle after recovery crash",
+    );
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_recovery_wal_recycle_after_done_commit_before_publish() {
+    let path = RandomPath::new();
+    seed_wal_recycle_intent_after_dir_sync(&path);
+
+    let status = spawn_child(
+        "recovery_wal_recycle_done_windows",
+        &path,
+        "mace_wal_recycle_after_done_commit_before_publish=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "recovery wal-recycle-after-done-commit-before-publish child should abort",
+    );
+    assert_eq!(
+        wal_recycle_stage(&path, 0),
+        Some(2),
+        "recovery done-commit crash must persist durable done frontier",
+    );
+
+    assert_visibility_after_reopen(&path, 64, 24);
+    assert_eq!(
+        wal_recycle_stage(&path, 0),
+        Some(2),
+        "clean reopen should keep durable done frontier after recovery crash",
+    );
 }
 
 #[test]

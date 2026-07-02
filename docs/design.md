@@ -9,6 +9,7 @@ It is focused on behavior that affects correctness, crash safety, and operationa
 - High write throughput via append-only WAL + asynchronous checkpoint publish.
 - Snapshot isolation (SI) with MVCC visibility.
 - Key/value separation: large values stored in blob files.
+- Optional per-bucket zstd compression for persisted data/blob records.
 - Crash-safe metadata updates and idempotent startup cleanup.
 
 ## Core architecture
@@ -33,7 +34,8 @@ It is focused on behavior that affects correctness, crash safety, and operationa
 Main buckets:
 
 - `numerics`
-  - global counters and orphan markers (`odf_*`, `obf_*`).
+  - global counters, orphan markers (`odf_*`, `obf_*`), and durable WAL recycle state (`wrc_*`,
+    `None/Intent/Done` per writer group).
 - `bucket_metas`
   - bucket name -> persisted `BucketMeta { bucket_id, options }`.
 - `bucket_frontier`
@@ -84,15 +86,21 @@ Delete (`delete_bucket`):
 
 - logical delete txn removes `bucket_metas` entry, inserts `pending_del`, records obsolete files.
 - runtime context/state are removed first.
-- GC later performs physical cleanup (`pending_del`) and decrements `nr_buckets`.
+- GC later performs physical cleanup (`pending_del`) in bounded batches over
+  `page_table_{bucket_id}`, `data_interval_{bucket_id}`, and `blob_interval_{bucket_id}`.
+- only after all three auxiliary tables are empty does GC finalize the delete, remove the
+  `pending_del` entry, and decrement `nr_buckets`.
 
 Bucket option update (`update_bucket_opt`):
 
 - only allowed while the bucket is not loaded.
 - persisted compatibility-sensitive fields currently include `inline_size` and `split_elems`;
   changing them is rejected with `OpCode::Invalid`.
-- runtime policy fields can be updated in persisted `BucketOptions` and take effect on the next
-  load.
+- runtime policy fields such as `enable_backpressure` and `enable_compression` can be updated in
+  persisted `BucketOptions` and take effect on the next load.
+- compression option flips are mixed-format safe: old files may stay raw while newer
+  checkpoint/rewrite outputs become compressed (or vice versa), because reloc metadata is
+  self-describing per record.
 
 `BucketState` (in-memory only):
 
@@ -133,8 +141,11 @@ Checkpoint cut (`Pool::checkpoint`):
 
 - waits old-generation writers to leave (`EpochInflight::wait_zero`).
 - walks dirty roots and reachable chains (link/sibling/remote hints).
-- carries reachable `addr > snap_addr` mutations back to new hot generation only when they are still
-  present in dirty generations; missing addresses are treated as already persisted/reclaimed.
+- carries every reachable live `addr > snap_addr` back to the new hot generation.
+- carry-over republishes page bytes and retired lineage under the same epoch publication boundary,
+  so readers never observe a live page as absent from both sealed and hot generations.
+- `addr > snap_addr` disappearing from dirty generations is treated as an invariant violation under
+  `extra_check`; only older addresses may be treated as already persisted/reclaimed.
 - computes per-group checkpoint frontier delta.
 - emits data/blob junk candidates for stat apply.
 - normalizes junk candidate streams to unique logical addresses before stat/metadata apply.
@@ -218,6 +229,15 @@ Data/blob file layout:
 - relocation table
 - footer (`DataFooter` / `BlobFooter`)
 
+Per-record payload encoding:
+
+- every relocation entry records `off`, `raw_len`, `compressed_len`, and `crc`.
+- `compressed_len == 0` means the payload is stored raw; otherwise the payload is stored as zstd
+  bytes and decoded back to `raw_len`.
+- checkpoint flush and GC rewrite consult bucket option `enable_compression`; large records are
+  compressed only when the stored payload becomes meaningfully smaller than the raw image.
+- WAL format is unchanged; compression applies only to persisted data/blob files.
+
 Protocol for each new file:
 
 1. stage orphan marker in `numerics` (`odf_*` / `obf_*`).
@@ -230,12 +250,22 @@ Protocol for each new file:
 1. sync built data/blob writers (`sync_data` or `sync` based on `sync_on_write`).
 2. merge bucket frontier with snapshot frontier delta.
 3. begin manifest txn:
-   - apply junk to data/blob stats,
+   - apply junk to old data/blob stats,
    - clear orphan markers for published files,
    - record intervals/stats/map/frontier/numerics in one atomic commit boundary.
 4. commit txn.
 5. clear in-memory unsynced sets.
 6. update WAL checkpoint records per writer group from global frontier lower bound (scan/recycle hint).
+
+Retired-stat race closure:
+
+- ordinary fully-obsolete reclaim marks retired old-file stat keys after the delete metadata commit
+  and before in-memory stat removal.
+- checkpoint publish snapshots those retired keys at bucket scope before computing old-file junk
+  deltas.
+- old-file stat deltas are written back with conditional metadata updates; if GC already retired the
+  stat key, publish skips recreating it.
+- the retired-key snapshot is cleared only after the enclosing manifest txn commits.
 
 Global frontier lower bound (`Manifest::global_frontier_lower_bound`):
 
@@ -290,6 +320,10 @@ Drop of uncommitted `TxnKV`:
 `TxnView`:
 
 - allocates from `CCPool`, holds snapshot `start_ts`, no WAL writes.
+- the first view in a quiescent epoch uses a handoff state so its `start_ts` is published before
+  `nr_view` becomes visible as nonzero.
+- the last view drop keeps the previous floor cached until the next `0 -> 1` handoff refresh,
+  preventing stale floor regression during view-epoch handoff.
 
 Visibility (`ConcurrencyControl::is_visible_to`):
 
@@ -330,9 +364,13 @@ Startup sequence:
 
 1. `ManifestBuilder::load` loads metadata caches and counters.
 2. `clean_orphans` scans orphan markers (`odf_*`, `obf_*`), removes stray files, deletes markers.
-3. WAL phase1 scans wal files per group and finds latest valid checkpoint as conservative scan start.
-4. context is created with per-group bootstrap info.
-5. phase2 runs `analyze -> redo`, while rebuilding abort outcomes and pending abort-clean state.
+3. finish any durable pending WAL recycle intent from `wrc_*` before WAL bootstrap scan.
+4. WAL phase1 scans wal files per group and finds latest valid checkpoint as conservative scan
+   start, using durable `wrc_*::Done` state as the oldest retained WAL frontier when earlier files
+   are already recycled.
+5. context is created with per-group bootstrap info.
+6. phase2 runs `analyze -> redo -> drain_abort_clean_during_recovery`, while rebuilding abort
+   outcomes and pending abort-clean state.
 
 Analyze stage:
 
@@ -349,6 +387,8 @@ Analyze stage:
 Boundary split (important semantic change):
 
 - `WalCheckpoint[group]` is a scan-start optimization and WAL recycle aid.
+- `WalRecycleState[group]` keeps the durable recycle frontier when old WAL files were already
+  removed before the current boot.
 - `BucketDurableFrontier[bucket][group]` is the correctness gate for "already durable or not".
 - therefore "one WAL record before checkpoint and another after checkpoint" can still exist, but only affects scan cost, not replay correctness.
 
@@ -361,6 +401,7 @@ Redo stage:
 Post recovery:
 
 - advances `oracle`/`wmk_oldest`.
+- finishes any reconstructed abort-clean work before open returns.
 - evicts loaded recovery bucket contexts.
 
 ## GC, scavenge, and vacuum
@@ -369,7 +410,7 @@ GC thread (`gc_timeout` periodic + manual trigger):
 
 1. `process_data` (victim selection + rewrite)
 2. `process_blob` (victim selection + rewrite)
-3. `process_pending_buckets` (physical cleanup for `pending_del`)
+3. `process_pending_buckets` (bounded physical cleanup for `pending_del`)
 4. `scavenge` (bounded in-memory page compaction)
 5. `delete_files` (idempotent obsolete file unlink + metadata ack)
 
@@ -394,6 +435,7 @@ Abort-clean:
 - removes aborted versions by page rewrite/compaction rather than inverse-value undo.
 - any bucket whose pages were touched by abort-clean must pass a durability barrier before the
   abort-clean task can retire.
+- recovery drains reconstructed abort-clean tasks before runtime GC starts.
 - task retirement is split:
   - `Pending`: page-touching cleanup may still occur, so the bucket is pinned against unload.
   - `WaitingQuiesce`: page cleanup is already durable; only post-EBR retirement bookkeeping remains.
@@ -404,6 +446,8 @@ Rewrite crash safety:
 
 - rewrite stages orphan marker before file build.
 - metadata txn publishes new intervals/stats + delete intents + clears marker.
+- rewrite-owned victim deletion does not publish retired-stat markers; only ordinary fully-obsolete
+  reclaim does.
 - old files are then physically deleted through obsolete-file pipeline.
 
 Scavenge:
@@ -450,9 +494,13 @@ Low-frequency recovery/GC metrics are reported without sampling.
 
 - Data/blob files referenced by metadata must be written before metadata commit.
 - Orphan marker stage/clear is the only startup orphan cleanup source of truth.
+- Durable WAL recycle intent/done state lives in `wrc_*` and must be completed before WAL bootstrap
+  scanning.
 - Checkpoint epoch cut must atomically rotate hot/sealed generation handles.
 - Writers must not straddle checkpoint cut (`epochs.gate` + inflight wait-zero).
 - Sealed generations must be uniquely owned when checkpoint finishes.
+- Live `addr > snap_addr` carry-over must move page bytes and retired lineage together; readers must
+  not observe a live page as neither hot nor sealed.
 - Reachable addresses (including sibling/remote-referenced old pages) must stay readable from memory
   until they are either durably published or proven unreachable by lifecycle closure.
 - History traversal must be region-bounded for each key (`head_page`, `start_slot`, `count`) and must
@@ -471,6 +519,8 @@ Low-frequency recovery/GC metrics are reported without sampling.
   remain invisible until abort-clean retires them.
 - Abort-clean retirement requires page durability closure before dropping abort outcome state.
 - Unload must not succeed while bucket-local abort-clean is still in `Pending`.
+- The first visible `TxnView` of a quiescent epoch must publish its `start_ts` before active-view
+  count becomes nonzero.
 - Bucket delete is two-phase (`pending_del`), and `nr_buckets` decrements only after physical cleanup.
 - WAL recycling must stay below min(active-txn boundary, last checkpoint boundary).
 - WAL recycling must also stay below any file pinned by pending abort-clean tasks.
