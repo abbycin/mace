@@ -1,3 +1,4 @@
+use crate::{must_ok, must_true};
 use std::cell::RefCell;
 use std::cmp::max;
 use std::collections::{BTreeMap, HashSet};
@@ -72,7 +73,10 @@ impl Recovery {
                 .remove(&txid)
                 .unwrap_or(tail.pos.file_id)
                 .min(tail.pos.file_id);
-            store.context.add_aborted(txid);
+            store
+                .context
+                .group(tail.group_id as usize)
+                .recover_retained_abort(txid);
             store.context.enqueue_abort_clean(
                 txid,
                 tail.bucket_id,
@@ -81,7 +85,6 @@ impl Recovery {
                 pin_file_id,
             );
         } else {
-            store.context.del_aborted(txid);
             store.context.remove_abort_clean(txid);
             self.pin_file.remove(&txid);
         }
@@ -92,7 +95,6 @@ impl Recovery {
         self.committed_txns.insert(txid);
         self.last_update.remove(&txid);
         self.pin_file.remove(&txid);
-        store.context.del_aborted(txid);
         store.context.remove_abort_clean(txid);
     }
 
@@ -109,11 +111,8 @@ impl Recovery {
             .get(&bucket_id)
             .map(|m| m.clone())
         {
-            assert_eq!(meta.id, bucket_id);
-            let bucket_ctx = store
-                .manifest
-                .load_bucket_context(bucket_id)
-                .expect("must exist");
+            must_true!(eq meta.id, bucket_id);
+            let bucket_ctx = must_ok!(store.manifest.load_bucket_context(bucket_id), "must exist");
             let tree = Tree::new(store.clone(), ROOT_PID, bucket_ctx);
             if let Some((evicted_id, evicted_tree)) =
                 self.trees
@@ -143,14 +142,18 @@ impl Recovery {
         store.manifest.buckets.unload_all();
     }
 
+    pub(crate) fn abort(&self, store: MutRef<Store>) {
+        self.evict_all(store);
+    }
+
     pub(crate) fn phase1(
         &mut self,
         manifest: Handle<crate::meta::Manifest>,
-        numerics: Arc<crate::meta::Numerics>,
+        sequences: Arc<crate::meta::Sequences>,
     ) -> Result<(Vec<GroupBoot>, Handle<Context>), OpCode> {
         self.finish_pending_wal_recycle(manifest)?;
         let wal_boot = self.load_wal_boot(manifest)?;
-        let ctx = Handle::new(Context::new(self.opt.clone(), numerics, &wal_boot));
+        let ctx = Handle::new(Context::new(self.opt.clone(), sequences, &wal_boot));
         Ok((wal_boot, ctx))
     }
 
@@ -169,7 +172,7 @@ impl Recovery {
             value: wal_boot.len() as u64,
         });
 
-        let mut oracle = store.manifest.numerics.oracle.load(Relaxed);
+        let mut oracle = store.manifest.sequences.oracle.load(Relaxed);
         let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
 
         for (group_id, boot) in wal_boot.iter().enumerate() {
@@ -229,8 +232,8 @@ impl Recovery {
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash("mace_recovery_abort_clean_after_drain_before_start");
         log::trace!("oracle {oracle}");
-        store.manifest.numerics.oracle.store(oracle, Relaxed);
-        store.manifest.numerics.wmk_oldest.store(oracle, Relaxed);
+        store.manifest.sequences.oracle.store(oracle, Relaxed);
+        store.context.init_safe_exclusive(oracle);
         self.evict_all(store);
         self.opt.observer.histogram(
             HistogramMetric::RecoveryPhase2Micros,
@@ -259,7 +262,12 @@ impl Recovery {
         block: &mut Block,
         store: MutRef<Store>,
     ) -> Result<bool, OpCode> {
-        assert!((loc.len as usize) <= block.len());
+        must_true!(
+            (loc.len as usize) <= block.len(),
+            "loc.len {}, block.len {}",
+            loc.len,
+            block.len()
+        );
         f.read(block.mut_slice(0, loc.len as usize), loc.pos.offset)?;
 
         let u = ptr_to::<WalUpdate>(block.data());
@@ -270,7 +278,7 @@ impl Recovery {
 
         let ver = Ver::new(u.txid, u.cmd_id);
 
-        debug_assert!(!self.dirty_table.contains_key(&ver));
+        must_true!(!self.dirty_table.contains_key(&ver));
 
         // correctness gate: if this WAL record is already covered by bucket durable frontier,
         // it has been materialized in persisted page image and must not enter redo.
@@ -317,7 +325,7 @@ impl Recovery {
 
         for i in file_id..=latest_file_id {
             let path = self.opt.wal_file(group_id, i);
-            if !path.exists() {
+            if !self.opt.fs.try_exists(&path)? {
                 if i < oldest_file_id {
                     continue;
                 }
@@ -326,7 +334,10 @@ impl Recovery {
                 );
                 return Err(OpCode::Corruption);
             }
-            let mut f = File::options().read(true).write(true).open(&path)?;
+            let mut f = File::options()
+                .read(true)
+                .write(true)
+                .open(self.opt.fs.as_ref(), &path)?;
             let end = f.size()?;
             if end == 0 {
                 continue;
@@ -350,7 +361,7 @@ impl Recovery {
                     pos = start_pos;
                     break;
                 };
-                debug_assert!(sz < Self::INIT_BLOCK_SIZE);
+                must_true!(sz < Self::INIT_BLOCK_SIZE);
 
                 log::trace!("pos {pos} sz {sz} {et:?}");
                 f.read(block.mut_slice(0, sz), pos)?;
@@ -484,10 +495,10 @@ impl Recovery {
             Ok(Some(f.clone()))
         } else {
             let path = opt.wal_file(group_id as u8, seq);
-            if !path.exists() {
+            if !opt.fs.try_exists(&path)? {
                 return Ok(None);
             }
-            let f = Rc::new(File::options().read(true).open(&path)?);
+            let f = Rc::new(File::options().read(true).open(opt.fs.as_ref(), &path)?);
             cache.add(cap, id, f.clone());
             Ok(Some(f))
         }
@@ -508,7 +519,7 @@ impl Recovery {
             let Some(f) = Self::get_file(&cache, cap, &self.opt, group_id, pos.file_id)? else {
                 break;
             };
-            assert!(len as usize <= block.len());
+            must_true!(len as usize <= block.len());
             f.read(block.mut_slice(0, len as usize), pos.offset)?;
             let c = ptr_to::<WalUpdate>(block.data());
             if !c.is_intact() {
@@ -548,7 +559,7 @@ impl Recovery {
         Ok(applied)
     }
 
-    fn wal_file_range(&self, group: u8) -> Option<(u64, u64)> {
+    fn wal_file_range(&self, group: u8) -> Result<Option<(u64, u64)>, OpCode> {
         let mut min_id = u64::MAX;
         let mut max_id = 0;
         let mut found = false;
@@ -560,9 +571,10 @@ impl Recovery {
             Options::SEP
         );
 
-        let iter = std::fs::read_dir(self.opt.log_root()).ok()?;
-        for entry in iter.flatten() {
-            let name = entry.file_name();
+        for entry in self.opt.fs.read_dir(&self.opt.log_root())? {
+            let Some(name) = entry.file_name() else {
+                continue;
+            };
             let Some(raw) = name.to_str() else {
                 continue;
             };
@@ -577,7 +589,7 @@ impl Recovery {
             max_id = max_id.max(id);
         }
 
-        if found { Some((min_id, max_id)) } else { None }
+        Ok(if found { Some((min_id, max_id)) } else { None })
     }
 
     fn load_wal_boot(
@@ -588,7 +600,7 @@ impl Recovery {
         for group in 0..self.opt.concurrent_write {
             let group_id = group;
             let recycle_state = manifest.load_wal_recycle_state(group_id);
-            if let Some((min_id, max_id)) = self.wal_file_range(group_id) {
+            if let Some((min_id, max_id)) = self.wal_file_range(group_id)? {
                 let oldest_id = if recycle_state.is_done() {
                     recycle_state.oldest_id()
                 } else {
@@ -659,14 +671,18 @@ impl Recovery {
     ) -> Result<(), OpCode> {
         for seq in intent.from_file_id..intent.to_file_id {
             let path = opt.wal_file(intent.group_id, seq);
-            if !path.exists() {
+            if !opt.fs.try_exists(&path)? {
                 continue;
             }
             if opt.keep_stable_wal_file {
                 let to = opt.wal_backup(intent.group_id, seq);
-                std::fs::rename(&path, &to)?;
+                match opt.fs.rename(&path, &to) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                }
             } else {
-                std::fs::remove_file(&path)?;
+                opt.fs.remove_file_if_exists(&path)?;
             }
         }
         Ok(())
@@ -681,10 +697,13 @@ impl Recovery {
         let block = Block::alloc(Self::INIT_BLOCK_SIZE);
         for file_id in (min_file..=max_file).rev() {
             let path = self.opt.wal_file(group_id, file_id);
-            if !path.exists() {
+            if !self.opt.fs.try_exists(&path)? {
                 continue;
             }
-            let file = File::options().read(true).write(true).open(&path)?;
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .open(self.opt.fs.as_ref(), &path)?;
             let end = file.size()?;
             if end == 0 {
                 continue;
@@ -748,5 +767,167 @@ impl Recovery {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::ErrorKind,
+        rc::Rc,
+        sync::{Arc, mpsc::channel},
+    };
+
+    use crate::{
+        BucketOptions, Mace, RandomPath, Store,
+        io::testfs::{InjectOp, InjectedFileSystem},
+        map::adapter::{ManifestCheckpointObserver, ManifestDataReader},
+        meta::WalRecycleIntent,
+        meta::builder::ManifestBuilder,
+        utils::lru::Lru,
+    };
+
+    use super::Recovery;
+    use crate::utils::options::{Options, ParsedOptions};
+
+    fn new_opt() -> (RandomPath, Arc<InjectedFileSystem>, Arc<ParsedOptions>) {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 1;
+        let fs = Arc::new(InjectedFileSystem::new());
+        opt.fs = fs.clone();
+        let parsed = Arc::new(opt.validate().expect("recovery options must validate"));
+        (root, fs, parsed)
+    }
+
+    #[test]
+    fn wal_file_range_surfaces_read_dir_error() {
+        let (_root, fs, opt) = new_opt();
+        fs.fail_once(
+            InjectOp::ReadDir,
+            opt.log_root(),
+            ErrorKind::PermissionDenied,
+        );
+        let recovery = Recovery::new(opt);
+        let err = recovery
+            .wal_file_range(0)
+            .expect_err("wal_file_range must fail");
+        assert_eq!(err, crate::OpCode::IoError);
+    }
+
+    #[test]
+    fn get_file_surfaces_open_error() {
+        let (_root, fs, opt) = new_opt();
+        let path = opt.wal_file(0, 0);
+        std::fs::write(&path, b"x").expect("wal seed write must succeed");
+        fs.fail_once(InjectOp::Open, &path, ErrorKind::PermissionDenied);
+        let cache = Lru::<(u32, u64), Rc<crate::io::File>>::new();
+        let err = match Recovery::get_file(&cache, 4, &opt, 0, 0) {
+            Err(err) => err,
+            Ok(_) => panic!("get_file must fail"),
+        };
+        assert_eq!(err, crate::OpCode::IoError);
+    }
+
+    #[test]
+    fn remove_wal_prefix_surfaces_rename_error() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 1;
+        opt.keep_stable_wal_file = true;
+        let fs = Arc::new(InjectedFileSystem::new());
+        opt.fs = fs.clone();
+        let parsed = Arc::new(opt.validate().expect("recovery options must validate"));
+        let path = parsed.wal_file(0, 0);
+        std::fs::write(&path, b"x").expect("wal seed write must succeed");
+        let to = parsed.wal_backup(0, 0);
+        fs.fail_once(InjectOp::Rename, &path, ErrorKind::PermissionDenied);
+        let err = Recovery::remove_wal_prefix(
+            &parsed,
+            WalRecycleIntent {
+                group_id: 0,
+                from_file_id: 0,
+                to_file_id: 1,
+            },
+        )
+        .expect_err("remove_wal_prefix must fail");
+        assert_eq!(err, crate::OpCode::IoError);
+        assert!(!to.exists(), "rename failure must not create backup file");
+    }
+
+    #[test]
+    fn remove_wal_prefix_surfaces_remove_error() {
+        let (_root, fs, opt) = new_opt();
+        let path = opt.wal_file(0, 0);
+        std::fs::write(&path, b"x").expect("wal seed write must succeed");
+        fs.fail_once(InjectOp::RemoveFile, &path, ErrorKind::PermissionDenied);
+        let err = Recovery::remove_wal_prefix(
+            &opt,
+            WalRecycleIntent {
+                group_id: 0,
+                from_file_id: 0,
+                to_file_id: 1,
+            },
+        )
+        .expect_err("remove_wal_prefix must fail");
+        assert_eq!(err, crate::OpCode::IoError);
+    }
+
+    #[test]
+    fn abort_unloads_recovery_loaded_buckets_before_store_abort() {
+        let root = RandomPath::tmp();
+        let opt = crate::Options::new(&*root);
+        let mace = Mace::new(opt.clone().validate().expect("initial open must validate"))
+            .expect("initial open must succeed");
+        mace.new_bucket("bucket", BucketOptions::default())
+            .expect("create bucket must succeed");
+        drop(mace);
+
+        let opt = Arc::new(opt.validate().expect("recovery options must validate"));
+        let (tx, _erx) = channel();
+        let (_etx, rx) = channel();
+        let mut builder = ManifestBuilder::new_with_channels(opt.clone(), tx, rx);
+        let persisted = builder.load().expect("manifest load must succeed");
+        let manifest = crate::utils::Handle::new(builder.finish());
+        if let Some(persisted) = persisted {
+            manifest
+                .store_persisted_options(&persisted)
+                .expect("options writeback must succeed");
+        }
+
+        let bucket_id = manifest
+            .bucket_metas
+            .get("bucket")
+            .expect("bucket meta must exist")
+            .id;
+        let mut recovery = Recovery::new(opt.clone());
+        let (_wal_boot, ctx) = recovery
+            .phase1(manifest, manifest.sequences.clone())
+            .expect("phase1 must succeed");
+        let observer = Arc::new(ManifestCheckpointObserver::new(manifest, ctx));
+        let reader = Arc::new(ManifestDataReader::new(manifest));
+        manifest.set_context(ctx, reader, observer);
+        let store = crate::utils::MutRef::new(Store::new(opt, manifest, ctx));
+
+        assert!(
+            recovery.get_tree(bucket_id, store.clone()).is_some(),
+            "recovery must be able to load the persisted bucket"
+        );
+        assert!(
+            !store.manifest.buckets.buckets.is_empty(),
+            "loading the tree must publish a bucket context"
+        );
+
+        recovery.abort(store.clone());
+        assert!(
+            recovery.loaded_buckets.borrow().is_empty(),
+            "recovery abort must clear the loaded bucket set"
+        );
+        assert!(
+            store.manifest.buckets.buckets.is_empty(),
+            "recovery abort must unload bucket contexts before store abort tears down flush/context"
+        );
+
+        store.raw_ref().abort();
     }
 }

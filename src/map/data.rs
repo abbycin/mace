@@ -1,13 +1,15 @@
-use crate::io::{File, GatherIO};
+use crate::io::{File, FileSystem, GatherIO};
 use crate::map::buffer::{JunkAddrSlot, JunkSlot, PageSlot, PidSlot};
 use crate::map::flow::CheckpointFlow;
 use crate::map::table::PageMap;
+use crate::must_true;
+use crate::{must_exist, must_ok};
 use crc32c::Crc32cHasher;
 use dashmap::{DashMap, DashSet};
 use parking_lot::{Condvar, Mutex, RwLock};
 
-use crate::map::{IFooter, JunksMap, PagesMap};
-use crate::meta::{BlobStatInner, DataStatInner, MemBlobStat, MemDataStat, PageTable};
+use crate::map::{JunksMap, PagesMap};
+use crate::meta::{FileKind, MemStat, PageTable, StatInner};
 use crate::types::header::{NodeType, TagFlag, TagKind};
 use crate::types::refbox::{BaseView, BoxRef, RemoteView};
 use crate::types::traits::{IAsSlice, IHeader};
@@ -164,6 +166,7 @@ pub(crate) struct CheckpointTask {
     pub(crate) unmap_pid: Arc<PidSet>,
     pub(crate) epoch_inflight: Arc<EpochInflight>,
     pub(crate) pages: Arc<PagesMap>,
+    pub(crate) retired_pages: Arc<PagesMap>,
     pub(crate) sealed_bytes: Arc<AtomicUsize>,
     pub(crate) sealed_bytes_init: usize,
     pub(crate) retired: Arc<JunksMap>,
@@ -230,7 +233,7 @@ impl CheckpointTask {
             if let Some((_, page)) = self.pages.remove(&addr) {
                 let sz = page.header().total_size as usize;
                 let old = self.sealed_bytes.fetch_sub(sz, AcqRel);
-                assert!(
+                must_true!(
                     old >= sz,
                     "sealed bytes underflow while releasing persisted addr {addr}: old={old}, size={sz}"
                 );
@@ -256,7 +259,7 @@ impl CheckpointTask {
             if let Some((_, page)) = self.pages.remove(&addr) {
                 let sz = page.header().total_size as usize;
                 let old = self.sealed_bytes.fetch_sub(sz, AcqRel);
-                assert!(
+                must_true!(
                     old >= sz,
                     "sealed bytes underflow while carrying over addr {addr}: old={old}, size={sz}"
                 );
@@ -397,6 +400,12 @@ impl CheckpointTask {
                 (x.value().clone(), true)
             } else if let Some(x) = hot_pages.get(&addr) {
                 (x.value().clone(), false)
+            } else if addr > self.snap_addr
+                && let Some(x) = self.retired_pages.get(&addr)
+            {
+                // same-checkpoint writers can retire structural junk into the temporary fallback
+                // map before the sealed snapshot finishes walking stale edges above snap_addr
+                (x.value().clone(), true)
             } else {
                 #[cfg(feature = "extra_check")]
                 assert!(
@@ -422,7 +431,7 @@ impl CheckpointTask {
                         let base = b.view().as_base();
                         if from_sealed && let Some(v) = self.retired.get(&h.addr) {
                             if !v.addrs.is_empty() {
-                                assert!(
+                                must_true!(
                                     !v.frontier.is_empty(),
                                     "retired chain for base {} missing frontier",
                                     h.addr
@@ -474,7 +483,7 @@ impl CheckpointTask {
 
             if !chain_frontier {
                 let pos = h.group as usize;
-                debug_assert!(pos < start_chkpt_lsn.len());
+                must_true!(pos < start_chkpt_lsn.len());
                 chkpt_lsn[pos] = chkpt_lsn[pos].max(h.lsn);
             }
             pages.push(b);
@@ -516,7 +525,7 @@ impl CheckpointTask {
 
     pub(crate) fn done(self, snapshot: Snapshot) {
         let bytes_left = self.sealed_bytes.swap(0, AcqRel);
-        assert!(
+        must_true!(
             bytes_left <= self.sealed_bytes_init,
             "sealed bytes increased during checkpoint: init={} now={}",
             self.sealed_bytes_init,
@@ -564,75 +573,72 @@ impl CheckpointTask {
 
 /// the layout of a flushed batch is:
 /// ```text
-/// +-------------+-----------+-------------+--------+
-/// | data frames | intervals | relocations | footer |
-/// +-------------+-----------+-------------+--------+
+/// +-------------+-----------+-------------+---------+
+/// | data frames | intervals | relocations | trailer |
+/// +-------------+-----------+-------------+---------+
 /// ```
-/// write file from frames to footer while read file from footer to relocations
+/// write file from frames to trailer while read file from trailer to relocations
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileVersion(u16);
+
+impl FileVersion {
+    pub(crate) const V1: Self = Self(1);
+    pub(crate) const CURRENT: Self = Self::V1;
+
+    pub(crate) const fn raw(self) -> u16 {
+        self.0
+    }
+
+    pub(crate) const fn can_reuse_to(self, target: Self) -> bool {
+        matches!((self.0, target.0), (1, 1))
+    }
+
+    fn from_raw(raw: u16) -> Option<Self> {
+        match raw {
+            x if x == Self::V1.raw() => Some(Self::V1),
+            _ => None,
+        }
+    }
+}
+
 #[repr(C, packed(1))]
-#[derive(Default, Debug)]
-pub(crate) struct DataFooter {
-    /// monotonically increasing, it's file_id on flush, average of file_id on compaction
-    pub(crate) up2: u64,
-    /// item's relocation table
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct FileFooter {
+    pub(crate) version: u16,
+    pub(crate) padding: [u8; 6],
     pub(crate) nr_reloc: u32,
     pub(crate) nr_intervals: u32,
     pub(crate) reloc_crc: u32,
     pub(crate) interval_crc: u32,
 }
 
-impl IAsSlice for DataFooter {}
+impl IAsSlice for FileFooter {}
 
-impl IFooter for DataFooter {
-    fn interval_crc(&self) -> u32 {
-        self.interval_crc
+impl FileFooter {
+    const VERSION: u16 = FileVersion::CURRENT.raw();
+
+    pub(crate) const fn new(
+        nr_reloc: u32,
+        nr_intervals: u32,
+        reloc_crc: u32,
+        interval_crc: u32,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            padding: [0; 6],
+            nr_reloc,
+            nr_intervals,
+            reloc_crc,
+            interval_crc,
+        }
     }
 
-    fn reloc_crc(&self) -> u32 {
-        self.reloc_crc
-    }
-
-    fn nr_interval(&self) -> usize {
-        self.nr_intervals as usize
-    }
-
-    fn nr_reloc(&self) -> usize {
-        self.nr_reloc as usize
-    }
-}
-
-/// the layout of a blob file is:
-/// ```text
-/// +-------+-----------+-------------+--------+
-/// | value | intervals | relocations | footer |
-/// +-------+-----------+-------------+--------+
-/// ```
-#[repr(C, packed(1))]
-#[derive(Default, Debug)]
-pub(crate) struct BlobFooter {
-    pub(crate) nr_reloc: u32,
-    pub(crate) nr_intervals: u32,
-    pub(crate) reloc_crc: u32,
-    pub(crate) interval_crc: u32,
-}
-
-impl IAsSlice for BlobFooter {}
-
-impl IFooter for BlobFooter {
-    fn interval_crc(&self) -> u32 {
-        self.interval_crc
-    }
-
-    fn reloc_crc(&self) -> u32 {
-        self.reloc_crc
-    }
-
-    fn nr_interval(&self) -> usize {
-        self.nr_intervals as usize
-    }
-
-    fn nr_reloc(&self) -> usize {
-        self.nr_reloc as usize
+    fn is_supported_version(&self, version: FileVersion) -> bool {
+        match version {
+            FileVersion::V1 => self.padding.iter().all(|x| *x == 0),
+            _ => false,
+        }
     }
 }
 
@@ -643,36 +649,20 @@ pub(crate) struct FileBuilder {
     bucket_id: u64,
     enable_compression: bool,
     compressors: Arc<CompressorPool>,
-    data_active_size: usize,
-    blob_active_size: usize,
-    data: Vec<BoxRef>,
-    blobs: Vec<BoxRef>,
+    fs: Arc<dyn FileSystem>,
+    files: [FlushFrames; 2],
 }
 
-pub(crate) struct BuiltDataFile {
+pub(crate) struct BuiltFile {
     pub(crate) file_id: u64,
     pub(crate) interval: Interval,
     pub(crate) writer: GatherWriter,
-    pub(crate) stat: MemDataStat,
+    pub(crate) stat: MemStat,
     pub(crate) addrs: Vec<u64>,
 }
 
-pub(crate) struct BuiltBlobFile {
-    pub(crate) file_id: u64,
-    pub(crate) interval: Interval,
-    pub(crate) writer: GatherWriter,
-    pub(crate) stat: MemBlobStat,
-    pub(crate) addrs: Vec<u64>,
-}
-
-struct DataChunkBuild {
-    built: BuiltDataFile,
-    consumed: usize,
-    resident_size: usize,
-}
-
-struct BlobChunkBuild {
-    built: BuiltBlobFile,
+struct ChunkBuild {
+    built: BuiltFile,
     consumed: usize,
     resident_size: usize,
 }
@@ -682,6 +672,27 @@ struct RawRecordMeta {
     crc: u32,
 }
 
+#[derive(Clone)]
+struct PersistedHead {
+    len: usize,
+    bytes: [u8; BoxRef::MAX_PERSISTED_HEAD_LEN],
+}
+
+impl PersistedHead {
+    fn new(src: &[u8]) -> Self {
+        let mut bytes = [0u8; BoxRef::MAX_PERSISTED_HEAD_LEN];
+        bytes[..src.len()].copy_from_slice(src);
+        Self {
+            len: src.len(),
+            bytes,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 struct ChunkRecordMeta {
     raw_len: u32,
     compressed_len: u32,
@@ -689,7 +700,27 @@ struct ChunkRecordMeta {
     crc: u32,
 }
 
+#[derive(Default)]
+struct FlushFrames {
+    active_size: usize,
+    frames: Vec<BoxRef>,
+}
+
 impl FileBuilder {
+    fn make_stat(&self, file_id: u64, tick: u64, active_size: usize, nr_reloc: u32) -> MemStat {
+        let inner = StatInner {
+            file_id,
+            up1: tick,
+            up2: tick,
+            active_elems: nr_reloc,
+            total_elems: nr_reloc,
+            active_size,
+            total_size: active_size,
+            bucket_id: self.bucket_id,
+        };
+        MemStat::from_parts(inner, Some(BitMap::new(nr_reloc)))
+    }
+
     fn update_addr(ivl: &mut Interval, addr: u64) {
         ivl.lo = ivl.lo.min(addr);
         ivl.hi = ivl.hi.max(addr);
@@ -699,15 +730,14 @@ impl FileBuilder {
         bucket_id: u64,
         enable_compression: bool,
         compressors: Arc<CompressorPool>,
+        fs: Arc<dyn FileSystem>,
     ) -> Self {
         Self {
             bucket_id,
             enable_compression,
             compressors,
-            data_active_size: 0,
-            blob_active_size: 0,
-            data: Vec::new(),
-            blobs: Vec::new(),
+            fs,
+            files: [FlushFrames::default(), FlushFrames::default()],
         }
     }
 
@@ -717,37 +747,42 @@ impl FileBuilder {
         match h.flag {
             TagFlag::Normal | TagFlag::Sibling => {
                 // all blob were allocated by RemoteView
-                if h.kind == TagKind::Remote {
-                    self.blob_active_size += f.dump_len();
-                    self.blobs.push(f);
+                let kind = if h.kind == TagKind::Remote {
+                    FileKind::Blob
                 } else {
-                    self.data_active_size += f.dump_len();
-                    self.data.push(f);
-                }
+                    FileKind::Data
+                };
+                let state = self.frames_mut(kind);
+                state.active_size += f.dump_len();
+                state.frames.push(f);
             }
         }
     }
 
-    pub(crate) fn has_blob(&self) -> bool {
-        !self.blobs.is_empty()
-    }
-
-    pub(crate) fn has_data(&self) -> bool {
-        !self.data.is_empty()
+    pub(crate) fn has_kind(&self, kind: FileKind) -> bool {
+        !self.frames(kind).frames.is_empty()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.data.is_empty() && self.blobs.is_empty()
+        self.files.iter().all(|x| x.frames.is_empty())
     }
 
     pub(crate) fn io_bytes(&self) -> u64 {
-        (self.data_active_size + self.blob_active_size) as u64
+        self.files.iter().map(|x| x.active_size as u64).sum()
+    }
+
+    fn frames(&self, kind: FileKind) -> &FlushFrames {
+        &self.files[kind.slot()]
+    }
+
+    fn frames_mut(&mut self, kind: FileKind) -> &mut FlushFrames {
+        &mut self.files[kind.slot()]
     }
 
     fn ensure_iov_room(
         need: usize,
         queued_iov: &mut usize,
-        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+        hdr_batch: &mut Vec<PersistedHead>,
         w: &mut GatherWriter,
     ) {
         if *queued_iov + need > GatherWriter::DEFAULT_IOVCNT {
@@ -762,18 +797,16 @@ impl FileBuilder {
         tail: Option<&[u8]>,
         w: &mut GatherWriter,
         queued_iov: &mut usize,
-        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+        hdr_batch: &mut Vec<PersistedHead>,
     ) {
+        let need = 1 + usize::from(tail.is_some());
+        Self::ensure_iov_room(need, queued_iov, hdr_batch, w);
+        hdr_batch.push(PersistedHead::new(head));
+        let hdr = must_exist!(hdr_batch.last(), "queued persisted head must exist");
+        w.queue(hdr.as_slice());
+        *queued_iov += 1;
         if let Some(body) = tail {
-            Self::ensure_iov_room(2, queued_iov, hdr_batch, w);
-            hdr_batch.push(head.try_into().expect("dump header must match fixed len"));
-            let hdr = hdr_batch.last().expect("queued dump header must exist");
-            w.queue(hdr);
             w.queue(body);
-            *queued_iov += 2;
-        } else {
-            Self::ensure_iov_room(1, queued_iov, hdr_batch, w);
-            w.queue(head);
             *queued_iov += 1;
         }
     }
@@ -782,18 +815,20 @@ impl FileBuilder {
         f: &BoxRef,
         w: &mut GatherWriter,
         queued_iov: &mut usize,
-        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+        hdr_batch: &mut Vec<PersistedHead>,
     ) {
-        f.with_dump_parts(|head, tail| Self::queue_raw_parts(head, tail, w, queued_iov, hdr_batch));
+        f.with_persisted_parts(|head, tail| {
+            Self::queue_raw_parts(head, tail, w, queued_iov, hdr_batch)
+        });
     }
 
     fn queue_raw_record_with_meta(
         f: &BoxRef,
         w: &mut GatherWriter,
         queued_iov: &mut usize,
-        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+        hdr_batch: &mut Vec<PersistedHead>,
     ) -> RawRecordMeta {
-        f.with_dump_parts(|head, tail| {
+        f.with_persisted_parts(|head, tail| {
             let mut crc = Crc32cHasher::default();
             crc.write(head);
             if let Some(body) = tail {
@@ -816,7 +851,7 @@ impl FileBuilder {
         relocs: &mut Vec<u8>,
         addrs: &mut Vec<u64>,
         queued_iov: &mut usize,
-        hdr_batch: &mut Vec<[u8; BoxRef::DUMP_HDR_LEN]>,
+        hdr_batch: &mut Vec<PersistedHead>,
     ) -> (usize, usize, usize, Interval) {
         #[cfg(feature = "extra_check")]
         for w in frames.windows(2) {
@@ -850,11 +885,9 @@ impl FileBuilder {
                 }
             } else {
                 let codec = compressor.get_or_insert_with(|| {
-                    self.compressors
-                        .borrow()
-                        .expect("record encode must succeed")
+                    must_ok!(self.compressors.borrow(), "record encode must succeed")
                 });
-                let data = codec.encode_box(f).expect("record encode must succeed");
+                let data = must_ok!(codec.encode_box(f), "record encode must succeed");
                 let meta = ChunkRecordMeta {
                     raw_len: data.raw_len,
                     compressed_len: data.compressed_len,
@@ -871,7 +904,7 @@ impl FileBuilder {
 
             let meta = if raw_path {
                 let raw = Self::queue_raw_record_with_meta(f, w, queued_iov, hdr_batch);
-                debug_assert_eq!(raw.raw_len as usize, raw_len);
+                must_true!(eq raw.raw_len as usize, raw_len);
                 ChunkRecordMeta {
                     raw_len: raw.raw_len,
                     compressed_len: 0,
@@ -879,8 +912,10 @@ impl FileBuilder {
                     crc: raw.crc,
                 }
             } else {
-                let encoded =
-                    encoded.expect("encoded payload must exist after compressed planning");
+                let encoded = must_exist!(
+                    encoded,
+                    "encoded payload must exist after compressed planning"
+                );
                 let dump_len = encoded.active_len();
                 let raw_len = encoded.raw_len;
                 let stored_len = encoded.compressed_len;
@@ -923,24 +958,25 @@ impl FileBuilder {
             idx += 1;
         }
 
-        debug_assert!(consumed > 0);
+        must_true!(consumed > 0);
         (consumed, active_size, resident_size, interval)
     }
 
-    fn build_data_head_chunk(
+    fn build_head_chunk(
         &self,
         frames: &[BoxRef],
         max_file_size: usize,
         file_id: u64,
+        tick: u64,
         path: PathBuf,
-    ) -> DataChunkBuild {
-        assert!(!frames.is_empty());
+    ) -> ChunkBuild {
+        must_true!(!frames.is_empty());
         let cap = max_file_size.max(1);
-        let mut w = GatherWriter::trunc(&path, 64);
+        let mut w = GatherWriter::trunc(self.fs.as_ref(), &path, 64);
         let mut relocs = Vec::new();
         let mut addrs = Vec::new();
         let mut queued_iov = 0usize;
-        let mut hdr_batch: Vec<[u8; BoxRef::DUMP_HDR_LEN]> =
+        let mut hdr_batch: Vec<PersistedHead> =
             Vec::with_capacity(GatherWriter::DEFAULT_IOVCNT / 2);
         let (consumed, active_size, resident_size, interval) = self.fill_head_chunk_records(
             frames,
@@ -952,7 +988,6 @@ impl FileBuilder {
             &mut hdr_batch,
         );
 
-        let nr_intervals = 1;
         let mut h = Crc32cHasher::default();
         let is = interval.as_slice();
         h.write(is);
@@ -968,34 +1003,15 @@ impl FileBuilder {
         w.queue(rs);
         queued_iov += 1;
 
-        let hdr = DataFooter {
-            up2: file_id,
-            nr_reloc: consumed as u32,
-            nr_intervals,
-            reloc_crc: reloc_crc.finish() as u32,
-            interval_crc,
-        };
+        let hdr = FileFooter::new(consumed as u32, 1, reloc_crc.finish() as u32, interval_crc);
 
         Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
         w.queue(hdr.as_slice());
         w.flush();
 
-        let n = consumed as u32;
-        let stat = MemDataStat {
-            inner: DataStatInner {
-                file_id,
-                up1: file_id,
-                up2: file_id,
-                active_elems: n,
-                total_elems: n,
-                active_size,
-                total_size: active_size,
-                bucket_id: self.bucket_id,
-            },
-            mask: Some(BitMap::new(n)),
-        };
-        DataChunkBuild {
-            built: BuiltDataFile {
+        let stat = self.make_stat(file_id, tick, active_size, consumed as u32);
+        ChunkBuild {
+            built: BuiltFile {
                 file_id,
                 interval,
                 writer: w,
@@ -1007,125 +1023,32 @@ impl FileBuilder {
         }
     }
 
-    fn build_blob_head_chunk(
-        &self,
-        frames: &[BoxRef],
-        max_file_size: usize,
-        file_id: u64,
-        path: PathBuf,
-    ) -> BlobChunkBuild {
-        assert!(!frames.is_empty());
-        let cap = max_file_size.max(1);
-        let mut w = GatherWriter::trunc(&path, 64);
-        let mut relocs = Vec::new();
-        let mut addrs = Vec::new();
-        let mut queued_iov = 0usize;
-        let mut hdr_batch: Vec<[u8; BoxRef::DUMP_HDR_LEN]> =
-            Vec::with_capacity(GatherWriter::DEFAULT_IOVCNT / 2);
-        let (consumed, active_size, resident_size, interval) = self.fill_head_chunk_records(
-            frames,
-            cap,
-            &mut w,
-            &mut relocs,
-            &mut addrs,
-            &mut queued_iov,
-            &mut hdr_batch,
-        );
-
-        let mut interval_crc = Crc32cHasher::default();
-        let is = interval.as_slice();
-        interval_crc.write(is);
-        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
-        w.queue(is);
-        queued_iov += 1;
-
-        let mut reloc_crc = Crc32cHasher::default();
-        let rs = relocs.as_slice();
-        reloc_crc.write(rs);
-        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
-        w.queue(rs);
-        queued_iov += 1;
-
-        let hdr = BlobFooter {
-            nr_reloc: consumed as u32,
-            nr_intervals: 1,
-            reloc_crc: reloc_crc.finish() as u32,
-            interval_crc: interval_crc.finish() as u32,
-        };
-
-        Self::ensure_iov_room(1, &mut queued_iov, &mut hdr_batch, &mut w);
-        w.queue(hdr.as_slice());
-        w.flush();
-        let n = consumed as u32;
-        let stat = MemBlobStat {
-            inner: BlobStatInner {
-                file_id,
-                active_size,
-                nr_active: n,
-                nr_total: n,
-                bucket_id: self.bucket_id,
-            },
-            mask: Some(BitMap::new(n)),
-        };
-        BlobChunkBuild {
-            built: BuiltBlobFile {
-                file_id,
-                interval,
-                writer: w,
-                stat,
-                addrs,
-            },
-            consumed,
-            resident_size,
-        }
-    }
-
-    pub(crate) fn flush_data_files<F, P, O>(
+    pub(crate) fn flush_files<F, P, O>(
         &mut self,
+        kind: FileKind,
         max_file_size: usize,
+        tick: u64,
         mut alloc: F,
         mut on_flushed: P,
         mut on_file: O,
-    ) -> Vec<BuiltDataFile>
+    ) -> Vec<BuiltFile>
     where
         F: FnMut() -> (u64, PathBuf),
         P: FnMut(u64),
-        O: FnMut(&BuiltDataFile),
+        O: FnMut(&BuiltFile),
     {
-        // sort by addr is necessary to avoid interval overlap
-        self.data.sort_unstable_by_key(|x| x.header().addr);
+        let mut frames = {
+            let state = self.frames_mut(kind);
+            state.active_size = 0;
+            std::mem::take(&mut state.frames)
+        };
+        frames.sort_unstable_by_key(|x| x.header().addr);
         let mut out = Vec::new();
-        while !self.data.is_empty() {
+        while !frames.is_empty() {
             let (file_id, path) = alloc();
-            let chunk = self.build_data_head_chunk(&self.data, max_file_size, file_id, path);
+            let chunk = self.build_head_chunk(&frames, max_file_size, file_id, tick, path);
             on_flushed(chunk.resident_size as u64);
-            self.data.drain(..chunk.consumed);
-            on_file(&chunk.built);
-            out.push(chunk.built);
-        }
-        out
-    }
-
-    pub(crate) fn flush_blob_files<F, P, O>(
-        &mut self,
-        max_file_size: usize,
-        mut alloc: F,
-        mut on_flushed: P,
-        mut on_file: O,
-    ) -> Vec<BuiltBlobFile>
-    where
-        F: FnMut() -> (u64, PathBuf),
-        P: FnMut(u64),
-        O: FnMut(&BuiltBlobFile),
-    {
-        // sort by addr is necessary to avoid interval overlap
-        self.blobs.sort_unstable_by_key(|x| x.header().addr);
-        let mut out = Vec::new();
-        while !self.blobs.is_empty() {
-            let (file_id, path) = alloc();
-            let chunk = self.build_blob_head_chunk(&self.blobs, max_file_size, file_id, path);
-            on_flushed(chunk.resident_size as u64);
-            self.blobs.drain(..chunk.consumed);
+            frames.drain(..chunk.consumed);
             on_file(&chunk.built);
             out.push(chunk.built);
         }
@@ -1133,72 +1056,136 @@ impl FileBuilder {
     }
 }
 
-pub(crate) struct MetaReader<T: IFooter> {
+pub(crate) struct MetaReader {
     file: File,
-    footer: T,
+    footer: ParsedFooter,
     end: u64,
 }
 
-impl<T> MetaReader<T>
-where
-    T: IFooter,
-{
-    pub(crate) fn new<P: AsRef<Path>>(path: P) -> Result<Self, OpCode> {
-        let file = File::options()
-            .read(true)
-            .trunc(false)
-            .open(&path)
-            .map_err(|x| {
-                log::error!("can't open {:?} {:?}", x, path.as_ref());
-                OpCode::IoError
-            })?;
-        let end = file.size().expect("can't get file size");
-        if end < T::LEN as u64 {
-            return Err(OpCode::NoSpace);
+#[derive(Clone, Copy, Debug)]
+struct ParsedFooter {
+    version: FileVersion,
+    nr_reloc: u32,
+    nr_intervals: u32,
+    reloc_crc: u32,
+    interval_crc: u32,
+}
+
+impl ParsedFooter {
+    fn from_footer(version: FileVersion, footer: FileFooter) -> Self {
+        Self {
+            version,
+            nr_reloc: footer.nr_reloc,
+            nr_intervals: footer.nr_intervals,
+            reloc_crc: footer.reloc_crc,
+            interval_crc: footer.interval_crc,
         }
-        let mut footer = T::default();
-        let tmp = unsafe {
-            let p = addr_of_mut!(footer);
-            std::slice::from_raw_parts_mut(p.cast::<u8>(), T::LEN)
-        };
-        file.read(tmp, end - T::LEN as u64)
-            .map_err(|_| OpCode::Corruption)?;
+    }
+}
 
-        Ok(Self { file, footer, end })
+impl MetaReader {
+    pub(crate) fn new<P: AsRef<Path>>(fs: &dyn FileSystem, path: P) -> Self {
+        let file = must_ok!(
+            File::options().read(true).trunc(false).open(fs, &path),
+            "can't open {:?}",
+            path.as_ref()
+        );
+        let end = must_ok!(file.size(), "can't get file size");
+        if end < size_of::<FileFooter>() as u64 {
+            must_ok!(
+                Result::<(), OpCode>::Err(OpCode::Invalid),
+                "incomplete trailer"
+            );
+        }
+        let footer = Self::read_tail::<FileFooter>(&file, end - size_of::<FileFooter>() as u64);
+        let version_raw = footer.version;
+        let version = must_ok!(
+            FileVersion::from_raw(version_raw).ok_or(OpCode::BadVersion),
+            "unsupported file version {}",
+            version_raw
+        );
+        must_true!(
+            footer.is_supported_version(version),
+            "unsupported file trailer fields for version {}",
+            version.raw()
+        );
+        let footer = ParsedFooter::from_footer(version, footer);
+        let interval_len = must_exist!((footer.nr_intervals as usize).checked_mul(Interval::LEN));
+        let reloc_len = must_exist!((footer.nr_reloc as usize).checked_mul(AddrPair::LEN));
+        let meta_len = must_exist!(
+            interval_len
+                .checked_add(reloc_len)
+                .and_then(|x| x.checked_add(size_of::<FileFooter>()))
+        );
+        must_true!(end >= meta_len as u64, "file trailer exceeds file size");
+
+        Self { file, footer, end }
     }
 
-    pub(crate) fn get_reloc(&mut self) -> Result<Box<[AddrPair]>, OpCode> {
-        let len = self.footer.reloc_len();
+    pub(crate) fn version(&self) -> FileVersion {
+        self.footer.version
+    }
+
+    pub(crate) fn get_reloc(&mut self) -> Box<[AddrPair]> {
+        let len = self.footer.nr_reloc as usize * AddrPair::LEN;
         self.read_meta(
-            self.end - (len + T::LEN) as u64,
-            self.footer.nr_reloc(),
-            self.footer.reloc_crc(),
+            self.end - (len + size_of::<FileFooter>()) as u64,
+            self.footer.nr_reloc as usize,
+            self.footer.reloc_crc,
         )
     }
 
-    pub(crate) fn get_interval(&mut self) -> Result<Box<[Interval]>, OpCode> {
-        let len = self.footer.interval_len();
+    pub(crate) fn get_interval(&mut self) -> Box<[Interval]> {
+        let len = self.footer.nr_intervals as usize * Interval::LEN;
         self.read_meta(
-            self.end - (len + self.footer.reloc_len() + T::LEN) as u64,
-            self.footer.nr_interval(),
-            self.footer.interval_crc(),
+            self.end
+                - (len + self.footer.nr_reloc as usize * AddrPair::LEN + size_of::<FileFooter>())
+                    as u64,
+            self.footer.nr_intervals as usize,
+            self.footer.interval_crc,
         )
     }
 
-    fn read_meta<U>(&self, off: u64, count: usize, crc: u32) -> Result<Box<[U]>, OpCode> {
-        let len = size_of::<U>().checked_mul(count).ok_or(OpCode::NoSpace)?;
+    fn read_meta<U>(&self, off: u64, count: usize, crc: u32) -> Box<[U]> {
+        let len = must_exist!(size_of::<U>().checked_mul(count));
         let mut data = Box::<[MaybeUninit<U>]>::new_uninit_slice(count);
         let dst = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), len) };
-        self.file.read(dst, off).map_err(|_| OpCode::IoError)?;
+        Self::read_exact(&self.file, dst, off);
         let mut h = Crc32cHasher::default();
         h.write(dst);
         let actual_crc = h.finish() as u32;
         if actual_crc != crc {
-            log::error!("checksum mismatch, expect {} get {}", crc, actual_crc);
-            return Err(OpCode::Corruption);
+            must_ok!(
+                Result::<(), OpCode>::Err(OpCode::Corruption),
+                "checksum mismatch, expect {} get {}",
+                crc,
+                actual_crc
+            );
         }
         let p = Box::into_raw(data) as *mut [U];
-        Ok(unsafe { Box::from_raw(p) })
+        unsafe { Box::from_raw(p) }
+    }
+
+    fn read_tail<T: Default>(file: &File, off: u64) -> T {
+        let mut footer = T::default();
+        let dst = unsafe {
+            let p = addr_of_mut!(footer);
+            std::slice::from_raw_parts_mut(p.cast::<u8>(), size_of::<T>())
+        };
+        Self::read_exact(file, dst, off);
+        footer
+    }
+
+    fn read_exact(file: &File, buf: &mut [u8], off: u64) {
+        let got = must_ok!(file.read(buf, off), "must read metadata");
+        if got != buf.len() {
+            must_ok!(
+                Result::<(), OpCode>::Err(OpCode::Corruption),
+                "incomplete metadata read: expect {} get {}",
+                buf.len(),
+                got
+            );
+        }
     }
 
     pub(crate) fn take(self) -> File {
@@ -1222,7 +1209,7 @@ impl MapBuilder {
     }
 
     fn add_impl(&mut self, pid: u64, addr: u64) {
-        debug_assert_ne!(pid, NULL_PID);
+        must_true!(ne pid, NULL_PID);
         self.table.add(pid, addr);
     }
 
@@ -1236,7 +1223,7 @@ impl MapBuilder {
                 }
             }
             TagFlag::Sibling => {
-                assert_eq!(h.pid, NULL_PID);
+                must_true!(eq h.pid, NULL_PID);
             }
         }
     }
@@ -1250,7 +1237,8 @@ impl MapBuilder {
 mod test {
     use crate::{
         Options, RandomPath,
-        map::data::{DataFooter, MetaReader},
+        map::data::{FileVersion, MetaReader},
+        meta::FileKind,
         types::{
             header::{NodeType, TagKind},
             refbox::BoxRef,
@@ -1261,6 +1249,21 @@ mod test {
 
     use super::FileBuilder;
 
+    fn sample_pages() -> [BoxRef; 2] {
+        let (pid, addr) = (114514, 1919810);
+        let mut p = BoxRef::alloc(233, addr);
+        p.header_mut().pid = pid;
+        p.header_mut().kind = TagKind::Delta;
+        p.header_mut().node_type = NodeType::Leaf;
+
+        let (pid1, addr1) = (192, 68);
+        let mut p1 = BoxRef::alloc(666, addr1);
+        p1.header_mut().pid = pid1;
+        p1.header_mut().kind = TagKind::Delta;
+        p1.header_mut().node_type = NodeType::Leaf;
+        [p, p1]
+    }
+
     #[test]
     fn data_dump_load() {
         let path = RandomPath::new();
@@ -1270,25 +1273,20 @@ mod test {
 
         let _ = opt.create_dir();
 
-        let (pid, addr) = (114514, 1919810);
-        let mut p = BoxRef::alloc(233, addr);
-        p.header_mut().pid = pid;
-        p.header_mut().kind = TagKind::Delta;
-        p.header_mut().node_type = NodeType::Leaf;
-        let (pid1, addr1) = (192, 68);
-        let mut p1 = BoxRef::alloc(666, addr1);
-        p1.header_mut().pid = pid1;
-        p1.header_mut().kind = TagKind::Delta;
-        p1.header_mut().node_type = NodeType::Leaf;
+        let [p, p1] = sample_pages();
+        let addr = p.header().addr;
+        let addr1 = p1.header().addr;
 
-        let mut builder = FileBuilder::new(0, false, CompressorPool::new());
+        let mut builder = FileBuilder::new(0, false, CompressorPool::new(), opt.fs.clone());
 
         builder.add(p.clone());
         builder.add(p1.clone());
 
         let mut file_id = INIT_ID;
-        let files = builder.flush_data_files(
+        let files = builder.flush_files(
+            FileKind::Data,
             opt.data_file_size,
+            7,
             || {
                 let id = file_id;
                 file_id += 1;
@@ -1299,10 +1297,11 @@ mod test {
         );
         assert_eq!(files.len(), 1);
 
-        let mut loader = MetaReader::<DataFooter>::new(opt.data_file(INIT_ID)).unwrap();
+        let mut loader = MetaReader::new(opt.fs.as_ref(), opt.data_file(INIT_ID));
+        assert_eq!(loader.version(), FileVersion::V1);
 
-        let reloc = loader.get_reloc().unwrap();
-        let intervals = loader.get_interval().unwrap();
+        let reloc = loader.get_reloc();
+        let intervals = loader.get_interval();
 
         assert_eq!(reloc.len(), 2);
         assert_eq!(intervals.len(), 1);

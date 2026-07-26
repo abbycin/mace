@@ -1,3 +1,4 @@
+use crate::must_true;
 use parking_lot::Mutex;
 use std::hash::Hasher;
 use std::ops::{Deref, DerefMut};
@@ -5,7 +6,8 @@ use std::sync::Arc;
 use zstd::stream::raw::{Decoder, Encoder, InBuffer, Operation, OutBuffer};
 use zstd::zstd_safe::{self, CCtx, CParameter, DCtx, ResetDirective};
 
-use crate::{OpCode, io::GatherIO, types::refbox::BoxRef, utils::data::GatherWriter};
+use crate::utils::data::GatherWriter;
+use crate::{OpCode, io::GatherIO, types::refbox::BoxRef};
 
 pub(crate) const COMPRESS_MIN_LEN: usize = 1024;
 const COMPRESS_LEVEL: i32 = 3;
@@ -113,9 +115,9 @@ impl RecordCompressor {
     }
 
     pub(crate) fn encode_box(&mut self, b: &BoxRef) -> Result<EncodedRecord, OpCode> {
-        b.with_dump_parts(|head, tail| {
+        b.with_persisted_parts(|head, tail| {
             let raw_len = head.len() + tail.map_or(0, <[u8]>::len);
-            debug_assert!(raw_len >= COMPRESS_MIN_LEN);
+            must_true!(raw_len >= COMPRESS_MIN_LEN);
 
             let mut parts = [head, &[][..]];
             let parts = if let Some(body) = tail {
@@ -407,16 +409,17 @@ mod test {
             .expect("payload must compress");
 
         let path = RandomPath::tmp();
-        let mut writer = GatherWriter::trunc(&path.to_path_buf(), 8);
+        let fs = crate::io::OsFileSystem;
+        let mut writer = GatherWriter::trunc(&fs, &path.to_path_buf(), 8);
         writer.write(&compressed);
         drop(writer);
 
         let reader = File::options()
             .read(true)
-            .open(path.to_path_buf())
+            .open(&fs, path.to_path_buf())
             .expect("compressed file must open");
         let out = RandomPath::tmp();
-        let mut out_writer = GatherWriter::trunc(&out.to_path_buf(), 8);
+        let mut out_writer = GatherWriter::trunc(&fs, &out.to_path_buf(), 8);
         let mut decoder = RecordDecompressor::new().expect("decoder must initialize");
         let crc = decoder
             .decode_to_writer(&reader, 0, raw.len(), compressed.len(), &mut out_writer)
@@ -430,7 +433,7 @@ mod test {
         let mut loaded = vec![0u8; raw.len()];
         let out_reader = File::options()
             .read(true)
-            .open(out.to_path_buf())
+            .open(&fs, out.to_path_buf())
             .expect("decoded file must open");
         let got = out_reader
             .read(&mut loaded, 0)

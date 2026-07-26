@@ -1,0 +1,1240 @@
+schema_version: 1
+
+policy:
+  summary: >
+    Live constraint ledger for Mace. Entries here must stand on their own instead of
+    pointing back to source documents as the primary carrier of the rule.
+  source_split:
+    design_md: stable architecture and protocol explanation
+    registry_yaml: executable live constraint ledger
+    retired_md: intentionally removed constraints with retirement reason
+  status_meaning:
+    draft: observed or inferred but not yet strong enough to rely on
+    active: currently relied on and backed by at least one meaningful verifier
+    suspect: likely real but must be re-reviewed because evidence is weak, stale, or a watch point changed
+    retired: no longer intended to hold and should be moved to retired.md
+  kind_meaning:
+    local: closed inside one module or data structure
+    protocol: spans a bounded sequence of steps or lifecycle phases
+    emergent: holds only because several code paths preserve it together
+    dependency: depends on upstream or external contract semantics
+  minimum_fields:
+    - id
+    - title
+    - kind
+    - status
+    - statement
+    - watch_points
+    - witnesses
+    - failure_symptoms
+    - verifiers
+
+entries:
+  - id: protocol.flush_publish_data_first_meta_last
+    title: persisted data and blob payloads must become durable before metadata points to them
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Any data or blob file that becomes reachable through manifest metadata must be fully written
+      and synced before the manifest transaction publishes intervals, stats, map, frontier, or
+      `Sequences` metadata that references it. Metadata must never point to non-durable payload files.
+    watch_points:
+      - path: src/map/flush.rs
+        note: file build and stage-orphan sequencing starts here
+      - path: src/io/mod.rs
+        note: filesystem boundary dispatch for runtime data/blob file opens lives here
+      - path: src/io/unix.rs
+        note: unix open flag mapping for runtime data/blob/wal files lives here
+      - path: src/io/win.rs
+        note: windows open flag mapping for runtime data/blob/wal files lives here
+      - path: src/utils/options.rs
+        note: explicit data/log directory sync helpers used by durability closure live here
+      - path: src/store/store.rs
+        note: publish ordering between file sync and manifest txn is enforced here
+      - path: src/meta/manifest.rs
+        note: manifest records orphan markers and metadata publish state here
+      - path: src/store/gc.rs
+        note: rewrite path follows the same durability ordering for replacement files
+    witnesses:
+      - path: src/map/flush.rs
+        note: staged orphan marker and file build sequence precede metadata publish handoff
+      - path: src/store/store.rs
+        note: sync built writers before beginning the manifest transaction
+      - path: src/store/gc.rs
+        note: rewrite stages orphan intent before rewrite output is flushed and clears it in metadata publish
+    failure_symptoms:
+      - reopen or recovery sees metadata pointing to a file that is missing or truncated
+      - crash window leaves a published interval whose payload file is not durable
+      - data or blob reads fail after restart despite metadata claiming the file exists
+    verifiers:
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: crash windows around flush publish validate orphan cleanup and durable file survival
+      - type: runtime-order
+        path: src/store/store.rs
+        note: publish flow orders sync before manifest commit in code
+
+  - id: protocol.orphan_marker_is_only_cleanup_source
+    title: orphan files are cleaned only through explicit Sequences markers
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Startup orphan cleanup must rely only on explicit `odf_*` and `obf_*` entries in the
+      Sequences metadata bucket.
+      Recovery must not scan directories heuristically or infer orphan ranges from max file ids.
+      Marker clear failure is fatal because markers are the durable source of truth for orphan cleanup.
+    watch_points:
+      - path: src/meta/builder.rs
+        note: startup orphan cleanup and marker clear happen here
+      - path: src/meta/manifest.rs
+        note: orphan stage and clear operations are defined here
+      - path: src/io/mod.rs
+        note: marker-driven cleanup now relies on centralized try_exists/remove_file semantics here
+      - path: src/map/flush.rs
+        note: flush stages orphan files here
+      - path: src/store/gc.rs
+        note: rewrite stages and clears orphan markers here
+    witnesses:
+      - path: src/meta/builder.rs
+        note: clean_orphans iterates Sequences markers and forbids max-id probing or directory scans
+      - path: src/meta/manifest.rs
+        note: stage_orphan_file and clear_orphan_file are the manifest-side carrier of the protocol
+      - path: src/store/gc.rs
+        note: rewrite path reuses the same orphan marker protocol for replacement files
+    failure_symptoms:
+      - orphan files remain after recovery despite marker-driven cleanup
+      - recovery deletes non-orphan files because cleanup became heuristic
+      - orphan marker update panic or crash leaves startup in an unrecoverable state
+    verifiers:
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear validates marker-driven cleanup across crash windows
+      - type: runtime-assert
+        path: src/meta/builder.rs
+        note: orphan marker update failure panics instead of silently weakening the protocol
+
+  - id: protocol.interval_map_non_overlap
+    title: live interval metadata must remain non-overlapping
+    kind: local
+    status: active
+    confidence: high
+    statement: >
+      Each inserted data or blob interval must preserve the non-overlap invariant within the
+      corresponding `IntervalMap`. Recovery may upsert the same interval key to a new file id, but
+      live interval insertion must not create overlapping ranges.
+    watch_points:
+      - path: src/utils/interval.rs
+        note: IntervalMap insert and recovery upsert semantics live here
+      - path: src/meta/manifest.rs
+        note: interval recovery and in-memory stat interval updates route through this logic
+      - path: src/store/store.rs
+        note: flush publish inserts new intervals here
+      - path: src/store/gc.rs
+        note: rewrite/remap intervals are produced here
+    witnesses:
+      - path: src/utils/interval.rs
+        note: extra_check asserts reject overlap on insert and constrain upsert to recovery semantics
+      - path: src/store/store.rs
+        note: publish path records interval metadata and updates in-memory interval state together
+      - path: src/store/gc.rs
+        note: rewrite path deletes stale intervals before publishing remapped intervals
+    failure_symptoms:
+      - interval lookups resolve the wrong file id for a logical address
+      - overlap panic under extra_check
+      - GC or read path hits inconsistent interval ownership for one address
+    verifiers:
+      - type: unit-test
+        path: src/utils/interval.rs
+        note: moha and merge_split cover overlap rejection and find behavior
+      - type: runtime-assert
+        path: src/utils/interval.rs
+        note: insert asserts no overlap under extra_check
+
+  - id: protocol.reloc_completeness_for_mapped_addrs
+    title: every mapped address in a published flush batch must resolve through reloc metadata
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      For any logical address exposed by the published map and interval metadata for a flush batch,
+      relocation lookup must succeed. `ivl_map.find(addr)` and reloc lookup must jointly remain valid
+      for all mapped addresses in that durable batch.
+    watch_points:
+      - path: src/map/data.rs
+        note: file builder emits interval and reloc metadata here
+      - path: src/io/mod.rs
+        note: filesystem boundary dispatch for stat and data/blob reader opens lives here
+      - path: src/io/unix.rs
+        note: unix read/open flag mapping for stat and data/blob readers lives here
+      - path: src/io/win.rs
+        note: windows read/open flag mapping for stat and data/blob readers lives here
+      - path: src/meta/stat.rs
+        note: junk/stat apply depends on reloc lookup remaining valid here
+      - path: src/store/gc.rs
+        note: rewrite builder rebuilds reloc and interval metadata here
+      - path: src/store/store.rs
+        note: publish path records intervals and stats in one metadata boundary
+    witnesses:
+      - path: src/map/data.rs
+        note: flush file tests assert reloc entries exist for flushed addresses
+      - path: src/meta/stat.rs
+        note: stat apply uses interval lookup plus reloc lookup as the read-side correctness assumption
+      - path: src/store/gc.rs
+        note: rewrite builder sorts reloc entries and asserts uniqueness
+    failure_symptoms:
+      - can't find addr in reloc panic during reopen, recovery, or GC
+      - stat apply or read path observes an interval hit with no matching reloc entry
+      - persisted file metadata passes interval lookup but cannot locate payload offset
+    verifiers:
+      - type: unit-test
+        path: src/map/data.rs
+        note: flush metadata test asserts interval and reloc completeness for flushed addrs
+      - type: runtime-assert
+        path: src/meta/stat.rs
+        note: read/stat paths panic when reloc completeness is violated
+
+  - id: emergent.checkpoint_live_set_only
+    title: checkpoint snapshot must flush only the current live dirty set
+    kind: emergent
+    status: active
+    confidence: high
+    statement: >
+      Checkpoint snapshot may flush only pages reachable from the dirty-root live graph that are not
+      already durable. For `addr > snap_addr`, disappearing from both sealed and hot generations is an
+      invariant violation. Carry-over of live pages must move page bytes and retired lineage together.
+    watch_points:
+      - path: src/map/buffer.rs
+        note: epoch cut and root/inflight rotation decide the snapshot boundary here
+      - path: src/map/data.rs
+        note: snapshot traversal, carry-over, and live-set assertions live here
+      - path: src/map/publish.rs
+        note: replace and evict feed dirty roots and retired lineage into checkpoint closure
+    witnesses:
+      - path: src/map/buffer.rs
+        note: checkpoint atomically rotates hot and sealed generations in one critical section
+      - path: src/map/data.rs
+        note: snapshot waits inflight writers to zero and asserts live addrs above snap_addr do not disappear
+      - path: src/map/data.rs
+        note: carry_over_addrs republishes page bytes and retired lineage under one boundary
+    failure_symptoms:
+      - live page above `snap_addr` disappears from dirty generations before becoming durable
+      - checkpoint flushes stale or unreachable pages as if they were live
+      - readers observe a page as neither hot nor sealed during churn
+    verifiers:
+      - type: runtime-assert
+        path: src/map/data.rs
+        note: extra_check asserts on disappearing live addrs above snap_addr
+      - type: runtime-order
+        path: src/map/buffer.rs
+        note: epoch cut keeps root/inflight rotation atomic in code
+
+  - id: protocol.checkpoint_epoch_cut_atomicity
+    title: checkpoint epoch cut must atomically rotate writable and sealed generations
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Starting a checkpoint must atomically swap hot generations, publish sealed generations, and
+      rotate writer root and inflight slots under one cut. Writers must not straddle that cut, and
+      sealed generations must be uniquely owned before checkpoint finish recycles them.
+    watch_points:
+      - path: src/map/buffer.rs
+        note: checkpoint cut, gate locking, and fresh checkpoint barrier live here
+      - path: src/map/data.rs
+        note: finish path requires unique ownership before recycling sealed generations
+    witnesses:
+      - path: src/map/buffer.rs
+        note: checkpoint uses epochs.gate write lock and one critical section to rotate page/root/inflight state
+      - path: src/map/data.rs
+        note: sealed generation recycle uses Arc::try_unwrap and waits inflight zero first
+    failure_symptoms:
+      - writer mutations straddle the cut and become visible in both epochs
+      - checkpoint finish panics because sealed generations are still shared
+      - dirty roots or inflight state leak across checkpoint boundaries
+    verifiers:
+      - type: runtime-assert
+        path: src/map/data.rs
+        note: sealed generation uniqueness is asserted with Arc::try_unwrap
+      - type: runtime-order
+        path: src/map/buffer.rs
+        note: gate plus root/inflight rotation enforce the protocol in code
+
+  - id: emergent.reachable_junk_lifecycle
+    title: reachable junk stays readable until durability closure
+    kind: emergent
+    status: active
+    confidence: high
+    statement: >
+      Any logical address that is still reachable from the live graph must remain readable from
+      dirty memory until the matching interval and reloc metadata publish makes it durably readable.
+      Structural junk from earlier dirty generations may retire at publish time with EBR deferral,
+      but current-generation structural junk and compaction junk must stay discoverable through the
+      checkpoint snapshot boundary until the matching owner-page durability closure finishes.
+      GC file reclaim and rewrite may consume only junk whose stat and interval effects have
+      already crossed that durability boundary; there is no separate scavenge stabilization phase.
+    watch_points:
+      - path: src/index/tree.rs
+        note: merge and split publish paths must keep replace plus mark_unmap within one publish boundary
+      - path: src/map/publish.rs
+        note: structural and compaction junk classification plus inherited frontier transfer happen here
+      - path: src/map/buffer.rs
+        note: transfer_junks, retire_junks, and retired_pages decide which junk retires now versus stays visible through checkpoint
+      - path: src/map/data.rs
+        note: checkpoint snapshot carry-over, retired-page fallback, and new_junks filtering must not classify live addrs as junk
+      - path: src/meta/stat.rs
+        note: junk apply surfaces interval or reloc holes after premature retirement
+      - path: src/meta/manifest.rs
+        note: metadata publish closes the durability boundary for junk retirement
+      - path: src/store/gc.rs
+        note: file reclaim and rewrite must consume only manifest-published junk and stats after durability closure
+    witnesses:
+      - path: src/index/tree.rs
+        note: publish comments and flow require replace plus mark_unmap in one epoch commit
+      - path: src/map/buffer.rs
+        note: only earlier-generation structural junk retires at publish time while same-generation structural junk and compaction junk stay visible until checkpoint
+      - path: src/map/data.rs
+        note: new_junks filtering plus retired-page fallback reject live-junk contradictions and disappearing addrs above snap_addr
+      - path: tests/junk_reachability.rs
+        note: lagging-view regression guard exercises split, consolidate, and checkpoint churn
+      - path: src/store/gc.rs
+        note: GC file reclaim and rewrite operate from durable manifest stats and no longer perform loaded-page stabilization
+      - path: tests/gc.rs
+        note: checkpoint-only and single-GC reopen regressions keep deleted blob values from resurrecting without a scavenge phase
+    failure_symptoms:
+      - lagging snapshot or seek returns NotFound for a key that should still be visible
+      - interval lookup misses a still-reachable addr during checkpoint churn
+      - extra_check panics because a live addr was classified as junk
+      - reopened or long-lived views observe false key loss after churn
+      - current-generation junk disappears from hot, sealed, and retired fallback before checkpoint snapshot closure
+      - file reclaim or rewrite consumes junk before its owner-page durability closure is durable
+    verifiers:
+      - type: regression-test
+        path: tests/junk_reachability.rs
+        note: reachable_junk_regression_guard keeps a lagging view alive across churn
+      - type: runtime-assert
+        path: src/map/data.rs
+        note: extra_check asserts on live-junk contradictions and disappearing addrs
+      - type: regression-test
+        path: tests/gc.rs
+        note: gc_blob_delete_checkpoint_stays_deleted_without_gc and gc_blob_single_gc_run_stays_deleted_after_reopen verify deleted blob values do not resurrect without scavenge
+
+  - id: protocol.flush_junk_atomic_with_owner_durability
+    title: junk retirement must be atomic with the durability of the owner page closure
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Any junk address retired by a flush or rewrite round must either become durably retired together
+      with the owner page closure or be lost together with that closure. The system must not publish a
+      half-state where a page is durable but its coupled junk retirement is not, or vice versa.
+    watch_points:
+      - path: src/store/store.rs
+        note: publish applies junk, stats, map, frontier, and Sequences in one manifest transaction
+      - path: src/meta/stat.rs
+        note: stat apply consumes junk addresses and reloc metadata here
+      - path: src/map/data.rs
+        note: checkpoint snapshot emits deduplicated junk candidates here
+      - path: src/store/gc.rs
+        note: rewrite retire path and fully obsolete reclaim interact with junk retirement here
+    witnesses:
+      - path: src/map/buffer.rs
+        note: transfer_junks appends current-round junk lineage to new_base before foreground junk retirement
+      - path: src/store/store.rs
+        note: publish begins one manifest transaction that includes junk stat apply and map/frontier metadata
+      - path: src/map/data.rs
+        note: checkpoint emits logically unique junk output only after live graph traversal
+      - path: src/meta/stat.rs
+        note: junk apply updates stats only while matching interval and reloc metadata remain coherent
+    failure_symptoms:
+      - durable page images reference an owner closure whose junk retirement is missing
+      - GC or publish resurrects or double-retires addresses because junk retirement crossed an invalid boundary
+      - reopen hits reloc or interval holes tied to half-persisted junk state
+    verifiers:
+      - type: regression-test
+        path: tests/junk_reachability.rs
+        note: lagging-view churn guards against half-persisted reachable junk states
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: manifest crash windows validate metadata atomicity around publish boundaries
+
+  - id: protocol.history_region_key_locality
+    title: history traversal must stay inside each key's declared history region
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Old-version traversal for a key must stay within that key's declared history region
+      `(head_page, start_slot, count)`. Traversal may cross linked history pages inside the region,
+      but must never spill into neighboring keys' history entries when history pages are shared.
+      Retiring a shared history page must not imply bulk retirement of all referenced blob addresses.
+    watch_points:
+      - path: src/index/tree.rs
+        note: history traversal and lower_bound subrange logic live here
+      - path: src/types/base.rs
+        note: history region building and sibling-page iteration semantics live here
+      - path: src/types/data.rs
+        note: encoded HistRef fields define the traversal region here
+    witnesses:
+      - path: src/index/tree.rs
+        note: traverse_hist limits search to key-local active subranges
+      - path: src/types/base.rs
+        note: history region builder emits explicit page, slot, and count references
+      - path: tests/cc.rs
+        note: shared-history regression tests assert key-local traversal and no spill into neighbor keys
+    failure_symptoms:
+      - snapshot get on one key leaks a neighboring key's older history value
+      - iteration crosses into another key's history region after compaction
+      - history-page retirement incorrectly reclaims blobs still referenced by surviving keys
+    verifiers:
+      - type: regression-test
+        path: tests/cc.rs
+        note: get_compacted_shared_hist_page_keeps_key_local_old_versions and get_never_crosses_into_next_key_hist_region_when_own_hist_invisible
+      - type: unit-test
+        path: src/types/base.rs
+        note: builder_leaf_history_region_can_cross_page validates multi-page region boundaries
+
+  - id: protocol.frontier_monotonic_multi_group_closure
+    title: durable frontier must monotonically cover every writer group folded into durable closure
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Bucket durable frontier is a per-bucket, per-group durable boundary. It must advance monotonically
+      and include every writer group's WAL effects that were folded into the current durable closure,
+      not only the page-header group. Deferred pages that are neither durable nor folded into the
+      current closure must not advance the frontier.
+    watch_points:
+      - path: src/map/buffer.rs
+        note: lineage frontier is collected and merged across retired chains here
+      - path: src/map/data.rs
+        note: checkpoint snapshot applies page or chain frontier to per-group positions here
+      - path: src/meta/manifest.rs
+        note: bucket frontier storage and global frontier lower bound live here
+      - path: src/store/store.rs
+        note: publish persists map and frontier in one manifest transaction here
+      - path: src/store/recovery.rs
+        note: recovery uses bucket frontier as the correctness gate here
+    witnesses:
+      - path: src/map/buffer.rs
+        note: transfer and carry-over fold page and chain frontier across rewritten lineage
+      - path: src/map/data.rs
+        note: snapshot applies chain frontier and falls back to header lsn only when no chain frontier exists
+      - path: tests/gc.rs
+        note: cross-group remote blob update/delete regression exercises owner-lsn lineage through consolidate, checkpoint, and reopen
+      - path: src/store/store.rs
+        note: publish merges bucket frontier in the same transaction as map/stat metadata
+      - path: src/store/recovery.rs
+        note: recovery skips redo when WAL record lsn is already <= durable frontier
+    failure_symptoms:
+      - recovery resurrects an older value because one absorbed writer group was not covered by frontier
+      - frontier regresses and causes replay to miss or double-apply folded history
+      - WAL gap detection is weakened after a durable recycle boundary
+    verifiers:
+      - type: regression-test
+        path: tests/gc.rs
+        note: remote_blob_update_from_other_group_stays_deleted_after_reopen fails when the remote owner delta omits its WAL lsn
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: wal recycle done frontier tests validate durable frontier persistence and gap detection
+      - type: runtime-order
+        path: src/store/recovery.rs
+        note: redo gate explicitly checks durable frontier before enrolling dirty replay state
+
+  - id: protocol.map_and_frontier_publish_atomicity
+    title: map metadata and bucket frontier must publish in the same manifest transaction
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Page map, interval/stat metadata, bucket frontier, and related Sequences for a flush round must
+      publish atomically in one manifest transaction. Crash after commit must leave a consistent
+      durable boundary where map visibility and frontier visibility agree.
+    watch_points:
+      - path: src/store/store.rs
+        note: publish assembles the manifest transaction and records frontier here
+      - path: src/meta/txn.rs
+        note: multi-bucket manifest commit lives here
+      - path: src/meta/manifest.rs
+        note: frontier merge and persistent frontier record types live here
+    witnesses:
+      - path: src/store/store.rs
+        note: publish records intervals, stats, map, frontier, and Sequences in one transaction
+      - path: src/meta/txn.rs
+        note: exec_multi commits manifest bucket operations atomically at the metadata backend level
+      - path: src/meta/manifest.rs
+        note: merge_bucket_frontier updates in-memory and persistent frontier state as one publish unit
+    failure_symptoms:
+      - recovery sees a frontier that implies data is durable while map metadata does not
+      - map metadata becomes visible without the matching frontier advancement
+      - crash leaves one publish half visible across manifest buckets
+    verifiers:
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: manifest crash windows validate atomicity around multi-bucket commit
+      - type: evidence-gap
+        path: src/meta/txn.rs
+        note: backend multi-bucket atomicity still depends on btree-store contract and should keep being audited
+
+  - id: protocol.recovery_gate_uses_bucket_frontier
+    title: recovery must gate redo by bucket durable frontier instead of group checkpoint alone
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Recovery analyze and redo must treat bucket durable frontier as the correctness gate for
+      whether a WAL record is already durable. Group checkpoint and recycle state are scan-start and
+      retention aids, not the sole correctness boundary.
+    watch_points:
+      - path: src/store/recovery.rs
+        note: analyze and redo frontier gate lives here
+      - path: src/meta/manifest.rs
+        note: durable_frontier_lsn and global frontier lower bound live here
+      - path: src/store/store.rs
+        note: publish updates checkpoint hints from the durable frontier lower bound here
+    witnesses:
+      - path: src/store/recovery.rs
+        note: recovery skips redo only when WAL position is <= bucket durable frontier
+      - path: src/meta/manifest.rs
+        note: manifest stores and serves per-bucket frontier positions
+      - path: tests/prod_recovery_failpoints.rs
+        note: durable frontier crash-window tests cover replay and recycle correctness
+    failure_symptoms:
+      - replay misses folded history because checkpoint alone was used as correctness gate
+      - recovery replays already durable records and resurrects stale states
+      - WAL gap rejection becomes weaker after done frontier advancement
+    verifiers:
+      - type: regression-test
+        path: tests/gc.rs
+        note: remote_blob_update_from_other_group_stays_deleted_after_reopen catches stale update replay under an incomplete per-group frontier
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: durable recycle frontier and sparse-gap tests validate the recovery gate
+      - type: runtime-order
+        path: src/store/recovery.rs
+        note: analyze gate uses durable frontier before dirty-table enrollment
+
+  - id: protocol.abort_clean_visibility_and_retirement
+    title: aborted versions may persist physically but must remain invisible until durability-closed abort-clean retirement
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Aborted or in-progress versions may become durable in page images before physical cleanup, but
+      visibility rules must keep them invisible until abort-clean retires them. Abort-clean tasks that
+      touched pages must not drop abort outcome state until a durability barrier closes the page rewrite.
+      Steady-state GC must not load a currently unloaded bucket only to run abort-clean; it may clean
+      only buckets that are already loaded. Recovery may temporarily load bucket contexts to drain
+      reconstructed abort-clean tasks or inspect WAL state, but startup must unload every such context
+      before returning success or surfacing a recovery error.
+      Unload or drop must remain blocked and return `OpCode::Again` while bucket-local abort-clean is
+      still `Pending`.
+    watch_points:
+      - path: src/index/tree.rs
+        note: page-wide compaction and aborted-head handling live here
+      - path: src/cc/context.rs
+        note: visibility and active-view state interact with abort outcomes here
+      - path: src/meta/manifest.rs
+        note: unload path rejects buckets that still have pending abort-clean tasks
+      - path: src/store/gc.rs
+        note: abort-clean load mode, retirement, and steady-state no-reload semantics live here
+      - path: src/store/recovery.rs
+        note: recovery reconstructs and drains abort-clean, then unloads any buckets it loaded before startup returns
+      - path: src/store/store.rs
+        note: phase2 failure must unload recovery-loaded buckets before store abort tears down checkpoint/context
+    witnesses:
+      - path: src/meta/manifest.rs
+        note: unload_bucket returns Again when the bucket still has a pending abort-clean task
+      - path: src/store/gc.rs
+        note: AbortCleanLoadMode::SteadyState refuses to load unloaded buckets, while recovery mode may load them and still requires checkpoint closure before retirement
+      - path: src/store/recovery.rs
+        note: recovery drains reconstructed abort-clean tasks and evicts all loaded buckets before open returns or before aborting startup
+      - path: src/store/store.rs
+        note: Mace::new calls Recovery::abort before Store::abort when phase2 fails
+      - path: tests/gc.rs
+        note: drop_bucket remains blocked during pending abort-clean, recovery drain finishes before open returns, and recovery does not leave the bucket loaded
+    failure_symptoms:
+      - another snapshot sees an aborted value after reopen or churn
+      - abort-clean drops outcome state before rewritten pages are durable
+      - steady-state GC silently reloads a user-unloaded bucket just to run abort-clean
+      - recovery returns with abort-clean buckets still loaded in the runtime cache
+      - recovery error teardown panics while dropping a recovery-loaded bucket after checkpoint infrastructure is already shut down
+      - drop_bucket or unload succeeds while page-touching abort-clean is still pending
+    verifiers:
+      - type: regression-test
+        path: tests/gc.rs
+        note: recovery_drains_abort_clean_before_startup_returns, recovery_abort_clean_does_not_leave_bucket_loaded_after_startup, and related drop_bucket tests cover the lifecycle
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: recovery abort-clean crash windows validate ordering around drain and runtime GC start
+      - type: unit-test
+        path: src/store/recovery.rs
+        note: abort_unloads_recovery_loaded_buckets_before_store_abort proves failure teardown drops recovery-loaded buckets before store abort
+
+  - id: protocol.runtime_checkpoint_enable_waits_for_recovery_abort_clean
+    title: runtime checkpoint enable and WAL recycle must stay gated behind recovery abort-clean drain
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      During startup, recovery must finish reconstructing and draining pending abort-clean tasks before
+      runtime checkpoint recording is enabled. Until that gate opens, `update_checkpoint` must not
+      advance `last_ckpt`, and post-start GC must not recycle WAL based on a runtime checkpoint that
+      does not exist yet. This keeps WAL needed by abort-clean chains retained until recovery finishes
+      and the runtime checkpoint pipeline becomes valid.
+    watch_points:
+      - path: src/store/store.rs
+        note: startup order decides when recovery phase2, checkpoint enable, and GC start become visible
+      - path: src/store/recovery.rs
+        note: phase2 drains abort-clean and unloads recovery-loaded buckets here
+      - path: src/cc/context.rs
+        note: context.start enables per-group checkpoint recording here
+      - path: src/cc/log.rs
+        note: update_checkpoint is gated by enable_checkpoint here
+      - path: src/store/gc.rs
+        note: WAL recycle uses last_ckpt and pending abort-clean file boundaries here
+    witnesses:
+      - path: src/store/store.rs
+        note: Mace::new runs recovery phase2 before calling store.start and before launching runtime GC
+      - path: src/store/recovery.rs
+        note: phase2 calls drain_abort_clean_during_recovery before startup returns
+      - path: src/cc/context.rs
+        note: checkpoint recording only becomes enabled when start runs after recovery
+      - path: src/cc/log.rs
+        note: update_checkpoint returns early until enable_checkpoint has been called
+      - path: tests/prod_recovery_failpoints.rs
+        note: post-start GC crash window asserts that no WAL is recycled before a runtime checkpoint exists
+    failure_symptoms:
+      - a post-recovery GC cycle deletes WAL files before any runtime checkpoint has been enabled
+      - checkpoint state advances during bootstrap even though abort-clean drain is still part of recovery
+      - restart loses WAL needed to finish abort-clean or later recovery observes a sparse retained-WAL gap
+    verifiers:
+      - type: unit-test
+        path: src/cc/log.rs
+        note: update_checkpoint_does_not_advance_before_checkpoint_is_enabled and update_checkpoint_advances_after_checkpoint_is_enabled cover the checkpoint gate
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: chaos_failpoint_recovery_abort_clean_does_not_recycle_wal_before_runtime_checkpoint exercises the startup gate
+      - type: runtime-order
+        path: src/store/store.rs
+        note: startup constructor order enforces recovery phase2 before checkpoint enable and GC start
+
+  - id: protocol.snapshot_terminal_publication_order
+    title: modified commit must publish terminal state only after owning the visibility publication window
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      If a modified transaction becomes committed for snapshot visibility, it must hold the target
+      terminal-publication ownership from before commit timestamp allocation until the terminal
+      outcome is published. Readers must not observe a state where the transaction is no longer
+      active for its snapshot cut but still lacks a stable terminal fact.
+    watch_points:
+      - path: src/index/txn.rs
+        note: commit timestamp allocation, fact publication, and WAL ordering live here
+      - path: src/cc/mod.rs
+        note: exact visibility relies on the published terminal fact or a later safe proof here
+      - path: src/cc/group.rs
+        note: Logging serializes WAL terminal handling and exact fact publication here
+      - path: tests/si.rs
+        note: deterministic publication-window witnesses live here
+    witnesses:
+      - path: src/index/txn.rs
+        note: modified commit writes Committed(commit_ts) before releasing the fact guard and before readers can rely on later proofs
+      - path: tests/si.rs
+        note: snapshot_cut_commit_publication_witness and txn_exact_read_waits_for_commit_publication_after_commit_timestamp_alloc freeze the publication window on both sides
+    failure_symptoms:
+      - a snapshot started while a writer is still active later sees that writer's version
+      - visibility depends on racing active-set removal instead of a stable terminal publication fact
+      - iterator or point read returns a version whose commit was not yet publish-complete at snapshot cut
+    verifiers:
+      - type: regression-test
+        path: tests/si.rs
+        note: snapshot_cut_commit_publication_witness and txn_exact_read_waits_for_commit_publication_after_commit_timestamp_alloc cover pre- and post-publication readers
+      - type: model
+        path: docs/proposals/cc_window_micro.tla
+        note: the publication-window micro-model covers commit-ts allocation, terminal publication, and safe re-read windows
+
+  - id: protocol.snapshot_registration_cut_covers_every_live_reader
+    title: collector cut must include every live reader before publishing a safe snapshot boundary
+    kind: protocol
+    status: active
+    confidence: medium
+    statement: >
+      If the collector publishes a snapshot-safe boundary, it must first take an oracle cut and then
+      include every live reader source that can still observe an older snapshot before advancing the
+      boundary. No reader registration source may be omitted from the cut computation.
+    watch_points:
+      - path: src/cc/context.rs
+        note: collector cut, CCPool registry snapshot, and safe publication live here
+      - path: src/index/txn.rs
+        note: TxnView acquisition and drop publish the Registering Active Idle lifecycle here
+      - path: src/cc/group.rs
+        note: txn_seq and stable_ts publish writer begin registration here
+      - path: tests/si.rs
+        note: collector-cut and multi-view churn witnesses live here
+    witnesses:
+      - path: src/cc/context.rs
+        note: run_collect_cycle takes a SeqCst oracle cut before its SeqCst CCNode state scan; Registering blocks publication and Active contributes start_ts
+      - path: tests/si.rs
+        note: collector_cut_includes_begin_registration_before_fact_publish, post_cut_view_registration_does_not_pin_safe_boundary, and newer_live_view_keeps_snapshot_when_older_view_is_still_alive_during_churn cover the reader cut
+      - path: src/cc/context.rs
+        note: ccnode_registration_state_is_visible_to_collector directly covers Idle Registering Active Idle state observation
+    failure_symptoms:
+      - a non-oldest live snapshot loses visibility after another reader or collector cycle advances the floor
+      - collector advances reclamation past a reader that was live at the cut
+      - churn in the pool registry drops a live view from the safe-boundary computation
+    verifiers:
+      - type: regression-test
+        path: tests/si.rs
+        note: deterministic registration-cut and multi-view churn schedules cover writer and CCPool reader sources
+      - type: unit-test
+        path: src/cc/context.rs
+        note: ccnode_registration_state_is_visible_to_collector covers the single-atomic CCNode state machine
+      - type: model
+        path: docs/proposals/cc_bounded_si.tla
+        note: the bounded SI model covers cut-first safe publication against live reader registrations
+
+  - id: protocol.positive_proof_rechecks_abort_state
+    title: a positive visibility proof must still reject versions that abort concurrently
+    kind: protocol
+    status: active
+    confidence: medium
+    statement: >
+      If visibility accepts a version through a `safe_exclusive` positive proof, it must still
+      validate abort state after taking that proof. A concurrent
+      abort that lowers `abort_floor` or publishes `TxnFact::Aborted` before the reader finishes
+      validation must make the version invisible.
+    watch_points:
+      - path: src/cc/mod.rs
+        note: safe proof and abort-floor validation live here
+      - path: src/cc/group.rs
+        note: abort publication lowers abort_floor before publishing Aborted here
+      - path: tests/si.rs
+        note: deterministic proof-vs-abort race witnesses live here
+    witnesses:
+      - path: src/cc/mod.rs
+        note: validate_positive_proof rechecks abort_floor and exact fact before returning visible
+      - path: src/cc/group.rs
+        note: abort_fact lowers abort_floor before turning the fact into Aborted under the abort_seq publication window
+      - path: tests/si.rs
+        note: abort_exact_fact_stays_invisible_across_abort_publication freezes the exact-read and abort-publication windows and keeps the aborted version invisible
+    failure_symptoms:
+      - a snapshot returns a version that aborted after the reader obtained a safe proof
+      - proof-first visibility skips abort validation and treats an aborted provisional version as committed
+    verifiers:
+      - type: regression-test
+        path: tests/si.rs
+        note: abort_exact_fact_stays_invisible_across_abort_publication covers the abort-before-fact-publication race
+
+  - id: protocol.safe_prefix_covers_every_live_snapshot
+    title: a published safe prefix must be valid for every live snapshot and pruning must follow publication
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      If the system publishes a safe prefix that allows committed facts or history to be treated as
+      globally visible, that prefix must already be valid for every live snapshot, and any pruning
+      that relies on the prefix must happen only after the prefix publication is visible to readers.
+    watch_points:
+      - path: src/cc/mod.rs
+        note: proof-first visibility and exact-miss safe reread live here
+      - path: src/cc/context.rs
+        note: safe_exclusive publication, prune-after-publish, and compact_safe_txid live here
+      - path: src/index/tree.rs
+        note: compaction and traversal retain history behind compact_safe_txid here
+      - path: tests/si.rs
+        note: lagging snapshot, iterator churn, exact-miss, and reopen witnesses live here
+    witnesses:
+      - path: src/cc/context.rs
+        note: run_collect_cycle publishes safe_exclusive before committed prune and compact_safe_txid clamps with pending_abort_clean_floor
+      - path: tests/si.rs
+        note: lagging_snapshot_survives_after_prior_quiescent_view, range_iterator_keeps_pre_snapshot_version_across_later_commit_and_churn, exact_miss_rereads_safe_after_prune, and reopen_preserves_snapshot_visibility_for_recovered_state_and_new_churn cover safe publication and post-prune readers
+    failure_symptoms:
+      - a lagging snapshot loses a version after safe-prefix advance or compaction churn
+      - iterator visibility changes because pruning used a current safe boundary instead of the reader's snapshot
+      - committed history is removed before every live snapshot has a positive proof
+    verifiers:
+      - type: regression-test
+        path: tests/si.rs
+        note: lagging snapshot, iterator churn, exact-miss, and reopen witnesses exercise safe publication and prune ordering
+      - type: model
+        path: docs/proposals/cc_bounded_si.tla
+        note: the bounded SI model covers safe publication and prune-after-publish invariants
+
+  - id: protocol.snapshot_pin_covers_iterator_lifetime
+    title: the snapshot pin must outlive every iterator or borrowed read using that snapshot
+    kind: protocol
+    status: active
+    confidence: medium
+    statement: >
+      If a TxnKV or TxnView creates an iterator or returns borrowed values, the snapshot pin that
+      defines its visibility must remain live until every derived iterator or borrow is dropped.
+    watch_points:
+      - path: src/index/txn.rs
+        note: "TxnKV and TxnView own iterator creation and drop semantics here"
+      - path: src/cc/context.rs
+        note: "CCPool allocation and free define view-pin lifetime here"
+      - path: tests/si.rs
+        note: iterator lifetime witnesses now live here
+    witnesses:
+      - path: src/index/txn.rs
+        note: "iterators borrow the transaction or view, and the owner retires the snapshot state only in Drop"
+      - path: tests/si.rs
+        note: iterator_must_not_see_same_group_txn_that_was_active_at_snapshot, range_iterator_keeps_pre_snapshot_version_across_later_commit_and_churn, and snapshot_point_and_forward_reverse_traversal_match_reference_after_churn exercise iterator lifetime across churn
+    failure_symptoms:
+      - an iterator starts on one snapshot and later returns values from a newer one
+      - dropping a writer or view frees its visibility state while an iterator still depends on it
+      - compaction removes the last needed version while the iterator is still alive
+    verifiers:
+      - type: regression-test
+        path: tests/si.rs
+        note: iterator lifetime tests cover same-group holes, cross-commit churn, and forward or reverse traversal on a pinned snapshot
+
+  - id: protocol.snapshot_candidate_traversal_complete
+    title: point and iterator traversal must enumerate every candidate that can satisfy a snapshot
+    kind: protocol
+    status: active
+    confidence: medium
+    statement: >
+      If a snapshot-visible version exists for a raw key, point lookup and forward or reverse
+      iterators must enumerate at least one candidate path that reaches that version before the
+      snapshot pin is released.
+    watch_points:
+      - path: src/index/tree.rs
+        note: point and iterator traversal dispatch and retry paths begin here
+      - path: src/index/txn.rs
+        note: point/range/seek entry points must converge on the same visibility evaluator here
+      - path: src/types/node.rs
+        note: latest-head, base, delta, and history candidate enumeration live here
+      - path: tests/cc.rs
+        note: key-local history, split, merge, and traversal regressions remain here
+      - path: tests/si.rs
+        note: snapshot point and forward or reverse reference schedules live here
+    witnesses:
+      - path: src/types/node.rs
+        note: find_latest_meta now probes the raw-key head independent of probe txid
+      - path: tests/cc.rs
+        note: history locality, split or merge traversal, and reverse-iterator regressions cover structural candidate reachability
+      - path: tests/si.rs
+        note: snapshot_point_and_forward_reverse_traversal_match_reference_after_churn, iterator_page_capture_keeps_snapshot_for_forward_and_reverse_after_late_commit, and model_reference_schedules_match_point_forward_and_reverse_visibility cover point, forward, and reverse snapshot traversal plus the leaf-capture window
+    failure_symptoms:
+      - point get misses a version that should still be visible
+      - forward or reverse iteration skips the only visible version for a key
+      - compaction or split/merge removes the last reachable candidate before the reader drops its pin
+    verifiers:
+      - type: regression-test
+        path: tests/cc.rs
+        note: history locality and split or merge traversal regressions provide structural candidate coverage
+      - type: regression-test
+        path: tests/si.rs
+        note: point and forward or reverse reference schedules cover API-level snapshot traversal after churn
+      - type: regression-test
+        path: src/types/node.rs
+        note: find_latest_meta_is_independent_of_probe_txid guards raw-key latest-head selection used by point and write traversal
+
+  - id: protocol.snapshot_first_writer_wins
+    title: overlapping writers on the same key must enforce first-writer-wins across retries
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      If two overlapping write transactions attempt to modify the same logical key, at most one may
+      commit; any retry or page-replacement path must re-check the latest visible head before
+      publishing a new write.
+    watch_points:
+      - path: src/index/tree.rs
+        note: latest-head checks, page-lock ownership, and update retry paths live here
+      - path: src/index/txn.rs
+        note: transaction write APIs surface conflicts and retries here
+      - path: src/types/node.rs
+        note: latest raw-key head selection used by conflict detection lives here
+      - path: tests/anomalies.rs
+        note: high-level same-key write-conflict coverage lives here
+      - path: tests/si.rs
+        note: deterministic same-key race witnesses live here
+    witnesses:
+      - path: src/index/txn.rs
+        note: resolve_latest_meta_for_write rejects invisible non-aborted heads as conflicts and retries after page replacement
+      - path: src/types/node.rs
+        note: find_latest_meta follows the latest raw-key head instead of probe txid order
+      - path: tests/si.rs
+        note: same_key_overlapping_put_and_upsert_allow_only_first_writer, same_key_overlapping_delete_and_upsert_allow_only_first_writer, same_key_forced_race_commits_at_most_one_writer, same_key_retry_rechecks_latest_head_after_abort_during_meta_window, and same_key_page_replacement_retry_still_enforces_first_writer_wins pin overlapping-writer races across the latest-meta and Again/page-replacement retry windows
+      - path: tests/anomalies.rs
+        note: no_p0_1, no_p0_2, no_g0, and aborted_head_must_not_hide_newer_write_conflict keep black-box conflict coverage
+    failure_symptoms:
+      - two overlapping writers both commit on the same key
+      - "a page replacement or Again retry path forgets to re-check the latest head"
+      - conflict detection depends on an outdated snapshot of the page head
+    verifiers:
+      - type: regression-test
+        path: tests/si.rs
+        note: deterministic same-key schedules cover put upsert delete upsert forced concurrent update races and the Again/page-replacement retry witness
+      - type: regression-test
+        path: tests/anomalies.rs
+        note: anomaly tests keep black-box write-conflict coverage, including the aborted-head edge
+      - type: regression-test
+        path: src/types/node.rs
+        note: latest-head probe independence prevents retry paths from missing a newer provisional or committed head
+
+  - id: protocol.bucket_delete_two_phase_counter
+    title: bucket deletion is two-phase and nr_buckets includes pending delete buckets until physical cleanup finishes
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Bucket deletion must occur in two phases: logical delete removes the live meta entry and
+      inserts `pending_del`, then GC performs physical cleanup of page and interval tables.
+      `nr_buckets` must include pending-delete buckets and may decrement only after physical cleanup completes.
+    watch_points:
+      - path: src/meta/manifest.rs
+        note: delete metadata and bucket frontier removal are initiated here
+      - path: src/store/gc.rs
+        note: physical cleanup and final nr_buckets decrement happen here
+      - path: src/io/mod.rs
+        note: obsolete stat and physical cleanup file-removal semantics now route through the filesystem boundary here
+      - path: tests/bucket.rs
+        note: pending-delete counter and GC cleanup behavior are tested here
+      - path: tests/prod_bucket.rs
+        note: production-style pending-delete counter checks live here
+    witnesses:
+      - path: src/store/gc.rs
+        note: GC clears page and interval tables before deleting buckets and decrementing nr_buckets
+      - path: src/meta/manifest.rs
+        note: bucket count is documented as including active and pending-delete buckets
+      - path: tests/bucket.rs
+        note: nr_buckets remains unchanged after logical delete and drops only after GC
+    failure_symptoms:
+      - nr_buckets decreases before physical cleanup finishes
+      - pending-delete buckets vanish from quota accounting too early
+      - reopen or GC finds half-deleted bucket tables
+    verifiers:
+      - type: regression-test
+        path: tests/bucket.rs
+        note: pending-delete counter test validates post-delete accounting and later GC decrement
+      - type: regression-test
+        path: tests/prod_bucket.rs
+        note: fast_pending_delete_counter covers production-style behavior
+
+  - id: protocol.wal_recycle_safe_boundary
+    title: WAL recycling must stay behind active txn, checkpoint, and pending abort-clean boundaries
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      WAL recycling must not delete files beyond the safe boundary defined by the minimum of the
+      active-txn boundary and the last durable checkpoint boundary, and it must also remain below any
+      file still pinned by pending abort-clean tasks or the durable recycle frontier state. A modified
+      abort must publish its pending abort-clean task before releasing the group Logging mutex that
+      prevents collector maintenance from clearing the active-transaction WAL pin; the two pins must
+      overlap without an unprotected handoff window.
+    watch_points:
+      - path: src/meta/manifest.rs
+        note: durable recycle frontier and global frontier lower bound live here
+      - path: src/io/unix.rs
+        note: unix read/open flag mapping for retained WAL scan and recycle-open paths lives here
+      - path: src/io/win.rs
+        note: windows read/open flag mapping for retained WAL scan and recycle-open paths lives here
+      - path: src/utils/options.rs
+        note: explicit log-dir sync helper used after recycle file removal lives here
+      - path: src/cc/group.rs
+        note: live active facts and begin-registration state that bound wal recycle and checkpoint live here
+      - path: src/map/adapter.rs
+        note: checkpoint publish clamps wal checkpoints using live active facts while holding Logging here
+      - path: src/store/gc.rs
+        note: runtime GC derives the recycle upper bound while holding Logging and recycles WAL files here
+      - path: src/index/txn.rs
+        note: modified abort transfers WAL retention from the live active-fact pin to pending abort-clean here
+      - path: src/store/recovery.rs
+        note: startup recovery uses recycle state when earlier WAL files are already gone
+      - path: src/io/mod.rs
+        note: recycle bootstrap and file removal now rely on centralized try_exists/read_dir/rename/remove_file semantics here
+    witnesses:
+      - path: src/meta/manifest.rs
+        note: global frontier lower bound includes active buckets with pending flush and fallback checkpoints
+      - path: src/cc/group.rs
+        note: live active facts remain the source of truth for current active wal file and lsn bounds
+      - path: src/map/adapter.rs
+        note: checkpoint publish uses live active lsn bounds while holding Logging before updating wal checkpoints
+      - path: src/store/gc.rs
+        note: GC reads live active wal file bounds while holding Logging and then applies pending abort-clean and checkpoint limits
+      - path: src/index/txn.rs
+        note: abort-clean task enqueue occurs while Logging still overlaps the active-fact pin and the pending abort-clean pin
+      - path: tests/prod_recovery_failpoints.rs
+        note: durable frontier and sparse-gap tests exercise safe recycle boundaries
+      - path: tests/si.rs
+        note: abort_clean_pin_is_published_before_logging_handoff_releases checks the active-to-task pin overlap
+    failure_symptoms:
+      - recovery encounters a sparse WAL gap that should have remained readable
+      - abort-clean loses older WAL it still needs
+      - recycle frontier persistence becomes weaker across crash windows
+      - WAL recycle sees no active pin before the matching abort-clean task becomes visible
+      - stable wal backup creation stalls behind a long-gone active txn pin
+    verifiers:
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: wal_recycle_done_does_not_weaken_gap_detection_after_frontier and related done frontier tests
+      - type: runtime-order
+        path: src/store/recovery.rs
+        note: recovery uses recycle frontier and bucket frontier state as retained WAL gates
+      - type: regression-test
+        path: tests/si.rs
+        note: abort_clean_pin_is_published_before_logging_handoff_releases verifies task publication before Logging release
+      - type: regression-test
+        path: tests/gc.rs
+        note: gc_wal verifies stable wal backup creation is not pinned by stale active txn state after checkpoint
+
+  - id: protocol.wal_recycle_state_bootstrap_completion
+    title: durable wal recycle intent and done state must complete before bootstrap scanning
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Durable WAL recycle state in `wrc_*` is the startup source of truth for recycle progress.
+      Recovery must complete any durable pending recycle intent before WAL bootstrap scanning, and
+      `Done` state must remain durable enough to serve as the retained frontier when earlier WAL
+      files have already been removed.
+    watch_points:
+      - path: src/meta/manifest.rs
+        note: wal recycle state load and commit operations live here
+      - path: src/io/unix.rs
+        note: unix read/open flag mapping for bootstrap WAL enumeration follow-up opens lives here
+      - path: src/io/win.rs
+        note: windows read/open flag mapping for bootstrap WAL enumeration follow-up opens lives here
+      - path: src/store/recovery.rs
+        note: recovery completes recycle intent before bootstrap scan here
+      - path: src/store/gc.rs
+        note: runtime recycle creates intent and done state here
+      - path: src/utils/options.rs
+        note: explicit log-dir sync helper used by recycle closure remains here
+      - path: src/io/mod.rs
+        note: recycle bootstrap file enumeration and physical delete semantics now route through the filesystem boundary here
+      - path: tests/prod_recovery_failpoints.rs
+        note: crash windows around intent and done state persistence live here
+    witnesses:
+      - path: src/meta/manifest.rs
+        note: load_wal_recycle_state and commit_wal_recycle_intent/done carry durable Sequences state
+      - path: src/store/recovery.rs
+        note: recovery uses durable recycle state during bootstrap and later recycle completion
+      - path: tests/prod_recovery_failpoints.rs
+        note: done-frontier crash windows assert durable recycle bootstrap behavior across reopens
+    failure_symptoms:
+      - recovery starts scanning from a frontier that assumes recycle completed when it did not
+      - restart loses durable recycle progress and reopens with an invalid oldest retained wal boundary
+      - done frontier is not durable enough to protect later boots after earlier wal files are removed
+    verifiers:
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: recovery wal recycle done window tests validate intent and done durability across crash windows
+      - type: runtime-order
+        path: src/meta/manifest.rs
+        note: recycle state is stored and loaded from Sequences as explicit durable state
+
+  - id: protocol.filesystem_io_errors_do_not_collapse_to_absence
+    title: startup directory prep, recovery bootstrap, and runtime probe/open paths must not collapse fs faults into absence
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Filesystem operations routed through Mace's `FileSystem` boundary for startup directory
+      creation and sync, recovery bootstrap enumeration and existence probes, and runtime file
+      probe/open decisions must preserve non-`NotFound` I/O failures. These paths may intentionally
+      treat `NotFound` as absence only where the protocol already models absence explicitly, such as
+      `remove_file_if_exists`; they must not reinterpret other I/O failures as `false`, `None`, or
+      empty directory scans.
+      This entry does not duplicate orphan cleanup, obsolete-stat cleanup, or steady-state WAL
+      recycle cleanup, which remain owned by `protocol.orphan_marker_is_only_cleanup_source`,
+      `protocol.bucket_delete_two_phase_counter`, `protocol.wal_recycle_safe_boundary`, and
+      `protocol.wal_recycle_state_bootstrap_completion`.
+    watch_points:
+      - path: src/io/mod.rs
+        note: FileSystem dispatch and remove_file_if_exists semantics live here
+      - path: src/io/unix.rs
+        note: unix runtime open and sync_dir implementations back the filesystem boundary here
+      - path: src/io/win.rs
+        note: windows runtime open and sync_dir implementations back the filesystem boundary here
+      - path: src/utils/options.rs
+        note: startup directory creation and explicit directory sync helpers must surface fs failures here
+      - path: src/utils/data.rs
+        note: GatherWriter create and append paths use FileSystem-backed runtime opens here
+      - path: src/map/data.rs
+        note: data/blob file build and metadata reader opens route through FileSystem here
+      - path: src/meta/stat.rs
+        note: stat readers depend on FileSystem-backed metadata opens here
+      - path: src/cc/log.rs
+        note: WAL rotation and log file creation probe filesystem state through FileSystem here
+      - path: src/store/recovery.rs
+        note: recovery bootstrap, WAL enumeration, and recycle cleanup must surface fs failures here
+      - path: src/store/store.rs
+        note: startup manifest existence probe must preserve FileSystem try_exists faults here
+    witnesses:
+      - path: src/io/mod.rs
+        note: remove_file_if_exists only absorbs explicit NotFound while preserving all other fs errors
+      - path: src/utils/options.rs
+        note: create_dir_all_and_sync and sync_*_dir propagate fs failures instead of collapsing them to directory absence
+      - path: src/store/recovery.rs
+        note: wal_file_range, get_file, find_latest_checkpoint, and remove_wal_prefix now use FileSystem and return OpCode::IoError on fs faults
+      - path: src/cc/log.rs
+        note: WAL rotate/open probes use FileSystem and panic through must_ok on unexpected fs faults
+      - path: src/store/store.rs
+        note: Mace::new probes manifest existence through FileSystem before opening the manifest btree
+    failure_symptoms:
+      - validate or reopen succeeds after a permission-denied create_dir_all, sync_dir, read_dir, open, rename, or remove_file fault on the scoped startup or recovery path
+      - recovery silently skips WAL enumeration or retained-WAL discovery because a filesystem error was flattened into absence
+      - runtime file builders or readers treat a non-NotFound fs fault as an empty file set or a missing file
+    verifiers:
+      - type: unit-test
+        path: src/utils/options.rs
+        note: validate_returns_io_error_when_create_dir_all_fails and validate_returns_io_error_when_parent_sync_fails
+      - type: unit-test
+        path: src/store/recovery.rs
+        note: wal_file_range_surfaces_read_dir_error, get_file_surfaces_open_error, and remove_wal_prefix fs-fault tests
+      - type: unit-test
+        path: src/io/mod.rs
+        note: remove_file_if_exists_propagates_non_not_found_error keeps non-NotFound fs errors visible
+      - type: unit-test
+        path: src/cc/log.rs
+        note: wal_rotate_open_failure_panics proves runtime WAL rotation does not swallow open errors
+      - type: failpoint-test
+        path: tests/prod_recovery.rs
+        note: chaos_failpoint_fs_create_dir_all_io, chaos_failpoint_fs_sync_dir_io, and chaos_failpoint_fs_read_dir_io validate startup/open error surfacing
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: chaos_failpoint_recovery_fs_remove_file_io and chaos_failpoint_recovery_fs_rename_io validate recovery recycle cleanup error surfacing
+      - type: unit-test
+        path: src/store/store.rs
+        note: new_surfaces_manifest_try_exists_error_through_file_system keeps manifest stat faults visible through FileSystem
+
+  - id: protocol.global_options_presence_and_compatibility_gate
+    title: initialized manifests must carry global options and pass the immutable reopen gate before recovery
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      A manifest becomes initialized only after `current_version` and `BUCKET_MISC/options` are
+      durably published together. Once a manifest is treated as initialized, `BUCKET_MISC/options`
+      must exist and decode as `PersistedOptions`. Reopen must reject missing or malformed records
+      as corruption and must reject immutable global-option mismatches, currently `concurrent_write`,
+      before recovery starts. A visible but otherwise pristine manifest file that still lacks both
+      records must bootstrap them instead of being treated as corruption. Mutable persisted fields
+      follow the current open call's normalized `Options`; if the persisted subset changes, the
+      manifest must be rewritten before recovery begins.
+    watch_points:
+      - path: src/utils/options.rs
+        note: persisted options schema, defaults, json decode, and immutable compatibility checks live here
+      - path: src/meta/manifest.rs
+        note: manifest bootstrap and BUCKET_MISC/options read-write helpers live here
+      - path: src/meta/builder.rs
+        note: open-time persisted options load and compatibility gate live here
+      - path: src/store/store.rs
+        note: options writeback is sequenced before recovery here
+      - path: tests/bucket.rs
+        note: manifest misc/options regressions and immutable mismatch reopens live here
+    witnesses:
+      - path: src/meta/manifest.rs
+        note: manifest helpers publish current_version and options together and distinguish pristine bootstrap from initialized corruption here
+      - path: src/meta/builder.rs
+        note: load bootstraps only pristine manifests and otherwise rejects missing or incompatible persisted options before bucket metadata and recovery proceed
+      - path: src/store/store.rs
+        note: Mace::new probes manifest state through FileSystem and writes updated mutable persisted options before Recovery::phase1 starts
+      - path: tests/bucket.rs
+        note: bootstrap, visible-but-uninitialized bootstrap, mutable rewrite, missing key, bad json, and concurrent_write conflict reopens are asserted here
+    failure_symptoms:
+      - a crash after manifest file creation but before version/options bootstrap permanently bricks an otherwise empty database root
+      - "reopen succeeds even though an initialized manifest lacks `BUCKET_MISC/options`"
+      - malformed options json is treated as absence or silently rebuilt
+      - "`concurrent_write` changes across reopens and recovery still starts"
+      - mutable global-option changes are visible in memory for the current open but missing from the next manifest read
+    verifiers:
+      - type: unit-test
+        path: src/utils/options.rs
+        note: persisted options tests cover defaults, unknown fields, and concurrent_write conflict detection
+      - type: regression-test
+        path: tests/bucket.rs
+        note: global_options_* tests validate bootstrap writeback, visible-but-uninitialized bootstrap, mutable rewrites, corruption cases, and immutable mismatch rejection
+      - type: runtime-order
+        path: src/store/store.rs
+        note: Mace::new writes persisted options before Recovery::phase1
+
+  - id: protocol.foreground_admission_before_tree_update
+    title: foreground admission wait must happen before entering tree.update mutation paths
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Foreground write admission and any backpressure wait must occur before the writer enters the
+      `tree.update` critical mutation path. The permit reserves dirty-memory budget and the write path
+      must not bypass it when backpressure is enabled.
+    watch_points:
+      - path: src/index/txn.rs
+        note: transaction write paths obtain foreground permits before tree.update here
+      - path: src/map/flow.rs
+        note: FlowController and ForegroundWritePermit semantics live here
+      - path: src/map/buffer.rs
+        note: before_foreground_write bridges bucket pool and flow controller here
+      - path: tests/backpressure.rs
+        note: metrics-based behavior coverage lives here
+    witnesses:
+      - path: src/index/txn.rs
+        note: before_write_budget obtains ForegroundWritePermit before update mutation calls
+      - path: src/map/flow.rs
+        note: acquire_foreground_permit blocks and accounts wait before granting mutation entry
+      - path: tests/backpressure.rs
+        note: observe metrics prove admission waiting occurred under pressure
+    failure_symptoms:
+      - writers enter mutation without dirty-budget reservation
+      - backpressure metrics stay zero while memory pressure should block foreground writes
+      - mutation path amplifies dirty memory because waiting happened too late
+    verifiers:
+      - type: regression-test
+        path: tests/backpressure.rs
+        note: write_backpressure_emits_observe_metrics verifies blocking and metrics emission
+      - type: runtime-order
+        path: src/index/txn.rs
+        note: write paths call before_write_budget before tree.update
+
+  - id: dependency.manifest_conditional_update_semantics
+    title: manifest stat apply depends on btree-store conditional update and atomic multi-bucket commit
+    kind: dependency
+    status: suspect
+    confidence: medium
+    statement: >
+      Manifest commit currently assumes the metadata backend provides an atomic commit across
+      multiple buckets and an update operation that returns false on a missing key instead of
+      silently inserting. Mace relies on that contract when applying persisted stat updates,
+      recording miss metrics, and publishing map, frontier, Sequences, and stats inside one
+      manifest transaction boundary.
+    watch_points:
+      - path: Cargo.toml
+        note: btree-store version and feature changes can invalidate this contract
+      - path: src/meta/manifest.rs
+        note: Manifest is directly bound to BTree::open and btree-backed buckets
+      - path: src/meta/txn.rs
+        note: exec_multi commit path and MetaOp::Update handling encode the dependency
+      - path: src/store/store.rs
+        note: flush publish relies on one manifest transaction for stats, map, frontier, and Sequences
+      - path: tests/prod_recovery_failpoints.rs
+        note: crash windows around manifest commit are the closest existing behavioral evidence
+    witnesses:
+      - path: src/meta/txn.rs
+        note: MetaOp::Update interprets tree_txn.update returning false as a miss rather than an insert
+      - path: src/meta/txn.rs
+        note: exec_multi is treated as one atomic manifest commit across buckets
+      - path: src/store/store.rs
+        note: publish relies on the manifest transaction to keep map, frontier, stats, and Sequences aligned
+    failure_symptoms:
+      - stat rows are silently inserted, skipped, or drift from intended conditional update behavior
+      - multi-bucket publish becomes partially visible across stats, map, frontier, or Sequences
+      - recovery or GC observes metadata that crossed an invalid durability boundary
+      - upgrading btree-store changes semantics without any local compile error
+    verifiers:
+      - type: failpoint-partial
+        path: tests/prod_recovery_failpoints.rs
+        note: manifest_before_multi_commit exercises atomicity under crash timing, but not the full contract
+      - type: evidence-gap
+        path: src/meta/txn.rs
+        note: there is no dedicated contract test today for update-on-miss or exec_multi semantics
+    next_actions:
+      - add a narrow contract test that proves update-on-miss returns false without inserting
+      - add a meta-store adapter boundary so dependency semantics are audited in one place

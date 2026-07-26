@@ -1,4 +1,5 @@
 use parking_lot::{Mutex, RwLock};
+use std::ptr::null_mut;
 use std::sync::{
     Arc, OnceLock,
     atomic::{
@@ -18,9 +19,10 @@ use crate::{
         data::{AddrSet, CheckpointTask, EpochInflight, PidMap, PidSet},
         table::Swip,
     },
+    must_exist, must_ok, must_true,
     types::{page::Page, traits::IHeader},
     utils::{
-        Handle, MutRef, OpCode, ROOT_PID,
+        Handle, MutRef, ROOT_PID,
         compress::CompressorPool,
         data::{GroupPositions, Position},
         interval::IntervalMap,
@@ -40,22 +42,12 @@ use crate::types::refbox::{BoxRef, RemoteView};
 struct DummyDataReader;
 
 impl IDataReader for DummyDataReader {
-    fn load_data(
-        &self,
-        _bucket_id: u64,
-        _addr: u64,
-        _cache: &dyn Fn(BoxRef),
-    ) -> Result<BoxRef, OpCode> {
-        Err(OpCode::NotFound)
+    fn load_data(&self, _bucket_id: u64, _addr: u64, _cache: &dyn Fn(BoxRef)) -> BoxRef {
+        unimplemented!()
     }
 
-    fn load_blob(
-        &self,
-        _bucket_id: u64,
-        _addr: u64,
-        _cache: &dyn Fn(BoxView),
-    ) -> Result<BoxRef, OpCode> {
-        Err(OpCode::NotFound)
+    fn load_blob(&self, _bucket_id: u64, _addr: u64, _cache: &dyn Fn(BoxView)) -> BoxRef {
+        unimplemented!()
     }
 }
 
@@ -92,9 +84,7 @@ impl std::ops::Deref for WriteEpoch {
     type Target = Current;
 
     fn deref(&self) -> &Self::Target {
-        self.inner
-            .as_deref()
-            .expect("write epoch inner must exist before drop")
+        must_exist!(self.inner.as_deref())
     }
 }
 
@@ -385,6 +375,7 @@ impl Pool {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn transfer_junks(
         &self,
         w: &WriteEpoch,
@@ -393,10 +384,13 @@ impl Pool {
         new_base_addr: u64,
         structural_junks: Vec<u64>,
         mut compaction_junks: Vec<u64>,
+        old_frontier: SparseFrontier,
     ) {
-        let mut junks = structural_junks.clone();
+        let structural_len = structural_junks.len();
+        let mut junks = structural_junks;
         junks.append(&mut compaction_junks);
-        for &raw in &junks {
+        let mut structural_retire_now = Vec::with_capacity(structural_len);
+        for (index, &raw) in junks.iter().enumerate() {
             let logical = if RemoteView::is_tagged(raw) {
                 RemoteView::untagged(raw)
             } else {
@@ -405,15 +399,13 @@ impl Pool {
             // only new junk produced in this write generation should be tracked here
             if w.pages.contains_key(&logical) {
                 w.new_junks.mark(logical);
+            } else {
+                if index < structural_len {
+                    structural_retire_now.push(raw);
+                }
             }
         }
 
-        let mut frontier_junks = Vec::with_capacity(junks.len());
-        for &x in &junks {
-            if !RemoteView::is_tagged(x) {
-                frontier_junks.push(x);
-            }
-        }
         let mut inherited = RetiredChain::default();
 
         {
@@ -439,19 +431,20 @@ impl Pool {
             }
 
             if !inherited.addrs.is_empty() {
-                assert!(
+                must_true!(
                     !inherited.frontier.is_empty(),
                     "retired chain for base {} missing frontier",
                     old_base_addr
                 );
             }
+            inherited.frontier.merge_sparse(&old_frontier);
 
             if junks.is_empty() && inherited.addrs.is_empty() {
                 return;
             }
 
             // phase 2 + phase 3. classify_new_junks + fold_frontier
-            for &logical in &frontier_junks {
+            for &logical in junks.iter().filter(|&&raw| !RemoteView::is_tagged(raw)) {
                 // old_base may have no inherited retired chain on its first replacement
                 // in that case we still need to fold old_base's page frontier, otherwise
                 // this group's checkpoint frontier can lag behind
@@ -485,9 +478,10 @@ impl Pool {
             }
         }
 
-        // phase 4. only structural junk is retired at publish time; compaction junk can still
-        // be reached by the post-publish live graph and must stay in dirty generations.
-        self.retire_junks(&w.pages, &w.bytes, g, &structural_junks);
+        // phase 4. only earlier-generation structural junk retires at publish time.
+        // same-generation structural junk must stay dirty until checkpoint filters `new_junks`,
+        // so junk addr and owner page durability close together
+        self.retire_junks(&w.pages, &w.bytes, g, &structural_retire_now);
 
         // append current-round junks after inherited lineage
         //
@@ -520,7 +514,7 @@ impl Pool {
             if let Some((_, page)) = pages.remove(&logical) {
                 let sz = page.header().total_size as usize;
                 let old_bytes = bytes.fetch_sub(sz, AcqRel);
-                assert!(old_bytes >= sz);
+                must_true!(old_bytes >= sz);
                 self.retired_pages.insert(logical, page);
                 retired_addrs.push(logical);
             }
@@ -554,7 +548,7 @@ impl Pool {
 
     pub(crate) fn checkpoint_lsn(&self, group: u8) -> Position {
         let idx = group as usize;
-        debug_assert!(idx < Options::MAX_CONCURRENT_WRITE as usize);
+        must_true!(idx < Options::MAX_CONCURRENT_WRITE as usize);
         self.last_chkpt_lsn[idx]
     }
 
@@ -639,6 +633,7 @@ impl Pool {
             unmap_pid,
             epoch_inflight,
             pages,
+            retired_pages: self.retired_pages.clone(),
             sealed_bytes,
             sealed_bytes_init: sealed_init,
             retired,
@@ -655,10 +650,7 @@ impl Pool {
             flow,
         };
 
-        self.chkpt
-            .tx
-            .send(task)
-            .expect("flusher channel disconnected before flush publish");
+        must_ok!(self.chkpt.tx.send(task));
     }
 
     fn checkpoint_and_wait_fresh(&self) {
@@ -683,6 +675,10 @@ impl Pool {
         }
     }
 
+    fn checkpoint_inflight(&self) -> bool {
+        self.flush_in.load(Acquire) != self.flush_out.load(Acquire)
+    }
+
     pub(crate) fn before_foreground_write(&self, bytes: u64) -> ForegroundWritePermit {
         if self.flow.is_enabled() {
             let snapshot = || {
@@ -702,7 +698,7 @@ impl Pool {
         if self.dirty_bytes_snapshot().1 != 0 {
             return true;
         }
-        self.flush_in.load(Acquire) != self.flush_out.load(Acquire)
+        self.checkpoint_inflight()
     }
 
     pub(crate) fn nudge_checkpoint(&self, min_interval_ms: u64) {
@@ -814,7 +810,7 @@ impl BucketContext {
             pool: self.pool,
             ctx,
             lru: self.lru,
-            node_pins: MutRef::new(DashMap::with_capacity(Loader::PIN_CAP)),
+            node_pins: MutRef::new(Loader::new_node_pins(Loader::PIN_CAP)),
             bucket_id: self.bucket_id,
             reader: self.reader.clone(),
         }
@@ -832,21 +828,21 @@ impl BucketContext {
         self.maybe_evict();
     }
 
-    pub(crate) fn load(&self, pid: u64) -> Result<Option<Page<Loader>>, OpCode> {
+    pub(crate) fn load(&self, pid: u64) -> Option<Page<Loader>> {
         loop {
             let swip = Swip::new(self.table.get(pid));
             if swip.is_null() {
-                return Ok(None);
+                return None;
             }
             if !swip.is_tagged() {
                 let page = Page::<Loader>::from_swip(swip.raw());
                 page.mark_recent();
-                return Ok(Some(page));
+                return Some(page);
             }
-            let new = Page::load(self.loader(self.ctx), swip.untagged())?;
+            let new = Page::load(self.loader(self.ctx), swip.untagged());
             if self.table.cas(pid, swip.raw(), new.swip()).is_ok() {
                 self.cache(new);
-                return Ok(Some(new));
+                return Some(new);
             } else {
                 new.reclaim();
             }
@@ -886,10 +882,6 @@ impl BucketContext {
     pub(crate) fn almost_full(&self) -> bool {
         let threshold = self.opt.cache_capacity as isize * 80 / 100;
         self.cache.used() >= threshold
-    }
-
-    pub(crate) fn max_delta_len(&self) -> usize {
-        self.opt.max_delta_len()
     }
 
     pub(crate) fn evict_sample_target(&self, candidates: usize) -> usize {
@@ -939,16 +931,16 @@ impl BucketContext {
         }
     }
 
-    fn flush_and_wait(&self) {
-        self.pool.checkpoint();
-        self.pool.wait_checkpoint();
-    }
-
     pub(crate) fn checkpoint_and_wait(&self) {
         if self.reclaimed.load(Acquire) {
             return;
         }
         self.pool.checkpoint_and_wait_fresh();
+    }
+
+    fn flush_and_wait(&self) {
+        self.pool.checkpoint();
+        self.pool.wait_checkpoint();
     }
 
     pub(crate) fn checkpoint_before_reclaim(&self) {
@@ -1026,8 +1018,27 @@ impl BucketMgr {
         self.flush = Some(Checkpoint::new(ctx, observer));
     }
 
-    pub(crate) fn quit(&self) {
-        // 1) stop evictor to avoid new eviction/compaction work while draining flushes
+    fn reclaim_lru(&mut self) {
+        if !self.lru.inner().is_null() {
+            self.lru.reclaim();
+            self.lru = Handle::from(null_mut());
+        }
+    }
+
+    pub(crate) fn abort(&mut self) {
+        // loaded buckets may still hold recovery-built dirty state; keep the flusher alive
+        // until BucketContext::drop finishes its own checkpoint closure
+        self.buckets.clear();
+
+        if let Some(f) = self.flush.take() {
+            f.quit();
+        }
+
+        self.reclaim_lru();
+    }
+
+    pub(crate) fn quit(&mut self) {
+        // 1) stop evictor to avoid new eviction work while draining flushes
         let _ = self.tx.send(SharedState::Quit);
         let _ = self.rx.recv();
 
@@ -1037,7 +1048,7 @@ impl BucketMgr {
         }
 
         // 3) stop flusher after outstanding flush tasks are drained
-        if let Some(f) = self.flush.as_ref() {
+        if let Some(f) = self.flush.take() {
             f.quit();
         }
 
@@ -1045,7 +1056,7 @@ impl BucketMgr {
         self.buckets.clear();
 
         // 5) release shared lru
-        self.lru.reclaim();
+        self.reclaim_lru();
     }
 
     pub(crate) fn del_bucket(&self, bucket_id: u64) {

@@ -1,7 +1,7 @@
+use crate::must_true;
 use std::{
     sync::{
         Arc,
-        atomic::Ordering::Relaxed,
         mpsc::{Receiver, RecvTimeoutError, Sender},
     },
     time::{Duration, Instant},
@@ -21,14 +21,12 @@ use crate::{
         buffer::{BucketContext, BucketMgr},
         table::Swip,
     },
-    meta::Numerics,
     utils::{Handle, options::ParsedOptions},
 };
 
 pub(crate) struct Evictor {
     opt: Arc<ParsedOptions>,
     buckets: Handle<BucketMgr>,
-    numerics: Arc<Numerics>,
     rx: Receiver<SharedState>,
     tx: Sender<()>,
 }
@@ -39,14 +37,12 @@ impl Evictor {
     pub(crate) fn new(
         opt: Arc<ParsedOptions>,
         buckets: Handle<BucketMgr>,
-        numerics: Arc<Numerics>,
         rx: Receiver<SharedState>,
         tx: Sender<()>,
     ) -> Self {
         Self {
             opt,
             buckets,
-            numerics,
             rx,
             tx,
         }
@@ -108,7 +104,7 @@ impl Evictor {
                 loop {
                     let swip = Swip::new(bucket_ctx.table.get(pid));
 
-                    // it's passible when a node was unmapped, but not removed from cache yet (concurrently)
+                    // it's possible when a node was unmapped, but not removed from cache yet (concurrently)
                     if swip.is_null() {
                         break;
                     }
@@ -136,7 +132,7 @@ impl Evictor {
                     if !old.is_intl() && old.delta_len() > 0 {
                         let (node, junk) = old.compact(&mut build, safe_txid);
                         let addr = node.latest_addr();
-                        assert_eq!(addr, node.base_addr());
+                        must_true!(eq addr, node.base_addr());
                         let mut publish = build.into_publish(g);
                         publish.evict(old, node, junk, Swip::tagged(addr));
                         publish.commit();
@@ -162,70 +158,6 @@ impl Evictor {
         }
     }
 
-    fn compact_once(&mut self, g: &Guard, safe_txid: u64) {
-        if self.numerics.oracle.load(Relaxed) != safe_txid {
-            return;
-        }
-        let bucket_ctxs = self.buckets.active_contexts();
-        if bucket_ctxs.is_empty() {
-            return;
-        }
-
-        let mut rng = rand::rng();
-        let mut compacted = false;
-
-        for bucket_ctx in bucket_ctxs {
-            let mut candidates = bucket_ctx.candidate_snapshot();
-            let target = bucket_ctx.evict_sample_target(candidates.len());
-            if target == 0 {
-                continue;
-            }
-
-            for _ in 0..EVICT_SAMPLE_MAX_ROUNDS {
-                candidates.shuffle(&mut rng);
-                for pid in candidates.iter().take(target) {
-                    let pid = *pid;
-                    let Some(state) = bucket_ctx.cache_state(pid) else {
-                        continue;
-                    };
-                    if state == CacheState::Cold {
-                        continue;
-                    }
-
-                    let swip = Swip::new(bucket_ctx.table.get(pid));
-                    // it's passible when a node was unmapped, but not removed from cache yet (concurrently)
-                    if swip.is_null() {
-                        continue;
-                    }
-                    // tagged means the page has been evicted or replaced already
-                    if swip.is_tagged() {
-                        continue;
-                    }
-                    let old = Page::from_swip(swip.untagged());
-                    if old.delta_len() > bucket_ctx.max_delta_len() {
-                        let Some(_lk) = old.try_lock() else {
-                            continue;
-                        };
-                        if bucket_ctx.table.get(pid) != old.swip() {
-                            continue;
-                        }
-                        let mut build = self.begin_build(&bucket_ctx);
-                        let (node, junk) = old.compact(&mut build, safe_txid);
-                        let mut publish = build.into_publish(g);
-
-                        publish.replace(old, node, junk);
-                        publish.commit();
-                        compacted = true;
-                    }
-                }
-
-                if compacted {
-                    return;
-                }
-            }
-        }
-    }
-
     fn nudge_stale_checkpoints(&self, interval_ms: u64) {
         for bucket_ctx in self.buckets.active_contexts() {
             bucket_ctx.nudge_checkpoint(interval_ms);
@@ -244,9 +176,7 @@ impl Evictor {
 
 fn evictor_loop(mut e: Evictor) {
     const TMO_MS: u64 = 200;
-    const COMPACT_TMO: u64 = 5 * TMO_MS;
     const SCAN_MS: u64 = 10 * 1000;
-    let mut compact_cnt = 0;
     let chkpt_ivl = e.opt.checkpoint_nudge_ms;
     let mut last_nudge_scan = Instant::now();
     loop {
@@ -264,13 +194,9 @@ fn evictor_loop(mut e: Evictor) {
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                compact_cnt += TMO_MS;
                 let bucket_ctxs = e.eviction_buckets();
                 if !bucket_ctxs.is_empty() {
                     e.evict_once(&g, safe_txid, bucket_ctxs);
-                } else if compact_cnt >= COMPACT_TMO {
-                    compact_cnt = 0;
-                    e.compact_once(&g, safe_txid);
                 }
             }
             Err(_) => break,

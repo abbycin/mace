@@ -25,28 +25,31 @@ use crate::{
     },
     index::tree::Tree,
     io::{File, GatherIO},
-    map::{
-        buffer::BucketContext,
-        data::{BlobFooter, DataFooter, MetaReader},
-        table::{BucketState, Swip},
-    },
+    map::data::{FileFooter, FileVersion, MetaReader},
     meta::{
-        BUCKET_PENDING_DEL, BlobStatInner, DataStatInner, DelInterval, Delete, IntervalPair,
-        MemBlobStat, MemDataStat, MetaKind, MetaOp, Numerics, blob_interval_name,
-        data_interval_name, page_table_name,
+        BUCKET_PENDING_DEL, DelInterval, Delete, FileKind, FileReader, IntervalPair, Manifest,
+        MemStat, MetaKind, Sequences, blob_interval_name, data_interval_name, new_reader,
+        page_table_name,
     },
-    store::VacuumStats,
-    types::traits::IAsSlice,
+    must_exist, must_true,
+    types::{refbox::BoxRef, traits::IAsSlice},
     utils::{
         Handle, MutRef, ROOT_PID,
         bitmap::BitMap,
         block::Block,
-        compress::{COMPRESS_MIN_LEN, CompressorPool, RecordCompressor, RecordDecompressor},
+        compress::{
+            COMPRESS_MIN_LEN, CompressorGuard, CompressorPool, DecompressorPool, RecordCompressor,
+            RecordDecompressor,
+        },
         countblock::Countblock,
         data::{AddrPair, GatherWriter, Interval, LenSeq, Position},
         lru::Lru,
         observe::{CounterMetric, EventKind, HistogramMetric, ObserveEvent},
     },
+};
+use crate::{
+    meta::{MetaOp, StatInner},
+    must_ok,
 };
 
 const GC_QUIT: i32 = -1;
@@ -107,7 +110,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
             sem.post();
             log::info!("garbage-collector thread exit");
         })
-        .unwrap()
+        .expect("can't start garbage-collector thread")
 }
 
 #[derive(Clone)]
@@ -120,29 +123,29 @@ pub(crate) struct GCHandle {
 
 impl GCHandle {
     pub(crate) fn quit(&self) {
-        self.tx.send(GC_QUIT).unwrap();
+        must_ok!(self.tx.send(GC_QUIT));
         self.sem.wait();
     }
 
     pub(crate) fn pause(&self) {
-        self.tx.send(GC_PAUSE).unwrap();
+        must_ok!(self.tx.send(GC_PAUSE));
         self.sem.wait();
     }
 
     pub(crate) fn resume(&self) {
-        self.tx.send(GC_RESUME).unwrap();
+        must_ok!(self.tx.send(GC_RESUME));
         self.sem.wait();
     }
 
     pub(crate) fn start(&self) {
-        self.tx.send(GC_START).unwrap();
+        must_ok!(self.tx.send(GC_START));
         self.sem.wait();
     }
 
     pub(crate) fn wal_clean(&self, manifest: Handle<crate::meta::Manifest>, ctx: Handle<Context>) {
         if self.tx.send(GC_WAL).is_err() {
             let mut gc = GarbageCollector {
-                numerics: ctx.numerics.clone(),
+                sequences: ctx.sequences.clone(),
                 ctx,
                 store: MutRef::default(),
                 data_runs: Arc::new(AtomicU64::new(0)),
@@ -167,7 +170,7 @@ pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
     let data_runs = Arc::new(AtomicU64::new(0));
     let blob_runs = Arc::new(AtomicU64::new(0));
     let gc = GarbageCollector {
-        numerics: ctx.numerics.clone(),
+        sequences: ctx.sequences.clone(),
         ctx,
         store,
         data_runs: data_runs.clone(),
@@ -187,7 +190,7 @@ pub(crate) fn drain_abort_clean_during_recovery(
     ctx: Handle<Context>,
 ) -> Result<(), OpCode> {
     let mut gc = GarbageCollector {
-        numerics: ctx.numerics.clone(),
+        sequences: ctx.sequences.clone(),
         ctx,
         store,
         data_runs: Arc::new(AtomicU64::new(0)),
@@ -211,63 +214,77 @@ struct Score {
     bucket_id: u64,
 }
 
+trait GcStat {
+    fn file_id(&self) -> u64;
+    fn active_size(&self) -> usize;
+    fn total_size(&self) -> usize;
+    fn active_elems(&self) -> u32;
+    fn up2(&self) -> u64;
+    fn bucket_id(&self) -> u64;
+}
+
+impl GcStat for StatInner {
+    fn file_id(&self) -> u64 {
+        self.file_id
+    }
+
+    fn active_size(&self) -> usize {
+        self.active_size
+    }
+
+    fn total_size(&self) -> usize {
+        self.total_size
+    }
+
+    fn active_elems(&self) -> u32 {
+        self.active_elems
+    }
+
+    fn up2(&self) -> u64 {
+        self.up2
+    }
+
+    fn bucket_id(&self) -> u64 {
+        self.bucket_id
+    }
+}
+
 impl Score {
-    fn from(stat: DataStatInner, now: u64) -> Self {
+    fn from<S>(stat: S, now: u64) -> Self
+    where
+        S: GcStat,
+    {
         Self {
-            id: stat.file_id,
-            size: stat.active_size,
-            rate: Self::calc_decline_rate(stat, now),
-            up2: stat.up2,
-            bucket_id: stat.bucket_id,
+            id: stat.file_id(),
+            size: stat.active_size(),
+            rate: Self::calc_decline_rate(&stat, now),
+            up2: stat.up2(),
+            bucket_id: stat.bucket_id(),
         }
     }
 
-    fn calc_decline_rate(stat: DataStatInner, now: u64) -> f64 {
-        let free = stat.total_size.saturating_sub(stat.active_size);
-        let live = stat.active_elems.max(1);
+    fn calc_decline_rate<S>(stat: &S, now: u64) -> f64
+    where
+        S: GcStat,
+    {
+        let free = stat.total_size().saturating_sub(stat.active_size());
+        let live = stat.active_elems().max(1);
         // no junk has been applied yet, or
         // it's possible gc and flush thread get same tick
-        if free == 0 || stat.up2 == now {
+        if free == 0 || stat.up2() == now {
             return f64::INFINITY;
         }
 
-        (stat.active_size as f64 / free as f64).powi(2) / (live as f64 * (now - stat.up2) as f64)
+        (stat.active_size() as f64 / free as f64).powi(2)
+            / (live as f64 * (now - stat.up2()) as f64)
     }
 
     fn cmp_priority(&self, other: &Self) -> Ordering {
         self.rate
             .total_cmp(&other.rate)
+            .then_with(|| self.up2.cmp(&other.up2))
+            .then_with(|| self.size.cmp(&other.size))
             .then_with(|| self.id.cmp(&other.id))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BlobVictim {
-    file_id: u64,
-    active_size: usize,
-    bucket_id: u64,
-    nr_active: u32,
-    nr_total: u32,
-}
-
-impl BlobVictim {
-    fn from(inner: BlobStatInner) -> Self {
-        Self {
-            file_id: inner.file_id,
-            active_size: inner.active_size,
-            bucket_id: inner.bucket_id,
-            nr_active: inner.nr_active,
-            nr_total: inner.nr_total.max(1),
-        }
-    }
-
-    fn cmp_utilization(&self, other: &Self) -> Ordering {
-        let lhs = self.nr_active as u128 * other.nr_total as u128;
-        let rhs = other.nr_active as u128 * self.nr_total as u128;
-        lhs.cmp(&rhs)
-            .then_with(|| self.nr_active.cmp(&other.nr_active))
-            .then_with(|| self.nr_total.cmp(&other.nr_total))
-            .then_with(|| self.file_id.cmp(&other.file_id))
     }
 }
 
@@ -292,7 +309,7 @@ impl PartialEq for Score {
 impl Eq for Score {}
 
 struct GarbageCollector {
-    numerics: Arc<Numerics>,
+    sequences: Arc<Sequences>,
     ctx: Handle<Context>,
     store: MutRef<Store>,
     data_runs: Arc<AtomicU64>,
@@ -313,10 +330,10 @@ impl GarbageCollector {
         self.store.opt.observer.counter(CounterMetric::GcRun, 1);
         self.process_abort_clean();
         self.process_wal_clean();
-        self.process_data();
-        self.process_blob();
+        for kind in FileKind::ALL {
+            self.process_files(kind);
+        }
         self.process_pending_buckets();
-        self.scavenge();
         self.store.manifest.delete_files();
         self.store.opt.observer.histogram(
             HistogramMetric::GcRunMicros,
@@ -328,14 +345,10 @@ impl GarbageCollector {
         self.process_wal_clean_with_manifest(self.store.manifest);
     }
 
-    fn process_wal_clean_with_manifest(&mut self, manifest: Handle<crate::meta::Manifest>) {
+    fn process_wal_clean_with_manifest(&mut self, manifest: Handle<Manifest>) {
         let ctx = self.ctx;
         for g in ctx.groups().iter() {
-            let mut checkpoint_id = g.active_txns.min_position_file_id();
-            if let Some(min_pending_file) = ctx.min_file_id(g.id as u8) {
-                checkpoint_id = checkpoint_id.min(min_pending_file);
-            }
-            let (oldest_id, last_ckpt_file) = {
+            let (oldest_id, last_ckpt_file, mut checkpoint_id) = {
                 let mut logging = g.logging.lock();
                 if ctx.opt.sync_on_write
                     && let Err(e) = logging.sync(false)
@@ -343,8 +356,15 @@ impl GarbageCollector {
                     log::error!("wal sync fail, group {}, error {:?}", g.id, e);
                     continue;
                 }
-                (logging.oldest_wal_id(), logging.last_ckpt().file_id)
+                (
+                    logging.oldest_wal_id(),
+                    logging.last_ckpt().file_id,
+                    g.min_active_wal_file_id(&mut logging),
+                )
             };
+            if let Some(min_pending_file) = ctx.min_abort_clean_file_id(g.id as u8) {
+                checkpoint_id = checkpoint_id.min(min_pending_file);
+            }
             checkpoint_id = checkpoint_id.min(last_ckpt_file);
             if oldest_id >= checkpoint_id {
                 continue;
@@ -384,22 +404,22 @@ impl GarbageCollector {
         // NOTE: not including `end`
         for seq in intent.from_file_id..intent.to_file_id {
             let from = ctx.opt.wal_file(intent.group_id, seq);
-            if !from.exists() {
+            if !must_ok!(ctx.opt.fs.try_exists(&from), "can't stat {:?}", from) {
                 continue;
             }
             let to = ctx.opt.wal_backup(intent.group_id, seq);
             if ctx.opt.keep_stable_wal_file {
                 log::info!("rename {from:?} to {to:?}");
-                std::fs::rename(&from, &to)
-                    .inspect_err(|e| {
-                        log::error!("can't rename {from:?} to {to:?}, error {e:?}");
-                    })
-                    .unwrap();
+                must_ok!(
+                    ctx.opt.fs.rename(&from, &to),
+                    "can't rename {from:?} to {to:?}"
+                );
             } else {
                 log::info!("unlink {from:?}");
-                std::fs::remove_file(&from)
-                    .inspect_err(|e| log::error!("can't remove {from:?}, error {e:?}"))
-                    .unwrap();
+                must_ok!(
+                    ctx.opt.fs.remove_file_if_exists(&from),
+                    "can't remove {from:?}"
+                );
             }
             recycled += 1;
             #[cfg(feature = "failpoints")]
@@ -439,7 +459,6 @@ impl GarbageCollector {
                     },
                     AbortCleanState::WaitingQuiesce => {
                         self.ctx.remove_abort_clean(task.txid);
-                        self.ctx.del_aborted(task.txid);
                     }
                 }
             }
@@ -454,7 +473,6 @@ impl GarbageCollector {
 
             for txid in cleaned_txids {
                 self.ctx.remove_abort_clean(txid);
-                self.ctx.del_aborted(txid);
             }
         }
     }
@@ -469,7 +487,6 @@ impl GarbageCollector {
         if tasks.is_empty() {
             for txid in drained_events {
                 self.ctx.remove_abort_clean(txid);
-                self.ctx.del_aborted(txid);
             }
             return;
         }
@@ -503,7 +520,6 @@ impl GarbageCollector {
                 AbortCleanState::WaitingQuiesce => {
                     if task.quiesced {
                         self.ctx.remove_abort_clean(task.txid);
-                        self.ctx.del_aborted(task.txid);
                     }
                 }
             }
@@ -548,7 +564,6 @@ impl GarbageCollector {
 
         for txid in drained_events {
             self.ctx.remove_abort_clean(txid);
-            self.ctx.del_aborted(txid);
         }
     }
 
@@ -621,10 +636,12 @@ impl GarbageCollector {
         loop {
             if wal_files.get(&cursor.file_id).is_none() {
                 let path = self.ctx.opt.wal_file(task.group_id, cursor.file_id);
-                if !path.exists() {
+                if !self.ctx.opt.fs.try_exists(&path)? {
                     return Err(OpCode::Corruption);
                 }
-                let file = File::options().read(true).open(&path)?;
+                let file = File::options()
+                    .read(true)
+                    .open(self.ctx.opt.fs.as_ref(), &path)?;
                 let end = file.size()?;
                 wal_files.add(
                     Self::ABORT_CLEAN_WAL_FILE_CACHE_CAP,
@@ -727,11 +744,11 @@ impl GarbageCollector {
     fn process_pending_buckets(&mut self) {
         let mut bucket_id = None;
         let _ = self.store.manifest.btree.view(BUCKET_PENDING_DEL, |txn| {
-            let mut iter = txn.iter();
+            let mut iter = txn.iter_uncached();
             let mut k = Vec::new();
             let mut v = Vec::new();
             if iter.next_ref(&mut k, &mut v) {
-                bucket_id = Some(<u64>::from_be_bytes(k[..8].try_into().unwrap()));
+                bucket_id = Some(<u64>::from_le_bytes(must_ok!(k[..8].try_into())));
             }
             Ok(())
         });
@@ -788,7 +805,7 @@ impl GarbageCollector {
         txn.ops_mut()
             .entry(BUCKET_PENDING_DEL.to_string())
             .or_default()
-            .push(MetaOp::Del(bucket_id.to_be_bytes().to_vec()));
+            .push(MetaOp::Del(bucket_id.to_le_bytes().to_vec()));
         txn.commit();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash("mace_pending_bucket_reap_after_manifest_commit");
@@ -800,7 +817,7 @@ impl GarbageCollector {
     fn delete_bucket_batch(&self, bucket: &str) -> usize {
         let mut keys = Vec::with_capacity(Self::MAX_ELEMS);
         let _ = self.store.manifest.btree.view(bucket, |txn| {
-            let mut iter = txn.iter();
+            let mut iter = txn.iter_uncached();
             let mut k = Vec::new();
             let mut v = Vec::new();
             while iter.next_ref(&mut k, &mut v) && keys.len() < Self::MAX_ELEMS {
@@ -822,368 +839,272 @@ impl GarbageCollector {
         keys.len()
     }
 
-    fn scavenge(&mut self) {
-        let started = Instant::now();
-        let g = crossbeam_epoch::pin();
-        let mut scanned_pages = 0;
-        let mut compacted_pages = 0;
-
-        let bucket_ctxs = self.store.manifest.buckets.active_contexts();
-
-        for ctx in bucket_ctxs {
-            let bucket_id = ctx.bucket_id;
-            let state = ctx.state.clone();
-            let table = ctx.table.clone();
-            let max_pid = table.len();
-            if max_pid == 0 {
-                continue;
-            }
-            if state.is_vacuuming() {
-                continue;
-            }
-            // strategy: scan the entire page table approximately every 500 ticks (e.g., ~8 hours if tick=1min)
-            // but keep the batch size within a reasonable range [128, 10000]
-            let batch_size = (max_pid / 500).clamp(128, 10000);
-            let mut compact_count = 0;
-            let max_compact_per_tick = 64; // limit I/O impact
-
-            for _ in 0..batch_size {
-                if state.is_deleting() || state.is_drop() {
-                    break;
-                }
-                if state.is_vacuuming() {
-                    break;
-                }
-
-                let mut cursor = table.scavenge_cursor.load(Relaxed);
-
-                if cursor >= max_pid {
-                    cursor = 0;
-                }
-                table.scavenge_cursor.store(cursor + 1, Relaxed);
-
-                if !self
-                    .store
-                    .manifest
-                    .bucket_metas_by_id
-                    .contains_key(&bucket_id)
-                {
-                    break; // bucket removed
-                }
-
-                let swip = Swip::new(table.get(cursor));
-                if swip.is_null() {
-                    continue;
-                }
-                scanned_pages += 1;
-
-                let tree = Tree::new(self.store.clone(), ROOT_PID, ctx.clone());
-
-                match tree.try_scavenge(cursor, &g) {
-                    Ok(true) => {
-                        compact_count += 1;
-                        compacted_pages += 1;
-                    }
-                    _ => {
-                        // page is locked or busy or something else, just skip it this time
-                    }
-                }
-
-                // if we reached the I/O quota, stop this batch early
-                if compact_count >= max_compact_per_tick {
-                    break;
-                }
-            }
-        }
-
-        if scanned_pages > 0 {
-            self.store
-                .opt
-                .observer
-                .counter(CounterMetric::GcScavengePageScan, scanned_pages);
-        }
-        if compacted_pages > 0 {
-            self.store
-                .opt
-                .observer
-                .counter(CounterMetric::GcScavengePageCompact, compacted_pages);
-        }
-        self.store.opt.observer.histogram(
-            HistogramMetric::GcScavengeMicros,
-            started.elapsed().as_micros() as u64,
-        );
-    }
-
-    fn process_obsoleted_blob(&self, obsoleted: &[u64], bucket_id: u64) {
-        if !obsoleted.is_empty() {
-            let mut unlinked = Delete::default();
-            let mut del_intervals = DelInterval {
-                lo: Vec::new(),
-                bucket_id,
-            };
-            obsoleted
-                .iter()
-                .filter(|x| !self.store.manifest.is_unsynced_blob_file(**x))
-                .for_each(|&x| {
-                    let mut loader = MetaReader::<BlobFooter>::new(self.store.opt.blob_file(x))
-                        .expect("never happen");
-                    let ivls = loader.get_interval().unwrap();
-                    for i in ivls {
-                        if i.lo <= i.hi {
-                            del_intervals.push(i.lo);
-                        }
-                    }
-                    unlinked.push(x);
-                });
-            let mut txn = self.store.manifest.begin();
-            txn.record(MetaKind::BlobDelete, &unlinked);
-            txn.record(MetaKind::BlobDelInterval, &del_intervals);
-            txn.commit();
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_gc_blob_obsolete_after_meta_commit");
-
-            // only ordinary obsolete reclaim publishes retired keys for flush races
-            self.store
-                .manifest
-                .mark_retired_blob_stats(bucket_id, &unlinked);
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_gc_blob_obsolete_after_retired_mark");
-            self.store
-                .manifest
-                .blob_stat
-                .remove_stat_interval(&unlinked);
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_gc_blob_obsolete_after_remove_stat");
-            self.store.manifest.save_obsolete_blob(&unlinked);
-            self.store.manifest.delete_files();
-            self.store
-                .opt
-                .observer
-                .counter(CounterMetric::GcBlobObsoleteFile, unlinked.len() as u64);
-            self.blob_runs.fetch_add(1, Relaxed);
+    fn delete_meta_kind(kind: FileKind) -> MetaKind {
+        match kind {
+            FileKind::Data => MetaKind::DataDelete,
+            FileKind::Blob => MetaKind::BlobDelete,
         }
     }
 
-    fn process_obsoleted_data(&self, obsoleted: &[u64], bucket_id: u64) {
-        if !obsoleted.is_empty() {
-            let mut unlinked = Delete::default();
-            let mut del_intervals = DelInterval {
-                lo: Vec::new(),
-                bucket_id,
-            };
-            obsoleted
-                .iter()
-                .filter(|x| !self.store.manifest.is_unsynced_data_file(**x))
-                .for_each(|&x| {
-                    let mut loader = MetaReader::<DataFooter>::new(self.store.opt.data_file(x))
-                        .expect("never happen");
-                    let ivls = loader.get_interval().unwrap();
-                    for i in ivls {
-                        // keep deleting legacy sentinel keys from old empty data files
+    fn delete_interval_meta_kind(kind: FileKind) -> MetaKind {
+        match kind {
+            FileKind::Data => MetaKind::DataDelInterval,
+            FileKind::Blob => MetaKind::BlobDelInterval,
+        }
+    }
+
+    fn interval_meta_kind(kind: FileKind) -> MetaKind {
+        match kind {
+            FileKind::Data => MetaKind::DataInterval,
+            FileKind::Blob => MetaKind::BlobInterval,
+        }
+    }
+
+    fn stat_meta_kind(kind: FileKind) -> MetaKind {
+        match kind {
+            FileKind::Data => MetaKind::DataStat,
+            FileKind::Blob => MetaKind::BlobStat,
+        }
+    }
+
+    fn obsolete_counter(kind: FileKind) -> CounterMetric {
+        match kind {
+            FileKind::Data => CounterMetric::GcDataObsoleteFile,
+            FileKind::Blob => CounterMetric::GcBlobObsoleteFile,
+        }
+    }
+
+    fn rewrite_counter(kind: FileKind) -> CounterMetric {
+        match kind {
+            FileKind::Data => CounterMetric::GcDataRewrite,
+            FileKind::Blob => CounterMetric::GcBlobRewrite,
+        }
+    }
+
+    fn rewrite_micros(kind: FileKind) -> HistogramMetric {
+        match kind {
+            FileKind::Data => HistogramMetric::GcDataRewriteMicros,
+            FileKind::Blob => HistogramMetric::GcBlobRewriteMicros,
+        }
+    }
+
+    fn rewrite_victim_hist(kind: FileKind) -> HistogramMetric {
+        match kind {
+            FileKind::Data => HistogramMetric::GcDataRewriteVictimFiles,
+            FileKind::Blob => HistogramMetric::GcBlobRewriteVictimFiles,
+        }
+    }
+
+    fn rewrite_complete_event(kind: FileKind) -> EventKind {
+        match kind {
+            FileKind::Data => EventKind::GcDataRewriteComplete,
+            FileKind::Blob => EventKind::GcBlobRewriteComplete,
+        }
+    }
+
+    #[cfg(feature = "failpoints")]
+    fn obsolete_after_meta_commit_failpoint(kind: FileKind) -> &'static str {
+        match kind {
+            FileKind::Data => "mace_gc_data_obsolete_after_meta_commit",
+            FileKind::Blob => "mace_gc_blob_obsolete_after_meta_commit",
+        }
+    }
+
+    #[cfg(feature = "failpoints")]
+    fn obsolete_after_retired_mark_failpoint(kind: FileKind) -> &'static str {
+        match kind {
+            FileKind::Data => "mace_gc_data_obsolete_after_retired_mark",
+            FileKind::Blob => "mace_gc_blob_obsolete_after_retired_mark",
+        }
+    }
+
+    #[cfg(feature = "failpoints")]
+    fn obsolete_after_remove_stat_failpoint(kind: FileKind) -> &'static str {
+        match kind {
+            FileKind::Data => "mace_gc_data_obsolete_after_remove_stat",
+            FileKind::Blob => "mace_gc_blob_obsolete_after_remove_stat",
+        }
+    }
+
+    #[cfg(feature = "failpoints")]
+    fn rewrite_stage_marker_failpoint(kind: FileKind) -> &'static str {
+        match kind {
+            FileKind::Data => "mace_gc_data_rewrite_after_stage_marker",
+            FileKind::Blob => "mace_gc_blob_rewrite_after_stage_marker",
+        }
+    }
+
+    #[cfg(feature = "failpoints")]
+    fn rewrite_after_dir_sync_failpoint(kind: FileKind) -> &'static str {
+        match kind {
+            FileKind::Data => "mace_gc_data_rewrite_after_data_dir_sync",
+            FileKind::Blob => "mace_gc_blob_rewrite_after_data_dir_sync",
+        }
+    }
+
+    #[cfg(feature = "failpoints")]
+    fn rewrite_before_meta_commit_failpoint(kind: FileKind) -> &'static str {
+        match kind {
+            FileKind::Data => "mace_gc_data_rewrite_before_meta_commit",
+            FileKind::Blob => "mace_gc_blob_rewrite_before_meta_commit",
+        }
+    }
+
+    #[cfg(feature = "failpoints")]
+    fn rewrite_after_meta_commit_failpoint(kind: FileKind) -> &'static str {
+        match kind {
+            FileKind::Data => "mace_gc_data_rewrite_after_meta_commit",
+            FileKind::Blob => "mace_gc_blob_rewrite_after_meta_commit",
+        }
+    }
+
+    fn next_tick(&self, bucket_id: u64, kind: FileKind) -> u64 {
+        self.store
+            .manifest
+            .get_bucket_runtime(bucket_id)
+            .load_update_epoch(kind)
+    }
+
+    fn alloc_file_id(&self) -> u64 {
+        self.sequences.next_file_id.fetch_add(1, Relaxed)
+    }
+
+    fn target_ratio(&self, kind: FileKind) -> u64 {
+        match kind {
+            FileKind::Data => self.store.opt.data_garbage_ratio as u64,
+            FileKind::Blob => self.store.opt.blob_garbage_ratio as u64,
+        }
+    }
+
+    fn target_file_size(&self, kind: FileKind) -> usize {
+        match kind {
+            FileKind::Data => self.store.opt.data_file_size,
+            FileKind::Blob => self.store.opt.blob_file_size,
+        }
+    }
+
+    fn file_runs(&self, kind: FileKind) -> &AtomicU64 {
+        match kind {
+            FileKind::Data => self.data_runs.as_ref(),
+            FileKind::Blob => self.blob_runs.as_ref(),
+        }
+    }
+
+    fn process_obsoleted_files(&self, kind: FileKind, obsoleted: &[u64], bucket_id: u64) {
+        if obsoleted.is_empty() {
+            return;
+        }
+
+        let mut unlinked = Delete::default();
+        let mut del_intervals = DelInterval {
+            lo: Vec::new(),
+            bucket_id,
+        };
+        obsoleted
+            .iter()
+            .filter(|x| !self.store.manifest.is_unsynced_file(kind, **x))
+            .for_each(|&x| {
+                let path = match kind {
+                    FileKind::Data => self.store.opt.data_file(x),
+                    FileKind::Blob => self.store.opt.blob_file(x),
+                };
+                let mut loader = MetaReader::new(self.store.opt.fs.as_ref(), path);
+                let ivls = loader.get_interval();
+                for i in ivls {
+                    if kind == FileKind::Data || i.lo <= i.hi {
+                        // keep deleting old sentinel keys from earlier empty data files
                         del_intervals.push(i.lo);
                     }
-                    unlinked.push(x);
-                });
-            let mut txn = self.store.manifest.begin();
-            txn.record(MetaKind::DataDelete, &unlinked);
-            txn.record(MetaKind::DataDelInterval, &del_intervals);
-            txn.commit();
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_gc_data_obsolete_after_meta_commit");
+                }
+                unlinked.push(x);
+            });
 
-            // only ordinary obsolete reclaim publishes retired keys for flush races
-            self.store
-                .manifest
-                .mark_retired_data_stats(bucket_id, &unlinked);
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_gc_data_obsolete_after_retired_mark");
-            self.store
-                .manifest
-                .data_stat
-                .remove_stat_interval(&unlinked);
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_gc_data_obsolete_after_remove_stat");
-            self.store.manifest.save_obsolete_data(&unlinked);
-            self.store.manifest.delete_files();
-            self.store
-                .opt
-                .observer
-                .counter(CounterMetric::GcDataObsoleteFile, unlinked.len() as u64);
-            self.data_runs.fetch_add(1, Relaxed);
-        }
+        let mut txn = self.store.manifest.begin();
+        txn.record(Self::delete_meta_kind(kind), &unlinked);
+        txn.record(Self::delete_interval_meta_kind(kind), &del_intervals);
+        txn.commit();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash(Self::obsolete_after_meta_commit_failpoint(kind));
+
+        // only ordinary obsolete reclaim publishes retired keys for flush races
+        self.store
+            .manifest
+            .mark_retired_stats(kind, bucket_id, &unlinked);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash(Self::obsolete_after_retired_mark_failpoint(kind));
+        self.store
+            .manifest
+            .stat_ctx(kind)
+            .remove_stat_interval(&unlinked);
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash(Self::obsolete_after_remove_stat_failpoint(kind));
+        self.store.manifest.save_obsolete_files(kind, &unlinked);
+        self.store.manifest.delete_files();
+        self.store
+            .opt
+            .observer
+            .counter(Self::obsolete_counter(kind), unlinked.len() as u64);
+        self.file_runs(kind).fetch_add(1, Relaxed);
     }
 
-    fn process_blob(&mut self) {
-        let (obsoleted, victims) = self.collect_blob_candidates(
-            self.store.opt.blob_gc_ratio,
-            self.store.opt.blob_garbage_ratio,
-        );
+    fn process_files(&mut self, kind: FileKind) {
+        let tgt_ratio = self.target_ratio(kind);
+        let tgt_size = self.target_file_size(kind);
+        let eager = self.store.opt.gc_eager;
+        let (obsoleted, bucket_usage, candidates) = self.collect_candidates(kind);
 
         for (bucket_id, files) in obsoleted {
-            self.process_obsoleted_blob(&files, bucket_id);
+            self.process_obsoleted_files(kind, &files, bucket_id);
         }
 
-        let groups = Self::group_blob_victims_by_bucket(victims);
-        for (bucket_id, list) in groups {
-            let mut dst_size = 0;
-            let mut dst = Vec::new();
-            for (file_id, size) in list {
-                dst_size += size;
-                dst.push(file_id);
-                if dst_size >= self.store.opt.blob_file_size && dst.len() >= 2 {
-                    self.rewrite_blob(&dst, bucket_id);
-                    dst.clear();
-                    dst_size = 0;
-                }
-            }
-
-            if self.store.opt.gc_eager && dst.len() >= 2 {
-                self.rewrite_blob(&dst, bucket_id);
-            }
-        }
-    }
-
-    fn collect_blob_candidates(
-        &self,
-        file_ratio: usize,
-        garbage_ratio: usize,
-    ) -> (HashMap<u64, Vec<u64>>, Vec<BlobVictim>) {
-        let lk = self.store.manifest.blob_stat.read();
-        let mut obsoleted = HashMap::<u64, Vec<u64>>::new();
-        let mut candidates = Vec::new();
-
-        for (_, stat) in lk.iter() {
-            if self.store.manifest.is_unsynced_blob_file(stat.file_id) {
-                continue;
-            }
-            if stat.nr_active == 0 {
-                obsoleted
-                    .entry(stat.bucket_id)
-                    .or_default()
-                    .push(stat.file_id);
-            } else {
-                candidates.push(BlobVictim::from(stat.inner));
-            }
-        }
-        drop(lk);
-
-        if candidates.len() < 2 {
-            return (obsoleted, Vec::new());
-        }
-        (
-            obsoleted,
-            Self::select_blob_victims(candidates, file_ratio, garbage_ratio),
-        )
-    }
-
-    fn select_blob_victims(
-        mut candidates: Vec<BlobVictim>,
-        file_ratio: usize,
-        garbage_ratio: usize,
-    ) -> Vec<BlobVictim> {
-        if candidates.len() < 2 {
-            return Vec::new();
-        }
-        candidates.sort_unstable_by(BlobVictim::cmp_utilization);
-        let selected = Self::pick_blob_candidate_count(candidates.len(), file_ratio);
-        if selected < 2 {
-            return Vec::new();
-        }
-        candidates.truncate(selected);
-        if !Self::blob_ratio_gate_passed(&candidates, garbage_ratio) {
-            return Vec::new();
-        }
-        candidates
-    }
-
-    fn blob_ratio_gate_passed(candidates: &[BlobVictim], garbage_ratio: usize) -> bool {
-        let mut nr_total = 0u64;
-        let mut nr_active = 0u64;
-        for c in candidates {
-            nr_total += c.nr_total as u64;
-            nr_active += c.nr_active as u64;
-        }
-        if nr_total == 0 {
-            return false;
-        }
-        let ratio = (nr_total - nr_active) * 100 / nr_total;
-        (ratio as usize) >= garbage_ratio
-    }
-
-    fn pick_blob_candidate_count(total: usize, ratio: usize) -> usize {
-        if total < 2 {
-            return 0;
-        }
-        let ratio = ratio.min(100);
-        if ratio == 0 {
-            return 0;
-        }
-        total.saturating_mul(ratio) / 100
-    }
-
-    fn group_blob_victims_by_bucket(victims: Vec<BlobVictim>) -> Vec<(u64, Vec<(u64, usize)>)> {
-        let mut groups: HashMap<u64, Vec<(u64, usize)>> = HashMap::new();
-        for v in victims {
-            groups
-                .entry(v.bucket_id)
-                .or_default()
-                .push((v.file_id, v.active_size));
-        }
-        let mut out: Vec<(u64, Vec<(u64, usize)>)> = groups.into_iter().collect();
-        out.sort_by_key(|x| x.0);
-        out
-    }
-
-    fn process_data(&mut self) {
-        let tgt_ratio = self.store.opt.data_garbage_ratio as u64;
-        let tgt_size = self.store.opt.data_file_size;
-        let eager = self.store.opt.gc_eager;
-        let tick = self.numerics.next_data_id.load(Relaxed);
-        let mut bucket_usage = HashMap::<u64, (u64, u64)>::new();
-        let mut bucket_obsoleted: HashMap<u64, Vec<u64>> = HashMap::new();
-        let mut candidates = Vec::new();
-
-        for x in self.store.manifest.data_stat.bucket_files().iter() {
-            let bucket_id = *x.key();
-            for &fid in x.value().iter() {
-                if self.store.manifest.is_unsynced_data_file(fid) {
-                    continue;
-                }
-                if let Some(s) = self.store.manifest.data_stat.get(&fid) {
-                    if s.active_elems == 0 {
-                        bucket_obsoleted.entry(bucket_id).or_default().push(fid);
-                    } else {
-                        let e = bucket_usage.entry(bucket_id).or_insert((0, 0));
-                        e.0 += s.total_size as u64;
-                        e.1 += s.active_size as u64;
-                        // copy the inner value (DataStatInner is Copy)
-                        candidates.push(s.inner);
-                    }
-                }
-            }
-        }
-
-        // fully obsolete files should be reclaimed immediately, independent of ratio gate
-        for (bucket_id, files) in bucket_obsoleted {
-            self.process_obsoleted_data(&files, bucket_id);
-        }
-
-        let ranked = Self::rank_data_candidates(candidates, tick);
+        let ranked = Self::rank_candidates(candidates, |bucket_id| self.next_tick(bucket_id, kind));
         if ranked.is_empty() {
             return;
         }
 
         let plans =
-            Self::plan_data_rewrite_from_global(ranked, &bucket_usage, tgt_ratio, tgt_size, eager);
+            Self::plan_rewrite_from_global(ranked, &bucket_usage, tgt_ratio, tgt_size, eager);
         for (bucket_id, victim) in plans {
-            if !self.should_run_data_rewrite_live(bucket_id, tgt_ratio) {
+            if !self.should_run_rewrite_live(kind, bucket_id, tgt_ratio) {
                 continue;
             }
-            self.rewrite_data(victim, bucket_id);
+            self.rewrite_files(kind, &victim, bucket_id);
         }
     }
 
-    fn plan_data_rewrite_from_global(
+    fn collect_candidates(
+        &self,
+        kind: FileKind,
+    ) -> (
+        HashMap<u64, Vec<u64>>,
+        HashMap<u64, (u64, u64)>,
+        Vec<StatInner>,
+    ) {
+        let mut obsoleted = HashMap::<u64, Vec<u64>>::new();
+        let mut bucket_usage = HashMap::<u64, (u64, u64)>::new();
+        let mut candidates = Vec::new();
+        for x in self.store.manifest.stat_ctx(kind).bucket_files().iter() {
+            let bucket_id = *x.key();
+            for &fid in x.value().iter() {
+                if self.store.manifest.is_unsynced_file(kind, fid) {
+                    continue;
+                }
+                if let Some(stat) = self.store.manifest.stat_ctx(kind).get(&fid) {
+                    if stat.active_elems == 0 {
+                        obsoleted.entry(bucket_id).or_default().push(fid);
+                    } else {
+                        let e = bucket_usage.entry(bucket_id).or_insert((0, 0));
+                        e.0 += stat.total_size as u64;
+                        e.1 += stat.active_size as u64;
+                        candidates.push(stat.inner);
+                    }
+                }
+            }
+        }
+        (obsoleted, bucket_usage, candidates)
+    }
+
+    fn plan_rewrite_from_global(
         ranked: Vec<Score>,
         bucket_usage: &HashMap<u64, (u64, u64)>,
         tgt_ratio: u64,
@@ -1200,17 +1121,17 @@ impl GarbageCollector {
         let mut plans = Vec::new();
         for bucket_id in bucket_ids {
             let ranked = by_bucket.remove(&bucket_id).unwrap_or_default();
-            if !Self::should_run_data_rewrite_for_bucket(bucket_id, tgt_ratio, bucket_usage) {
+            if !Self::should_run_rewrite_for_bucket(bucket_id, tgt_ratio, bucket_usage) {
                 continue;
             }
-            if let Some(p) = Self::select_data_rewrite_batch_for_bucket(ranked, tgt_size, eager) {
+            if let Some(p) = Self::select_rewrite_batch_for_bucket(ranked, tgt_size, eager) {
                 plans.push((bucket_id, p));
             }
         }
         plans
     }
 
-    fn select_data_rewrite_batch_for_bucket(
+    fn select_rewrite_batch_for_bucket(
         ranked: Vec<Score>,
         tgt_size: usize,
         eager: bool,
@@ -1230,10 +1151,14 @@ impl GarbageCollector {
         None
     }
 
-    fn rank_data_candidates(candidates: Vec<DataStatInner>, tick: u64) -> Vec<Score> {
+    fn rank_candidates<T, F>(candidates: Vec<T>, tick_for_bucket: F) -> Vec<Score>
+    where
+        T: GcStat + Copy,
+        F: Fn(u64) -> u64,
+    {
         let mut ranked: Vec<Score> = candidates
             .into_iter()
-            .map(|s| Score::from(s, tick))
+            .map(|s| Score::from(s, tick_for_bucket(s.bucket_id())))
             .filter(|s| s.rate.is_finite())
             .collect();
         ranked.sort_unstable_by(Score::cmp_priority);
@@ -1243,11 +1168,11 @@ impl GarbageCollector {
         ranked
     }
 
-    fn should_run_data_rewrite(ratio: u64, tgt_ratio: u64) -> bool {
+    fn should_run_rewrite(ratio: u64, tgt_ratio: u64) -> bool {
         ratio >= tgt_ratio
     }
 
-    fn should_run_data_rewrite_for_bucket(
+    fn should_run_rewrite_for_bucket(
         bucket_id: u64,
         tgt_ratio: u64,
         bucket_usage: &HashMap<u64, (u64, u64)>,
@@ -1259,60 +1184,48 @@ impl GarbageCollector {
             return false;
         }
         let ratio = (total - active) * 100 / total;
-        Self::should_run_data_rewrite(ratio, tgt_ratio)
+        Self::should_run_rewrite(ratio, tgt_ratio)
     }
 
-    fn should_run_data_rewrite_live(&self, bucket_id: u64, tgt_ratio: u64) -> bool {
-        let Some(ratio) = self.current_bucket_data_ratio(bucket_id) else {
+    fn should_run_rewrite_live(&self, kind: FileKind, bucket_id: u64, tgt_ratio: u64) -> bool {
+        let Some(ratio) = self.current_bucket_ratio(kind, bucket_id) else {
             return false;
         };
-        Self::should_run_data_rewrite(ratio, tgt_ratio)
+        Self::should_run_rewrite(ratio, tgt_ratio)
     }
 
-    fn current_bucket_data_ratio(&self, bucket_id: u64) -> Option<u64> {
-        let files = self
-            .store
+    fn current_bucket_ratio(&self, kind: FileKind, bucket_id: u64) -> Option<u64> {
+        self.store
             .manifest
-            .data_stat
-            .bucket_files()
-            .get(&bucket_id)?;
-        let mut total = 0u64;
-        let mut active = 0u64;
-        for &fid in files.value().iter() {
-            if self.store.manifest.is_unsynced_data_file(fid) {
-                continue;
-            }
-            if let Some(s) = self.store.manifest.data_stat.get(&fid) {
-                if s.active_elems == 0 {
-                    continue;
-                }
-                total += s.total_size as u64;
-                active += s.active_size as u64;
-            }
-        }
-        if total == 0 {
-            return None;
-        }
-        Some((total - active) * 100 / total)
+            .stat_ctx(kind)
+            .bucket_ratio(bucket_id, |fid| {
+                self.store.manifest.is_unsynced_file(kind, fid)
+            })
     }
 
-    fn rewrite_data(&mut self, candidate: Vec<Score>, bucket_id: u64) {
+    fn rewrite_files(&mut self, kind: FileKind, candidate: &[Score], bucket_id: u64) {
         let started = Instant::now();
         let opt = &self.store.opt;
         let Some(permit) = self.store.manifest.try_acquire_rewrite(bucket_id) else {
             return;
         };
-        let file_id = self.numerics.next_data_id.fetch_add(1, Relaxed);
+        let file_id = self.alloc_file_id();
+        let tick = self
+            .store
+            .manifest
+            .get_bucket_runtime(bucket_id)
+            .next_update_epoch(kind);
         // stage orphan intent before rewrite output is flushed
         // crash can happen after file sync but before manifest commit
-        self.store.manifest.stage_orphan_data_file(file_id);
+        self.store.manifest.stage_orphan_file(kind, file_id);
         #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_gc_data_rewrite_after_stage_marker");
-        let mut builder = DataReWriter::new(
+        crate::utils::failpoint::crash(Self::rewrite_stage_marker_failpoint(kind));
+        let mut builder = RewriteBuilder::new(
             file_id,
             opt,
             candidate.len(),
             bucket_id,
+            tick,
             permit.enable_compression,
             permit.compressors.clone(),
         );
@@ -1323,16 +1236,18 @@ impl GarbageCollector {
         };
         let mut obsoleted = Vec::new();
 
-        self.store.manifest.data_stat.start_collect_junks(); // stop in update_stat_interval
+        self.store.manifest.stat_ctx(kind).start_collect_junks(); // stop in update_stat_interval
         let victims: Vec<u64> = candidate
             .iter()
             .filter_map(|x| {
-                let mut loader =
-                    MetaReader::<DataFooter>::new(opt.data_file(x.id)).expect("never happen");
-                let relocs = loader.get_reloc().unwrap();
+                let path = match kind {
+                    FileKind::Data => opt.data_file(x.id),
+                    FileKind::Blob => opt.blob_file(x.id),
+                };
+                let mut loader = MetaReader::new(opt.fs.as_ref(), path);
+                let relocs = loader.get_reloc();
                 let ivls: Vec<Interval> = loader
                     .get_interval()
-                    .unwrap()
                     .iter()
                     .copied()
                     .filter(|ivl| ivl.lo <= ivl.hi)
@@ -1341,23 +1256,19 @@ impl GarbageCollector {
                 let bitmap = self
                     .store
                     .manifest
-                    .data_stat
+                    .stat_ctx(kind)
                     .load_mask_clone(x.id, &self.store.manifest.btree)
                     .expect("must exist");
 
-                // collect active frames
                 let active: Vec<Entry> = relocs
                     .iter()
                     .filter(|m| !bitmap.test(m.val.seq))
                     .map(|m| {
-                        // test here because bitmap maybe full of garbage, it must be ignore
                         im.test(m.key);
                         Entry {
                             key: m.key,
-                            off: m.val.off,
                             raw_len: m.val.raw_len(),
                             compressed_len: m.val.compressed_len(),
-                            crc: m.val.crc,
                         }
                     })
                     .collect();
@@ -1375,33 +1286,26 @@ impl GarbageCollector {
                         builder.add_interval(lo, hi);
                     }
                 });
-                builder.add_frame(Item::new(x.id, x.up2, active));
+                builder.add_item(RewriteItem::new(x.id, x.up2, active));
                 Some(x.id)
             })
             .collect();
         let victim_count = victims.len() as u64;
 
-        // it's possible that other thread deactived all data in data file while we are procesing
-        self.process_obsoleted_data(&obsoleted, bucket_id);
+        // it's possible that another thread deactivated all live items while we were processing
+        self.process_obsoleted_files(kind, &obsoleted, bucket_id);
 
-        // 1. perform disk I/O (build data file)
-        let (mut fstat, relocs) = builder
-            .build()
-            .inspect_err(|e| {
-                log::error!("error {e}");
-            })
-            .unwrap();
+        let (mut fstat, relocs) = must_ok!(builder.build(kind));
         fstat.inner.bucket_id = bucket_id;
         self.store.opt.sync_data_dir();
         #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_gc_data_rewrite_after_data_dir_sync");
+        crate::utils::failpoint::crash(Self::rewrite_after_dir_sync_failpoint(kind));
 
-        // 2. commit metadata transaction
         let mut txn = self.store.manifest.begin();
-        txn.record(MetaKind::Numerics, self.store.manifest.numerics.deref());
+        txn.record(MetaKind::Sequences, self.store.manifest.sequences.deref());
 
-        // the only problem is junks collected by flush thread maybe too many
-        let stat = self.store.manifest.update_data_stat_interval(
+        let stat = self.store.manifest.update_stat_interval(
+            kind,
             fstat,
             relocs,
             &victims,
@@ -1409,300 +1313,47 @@ impl GarbageCollector {
             &remap_intervals,
         );
 
-        txn.record(MetaKind::DataStat, &stat);
+        txn.record(Self::stat_meta_kind(kind), &stat);
 
-        // 1. record delete first
         if !del_intervals.is_empty() {
-            txn.record(MetaKind::DataDelInterval, &del_intervals);
+            txn.record(Self::delete_interval_meta_kind(kind), &del_intervals);
         }
-        // 2. then record remapping, old intervals are point to new file_id
         for i in &remap_intervals {
-            txn.record(MetaKind::DataInterval, i);
+            txn.record(Self::interval_meta_kind(kind), i);
         }
-        // in case crash happens before/during deleting files
         let tmp: Delete = victims.into();
-        // rewrite owns victim deletion in the same transaction and must not publish retired keys
-        txn.record(MetaKind::DataDelete, &tmp);
-        // clear intent in the same metadata txn that publishes the new file
+        txn.record(Self::delete_meta_kind(kind), &tmp);
         self.store
             .manifest
-            .clear_orphan_data_file(&mut txn, file_id);
+            .clear_orphan_file(kind, &mut txn, file_id);
         #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_gc_data_rewrite_before_meta_commit");
+        crate::utils::failpoint::crash(Self::rewrite_before_meta_commit_failpoint(kind));
         txn.commit();
         #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_gc_data_rewrite_after_meta_commit");
+        crate::utils::failpoint::crash(Self::rewrite_after_meta_commit_failpoint(kind));
 
-        // 3. it's safe to clean obsolete files, because they are not referenced
-        self.store.manifest.save_obsolete_data(&tmp);
+        self.store.manifest.save_obsolete_files(kind, &tmp);
         self.store.manifest.delete_files();
-        self.data_runs.fetch_add(1, AcqRel);
+        self.file_runs(kind).fetch_add(1, AcqRel);
         self.store
             .opt
             .observer
-            .counter(CounterMetric::GcDataRewrite, 1);
+            .counter(Self::rewrite_counter(kind), 1);
         self.store.opt.observer.histogram(
-            HistogramMetric::GcDataRewriteMicros,
+            Self::rewrite_micros(kind),
             started.elapsed().as_micros() as u64,
         );
         self.store
             .opt
             .observer
-            .histogram(HistogramMetric::GcDataRewriteVictimFiles, victim_count);
+            .histogram(Self::rewrite_victim_hist(kind), victim_count);
         self.store.opt.observer.event(ObserveEvent {
-            kind: EventKind::GcDataRewriteComplete,
+            kind: Self::rewrite_complete_event(kind),
             bucket_id,
             txid: 0,
             file_id,
             value: victim_count,
         });
-    }
-
-    fn rewrite_blob(&mut self, candidate: &[u64], bucket_id: u64) {
-        let started = Instant::now();
-        let opt = &self.ctx.opt;
-        let Some(permit) = self.store.manifest.try_acquire_rewrite(bucket_id) else {
-            return;
-        };
-        let mut remap_intervals = Vec::new();
-        let mut del_intervals = DelInterval {
-            lo: Vec::new(),
-            bucket_id,
-        };
-        let mut builder = BlobRewriter::new(
-            opt,
-            bucket_id,
-            permit.enable_compression,
-            permit.compressors.clone(),
-        );
-        let blob_id = self.numerics.next_blob_id.fetch_add(1, Relaxed);
-        // stage orphan intent before rewrite output is flushed
-        // crash can happen after file sync but before manifest commit
-        self.store.manifest.stage_orphan_blob_file(blob_id);
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_gc_blob_rewrite_after_stage_marker");
-        let mut obsoleted = Vec::new();
-
-        self.store.manifest.blob_stat.start_collect_junks();
-        let victims: Vec<u64> = candidate
-            .iter()
-            .filter_map(|&victim_id| {
-                let mut loader =
-                    MetaReader::<BlobFooter>::new(opt.blob_file(victim_id)).expect("never happen");
-                let relocs = loader.get_reloc().unwrap();
-                let bitmap = self
-                    .store
-                    .manifest
-                    .blob_stat
-                    .load_mask_clone(victim_id, &self.store.manifest.btree)
-                    .expect("must exist");
-                let ivls: Vec<Interval> = loader
-                    .get_interval()
-                    .unwrap()
-                    .iter()
-                    .copied()
-                    .filter(|ivl| ivl.lo <= ivl.hi)
-                    .collect();
-                let mut im = InactiveMap::new(&ivls);
-
-                let active: Vec<Entry> = relocs
-                    .iter()
-                    .filter(|x| !bitmap.test(x.val.seq))
-                    .map(|x| {
-                        // test here because bitmap maybe full of garbage, it must be ignore
-                        im.test(x.key);
-                        Entry {
-                            key: x.key,
-                            off: x.val.off,
-                            raw_len: x.val.raw_len(),
-                            compressed_len: x.val.compressed_len(),
-                            crc: x.val.crc,
-                        }
-                    })
-                    .collect();
-
-                if active.is_empty() {
-                    obsoleted.push(victim_id);
-                    return None;
-                }
-                im.collect(|unref, ivl| {
-                    let Interval { lo, hi } = ivl;
-                    if unref {
-                        del_intervals.push(lo);
-                    } else {
-                        remap_intervals.push(IntervalPair::new(lo, hi, blob_id, bucket_id));
-                        builder.add_interval(lo, hi);
-                    }
-                });
-                builder.add_item(BlobItem::new(victim_id, active));
-                Some(victim_id)
-            })
-            .collect();
-        let victim_count = victims.len() as u64;
-
-        // it's possible that other thread deactivated all data in blob file while we are processing
-        self.process_obsoleted_blob(&obsoleted, bucket_id);
-
-        // 1. perform disk I/O (build blob file)
-        let (mut bstat, reloc) = builder
-            .build(blob_id)
-            .inspect_err(|e| {
-                log::error!("error {e:?}");
-            })
-            .unwrap();
-        bstat.inner.bucket_id = bucket_id;
-        self.store.opt.sync_data_dir();
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_gc_blob_rewrite_after_data_dir_sync");
-
-        // 2. commit metadata transaction
-        let mut txn = self.store.manifest.begin();
-        txn.record(MetaKind::Numerics, self.store.manifest.numerics.deref());
-
-        let stat = self.store.manifest.update_blob_stat_interval(
-            bstat,
-            reloc,
-            &victims,
-            &del_intervals,
-            &remap_intervals,
-        );
-        txn.record(MetaKind::BlobStat, &stat);
-
-        if !del_intervals.is_empty() {
-            txn.record(MetaKind::BlobDelInterval, &del_intervals);
-        }
-
-        for i in &remap_intervals {
-            txn.record(MetaKind::BlobInterval, i);
-        }
-
-        let tmp: Delete = victims.into();
-        // rewrite owns victim deletion in the same transaction and must not publish retired keys
-        txn.record(MetaKind::BlobDelete, &tmp);
-        // clear intent in the same metadata txn that publishes the new file
-        self.store
-            .manifest
-            .clear_orphan_blob_file(&mut txn, blob_id);
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_gc_blob_rewrite_before_meta_commit");
-
-        txn.commit();
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_gc_blob_rewrite_after_meta_commit");
-
-        self.store.manifest.save_obsolete_blob(&tmp);
-        self.store.manifest.delete_files();
-        self.blob_runs.fetch_add(1, AcqRel);
-        self.store
-            .opt
-            .observer
-            .counter(CounterMetric::GcBlobRewrite, 1);
-        self.store.opt.observer.histogram(
-            HistogramMetric::GcBlobRewriteMicros,
-            started.elapsed().as_micros() as u64,
-        );
-        self.store
-            .opt
-            .observer
-            .histogram(HistogramMetric::GcBlobRewriteVictimFiles, victim_count);
-        self.store.opt.observer.event(ObserveEvent {
-            kind: EventKind::GcBlobRewriteComplete,
-            bucket_id,
-            txid: 0,
-            file_id: blob_id,
-            value: victim_count,
-        });
-    }
-}
-
-pub(crate) fn vacuum_bucket(
-    store: MutRef<Store>,
-    bucket_ctx: Arc<BucketContext>,
-) -> Result<VacuumStats, OpCode> {
-    let state = bucket_ctx.state.clone();
-    let start_epoch = state.vacuum_epoch();
-    let mut stats = VacuumStats::default();
-
-    loop {
-        if state.is_deleting() || state.is_drop() {
-            return Err(OpCode::Again);
-        }
-        if state.try_begin_vacuum() {
-            break;
-        }
-        if state.vacuum_epoch() != start_epoch {
-            return Ok(stats);
-        }
-        state.wait_vacuum(start_epoch);
-        if state.vacuum_epoch() != start_epoch {
-            return Ok(stats);
-        }
-    }
-
-    let _guard = VacuumGuard::new(state.clone());
-    if state.is_deleting() || state.is_drop() {
-        return Err(OpCode::Again);
-    }
-
-    let g = crossbeam_epoch::pin();
-    let table = bucket_ctx.table.clone();
-    let max_pid = table.len();
-    if max_pid == 0 {
-        return Ok(stats);
-    }
-
-    let tree = Tree::new(store.clone(), ROOT_PID, bucket_ctx);
-
-    for pid in ROOT_PID..max_pid {
-        if state.is_deleting() || state.is_drop() {
-            break;
-        }
-
-        let swip = Swip::new(table.get(pid));
-        if swip.is_null() {
-            continue;
-        }
-
-        stats.scanned += 1;
-        if matches!(tree.try_scavenge(pid, &g), Ok(true)) {
-            stats.compacted += 1;
-        }
-    }
-
-    Ok(stats)
-}
-
-struct VacuumGuard {
-    state: MutRef<BucketState>,
-}
-
-impl VacuumGuard {
-    fn new(state: MutRef<BucketState>) -> Self {
-        Self { state }
-    }
-}
-
-impl Drop for VacuumGuard {
-    fn drop(&mut self) {
-        self.state.end_vacuum();
-    }
-}
-
-struct RewriteBuffers {
-    io: Block,
-}
-
-impl RewriteBuffers {
-    fn new(size: usize) -> Self {
-        Self {
-            io: Block::alloc(size),
-        }
-    }
-
-    fn ensure_io(&mut self, need: usize) {
-        if self.io.len() < need {
-            self.io.realloc(need);
-        }
     }
 }
 
@@ -1745,30 +1396,32 @@ fn build_sorted_relocs(pending: &mut [PendingReloc]) -> (Vec<AddrPair>, HashMap<
             entry.key,
             LenSeq::new(entry.raw_len, entry.compressed_len, seq),
         );
-        assert!(old.is_none(), "rewritten reloc key must be unique");
+        must_true!(old.is_none(), "rewritten reloc key must be unique");
     }
     (relocs, reloc_map)
 }
 
-struct DataReWriter<'a> {
+struct RewriteBuilder<'a> {
     file_id: u64,
-    items: Vec<Item>,
+    items: Vec<RewriteItem>,
     intervals: Vec<u8>,
     nr_interval: u32,
-    sum_up2: u64,
-    total: u64,
+    weighted_up2_sum: u128,
+    weighted_up2_size: u128,
+    tick: u64,
     opt: &'a Options,
     enable_compression: bool,
     compressors: Arc<CompressorPool>,
     bucket_id: u64,
 }
 
-impl<'a> DataReWriter<'a> {
+impl<'a> RewriteBuilder<'a> {
     fn new(
         file_id: u64,
         opt: &'a Options,
         cap: usize,
         bucket_id: u64,
+        tick: u64,
         enable_compression: bool,
         compressors: Arc<CompressorPool>,
     ) -> Self {
@@ -1777,8 +1430,9 @@ impl<'a> DataReWriter<'a> {
             items: Vec::with_capacity(cap),
             intervals: Vec::with_capacity(cap),
             nr_interval: 0,
-            sum_up2: 0,
-            total: cap as u64,
+            weighted_up2_sum: 0,
+            weighted_up2_size: 0,
+            tick,
             opt,
             enable_compression,
             compressors,
@@ -1786,8 +1440,10 @@ impl<'a> DataReWriter<'a> {
         }
     }
 
-    fn add_frame(&mut self, item: Item) {
-        self.sum_up2 += item.up2;
+    fn add_item(&mut self, item: RewriteItem) {
+        let weight = item.live_bytes.max(1) as u128;
+        self.weighted_up2_sum += weight * item.up2 as u128;
+        self.weighted_up2_size += weight;
         self.items.push(item);
     }
 
@@ -1797,44 +1453,56 @@ impl<'a> DataReWriter<'a> {
         self.nr_interval += 1;
     }
 
-    fn build(&mut self) -> Result<(MemDataStat, HashMap<u64, LenSeq>), OpCode> {
-        let up2 = self.sum_up2 / self.total;
-        let mut buffers = RewriteBuffers::new(1 << 20);
-        let mut decoder = RecordDecompressor::new()?;
+    fn build(&mut self, kind: FileKind) -> Result<(MemStat, HashMap<u64, LenSeq>), OpCode> {
+        let up2 = self
+            .weighted_up2_sum
+            .checked_div(self.weighted_up2_size)
+            .map(|x| x as u64)
+            .unwrap_or(self.tick);
         let mut off = 0;
-        let path = self.opt.data_file(self.file_id);
-        let mut writer = GatherWriter::trunc(&path, 128);
+        let path = match kind {
+            FileKind::Data => self.opt.data_file(self.file_id),
+            FileKind::Blob => self.opt.blob_file(self.file_id),
+        };
+        let mut writer = GatherWriter::trunc(
+            self.opt.fs.as_ref(),
+            &path,
+            match kind {
+                FileKind::Data => 128,
+                FileKind::Blob => 8,
+            },
+        );
         let mut reloc: Vec<u8> = Vec::new();
         let mut pending_relocs = Vec::new();
+        let decoders = DecompressorPool::new();
+        let mut buffers = RewriteBuffers::new(1 << 20);
+        let mut decoder = RecordDecompressor::new()?;
 
-        self.items.sort_unstable_by_key(|x| x.id);
-        let mut compressor = None;
+        self.items.sort_unstable_by_key(|x| (x.up2, x.id));
+        let mut beg = u64::MAX;
+        let mut end = u64::MIN;
+        let mut compression = RewriteCompression {
+            enabled: self.enable_compression,
+            compressors: self.compressors.as_ref(),
+            compressor: None,
+        };
         for item in &self.items {
-            let reader = File::options()
-                .read(true)
-                .open(self.opt.data_file(item.id))
-                .unwrap();
+            beg = beg.min(item.id);
+            end = end.max(item.id);
+
+            let reader_path = match kind {
+                FileKind::Data => self.opt.data_file(item.id),
+                FileKind::Blob => self.opt.blob_file(item.id),
+            };
+            let reader = new_reader(reader_path, decoders.clone(), self.opt.fs.clone());
             for e in &item.pos {
-                let codec = if self.enable_compression
-                    && e.compressed_len == 0
-                    && e.raw_len as usize >= COMPRESS_MIN_LEN
-                {
-                    Some(compressor.get_or_insert_with(|| {
-                        self.compressors
-                            .borrow()
-                            .expect("data rewrite compressor must exist")
-                    }) as &mut RecordCompressor)
-                } else {
-                    None
-                };
                 let encoded = rewrite_record(
                     &reader,
                     &mut writer,
                     &mut buffers,
                     &mut decoder,
-                    codec,
+                    &mut compression,
                     e,
-                    self.enable_compression,
                 )?;
                 pending_relocs.push(PendingReloc::new(
                     e.key,
@@ -1868,22 +1536,27 @@ impl<'a> DataReWriter<'a> {
         reloc_crc.write(s);
         writer.queue(s);
 
-        let footer = DataFooter {
-            up2,
+        let footer = FileFooter::new(
             nr_reloc,
-            nr_intervals: self.nr_interval,
-            reloc_crc: reloc_crc.finish() as u32,
-            interval_crc: interval_crc.finish() as u32,
-        };
+            self.nr_interval,
+            reloc_crc.finish() as u32,
+            interval_crc.finish() as u32,
+        );
 
         writer.queue(footer.as_slice());
-
         writer.flush();
         writer.sync();
-        log::info!("compacted to {path:?} {footer:?}");
+        match kind {
+            FileKind::Data => {
+                log::info!("compacted to {path:?} {footer:?}");
+            }
+            FileKind::Blob => {
+                log::info!("compacted [{beg}, {end}] to {path:?} {footer:?}");
+            }
+        }
 
-        let stat = MemDataStat {
-            inner: DataStatInner {
+        let stat = MemStat::from_parts(
+            StatInner {
                 file_id: self.file_id,
                 up1: up2,
                 up2,
@@ -1893,186 +1566,38 @@ impl<'a> DataReWriter<'a> {
                 total_size: off,
                 bucket_id: self.bucket_id,
             },
-            mask: Some(BitMap::new(nr_reloc)),
-        };
+            Some(BitMap::new(nr_reloc)),
+        );
         Ok((stat, reloc_map))
     }
 }
 
-struct BlobRewriter<'a> {
-    opt: &'a Options,
-    items: Vec<BlobItem>,
-    intervals: Vec<u8>,
-    nr_interval: u32,
-    enable_compression: bool,
-    compressors: Arc<CompressorPool>,
-    bucket_id: u64,
-}
-
-impl<'a> BlobRewriter<'a> {
-    fn new(
-        opt: &'a Options,
-        bucket_id: u64,
-        enable_compression: bool,
-        compressors: Arc<CompressorPool>,
-    ) -> Self {
-        Self {
-            opt,
-            items: Vec::new(),
-            intervals: Vec::new(),
-            nr_interval: 0,
-            enable_compression,
-            compressors,
-            bucket_id,
-        }
-    }
-
-    fn add_item(&mut self, item: BlobItem) {
-        self.items.push(item);
-    }
-
-    fn add_interval(&mut self, lo: u64, hi: u64) {
-        let ivl = Interval::new(lo, hi);
-        self.intervals.extend_from_slice(ivl.as_slice());
-        self.nr_interval += 1;
-    }
-
-    fn build(&mut self, file_id: u64) -> Result<(MemBlobStat, HashMap<u64, LenSeq>), OpCode> {
-        let path = self.opt.blob_file(file_id);
-        let mut w = GatherWriter::trunc(&path, 8);
-        let mut off = 0;
-        let mut reloc = Vec::new();
-        let mut pending_relocs = Vec::new();
-        let mut buffers = RewriteBuffers::new(1 << 20);
-        let mut decoder = RecordDecompressor::new()?;
-
-        self.items.sort_unstable_by_key(|x| x.id);
-
-        let mut beg = u64::MAX;
-        let mut end = u64::MIN;
-        let mut compressor = None;
-        for item in &self.items {
-            beg = beg.min(item.id);
-            end = end.max(item.id);
-
-            let reader = File::options()
-                .read(true)
-                .open(self.opt.blob_file(item.id))
-                .unwrap();
-
-            for e in &item.pos {
-                let codec = if self.enable_compression
-                    && e.compressed_len == 0
-                    && e.raw_len as usize >= COMPRESS_MIN_LEN
-                {
-                    Some(compressor.get_or_insert_with(|| {
-                        self.compressors
-                            .borrow()
-                            .expect("blob rewrite compressor must exist")
-                    }) as &mut RecordCompressor)
-                } else {
-                    None
-                };
-                let encoded = rewrite_record(
-                    &reader,
-                    &mut w,
-                    &mut buffers,
-                    &mut decoder,
-                    codec,
-                    e,
-                    self.enable_compression,
-                )?;
-                pending_relocs.push(PendingReloc::new(
-                    e.key,
-                    off,
-                    encoded.raw_len,
-                    encoded.compressed_len,
-                    encoded.crc,
-                ));
-                off += if encoded.compressed_len == 0 {
-                    encoded.raw_len as usize
-                } else {
-                    encoded.compressed_len as usize
-                };
-            }
-        }
-
-        let nr_reloc = pending_relocs.len() as u32;
-        let (sorted_relocs, map) = build_sorted_relocs(&mut pending_relocs);
-        reloc.reserve(sorted_relocs.len() * AddrPair::LEN);
-        for entry in sorted_relocs {
-            reloc.extend_from_slice(entry.as_slice());
-        }
-
-        let mut interval_crc = Crc32cHasher::default();
-        let is = self.intervals.as_slice();
-        interval_crc.write(is);
-        w.queue(is);
-
-        let mut reloc_crc = Crc32cHasher::default();
-        let rs = reloc.as_slice();
-        reloc_crc.write(rs);
-        w.queue(rs);
-
-        let footer = BlobFooter {
-            nr_reloc,
-            nr_intervals: self.nr_interval,
-            reloc_crc: reloc_crc.finish() as u32,
-            interval_crc: interval_crc.finish() as u32,
-        };
-
-        w.queue(footer.as_slice());
-        w.flush();
-        w.sync();
-        log::info!("compacted [{beg}, {end}] to {path:?} {footer:?}");
-        let stat = MemBlobStat {
-            inner: BlobStatInner {
-                file_id,
-                active_size: off,
-                nr_active: nr_reloc,
-                nr_total: nr_reloc,
-                bucket_id: self.bucket_id,
-            },
-            mask: Some(BitMap::new(nr_reloc)),
-        };
-        Ok((stat, map))
-    }
-}
-
-struct Item {
+struct RewriteItem {
     id: u64,
     up2: u64,
+    live_bytes: usize,
     pos: Vec<Entry>,
 }
 
-struct BlobItem {
-    id: u64,
-    pos: Vec<Entry>,
-}
-
-impl Item {
-    const fn new(id: u64, up2: u64, pos: Vec<Entry>) -> Self {
-        Self { id, up2, pos }
-    }
-}
-
-impl BlobItem {
-    const fn new(id: u64, pos: Vec<Entry>) -> Self {
-        Self { id, pos }
+impl RewriteItem {
+    fn new(id: u64, up2: u64, pos: Vec<Entry>) -> Self {
+        let live_bytes = pos.iter().map(|e| e.raw_len as usize).sum();
+        Self {
+            id,
+            up2,
+            live_bytes,
+            pos,
+        }
     }
 }
 
 struct Entry {
     /// logical address
     key: u64,
-    /// offset in data file
-    off: usize,
     /// decoded or stored bytes to read
     raw_len: u32,
     /// stored compressed length, 0 means raw
     compressed_len: u32,
-    /// old checksum
-    crc: u32,
 }
 
 struct InactiveMap {
@@ -2102,8 +1627,8 @@ impl InactiveMap {
                 pos - 1
             }
         };
-        assert!(pos < self.ivls.len());
-        assert!(addr >= self.ivls[pos].lo);
+        must_true!(pos < self.ivls.len());
+        must_true!(addr >= self.ivls[pos].lo);
         self.map[pos] = true;
     }
 
@@ -2122,6 +1647,47 @@ struct RewrittenRecord {
     raw_len: u32,
     compressed_len: u32,
     crc: u32,
+}
+
+struct RewriteBuffers {
+    io: Block,
+}
+
+impl RewriteBuffers {
+    fn new(size: usize) -> Self {
+        Self {
+            io: Block::alloc(size),
+        }
+    }
+
+    fn ensure_io(&mut self, need: usize) {
+        if self.io.len() < need {
+            self.io.realloc(need);
+        }
+    }
+}
+
+struct RewriteCompression<'a> {
+    enabled: bool,
+    compressors: &'a CompressorPool,
+    compressor: Option<CompressorGuard<'a>>,
+}
+
+impl<'a> RewriteCompression<'a> {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn get_or_insert(&mut self) -> &mut RecordCompressor {
+        if self.compressor.is_none() {
+            self.compressor = Some(must_ok!(
+                self.compressors.borrow(),
+                "rewrite compressor must exist"
+            ));
+        }
+        must_exist!(self.compressor.as_mut(), "rewrite compressor must exist")
+            as &mut RecordCompressor
+    }
 }
 
 #[inline]
@@ -2165,18 +1731,61 @@ where
     Ok(())
 }
 
-fn rewrite_record<R>(
-    reader: &R,
+fn write_current_record(
+    w: &mut GatherWriter,
+    codec: Option<&mut RecordCompressor>,
+    b: &BoxRef,
+) -> Result<RewrittenRecord, OpCode> {
+    if let Some(codec) = codec {
+        let encoded = codec.encode_box(b)?;
+        if let Some(bytes) = encoded.bytes.as_ref() {
+            w.write(bytes);
+        } else {
+            b.with_persisted_parts(|head, tail| {
+                w.write(head);
+                if let Some(body) = tail {
+                    w.write(body);
+                }
+            });
+        }
+        return Ok(RewrittenRecord {
+            raw_len: encoded.raw_len,
+            compressed_len: encoded.compressed_len,
+            crc: encoded.crc,
+        });
+    }
+
+    let mut crc = Crc32cHasher::default();
+    b.with_persisted_parts(|head, tail| {
+        crc.write(head);
+        w.write(head);
+        if let Some(body) = tail {
+            crc.write(body);
+            w.write(body);
+        }
+    });
+    Ok(RewrittenRecord {
+        raw_len: b.dump_len() as u32,
+        compressed_len: 0,
+        crc: crc.finish() as u32,
+    })
+}
+
+fn rewrite_record<'a>(
+    reader: &FileReader,
     writer: &mut GatherWriter,
     buffers: &mut RewriteBuffers,
     decoder: &mut RecordDecompressor,
-    codec: Option<&mut RecordCompressor>,
+    compression: &mut RewriteCompression<'a>,
     entry: &Entry,
-    enable_compression: bool,
-) -> Result<RewrittenRecord, OpCode>
-where
-    R: GatherIO,
-{
+) -> Result<RewrittenRecord, OpCode> {
+    let target_version = FileVersion::CURRENT;
+    let reloc = must_exist!(
+        reader.find_reloc(entry.key),
+        "reloc must exist for {}",
+        entry.key
+    );
+    let reloc_crc = reloc.crc;
     let raw_len = entry.raw_len as usize;
     let stored_len = if entry.compressed_len == 0 {
         raw_len
@@ -2184,95 +1793,136 @@ where
         entry.compressed_len as usize
     };
 
-    if entry.compressed_len == 0 && (!enable_compression || raw_len < COMPRESS_MIN_LEN) {
-        buffers.ensure_io(stored_len.clamp(1, 4 << 20));
-        let crc = copy_exact(
-            reader,
-            writer,
-            buffers.io.mut_slice(0, buffers.io.len()),
-            stored_len,
-            entry.off as u64,
-        )?;
-        assert_eq!(crc, entry.crc);
-        return Ok(RewrittenRecord {
-            raw_len: entry.raw_len,
-            compressed_len: 0,
-            crc,
-        });
-    }
-
-    if enable_compression && entry.compressed_len == 0 {
-        let codec =
-            codec.expect("compressor must exist when compression is enabled for large raw record");
-        buffers.ensure_io(stored_len);
-        let src = buffers.io.mut_slice::<u8>(0, stored_len);
-        read_exact_at(reader, src, entry.off as u64)?;
-        let crc = crc32c::crc32c(src);
-        assert_eq!(crc, entry.crc);
-
-        if let Some(compressed) = codec.try_compress(src)? {
-            let crc = crc32c::crc32c(&compressed);
-            let stored_len = compressed.len() as u32;
-            writer.write(&compressed);
+    if reader.version().can_reuse_to(target_version) {
+        if entry.compressed_len == 0 && (!compression.enabled() || raw_len < COMPRESS_MIN_LEN) {
+            buffers.ensure_io(stored_len.clamp(1, 4 << 20));
+            let crc = copy_exact(
+                reader.file(),
+                writer,
+                buffers.io.mut_slice(0, buffers.io.len()),
+                stored_len,
+                reloc.off as u64,
+            )?;
+            must_true!(eq crc, reloc_crc);
             return Ok(RewrittenRecord {
                 raw_len: entry.raw_len,
-                compressed_len: stored_len,
+                compressed_len: 0,
                 crc,
             });
         }
 
-        writer.write(src);
-        return Ok(RewrittenRecord {
-            raw_len: entry.raw_len,
-            compressed_len: 0,
-            crc,
-        });
-    }
+        if compression.enabled() && entry.compressed_len == 0 {
+            let codec = compression.get_or_insert();
+            buffers.ensure_io(stored_len);
+            let src = buffers.io.mut_slice::<u8>(0, stored_len);
+            read_exact_at(reader.file(), src, reloc.off as u64)?;
+            let crc = crc32c::crc32c(src);
+            must_true!(eq crc, reloc_crc);
 
-    if enable_compression && entry.compressed_len > 0 {
-        buffers.ensure_io(stored_len.clamp(1, 4 << 20));
-        let crc = copy_exact(
-            reader,
-            writer,
-            buffers.io.mut_slice(0, buffers.io.len()),
+            if let Some(compressed) = codec.try_compress(src)? {
+                let crc = crc32c::crc32c(&compressed);
+                let compressed_len = compressed.len() as u32;
+                writer.write(&compressed);
+                return Ok(RewrittenRecord {
+                    raw_len: entry.raw_len,
+                    compressed_len,
+                    crc,
+                });
+            }
+
+            writer.write(src);
+            return Ok(RewrittenRecord {
+                raw_len: entry.raw_len,
+                compressed_len: 0,
+                crc,
+            });
+        }
+
+        if compression.enabled() && entry.compressed_len > 0 {
+            buffers.ensure_io(stored_len.clamp(1, 4 << 20));
+            let crc = copy_exact(
+                reader.file(),
+                writer,
+                buffers.io.mut_slice(0, buffers.io.len()),
+                stored_len,
+                reloc.off as u64,
+            )?;
+            must_true!(eq crc, reloc_crc);
+            return Ok(RewrittenRecord {
+                raw_len: entry.raw_len,
+                compressed_len: entry.compressed_len,
+                crc,
+            });
+        }
+
+        must_true!(!compression.enabled());
+        if entry.compressed_len == 0 {
+            buffers.ensure_io(stored_len);
+            let src = buffers.io.mut_slice::<u8>(0, stored_len);
+            read_exact_at(reader.file(), src, reloc.off as u64)?;
+            let crc = crc32c::crc32c(src);
+            must_true!(eq crc, reloc_crc);
+            writer.write(src);
+            return Ok(RewrittenRecord {
+                raw_len: entry.raw_len,
+                compressed_len: 0,
+                crc,
+            });
+        }
+
+        let crc = decoder.decode_to_writer(
+            reader.file(),
+            reloc.off as u64,
+            raw_len,
             stored_len,
-            entry.off as u64,
+            writer,
         )?;
-        assert_eq!(crc, entry.crc);
-        return Ok(RewrittenRecord {
-            raw_len: entry.raw_len,
-            compressed_len: entry.compressed_len,
-            crc,
-        });
-    }
-
-    debug_assert!(!enable_compression);
-    if entry.compressed_len == 0 {
-        buffers.ensure_io(stored_len);
-        let src = buffers.io.mut_slice::<u8>(0, stored_len);
-        read_exact_at(reader, src, entry.off as u64)?;
-        let crc = crc32c::crc32c(src);
-        assert_eq!(crc, entry.crc);
-        writer.write(src);
+        must_true!(eq crc.stored, reloc_crc);
         return Ok(RewrittenRecord {
             raw_len: entry.raw_len,
             compressed_len: 0,
-            crc,
+            crc: crc.raw,
         });
     }
 
-    let crc = decoder.decode_to_writer(reader, entry.off as u64, raw_len, stored_len, writer)?;
-    assert_eq!(crc.stored, entry.crc);
-    Ok(RewrittenRecord {
-        raw_len: entry.raw_len,
-        compressed_len: 0,
-        crc: crc.raw,
-    })
+    let record = reader.read_at(entry.key);
+    let codec = if compression.enabled() && record.dump_len() >= COMPRESS_MIN_LEN {
+        Some(compression.get_or_insert())
+    } else {
+        None
+    };
+    write_current_record(writer, codec, &record)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingReloc, build_sorted_relocs};
+    use super::{Entry, PendingReloc, RewriteBuilder, RewriteItem, build_sorted_relocs};
+    use crate::{
+        Options, RandomPath,
+        map::data::{FileVersion, MetaReader},
+        meta::{FileKind, StatInner},
+        types::{
+            header::{NodeType, TagKind},
+            refbox::BoxRef,
+            traits::IHeader,
+        },
+        utils::{INIT_ID, compress::CompressorPool},
+    };
+
+    fn sample_pages() -> [BoxRef; 2] {
+        let (pid, addr) = (114514, 1919810);
+        let mut p = BoxRef::alloc(233, addr);
+        p.header_mut().pid = pid;
+        p.header_mut().kind = TagKind::Delta;
+        p.header_mut().node_type = NodeType::Leaf;
+
+        let (pid1, addr1) = (192, 68);
+        let mut p1 = BoxRef::alloc(666, addr1);
+        p1.header_mut().pid = pid1;
+        p1.header_mut().kind = TagKind::Delta;
+        p1.header_mut().node_type = NodeType::Leaf;
+        [p, p1]
+    }
 
     #[test]
     fn build_sorted_relocs_orders_by_addr_and_reassigns_seq() {
@@ -2302,5 +1952,150 @@ mod tests {
         assert_eq!(map.get(&10).unwrap().compressed_len, 4);
         assert_eq!(map.get(&20).unwrap().seq, 1);
         assert_eq!(map.get(&30).unwrap().seq, 2);
+    }
+
+    #[test]
+    fn score_uses_shared_data_and_blob_formula() {
+        let now = 100;
+        let data = StatInner {
+            file_id: 7,
+            up1: 90,
+            up2: 80,
+            active_elems: 4,
+            total_elems: 8,
+            active_size: 40,
+            total_size: 100,
+            bucket_id: 3,
+        };
+        let blob = StatInner {
+            file_id: 7,
+            up1: 90,
+            up2: 80,
+            active_elems: 4,
+            total_elems: 8,
+            active_size: 40,
+            total_size: 100,
+            bucket_id: 3,
+        };
+
+        let data_score = super::Score::from(data, now);
+        let blob_score = super::Score::from(blob, now);
+
+        assert_eq!(data_score.rate, blob_score.rate);
+        assert_eq!(data_score.size, blob_score.size);
+        assert_eq!(data_score.up2, blob_score.up2);
+    }
+
+    #[test]
+    fn rewrite_builder_emits_v1() {
+        let path = RandomPath::new();
+        let mut opt = Options::new(&*path);
+        opt.tmp_store = true;
+        let opt = opt.validate().unwrap();
+        let _ = opt.create_dir();
+
+        let [p, p1] = sample_pages();
+        let mut file_id = INIT_ID;
+        let mut writer =
+            crate::map::data::FileBuilder::new(0, false, CompressorPool::new(), opt.fs.clone());
+        writer.add(p);
+        writer.add(p1);
+        let files = writer.flush_files(
+            FileKind::Data,
+            opt.data_file_size,
+            7,
+            || {
+                let id = file_id;
+                file_id += 1;
+                (id, opt.data_file(id))
+            },
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(files.len(), 1);
+
+        let mut loader = MetaReader::new(opt.fs.as_ref(), opt.data_file(INIT_ID));
+        assert_eq!(loader.version(), FileVersion::V1);
+        let relocs = loader.get_reloc();
+        let intervals = loader.get_interval();
+
+        let mut builder =
+            RewriteBuilder::new(INIT_ID + 1, &opt, 1, 0, 9, false, CompressorPool::new());
+        for ivl in intervals.iter().copied() {
+            builder.add_interval(ivl.lo, ivl.hi);
+        }
+        let active = relocs
+            .iter()
+            .map(|m| Entry {
+                key: m.key,
+                raw_len: m.val.raw_len(),
+                compressed_len: m.val.compressed_len(),
+            })
+            .collect();
+        builder.add_item(RewriteItem::new(INIT_ID, 7, active));
+
+        let (_stat, _reloc_map) = builder.build(FileKind::Data).expect("rewrite must succeed");
+        let reopened = MetaReader::new(opt.fs.as_ref(), opt.data_file(INIT_ID + 1));
+        assert_eq!(reopened.version(), FileVersion::V1);
+    }
+
+    #[test]
+    fn rewrite_builder_keeps_compressed_v1_records_compressed() {
+        let path = RandomPath::new();
+        let mut opt = Options::new(&*path);
+        opt.tmp_store = true;
+        let opt = opt.validate().unwrap();
+        let _ = opt.create_dir();
+
+        let mut page = BoxRef::alloc(4096, 114514);
+        page.header_mut().pid = 1919810;
+        page.header_mut().kind = TagKind::Delta;
+        page.header_mut().node_type = NodeType::Leaf;
+        page.data_slice_mut::<u8>()[size_of::<crate::types::header::DeltaHeader>()..].fill(b'x');
+
+        let mut file_id = INIT_ID;
+        let mut writer =
+            crate::map::data::FileBuilder::new(0, true, CompressorPool::new(), opt.fs.clone());
+        writer.add(page);
+        let files = writer.flush_files(
+            FileKind::Data,
+            opt.data_file_size,
+            7,
+            || {
+                let id = file_id;
+                file_id += 1;
+                (id, opt.data_file(id))
+            },
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(files.len(), 1);
+
+        let mut loader = MetaReader::new(opt.fs.as_ref(), opt.data_file(INIT_ID));
+        let relocs = loader.get_reloc();
+        assert_eq!(relocs.len(), 1);
+        assert!(relocs[0].val.compressed_len() > 0);
+        let intervals = loader.get_interval();
+
+        let mut builder =
+            RewriteBuilder::new(INIT_ID + 1, &opt, 1, 0, 9, true, CompressorPool::new());
+        for ivl in intervals.iter().copied() {
+            builder.add_interval(ivl.lo, ivl.hi);
+        }
+        let active = relocs
+            .iter()
+            .map(|m| Entry {
+                key: m.key,
+                raw_len: m.val.raw_len(),
+                compressed_len: m.val.compressed_len(),
+            })
+            .collect();
+        builder.add_item(RewriteItem::new(INIT_ID, 7, active));
+
+        let (_stat, _reloc_map) = builder.build(FileKind::Data).expect("rewrite must succeed");
+        let mut rewritten = MetaReader::new(opt.fs.as_ref(), opt.data_file(INIT_ID + 1));
+        let rewritten_relocs = rewritten.get_reloc();
+        assert_eq!(rewritten_relocs.len(), 1);
+        assert!(rewritten_relocs[0].val.compressed_len() > 0);
     }
 }

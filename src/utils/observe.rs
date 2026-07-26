@@ -44,8 +44,6 @@ pub enum CounterMetric {
     GcRun,
     GcWalRecycleFile,
     GcPendingBucketClean,
-    GcScavengePageScan,
-    GcScavengePageCompact,
     GcDataRewrite,
     GcBlobRewrite,
     GcDataObsoleteFile,
@@ -60,7 +58,7 @@ pub enum CounterMetric {
 }
 
 impl CounterMetric {
-    pub const COUNT: usize = 35;
+    pub const COUNT: usize = 33;
     pub const ALL: [CounterMetric; Self::COUNT] = [
         CounterMetric::TxnBegin,
         CounterMetric::TxnCommit,
@@ -84,8 +82,6 @@ impl CounterMetric {
         CounterMetric::GcRun,
         CounterMetric::GcWalRecycleFile,
         CounterMetric::GcPendingBucketClean,
-        CounterMetric::GcScavengePageScan,
-        CounterMetric::GcScavengePageCompact,
         CounterMetric::GcDataRewrite,
         CounterMetric::GcBlobRewrite,
         CounterMetric::GcDataObsoleteFile,
@@ -140,7 +136,6 @@ pub enum HistogramMetric {
     RecoveryRedoMicros,
     RecoveryUndoMicros,
     GcRunMicros,
-    GcScavengeMicros,
     GcDataRewriteMicros,
     GcBlobRewriteMicros,
     GcDataRewriteVictimFiles,
@@ -149,7 +144,7 @@ pub enum HistogramMetric {
 }
 
 impl HistogramMetric {
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 15;
     pub const ALL: [HistogramMetric; Self::COUNT] = [
         HistogramMetric::TxnCommitMicros,
         HistogramMetric::TxnRollbackMicros,
@@ -161,7 +156,6 @@ impl HistogramMetric {
         HistogramMetric::RecoveryRedoMicros,
         HistogramMetric::RecoveryUndoMicros,
         HistogramMetric::GcRunMicros,
-        HistogramMetric::GcScavengeMicros,
         HistogramMetric::GcDataRewriteMicros,
         HistogramMetric::GcBlobRewriteMicros,
         HistogramMetric::GcDataRewriteVictimFiles,

@@ -1,3 +1,27 @@
+## [0.1.0] 2026-07-26
+### New Features
+- Reworked concurrency control into a fact-based MVCC model
+- Added persisted global engine options
+- Introduced an internal filesystem boundary for path-level operations with a fault-injecting implementation for tests
+- Added SI/visibility, recovery and filesystem-failpoint test suites plus an `extra_check`-gated testing surface for deterministic sync points
+
+### Changes
+- Removed `Mace::vacuum_bucket` and `Mace::is_bucket_vacuuming`, and renamed `vacuum_meta` to `compact_meta`
+- Removed runtime background delta compaction from the evictor
+- Standardized all persisted integer layouts on little-endian
+- Hardened startup recovery teardown so a failed open releases manifest state, reconstructed abort-clean work and store resources instead of leaving partially initialized state behind
+- Refreshed `docs/design.md` and the constraint registry to match the current runtime, recovery, checkpoint, WAL recycle and GC behavior
+- Reworked `README.md`: storage format and public APIs are now considered essentially stable and ready for production evaluation
+
+### Performance
+- Improved tree lookup and read-path locality
+
+### Bug Fixes
+- Fixed a visibility hole caused by retiring same-generation structural junk too early
+- Fixed durable-frontier information loss for remote values
+- Fixed the WAL maintenance boundary reading a lagging source of truth
+- Fixed foreground admission waiters stalling on snapshot-backed predicates that are not paired with a condvar signal, by rechecking on a bounded timeout
+
 ## [0.0.35] 2026-07-02
 ### New Features
 - Added optional zstd compression for persisted bucket data and blob records

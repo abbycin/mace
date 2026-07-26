@@ -1,3 +1,5 @@
+use crate::must_true;
+
 pub struct Varint32;
 #[cfg(test)]
 pub struct Varint64;
@@ -39,11 +41,10 @@ macro_rules! impl_varint {
                     i += 1;
                 }
                 data[i] = x as u8;
-                debug_assert!(data[i] < 128);
+                must_true!(data[i] < 128);
                 i + 1
             }
 
-            #[allow(unused)]
             pub fn decode(data: &[u8]) -> Option<($e, usize)> {
                 let mut n: $e = 0;
                 let mut shift = 0;

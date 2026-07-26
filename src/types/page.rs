@@ -2,7 +2,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::{
     types::traits::{IHeader, ILoader},
-    utils::{Handle, OpCode},
+    utils::Handle,
 };
 
 use super::node::Node;
@@ -33,11 +33,11 @@ where
         }
     }
 
-    pub(crate) fn load(l: L, addr: u64) -> Result<Self, OpCode> {
-        let node = Node::<L>::load(addr, l)?;
-        Ok(Self {
+    pub(crate) fn load(l: L, addr: u64) -> Self {
+        let node = Node::<L>::load(addr, l);
+        Self {
             inner: Handle::new(node),
-        })
+        }
     }
 
     pub(crate) fn swip(&self) -> u64 {

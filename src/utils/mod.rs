@@ -23,6 +23,7 @@ pub(crate) mod interval;
 pub(crate) mod lru;
 pub mod observe;
 pub(crate) mod options;
+pub(crate) mod seqlock;
 pub(crate) mod spooky;
 pub(crate) mod varint;
 
@@ -94,8 +95,6 @@ pub const ADDR_LEN: usize = size_of::<u64>();
 pub(crate) const INIT_ID: u64 = 0;
 pub(crate) const INIT_CMD: u32 = 1;
 pub(crate) const NULL_CMD: u32 = u32::MAX;
-pub(crate) const INIT_WMK: u64 = 0;
-/// NOTE: must larger than wmk_oldest (which is 0 by default)
 pub(crate) const INIT_ORACLE: u64 = 1;
 pub(crate) const NULL_ORACLE: u64 = u64::MAX;
 
@@ -107,6 +106,8 @@ pub(crate) const fn align_up(n: usize, align: usize) -> usize {
 pub(crate) const fn align_down(n: usize, align: usize) -> usize {
     n & !(align - 1)
 }
+
+use crate::must_true;
 
 pub(crate) fn raw_ptr_to_ref<'a, T>(x: *mut T) -> &'a T {
     unsafe { &*x }
@@ -135,12 +136,12 @@ macro_rules! static_assert {
 #[macro_export]
 macro_rules! number_to_slice {
     ($num: expr, $slice:expr) => {
-        $slice.copy_from_slice(&$num.to_be_bytes());
+        $slice.copy_from_slice(&$num.to_le_bytes());
     };
 }
 #[macro_export]
 macro_rules! slice_to_number {
-    ($slice:expr, $num:ty) => {{ <$num>::from_be_bytes($slice.try_into().unwrap()) }};
+    ($slice:expr, $num:ty) => {{ <$num>::from_le_bytes($slice.try_into().unwrap()) }};
 }
 
 pub fn rand_range(range: Range<usize>) -> usize {
@@ -149,6 +150,7 @@ pub fn rand_range(range: Range<usize>) -> usize {
 
 static_assert!(size_of::<usize>() == size_of::<u64>());
 static_assert!(size_of::<u8>() == size_of::<bool>());
+static_assert!(cfg!(target_endian = "little"));
 
 /// A utility for managing temporary paths that are deleted on drop.
 pub struct RandomPath {
@@ -347,7 +349,7 @@ impl<T> Handle<T> {
     }
 
     pub(crate) fn reclaim(&self) {
-        debug_assert!(
+        must_true!(
             !self.raw.is_null(),
             "Double reclaim detected or reclaiming null handle"
         );
@@ -488,14 +490,14 @@ mod test {
         static_assert!(true, "damn");
 
         let mut num = 233u64;
-        let mut s = &mut num.to_be_bytes()[0..size_of::<u64>()];
+        let mut s = &mut num.to_le_bytes()[0..size_of::<u64>()];
         let new_num = slice_to_number!(s, u64);
         assert_eq!(new_num, num);
 
         s[0] = 1;
         num = 114514;
         number_to_slice!(num, &mut s);
-        let new_num = u64::from_be_bytes(s.try_into().unwrap());
+        let new_num = u64::from_le_bytes(s.try_into().unwrap());
 
         assert_eq!(new_num, num);
     }

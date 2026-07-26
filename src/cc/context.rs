@@ -1,22 +1,22 @@
+use crate::meta::Sequences;
+use crate::{must_ok, must_true};
 use crossbeam_epoch::Guard;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 
 use crate::OpCode;
-use crate::cc::cc::ConcurrencyControl;
-use crate::meta::Numerics;
 use crate::utils::data::Position;
 use crate::utils::options::ParsedOptions;
-use crate::utils::{CachePad, Handle, INIT_WMK, NULL_ORACLE};
+use crate::utils::seqlock::SeqLock;
+use crate::utils::{CachePad, Handle, NULL_ORACLE};
 
-use super::group::WriterGroup;
-use std::ops::{Deref, DerefMut};
+use super::group::{RegistrationTs, TxnFact, WriterGroup};
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -25,11 +25,6 @@ pub(crate) struct GroupBoot {
     pub oldest_id: u64,
     pub latest_id: u64,
     pub checkpoint: Position,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TxOutcome {
-    Aborted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,99 +44,58 @@ pub(crate) enum AbortCleanState {
     WaitingQuiesce,
 }
 
-struct SeqLock {
-    seq: CachePad<AtomicU64>,
+#[cfg_attr(not(feature = "extra_check"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectorSignal {
+    Wake,
+    Quit,
 }
 
-struct SeqWriteGuard<'a> {
-    lock: &'a SeqLock,
-}
-
-impl SeqLock {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            seq: CachePad::default(),
-        }
+#[inline]
+fn two_choices(ticket: usize, nr: usize) -> (usize, usize) {
+    debug_assert!(nr > 0);
+    let home = ticket % nr;
+    if nr == 1 {
+        return (home, home);
     }
 
-    #[inline]
-    fn write_lock(&self) -> SeqWriteGuard<'_> {
-        let mut seq = self.seq.load(Relaxed);
-        loop {
-            if seq & 1 == 1 {
-                std::hint::spin_loop();
-                seq = self.seq.load(Relaxed);
-                continue;
-            }
-            match self
-                .seq
-                .compare_exchange_weak(seq, seq + 1, AcqRel, Acquire)
-            {
-                Ok(_) => return SeqWriteGuard { lock: self },
-                Err(actual) => seq = actual,
-            }
-        }
-    }
-
-    #[inline]
-    fn read<T, F>(&self, mut f: F) -> T
-    where
-        F: FnMut() -> T,
-    {
-        loop {
-            let seq1 = self.seq.load(Acquire);
-            if seq1 & 1 == 1 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let out = f();
-            let seq2 = self.seq.load(Acquire);
-            if seq1 == seq2 {
-                return out;
-            }
-        }
-    }
-}
-
-impl Drop for SeqWriteGuard<'_> {
-    fn drop(&mut self) {
-        self.lock.seq.fetch_add(1, Release);
-    }
+    // advance the offset after each full home round so every home visits every other choice
+    let round = ticket / nr;
+    let offset = 1 + round % (nr - 1);
+    let second = home + offset;
+    (home, if second >= nr { second - nr } else { second })
 }
 
 pub struct Context {
     pub(crate) opt: Arc<ParsedOptions>,
-    /// maybe a bottleneck
-    /// contains oldest, txid less than or equal to it can be purged
-    pub(crate) numerics: Arc<Numerics>,
+    pub(crate) sequences: Arc<Sequences>,
+    safe_exclusive: Arc<AtomicU64>,
     pool: Arc<CCPool>,
     groups: Arc<Vec<WriterGroup>>,
-    nr_view: CachePad<AtomicUsize>,
     group_rr: CachePad<AtomicUsize>,
-    /// this value is advanced by collect_thread based on active view snapshots
-    min_view_txid: Arc<AtomicU64>,
-    tx_outcomes: Vec<RwLock<FxHashMap<u64, TxOutcome>>>,
     pending_abort_clean: Vec<RwLock<BTreeMap<u64, AbortCleanTask>>>,
     pending_abort_clean_buckets: Vec<RwLock<FxHashMap<u64, usize>>>,
     pending_abort_clean_nr: CachePad<AtomicUsize>,
     pending_abort_clean_floor: CachePad<AtomicU64>,
     pending_abort_clean_seqlock: SeqLock,
     abort_clean_events: Arc<Mutex<Vec<u64>>>,
-    tx: Sender<()>,
+    tx: Sender<CollectorSignal>,
     collector: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Context {
     const SHARDS: usize = 64;
     const MASK: usize = Self::SHARDS - 1;
-    const VIEW_HANDOFF: usize = usize::MAX;
 
     const fn shard_of(txid: u64) -> usize {
         (txid as usize) & Self::MASK
     }
 
-    pub fn new(opt: Arc<ParsedOptions>, numerics: Arc<Numerics>, group_boot: &[GroupBoot]) -> Self {
+    pub fn new(
+        opt: Arc<ParsedOptions>,
+        sequences: Arc<Sequences>,
+        group_boot: &[GroupBoot],
+    ) -> Self {
         let cores = opt.concurrent_write as usize;
         let mut groups = Vec::with_capacity(cores);
         for i in 0..cores {
@@ -160,23 +114,25 @@ impl Context {
             groups.push(g);
         }
 
-        let pool = Arc::new(CCPool::new(cores));
+        let pool = Arc::new(CCPool::new());
         let groups = Arc::new(groups);
-        let min_view_txid = Arc::new(AtomicU64::new(INIT_WMK));
+        let safe_exclusive = Arc::new(AtomicU64::new(sequences.oracle.load(Acquire)));
         let (tx, rx) = channel();
-        let collector = collect_thread(rx, min_view_txid.clone(), pool.clone());
+        let collector = collect_thread(
+            rx,
+            sequences.clone(),
+            groups.clone(),
+            safe_exclusive.clone(),
+            pool.clone(),
+        );
 
         Self {
             opt: opt.clone(),
-            numerics,
+            sequences,
+            safe_exclusive,
             pool,
             groups,
-            nr_view: CachePad::default(),
             group_rr: CachePad::default(),
-            min_view_txid,
-            tx_outcomes: (0..Self::SHARDS)
-                .map(|_| RwLock::new(FxHashMap::default()))
-                .collect(),
             pending_abort_clean: (0..Self::SHARDS)
                 .map(|_| RwLock::new(BTreeMap::new()))
                 .collect(),
@@ -216,75 +172,26 @@ impl Context {
         self.pending_abort_clean_floor.store(floor, Relaxed);
     }
 
-    pub fn oldest_view_txid(&self) -> Option<u64> {
-        loop {
-            let nr = self.nr_view.load(Acquire);
-            if nr == Self::VIEW_HANDOFF {
-                std::hint::spin_loop();
-                continue;
-            }
-            if nr > 0 {
-                return Some(self.min_view_txid.load(Relaxed));
-            }
-            return None;
-        }
+    pub(crate) fn alloc_view_pin(&self) -> Handle<CCNode> {
+        let pin = self.pool.alloc();
+        pin.begin_reg();
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_view_sync_point(
+            crate::testing::ViewSyncPoint::AfterCcnodeRegisteringBeforeTimestampSample,
+        );
+        let start_ts = self.sample_view_oracle();
+        pin.activate(start_ts);
+        pin
     }
 
-    pub(crate) fn alloc_cc(&self) -> Handle<CCNode> {
-        loop {
-            let prev = self.nr_view.load(Acquire);
-            if prev == Self::VIEW_HANDOFF {
-                std::hint::spin_loop();
-                continue;
-            }
-            if prev == 0 {
-                // publish the new epoch floor before readers can observe active views again
-                if self
-                    .nr_view
-                    .compare_exchange(0, Self::VIEW_HANDOFF, AcqRel, Acquire)
-                    .is_err()
-                {
-                    continue;
-                }
-                // reserve a node before publication so its start_ts can become the
-                // first visible active-view source before nr_view leaves handoff
-                let cc = self.pool.alloc();
-                let start_ts = self.load_oracle();
-                cc.set_start_ts(start_ts);
-                self.min_view_txid.store(start_ts, Relaxed);
-                self.nr_view.store(1, Release);
-                return cc;
-            }
-            if self
-                .nr_view
-                .compare_exchange_weak(prev, prev + 1, AcqRel, Acquire)
-                .is_ok()
-            {
-                // reserve a node and publish its start_ts before the collector can
-                // observe this shared view through the registry scan
-                let cc = self.pool.alloc();
-                let start_ts = self.load_oracle();
-                cc.set_start_ts(start_ts);
-                return cc;
-            }
-        }
+    pub fn free_view_pin(&self, pin: Handle<CCNode>) {
+        pin.clear_idle();
+        self.pool.free(pin);
     }
 
-    pub fn free_cc(&self, cc: Handle<CCNode>) {
-        loop {
-            let prev = self.nr_view.load(Acquire);
-            debug_assert!(prev > 0 && prev != Self::VIEW_HANDOFF);
-            if self
-                .nr_view
-                .compare_exchange_weak(prev, prev - 1, Release, Acquire)
-                .is_ok()
-            {
-                break;
-            }
-        }
-        // keep the previous floor until the next 0 -> 1 refresh so a racing handoff
-        // cannot publish a stale older epoch as active
-        self.pool.free(cc);
+    #[cfg(feature = "extra_check")]
+    pub(crate) fn request_collect(&self) {
+        let _ = self.tx.send(CollectorSignal::Wake);
     }
 
     #[inline]
@@ -298,83 +205,75 @@ impl Context {
 
     pub(crate) fn next_group_id(&self) -> usize {
         let nr = self.groups.len();
-        const SPIN_RETRY: usize = 32;
-        let mut best_gid = 0;
-        let mut best_load = usize::MAX;
-        for attempt in 0..=SPIN_RETRY {
-            let start = self.group_rr.fetch_add(1, Relaxed) % nr;
-            for i in 0..nr {
-                let gid = (start + i) % nr;
-                if self.groups[gid].try_enter_inflight_if_free() {
-                    return gid;
-                }
-                let load = self.groups[gid].inflight();
-                if load < best_load {
-                    best_load = load;
-                    best_gid = gid;
-                }
-            }
-            if best_load <= 1 && attempt < SPIN_RETRY {
-                std::thread::yield_now();
-                best_load = usize::MAX;
-                continue;
-            }
-            self.groups[best_gid].enter_inflight();
-            return best_gid;
-        }
-        unreachable!()
-    }
-
-    #[inline]
-    pub(crate) fn watermark_txid(&self) -> u64 {
-        self.numerics.wmk_oldest.load(Relaxed)
-    }
-
-    #[inline]
-    pub(crate) fn update_wmk(&self, x: u64) {
-        let oldest = if let Some(view) = self.oldest_view_txid() {
-            view.min(x)
+        let ticket = self.group_rr.fetch_add(1, Relaxed);
+        let (home, second) = two_choices(ticket, nr);
+        let home_load = self.groups[home].inflight();
+        let chosen = if nr == 1 {
+            home
         } else {
-            x
+            let second_load = self.groups[second].inflight();
+            if second_load < home_load {
+                second
+            } else {
+                home
+            }
         };
-        self.numerics.wmk_oldest.store(oldest, Relaxed);
+        self.groups[chosen].enter_inflight();
+        chosen
     }
 
     #[inline]
-    pub(crate) fn load_oracle(&self) -> u64 {
-        self.numerics.oracle.load(Relaxed)
+    pub(crate) fn safe_exclusive(&self) -> u64 {
+        self.safe_exclusive.load(Acquire)
+    }
+
+    pub(crate) fn init_safe_exclusive(&self, recovered_oracle: u64) {
+        self.safe_exclusive.store(recovered_oracle, Release);
+    }
+
+    #[inline]
+    fn sample_view_oracle(&self) -> u64 {
+        self.sequences.oracle.load(SeqCst) // must use seqcst
     }
 
     pub(crate) fn alloc_oracle(&self) -> u64 {
-        self.numerics.oracle.fetch_add(1, Relaxed)
+        self.sequences.oracle.fetch_add(1, AcqRel)
     }
 
     #[inline]
-    pub(crate) fn add_aborted(&self, txid: u64) {
-        let shard = Self::shard_of(txid);
-        self.tx_outcomes[shard]
+    pub(crate) fn build_abort_clean_task(
+        &self,
+        txid: u64,
+        bucket_id: u64,
+        group_id: u8,
+        tail_lsn: Position,
+        pin_file_id: u64,
+    ) -> AbortCleanTask {
+        AbortCleanTask {
+            txid,
+            bucket_id,
+            group_id,
+            tail_lsn,
+            pin_file_id: pin_file_id.min(tail_lsn.file_id),
+            state: AbortCleanState::Pending,
+            quiesced: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn enqueue_abort_clean_task(&self, task: AbortCleanTask) {
+        let _seq = self.pending_abort_clean_seqlock.write_lock();
+        let shard = Self::shard_of(task.txid);
+        let old = self.pending_abort_clean[shard]
             .write()
-            .insert(txid, TxOutcome::Aborted);
-    }
-
-    #[inline]
-    pub(crate) fn del_aborted(&self, txid: u64) {
-        let shard = Self::shard_of(txid);
-        self.tx_outcomes[shard].write().remove(&txid);
-    }
-
-    #[inline]
-    pub(crate) fn get_aborted(&self, txid: u64) -> Option<TxOutcome> {
-        let shard = Self::shard_of(txid);
-        self.tx_outcomes[shard].read().get(&txid).copied()
-    }
-
-    #[inline]
-    pub(crate) fn is_aborted(&self, txid: u64) -> bool {
-        let pending_floor = self
-            .pending_abort_clean_seqlock
-            .read(|| self.pending_abort_clean_floor.load(Relaxed));
-        pending_floor != u64::MAX && txid >= pending_floor
+            .insert(task.txid, task);
+        if old.is_none() {
+            self.pending_abort_clean_nr.fetch_add(1, Relaxed);
+            self.update_pending_abort_clean_floor(task.txid);
+            let bucket_shard = Self::shard_of(task.bucket_id);
+            let mut buckets = self.pending_abort_clean_buckets[bucket_shard].write();
+            *buckets.entry(task.bucket_id).or_insert(0) += 1;
+        }
     }
 
     #[inline]
@@ -386,47 +285,42 @@ impl Context {
         tail_lsn: Position,
         pin_file_id: u64,
     ) {
-        let task = AbortCleanTask {
+        self.enqueue_abort_clean_task(self.build_abort_clean_task(
             txid,
             bucket_id,
             group_id,
             tail_lsn,
-            pin_file_id: pin_file_id.min(tail_lsn.file_id),
-            state: AbortCleanState::Pending,
-            quiesced: false,
-        };
-        let _seq = self.pending_abort_clean_seqlock.write_lock();
-        let shard = Self::shard_of(txid);
-        let old = self.pending_abort_clean[shard].write().insert(txid, task);
-        if old.is_none() {
-            self.pending_abort_clean_nr.fetch_add(1, Relaxed);
-            self.update_pending_abort_clean_floor(txid);
-            let bucket_shard = Self::shard_of(bucket_id);
-            let mut buckets = self.pending_abort_clean_buckets[bucket_shard].write();
-            *buckets.entry(bucket_id).or_insert(0) += 1;
-        }
+            pin_file_id,
+        ));
     }
 
-    #[inline]
     pub(crate) fn remove_abort_clean(&self, txid: u64) {
-        let _seq = self.pending_abort_clean_seqlock.write_lock();
-        let shard = Self::shard_of(txid);
-        let old = self.pending_abort_clean[shard].write().remove(&txid);
-        if let Some(task) = old {
-            self.pending_abort_clean_nr.fetch_sub(1, Relaxed);
-            if self.pending_abort_clean_nr.load(Relaxed) == 0 {
-                self.pending_abort_clean_floor.store(u64::MAX, Relaxed);
-            } else if txid <= self.pending_abort_clean_floor.load(Relaxed) {
-                self.recompute_pending_abort_clean_floor();
-            }
-            let bucket_shard = Self::shard_of(task.bucket_id);
-            let mut buckets = self.pending_abort_clean_buckets[bucket_shard].write();
-            if let Some(cnt) = buckets.get_mut(&task.bucket_id) {
-                *cnt -= 1;
-                if *cnt == 0 {
-                    buckets.remove(&task.bucket_id);
+        let old = {
+            let _seq = self.pending_abort_clean_seqlock.write_lock();
+            let shard = Self::shard_of(txid);
+            let old = self.pending_abort_clean[shard].write().remove(&txid);
+            if let Some(task) = old {
+                self.pending_abort_clean_nr.fetch_sub(1, Relaxed);
+                if self.pending_abort_clean_nr.load(Relaxed) == 0 {
+                    self.pending_abort_clean_floor.store(u64::MAX, Relaxed);
+                } else if txid <= self.pending_abort_clean_floor.load(Relaxed) {
+                    self.recompute_pending_abort_clean_floor();
                 }
+                let bucket_shard = Self::shard_of(task.bucket_id);
+                let mut buckets = self.pending_abort_clean_buckets[bucket_shard].write();
+                if let Some(cnt) = buckets.get_mut(&task.bucket_id) {
+                    *cnt -= 1;
+                    if *cnt == 0 {
+                        buckets.remove(&task.bucket_id);
+                    }
+                }
+                Some(task)
+            } else {
+                None
             }
+        };
+        if let Some(task) = old {
+            self.groups[task.group_id as usize].retire_aborted_fact(txid);
         }
     }
 
@@ -463,7 +357,7 @@ impl Context {
         std::mem::take(&mut *self.abort_clean_events.lock())
     }
 
-    pub(crate) fn min_file_id(&self, group_id: u8) -> Option<u64> {
+    pub(crate) fn min_abort_clean_file_id(&self, group_id: u8) -> Option<u64> {
         let mut min_id = None;
         for shard in &self.pending_abort_clean {
             let candidate = shard
@@ -489,12 +383,7 @@ impl Context {
 
     #[inline]
     pub(crate) fn compact_safe_txid(&self) -> u64 {
-        let mut safe = self.watermark_txid();
-        if let Some(view) = self.oldest_view_txid() {
-            // compaction must preserve one version strictly older than the oldest lagging view
-            // because records written at the same start_ts are only visible to that exact txn/group
-            safe = safe.min(view.saturating_sub(1));
-        }
+        let mut safe = self.safe_exclusive().saturating_sub(1);
         let pending_floor = self
             .pending_abort_clean_seqlock
             .read(|| self.pending_abort_clean_floor.load(Relaxed));
@@ -512,18 +401,10 @@ impl Context {
 
     pub(crate) fn quit(&self) {
         self.groups.iter().for_each(|x| {
-            let r = {
-                let mut log = x.logging.lock();
-                log.sync(true)
-            };
-            r.inspect_err(|e| {
-                log::error!("can't stabilize WAL, {:?}", e);
-            })
-            .expect("can't fail");
+            let mut log = x.logging.lock();
+            must_ok!(log.sync(true));
         });
-        self.tx
-            .send(())
-            .expect("notify collector thread quit failed");
+        must_ok!(self.tx.send(CollectorSignal::Quit));
 
         if let Some(h) = self.collector.lock().take() {
             let _ = h.join();
@@ -540,67 +421,267 @@ impl Context {
 }
 
 fn collect_thread(
-    reader: Receiver<()>,
-    min_view_txid: Arc<AtomicU64>,
+    reader: Receiver<CollectorSignal>,
+    sequences: Arc<Sequences>,
+    groups: Arc<Vec<WriterGroup>>,
+    safe_exclusive: Arc<AtomicU64>,
     pool: Arc<CCPool>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("collector".into())
         .spawn(move || {
-            loop {
-                let r = reader.recv_timeout(Duration::from_millis(10));
-                match r {
-                    Err(RecvTimeoutError::Timeout) => {
-                        let mut min = NULL_ORACLE;
-                        let r = pool.registry.read();
-                        for h in r.iter() {
-                            min = min.min(h.start_ts());
-                        }
-                        drop(r);
-                        if min != NULL_ORACLE {
-                            min_view_txid.store(min, Relaxed);
-                        }
-                        pool.maybe_shrink();
-                    }
-                    _ => break,
+            let mut committed = Vec::new();
+            let mut registry_nodes = Vec::with_capacity(CCPOOL_SHARD);
+            let mut idle_delay = collector_idle_delay(Duration::ZERO);
+            while let Err(RecvTimeoutError::Timeout) | Ok(CollectorSignal::Wake) =
+                reader.recv_timeout(idle_delay)
+            {
+                let cost = run_collect_cycle(
+                    &sequences,
+                    groups.as_ref(),
+                    safe_exclusive.as_ref(),
+                    &pool,
+                    &mut committed,
+                    &mut registry_nodes,
+                );
+                idle_delay = collector_idle_delay(cost);
+                if drain_pending_wakes(&reader) {
+                    break;
                 }
             }
         })
         .expect("can't start collector thread")
 }
 
+const MAINTENANCE_BUDGET: Duration = Duration::from_micros(200);
+const COLLECTOR_MIN_SLEEP: Duration = Duration::from_millis(10);
+const PRUNE_LOCK_BATCH: usize = 256;
+const DUTY_CYCLE_SLEEP_MULTIPLIER: u32 = 19;
+
+fn run_collect_cycle(
+    sequences: &Sequences,
+    groups: &[WriterGroup],
+    safe_exclusive: &AtomicU64,
+    pool: &CCPool,
+    committed: &mut Vec<(usize, u64, u64)>,
+    registry_nodes: &mut Vec<*mut CCNode>,
+) -> Duration {
+    let proof_scan_started = Instant::now();
+    // `SeqCst` linearizes this cut with view registration and timestamp sampling (`oracle` and
+    // `CCNode::state`)
+    //
+    // forbidden execution: the collector misses a live view registration while that view samples
+    // start_ts < cut
+    //
+    // if the scan does not cover a view that stays live, its state load must precede the
+    // `Registering` store in the `SeqCst` order; because this cut precedes the scan and registration
+    // precedes the view's oracle load, the resulting cut < scan < registration < sample order proves
+    // start_ts >= cut
+    let cut = sequences.oracle.load(SeqCst);
+    #[cfg(feature = "extra_check")]
+    crate::testing::fire_collector_sync_point(
+        crate::testing::CollectorSyncPoint::AfterCollectorCutBeforeFactScan,
+        cut,
+    );
+
+    let mut floor = cut;
+    let mut can_publish = true;
+    committed.clear();
+
+    for group in groups.iter() {
+        match group.stable_ts() {
+            RegistrationTs::None => {}
+            RegistrationTs::Published(start_ts) => {
+                floor = floor.min(start_ts);
+            }
+            RegistrationTs::Pending => {
+                can_publish = false;
+            }
+        }
+        for fact in group.facts.iter() {
+            let start_ts = *fact.key();
+            match *fact.value() {
+                TxnFact::Active(_) => {
+                    floor = floor.min(start_ts);
+                }
+                TxnFact::Committed(commit_ts) => {
+                    committed.push((group.id, start_ts, commit_ts));
+                }
+                TxnFact::Aborted => {}
+            }
+        }
+    }
+
+    let _guard = crossbeam_epoch::pin();
+    snapshot_registry_nodes(pool, registry_nodes);
+    for &node in registry_nodes.iter() {
+        let cc = unsafe { &*node };
+        match cc.collect() {
+            ViewState::Idle => {}
+            ViewState::Registering => {
+                can_publish = false;
+            }
+            ViewState::Active(start_ts) => {
+                floor = floor.min(start_ts);
+            }
+        }
+    }
+
+    let mut published_safe = safe_exclusive.load(Acquire);
+    if can_publish {
+        let mut committed_floor = u64::MAX;
+        for &(_, start_ts, commit_ts) in committed.iter() {
+            if commit_ts >= floor {
+                committed_floor = committed_floor.min(start_ts);
+            }
+        }
+        let candidate = floor.min(committed_floor);
+        debug_assert!(candidate <= cut);
+        debug_assert!(candidate >= published_safe);
+        if candidate > published_safe {
+            safe_exclusive.store(candidate, Release);
+            published_safe = candidate;
+        }
+    }
+    let proof_scan_cost = proof_scan_started.elapsed();
+
+    let deadline = Instant::now() + MAINTENANCE_BUDGET;
+    if published_safe != 0 {
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_collector_sync_point(
+            crate::testing::CollectorSyncPoint::AfterSafePublishBeforeCommittedFactPrune,
+            published_safe,
+        );
+        prune_committed_facts(groups, committed, published_safe, deadline);
+    }
+    if Instant::now() < deadline {
+        pool.maybe_shrink_until(deadline);
+    }
+    proof_scan_cost
+}
+
+fn prune_committed_facts(
+    groups: &[WriterGroup],
+    committed: &[(usize, u64, u64)],
+    safe_exclusive: u64,
+    deadline: Instant,
+) {
+    for (idx, &(group_id, start_ts, _)) in committed.iter().enumerate() {
+        if start_ts >= safe_exclusive {
+            continue;
+        }
+        if idx > 0 && idx.is_multiple_of(PRUNE_LOCK_BATCH) && Instant::now() >= deadline {
+            break;
+        }
+        groups[group_id].facts.remove(&start_ts);
+    }
+}
+
+fn collector_idle_delay(proof_scan_cost: Duration) -> Duration {
+    proof_scan_cost
+        .checked_mul(DUTY_CYCLE_SLEEP_MULTIPLIER)
+        .map_or(Duration::MAX, |delay| delay.max(COLLECTOR_MIN_SLEEP))
+}
+
+fn drain_pending_wakes(reader: &Receiver<CollectorSignal>) -> bool {
+    loop {
+        match reader.try_recv() {
+            Ok(CollectorSignal::Wake) => {}
+            Ok(CollectorSignal::Quit) | Err(TryRecvError::Disconnected) => return true,
+            Err(TryRecvError::Empty) => return false,
+        }
+    }
+}
+
+fn snapshot_registry_nodes(pool: &CCPool, registry_nodes: &mut Vec<*mut CCNode>) {
+    let registry = pool.registry.read();
+    registry_nodes.clear();
+    registry_nodes.extend(registry.iter().map(|node| node.inner()));
+}
+
 const CCPOOL_SHARD: usize = 32;
 const CCPOOL_SHARD_MASK: usize = CCPOOL_SHARD - 1;
 
+const VIEW_STATE_IDLE: u64 = 0;
+const VIEW_STATE_REGISTERING: u64 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewState {
+    Idle,
+    Registering,
+    Active(u64),
+}
+
+#[inline]
+fn encode_view_state(state: ViewState) -> u64 {
+    match state {
+        ViewState::Idle => VIEW_STATE_IDLE,
+        ViewState::Registering => VIEW_STATE_REGISTERING,
+        ViewState::Active(start_ts) => {
+            must_true!(start_ts <= u64::MAX - 2);
+            start_ts + 2
+        }
+    }
+}
+
+#[inline]
+fn decode_view_state(raw: u64) -> ViewState {
+    match raw {
+        VIEW_STATE_IDLE => ViewState::Idle,
+        VIEW_STATE_REGISTERING => ViewState::Registering,
+        x => ViewState::Active(x - 2),
+    }
+}
+
 pub(crate) struct CCNode {
-    cc: ConcurrencyControl,
+    state: AtomicU64,
     next: AtomicPtr<CCNode>,
     shard_index: usize,
     registry_index: usize,
 }
 
 impl CCNode {
-    fn new(concurrent_write: usize) -> Self {
+    fn new() -> Self {
         Self {
-            cc: ConcurrencyControl::new(concurrent_write),
+            state: AtomicU64::new(encode_view_state(ViewState::Idle)),
             next: AtomicPtr::new(null_mut()),
             shard_index: 0,
             registry_index: 0,
         }
     }
-}
 
-impl Deref for CCNode {
-    type Target = ConcurrencyControl;
-
-    fn deref(&self) -> &Self::Target {
-        &self.cc
+    fn begin_reg(&self) {
+        must_true!(matches!(
+            decode_view_state(self.state.load(Relaxed)),
+            ViewState::Idle
+        ));
+        self.state
+            .store(encode_view_state(ViewState::Registering), SeqCst);
     }
-}
 
-impl DerefMut for CCNode {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.cc
+    fn activate(&self, start_ts: u64) {
+        must_true!(matches!(
+            decode_view_state(self.state.load(Relaxed)),
+            ViewState::Registering
+        ));
+        self.state
+            .store(encode_view_state(ViewState::Active(start_ts)), Release);
+    }
+
+    fn clear_idle(&self) {
+        self.state
+            .store(encode_view_state(ViewState::Idle), Release);
+    }
+
+    pub(crate) fn start_ts(&self) -> u64 {
+        match decode_view_state(self.state.load(Acquire)) {
+            ViewState::Active(start_ts) => start_ts,
+            ViewState::Idle | ViewState::Registering => NULL_ORACLE,
+        }
+    }
+
+    fn collect(&self) -> ViewState {
+        decode_view_state(self.state.load(SeqCst))
     }
 }
 
@@ -610,14 +691,13 @@ struct CCPool {
     // TODO: maybe change to seqlock ?
     registry: RwLock<Vec<Handle<CCNode>>>,
     registry_len: CachePad<AtomicUsize>,
-    concurrent_write: usize,
 }
 
 impl CCPool {
-    fn new(concurrent_write: usize) -> Self {
+    fn new() -> Self {
         let mut registry = Vec::with_capacity(CCPOOL_SHARD);
         let shards = std::array::from_fn(|_| {
-            let mut h = Handle::new(CCNode::new(concurrent_write));
+            let mut h = Handle::new(CCNode::new());
             h.registry_index = registry.len();
             registry.push(h);
             AtomicPtr::new(h.inner())
@@ -627,12 +707,11 @@ impl CCPool {
             shard_index: CachePad::default(),
             registry: RwLock::new(registry),
             registry_len: CachePad::from(AtomicUsize::new(CCPOOL_SHARD)),
-            concurrent_write,
         }
     }
 
-    fn get_shard_idx(&self) -> usize {
-        self.shard_index.fetch_add(1, Relaxed) & CCPOOL_SHARD_MASK
+    fn next_ticket(&self) -> usize {
+        self.shard_index.fetch_add(1, Relaxed)
     }
 
     fn try_pop_shard(&self, index: usize, _guard: &Guard) -> Option<Handle<CCNode>> {
@@ -654,7 +733,6 @@ impl CCPool {
     }
 
     fn push_shard(&self, index: usize, cc: Handle<CCNode>) {
-        cc.set_start_ts(NULL_ORACLE);
         let ptr = cc.inner();
         loop {
             let head = self.shards[index].load(Acquire);
@@ -669,32 +747,22 @@ impl CCPool {
     }
 
     fn alloc(&self) -> Handle<CCNode> {
-        let shard = self.get_shard_idx();
+        let ticket = self.next_ticket();
+        let (shard, second) = two_choices(ticket, CCPOOL_SHARD);
         let guard = crossbeam_epoch::pin();
 
         if let Some(x) = self.try_pop_shard(shard, &guard) {
             x
+        } else if let Some(x) = self.try_pop_shard(second, &guard) {
+            x
         } else {
-            let mut popped = None;
-            for i in 0..CCPOOL_SHARD {
-                let idx = (shard + i) & CCPOOL_SHARD_MASK;
-                if let Some(x) = self.try_pop_shard(idx, &guard) {
-                    popped = Some(x);
-                    break;
-                }
-            }
-
-            if let Some(x) = popped {
-                x
-            } else {
-                let mut cc = Handle::new(CCNode::new(self.concurrent_write));
-                cc.shard_index = shard;
-                let mut r = self.registry.write();
-                cc.registry_index = r.len();
-                r.push(cc);
-                self.registry_len.store(r.len(), Release);
-                cc
-            }
+            let mut cc = Handle::new(CCNode::new());
+            cc.shard_index = shard;
+            let mut r = self.registry.write();
+            cc.registry_index = r.len();
+            r.push(cc);
+            self.registry_len.store(r.len(), Release);
+            cc
         }
     }
 
@@ -725,7 +793,7 @@ impl CCPool {
         }
 
         let last = r.swap_remove(cc.registry_index);
-        assert_eq!(last.inner(), cc.inner());
+        must_true!(eq last.inner(), cc.inner());
         if cc.registry_index < r.len() {
             r[cc.registry_index].registry_index = cc.registry_index;
         }
@@ -735,7 +803,7 @@ impl CCPool {
         true
     }
 
-    fn maybe_shrink(&self) {
+    fn maybe_shrink_until(&self, deadline: Instant) {
         let len = self.registry_len.load(Acquire);
         if len <= CCPOOL_SHARD {
             return;
@@ -748,8 +816,7 @@ impl CCPool {
         batch = batch.clamp(1, 16);
 
         let guard = crossbeam_epoch::pin();
-        let deadline = Instant::now() + Duration::from_micros(200);
-        let mut start = self.get_shard_idx();
+        let mut start = self.next_ticket() & CCPOOL_SHARD_MASK;
         let mut done = 0;
         while done < batch
             && self.registry_len.load(Acquire) > CCPOOL_SHARD
@@ -775,18 +842,34 @@ impl Drop for CCPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CCPOOL_SHARD, CCPool, Context};
-    use crate::{Options, RandomPath, meta::Numerics};
+    use super::{
+        CCNode, CCPOOL_SHARD, CCPool, COLLECTOR_MIN_SLEEP, CollectorSignal, Context,
+        DUTY_CYCLE_SLEEP_MULTIPLIER, collector_idle_delay, drain_pending_wakes, two_choices,
+    };
+    use crate::cc::context::ViewState;
+    use crate::utils::observe::InMemoryObserver;
+    use crate::{Options, RandomPath, meta::Sequences};
     use std::sync::Arc;
     use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
 
-    fn new_context() -> (RandomPath, Context) {
+    fn new_context_with_groups(groups: u8) -> (RandomPath, Context) {
+        let observer = Arc::new(InMemoryObserver::default());
+        new_context_with_groups_and_observer(groups, observer)
+    }
+
+    fn new_context_with_groups_and_observer(
+        groups: u8,
+        observer: Arc<InMemoryObserver>,
+    ) -> (RandomPath, Context) {
         let root = RandomPath::tmp();
         let mut opt = Options::new(&*root);
-        opt.concurrent_write = 1;
+        opt.concurrent_write = groups;
+        opt.observer = observer;
         let ctx = Context::new(
             Arc::new(opt.validate().expect("context options must validate")),
-            Arc::new(Numerics::default()),
+            Arc::new(Sequences::default()),
             &[],
         );
         (root, ctx)
@@ -794,21 +877,23 @@ mod tests {
 
     #[test]
     fn ccpool_shrink_reclaims_idle_nodes() {
-        let pool = CCPool::new(4);
+        let pool = CCPool::new();
         let total = CCPOOL_SHARD + 8;
         let mut handles = Vec::with_capacity(total);
         for i in 0..total {
             let h = pool.alloc();
-            h.set_start_ts(i as u64 + 1);
+            h.begin_reg();
+            h.activate(i as u64 + 1);
             handles.push(h);
         }
         assert!(pool.registry_len.load(Relaxed) >= total);
 
         for h in handles {
+            h.clear_idle();
             pool.free(h);
         }
         for _ in 0..(total * 4) {
-            pool.maybe_shrink();
+            pool.maybe_shrink_until(Instant::now() + Duration::from_millis(10));
             if pool.registry_len.load(Relaxed) == CCPOOL_SHARD {
                 break;
             }
@@ -818,37 +903,123 @@ mod tests {
 
     #[test]
     fn ccpool_alloc_free_fast_path_keeps_registry_len() {
-        let pool = CCPool::new(4);
+        let pool = CCPool::new();
         let base_len = pool.registry_len.load(Relaxed);
         let h = pool.alloc();
-        h.set_start_ts(10);
+        h.begin_reg();
+        h.activate(10);
+        h.clear_idle();
         pool.free(h);
         assert_eq!(pool.registry_len.load(Relaxed), base_len);
 
         let h2 = pool.alloc();
-        h2.set_start_ts(11);
+        h2.begin_reg();
+        h2.activate(11);
         assert_eq!(h2.start_ts(), 11);
+        h2.clear_idle();
         pool.free(h2);
     }
 
     #[test]
-    fn last_view_drop_keeps_floor_until_next_view_epoch() {
-        let (_root, ctx) = new_context();
-        let cc1 = ctx.alloc_cc();
-        let floor1 = cc1.start_ts();
-        assert_eq!(ctx.oldest_view_txid(), Some(floor1));
+    fn ccnode_registration_state_is_visible_to_collector() {
+        let node = CCNode::new();
+        assert_eq!(node.collect(), ViewState::Idle);
 
-        ctx.free_cc(cc1);
-        assert_eq!(ctx.oldest_view_txid(), None);
-        assert_eq!(ctx.min_view_txid.load(Relaxed), floor1);
+        node.begin_reg();
+        assert_eq!(node.collect(), ViewState::Registering);
 
-        ctx.alloc_oracle();
-        let cc2 = ctx.alloc_cc();
-        let floor2 = cc2.start_ts();
-        assert!(floor2 > floor1);
-        assert_eq!(ctx.oldest_view_txid(), Some(floor2));
+        node.activate(10);
+        assert_eq!(node.collect(), ViewState::Active(10));
 
-        ctx.free_cc(cc2);
+        node.clear_idle();
+        assert_eq!(node.collect(), ViewState::Idle);
+    }
+
+    #[test]
+    fn next_group_id_only_compares_home_and_second_candidate() {
+        let (_root, ctx) = new_context_with_groups(4);
+        ctx.group_rr.store(0, Relaxed);
+
+        ctx.group(0).enter_inflight();
+        ctx.group(0).enter_inflight();
+        ctx.group(1).enter_inflight();
+        ctx.group(1).enter_inflight();
+        ctx.group(1).enter_inflight();
+
+        let chosen = ctx.next_group_id();
+        assert_eq!(chosen, 0);
+        assert_eq!(ctx.group(0).inflight(), 3);
+        assert_eq!(ctx.group(1).inflight(), 3);
+        assert_eq!(ctx.group(2).inflight(), 0);
+        assert_eq!(ctx.group(3).inflight(), 0);
+
+        ctx.group(0).leave_inflight();
+        ctx.group(0).leave_inflight();
+        ctx.group(0).leave_inflight();
+        ctx.group(1).leave_inflight();
+        ctx.group(1).leave_inflight();
+        ctx.group(1).leave_inflight();
         ctx.quit();
+    }
+
+    #[test]
+    fn two_choices_are_distinct_and_cover_every_pair() {
+        for nr in 1..=CCPOOL_SHARD {
+            let mut seen = vec![vec![false; nr]; nr];
+            for round in 0..nr.max(2) - 1 {
+                for expected_home in 0..nr {
+                    let ticket = round * nr + expected_home;
+                    let (home, second) = two_choices(ticket, nr);
+                    assert_eq!(home, expected_home);
+                    if nr == 1 {
+                        assert_eq!(second, home);
+                    } else {
+                        assert_ne!(second, home);
+                        seen[home][second] = true;
+                    }
+                }
+            }
+
+            if nr > 1 {
+                for (home, choices) in seen.iter().enumerate() {
+                    assert!(
+                        choices
+                            .iter()
+                            .enumerate()
+                            .all(|(second, &visited)| second == home || visited)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collector_idle_delay_enforces_minimum_and_duty_cycle_bound() {
+        assert_eq!(collector_idle_delay(Duration::ZERO), COLLECTOR_MIN_SLEEP);
+        assert_eq!(
+            collector_idle_delay(Duration::from_micros(100)),
+            COLLECTOR_MIN_SLEEP
+        );
+        assert_eq!(
+            collector_idle_delay(Duration::from_millis(3)),
+            Duration::from_millis(3 * DUTY_CYCLE_SLEEP_MULTIPLIER as u64)
+        );
+    }
+
+    #[test]
+    fn collector_wake_drain_coalesces_pending_signals() {
+        let (_tx, reader) = channel();
+        assert!(!drain_pending_wakes(&reader));
+
+        let (tx, reader) = channel();
+        tx.send(CollectorSignal::Wake).unwrap();
+        tx.send(CollectorSignal::Wake).unwrap();
+        assert!(!drain_pending_wakes(&reader));
+        assert!(!drain_pending_wakes(&reader));
+
+        let (tx, reader) = channel();
+        tx.send(CollectorSignal::Wake).unwrap();
+        tx.send(CollectorSignal::Quit).unwrap();
+        assert!(drain_pending_wakes(&reader));
     }
 }

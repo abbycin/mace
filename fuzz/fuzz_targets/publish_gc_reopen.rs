@@ -73,7 +73,6 @@ fuzz_target!(|data: &[u8]| {
         opt.blob_file_size = 16 << 10;
         opt.data_garbage_ratio = 0;
         opt.blob_garbage_ratio = 0;
-        opt.blob_gc_ratio = 100;
         opt.gc_eager = true;
     });
     let mut bucket =
@@ -160,7 +159,6 @@ fuzz_target!(|data: &[u8]| {
                         opt.blob_file_size = 16 << 10;
                         opt.data_garbage_ratio = 0;
                         opt.blob_garbage_ratio = 0;
-                        opt.blob_gc_ratio = 100;
                         opt.gc_eager = true;
                     });
                     bucket = get_or_create_bucket(&mace, "main", bucket_opt).expect("reopen gc bucket");

@@ -1,5 +1,6 @@
 use btree_store::BTree;
 use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
+use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,6 +22,27 @@ fn load_persisted_bucket_options(opt: &Options, name: &str) -> BucketOptions {
     let raw = raw.unwrap();
     let meta = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast::<PersistedBucketMeta>()) };
     meta.options
+}
+
+fn load_persisted_global_options(opt: &Options) -> Value {
+    let tree = BTree::open(opt.manifest()).unwrap();
+    let mut raw = None;
+    tree.view("misc", |txn| {
+        raw = Some(txn.get("options")?.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    serde_json::from_slice(&raw.unwrap()).unwrap()
+}
+
+fn assert_runtime_only_fields_absent(value: &Value) {
+    let obj = value.as_object().expect("options json must be an object");
+    for key in ["db_root", "log_root", "tmp_store", "observer", "fs"] {
+        assert!(
+            !obj.contains_key(key),
+            "runtime-only field {key} should not be persisted"
+        );
+    }
 }
 
 #[test]
@@ -72,6 +94,104 @@ fn bucket_concurrency_non_blocking() {
         iterations,
         elapsed
     );
+}
+
+#[test]
+fn global_options_bootstrap_writes_manifest_json() {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+    drop(mace);
+
+    let value = load_persisted_global_options(&opt);
+    assert_eq!(value["concurrent_write"], 16);
+    assert_eq!(value["sync_on_write"], true);
+    assert_eq!(value["gc_timeout"], 60_000);
+    assert_runtime_only_fields_absent(&value);
+}
+
+#[test]
+fn global_options_bootstrap_recovers_visible_uninitialized_manifest() {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    opt.clone().validate().unwrap();
+
+    let tree = BTree::open(opt.manifest()).unwrap();
+    drop(tree);
+
+    let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+    drop(mace);
+
+    let value = load_persisted_global_options(&opt);
+    assert_eq!(value["concurrent_write"], 16);
+    assert_eq!(value["sync_on_write"], true);
+    assert_runtime_only_fields_absent(&value);
+}
+
+#[test]
+fn global_options_reopen_updates_mutable_fields() {
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.concurrent_write = 8;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 1234;
+    let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+    drop(mace);
+
+    let mut reopen = Options::new(&*path);
+    reopen.concurrent_write = 8;
+    reopen.sync_on_write = true;
+    reopen.gc_timeout = 7777;
+    let mace = Mace::new(reopen.clone().validate().unwrap()).unwrap();
+    drop(mace);
+
+    let value = load_persisted_global_options(&reopen);
+    assert_eq!(value["concurrent_write"], 8);
+    assert_eq!(value["sync_on_write"], true);
+    assert_eq!(value["gc_timeout"], 7777);
+    assert_runtime_only_fields_absent(&value);
+}
+
+#[test]
+fn global_options_missing_record_is_corruption() {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+    drop(mace);
+
+    let tree = BTree::open(opt.manifest()).unwrap();
+    tree.exec("misc", |txn| txn.del("options")).unwrap();
+
+    let err = Mace::new(opt.validate().unwrap()).err().unwrap();
+    assert_eq!(err, OpCode::Corruption);
+}
+
+#[test]
+fn global_options_bad_json_is_corruption() {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+    drop(mace);
+
+    let tree = BTree::open(opt.manifest()).unwrap();
+    tree.exec("misc", |txn| txn.put("options", b"{")).unwrap();
+
+    let err = Mace::new(opt.validate().unwrap()).err().unwrap();
+    assert_eq!(err, OpCode::Corruption);
+}
+
+#[test]
+fn global_options_concurrent_write_conflict_is_invalid() {
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.concurrent_write = 8;
+    let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+    drop(mace);
+
+    let mut reopen = Options::new(&*path);
+    reopen.concurrent_write = 16;
+    let err = Mace::new(reopen.validate().unwrap()).err().unwrap();
+    assert_eq!(err, OpCode::Invalid);
 }
 
 #[test]

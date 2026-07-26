@@ -9,11 +9,14 @@ pub use utils::{
 };
 
 mod cc;
+mod error;
 mod index;
 mod io;
 mod map;
 mod meta;
 mod store;
+#[cfg(feature = "extra_check")]
+pub mod testing;
 mod utils;
 
 mod types;

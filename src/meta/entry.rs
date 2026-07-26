@@ -1,5 +1,6 @@
+use crate::{must_exist, must_true};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     ops::{Deref, DerefMut},
     ptr::addr_of_mut,
@@ -8,10 +9,15 @@ use std::{
 
 use crate::{
     BucketOptions, OpCode,
-    meta::IMetaCodec,
+    meta::{
+        BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BUCKET_MISC, BUCKET_OBSOLETE_BLOB,
+        BUCKET_OBSOLETE_DATA, SEQUENCES_KEY, blob_interval_name, data_interval_name,
+        page_table_name,
+    },
+    observe::CounterMetric,
     types::traits::IAsSlice,
     utils::{
-        INIT_ID, INIT_ORACLE, INIT_WMK, NULL_ADDR,
+        INIT_ID, INIT_ORACLE, NULL_ADDR,
         bitmap::BitMap,
         data::{GroupPositions, MapEntry, Reloc},
     },
@@ -20,7 +26,7 @@ use crate::{
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum MetaKind {
-    Numerics,
+    Sequences,
     DataInterval,
     BlobInterval,
     DataStat,
@@ -38,6 +44,23 @@ pub enum MetaKind {
 
 impl IAsSlice for MetaKind {}
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FileKind {
+    Data,
+    Blob,
+}
+
+impl FileKind {
+    pub(crate) const ALL: [Self; 2] = [Self::Data, Self::Blob];
+
+    pub(crate) const fn slot(self) -> usize {
+        match self {
+            Self::Data => 0,
+            Self::Blob => 1,
+        }
+    }
+}
+
 impl TryFrom<u8> for MetaKind {
     type Error = OpCode;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
@@ -51,7 +74,7 @@ impl TryFrom<u8> for MetaKind {
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct DataStatInner {
+pub struct StatInner {
     pub file_id: u64,
     /// up1 and up2, see [Efficiently Reclaiming Space in a Log Structured Store](https://ieeexplore.ieee.org/document/9458684)
     pub up1: u64,
@@ -63,31 +86,44 @@ pub struct DataStatInner {
     pub bucket_id: u64,
 }
 
-impl IAsSlice for DataStatInner {}
+impl IAsSlice for StatInner {}
 
 #[derive(Clone)]
-pub struct DataStat {
-    pub inner: DataStatInner,
+pub struct PersistStat {
+    pub inner: StatInner,
     pub inactive_elems: Vec<u32>,
 }
 
-impl Deref for DataStat {
-    type Target = DataStatInner;
+pub struct MemStat {
+    pub inner: StatInner,
+    pub mask: Option<BitMap>,
+}
+
+impl Deref for PersistStat {
+    type Target = StatInner;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-pub struct MemDataStat {
-    pub inner: DataStatInner,
-    pub mask: Option<BitMap>,
+impl DerefMut for PersistStat {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
 
-impl DataStat {
-    pub(crate) fn decode_inner_only(src: &[u8]) -> DataStatInner {
+impl PersistStat {
+    pub(crate) fn from_parts(inner: StatInner, inactive_elems: Vec<u32>) -> Self {
+        Self {
+            inner,
+            inactive_elems,
+        }
+    }
+
+    pub(crate) fn decode_inner_only(src: &[u8]) -> StatInner {
         let hdr = StatHdr::from_slice(src);
-        DataStatInner::from_slice(&src[hdr.len()..])
+        StatInner::from_slice(&src[hdr.len()..])
     }
 
     pub(crate) fn decode_mask_only(src: &[u8], total_elems: u32) -> BitMap {
@@ -95,7 +131,7 @@ impl DataStat {
         let mut mask = BitMap::new(total_elems);
         let seq = unsafe {
             src.as_ptr()
-                .add(hdr.len() + size_of::<DataStatInner>())
+                .add(hdr.len() + size_of::<StatInner>())
                 .cast::<u32>()
         };
         for i in 0..hdr.elems as usize {
@@ -108,29 +144,33 @@ impl DataStat {
     }
 
     fn len(&self) -> usize {
-        size_of::<DataStatInner>() + self.inactive_elems.len() * size_of::<u32>()
+        size_of::<StatInner>() + self.inactive_elems.len() * size_of::<u32>()
     }
 }
 
-impl Deref for MemDataStat {
-    type Target = DataStatInner;
+impl Deref for MemStat {
+    type Target = StatInner;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl DerefMut for MemDataStat {
+impl DerefMut for MemStat {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-impl MemDataStat {
+impl MemStat {
+    pub(crate) fn from_parts(inner: StatInner, mask: Option<BitMap>) -> Self {
+        Self { inner, mask }
+    }
+
     pub(super) fn update(&mut self, tick: u64, reloc: &Reloc) {
         self.active_elems -= 1;
         self.active_size -= reloc.active_len() as usize;
-        self.mask.as_mut().expect("mask loaded").set(reloc.seq);
+        must_exist!(self.mask.as_mut(), "mask loaded").set(reloc.seq);
 
         if self.up1 < tick {
             self.up2 = self.up1;
@@ -138,18 +178,12 @@ impl MemDataStat {
         }
     }
 
-    pub(crate) fn copy(&self) -> DataStat {
-        DataStat {
-            inner: self.inner,
-            inactive_elems: Vec::new(),
-        }
+    pub(crate) fn copy(&self) -> PersistStat {
+        PersistStat::from_parts(self.inner, Vec::new())
     }
 
     pub(crate) fn clone_mem(&self) -> Self {
-        Self {
-            inner: self.inner,
-            mask: self.mask.clone(),
-        }
+        Self::from_parts(self.inner, self.mask.clone())
     }
 }
 
@@ -162,13 +196,13 @@ pub(crate) struct StatHdr {
 
 impl IAsSlice for StatHdr {}
 
-impl IMetaCodec for DataStat {
+impl IMetaCodec for PersistStat {
     fn packed_size(&self) -> usize {
         size_of::<StatHdr>() + self.len()
     }
 
     fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
+        must_true!(eq to.len(), self.packed_size());
         let hdr = StatHdr {
             elems: self.inactive_elems.len() as u32,
             size: self.len() as u32,
@@ -179,166 +213,18 @@ impl IMetaCodec for DataStat {
         dst[..inner_s.len()].copy_from_slice(inner_s);
         let src = unsafe {
             let p = self.inactive_elems.as_ptr().cast::<u8>();
-            std::slice::from_raw_parts(p, self.len() - size_of::<DataStatInner>())
+            std::slice::from_raw_parts(p, self.len() - size_of::<StatInner>())
         };
         dst[inner_s.len()..].copy_from_slice(src);
     }
 
     fn decode(src: &[u8]) -> Self {
         let hdr = StatHdr::from_slice(src);
-        let inner = DataStatInner::from_slice(&src[hdr.len()..]);
-        let mut stat = DataStat {
-            inner,
-            inactive_elems: Vec::with_capacity(hdr.elems as usize),
-        };
+        let inner = StatInner::from_slice(&src[hdr.len()..]);
+        let mut stat = Self::from_parts(inner, Vec::with_capacity(hdr.elems as usize));
         let seq = unsafe {
             src.as_ptr()
-                .add(hdr.len() + size_of::<DataStatInner>())
-                .cast::<u32>()
-        };
-
-        for i in 0..hdr.elems as usize {
-            unsafe {
-                let x = seq.add(i).read_unaligned();
-                stat.inactive_elems.push(x);
-            }
-        }
-        stat
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct BlobStatInner {
-    pub file_id: u64,
-    pub active_size: usize,
-    pub nr_active: u32,
-    pub nr_total: u32,
-    pub bucket_id: u64,
-}
-
-impl IAsSlice for BlobStatInner {}
-
-#[derive(Clone)]
-pub struct MemBlobStat {
-    pub inner: BlobStatInner,
-    pub mask: Option<BitMap>,
-}
-
-impl MemBlobStat {
-    pub(super) fn update(&mut self, reloc: &Reloc) {
-        self.nr_active -= 1;
-        self.active_size -= reloc.active_len() as usize;
-        self.mask.as_mut().expect("mask loaded").set(reloc.seq);
-    }
-
-    pub fn copy(&self) -> BlobStat {
-        BlobStat {
-            inner: self.inner,
-            inactive_elems: Vec::new(),
-        }
-    }
-
-    pub(crate) fn clone_mem(&self) -> Self {
-        Self {
-            inner: self.inner,
-            mask: self.mask.clone(),
-        }
-    }
-}
-
-pub struct BlobStat {
-    pub inner: BlobStatInner,
-    pub inactive_elems: Vec<u32>,
-}
-
-impl BlobStat {
-    pub(crate) fn decode_inner_only(src: &[u8]) -> BlobStatInner {
-        let hdr = StatHdr::from_slice(src);
-        BlobStatInner::from_slice(&src[hdr.len()..])
-    }
-
-    pub(crate) fn decode_mask_only(src: &[u8], total_elems: u32) -> BitMap {
-        let hdr = StatHdr::from_slice(src);
-        let mut mask = BitMap::new(total_elems);
-        let seq = unsafe {
-            src.as_ptr()
-                .add(hdr.len() + size_of::<BlobStatInner>())
-                .cast::<u32>()
-        };
-        for i in 0..hdr.elems as usize {
-            unsafe {
-                let x = seq.add(i).read_unaligned();
-                mask.set(x);
-            }
-        }
-        mask
-    }
-
-    fn len(&self) -> usize {
-        size_of::<BlobStatInner>() + self.inactive_elems.len() * size_of::<u32>()
-    }
-}
-
-impl Deref for BlobStat {
-    type Target = BlobStatInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for BlobStat {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl Deref for MemBlobStat {
-    type Target = BlobStatInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for MemBlobStat {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl IMetaCodec for BlobStat {
-    fn packed_size(&self) -> usize {
-        size_of::<StatHdr>() + self.len()
-    }
-
-    fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
-        let hdr = StatHdr {
-            elems: self.inactive_elems.len() as u32,
-            size: self.len() as u32,
-        };
-        to[0..hdr.len()].copy_from_slice(hdr.as_slice());
-        let dst = &mut to[hdr.len()..];
-        let inner = self.inner.as_slice();
-        dst[..inner.len()].copy_from_slice(inner);
-        let junks = unsafe {
-            let p = self.inactive_elems.as_ptr().cast::<u8>();
-            std::slice::from_raw_parts(p, self.len() - size_of::<BlobStatInner>())
-        };
-        dst[inner.len()..].copy_from_slice(junks);
-    }
-
-    fn decode(src: &[u8]) -> Self {
-        let hdr = StatHdr::from_slice(src);
-        let inner = BlobStatInner::from_slice(&src[hdr.len()..]);
-        let mut stat = BlobStat {
-            inner,
-            inactive_elems: Vec::with_capacity(hdr.elems as usize),
-        };
-        let seq = unsafe {
-            src.as_ptr()
-                .add(hdr.len() + size_of::<BlobStatInner>())
+                .add(hdr.len() + size_of::<StatInner>())
                 .cast::<u32>()
         };
 
@@ -418,7 +304,7 @@ impl IMetaCodec for PageTable {
     }
 
     fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
+        must_true!(eq to.len(), self.packed_size());
         let hdr = PageTableHdr {
             elems: self.data.len() as u32,
             size: self.len(),
@@ -462,7 +348,7 @@ impl IMetaCodec for BucketDurableFrontier {
     }
 
     fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
+        must_true!(eq to.len(), self.packed_size());
         to.copy_from_slice(self.as_slice());
     }
 
@@ -473,12 +359,10 @@ impl IMetaCodec for BucketDurableFrontier {
 
 #[derive(Debug)]
 #[repr(C)]
-pub struct Numerics {
-    pub next_data_id: AtomicU64,
-    pub next_blob_id: AtomicU64,
+pub struct Sequences {
+    pub next_file_id: AtomicU64,
     pub next_bucket_id: AtomicU64,
     pub oracle: AtomicU64,
-    pub wmk_oldest: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -550,7 +434,7 @@ impl IMetaCodec for WalRecycleState {
     }
 
     fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
+        must_true!(eq to.len(), self.packed_size());
         to.copy_from_slice(self.as_slice());
     }
 
@@ -559,42 +443,40 @@ impl IMetaCodec for WalRecycleState {
     }
 }
 
-impl Default for Numerics {
+impl Default for Sequences {
     fn default() -> Self {
         Self {
-            next_data_id: AtomicU64::new(INIT_ID),
-            next_blob_id: AtomicU64::new(INIT_ID),
+            next_file_id: AtomicU64::new(INIT_ID),
             next_bucket_id: AtomicU64::new(INIT_ID),
             oracle: AtomicU64::new(INIT_ORACLE),
-            wmk_oldest: AtomicU64::new(INIT_WMK),
         }
     }
 }
 
-impl Clone for Numerics {
+impl Clone for Sequences {
     // a snapshot of atomic values, that's ok for data sync
     fn clone(&self) -> Self {
-        let mut tmp = Numerics::default();
+        let mut tmp = Sequences::default();
         let dst = addr_of_mut!(tmp);
         unsafe { std::ptr::copy_nonoverlapping(self, dst, 1) };
         tmp
     }
 }
 
-impl IAsSlice for Numerics {}
+impl IAsSlice for Sequences {}
 
-impl IMetaCodec for Numerics {
+impl IMetaCodec for Sequences {
     fn packed_size(&self) -> usize {
         size_of::<Self>()
     }
 
     fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
+        must_true!(eq to.len(), self.packed_size());
         to.copy_from_slice(self.as_slice());
     }
 
     fn decode(src: &[u8]) -> Self {
-        Numerics::from_slice(src)
+        Sequences::from_slice(src)
     }
 }
 
@@ -635,7 +517,7 @@ impl IMetaCodec for Delete {
     }
 
     fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
+        must_true!(eq to.len(), self.packed_size());
         let hdr = DeleteHdr {
             nr_id: self.id.len() as u32,
         };
@@ -695,7 +577,7 @@ impl IMetaCodec for IntervalPair {
     }
 
     fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
+        must_true!(eq to.len(), self.packed_size());
         to.copy_from_slice(self.as_slice());
     }
 
@@ -739,7 +621,7 @@ impl IMetaCodec for DelInterval {
     }
 
     fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
+        must_true!(eq to.len(), self.packed_size());
         let hdr = DelIntervalStartHdr {
             nr_lo: self.lo.len() as u16,
             bucket_id: self.bucket_id,
@@ -780,13 +662,146 @@ impl IMetaCodec for BucketMeta {
     }
 
     fn encode(&self, to: &mut [u8]) {
-        assert_eq!(to.len(), self.packed_size());
+        must_true!(eq to.len(), self.packed_size());
         to.copy_from_slice(self.as_slice());
     }
 
     fn decode(src: &[u8]) -> Self {
-        unsafe { std::ptr::read(src.as_ptr() as *const Self) }
+        unsafe { std::ptr::read_unaligned(src.as_ptr().cast::<Self>()) }
     }
 }
 
 impl IAsSlice for BucketMeta {}
+
+pub enum MetaOp {
+    Put(Vec<u8>, Vec<u8>),
+    Update(Vec<u8>, Vec<u8>, CounterMetric),
+    Del(Vec<u8>),
+}
+
+pub(crate) trait IMetaCodec {
+    fn packed_size(&self) -> usize;
+
+    fn encode(&self, to: &mut [u8]);
+
+    fn decode(src: &[u8]) -> Self;
+}
+
+pub(crate) trait MetaRecord: IMetaCodec {
+    fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>);
+}
+
+impl MetaRecord for Sequences {
+    fn record(&self, _kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
+        let mut buf = vec![0u8; self.packed_size()];
+        self.encode(&mut buf);
+        ops.entry(BUCKET_MISC.to_string())
+            .or_default()
+            .push(MetaOp::Put(SEQUENCES_KEY.as_bytes().to_vec(), buf));
+    }
+}
+
+impl MetaRecord for PageTable {
+    fn record(&self, _kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
+        let bucket_name = page_table_name(self.bucket_id);
+        let bucket_ops = ops.entry(bucket_name).or_default();
+        for (&pid, &addr) in self.iter() {
+            bucket_ops.push(MetaOp::Put(
+                pid.to_le_bytes().to_vec(),
+                addr.to_le_bytes().to_vec(),
+            ));
+        }
+    }
+}
+
+impl MetaRecord for BucketDurableFrontier {
+    fn record(&self, _kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
+        let mut buf = vec![0u8; self.packed_size()];
+        self.encode(&mut buf);
+        ops.entry(BUCKET_FRONTIER.to_string())
+            .or_default()
+            .push(MetaOp::Put(self.bucket_id.to_le_bytes().to_vec(), buf));
+    }
+}
+
+impl MetaRecord for PersistStat {
+    fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
+        let mut buf = vec![0u8; self.packed_size()];
+        self.encode(&mut buf);
+        let bucket = if kind == MetaKind::DataStat {
+            BUCKET_DATA_STAT
+        } else {
+            BUCKET_BLOB_STAT
+        };
+        ops.entry(bucket.to_string())
+            .or_default()
+            .push(MetaOp::Put(self.file_id.to_le_bytes().to_vec(), buf));
+    }
+}
+
+impl MetaRecord for IntervalPair {
+    fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
+        let mut buf = vec![0u8; self.packed_size()];
+        self.encode(&mut buf);
+        let bucket = if kind == MetaKind::DataInterval {
+            data_interval_name(self.bucket_id)
+        } else {
+            blob_interval_name(self.bucket_id)
+        };
+        ops.entry(bucket)
+            .or_default()
+            .push(MetaOp::Put(self.lo_addr.to_le_bytes().to_vec(), buf));
+    }
+}
+
+impl MetaRecord for Delete {
+    fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
+        match kind {
+            MetaKind::DataDelete | MetaKind::BlobDelete => {
+                let (obs_bucket, stat_bucket) = if kind == MetaKind::DataDelete {
+                    (BUCKET_OBSOLETE_DATA, BUCKET_DATA_STAT)
+                } else {
+                    (BUCKET_OBSOLETE_BLOB, BUCKET_BLOB_STAT)
+                };
+                for &id in self.iter() {
+                    let key = id.to_le_bytes().to_vec();
+                    ops.entry(obs_bucket.to_string())
+                        .or_default()
+                        .push(MetaOp::Put(key.clone(), vec![]));
+                    ops.entry(stat_bucket.to_string())
+                        .or_default()
+                        .push(MetaOp::Del(key));
+                }
+            }
+            MetaKind::DataDeleteDone | MetaKind::BlobDeleteDone => {
+                let bucket = if kind == MetaKind::DataDeleteDone {
+                    BUCKET_OBSOLETE_DATA
+                } else {
+                    BUCKET_OBSOLETE_BLOB
+                };
+                let bucket_ops = ops.entry(bucket.to_string()).or_default();
+                for &id in self.iter() {
+                    bucket_ops.push(MetaOp::Del(id.to_le_bytes().to_vec()));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl MetaRecord for DelInterval {
+    fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
+        let bucket = if kind == MetaKind::DataDelInterval {
+            data_interval_name(self.bucket_id)
+        } else {
+            blob_interval_name(self.bucket_id)
+        };
+        let bucket_ops = ops.entry(bucket).or_default();
+        let mut dedup = BTreeSet::new();
+        for &lo in self.iter() {
+            if dedup.insert(lo) {
+                bucket_ops.push(MetaOp::Del(lo.to_le_bytes().to_vec()));
+            }
+        }
+    }
+}

@@ -1,7 +1,8 @@
+use crate::hot_true;
 use std::{cell::Cell, collections::VecDeque, ptr::null_mut};
 
 use crate::{
-    BucketOptions,
+    BucketOptions, must_exist,
     types::{
         data::{HistRef, Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
         header::{BaseHeader, NodeType, SLOT_LEN, SlotType, TagFlag, TagKind},
@@ -97,7 +98,7 @@ impl BaseView {
                     hints.push_back((pos - 1, 0));
                 }
 
-                let (_, cnt) = hints.back_mut().unwrap();
+                let (_, cnt) = must_exist!(hints.back_mut());
                 *cnt += 1;
                 pos += 1;
                 continue;
@@ -174,8 +175,8 @@ impl BaseView {
             builder.add_leaf(inline_size, k, &r, hist, remote);
             pos += 1;
         }
-        debug_assert!(hints.is_empty());
-        debug_assert!(sibling_refs.is_empty());
+        hot_true!(hints.is_empty());
+        hot_true!(sibling_refs.is_empty());
         base.header_mut().has_multiple_versions = has_multiple_versions;
         if !sibling_hint_addrs.is_empty() || !remote_hint_addrs.is_empty() {
             base.write_leaf_hints(&sibling_hint_addrs, &remote_hint_addrs);
@@ -262,7 +263,7 @@ impl BaseView {
         let mut regions = Vec::with_capacity(hints.len());
         let mut old_vers = Vec::new();
         for &(idx, cnt) in hints {
-            debug_assert!(cnt > 0);
+            hot_true!(cnt > 0);
             let start = old_vers.len();
             iter.seek_to(idx + 1);
             for _ in 0..cnt {
@@ -420,6 +421,7 @@ impl BaseView {
         h.merging = false;
         h.prefix_len = prefix_len as u32;
         h.is_index = IS_INDEX;
+        h.has_multiple_versions = false;
         h.padding = 0;
 
         p
@@ -440,11 +442,12 @@ impl BaseView {
     }
 
     fn write_leaf_hints(&mut self, heads: &[u64], remotes: &[u64]) {
-        debug_assert!(!self.header().is_index);
-        let payload = self.box_header().payload_size as usize;
+        hot_true!(!self.header().is_index);
         let off = self.header().size as usize;
-        let need = off + Self::leaf_hint_size(heads.len(), remotes.len());
-        assert!(payload >= need);
+        hot_true!(
+            self.box_header().payload_size as usize
+                >= off + Self::leaf_hint_size(heads.len(), remotes.len())
+        );
 
         let p = self.0.cast::<u8>();
         unsafe {
@@ -468,21 +471,24 @@ impl BaseView {
     }
 
     fn leaf_hint_layout(&self) -> Option<(usize, usize, usize)> {
-        debug_assert!(!self.header().is_index);
+        hot_true!(!self.header().is_index);
         let payload = self.box_header().payload_size as usize;
         let off = self.header().size as usize;
         if payload == off {
             return None;
         }
-        assert!(payload >= off + Self::SIBLING_HINT_CNT_LEN);
+        hot_true!(payload >= off + Self::SIBLING_HINT_CNT_LEN);
         let p = self.0.cast::<u8>();
         let cnt = unsafe { p.add(off).cast::<u32>().read_unaligned() as usize };
         let remote_cnt_off = off + Self::sibling_hint_size(cnt);
-        assert!(payload >= remote_cnt_off + Self::REMOTE_HINT_CNT_LEN);
+        hot_true!(payload >= remote_cnt_off + Self::REMOTE_HINT_CNT_LEN);
         let remote_cnt = unsafe { p.add(remote_cnt_off).cast::<u32>().read_unaligned() as usize };
-        let need =
-            remote_cnt_off + Self::REMOTE_HINT_CNT_LEN + remote_cnt * Self::REMOTE_HINT_ADDR_LEN;
-        assert!(payload >= need);
+        hot_true!(
+            payload
+                >= remote_cnt_off
+                    + Self::REMOTE_HINT_CNT_LEN
+                    + remote_cnt * Self::REMOTE_HINT_ADDR_LEN
+        );
         Some((off, cnt, remote_cnt))
     }
 
@@ -534,7 +540,7 @@ impl BaseView {
     ) -> BoxRef {
         let hdr1 = self.header();
         let hdr2 = other.header();
-        assert_eq!(hdr1.is_index, hdr2.is_index);
+        hot_true!(eq hdr1.is_index, hdr2.is_index);
 
         let lo1 = self.lo();
         let lo2 = other.lo();
@@ -730,7 +736,7 @@ where
                     continue;
                 }
                 on_sibling(link);
-                let page = self.loader.load_sibling(link)?;
+                let page = self.loader.load_sibling(link);
                 self.keepalive.push(page.clone());
                 state.page = page;
                 state.slot = 0;
@@ -748,7 +754,7 @@ where
             self.beg += 1;
             if let Some(hist) = v.get_hist() {
                 on_sibling(hist.page_addr);
-                let page = self.loader.load_sibling(hist.page_addr)?;
+                let page = self.loader.load_sibling(hist.page_addr);
                 self.keepalive.push(page.clone());
                 self.hist = Some(HistIter {
                     key_raw: k.raw,
@@ -801,7 +807,7 @@ where
                     continue;
                 }
                 on_sibling(link);
-                let page = self.loader.load_sibling(link)?;
+                let page = self.loader.load_sibling(link);
                 self.keepalive.push(page.clone());
                 state.page = page;
                 state.slot = 0;
@@ -821,7 +827,7 @@ where
             self.cur -= 1;
             if let Some(hist) = v.get_hist() {
                 on_sibling(hist.page_addr);
-                let page = self.loader.load_sibling(hist.page_addr)?;
+                let page = self.loader.load_sibling(hist.page_addr);
                 self.keepalive.push(page.clone());
                 self.hist = Some(HistIter {
                     key_raw: k.raw,
@@ -1088,8 +1094,8 @@ mod test {
     }
 
     impl ILoader for Allocator {
-        fn load_pinned(&self, addr: u64) -> Result<BoxView, crate::OpCode> {
-            Ok(self.inner.map.get(&addr).unwrap().view())
+        fn load_pinned(&self, addr: u64) -> BoxView {
+            self.inner.map.get(&addr).unwrap().view()
         }
 
         fn pin(&self, data: BoxRef) {
@@ -1104,12 +1110,12 @@ mod test {
             self.clone()
         }
 
-        fn load_sibling(&self, addr: u64) -> Result<BoxRef, crate::OpCode> {
-            Ok(self.inner.map.get(&addr).unwrap().clone())
+        fn load_sibling(&self, addr: u64) -> BoxRef {
+            self.inner.map.get(&addr).unwrap().clone()
         }
 
-        fn load_blob(&self, addr: u64, _cache: bool) -> Result<BoxRef, crate::OpCode> {
-            Ok(self.inner.map.get(&addr).unwrap().clone())
+        fn load_blob(&self, addr: u64, _cache: bool) -> BoxRef {
+            self.inner.map.get(&addr).unwrap().clone()
         }
     }
 
@@ -1409,11 +1415,7 @@ mod test {
         let hist = head_v.get_hist().expect("must have history");
         assert_eq!(hist.slot, 0);
         assert_eq!(hist.count, 19);
-        let head_page = l
-            .load_sibling(hist.page_addr)
-            .expect("must load")
-            .view()
-            .as_base();
+        let head_page = l.load_sibling(hist.page_addr).view().as_base();
         assert_ne!(head_page.box_header().link, NULL_ADDR);
 
         for txid in (1..20).rev() {

@@ -1,3 +1,4 @@
+use crate::hot_true;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::{
     cmp::Ordering::{self, Equal, Greater, Less},
@@ -9,7 +10,8 @@ use std::{
 };
 
 use crate::{
-    cc::context::{Context, TxOutcome},
+    cc::context::Context,
+    must_exist,
     types::{
         base::{BaseIter, BaseRevIter},
         data::{
@@ -64,17 +66,17 @@ pub(crate) struct Node<L: ILoader> {
 }
 
 fn intl_cmp(x: &DeltaView, y: &DeltaView) -> Ordering {
-    let l = IntlKey::decode_from(x.key());
-    let r = IntlKey::decode_from(y.key());
-
     // for internal nodes, we never use the txid for insert
-    l.raw.cmp(r.raw)
+    IntlKey::encoded_raw(x.key()).cmp(IntlKey::encoded_raw(y.key()))
 }
 
 fn leaf_cmp(x: &DeltaView, y: &DeltaView) -> Ordering {
-    let l = Key::decode_from(x.key());
-    let r = Key::decode_from(y.key());
-    l.cmp(&r)
+    let (lver, lraw) = Key::encoded_key_parts(x.key());
+    let (rver, rraw) = Key::encoded_key_parts(y.key());
+    match lraw.cmp(rraw) {
+        Equal => Ver::decode_from(lver).cmp(&Ver::decode_from(rver)),
+        ord => ord,
+    }
 }
 
 fn null_cmp(_x: &DeltaView, _y: &DeltaView) -> Ordering {
@@ -114,8 +116,8 @@ where
         }
     }
 
-    pub(crate) fn load(addr: u64, loader: L) -> Result<Self, OpCode> {
-        let d = loader.load_pinned(addr)?;
+    pub(crate) fn load(addr: u64, loader: L) -> Self {
+        let d = loader.load_pinned(addr);
         let mut l = Self {
             loader,
             mtx: Arc::new(Mutex::new(())),
@@ -130,8 +132,8 @@ where
             }),
             inner: BaseView::null(),
         };
-        Self::load_inner(&mut l, d)?;
-        Ok(l)
+        Self::load_inner(&mut l, d);
+        l
     }
 
     /// keep node-owned pages alive until the page itself is reclaimed
@@ -250,6 +252,18 @@ where
         f(self.base_addr());
     }
 
+    pub(crate) fn collect_frontier_and_junk<F>(&self, mut f: F)
+    where
+        F: FnMut(u8, Position, u64),
+    {
+        self.state.read().delta.clone().iter().for_each(|x| {
+            let h = x.box_header();
+            f(h.group, h.lsn, h.addr);
+        });
+        let h = self.inner.box_header();
+        f(h.group, h.lsn, h.addr);
+    }
+
     fn set_comparator(&mut self, nt: NodeType) {
         let mut state = self.state.write();
         if nt == NodeType::Intl {
@@ -281,7 +295,7 @@ where
     }
 
     pub(crate) fn can_merge_child(&self, child_lo: &[u8], child_pid: u64) -> bool {
-        debug_assert_eq!(self.box_header().node_type, NodeType::Intl);
+        hot_true!(eq self.box_header().node_type, NodeType::Intl);
         let h = self.header();
         if h.merging_child != NULL_PID || h.merging {
             return false;
@@ -335,14 +349,8 @@ where
                 assert!(hi > k);
             }
         }
-        let sst = self.sst::<IntlKey>();
-        let pos = match sst.search_by(&IntlKey::new(k), |x, y| x.raw.cmp(y.raw)) {
-            Ok(pos) => pos,
-            Err(pos) => pos.max(1) - 1,
-        };
-
-        let (_, v) = sst.kv_at::<Index>(pos);
-        (pos == 0, v.pid)
+        let (pos, pid) = must_exist!(self.sst::<IntlKey>().floor_pid_by_raw(k));
+        (pos == 0, pid)
     }
 
     /// NOTE: before we add lock, it will search key in current node and return None if find, after
@@ -500,7 +508,7 @@ where
 
     #[allow(clippy::iter_skip_zero)]
     pub(crate) fn intl_iter(&'_ self) -> IntlIter<'_, L> {
-        debug_assert_eq!(self.box_header().node_type, NodeType::Intl);
+        hot_true!(eq self.box_header().node_type, NodeType::Intl);
         let len = self.header().prefix_len as usize;
         let lo = self.lo();
         IntlIter {
@@ -516,7 +524,7 @@ where
 
     #[allow(clippy::iter_skip_zero)]
     fn leaf_iter<'b>(&'b self, j: &'b mut Junk, safe_txid: u64) -> LeafIter<'b, L> {
-        debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
+        hot_true!(eq self.box_header().node_type, NodeType::Leaf);
         let len = self.header().prefix_len as usize;
         let lo = self.lo();
         LeafIter {
@@ -538,7 +546,7 @@ where
         safe_txid: u64,
         ctx: Handle<Context>,
     ) -> LeafIter<'b, L> {
-        debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
+        hot_true!(eq self.box_header().node_type, NodeType::Leaf);
         let len = self.header().prefix_len as usize;
         let lo = self.lo();
         LeafIter {
@@ -637,7 +645,7 @@ where
         let lo = self.lo();
         let hi = self.hi();
 
-        debug_assert!(!h.is_index);
+        hot_true!(!h.is_index);
         let mut iter = self.leaf_iter_drop_aborted(j, safe_txid, ctx);
         let (group, lsn) = self.get_group_lsn();
         let base = BaseView::new_leaf(
@@ -662,7 +670,7 @@ where
     ) -> (Node<L>, Junk) {
         match op {
             MergeOp::Merged => {
-                assert_eq!(self.box_header().node_type, NodeType::Intl);
+                hot_true!(eq self.box_header().node_type, NodeType::Intl);
                 let mut key = None;
                 let h = self.header();
                 let merging_child = h.merging_child;
@@ -675,7 +683,7 @@ where
                 let (group, lsn) = self.get_group_lsn();
                 let b = DeltaView::from_key_index(
                     a,
-                    key.unwrap(),
+                    must_exist!(key),
                     Index::null(),
                     safe_txid,
                     group,
@@ -688,13 +696,13 @@ where
                 (p, j)
             }
             MergeOp::MarkParent(pid) => {
-                assert_eq!(self.box_header().node_type, NodeType::Intl);
+                hot_true!(eq self.box_header().node_type, NodeType::Intl);
                 let (mut p, j) = self.compact(a, safe_txid);
                 p.header_mut().merging_child = pid;
                 (p, j)
             }
             MergeOp::MarkChild => {
-                assert_eq!(self.box_header().node_type, NodeType::Leaf);
+                hot_true!(eq self.box_header().node_type, NodeType::Leaf);
                 let (mut p, j) = self.compact(a, safe_txid);
                 p.header_mut().merging = true;
                 (p, j)
@@ -771,35 +779,27 @@ where
         self.state.read().addr
     }
 
-    pub(crate) fn has_garbage(&self, safe_txid: u64) -> bool {
-        if self.header().is_index {
-            return false;
-        }
-
-        let state = self.state.read();
-        // if the latest modification (delta or base) is stable,
-        // and base has explicitly marked garbage, then it is a candidate for compaction
-        if state.max_txid <= safe_txid {
-            return self.inner.header().has_multiple_versions;
-        }
-
-        false
-    }
-
     /// when value is inlined return node (or delta) or else retuen remote, the node (or delta) is
     /// always valid when node is valid
     pub(crate) fn find_latest(&self, key: &Key) -> Option<(Ver, Record, BoxRef)> {
-        debug_assert!(!self.inner.header().is_index);
+        hot_true!(!self.inner.header().is_index);
         let mut result = None;
         self.visit_versions(
             *key,
-            |x, y| Key::decode_from(x.key()).cmp(y),
+            |x, y| {
+                let (ver, raw) = Key::encoded_key_parts(x.key());
+                match raw.cmp(y.raw) {
+                    Equal => Ver::decode_from(ver).cmp(&y.ver),
+                    ord => ord,
+                }
+            },
             |x| {
-                let k = Key::decode_from(x.key());
-                if k.raw() == key.raw() {
+                let (ver, raw) = Key::encoded_key_parts(x.key());
+                if raw == key.raw() {
                     let v = x.val();
+                    let ver = Ver::decode_from(ver);
                     let (v, r) = v.get_record(&self.loader);
-                    result = Some((k.ver, v, r.unwrap_or_else(|| self.base_box())));
+                    result = Some((ver, v, r.unwrap_or_else(|| self.base_box())));
                     return true;
                 }
                 false
@@ -810,24 +810,31 @@ where
             return result;
         }
 
-        self.search_sst(key).map(|(k, v)| {
+        self.search_sst_value(key).map(|(ver, v)| {
             let (v, r) = v.get_record(&self.loader);
-            (k.ver, v, r.unwrap_or_else(|| self.base_box()))
+            (ver, v, r.unwrap_or_else(|| self.base_box()))
         })
     }
 
     pub(crate) fn find_latest_meta(&self, key: &Key) -> Option<LatestMeta> {
-        debug_assert!(!self.inner.header().is_index);
+        hot_true!(!self.inner.header().is_index);
         let mut result = None;
+        let probe = Key::new(key.raw(), Ver::new(u64::MAX, u32::MAX));
         self.visit_versions(
-            *key,
-            |x, y| Key::decode_from(x.key()).cmp(y),
+            probe,
+            |x, y| {
+                let (ver, raw) = Key::encoded_key_parts(x.key());
+                match raw.cmp(y.raw) {
+                    Equal => Ver::decode_from(ver).cmp(&y.ver),
+                    ord => ord,
+                }
+            },
             |x| {
-                let k = Key::decode_from(x.key());
-                if k.raw() == key.raw() {
+                let (ver, raw) = Key::encoded_key_parts(x.key());
+                if raw == key.raw() {
                     let v = x.val();
                     result = Some(LatestMeta {
-                        ver: k.ver,
+                        ver: Ver::decode_from(ver),
                         group_id: v.group_id(),
                         is_del: v.is_tombstone(),
                     });
@@ -841,24 +848,16 @@ where
             return result;
         }
 
-        self.search_sst(key).map(|(k, v)| LatestMeta {
-            ver: k.ver,
+        self.search_sst_value(key).map(|(ver, v)| LatestMeta {
+            ver,
             group_id: v.group_id(),
             is_del: v.is_tombstone(),
         })
     }
 
-    pub(crate) fn search_sst<'a>(&self, key: &Key) -> Option<(Key<'a>, Val<'a>)> {
-        debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
-        if self.header().elems > 0 {
-            let sst = self.inner.sst::<Key>();
-            let pos = sst.search_by(key, |x, y| x.raw().cmp(y.raw())).ok()?;
-            Some(sst.kv_at(pos))
-        } else {
-            // it not just ROOT_PID may have empty elems, it's same to those nodes have been compacted
-            // with all elems were filtered out
-            None
-        }
+    pub(crate) fn search_sst_value<'a>(&self, key: &Key) -> Option<(Ver, Val<'a>)> {
+        hot_true!(eq self.box_header().node_type, NodeType::Leaf);
+        self.inner.sst::<Key>().search_ver_val_by_raw(key.raw())
     }
 
     pub(crate) fn visit_versions<K, F>(&self, key: K, cmp: fn(&DeltaView, &K) -> Ordering, mut f: F)
@@ -909,8 +908,8 @@ where
         self.state.read().delta.len()
     }
 
-    fn load_inner(l: &mut Node<L>, mut d: BoxView) -> Result<(), OpCode> {
-        let mut one_base = true;
+    fn load_inner(l: &mut Node<L>, mut d: BoxView) {
+        let mut _one_base = true;
         let mut last_type = None;
 
         loop {
@@ -923,8 +922,8 @@ where
             // the head page carries the latest group/lsn for future base rebuilds
             state.total_size += d.total_size as usize;
             state.max_txid = state.max_txid.max(h.txid);
-            if let Some(t) = last_type {
-                assert_eq!(t, h.node_type);
+            if let Some(_t) = last_type {
+                hot_true!(eq _t, h.node_type);
             } else {
                 l.set_comparator(h.node_type);
             }
@@ -936,8 +935,8 @@ where
                     l.state.get_mut().delta.put(delta);
                 }
                 TagKind::Base => {
-                    assert!(one_base);
-                    one_base = false;
+                    hot_true!(_one_base);
+                    _one_base = false;
                     l.inner = d.as_base();
                 }
                 _ => unreachable!("bad kind {:?}", h.kind),
@@ -945,10 +944,9 @@ where
             if d.link == NULL_ADDR {
                 break;
             }
-            d = l.loader.load_pinned(d.link)?;
+            d = l.loader.load_pinned(d.link);
         }
-        assert!(!l.inner.is_null());
-        Ok(())
+        hot_true!(!l.inner.is_null());
     }
 
     #[allow(clippy::iter_skip_zero)]
@@ -1342,7 +1340,7 @@ where
                 }
                 (Some(x), None) => {
                     self.next_l = None;
-                    debug_assert!(!x.1.is_tombstone());
+                    hot_true!(!x.1.is_tombstone());
                     return Some(x);
                 }
                 (Some(l), Some(r)) => match l.0.raw_cmp(&r.0) {
@@ -1598,7 +1596,7 @@ impl<'a> LeafFilter<'a> {
 
     fn check_impl(&mut self, k: &LeafSeg<'a>, v: &Val) -> bool {
         if let Some(ctx) = self.drop_aborted_ctx
-            && ctx.get_aborted(k.txid()) == Some(TxOutcome::Aborted)
+            && ctx.group(v.group_id() as usize).is_retained_abort(k.txid())
         {
             self.removed = true;
             return false;
@@ -1666,7 +1664,7 @@ mod test {
             refbox::{BoxRef, BoxView, DeltaView},
             traits::{IFrameAlloc, IHeader, ILoader},
         },
-        utils::{OpCode, data::Position},
+        utils::data::Position,
     };
 
     struct AInner {
@@ -1715,8 +1713,8 @@ mod test {
     }
 
     impl ILoader for A {
-        fn load_pinned(&self, addr: u64) -> Result<BoxView, OpCode> {
-            Ok(self.load(addr).view())
+        fn load_pinned(&self, addr: u64) -> BoxView {
+            self.load(addr).view()
         }
 
         fn pin(&self, data: BoxRef) {
@@ -1732,13 +1730,13 @@ mod test {
             self.clone()
         }
 
-        fn load_sibling(&self, addr: u64) -> Result<BoxRef, OpCode> {
-            Ok(self.load(addr))
+        fn load_sibling(&self, addr: u64) -> BoxRef {
+            self.load(addr)
         }
 
-        fn load_blob(&self, addr: u64, _cache: bool) -> Result<BoxRef, OpCode> {
+        fn load_blob(&self, addr: u64, _cache: bool) -> BoxRef {
             self.inner.remote_loads.fetch_add(1, Relaxed);
-            Ok(self.load(addr))
+            self.load(addr)
         }
     }
 
@@ -1774,6 +1772,37 @@ mod test {
         let latest = node.find_latest(&key).expect("latest value should exist");
         assert_eq!(latest.1.data(), value.as_slice());
         assert_eq!(a.inner.remote_loads.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn find_latest_meta_is_independent_of_probe_txid() {
+        let mut a = A::new();
+        let l = a.clone();
+        let node = Node::new_leaf(&mut a, l.clone(), 0, Position::MIN);
+        let raw = "race".as_bytes();
+
+        for txid in [20u64, 10u64] {
+            let key = Key::new(raw, Ver::new(txid, 1));
+            let value = format!("v{txid}").into_bytes();
+            let record = Record::normal(1, &value);
+            let (delta, remote) = DeltaView::from_key_val(&mut a, &key, &record, 0, Position::MIN);
+            node.insert_inplace(
+                delta.view().as_delta(),
+                remote
+                    .as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
+            let _ = remote;
+            node.save_delta(delta);
+        }
+
+        let probe = Key::new(raw, Ver::new(5, 1));
+        let meta = node
+            .find_latest_meta(&probe)
+            .expect("latest meta should follow raw-key head");
+        assert_eq!(meta.ver.txid, 20);
+        assert!(!meta.is_del);
     }
 
     #[test]
@@ -1937,5 +1966,76 @@ mod test {
             }
             last = Some(k);
         }
+    }
+
+    #[test]
+    fn compact_drops_latest_tombstone_instead_of_revealing_older_value() {
+        let mut a = A::new();
+        let l = a.clone();
+        let lsn = Position::default();
+        let mut node = Node::new_leaf(&mut a, l, 0, lsn);
+        let mut txid = 1_u64;
+        let v1 = vec![b'x'; BucketOptions::MIN_INLINE_SIZE + 1024];
+        let v2 = vec![b'y'; BucketOptions::MIN_INLINE_SIZE + 1024];
+
+        for i in 0..64 {
+            let raw = format!("blob_{i:04}");
+            let key = Key::new(raw.as_bytes(), Ver::new(txid, 0));
+            txid += 1;
+            let value = Record::normal(1, &v1);
+            let (delta, remote) = DeltaView::from_key_val(&mut a, &key, &value, 0, lsn);
+            node.insert_inplace(
+                delta.view().as_delta(),
+                remote
+                    .as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
+            let _ = remote;
+            node.save_delta(delta);
+        }
+        (node, _) = node.compact(&mut a, txid);
+
+        for i in 0..64 {
+            let raw = format!("blob_{i:04}");
+            let key = Key::new(raw.as_bytes(), Ver::new(txid, 0));
+            let value = Record::normal(1, &v2);
+            let (delta, remote) = DeltaView::from_key_val(&mut a, &key, &value, 0, lsn);
+            node.insert_inplace(
+                delta.view().as_delta(),
+                remote
+                    .as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
+            let _ = remote;
+            node.save_delta(delta);
+            txid += 1;
+        }
+
+        for i in 0..64 {
+            let raw = format!("blob_{i:04}");
+            let key = Key::new(raw.as_bytes(), Ver::new(txid, 0));
+            txid += 1;
+            let value = Record::remove(1);
+            let (delta, remote) = DeltaView::from_key_val(&mut a, &key, &value, 0, lsn);
+            node.insert_inplace(
+                delta.view().as_delta(),
+                remote
+                    .as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
+            let _ = remote;
+            node.save_delta(delta);
+        }
+
+        let latest_txid = txid;
+        (node, _) = node.compact(&mut a, latest_txid);
+        let mut junk = Junk::new();
+        assert_eq!(node.leaf_iter(&mut junk, latest_txid).count(), 0);
+
+        let probe = Key::new("blob_0000".as_bytes(), Ver::new(latest_txid, 0));
+        assert!(node.find_latest(&probe).is_none());
     }
 }

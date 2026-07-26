@@ -1,5 +1,4 @@
 use super::wal::{IWalCodec, IWalPayload, WalAbort, WalBegin, WalCheckpoint, WalCommit, WalUpdate};
-use crate::OpCode;
 use crate::types::data::Key;
 use crate::utils::MutRef;
 use crate::utils::block::Ring;
@@ -8,6 +7,7 @@ use crate::utils::observe::{
     CounterMetric, HistogramMetric, LATENCY_SAMPLE_SHIFT, observe_elapsed, sampled_instant,
 };
 use crate::utils::options::ParsedOptions;
+use crate::{OpCode, must_ok};
 use crate::{cc::wal::EntryType, utils::data::GatherWriter};
 use crc32c::Crc32cHasher;
 use std::hash::Hasher;
@@ -78,8 +78,8 @@ impl Logging {
         ckpt_cnt: Arc<AtomicUsize>,
     ) -> Self {
         let path = opt.wal_file(group, latest_id);
-        let log_dir_dirty = !path.exists();
-        let writer = GatherWriter::append(&path, 16);
+        let log_dir_dirty = !must_ok!(opt.fs.try_exists(&path), "can't stat {:?}", path);
+        let writer = GatherWriter::append(opt.fs.as_ref(), &path, 16);
         let pos = Position {
             file_id: latest_id,
             offset: writer.pos(),
@@ -127,8 +127,9 @@ impl Logging {
 
             self.sync(false)?;
             let path = self.opt.wal_file(self.group, self.log_pos.file_id);
-            let created = !path.exists();
-            self.writer.reset(GatherWriter::append(&path, 16));
+            let created = !must_ok!(self.opt.fs.try_exists(&path), "can't stat {:?}", path);
+            self.writer
+                .reset(GatherWriter::append(self.opt.fs.as_ref(), &path, 16));
             self.log_dir_dirty |= created;
         }
 
@@ -419,9 +420,14 @@ impl Logging {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
+
     use super::Logging;
-    use crate::utils::data::Position;
     use crate::utils::options::Options;
+    use crate::{
+        io::testfs::{InjectOp, InjectedFileSystem},
+        utils::data::Position,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -465,5 +471,35 @@ mod tests {
         assert!(!logging.update_checkpoint(newer));
         assert_eq!(logging.last_ckpt(), newer);
         assert_eq!(logging.ckpt_cnt.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn wal_rotate_open_failure_panics() {
+        let root = crate::RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 1;
+        opt.wal_file_size = 1;
+        let next_path = opt.wal_file(0, 1);
+        let fs = Arc::new(InjectedFileSystem::new());
+        fs.fail_once(
+            InjectOp::Open,
+            next_path,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        opt.fs = fs;
+        let parsed = Arc::new(opt.validate().expect("log options must validate"));
+        let mut logging = Logging::new(
+            0,
+            0,
+            0,
+            Position::default(),
+            parsed,
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = logging.advance(1);
+        }));
+        assert!(res.is_err(), "wal rotate open failure must panic");
     }
 }

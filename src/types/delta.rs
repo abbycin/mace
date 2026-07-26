@@ -3,7 +3,7 @@ use crate::{
         data::{Record, Val},
         header::{DeltaHeader, NodeType, RemoteHeader, TagKind},
         refbox::{BoxRef, DeltaView},
-        traits::{IBoxHeader, ICodec, IFrameAlloc, IHeader, IKey},
+        traits::{ICodec, IFrameAlloc, IHeader, IKey},
     },
     utils::data::Position,
 };
@@ -25,7 +25,7 @@ impl DeltaView {
 
         let sz = Val::calc_size(false, inline_size, vsz);
         let lsn = lsn.max(a.checkpoint_lsn(group));
-        let (mut d, remote) = if is_remote {
+        let (d, remote) = if is_remote {
             // must alloc remote first
             let r = a.alloc((vsz + size_of::<RemoteHeader>()) as u32);
             let d = a.alloc((ksz + sz + Self::HDR_LEN) as u32);
@@ -36,8 +36,10 @@ impl DeltaView {
         let mut view = d.view();
         let h = view.header_mut();
         h.kind = TagKind::Delta;
+        h.node_type = NodeType::Leaf;
         h.txid = k.txid();
         h.group = group;
+        h.lsn = lsn;
         let mut delta = view.as_delta();
         *delta.header_mut() = DeltaHeader {
             klen: ksz as u32,
@@ -46,12 +48,12 @@ impl DeltaView {
         k.encode_to(delta.key_mut());
         if !is_remote {
             Val::encode_inline(delta.val_mut(), None, v);
-            d.header_mut().lsn = lsn;
             (d, None)
         } else {
             let mut r = remote.expect("remote allocation must exist");
             let h = r.header_mut();
             h.kind = TagKind::Remote;
+            h.node_type = NodeType::Leaf;
             h.lsn = lsn;
             h.group = group;
             let mut view = r.view().as_remote();
@@ -76,6 +78,7 @@ impl DeltaView {
         let mut view = d.view();
         let h = view.header_mut();
         h.kind = TagKind::Delta;
+        h.node_type = NodeType::Intl;
         h.txid = txid;
         h.group = group;
         h.lsn = lsn;
@@ -100,7 +103,6 @@ impl DeltaView {
     }
 
     pub(crate) fn val<'a>(&self) -> Val<'a> {
-        debug_assert_eq!(self.box_header().node_type, NodeType::Leaf);
         let h = self.header();
         let p = self.data_ptr(h.klen as u64);
         let v = unsafe { std::slice::from_raw_parts(p, h.vlen as usize) };
@@ -109,7 +111,6 @@ impl DeltaView {
 
     /// for Index only
     pub(crate) fn index(&self) -> &[u8] {
-        debug_assert_eq!(self.box_header().node_type, NodeType::Intl);
         let h = self.header();
         unsafe { std::slice::from_raw_parts(self.data_ptr(h.klen as u64), h.vlen as usize) }
     }
@@ -122,5 +123,65 @@ impl DeltaView {
     fn val_mut(&mut self) -> &mut [u8] {
         let h = self.header();
         unsafe { std::slice::from_raw_parts_mut(self.data_ptr(h.klen as u64), h.vlen as usize) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        types::{
+            data::{Key, Record, Ver},
+            traits::{IFrameAlloc, IHeader},
+        },
+        utils::data::Position,
+    };
+
+    #[derive(Clone)]
+    struct Alloc {
+        inline_size: usize,
+        checkpoint_lsn: Position,
+        next_addr: u64,
+    }
+
+    impl Alloc {
+        fn new(inline_size: usize, checkpoint_lsn: Position) -> Self {
+            Self {
+                inline_size,
+                checkpoint_lsn,
+                next_addr: 1,
+            }
+        }
+    }
+
+    impl IFrameAlloc for Alloc {
+        fn alloc(&mut self, size: u32) -> crate::types::refbox::BoxRef {
+            let addr = self.next_addr;
+            self.next_addr += 1;
+            crate::types::refbox::BoxRef::alloc(size, addr)
+        }
+
+        fn inline_size(&self) -> usize {
+            self.inline_size
+        }
+
+        fn checkpoint_lsn(&self, _group: u8) -> Position {
+            self.checkpoint_lsn
+        }
+    }
+
+    #[test]
+    fn remote_delta_keeps_wal_lsn_on_owner_and_remote() {
+        let lsn = Position::new(7, 11);
+        let mut alloc = Alloc::new(32, Position::MIN);
+        let key = Key::new(b"blob", Ver::new(9, 3));
+        let val = Record::normal(1, &[b'x'; 128]);
+
+        let (delta, remote) = super::DeltaView::from_key_val(&mut alloc, &key, &val, 2, lsn);
+        let remote = remote.expect("remote value must allocate a blob page");
+
+        assert_eq!(delta.header().lsn, lsn);
+        assert_eq!(remote.header().lsn, lsn);
+        assert_eq!(delta.header().group, 2);
+        assert_eq!(remote.header().group, 2);
     }
 }

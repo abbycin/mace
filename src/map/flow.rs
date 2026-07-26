@@ -122,6 +122,7 @@ impl FlowController {
     const EWMA_ALPHA_FALL_NUM: u64 = 5;
     const EWMA_ALPHA_DEN: u64 = 100;
     const DEFAULT_IDLE_RESET_MS: u64 = 5_000;
+    const ADMISSION_WAIT_RECHECK_MS: u64 = 10;
     const ADMISSION_BURST_POOL_DIVISOR: u64 = 8;
     const ADMISSION_BURST_MIN_BYTES: u64 = 1 << 20;
     const ADMISSION_PROGRESS_EXTRA_BURST_CAP_MULTIPLIER: u64 = 3;
@@ -306,7 +307,12 @@ impl FlowController {
                 wait_started = Some(Instant::now());
             }
             state.waiting_writers = state.waiting_writers.saturating_add(1);
-            self.admission_cv.wait(&mut state);
+            // periodically recheck because snapshot-backed predicates can change
+            // outside admission_state and are not all paired with condvar signals
+            let _ = self.admission_cv.wait_for(
+                &mut state,
+                Duration::from_millis(Self::ADMISSION_WAIT_RECHECK_MS),
+            );
             state.waiting_writers = state.waiting_writers.saturating_sub(1);
         }
     }

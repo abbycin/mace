@@ -1,6 +1,6 @@
 [package]
 name = "mace-kv"
-version = "0.0.35"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
@@ -10,24 +10,27 @@ repository = "https://github.com/abbycin/mace"
 description = "A fast, cross-platform embedded key-value storage engine with ACID, MVCC, and flash-optimized storage"
 license = "MIT"
 categories = ["database-implementations", "database"]
-keywords = ["database", "kv", "btree", "storage", "embedded"]
+keywords = ["database", "lmdb", "sled", "rocksdb", "redis"]
 
 [lib]
 name = "mace"
 
 [dependencies]
+backtrace = "0.3.76"
 crc32c = "0.6.8"
 dashmap = "6.2.1"
-rand = "0.10.1"
-log = "0.4.32"
-crossbeam-epoch = "0.9.18"
+rand = "0.10.2"
+log = "0.4.33"
+crossbeam-epoch = "0.9.20"
 parking_lot = "0.12.5"
-btree-store = "0.1.9"
-rustc-hash = "2.1.2"
-zstd = { version = "0.13.3" }
+btree-store = "0.1.10"
+rustc-hash = "2.1.3"
+zstd = "0.13.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 [target.'cfg(not(windows))'.dependencies]
-libc = "0.2.186"
+libc = "0.2.189"
 
 [dev-dependencies]
 logger = { path = "deps/logger" }
@@ -35,7 +38,6 @@ logger = { path = "deps/logger" }
 [features]
 default = []
 extra_check = []
-metric = []
 failpoints = []
 
 [profile.release]

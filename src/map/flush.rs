@@ -1,6 +1,6 @@
 use crate::cc::context::Context;
 use crate::map::data::{CheckpointTask, FileBuilder, MapBuilder};
-use crate::meta::{BlobStat, DataStat, IntervalPair, MemBlobStat, MemDataStat, PageTable};
+use crate::meta::{FileKind, IntervalPair, MemStat, PageTable, PersistStat};
 #[cfg(feature = "extra_check")]
 use crate::utils::NULL_ADDR;
 use crate::utils::countblock::Countblock;
@@ -25,21 +25,53 @@ pub enum FlushDirective {
     Normal,
 }
 
+#[derive(Default)]
+pub struct FlushKindResult {
+    pub ivls: Vec<IntervalPair>,
+    pub stats: Vec<PersistStat>,
+    pub junk: Vec<u64>,
+}
+
 pub struct FlushResult {
     opt: Arc<ParsedOptions>,
     pub bucket_id: u64,
     pub map_table: PageTable,
-    pub data_ivls: Vec<IntervalPair>,
-    pub data_stats: Vec<DataStat>,
-    pub blob_ivls: Vec<IntervalPair>,
-    pub blob_stats: Vec<BlobStat>,
-    pub blob_junk: Vec<u64>,
-    pub data_junk: Vec<u64>,
+    pub kinds: [FlushKindResult; 2],
     pub writers: Vec<GatherWriter>,
     pub latest_chkpoint_lsn: MutRef<GroupPositions>,
 }
 
 impl FlushResult {
+    fn new(
+        opt: Arc<ParsedOptions>,
+        bucket_id: u64,
+        map_table: PageTable,
+        latest_chkpoint_lsn: MutRef<GroupPositions>,
+    ) -> Self {
+        Self {
+            opt,
+            bucket_id,
+            map_table,
+            kinds: [FlushKindResult::default(), FlushKindResult::default()],
+            writers: Vec::new(),
+            latest_chkpoint_lsn,
+        }
+    }
+
+    pub fn kind(&self, kind: FileKind) -> &FlushKindResult {
+        &self.kinds[kind.slot()]
+    }
+
+    pub fn kind_mut(&mut self, kind: FileKind) -> &mut FlushKindResult {
+        &mut self.kinds[kind.slot()]
+    }
+
+    pub fn has_new_files(&self) -> bool {
+        FileKind::ALL
+            .iter()
+            .any(|&kind| !self.kind(kind).ivls.is_empty())
+    }
+
     pub fn sync(&mut self) {
         let has_outputs = !self.writers.is_empty();
         if self.opt.sync_on_write {
@@ -59,12 +91,10 @@ impl FlushResult {
 
 pub trait CheckpointObserver: Send + Sync {
     fn flush_directive(&self, bucket_id: u64) -> FlushDirective;
-    fn stage_unsynced_data_file(&self, file_id: u64);
-    fn stage_unsynced_blob_file(&self, file_id: u64);
-    fn stage_orphan_data_file(&self, file_id: u64);
-    fn stage_orphan_blob_file(&self, file_id: u64);
-    fn update_data_mem_interval_stat(&self, ivl: IntervalPair, stat: MemDataStat);
-    fn update_blob_mem_interval_stat(&self, ivl: IntervalPair, stat: MemBlobStat);
+    fn next_update_epoch(&self, bucket_id: u64, kind: FileKind) -> u64;
+    fn stage_unsynced_file(&self, kind: FileKind, file_id: u64);
+    fn stage_orphan_file(&self, kind: FileKind, file_id: u64);
+    fn update_mem_interval_stat(&self, kind: FileKind, ivl: IntervalPair, stat: MemStat);
     fn on_checkpoint(&self, result: FlushResult);
     fn finish_checkpoint(&self);
 }
@@ -73,8 +103,12 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
     let bucket_id = task.bucket_id;
     let mut snapshot = task.snapshot();
     let mut map_builder = MapBuilder::new(bucket_id, &snapshot.unmap_pid);
-    let mut file_builder =
-        FileBuilder::new(bucket_id, task.enable_compression, task.compressors.clone());
+    let mut file_builder = FileBuilder::new(
+        bucket_id,
+        task.enable_compression,
+        task.compressors.clone(),
+        ctx.opt.fs.clone(),
+    );
 
     let pages = std::mem::take(&mut snapshot.pages);
     for b in pages {
@@ -95,39 +129,51 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
     }
 
     if file_builder.is_empty() {
-        observer.on_checkpoint(FlushResult {
-            opt: ctx.opt.clone(),
+        let mut result = FlushResult::new(
+            ctx.opt.clone(),
             bucket_id,
-            map_table: mapping,
-            data_ivls: Vec::new(),
-            data_stats: Vec::new(),
-            blob_ivls: Vec::new(),
-            blob_stats: Vec::new(),
-            blob_junk: std::mem::take(&mut snapshot.blob_junk),
-            data_junk: std::mem::take(&mut snapshot.data_junk),
-            writers: Vec::new(),
-            latest_chkpoint_lsn: task.last_chkpt_lsn.clone(),
-        });
+            mapping,
+            task.last_chkpt_lsn.clone(),
+        );
+        result.kind_mut(FileKind::Data).junk = std::mem::take(&mut snapshot.data_junk);
+        result.kind_mut(FileKind::Blob).junk = std::mem::take(&mut snapshot.blob_junk);
+        observer.on_checkpoint(result);
         task.done(snapshot);
         return;
     }
 
-    let mut data_ivls = Vec::new();
-    let mut data_stats = Vec::new();
-    let mut blob_ivls = Vec::new();
-    let mut blob_stats = Vec::new();
-    let mut writers = Vec::new();
+    let mut result = FlushResult::new(
+        ctx.opt.clone(),
+        bucket_id,
+        mapping,
+        task.last_chkpt_lsn.clone(),
+    );
+    result.kind_mut(FileKind::Data).junk = std::mem::take(&mut snapshot.data_junk);
+    result.kind_mut(FileKind::Blob).junk = std::mem::take(&mut snapshot.blob_junk);
     let actual_bytes = file_builder.io_bytes();
     let io_started = Instant::now();
 
-    if file_builder.has_data() {
-        let data_files = file_builder.flush_data_files(
-            ctx.opt.data_file_size,
+    for kind in FileKind::ALL {
+        if !file_builder.has_kind(kind) {
+            continue;
+        }
+        let tick = observer.next_update_epoch(bucket_id, kind);
+        let files = file_builder.flush_files(
+            kind,
+            match kind {
+                FileKind::Data => ctx.opt.data_file_size,
+                FileKind::Blob => ctx.opt.blob_file_size,
+            },
+            tick,
             || {
-                let data_file_id = ctx.numerics.next_data_id.fetch_add(1, Relaxed);
-                observer.stage_orphan_data_file(data_file_id);
-                observer.stage_unsynced_data_file(data_file_id);
-                (data_file_id, ctx.opt.data_file(data_file_id))
+                let file_id = ctx.sequences.next_file_id.fetch_add(1, Relaxed);
+                observer.stage_orphan_file(kind, file_id);
+                observer.stage_unsynced_file(kind, file_id);
+                let path = match kind {
+                    FileKind::Data => ctx.opt.data_file(file_id),
+                    FileKind::Blob => ctx.opt.blob_file(file_id),
+                };
+                (file_id, path)
             },
             |bytes| {
                 task.mark_checkpoint_progress(bytes);
@@ -135,62 +181,29 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
             |file| {
                 let ivl =
                     IntervalPair::new(file.interval.lo, file.interval.hi, file.file_id, bucket_id);
-                observer.update_data_mem_interval_stat(ivl, file.stat.clone_mem());
+                observer.update_mem_interval_stat(kind, ivl, file.stat.clone_mem());
                 task.release_persisted_pages(&file.addrs);
             },
         );
-        for file in data_files {
-            let Interval { lo, hi } = file.interval;
-            data_ivls.push(IntervalPair::new(lo, hi, file.file_id, bucket_id));
-            data_stats.push(file.stat.copy());
-            writers.push(file.writer);
+        let mut built_writers = Vec::with_capacity(files.len());
+        {
+            let slot = result.kind_mut(kind);
+            for file in files {
+                let Interval { lo, hi } = file.interval;
+                slot.ivls
+                    .push(IntervalPair::new(lo, hi, file.file_id, bucket_id));
+                slot.stats.push(file.stat.copy());
+                built_writers.push(file.writer);
+            }
         }
-    }
-
-    if file_builder.has_blob() {
-        let blob_files = file_builder.flush_blob_files(
-            ctx.opt.blob_file_size,
-            || {
-                let blob_file_id = ctx.numerics.next_blob_id.fetch_add(1, Relaxed);
-                observer.stage_orphan_blob_file(blob_file_id);
-                observer.stage_unsynced_blob_file(blob_file_id);
-                (blob_file_id, ctx.opt.blob_file(blob_file_id))
-            },
-            |bytes| {
-                task.mark_checkpoint_progress(bytes);
-            },
-            |file| {
-                let ivl =
-                    IntervalPair::new(file.interval.lo, file.interval.hi, file.file_id, bucket_id);
-                observer.update_blob_mem_interval_stat(ivl, file.stat.clone_mem());
-                task.release_persisted_pages(&file.addrs);
-            },
-        );
-        for file in blob_files {
-            let Interval { lo, hi } = file.interval;
-            blob_ivls.push(IntervalPair::new(lo, hi, file.file_id, bucket_id));
-            blob_stats.push(file.stat.copy());
-            writers.push(file.writer);
-        }
+        result.writers.extend(built_writers);
     }
 
     #[cfg(feature = "failpoints")]
     crate::utils::failpoint::crash("mace_flush_after_data_sync");
 
     task.mark_io_built(actual_bytes, io_started.elapsed());
-    observer.on_checkpoint(FlushResult {
-        opt: ctx.opt.clone(),
-        bucket_id,
-        map_table: mapping,
-        data_ivls,
-        data_stats,
-        blob_ivls,
-        blob_stats,
-        blob_junk: std::mem::take(&mut snapshot.blob_junk),
-        data_junk: std::mem::take(&mut snapshot.data_junk),
-        writers,
-        latest_chkpoint_lsn: task.last_chkpt_lsn.clone(),
-    });
+    observer.on_checkpoint(result);
 
     task.done(snapshot);
 }

@@ -43,7 +43,7 @@ pub struct File {
 }
 
 impl OpenOptions {
-    pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<File, io::Error> {
+    pub(crate) fn open_os<P: AsRef<Path>>(&self, path: P) -> Result<File, io::Error> {
         File::open(path, self)
     }
 }

@@ -2,13 +2,15 @@ use super::{ValRef, tree::LatestValMeta};
 use crate::{
     OpCode,
     cc::{
-        cc::ConcurrencyControl,
-        context::{CCNode, Context, TxOutcome},
-        group::TxnState,
+        SnapshotStamp,
+        context::{CCNode, Context},
+        group::{TxnState, WriterGroup},
+        is_visible_to,
         wal::{WalDel, WalPut, WalReplace},
     },
     index::tree::{Iter, Tree},
     map::flow::ForegroundWritePermit,
+    must_ok,
     types::data::{Key, Record, Ver},
     utils::{
         Handle, NULL_CMD,
@@ -25,31 +27,23 @@ use std::sync::atomic::Ordering::Relaxed;
 
 fn get_impl<K: AsRef<[u8]>>(
     ctx: &Context,
-    cc: &ConcurrencyControl,
     tree: &Tree,
-    group_id: u8,
-    start_ts: u64,
+    snapshot: SnapshotStamp,
     k: K,
 ) -> Result<ValRef, OpCode> {
     #[cfg(feature = "extra_check")]
     assert!(!k.as_ref().is_empty(), "key must be non-empty");
 
     let g = crossbeam_epoch::pin();
-    let key = Key::new(k.as_ref(), Ver::new(start_ts, NULL_CMD));
+    let key = Key::new(k.as_ref(), Ver::new(snapshot.start_ts, NULL_CMD));
     let r = tree.traverse(&g, key, |txid, record_gid| {
-        cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
+        is_visible_to(ctx, snapshot, record_gid, txid)
     })?;
 
     Ok(r)
 }
 
-fn seek_impl<'a, K>(
-    cc: &'a ConcurrencyControl,
-    tree: &'a Tree,
-    group_id: u8,
-    start_ts: u64,
-    prefix: K,
-) -> Iter<'a>
+fn seek_impl<'a, K>(tree: &'a Tree, snapshot: SnapshotStamp, prefix: K) -> Iter<'a>
 where
     K: AsRef<[u8]>,
 {
@@ -60,28 +54,22 @@ where
     let upper = prefix_upper_exclusive(b);
     if let Some(ref upper) = upper {
         tree.range(b..upper.as_slice(), move |ctx, txid, record_gid| {
-            cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
+            is_visible_to(ctx, snapshot, record_gid, txid)
         })
     } else {
         tree.range(b.., move |ctx, txid, record_gid| {
-            cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
+            is_visible_to(ctx, snapshot, record_gid, txid)
         })
     }
 }
 
-fn range_impl<'a, K, R>(
-    cc: &'a ConcurrencyControl,
-    tree: &'a Tree,
-    group_id: u8,
-    start_ts: u64,
-    range: R,
-) -> Iter<'a>
+fn range_impl<'a, K, R>(tree: &'a Tree, snapshot: SnapshotStamp, range: R) -> Iter<'a>
 where
     K: AsRef<[u8]>,
     R: RangeBounds<K>,
 {
     tree.range(range, move |ctx, txid, record_gid| {
-        cc.is_visible_to(ctx, group_id, record_gid, start_ts, txid)
+        is_visible_to(ctx, snapshot, record_gid, txid)
     })
 }
 
@@ -113,34 +101,72 @@ enum FailCause {
     Conflict,
 }
 
+struct RegGuard<'a> {
+    group: &'a WriterGroup,
+    finished: bool,
+}
+
+impl<'a> RegGuard<'a> {
+    fn new(group: &'a WriterGroup) -> Self {
+        Self {
+            group,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for RegGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.group.reg_abot();
+        }
+    }
+}
+
 impl<'a> TxnKV<'a> {
     pub(crate) fn new(ctx: &'a Context, tree: &'a Tree) -> Result<Self, OpCode> {
-        let start_ts = ctx.alloc_oracle();
         let gid = ctx.next_group_id();
         let g = ctx.group(gid);
         let start_ckpt = g.ckpt_cnt.load(Relaxed);
-        let mut state = TxnState::new(gid, start_ts, start_ckpt);
+        let mut state = TxnState::new(gid as u8, 0, start_ckpt);
         let bucket_id = tree.bucket_id();
         let max_ckpt_per_txn = tree.store.opt.max_ckpt_per_txn;
 
         tree.bucket.state.inc_txn_ref();
 
-        let begin_res = {
+        {
             let mut log = g.logging.lock();
-            log.record_begin(start_ts).map(|lsn| {
-                state.begin_lsn = lsn;
-                state.prev_lsn = lsn;
-                g.active_txns.insert(start_ts, state.prev_lsn);
-            })
-        };
-        if let Err(e) = begin_res {
-            g.leave_inflight();
-            tree.bucket.state.dec_txn_ref();
-            return Err(e);
+            let mut begin_guard = RegGuard::new(g);
+            g.start_reg();
+            let start_ts = ctx.alloc_oracle();
+            state.start_ts = start_ts;
+            g.reg_start_ts(start_ts);
+            #[cfg(feature = "extra_check")]
+            crate::testing::fire_txn_begin_sync_point(
+                crate::testing::TxnBeginSyncPoint::AfterBeginTimestampBeforeFactPublish,
+                start_ts,
+            );
+            match log.record_begin(start_ts) {
+                Ok(lsn) => {
+                    state.begin_lsn = lsn;
+                    state.prev_lsn = lsn;
+                    g.active_fact(start_ts, lsn);
+                    g.reg_end();
+                    begin_guard.finish();
+                }
+                Err(e) => {
+                    g.leave_inflight();
+                    tree.bucket.state.dec_txn_ref();
+                    return Err(e);
+                }
+            }
         }
         ctx.opt.observer.counter(CounterMetric::TxnBegin, 1);
 
-        g.cc.commit_tree.compact(ctx);
         Ok(Self {
             ctx,
             state: UnsafeCell::new(state),
@@ -153,7 +179,7 @@ impl<'a> TxnKV<'a> {
 
     fn should_abort(&self) -> Result<(), OpCode> {
         let state = self.state_ref();
-        let g = self.ctx.group(state.group_id);
+        let g = self.ctx.group(state.group());
 
         if self.is_end.get() || g.ckpt_cnt.load(Relaxed) - state.start_ckpt >= self.limit {
             return Err(OpCode::AbortTx);
@@ -164,6 +190,12 @@ impl<'a> TxnKV<'a> {
     #[inline]
     fn state_ref(&self) -> &TxnState {
         unsafe { &*self.state.get() }
+    }
+
+    #[inline]
+    #[cfg(feature = "extra_check")]
+    pub(crate) fn testing_start_ts(&self) -> u64 {
+        self.state_ref().start_ts
     }
 
     #[inline]
@@ -211,20 +243,13 @@ impl<'a> TxnKV<'a> {
     }
 
     #[inline]
-    fn is_visible_for_write(
-        &self,
-        group_id: usize,
-        start_ts: u64,
-        txid: u64,
-        record_gid: u8,
-    ) -> bool {
-        self.ctx.group(group_id).cc.is_visible_to(
-            self.ctx,
-            group_id as u8,
-            record_gid,
-            start_ts,
-            txid,
-        )
+    fn is_visible_for_write(&self, snapshot: SnapshotStamp, txid: u64, record_gid: u8) -> bool {
+        is_visible_to(self.ctx, snapshot, record_gid, txid)
+    }
+
+    #[inline]
+    fn snapshot(state: &TxnState) -> SnapshotStamp {
+        SnapshotStamp::txn(state.group() as u8, state.start_ts)
     }
 
     fn resolve_latest_meta_for_write(
@@ -235,13 +260,14 @@ impl<'a> TxnKV<'a> {
         let Some(rv) = opt else {
             return Ok(None);
         };
-        let gid = state.group_id;
-        let start_ts = state.start_ts;
-        if self.is_visible_for_write(gid, start_ts, rv.ver.txid, rv.group_id) {
+        let snapshot = Self::snapshot(state);
+        if self.is_visible_for_write(snapshot, rv.ver.txid, rv.group_id) {
             return Ok(Some(*rv));
         }
-        if self.ctx.is_aborted(rv.ver.txid)
-            && self.ctx.get_aborted(rv.ver.txid) == Some(TxOutcome::Aborted)
+        if self
+            .ctx
+            .group(rv.group_id as usize)
+            .is_retained_abort(rv.ver.txid)
         {
             return Err(FailCause::Aborted);
         }
@@ -253,14 +279,18 @@ impl<'a> TxnKV<'a> {
             .tree
             .get(g, Key::new(raw, Ver::new(u64::MAX, u32::MAX)))
         {
-            Ok((k, _)) => Some(k),
+            Ok((k, v)) => Some((k, v)),
             Err(OpCode::NotFound | OpCode::Again) => None,
             Err(e) => return Err(e),
         };
-        let Some(k) = latest else {
+        let Some((k, v)) = latest else {
             return Ok(false);
         };
-        if self.ctx.get_aborted(k.ver().txid) != Some(TxOutcome::Aborted) {
+        if !self
+            .ctx
+            .group(v.group_id() as usize)
+            .is_retained_abort(k.ver().txid)
+        {
             return Ok(false);
         }
 
@@ -280,12 +310,15 @@ impl<'a> TxnKV<'a> {
 
     fn put_impl(&self, k: &[u8], v: &[u8], logged: &mut bool) -> Result<(), OpCode> {
         let estimated = k.len().saturating_add(v.len());
+        #[cfg(feature = "extra_check")]
+        assert!(!k.is_empty(), "key must be non-empty");
+
         loop {
             self.should_abort()?;
             let g = crossbeam_epoch::pin();
             let state = self.state_mut();
             let start_ts = state.start_ts;
-            let gid = state.group_id;
+            let gid = state.group();
 
             let cmd_id_val = state.cmd_id;
             state.cmd_id += 1;
@@ -295,7 +328,6 @@ impl<'a> TxnKV<'a> {
             let mut abort_cause = FailCause::Conflict;
 
             let res = self.tree.update(&g, key, val, |opt| {
-                let gid = state.group_id;
                 let g = self.ctx.group(gid);
 
                 let current = match self.resolve_latest_meta_for_write(opt, state) {
@@ -353,7 +385,7 @@ impl<'a> TxnKV<'a> {
             let g = crossbeam_epoch::pin();
             let state = self.state_mut();
             let start_ts = state.start_ts;
-            let gid = state.group_id;
+            let gid = state.group();
 
             let cmd_id_val = state.cmd_id;
             state.cmd_id += 1;
@@ -363,7 +395,6 @@ impl<'a> TxnKV<'a> {
             let mut abort_cause = FailCause::Conflict;
 
             let res = self.tree.update(&g, key, val, |opt| {
-                let gid = state.group_id;
                 let g = self.ctx.group(gid);
                 let current = match self.resolve_latest_meta_for_write(opt, state) {
                     Ok(current) => current,
@@ -407,6 +438,7 @@ impl<'a> TxnKV<'a> {
     }
 
     /// Puts a key-value pair into the bucket.
+    /// **key must be non-empty**.
     pub fn put<K, V>(&self, k: K, v: V) -> Result<(), OpCode>
     where
         K: AsRef<[u8]>,
@@ -417,6 +449,7 @@ impl<'a> TxnKV<'a> {
     }
 
     /// Updates existing key-value pair in the bucket.
+    /// **key must be non-empty**.
     pub fn update<K, V>(&self, k: K, v: V) -> Result<(), OpCode>
     where
         K: AsRef<[u8]>,
@@ -427,6 +460,7 @@ impl<'a> TxnKV<'a> {
     }
 
     /// Upserts a key-value pair into the bucket.
+    /// **key must be non-empty**.
     pub fn upsert<K, V>(&self, k: K, v: V) -> Result<(), OpCode>
     where
         K: AsRef<[u8]>,
@@ -443,7 +477,7 @@ impl<'a> TxnKV<'a> {
             let g = crossbeam_epoch::pin();
             let state = self.state_mut();
             let start_ts = state.start_ts;
-            let gid = state.group_id;
+            let gid = state.group();
 
             let cmd_id_val = state.cmd_id;
             state.cmd_id += 1;
@@ -453,7 +487,6 @@ impl<'a> TxnKV<'a> {
             let mut abort_cause = FailCause::Conflict;
 
             let res = self.tree.update(&g, key, val, |opt| {
-                let gid = state.group_id;
                 let g = self.ctx.group(gid);
 
                 let current = match self.resolve_latest_meta_for_write(opt, state) {
@@ -501,6 +534,7 @@ impl<'a> TxnKV<'a> {
     }
 
     /// Deletes a key-value pair from the bucket.
+    /// **key must be non-empty**.
     pub fn del<T>(&self, k: T) -> Result<(), OpCode>
     where
         T: AsRef<[u8]>,
@@ -515,7 +549,7 @@ impl<'a> TxnKV<'a> {
             let g = crossbeam_epoch::pin();
             let state = self.state_mut();
             let start_ts = state.start_ts;
-            let gid = state.group_id;
+            let gid = state.group();
             let cmd_id_val = state.cmd_id;
             state.cmd_id += 1;
 
@@ -525,7 +559,6 @@ impl<'a> TxnKV<'a> {
             let mut abort_cause = FailCause::Conflict;
 
             let res = self.tree.update(&g, key, val, |opt| {
-                let gid = state.group_id;
                 let g = self.ctx.group(gid);
                 let current = match self.resolve_latest_meta_for_write(opt, state) {
                     Ok(current) => current,
@@ -573,7 +606,7 @@ impl<'a> TxnKV<'a> {
         self.should_abort()?;
         let state = self.state_ref();
         let commit_started = sampled_instant(state.start_ts, LATENCY_SAMPLE_SHIFT);
-        let g = self.ctx.group(state.group_id);
+        let g = self.ctx.group(state.group());
 
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check("mace_txn_commit_begin")?;
@@ -582,8 +615,8 @@ impl<'a> TxnKV<'a> {
             {
                 let mut log = g.logging.lock();
                 log.record_commit(state.start_ts)?;
+                g.remove_fact(state.start_ts);
             }
-            g.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
             self.observe_counter(CounterMetric::TxnCommit, 1);
             observe_elapsed(
@@ -594,23 +627,15 @@ impl<'a> TxnKV<'a> {
             return Ok(());
         }
 
-        let commit_ts = self.ctx.alloc_oracle();
+        let mut log = g.logging.lock();
+        log.record_commit(state.start_ts)?;
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_txn_commit_after_record_commit")?;
+        log.sync(false)?;
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check("mace_txn_commit_after_wal_sync")?;
+        g.commit_fact(state.start_ts, || self.ctx.alloc_oracle());
 
-        {
-            let mut log = g.logging.lock();
-            log.record_commit(state.start_ts)?;
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::check("mace_txn_commit_after_record_commit")?;
-            log.sync(false)?;
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::check("mace_txn_commit_after_wal_sync")?;
-        }
-
-        g.cc.commit_tree.append(state.start_ts, commit_ts);
-        g.cc.latest_cts.store(commit_ts, Relaxed);
-        g.cc.collect_wmk(self.ctx);
-
-        g.active_txns.remove(&state.start_ts);
         self.is_end.set(true);
         self.observe_counter(CounterMetric::TxnCommit, 1);
         observe_elapsed(
@@ -622,21 +647,14 @@ impl<'a> TxnKV<'a> {
     }
 
     /// Gets the value associated with a key.
+    /// **key must be non-empty**.
     #[inline]
     pub fn get<K>(&self, k: K) -> Result<ValRef, OpCode>
     where
         K: AsRef<[u8]>,
     {
         let state = self.state_ref();
-        let group_id = state.group_id;
-        get_impl(
-            self.ctx,
-            &self.ctx.group(group_id).cc,
-            self.tree,
-            group_id as u8,
-            state.start_ts,
-            k,
-        )
+        get_impl(self.ctx, self.tree, Self::snapshot(state), k)
     }
 
     /// Seeks an iterator to a key prefix.
@@ -650,14 +668,7 @@ impl<'a> TxnKV<'a> {
         K: AsRef<[u8]>,
     {
         let state = self.state_ref();
-        let group_id = state.group_id;
-        seek_impl(
-            &self.ctx.group(group_id).cc,
-            self.tree,
-            group_id as u8,
-            state.start_ts,
-            prefix,
-        )
+        seek_impl(self.tree, Self::snapshot(state), prefix)
     }
 
     #[inline]
@@ -667,54 +678,47 @@ impl<'a> TxnKV<'a> {
         R: RangeBounds<K>,
     {
         let state = self.state_ref();
-        let group_id = state.group_id;
-        range_impl(
-            &self.ctx.group(group_id).cc,
-            self.tree,
-            group_id as u8,
-            state.start_ts,
-            range,
-        )
+        range_impl(self.tree, Self::snapshot(state), range)
     }
 }
 
 impl Drop for TxnKV<'_> {
     fn drop(&mut self) {
-        let group_id = self.state_ref().group_id;
+        let group_id = self.state_ref().group();
         if !self.is_end.get() {
             let state = self.state_ref();
-            let grp = self.ctx.group(state.group_id);
+            let g = self.ctx.group(state.group());
             let modified = state.modified;
 
-            let mut log = grp.logging.lock();
-            log.record_abort(state.start_ts)
-                .inspect_err(|e| {
-                    log::error!("can't record abort, {:?}", e);
-                })
-                .expect("can't fail");
+            let mut log = g.logging.lock();
+            must_ok!(log.record_abort(state.start_ts));
             if modified {
-                log.sync(false)
-                    .inspect_err(|e| {
-                        log::error!("can't sync abort chain before enqueue, {:?}", e);
-                    })
-                    .expect("can't fail");
+                must_ok!(log.sync(false));
             }
-            drop(log);
-
-            if modified {
-                self.ctx.add_aborted(state.start_ts);
-                self.ctx.enqueue_abort_clean(
+            let abort_clean_task = modified.then(|| {
+                self.ctx.build_abort_clean_task(
                     state.start_ts,
                     self.bucket_id,
-                    state.group_id as u8,
+                    state.group() as u8,
                     state.prev_lsn,
                     state.begin_lsn.file_id,
-                );
+                )
+            });
+            if modified {
+                g.abort_fact(state.start_ts);
             } else {
-                // no tx-outcome mutation on clean readonly/empty-write abort path
+                g.remove_fact(state.start_ts);
             }
+            if let Some(task) = abort_clean_task {
+                self.ctx.enqueue_abort_clean_task(task);
+                #[cfg(feature = "extra_check")]
+                crate::testing::fire_txn_abort_sync_point(
+                    crate::testing::TxnAbortSyncPoint::AfterAbortCleanEnqueueBeforeLoggingRelease,
+                    state.start_ts,
+                );
+            }
+            drop(log);
             self.observe_counter(CounterMetric::TxnAbort, 1);
-            grp.active_txns.remove(&state.start_ts);
             self.is_end.set(true);
         }
         self.ctx.group(group_id).leave_inflight();
@@ -725,31 +729,24 @@ impl Drop for TxnKV<'_> {
 /// A read-only transaction (consistent view).
 pub struct TxnView<'a> {
     ctx: &'a Context,
-    cc: Handle<CCNode>,
-    group_id: u8,
+    pin: Handle<CCNode>,
     tree: &'a Tree,
 }
 
 impl<'a> TxnView<'a> {
     pub(crate) fn new(ctx: &'a Context, tree: &'a Tree) -> Result<Self, OpCode> {
-        let cc = ctx.alloc_cc();
-        Ok(Self {
-            ctx,
-            cc,
-            group_id: u8::MAX,
-            tree,
-        })
+        let pin = ctx.alloc_view_pin();
+        Ok(Self { ctx, pin, tree })
     }
 
     /// Gets the value associated with a key in this view.
+    /// **key must be non-empty**.
     #[inline]
     pub fn get<K: AsRef<[u8]>>(&self, k: K) -> Result<ValRef, OpCode> {
         get_impl(
             self.ctx,
-            &self.cc,
             self.tree,
-            self.group_id,
-            self.cc.start_ts(),
+            SnapshotStamp::view(self.pin.start_ts()),
             k,
         )
     }
@@ -764,13 +761,7 @@ impl<'a> TxnView<'a> {
     where
         K: AsRef<[u8]>,
     {
-        seek_impl(
-            &self.cc,
-            self.tree,
-            self.group_id,
-            self.cc.start_ts(),
-            prefix,
-        )
+        seek_impl(self.tree, SnapshotStamp::view(self.pin.start_ts()), prefix)
     }
 
     #[inline]
@@ -779,19 +770,19 @@ impl<'a> TxnView<'a> {
         K: AsRef<[u8]>,
         R: RangeBounds<K>,
     {
-        range_impl(
-            &self.cc,
-            self.tree,
-            self.group_id,
-            self.cc.start_ts(),
-            range,
-        )
+        range_impl(self.tree, SnapshotStamp::view(self.pin.start_ts()), range)
+    }
+
+    #[inline]
+    #[cfg(feature = "extra_check")]
+    pub(crate) fn testing_start_ts(&self) -> u64 {
+        self.pin.start_ts()
     }
 }
 
 impl Drop for TxnView<'_> {
     fn drop(&mut self) {
-        self.ctx.free_cc(self.cc);
+        self.ctx.free_view_pin(self.pin);
     }
 }
 

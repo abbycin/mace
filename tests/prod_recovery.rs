@@ -29,6 +29,18 @@ fn spawn_child(
     cmd.status().expect("spawn child failed")
 }
 
+#[cfg(all(feature = "failpoints", unix))]
+fn assert_child_aborted(status: ExitStatus, msg: &str) {
+    use std::os::unix::process::ExitStatusExt;
+
+    assert_eq!(status.signal(), Some(6), "{msg}");
+}
+
+#[cfg(all(feature = "failpoints", not(unix)))]
+fn assert_child_aborted(status: ExitStatus, msg: &str) {
+    assert!(!status.success(), "{msg}");
+}
+
 fn run_crash_verify_once(current_exe: &Path, test_name: &str, db_root: &str) {
     let crash_status = spawn_child(current_exe, test_name, "crash", db_root, None);
     assert!(
@@ -168,18 +180,6 @@ fn child_delete_chain_verify_path() {
 }
 
 #[cfg(feature = "failpoints")]
-fn child_update_chain_verify_failpoint_path() -> ! {
-    let db_root = std::env::var(DB_ROOT_FLAG).expect("missing verify db root");
-    let _engine = Mace::new(
-        Options::new(&db_root)
-            .validate()
-            .expect("bad verify options"),
-    )
-    .expect("reopen engine failed");
-    panic!("undo-after-clr-before-put failpoint did not fire")
-}
-
-#[cfg(feature = "failpoints")]
 fn child_failpoint_io_write_path() {
     let db_root = std::env::var(DB_ROOT_FLAG).expect("missing io db root");
     let engine = Mace::new(Options::new(&db_root).validate().expect("bad io options"))
@@ -251,6 +251,29 @@ fn child_failpoint_abort_verify_path() {
     }
 }
 
+#[cfg(feature = "failpoints")]
+fn child_fs_failpoint_validate_path() {
+    let db_root = std::env::var(DB_ROOT_FLAG).expect("missing fs failpoint db root");
+    let err = Options::new(&db_root)
+        .validate()
+        .err()
+        .expect("filesystem failpoint validate must fail");
+    assert_eq!(err, OpCode::IoError);
+}
+
+#[cfg(feature = "failpoints")]
+fn child_fs_failpoint_read_dir_path() {
+    let db_root = std::env::var(DB_ROOT_FLAG).expect("missing fs read_dir db root");
+    let err = Mace::new(
+        Options::new(&db_root)
+            .validate()
+            .expect("read_dir options must validate"),
+    )
+    .err()
+    .expect("filesystem failpoint open must fail");
+    assert_eq!(err, OpCode::IoError);
+}
+
 #[test]
 fn fast_reopen_visibility() -> Result<(), OpCode> {
     let env = TestEnv::new();
@@ -314,6 +337,16 @@ fn fast_process_crash_window() {
             child_failpoint_abort_verify_path();
             return;
         }
+        #[cfg(feature = "failpoints")]
+        Some("failpoint_fs_validate") => {
+            child_fs_failpoint_validate_path();
+            return;
+        }
+        #[cfg(feature = "failpoints")]
+        Some("failpoint_fs_read_dir") => {
+            child_fs_failpoint_read_dir_path();
+            return;
+        }
         _ => {}
     }
 
@@ -334,8 +367,6 @@ fn fast_process_crash_update_chain() {
             child_update_chain_verify_path();
             return;
         }
-        #[cfg(feature = "failpoints")]
-        Some("verify_update_chain_failpoint") => child_update_chain_verify_failpoint_path(),
         _ => {}
     }
 
@@ -469,10 +500,7 @@ fn chaos_failpoint_txn_commit_abort() {
         &db_root_text,
         Some("mace_txn_commit_begin=abort@1"),
     );
-    assert!(
-        !abort_status.success(),
-        "abort child should exit abnormally"
-    );
+    assert_child_aborted(abort_status, "abort child should exit with SIGABRT");
 
     let verify_status = spawn_child(
         &current_exe,
@@ -489,43 +517,83 @@ fn chaos_failpoint_txn_commit_abort() {
 #[cfg(feature = "failpoints")]
 #[test]
 #[ignore]
-fn chaos_failpoint_undo_after_clr_before_put() {
+fn chaos_failpoint_fs_create_dir_all_io() {
     let db_root = RandomPath::new();
     let db_root_text = db_root.to_string_lossy().to_string();
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
-    let crash_status = spawn_child(
+    let status = spawn_child(
         &current_exe,
-        "fast_process_crash_update_chain",
-        "crash_update_chain",
+        "fast_process_crash_window",
+        "failpoint_fs_validate",
         &db_root_text,
-        None,
+        Some("mace_fs_create_dir_all=io(permission_denied)@1"),
     );
     assert!(
-        !crash_status.success(),
-        "seed crash child should exit abnormally"
+        status.success(),
+        "filesystem io child should report io error"
     );
 
-    let fail_status = spawn_child(
+    let _ = std::fs::remove_dir_all(&db_root_text);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+#[ignore]
+fn chaos_failpoint_fs_sync_dir_io() {
+    let db_root = RandomPath::new();
+    let db_root_text = db_root.to_string_lossy().to_string();
+    let current_exe = std::env::current_exe().expect("load current exe failed");
+
+    let status = spawn_child(
         &current_exe,
-        "fast_process_crash_update_chain",
-        "verify_update_chain_failpoint",
+        "fast_process_crash_window",
+        "failpoint_fs_validate",
         &db_root_text,
-        Some("mace_undo_after_clr_before_put=abort@1"),
+        Some("mace_fs_sync_dir=io(permission_denied)@1"),
     );
     assert!(
-        !fail_status.success(),
-        "undo-after-clr-before-put failpoint child should abort"
+        status.success(),
+        "filesystem sync_dir child should report io error"
     );
 
-    let verify_status = spawn_child(
+    let _ = std::fs::remove_dir_all(&db_root_text);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+#[ignore]
+fn chaos_failpoint_fs_read_dir_io() {
+    let db_root = RandomPath::new();
+    let db_root_text = db_root.to_string_lossy().to_string();
+
+    {
+        let engine = Mace::new(
+            Options::new(&db_root_text)
+                .validate()
+                .expect("seed options must validate"),
+        )
+        .expect("seed engine must open");
+        let bucket = engine
+            .new_bucket("prod_recovery_read_dir", BucketOptions::default())
+            .expect("seed bucket must be created");
+        let txn = bucket.begin().expect("seed txn must open");
+        txn.put("k", "v").expect("seed put must succeed");
+        txn.commit().expect("seed commit must succeed");
+    }
+
+    let current_exe = std::env::current_exe().expect("load current exe failed");
+    let status = spawn_child(
         &current_exe,
-        "fast_process_crash_update_chain",
-        "verify_update_chain",
+        "fast_process_crash_window",
+        "failpoint_fs_read_dir",
         &db_root_text,
-        None,
+        Some("mace_fs_read_dir=io(permission_denied)@1"),
     );
-    assert!(verify_status.success(), "post-clr verify child should pass");
+    assert!(
+        status.success(),
+        "filesystem read_dir child should report io error"
+    );
 
-    std::fs::remove_dir_all(&db_root_text).expect("cleanup db root failed");
+    std::fs::remove_dir_all(&db_root_text).expect("cleanup read_dir db root failed");
 }

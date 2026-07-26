@@ -1,4 +1,5 @@
-use parking_lot::{Condvar, Mutex};
+use crate::must_true;
+use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;
@@ -13,7 +14,6 @@ pub struct PageMap {
     l2: Box<Layer2>,
     l3: Box<Layer3>,
     next: AtomicU64,
-    pub scavenge_cursor: AtomicU64,
     free: Mutex<BTreeSet<u64>>,
 }
 
@@ -37,7 +37,6 @@ impl Default for PageMap {
             l2: box_new(),
             l3: box_new(),
             next: AtomicU64::new(ROOT_PID),
-            scavenge_cursor: AtomicU64::new(ROOT_PID),
             free: Mutex::new(BTreeSet::new()),
         }
     }
@@ -45,18 +44,17 @@ impl Default for PageMap {
 
 impl PageMap {
     fn insert_free_pid(&self, lk: &mut BTreeSet<u64>, pid: u64) {
-        assert_eq!(
-            self.index(pid).load(Ordering::Acquire),
-            NULL_ADDR,
+        must_true!(
+            self.index(pid).load(Ordering::Acquire) == NULL_ADDR,
             "free list pid {pid} must be unmapped"
         );
-        assert!(lk.insert(pid), "free list already contains pid {pid}");
+        must_true!(lk.insert(pid), "free list already contains pid {pid}");
     }
 
     pub(crate) fn reserve_pid(&self) -> u64 {
         let mut lk = self.free.lock();
         if let Some(pid) = lk.pop_first() {
-            assert_eq!(
+            must_true!(eq
                 self.index(pid).load(Ordering::Acquire),
                 NULL_ADDR,
                 "free list returned mapped pid {pid}"
@@ -114,7 +112,7 @@ impl PageMap {
         if let Some(btree) = btree {
             let bucket_table = crate::meta::page_table_name(bucket_id);
             let _ = btree.view(&bucket_table, |txn| {
-                let mut iter = txn.iter();
+                let mut iter = txn.iter_uncached();
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 while iter.next_ref(&mut k, &mut v) {
@@ -124,8 +122,8 @@ impl PageMap {
                     let addr_bytes: [u8; 8] = v[..8]
                         .try_into()
                         .map_err(|_| btree_store::Error::Corruption)?;
-                    let pid = <u64>::from_be_bytes(pid_bytes);
-                    let addr = <u64>::from_be_bytes(addr_bytes);
+                    let pid = <u64>::from_le_bytes(pid_bytes);
+                    let addr = <u64>::from_le_bytes(addr_bytes);
                     let swip = if addr == NULL_ADDR {
                         NULL_ADDR
                     } else {
@@ -140,10 +138,6 @@ impl PageMap {
         }
 
         self.next.fetch_max(next_pid, Ordering::Relaxed);
-        self.scavenge_cursor.store(
-            rand::random_range(ROOT_PID..self.next.load(Ordering::Relaxed).max(ROOT_PID + 1)),
-            Ordering::Relaxed,
-        );
 
         let mut lk = self.free.lock();
         let max_pid = next_pid;
@@ -292,10 +286,6 @@ pub(crate) struct BucketState {
     pub(crate) next_addr: AtomicU64,
     pub(crate) is_deleting: AtomicBool,
     pub(crate) is_drop: AtomicBool,
-    pub(crate) vacuum_epoch: AtomicU64,
-    pub(crate) vacuum_inflight: AtomicBool,
-    pub(crate) vacuum_lock: Mutex<()>,
-    pub(crate) vacuum_cv: Condvar,
 }
 
 impl BucketState {
@@ -304,10 +294,6 @@ impl BucketState {
             txn_ref: AtomicUsize::new(0),
             is_deleting: AtomicBool::new(false),
             is_drop: AtomicBool::new(false),
-            vacuum_epoch: AtomicU64::new(0),
-            vacuum_inflight: AtomicBool::new(false),
-            vacuum_lock: Mutex::new(()),
-            vacuum_cv: Condvar::new(),
             next_addr: AtomicU64::new(INIT_ADDR),
         }
     }
@@ -348,37 +334,6 @@ impl BucketState {
 
     pub(crate) fn is_drop(&self) -> bool {
         self.is_drop.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn is_vacuuming(&self) -> bool {
-        self.vacuum_inflight.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn vacuum_epoch(&self) -> u64 {
-        self.vacuum_epoch.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn try_begin_vacuum(&self) -> bool {
-        self.vacuum_inflight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-    }
-
-    pub(crate) fn end_vacuum(&self) {
-        let _guard = self.vacuum_lock.lock();
-        self.vacuum_epoch.fetch_add(1, Ordering::AcqRel);
-        self.vacuum_inflight.store(false, Ordering::Release);
-        self.vacuum_cv.notify_all();
-    }
-
-    pub(crate) fn wait_vacuum(&self, epoch: u64) {
-        if self.vacuum_epoch.load(Ordering::Acquire) != epoch {
-            return;
-        }
-        let mut guard = self.vacuum_lock.lock();
-        while self.vacuum_epoch.load(Ordering::Acquire) == epoch {
-            self.vacuum_cv.wait(&mut guard);
-        }
     }
 
     pub(crate) fn is_busy(&self) -> bool {

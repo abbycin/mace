@@ -2,29 +2,31 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::map::SharedState;
-use crate::meta::entry::BlobStat;
+use crate::meta::entry::IMetaCodec;
 use crate::meta::{
-    BUCKET_FRONTIER, BUCKET_VERSION, BucketDurableFrontier, CURRENT_VERSION, DataStat, IMetaCodec,
-    MemBlobStat, MemDataStat, NUMERICS_KEY, ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX,
-    VERSION_KEY, entry::BucketMeta,
+    BUCKET_FRONTIER, BUCKET_VERSION, BucketDurableFrontier, CURRENT_VERSION, FileKind, MemStat,
+    ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, PersistStat, SEQUENCES_KEY, VERSION_KEY,
+    entry::BucketMeta,
 };
+use crate::must_ok;
 use crate::{
     OpCode,
     meta::{
-        BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_METAS, BUCKET_NUMERICS, BUCKET_OBSOLETE_BLOB,
-        BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, Manifest, entry::Numerics,
+        BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_METAS, BUCKET_MISC, BUCKET_OBSOLETE_BLOB,
+        BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, Manifest, entry::Sequences,
     },
-    utils::options::ParsedOptions,
+    utils::options::{ParsedOptions, PersistedOptions},
 };
 use std::sync::mpsc::{Receiver, Sender};
 
 pub(crate) struct ManifestBuilder {
     inner: Manifest,
-    max_data_id: u64,
-    max_blob_id: u64,
+    max_file_id: u64,
     // accumulated sizes for DataStat to avoid re-iteration in finish()
     data_active_size: u64,
     data_total_size: u64,
+    blob_active_size: u64,
+    blob_total_size: u64,
 }
 
 impl ManifestBuilder {
@@ -35,19 +37,17 @@ impl ManifestBuilder {
     ) -> Self {
         Self {
             inner: Manifest::new(opt, tx, rx),
-            max_data_id: 0,
-            max_blob_id: 0,
+            max_file_id: 0,
             data_active_size: 0,
             data_total_size: 0,
+            blob_active_size: 0,
+            blob_total_size: 0,
         }
     }
 
-    pub(crate) fn load(&mut self) -> Result<(), OpCode> {
-        let data_stat_ref = &self.inner.data_stat;
-        let blob_stat_ref = &self.inner.blob_stat;
-        let obs_data_ref = &self.inner.obsolete_data;
-        let obs_blob_ref = &self.inner.obsolete_blob;
-        let numerics_ref = &self.inner.numerics;
+    pub(crate) fn load(&mut self) -> Result<Option<PersistedOptions>, OpCode> {
+        let sequences_ref = &self.inner.sequences;
+        let current = PersistedOptions::from_options(self.inner.opt.as_ref());
 
         // 0. check version
         let mut has_version = false;
@@ -56,23 +56,38 @@ impl ManifestBuilder {
             .btree
             .view(BUCKET_VERSION, |txn| txn.get(VERSION_KEY))
         {
-            let ver = u64::from_be_bytes(val[..8].try_into().map_err(|_| OpCode::Corruption)?);
+            let ver = u64::from_le_bytes(val[..8].try_into().map_err(|_| OpCode::Corruption)?);
             if ver != CURRENT_VERSION {
                 return Err(OpCode::BadVersion);
             }
             has_version = true;
         }
 
-        // 1. load numerics
+        // 1. load persisted global options
+        let persisted = match self.inner.load_persisted_options_if_present()? {
+            Some(persisted) => {
+                persisted.check_compatible(self.inner.opt.as_ref())?;
+                persisted
+            }
+            None if !has_version && self.inner.is_pristine_uninitialized()? => {
+                self.inner.bootstrap_persisted_options(&current)?;
+                has_version = true;
+                current.clone()
+            }
+            None => return Err(OpCode::Corruption),
+        };
+        let needs_writeback = persisted != current;
+
+        // 2. load sequences
         if let Ok(val) = self
             .inner
             .btree
-            .view(BUCKET_NUMERICS, |txn| txn.get(NUMERICS_KEY))
+            .view(BUCKET_MISC, |txn| txn.get(SEQUENCES_KEY))
         {
             if !has_version {
                 return Err(OpCode::BadVersion);
             }
-            let src = Numerics::decode(&val);
+            let src = Sequences::decode(&val);
             macro_rules! set {
                 ($dst:expr, $src:expr; $($field:ident),*) => {
                     $(
@@ -81,23 +96,20 @@ impl ManifestBuilder {
                 };
             }
             set!(
-                numerics_ref,
+                sequences_ref,
                 src;
-                next_data_id,
-                next_blob_id,
+                next_file_id,
                 next_bucket_id,
-                oracle,
-                wmk_oldest
+                oracle
             );
-            self.max_data_id = src.next_data_id.load(Relaxed).saturating_sub(1);
-            self.max_blob_id = src.next_blob_id.load(Relaxed).saturating_sub(1);
+            self.max_file_id = src.next_file_id.load(Relaxed).saturating_sub(1);
         }
 
-        // 2. load BucketMeta
+        // 3. load BucketMeta
         self.inner
             .btree
             .view(BUCKET_METAS, |txn| {
-                let mut iter = txn.iter();
+                let mut iter = txn.iter_uncached();
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 while iter.next_ref(&mut k, &mut v) {
@@ -119,7 +131,7 @@ impl ManifestBuilder {
         // 2.1 count pending buckets
         let mut nr_buckets = self.inner.bucket_metas.len() as u64;
         let _ = self.inner.btree.view(BUCKET_PENDING_DEL, |txn| {
-            let mut iter = txn.iter();
+            let mut iter = txn.iter_uncached();
             let mut k = Vec::new();
             let mut v = Vec::new();
             while iter.next_ref(&mut k, &mut v) {
@@ -133,7 +145,7 @@ impl ManifestBuilder {
         self.inner
             .btree
             .view(BUCKET_FRONTIER, |txn| {
-                let mut iter = txn.iter();
+                let mut iter = txn.iter_uncached();
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 while iter.next_ref(&mut k, &mut v) {
@@ -144,101 +156,71 @@ impl ManifestBuilder {
             })
             .map_err(|_| OpCode::IoError)?;
 
-        // 4. load DataStat
-        let mut active_size = 0;
-        let mut total_size = 0;
-        self.inner
-            .btree
-            .view(BUCKET_DATA_STAT, |txn| {
-                let mut iter = txn.iter();
-                let mut k = Vec::new();
-                let mut v = Vec::new();
-                while iter.next_ref(&mut k, &mut v) {
-                    let inner = DataStat::decode_inner_only(&v);
-                    active_size += inner.active_size as u64;
-                    total_size += inner.total_size as u64;
-                    let fstat = MemDataStat { inner, mask: None };
-                    data_stat_ref
-                        .bucket_files()
-                        .entry(inner.bucket_id)
-                        .or_default()
-                        .push(inner.file_id);
-                    data_stat_ref.insert(inner.file_id, fstat);
-                }
-                Ok(())
-            })
-            .map_err(|_| OpCode::IoError)?;
-        self.data_active_size = active_size;
-        self.data_total_size = total_size;
+        for kind in FileKind::ALL {
+            let mut active_size = 0;
+            let mut total_size = 0;
+            self.inner
+                .btree
+                .view(
+                    match kind {
+                        FileKind::Data => BUCKET_DATA_STAT,
+                        FileKind::Blob => BUCKET_BLOB_STAT,
+                    },
+                    |txn| {
+                        let mut iter = txn.iter_uncached();
+                        let mut k = Vec::new();
+                        let mut v = Vec::new();
+                        while iter.next_ref(&mut k, &mut v) {
+                            let inner = PersistStat::decode_inner_only(&v);
+                            active_size += inner.active_size as u64;
+                            total_size += inner.total_size as u64;
+                            let fstat = MemStat::from_parts(inner, None);
+                            self.inner.stat_ctx(kind).insert_loaded_stat(fstat);
+                            self.inner
+                                .get_bucket_runtime(inner.bucket_id)
+                                .observe_stat_epoch(kind, inner.up1, inner.up2);
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(|_| OpCode::IoError)?;
+            self.set_loaded_sizes(kind, active_size, total_size);
 
-        // 5. load BlobStat
-        self.inner
-            .btree
-            .view(BUCKET_BLOB_STAT, |txn| {
-                let mut iter = txn.iter();
-                let mut k = Vec::new();
-                let mut v = Vec::new();
-                while iter.next_ref(&mut k, &mut v) {
-                    let inner = BlobStat::decode_inner_only(&v);
-                    let bstat = MemBlobStat { inner, mask: None };
-                    blob_stat_ref
-                        .bucket_files()
-                        .entry(inner.bucket_id)
-                        .or_default()
-                        .push(inner.file_id);
-                    blob_stat_ref.write().insert(inner.file_id, bstat);
-                }
-                Ok(())
-            })
-            .map_err(|_| OpCode::IoError)?;
-
-        // 7. load Obsolete
-        self.inner
-            .btree
-            .view(BUCKET_OBSOLETE_DATA, |txn| {
-                let mut iter = txn.iter();
-                let mut k = Vec::new();
-                let mut v = Vec::new();
-                let mut obs = obs_data_ref.lock();
-                while iter.next_ref(&mut k, &mut v) {
-                    let id_bytes: [u8; 8] = k[..8]
-                        .try_into()
-                        .map_err(|_| btree_store::Error::Corruption)?;
-                    let id = u64::from_be_bytes(id_bytes);
-                    obs.push(id);
-                }
-                Ok(())
-            })
-            .map_err(|_| OpCode::IoError)?;
-
-        self.inner
-            .btree
-            .view(BUCKET_OBSOLETE_BLOB, |txn| {
-                let mut iter = txn.iter();
-                let mut k = Vec::new();
-                let mut v = Vec::new();
-                let mut obs = obs_blob_ref.lock();
-                while iter.next_ref(&mut k, &mut v) {
-                    let id_bytes: [u8; 8] = k[..8]
-                        .try_into()
-                        .map_err(|_| btree_store::Error::Corruption)?;
-                    let id = u64::from_be_bytes(id_bytes);
-                    obs.push(id);
-                }
-                Ok(())
-            })
-            .map_err(|_| OpCode::IoError)?;
+            self.inner
+                .btree
+                .view(
+                    match kind {
+                        FileKind::Data => BUCKET_OBSOLETE_DATA,
+                        FileKind::Blob => BUCKET_OBSOLETE_BLOB,
+                    },
+                    |txn| {
+                        let mut iter = txn.iter_uncached();
+                        let mut k = Vec::new();
+                        let mut v = Vec::new();
+                        let mut obs = self.inner.file_state(kind).obsolete.lock();
+                        while iter.next_ref(&mut k, &mut v) {
+                            let id_bytes: [u8; 8] = k[..8]
+                                .try_into()
+                                .map_err(|_| btree_store::Error::Corruption)?;
+                            let id = u64::from_le_bytes(id_bytes);
+                            obs.push(id);
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(|_| OpCode::IoError)?;
+        }
 
         if !has_version {
             self.inner
                 .btree
                 .exec(BUCKET_VERSION, |txn| {
-                    txn.put(VERSION_KEY, CURRENT_VERSION.to_be_bytes())
+                    txn.put(VERSION_KEY, CURRENT_VERSION.to_le_bytes())
                 })
                 .map_err(|_| OpCode::IoError)?;
         }
 
-        Ok(())
+        Ok(needs_writeback.then_some(current))
     }
 
     pub(crate) fn finish(mut self) -> Manifest {
@@ -246,61 +228,79 @@ impl ManifestBuilder {
         self.inner.delete_files();
 
         self.inner
-            .data_stat
+            .stat_ctx(FileKind::Data)
             .update_size(self.data_active_size, self.data_total_size);
 
         self.inner
-            .numerics
-            .next_data_id
-            .store(self.max_data_id + 1, Relaxed);
+            .stat_ctx(FileKind::Blob)
+            .update_size(self.blob_active_size, self.blob_total_size);
+
         self.inner
-            .numerics
-            .next_blob_id
-            .store(self.max_blob_id + 1, Relaxed);
+            .sequences
+            .next_file_id
+            .store(self.max_file_id + 1, Relaxed);
 
         self.inner
     }
 
-    fn clean_orphans(&mut self) {
-        let mut data_markers = Vec::new();
-        let mut blob_markers = Vec::new();
+    fn set_loaded_sizes(&mut self, kind: FileKind, active_size: u64, total_size: u64) {
+        match kind {
+            FileKind::Data => {
+                self.data_active_size = active_size;
+                self.data_total_size = total_size;
+            }
+            FileKind::Blob => {
+                self.blob_active_size = active_size;
+                self.blob_total_size = total_size;
+            }
+        }
+    }
 
-        let _ = self.inner.btree.view(BUCKET_NUMERICS, |txn| {
+    fn clean_orphans(&mut self) {
+        let mut markers: [Vec<(u64, Vec<u8>)>; 2] = [Vec::new(), Vec::new()];
+
+        let _ = self.inner.btree.view(BUCKET_MISC, |txn| {
             // file ids can be sparse because some ids are reserved before any file is flushed
             // rely on explicit per-file markers instead of max_id tail probing or directory scan
-            let mut iter = txn.iter();
+            let mut iter = txn.iter_uncached();
             let mut k = Vec::new();
             let mut v = Vec::new();
             while iter.next_ref(&mut k, &mut v) {
-                if let Some(id) = Self::parse_orphan_marker_id(&k, ORPHAN_DATA_MARKER_PREFIX) {
-                    self.max_data_id = self.max_data_id.max(id);
-                    data_markers.push((id, k.clone()));
-                } else if let Some(id) = Self::parse_orphan_marker_id(&k, ORPHAN_BLOB_MARKER_PREFIX)
-                {
-                    self.max_blob_id = self.max_blob_id.max(id);
-                    blob_markers.push((id, k.clone()));
+                for kind in FileKind::ALL {
+                    let prefix = match kind {
+                        FileKind::Data => ORPHAN_DATA_MARKER_PREFIX,
+                        FileKind::Blob => ORPHAN_BLOB_MARKER_PREFIX,
+                    };
+                    if let Some(id) = Self::parse_orphan_marker_id(&k, prefix) {
+                        markers[kind.slot()].push((id, k.clone()));
+                        break;
+                    }
                 }
             }
             Ok(())
         });
 
-        let mut cleaned_data_marker_keys = Vec::new();
-        for (id, key) in data_markers {
-            let path = self.inner.opt.data_file(id);
-            if !path.exists() || std::fs::remove_file(&path).is_ok() {
-                cleaned_data_marker_keys.push(key);
+        let mut cleaned_marker_keys: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+        for kind in FileKind::ALL {
+            for (id, key) in markers[kind.slot()].drain(..) {
+                self.observe_orphan_id(id);
+                let path = match kind {
+                    FileKind::Data => self.inner.opt.data_file(id),
+                    FileKind::Blob => self.inner.opt.blob_file(id),
+                };
+                must_ok!(
+                    self.inner.opt.fs.remove_file_if_exists(&path),
+                    "path {:?}",
+                    path
+                );
+                cleaned_marker_keys[kind.slot()].push(key);
             }
         }
 
-        let mut cleaned_blob_marker_keys = Vec::new();
-        for (id, key) in blob_markers {
-            let path = self.inner.opt.blob_file(id);
-            if !path.exists() || std::fs::remove_file(&path).is_ok() {
-                cleaned_blob_marker_keys.push(key);
-            }
-        }
-
-        if cleaned_data_marker_keys.is_empty() && cleaned_blob_marker_keys.is_empty() {
+        if FileKind::ALL
+            .iter()
+            .all(|&kind| cleaned_marker_keys[kind.slot()].is_empty())
+        {
             return;
         }
 
@@ -310,18 +310,21 @@ impl ManifestBuilder {
             "mace_recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear",
         );
 
-        self.inner
-            .btree
-            .exec(BUCKET_NUMERICS, |txn| {
-                for key in &cleaned_data_marker_keys {
-                    let _ = txn.del(key);
-                }
-                for key in &cleaned_blob_marker_keys {
-                    let _ = txn.del(key);
+        must_ok!(
+            self.inner.btree.exec(BUCKET_MISC, |txn| {
+                for kind in FileKind::ALL {
+                    for key in &cleaned_marker_keys[kind.slot()] {
+                        let _ = txn.del(key);
+                    }
                 }
                 Ok(())
-            })
-            .expect("orphan marker update failed");
+            }),
+            "orphan marker update failed"
+        );
+    }
+
+    fn observe_orphan_id(&mut self, id: u64) {
+        self.max_file_id = self.max_file_id.max(id);
     }
 
     fn parse_orphan_marker_id(raw: &[u8], prefix: &str) -> Option<u64> {

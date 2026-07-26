@@ -1,5 +1,4 @@
-use crate::Options;
-use crate::cc::context::{Context, TxOutcome};
+use crate::cc::context::Context;
 use crate::map::buffer::BucketContext;
 use crate::map::publish::AllocGuard;
 use crate::map::{Loader, Node, Page};
@@ -12,6 +11,7 @@ use crate::utils::observe::{
     CounterMetric, HistogramMetric, LATENCY_SAMPLE_SHIFT, observe_elapsed, sampled_instant,
 };
 use crate::utils::{Handle, MutRef, NULL_ADDR, OpCode};
+use crate::{Options, must_exist};
 use crate::{
     Store,
     types::{
@@ -21,6 +21,7 @@ use crate::{
     },
     utils::{NULL_CMD, NULL_PID},
 };
+use crate::{hot_true, must_true};
 use crossbeam_epoch::Guard;
 use std::cmp::Ordering::Equal;
 use std::ops::{Bound, RangeBounds};
@@ -54,6 +55,10 @@ impl ValRef {
     /// Converts the reference into a owned Vec<u8>.
     pub fn to_vec(self) -> Vec<u8> {
         self.raw.data().to_vec()
+    }
+
+    pub fn group_id(&self) -> u8 {
+        self.raw.group_id()
     }
 }
 
@@ -105,7 +110,7 @@ impl Tree {
 
     pub(crate) fn load_node(&self, g: &Guard, pid: u64) -> Result<Option<Page>, OpCode> {
         loop {
-            if let Some(p) = self.bucket.load(pid)? {
+            if let Some(p) = self.bucket.load(pid) {
                 let child_pid = p.header().merging_child;
                 if child_pid != NULL_PID {
                     self.merge_node(p, child_pid, g)?;
@@ -134,14 +139,15 @@ impl Tree {
             return Ok(());
         }
 
-        assert_ne!(child_pid, NULL_PID);
-        assert!(parent_ptr.is_intl());
-        let child_index = parent_ptr
-            .intl_iter()
-            .position(|(_, idx)| idx.pid == child_pid)
-            .unwrap();
+        must_true!(child_pid != NULL_PID, "child pid {}", child_pid);
+        must_true!(parent_ptr.is_intl());
+        let child_index = must_exist!(
+            parent_ptr
+                .intl_iter()
+                .position(|(_, idx)| idx.pid == child_pid)
+        );
         // the "can_merge_child" check is somewhat failed
-        assert_ne!(child_index, 0, "we can't handle merge the leftmost node");
+        must_true!(child_index != 0, "we can't handle merge the leftmost node");
 
         let safe_txid = self.txid();
         // 1.
@@ -155,11 +161,8 @@ impl Tree {
 
         // 2.
         let mut merge_index = child_index - 1;
-        let mut cursor_pid = parent_ptr
-            .intl_iter()
-            .nth(merge_index)
-            .map(|(_, x)| x.pid)
-            .unwrap();
+        let mut cursor_pid =
+            must_exist!(parent_ptr.intl_iter().nth(merge_index).map(|(_, x)| x.pid));
         let mut child_unmapped = false;
 
         loop {
@@ -172,11 +175,8 @@ impl Tree {
                 }
 
                 merge_index -= 1;
-                cursor_pid = parent_ptr
-                    .intl_iter()
-                    .nth(merge_index)
-                    .map(|(_, x)| x.pid)
-                    .unwrap();
+                cursor_pid =
+                    must_exist!(parent_ptr.intl_iter().nth(merge_index).map(|(_, x)| x.pid));
                 continue;
             };
 
@@ -221,11 +221,10 @@ impl Tree {
             }
         }
 
-        // 4. hide child from the in-memory page table before reclaiming it (or else scavenge process
-        // may use it cause memory bug).
+        // 4. hide child from the in-memory page table before reclaiming it
         // checkpoint will later make this NULL mapping durable and only then recycle child_pid into
         // the free list. otherwise readers/gc can still load child_pid and observe a reclaimed page.
-        debug_assert_eq!(child_ptr.box_header().pid, child_pid);
+        must_true!(eq child_ptr.box_header().pid, child_pid);
         if !child_unmapped {
             self.begin_build().mark_unmap(child_pid, child_ptr.swip()); // child's junks were already collected
         }
@@ -245,7 +244,7 @@ impl Tree {
 
     // NOTE: caller must hold parent lock
     fn remove_node_index(&self, parent_ptr: Page, child_pid: u64, g: &Guard, safe_txid: u64) {
-        debug_assert_eq!(parent_ptr.header().merging_child, child_pid);
+        must_true!(eq parent_ptr.header().merging_child, child_pid);
 
         let mut build = self.begin_build();
         let (new_ptr, junks) = parent_ptr.process_merge(&mut build, MergeOp::Merged, safe_txid);
@@ -385,7 +384,7 @@ impl Tree {
         let mut publish = build.into_publish(g);
         publish.map_to(&mut lpage, lpid);
         let n = publish.replace(root, new_root_node, junk);
-        assert_eq!(n.box_header().pid, self.root_index.pid);
+        must_true!(eq n.box_header().pid, self.root_index.pid);
         publish.cache_after_commit(lpage);
         // publish new root to global
         publish.commit();
@@ -444,7 +443,7 @@ impl Tree {
             if is_splitting {
                 // search from right sibling
                 let rpid = node_ptr.header().right_sibling;
-                assert_ne!(rpid, NULL_PID);
+                must_true!(ne rpid, NULL_PID);
 
                 if unsplit_parent_opt.is_none() && parent_opt.is_some() {
                     unsplit_parent_opt = parent_opt;
@@ -452,9 +451,9 @@ impl Tree {
                     // root may be in partial split state:
                     // current page is lhs and rhs is already mapped but new root is not installed yet
                     // complete root installation cooperatively
-                    assert_eq!(cursor, self.root_index.pid);
+                    must_true!(eq cursor, self.root_index.pid);
                     let safe_txid = self.txid();
-                    let _ = self.split_root(g, node_ptr, rpid, hi.unwrap(), safe_txid);
+                    let _ = self.split_root(g, node_ptr, rpid, must_exist!(hi), safe_txid);
                     return Err(OpCode::Again);
                 }
                 cursor = rpid;
@@ -495,7 +494,7 @@ impl Tree {
             }
 
             if node_ptr.is_intl() {
-                assert_eq!(node_ptr.delta_len(), 0);
+                hot_true!(eq node_ptr.delta_len(), 0);
                 let (is_leftmost, pid) = node_ptr.child_index(key);
                 leftmost = is_leftmost;
                 parent_opt = Some(node_ptr);
@@ -535,14 +534,9 @@ impl Tree {
                 break;
             }
 
-            let sst = node.sst::<IntlKey>();
-            let pos = match sst.search_by(&IntlKey::new(key), |x, y| x.raw.cmp(y.raw)) {
-                Ok(pos) => pos,
-                Err(pos) => pos.max(1) - 1,
-            };
-            let (_, idx) = sst.kv_at::<Index>(pos);
+            let (pos, pid) = must_exist!(node.sst::<IntlKey>().floor_pid_by_raw(key));
             path.push((node.pid(), node.swip(), pos));
-            cursor = idx.pid;
+            cursor = pid;
         }
 
         while let Some((parent_pid, parent_swip, child_pos)) = path.pop() {
@@ -560,12 +554,10 @@ impl Tree {
                 return Err(OpCode::Again);
             }
 
-            let sst = parent.sst::<IntlKey>();
             if child_pos >= parent.header().elems as usize {
                 return Err(OpCode::Again);
             }
-            let (_, idx) = sst.kv_at::<Index>(child_pos - 1);
-            let mut pid = idx.pid;
+            let mut pid = parent.sst::<IntlKey>().pid_at(child_pos - 1);
 
             loop {
                 let Some(node) = self.load_node(g, pid)? else {
@@ -595,8 +587,7 @@ impl Tree {
                 if elems == 0 {
                     return Err(OpCode::Again);
                 }
-                let (_, rightmost) = node.sst::<IntlKey>().kv_at::<Index>(elems - 1);
-                pid = rightmost.pid;
+                pid = node.sst::<IntlKey>().pid_at(elems - 1);
             }
         }
 
@@ -619,35 +610,6 @@ impl Tree {
             .opt
             .observer
             .counter(CounterMetric::TreeNodeConsolidate, 1);
-    }
-
-    pub(crate) fn try_scavenge(&self, pid: u64, g: &Guard) -> Result<bool, OpCode> {
-        let page = if let Some(p) = self.load_node(g, pid)? {
-            p
-        } else {
-            return Ok(false);
-        };
-
-        let h = page.header();
-        if h.merging || h.merging_child != NULL_ADDR {
-            return Ok(false);
-        }
-
-        let safe_txid = self.txid();
-        let delta_len = page.delta_len();
-        let threshold = self.bucket.opt.consolidate_threshold as usize;
-
-        if delta_len >= threshold {
-            self.try_compact(g, page);
-            return Ok(true);
-        }
-
-        if page.ref_node().has_garbage(safe_txid) {
-            self.try_compact(g, page);
-            return Ok(true);
-        }
-
-        Ok(false)
     }
 
     fn try_merge(&self, g: &Guard, parent: Page, cur: Page) -> Result<(), OpCode> {
@@ -699,8 +661,13 @@ impl Tree {
                     HistogramMetric::TreeLinkHoldMicros,
                     lock_started,
                 );
+                #[cfg(feature = "extra_check")]
+                crate::testing::fire_tree_update_sync_point(
+                    crate::testing::TreeUpdateSyncPoint::AfterTreeAgainBeforeLatestMetaRecheck,
+                    pid,
+                );
                 return Err(OpCode::Again);
-            };
+            }
 
             let (group, pos) = check(page, k)?;
             let mut build = self.begin_build();
@@ -755,6 +722,11 @@ impl Tree {
         F: FnMut(&Option<LatestValMeta>) -> Result<(u8, Position), OpCode>,
     {
         let page = self.find_leaf(g, key.raw)?;
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_tree_update_sync_point(
+            crate::testing::TreeUpdateSyncPoint::AfterFindLeafBeforeLink,
+            page.pid(),
+        );
         let mut r = None;
 
         self.link(g, page, key, val, |pg, k| {
@@ -764,6 +736,11 @@ impl Tree {
                 group_id: meta.group_id,
                 is_del: meta.is_del,
             });
+            #[cfg(feature = "extra_check")]
+            crate::testing::fire_tree_update_sync_point(
+                crate::testing::TreeUpdateSyncPoint::AfterLatestMetaCheckBeforeDeltaInsert,
+                pg.pid(),
+            );
             visible(&r)
         })?;
 
@@ -834,14 +811,20 @@ impl Tree {
             return Err(OpCode::Again);
         }
 
-        let Some((head_ver, _, _)) = page.find_latest(&Key::new(raw, Ver::new(u64::MAX, u32::MAX)))
+        let Some((head_ver, head_val, _)) =
+            page.find_latest(&Key::new(raw, Ver::new(u64::MAX, u32::MAX)))
         else {
             return Ok(false);
         };
         if head_ver.txid != aborted_txid {
             return Ok(false);
         }
-        if self.store.context.get_aborted(aborted_txid) != Some(TxOutcome::Aborted) {
+        if !self
+            .store
+            .context
+            .group(head_val.group_id() as usize)
+            .is_retained_abort(aborted_txid)
+        {
             return Ok(false);
         }
 
@@ -925,7 +908,7 @@ impl Tree {
         let target = Ver::new(start_ts, NULL_CMD);
 
         while addr != NULL_PID && remaining > 0 {
-            let page = l.load_sibling(addr)?;
+            let page = l.load_sibling(addr);
             let ptr = page.view().as_base();
             let sst = ptr.sst::<Ver>();
             let elems = sst.header().elems as usize;
@@ -1028,8 +1011,8 @@ impl Tree {
         }
 
         // Key::raw is unique in sst
-        let (k, val) = page.search_sst(&key).ok_or(OpCode::NotFound)?;
-        if visible(k.txid, val.group_id()) {
+        let (ver, val) = page.search_sst_value(&key).ok_or(OpCode::NotFound)?;
+        if visible(ver.txid, val.group_id()) {
             if val.is_tombstone() {
                 return Err(OpCode::NotFound);
             }
@@ -1148,18 +1131,23 @@ impl Iter<'_> {
                     self.iter_bound = Some(Box::new(next_bound));
                 }
 
-                let cache = self.cache.as_ref().expect("must valid");
-                let bound = self.iter_bound.as_ref().expect("must valid");
+                let cache = must_exist!(self.cache.as_ref());
+                let bound = must_exist!(self.iter_bound.as_ref());
                 self.iter = Some(unsafe {
                     std::mem::transmute::<RawLeafIter<'_, Loader>, RawLeafIter<'_, Loader>>(
                         cache.successor(bound.as_ref(), self.cached_key),
                     )
                 });
+                #[cfg(feature = "extra_check")]
+                crate::testing::fire_tree_update_sync_point(
+                    crate::testing::TreeUpdateSyncPoint::AfterIteratorPageCaptureBeforeCandidateWalk,
+                    must_exist!(self.cache.as_ref()).pid(),
+                );
             }
 
             let r = loop {
                 let next = {
-                    let iter = self.iter.as_mut().expect("must valid");
+                    let iter = must_exist!(self.iter.as_mut());
                     iter.try_next()
                 };
                 match next {
@@ -1216,7 +1204,7 @@ impl Iter<'_> {
                 }
             } else {
                 self.iter.take();
-                let node = self.cache.as_ref().expect("must valid");
+                let node = must_exist!(self.cache.as_ref());
                 if let Some(hi) = node.hi() {
                     self.lo = Bound::Included(hi.to_vec());
                     continue;
@@ -1260,18 +1248,23 @@ impl<'a> DoubleEndedIterator for Iter<'a> {
                 }
                 self.rev_iter = Some(unsafe {
                     std::mem::transmute::<RawLeafRevIter<'_, Loader>, RawLeafRevIter<'_, Loader>>(
-                        self.cache.as_ref().expect("must valid").predecessor(
+                        must_exist!(self.cache.as_ref()).predecessor(
                             &self.lo,
                             &self.hi,
                             self.cached_key,
                         ),
                     )
                 });
+                #[cfg(feature = "extra_check")]
+                crate::testing::fire_tree_update_sync_point(
+                    crate::testing::TreeUpdateSyncPoint::AfterIteratorPageCaptureBeforeCandidateWalk,
+                    must_exist!(self.cache.as_ref()).pid(),
+                );
             }
 
             let res = loop {
                 let next = {
-                    let iter = self.rev_iter.as_mut().expect("must valid");
+                    let iter = must_exist!(self.rev_iter.as_mut());
                     iter.try_next_back()
                 };
                 match next {
@@ -1323,7 +1316,7 @@ impl<'a> DoubleEndedIterator for Iter<'a> {
             }
 
             self.rev_iter.take();
-            let lo = self.cache.as_ref().expect("must valid").lo();
+            let lo = must_exist!(self.cache.as_ref()).lo();
             if lo.is_empty() {
                 return None;
             }

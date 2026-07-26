@@ -4,10 +4,13 @@ mod common;
 
 use btree_store::{BTree, Error as BTreeError};
 use common::child_test_command;
+use mace::observe::{CounterMetric, InMemoryObserver};
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
+use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const ENV_CHILD: &str = "MACE_PROD_FP_CHILD";
@@ -15,8 +18,65 @@ const ENV_CASE: &str = "MACE_PROD_FP_CASE";
 const ENV_DB_ROOT: &str = "MACE_PROD_FP_DB_ROOT";
 const BUCKET_METAS: &str = "bucket_metas";
 const BUCKET_PENDING_DEL: &str = "pending_del";
-const BUCKET_NUMERICS: &str = "numerics";
+const BUCKET_MISC: &str = "misc";
 const WAL_RECYCLE_PREFIX: &str = "wrc_";
+const OPTIONS_KEY: &str = "options";
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PersistedGlobalOptions {
+    concurrent_write: u8,
+    sync_on_write: bool,
+    gc_timeout: u64,
+    checkpoint_nudge_ms: u64,
+    data_garbage_ratio: u32,
+    gc_eager: bool,
+    blob_file_size: usize,
+    blob_garbage_ratio: u32,
+    lru_capacity: usize,
+    stat_mask_cache_count: usize,
+    data_handle_cache_capacity: usize,
+    blob_handle_cache_capacity: usize,
+    data_file_size: usize,
+    wal_buffer_size: usize,
+    max_ckpt_per_txn: usize,
+    wal_file_size: u32,
+    keep_stable_wal_file: bool,
+    truncate_corrupted_wal: bool,
+}
+
+impl PersistedGlobalOptions {
+    fn apply_to(&self, opt: &mut Options) {
+        opt.concurrent_write = self.concurrent_write;
+        opt.sync_on_write = self.sync_on_write;
+        opt.gc_timeout = self.gc_timeout;
+        opt.checkpoint_nudge_ms = self.checkpoint_nudge_ms;
+        opt.data_garbage_ratio = self.data_garbage_ratio;
+        opt.gc_eager = self.gc_eager;
+        opt.blob_file_size = self.blob_file_size;
+        opt.blob_garbage_ratio = self.blob_garbage_ratio;
+        opt.lru_capacity = self.lru_capacity;
+        opt.stat_mask_cache_count = self.stat_mask_cache_count;
+        opt.data_handle_cache_capacity = self.data_handle_cache_capacity;
+        opt.blob_handle_cache_capacity = self.blob_handle_cache_capacity;
+        opt.data_file_size = self.data_file_size;
+        opt.wal_buffer_size = self.wal_buffer_size;
+        opt.max_ckpt_per_txn = self.max_ckpt_per_txn;
+        opt.wal_file_size = self.wal_file_size;
+        opt.keep_stable_wal_file = self.keep_stable_wal_file;
+        opt.truncate_corrupted_wal = self.truncate_corrupted_wal;
+    }
+}
+
+fn counter_value(observer: &InMemoryObserver, metric: CounterMetric) -> u64 {
+    observer
+        .snapshot()
+        .counters
+        .iter()
+        .find(|(current, _)| *current == metric)
+        .map(|(_, value)| *value)
+        .unwrap_or(0)
+}
 
 fn page_table_name(bucket_id: u64) -> String {
     format!("page_table_{bucket_id}")
@@ -62,6 +122,9 @@ where
 {
     let mut opt = Options::new(db_root);
     opt.tmp_store = false;
+    if let Some(persisted) = load_persisted_global_options(db_root) {
+        persisted.apply_to(&mut opt);
+    }
     tune(&mut opt);
     Mace::new(opt.validate().expect("validate options failed")).expect("open mace failed")
 }
@@ -69,6 +132,21 @@ where
 fn open_manifest(db_root: &Path) -> BTree {
     let opt = Options::new(db_root);
     BTree::open(opt.manifest()).expect("open manifest failed")
+}
+
+fn load_persisted_global_options(db_root: &Path) -> Option<PersistedGlobalOptions> {
+    let manifest_path = Options::new(db_root).manifest();
+    match manifest_path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(err) => panic!("check manifest path failed: {err:?}"),
+    }
+
+    let manifest = BTree::open(manifest_path).expect("open manifest failed");
+    let raw = manifest
+        .view(BUCKET_MISC, |txn| txn.get(OPTIONS_KEY))
+        .expect("load persisted global options failed");
+    Some(serde_json::from_slice(&raw).expect("decode persisted global options failed"))
 }
 
 fn manifest_bucket_exists(manifest: &BTree, bucket: &str) -> bool {
@@ -81,7 +159,7 @@ fn manifest_bucket_exists(manifest: &BTree, bucket: &str) -> bool {
 
 fn manifest_bucket_keys(manifest: &BTree, bucket: &str) -> Option<Vec<Vec<u8>>> {
     match manifest.view(bucket, |txn| {
-        let mut iter = txn.iter();
+        let mut iter = txn.iter_uncached();
         let mut out = Vec::new();
         let mut k = Vec::new();
         let mut v = Vec::new();
@@ -110,7 +188,7 @@ fn wal_recycle_key(group_id: u8) -> Vec<u8> {
 
 fn wal_recycle_state_bytes(db_root: &Path, group_id: u8) -> Option<Vec<u8>> {
     let manifest = open_manifest(db_root);
-    match manifest.view(BUCKET_NUMERICS, |txn| txn.get(&wal_recycle_key(group_id))) {
+    match manifest.view(BUCKET_MISC, |txn| txn.get(wal_recycle_key(group_id))) {
         Ok(val) => Some(val),
         Err(BTreeError::NotFound) => None,
         Err(err) => panic!("load wal recycle state failed: {err:?}"),
@@ -133,7 +211,7 @@ fn pending_bucket_ids(db_root: &Path) -> BTreeSet<u64> {
     keys.into_iter()
         .map(|key| {
             let raw: [u8; 8] = key[..8].try_into().expect("pending_del key must be u64");
-            u64::from_be_bytes(raw)
+            u64::from_le_bytes(raw)
         })
         .collect()
 }
@@ -195,7 +273,6 @@ fn child_setup_gc(db_root: &Path) -> (Mace, Bucket) {
         opt.gc_eager = true;
         opt.data_garbage_ratio = 1;
         opt.blob_garbage_ratio = 1;
-        opt.blob_gc_ratio = 100;
         opt.blob_file_size = 128 << 10;
     });
 
@@ -233,7 +310,6 @@ fn child_setup_data_gc(db_root: &Path) -> (Mace, Bucket) {
         // the test target here is crash-window closure after entering rewrite path
         opt.data_garbage_ratio = 0;
         opt.blob_garbage_ratio = 1;
-        opt.blob_gc_ratio = 100;
         opt.blob_file_size = 128 << 10;
     });
 
@@ -377,6 +453,37 @@ fn child_setup_wal_recycle(db_root: &Path) -> (Mace, Bucket) {
     (mace, bucket)
 }
 
+fn child_setup_wal_recycle_keep_stable(db_root: &Path) -> (Mace, Bucket) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 16 << 10;
+        opt.wal_buffer_size = 8 << 10;
+        opt.wal_file_size = 4 << 10;
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = false;
+        opt.keep_stable_wal_file = true;
+    });
+
+    let bucket = match mace.get_bucket("prod") {
+        Ok(bucket) => bucket,
+        Err(OpCode::NotFound) => mace
+            .new_bucket(
+                "prod",
+                BucketOptions {
+                    inline_size: 512,
+                    cache_evict_pct: 10,
+                    enable_backpressure: false,
+                    ..BucketOptions::default()
+                },
+            )
+            .expect("create prod bucket failed"),
+        Err(err) => panic!("open prod bucket failed: {err:?}"),
+    };
+
+    (mace, bucket)
+}
+
 fn seed_committed_and_uncommitted(bucket: &Bucket, committed: usize, uncommitted: usize) {
     let txn = bucket.begin().expect("begin committed txn failed");
     for idx in 0..committed {
@@ -433,17 +540,24 @@ fn drive_blob_gc_pressure(bucket: &Bucket, rounds: usize, blob_size: usize) {
             .expect("seed meta key failed");
     }
     txn.commit().expect("commit blob seed txn failed");
+    bucket.checkpoint();
 
     for round in 0..rounds {
         let txn = bucket.begin().expect("begin blob txn failed");
         for idx in 0..48 {
-            txn.upsert(format!("blob_{idx}"), &payload)
+            let key_idx = idx * 2;
+            txn.upsert(format!("blob_{key_idx}"), &payload)
                 .expect("upsert blob key failed");
-            txn.upsert(format!("meta_{idx}"), format!("m_{round}_{idx}"))
+            txn.upsert(format!("meta_{key_idx}"), format!("m_{round}_{idx}"))
                 .expect("upsert meta key failed");
         }
         txn.commit().expect("commit blob txn failed");
+        if round % 4 == 3 {
+            bucket.checkpoint();
+        }
     }
+
+    bucket.checkpoint();
 }
 
 fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted: usize) {
@@ -756,7 +870,6 @@ fn child_case_data_obsolete_reclaim(db_root: &Path) -> ! {
         opt.gc_eager = false;
         opt.data_garbage_ratio = 100;
         opt.blob_garbage_ratio = 100;
-        opt.blob_gc_ratio = 0;
     });
     let bucket = match mace.get_bucket("prod") {
         Ok(bucket) => bucket,
@@ -803,6 +916,7 @@ fn child_case_data_obsolete_reclaim(db_root: &Path) -> ! {
 }
 
 fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
+    let observer = Arc::new(InMemoryObserver::new(64));
     let mace = open_with_tune(db_root, |opt| {
         opt.concurrent_write = 1;
         opt.sync_on_write = true;
@@ -814,7 +928,7 @@ fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
         opt.gc_eager = false;
         opt.data_garbage_ratio = 100;
         opt.blob_garbage_ratio = 100;
-        opt.blob_gc_ratio = 0;
+        opt.observer = observer.clone();
     });
     let bucket = match mace.get_bucket("prod") {
         Ok(bucket) => bucket,
@@ -852,6 +966,26 @@ fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
             .expect("update blob obsolete key failed");
     }
     update.commit().expect("commit blob obsolete update failed");
+
+    let before = counter_value(&observer, CounterMetric::TreeNodeConsolidate);
+    for _ in 0..3 {
+        let consolidate = bucket
+            .begin()
+            .expect("begin blob consolidate trigger failed");
+        for _ in 0..32 {
+            consolidate
+                .update("bok_0000", &payload)
+                .expect("update blob consolidate trigger failed");
+        }
+        consolidate
+            .commit()
+            .expect("commit blob consolidate trigger failed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        counter_value(&observer, CounterMetric::TreeNodeConsolidate) >= before + 3,
+        "expected repeated foreground consolidation"
+    );
     bucket.checkpoint();
 
     for idx in 0..128 {
@@ -866,7 +1000,6 @@ fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        let _ = mace.vacuum_bucket("prod");
         bucket.checkpoint();
         mace.start_gc();
         std::thread::sleep(Duration::from_millis(20));
@@ -919,9 +1052,53 @@ fn child_case_wal_recycle_before_dir_sync(db_root: &Path) -> ! {
     panic!("wal recycle failpoint did not fire")
 }
 
+fn child_case_wal_recycle_before_dir_sync_keep_stable(db_root: &Path) -> ! {
+    let (mace, bucket) = child_setup_wal_recycle_keep_stable(db_root);
+    seed_committed_and_uncommitted(&bucket, 64, 24);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let payload = vec![b'w'; 1024];
+    let mut round = 0usize;
+
+    while Instant::now() < deadline {
+        let txn = bucket.begin().expect("begin wal recycle txn failed");
+        for idx in 0..64 {
+            txn.upsert(format!("rw_{round}_{idx}"), &payload)
+                .expect("upsert wal recycle key failed");
+        }
+        txn.commit().expect("commit wal recycle txn failed");
+        if round.is_multiple_of(4) {
+            bucket.checkpoint();
+            mace.start_gc();
+        }
+        round += 1;
+    }
+
+    panic!("wal recycle keep-stable failpoint did not fire")
+}
+
 fn child_case_wal_recycle_reopen(db_root: &Path) -> ! {
     let _ = child_setup_wal_recycle(db_root);
     panic!("recovery wal recycle failpoint did not fire")
+}
+
+fn child_case_wal_recycle_reopen_keep_stable(db_root: &Path) -> ! {
+    let _ = child_setup_wal_recycle_keep_stable(db_root);
+    panic!("recovery wal recycle keep-stable failpoint did not fire")
+}
+
+fn child_case_wal_recycle_reopen_expect_io(db_root: &Path, keep_stable: bool) {
+    let mut opt = Options::new(db_root);
+    opt.concurrent_write = 1;
+    opt.sync_on_write = true;
+    opt.data_file_size = 16 << 10;
+    opt.wal_buffer_size = 8 << 10;
+    opt.wal_file_size = 4 << 10;
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = false;
+    opt.keep_stable_wal_file = keep_stable;
+    let res = Mace::new(opt.validate().expect("validate options failed"));
+    let err = res.err().expect("recovery reopen must fail with io error");
+    assert_eq!(err, OpCode::IoError);
 }
 
 fn child_case_reopen_common(db_root: &Path) -> ! {
@@ -971,7 +1148,13 @@ fn child_case_gc_blob_before_meta_commit(db_root: &Path) -> ! {
     mace.sync().expect("sync before blob gc failed");
     wait_for_data_dir_quiet(db_root, Duration::from_millis(300), Duration::from_secs(20));
 
-    wait_for_crash(Duration::from_secs(20))
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        mace.start_gc();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!("gc blob failpoint did not fire")
 }
 
 fn child_case_evictor_before_evict_once(db_root: &Path) -> ! {
@@ -1174,7 +1357,19 @@ fn failpoint_child() {
             child_case_wal_recycle_before_dir_sync(&db_root)
         }
         "wal_recycle_done_windows" => child_case_wal_recycle_before_dir_sync(&db_root),
+        "wal_recycle_done_windows_keep_stable" => {
+            child_case_wal_recycle_before_dir_sync_keep_stable(&db_root)
+        }
         "recovery_wal_recycle_done_windows" => child_case_wal_recycle_reopen(&db_root),
+        "recovery_wal_recycle_done_windows_keep_stable" => {
+            child_case_wal_recycle_reopen_keep_stable(&db_root)
+        }
+        "recovery_wal_recycle_expect_remove_io" => {
+            child_case_wal_recycle_reopen_expect_io(&db_root, false)
+        }
+        "recovery_wal_recycle_expect_rename_io" => {
+            child_case_wal_recycle_reopen_expect_io(&db_root, true)
+        }
         "gc_data_rewrite_before_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_stage_marker" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_data_dir_sync" => child_case_gc_data_before_meta_commit(&db_root),
@@ -1594,6 +1789,40 @@ fn seed_wal_recycle_intent_after_dir_sync(db_root: &Path) {
     );
 }
 
+fn seed_wal_recycle_intent_after_first_remove(db_root: &Path) {
+    let status = spawn_child(
+        "wal_recycle_after_remove_before_dir_sync",
+        db_root,
+        "mace_wal_recycle_after_remove_before_dir_sync=abort@2",
+    );
+    assert_child_aborted(
+        status,
+        "wal-recycle-after-remove-before-dir-sync child should abort after partial recycle",
+    );
+    assert_eq!(
+        wal_recycle_stage(db_root, 0),
+        Some(1),
+        "seed crash must leave durable recycle intent after a partial remove",
+    );
+}
+
+fn seed_wal_recycle_intent_after_first_rename(db_root: &Path) {
+    let status = spawn_child(
+        "wal_recycle_done_windows_keep_stable",
+        db_root,
+        "mace_wal_recycle_after_remove_before_dir_sync=abort@2",
+    );
+    assert_child_aborted(
+        status,
+        "wal-recycle-after-remove-before-dir-sync child should abort after partial rename",
+    );
+    assert_eq!(
+        wal_recycle_stage(db_root, 0),
+        Some(1),
+        "seed crash must leave durable recycle intent after a partial rename",
+    );
+}
+
 #[test]
 #[ignore]
 fn chaos_failpoint_recovery_wal_recycle_after_dir_sync_before_done_commit() {
@@ -1649,6 +1878,50 @@ fn chaos_failpoint_recovery_wal_recycle_after_done_commit_before_publish() {
         wal_recycle_stage(&path, 0),
         Some(2),
         "clean reopen should keep durable done frontier after recovery crash",
+    );
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_recovery_fs_remove_file_io() {
+    let path = RandomPath::new();
+    seed_wal_recycle_intent_after_first_remove(&path);
+
+    let status = spawn_child(
+        "recovery_wal_recycle_expect_remove_io",
+        &path,
+        "mace_fs_remove_file=io(permission_denied)@1",
+    );
+    assert!(
+        status.success(),
+        "recovery remove_file child should report io error"
+    );
+    assert_eq!(
+        wal_recycle_stage(&path, 0),
+        Some(1),
+        "failed recovery remove must keep recycle intent durable",
+    );
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_recovery_fs_rename_io() {
+    let path = RandomPath::new();
+    seed_wal_recycle_intent_after_first_rename(&path);
+
+    let status = spawn_child(
+        "recovery_wal_recycle_expect_rename_io",
+        &path,
+        "mace_fs_rename=io(permission_denied)@1",
+    );
+    assert!(
+        status.success(),
+        "recovery rename child should report io error"
+    );
+    assert_eq!(
+        wal_recycle_stage(&path, 0),
+        Some(1),
+        "failed recovery rename must keep recycle intent durable",
     );
 }
 

@@ -1,3 +1,4 @@
+use crate::hot_true;
 use std::{
     cell::RefCell,
     cmp::Ordering,
@@ -6,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    number_to_slice, slice_to_number,
+    must_exist, number_to_slice, slice_to_number,
     types::{
         refbox::BoxRef,
         traits::{ICodec, IDecode, IKey, IKeyCodec, ILoader, IVal},
@@ -22,6 +23,12 @@ pub struct IntlKey<'a> {
 impl<'a> IntlKey<'a> {
     pub(crate) fn new(raw: &'a [u8]) -> Self {
         Self { raw }
+    }
+
+    #[inline(always)]
+    pub(crate) fn encoded_raw(src: &[u8]) -> &[u8] {
+        let (raw_len, n) = must_exist!(Varint32::decode(src), "invalid src: {:?}", src);
+        &src[n..n + raw_len as usize]
     }
 }
 
@@ -57,7 +64,7 @@ impl ICodec for IntlKey<'_> {
     }
 
     fn encode_to(&self, to: &mut [u8]) {
-        debug_assert_eq!(to.len(), self.packed_size());
+        hot_true!(eq to.len(), self.packed_size());
         let (l, r) = to.split_at_mut(Varint32::size(to.len()));
         Varint32::encode(l, self.raw.len() as u32);
         r.copy_from_slice(self.raw);
@@ -66,8 +73,7 @@ impl ICodec for IntlKey<'_> {
 
 impl IDecode for IntlKey<'_> {
     fn decode_from(src: &[u8]) -> Self {
-        let (raw_len, n) = Varint32::decode(src).unwrap();
-        let raw = &src[n..n + raw_len as usize];
+        let raw = Self::encoded_raw(src);
         Self {
             raw: unsafe { std::mem::transmute::<&[u8], &[u8]>(raw) },
         }
@@ -76,7 +82,7 @@ impl IDecode for IntlKey<'_> {
 
 impl IKeyCodec for IntlKey<'_> {
     fn remove_prefix(&self, prefix_len: usize) -> Self {
-        debug_assert!(self.raw.len() >= prefix_len);
+        hot_true!(self.raw.len() >= prefix_len);
         Self {
             raw: &self.raw[prefix_len..],
         }
@@ -92,6 +98,23 @@ pub struct Key<'a> {
 impl<'a> Key<'a> {
     pub fn new(raw: &'a [u8], ver: Ver) -> Self {
         Self { raw, ver }
+    }
+
+    #[inline(always)]
+    fn encoded_key(data: &[u8]) -> &[u8] {
+        let (len, n) = must_exist!(Varint32::decode(data), "invalid data: {:?}", data);
+        &data[n..n + len as usize]
+    }
+
+    #[inline(always)]
+    pub(crate) fn encoded_key_parts(data: &[u8]) -> (&[u8], &[u8]) {
+        Self::encoded_key(data).split_at(Ver::len())
+    }
+
+    #[inline(always)]
+    pub(crate) fn encoded_parts(data: &[u8]) -> (Ver, &[u8]) {
+        let (ver, raw) = Self::encoded_key_parts(data);
+        (Ver::decode_from(ver), raw)
     }
 
     fn len(&self) -> usize {
@@ -130,12 +153,11 @@ impl Ord for Key<'_> {
 
 impl IDecode for Key<'_> {
     fn decode_from(data: &[u8]) -> Self {
-        let (len, n) = Varint32::decode(data).unwrap();
-        let (num, raw) = data[n..n + len as usize].split_at(Ver::len());
+        let (ver, raw) = Self::encoded_parts(data);
 
         Self {
             raw: unsafe { std::mem::transmute::<&[u8], &[u8]>(raw) },
-            ver: Ver::decode_from(num),
+            ver,
         }
     }
 }
@@ -146,7 +168,7 @@ impl ICodec for Key<'_> {
     }
 
     fn encode_to(&self, to: &mut [u8]) {
-        debug_assert_eq!(to.len(), self.packed_size());
+        hot_true!(eq to.len(), self.packed_size());
         let (len, key) = to.split_at_mut(Varint32::size(to.len()));
         Varint32::encode(len, self.len() as u32);
         let (num, raw) = key.split_at_mut(Ver::len());
@@ -157,7 +179,7 @@ impl ICodec for Key<'_> {
 
 impl IKeyCodec for Key<'_> {
     fn remove_prefix(&self, prefix_len: usize) -> Self {
-        debug_assert!(self.raw.len() >= prefix_len);
+        hot_true!(self.raw.len() >= prefix_len);
         Self {
             raw: &self.raw[prefix_len..],
             ver: self.ver,
@@ -215,7 +237,7 @@ impl ICodec for Ver {
     }
 
     fn encode_to(&self, to: &mut [u8]) {
-        debug_assert_eq!(to.len(), Self::len());
+        hot_true!(eq to.len(), Self::len());
         let (x, y) = to.split_at_mut(size_of::<u64>());
         number_to_slice!(self.txid, x);
         number_to_slice!(self.cmd, y);
@@ -277,7 +299,7 @@ impl IDecode for IntlSeg<'_> {
 
 impl IKeyCodec for IntlSeg<'_> {
     fn remove_prefix(&self, prefix_len: usize) -> Self {
-        debug_assert!(self.len() >= prefix_len);
+        hot_true!(self.len() >= prefix_len);
         if prefix_len >= self.prefix.len() {
             let rest = prefix_len - self.prefix.len();
             Self {
@@ -388,7 +410,7 @@ impl IDecode for LeafSeg<'_> {
 
 impl IKeyCodec for LeafSeg<'_> {
     fn remove_prefix(&self, prefix_len: usize) -> Self {
-        debug_assert!(self.len() - Ver::len() >= prefix_len);
+        hot_true!(self.len() - Ver::len() >= prefix_len);
         if prefix_len >= self.prefix.len() {
             let rest = prefix_len - self.prefix.len();
             Self {
@@ -494,7 +516,7 @@ impl<'a> Val<'a> {
             (&self.data[off..], None)
         } else {
             let addr = Self::read::<u64>(self.data, off);
-            let r = l.load_blob(addr, cache).expect("must exist");
+            let r = l.load_blob(addr, cache);
             (r.view().as_remote().raw(), Some(r))
         };
         (Record::decode_from(&src[..len]), r)
@@ -631,14 +653,14 @@ impl ICodec for Index {
     }
 
     fn encode_to(&self, to: &mut [u8]) {
-        debug_assert_eq!(to.len(), self.packed_size());
+        hot_true!(to.len() == self.packed_size());
         number_to_slice!(self.pid, to);
     }
 }
 
 impl IDecode for Index {
     fn decode_from(raw: &[u8]) -> Self {
-        debug_assert!(raw.len() >= size_of::<u64>());
+        hot_true!(raw.len() >= size_of::<u64>());
         Self {
             pid: slice_to_number!(&raw[0..Self::len()], u64),
         }
@@ -691,8 +713,8 @@ impl Record {
     pub fn as_slice(&self, s: &mut [u8]) {
         let (l, r) = s.split_at_mut(size_of::<u8>());
         number_to_slice!(self.group_id, l);
-        debug_assert_eq!(r.len(), self.data.len());
-        debug_assert_ne!(self.data.as_ptr(), r.as_ptr());
+        hot_true!(eq r.len(), self.data.len());
+        hot_true!(ne self.data.as_ptr(), r.as_ptr());
         r.copy_from_slice(self.data);
     }
 
@@ -883,7 +905,7 @@ mod test {
     };
 
     use crate::{
-        BucketOptions, OpCode,
+        BucketOptions,
         types::{
             data::{HistRef, IntlKey, Record, Val, Ver},
             refbox::{BoxRef, BoxView, RemoteView},
@@ -1020,12 +1042,8 @@ mod test {
         }
 
         impl ILoader for L {
-            fn load_pinned(&self, addr: u64) -> Result<BoxView, OpCode> {
-                self.m
-                    .borrow()
-                    .get(&addr)
-                    .map(|x| x.view())
-                    .ok_or(OpCode::NotFound)
+            fn load_pinned(&self, addr: u64) -> BoxView {
+                self.m.borrow().get(&addr).map(|x| x.view()).unwrap()
             }
 
             fn pin(&self, data: BoxRef) {
@@ -1040,12 +1058,12 @@ mod test {
                 self.clone()
             }
 
-            fn load_sibling(&self, addr: u64) -> Result<BoxRef, OpCode> {
-                self.m.borrow().get(&addr).cloned().ok_or(OpCode::NotFound)
+            fn load_sibling(&self, addr: u64) -> BoxRef {
+                self.m.borrow().get(&addr).cloned().unwrap()
             }
 
-            fn load_blob(&self, addr: u64, _cache: bool) -> Result<BoxRef, OpCode> {
-                self.m.borrow().get(&addr).cloned().ok_or(OpCode::NotFound)
+            fn load_blob(&self, addr: u64, _cache: bool) -> BoxRef {
+                self.m.borrow().get(&addr).cloned().unwrap()
             }
         }
 

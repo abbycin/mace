@@ -1,9 +1,13 @@
-use crate::map::buffer::{BucketContext, WriteEpoch};
 use crate::map::table::{PageMap, Swip};
 use crate::map::{Node, Page};
+use crate::map::{
+    SparseFrontier,
+    buffer::{BucketContext, WriteEpoch},
+};
 use crate::types::refbox::BoxRef;
 use crate::types::traits::IFrameAlloc;
 use crate::utils::NULL_ADDR;
+use crate::{must_ok, must_true};
 use crossbeam_epoch::Guard;
 use rustc_hash::FxHashMap;
 
@@ -55,9 +59,10 @@ impl<'a> Publish<'a> {
     }
 
     pub(crate) fn evict_simple(&mut self, pid: u64, old: Page, addr: u64) {
-        self.table
-            .cas(pid, old.swip(), addr)
-            .expect("must success, becuase it has been protected by Mutex");
+        must_ok!(
+            self.table.cas(pid, old.swip(), addr),
+            "must success, becuase it has been protected by Mutex"
+        );
         self.bucket.evict_cache(pid);
         self.touch_pid(pid, Swip::new(addr).untagged());
         self.g.defer(move || old.reclaim());
@@ -68,10 +73,14 @@ impl<'a> Publish<'a> {
         let old_base = old.base_addr();
         // compact/merge may pass extra junks, but old base/delta must always be retired
         let mut structural_junks = Vec::new();
-        old.collect_junk(|x| structural_junks.push(x));
+        let mut old_frontier = SparseFrontier::default();
+        old.collect_frontier_and_junk(|group, lsn, addr| {
+            structural_junks.push(addr);
+            old_frontier.merge_group(group, lsn);
+        });
         node.set_pid(pid);
         let new_base = node.base_addr();
-        debug_assert_eq!(Swip::new(addr).untagged(), node.latest_addr());
+        must_true!(eq Swip::new(addr).untagged(), node.latest_addr());
         self.evict_simple(pid, old, addr);
         self.bucket.pool.transfer_junks(
             &self.epoch,
@@ -80,6 +89,7 @@ impl<'a> Publish<'a> {
             new_base,
             structural_junks,
             junks,
+            old_frontier,
         );
     }
 
@@ -88,7 +98,11 @@ impl<'a> Publish<'a> {
         let old_base = old.base_addr();
         let new_base = node.base_addr();
         let mut structural_junks = Vec::new();
-        old.collect_junk(|x| structural_junks.push(x));
+        let mut old_frontier = SparseFrontier::default();
+        old.collect_frontier_and_junk(|group, lsn, addr| {
+            structural_junks.push(addr);
+            old_frontier.merge_group(group, lsn);
+        });
         node.set_pid(pid);
         let new = Page::new(node);
         if self.table.cas(pid, old.swip(), new.swip()).is_ok() {
@@ -99,6 +113,7 @@ impl<'a> Publish<'a> {
                 new_base,
                 structural_junks,
                 junks,
+                old_frontier,
             );
             self.bucket.warm(pid, new.size());
             self.touch_pid(pid, new_base);
@@ -111,9 +126,10 @@ impl<'a> Publish<'a> {
     }
 
     pub(crate) fn mark_unmap(&mut self, pid: u64, old: u64) {
-        self.table
-            .cas(pid, old, NULL_ADDR)
-            .expect("unmapped pid must still be mapped before recycle");
+        must_ok!(
+            self.table.cas(pid, old, NULL_ADDR),
+            "unmapped pid must still be mapped before recycle"
+        );
         self.epoch.unmap_pid.mark(pid);
     }
 }
@@ -149,10 +165,10 @@ impl<'a> AllocGuard<'a> {
     }
 
     pub(crate) fn mark_unmap(&self, pid: u64, old: u64) {
-        self.bucket
-            .table
-            .cas(pid, old, NULL_ADDR)
-            .expect("unmapped pid must still be mapped before recycle");
+        must_ok!(
+            self.bucket.table.cas(pid, old, NULL_ADDR),
+            "unmapped pid must still be mapped before recycle"
+        );
         self.epoch.unmap_pid.mark(pid);
     }
 

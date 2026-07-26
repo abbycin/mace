@@ -1,7 +1,7 @@
-use crate::Options;
 use crate::types::traits::IAsSlice;
+use crate::{Options, must_ok};
 
-use crate::io::{self, GatherIO, IoVec};
+use crate::io::{self, FileSystem, GatherIO, IoVec};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
@@ -153,23 +153,23 @@ impl GatherWriter {
     pub(crate) const MAX_IOVCNT: usize = 1024;
     pub(crate) const DEFAULT_IOVCNT: usize = 64;
 
-    fn open(path: &PathBuf, trunc: bool) -> io::File {
-        io::File::options()
-            .write(true)
-            .append(true)
-            .trunc(trunc)
-            .create(true)
-            .open(path)
-            .inspect_err(|x| {
-                log::error!("can't open {path:?}, {x}");
-            })
-            .unwrap()
+    fn open(fs: &dyn FileSystem, path: &PathBuf, trunc: bool) -> io::File {
+        must_ok!(
+            io::File::options()
+                .write(true)
+                .append(true)
+                .trunc(trunc)
+                .create(true)
+                .open(fs, path),
+            "can't open {:?}",
+            path
+        )
     }
 
-    fn create(path: &PathBuf, max_iovcnt: usize, trunc: bool) -> Self {
+    fn create(fs: &dyn FileSystem, path: &PathBuf, max_iovcnt: usize, trunc: bool) -> Self {
         Self {
             path: path.clone(),
-            file: Self::open(path, trunc),
+            file: Self::open(fs, path, trunc),
             queue: Vec::with_capacity(max_iovcnt),
             owned: Vec::new(),
             queued_len: 0,
@@ -181,12 +181,12 @@ impl GatherWriter {
         }
     }
 
-    pub fn trunc(path: &PathBuf, max_iovcnt: usize) -> Self {
-        Self::create(path, max_iovcnt, true)
+    pub fn trunc(fs: &dyn FileSystem, path: &PathBuf, max_iovcnt: usize) -> Self {
+        Self::create(fs, path, max_iovcnt, true)
     }
 
-    pub fn append(path: &PathBuf, max_iovcnt: usize) -> Self {
-        Self::create(path, max_iovcnt, false)
+    pub fn append(fs: &dyn FileSystem, path: &PathBuf, max_iovcnt: usize) -> Self {
+        Self::create(fs, path, max_iovcnt, false)
     }
 
     pub fn queue(&mut self, data: &[u8]) {
@@ -217,50 +217,31 @@ impl GatherWriter {
     }
 
     pub fn pos(&self) -> u64 {
-        self.file
-            .size()
-            .inspect_err(|x| {
-                log::error!("can't get metadata of {:?}, {}", self.path, x);
-            })
-            .unwrap()
+        must_ok!(self.file.size(), "path: {:?}", self.path)
     }
 
     pub fn write(&mut self, data: &[u8]) {
-        self.file
-            .write(data)
-            .inspect_err(|e| {
-                log::error!("can't write: {:?}", e);
-            })
-            .expect("can't fail");
+        must_ok!(self.file.write(data), "path: {:?}", self.path);
     }
 
     pub fn flush(&mut self) {
         let iov = self.queue.as_mut_slice();
-        self.file
-            .writev(iov, self.queued_len)
-            .inspect_err(|x| log::error!("can't write iov, {x}"))
-            .unwrap();
+        must_ok!(
+            self.file.writev(iov, self.queued_len),
+            "path: {:?}",
+            self.path
+        );
         self.queued_len = 0;
         self.queue.clear();
         self.owned.clear();
     }
 
     pub fn sync(&mut self) {
-        self.file
-            .sync()
-            .inspect_err(|x| {
-                log::error!("can't sync {:?}, {}", self.path, x);
-            })
-            .expect("can't fail");
+        must_ok!(self.file.sync(), "path {:?}", self.path);
     }
 
     pub fn sync_data(&mut self) {
-        self.file
-            .sync_data()
-            .inspect_err(|x| {
-                log::error!("can't sync data {:?}, {}", self.path, x);
-            })
-            .expect("can't fail");
+        must_ok!(self.file.sync_data(), "path: {:?}", self.path);
     }
 }
 

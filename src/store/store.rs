@@ -1,326 +1,22 @@
-use parking_lot::Mutex;
-
 use crate::cc::context::Context;
 use crate::index::tree::Tree;
 pub use crate::index::txn::{TxnKV, TxnView};
-use crate::map::IDataReader;
+use crate::map::adapter::{ManifestCheckpointObserver, ManifestDataReader};
 use crate::map::evictor::Evictor;
-use crate::map::flush::{CheckpointObserver, FlushDirective, FlushResult};
 use crate::meta::builder::ManifestBuilder;
-use crate::meta::{
-    BlobStat, BucketMeta, DataStat, IntervalPair, Manifest, MemBlobStat, MemDataStat, MetaKind, Txn,
-};
+use crate::meta::{BucketMeta, Manifest};
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
-use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats, VacuumStats};
-use crate::types::refbox::{BoxRef, BoxView};
+use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats};
 use crate::utils::Handle;
 use crate::utils::MutRef;
 pub use crate::utils::OpCode;
 use crate::utils::ROOT_PID;
-use crate::utils::data::init_group_pos;
 pub use crate::utils::options::Options;
 use crate::utils::options::{BucketOptions, ParsedOptions};
-use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::channel;
-
-struct FlushStatDelta {
-    old_data_stats: Vec<DataStat>,
-    old_blob_stats: Vec<BlobStat>,
-    new_data_stats: Vec<DataStat>,
-    new_blob_stats: Vec<BlobStat>,
-}
-
-struct StoreFlushObserver {
-    manifest: Handle<Manifest>,
-    ctx: Handle<Context>,
-    handle: Mutex<Option<GCHandle>>,
-}
-
-struct StoreDataReader {
-    meta: Handle<Manifest>,
-}
-
-impl StoreDataReader {
-    fn new(meta: Handle<Manifest>) -> Self {
-        Self { meta }
-    }
-
-    fn read_data(
-        &self,
-        bucket_id: u64,
-        addr: u64,
-        cache: &dyn Fn(BoxRef),
-    ) -> Result<BoxRef, OpCode> {
-        self.meta.load_data(bucket_id, addr, cache)
-    }
-
-    fn read_blob(
-        &self,
-        bucket_id: u64,
-        addr: u64,
-        cache: &dyn Fn(BoxView),
-    ) -> Result<BoxRef, OpCode> {
-        self.meta.load_blob(bucket_id, addr, cache)
-    }
-}
-
-impl IDataReader for StoreDataReader {
-    fn load_data(
-        &self,
-        bucket_id: u64,
-        addr: u64,
-        cache: &dyn Fn(BoxRef),
-    ) -> Result<BoxRef, OpCode> {
-        self.read_data(bucket_id, addr, cache)
-    }
-
-    fn load_blob(
-        &self,
-        bucket_id: u64,
-        addr: u64,
-        cache: &dyn Fn(BoxView),
-    ) -> Result<BoxRef, OpCode> {
-        self.read_blob(bucket_id, addr, cache)
-    }
-}
-
-impl StoreFlushObserver {
-    fn new(manifest: Handle<Manifest>, ctx: Handle<Context>) -> Self {
-        Self {
-            manifest,
-            ctx,
-            handle: Mutex::new(None),
-        }
-    }
-
-    #[cfg(feature = "failpoints")]
-    #[cold]
-    fn abort_flush_publish(stage: &str, err: OpCode) -> ! {
-        log::error!("flush publish {} failed: {:?}", stage, err);
-        std::process::abort()
-    }
-
-    fn attach_handle(&self, handle: GCHandle) {
-        self.handle.lock().replace(handle);
-    }
-
-    fn update_stat_interval(&self, txn: &mut Txn, result: &mut FlushResult) -> FlushStatDelta {
-        let bucket_id = result.bucket_id;
-        let data_tick = result
-            .data_ivls
-            .iter()
-            .map(|x| x.file_id)
-            .max()
-            .unwrap_or_else(|| self.manifest.numerics.next_data_id.load(Relaxed));
-        let mut data_by_file = BTreeMap::<u64, DataStat>::new();
-        for stat in self
-            .manifest
-            .apply_data_junks(bucket_id, data_tick, &result.data_junk)
-        {
-            data_by_file.insert(stat.file_id, stat);
-        }
-        let mut blob_by_file = BTreeMap::<u64, BlobStat>::new();
-        for stat in self.manifest.apply_blob_junks(bucket_id, &result.blob_junk) {
-            blob_by_file.insert(stat.file_id, stat);
-        }
-        let old_data_stats: Vec<_> = data_by_file.into_values().collect();
-        let old_blob_stats: Vec<_> = blob_by_file.into_values().collect();
-
-        #[cfg(feature = "failpoints")]
-        if !old_data_stats.is_empty() || !old_blob_stats.is_empty() {
-            crate::utils::failpoint::crash("mace_flush_after_old_stat_delta");
-        }
-
-        #[cfg(feature = "extra_check")]
-        assert_eq!(result.data_stats.len(), result.data_ivls.len());
-        #[cfg(feature = "extra_check")]
-        assert_eq!(result.blob_stats.len(), result.blob_ivls.len());
-
-        let mut new_data_stats = Vec::with_capacity(result.data_stats.len());
-        for (mem_stat, ivl) in result
-            .data_stats
-            .drain(..)
-            .zip(result.data_ivls.iter().copied())
-        {
-            new_data_stats.push(mem_stat);
-            self.manifest.clear_orphan_data_file(txn, ivl.file_id);
-        }
-
-        let mut new_blob_stats = Vec::with_capacity(result.blob_stats.len());
-        for (mem_stat, ivl) in result
-            .blob_stats
-            .drain(..)
-            .zip(result.blob_ivls.iter().copied())
-        {
-            new_blob_stats.push(mem_stat);
-            self.manifest.clear_orphan_blob_file(txn, ivl.file_id);
-        }
-        FlushStatDelta {
-            old_data_stats,
-            old_blob_stats,
-            new_data_stats,
-            new_blob_stats,
-        }
-    }
-
-    fn publish(&self, mut result: FlushResult) {
-        let has_new_files = !result.data_ivls.is_empty() || !result.blob_ivls.is_empty();
-        let bucket_id = result.bucket_id;
-        let retired_stat_snapshot = self.manifest.snapshot_retired_stat_keys(bucket_id);
-        let frontier_delta = *result.latest_chkpoint_lsn.deref();
-        let previous_frontier = self
-            .manifest
-            .bucket_frontier
-            .get(&bucket_id)
-            .map(|x| *x.value())
-            .unwrap_or_else(init_group_pos);
-        let groups = self.ctx.groups();
-
-        // page checkpoint can fold uncleaned txn versions into durable pages, recovery still needs
-        // the corresponding WAL tail to rebuild tx outcomes before safe_txid can expose them
-        for (i, g) in groups.iter().enumerate() {
-            if i < frontier_delta.len() && frontier_delta[i] > previous_frontier[i] {
-                let mut log = g.logging.lock();
-
-                log.sync_checkpoint_barrier()
-                    .inspect_err(|e| {
-                        log::error!("can't sync WAL checkpoint barrier, {:?}", e);
-                    })
-                    .expect("can't fail");
-            }
-        }
-
-        result.sync(); // must be called before updatin manifest
-        if has_new_files {
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_flush_after_data_dir_sync");
-        }
-        let bucket_frontier = self
-            .manifest
-            .merge_bucket_frontier(bucket_id, &frontier_delta);
-        let mut txn = self.manifest.begin();
-        let stat_delta = self.update_stat_interval(&mut txn, &mut result);
-
-        for ivl in &result.data_ivls {
-            txn.record(MetaKind::DataInterval, ivl);
-        }
-        for ivl in &result.blob_ivls {
-            txn.record(MetaKind::BlobInterval, ivl);
-        }
-
-        stat_delta
-            .old_data_stats
-            .iter()
-            .filter(|x| !self.manifest.is_retired_data_stat(bucket_id, x.file_id))
-            .for_each(|x| {
-                txn.record_data_stat_update(x);
-            });
-        stat_delta
-            .old_blob_stats
-            .iter()
-            .filter(|x| !self.manifest.is_retired_blob_stat(bucket_id, x.file_id))
-            .for_each(|x| {
-                txn.record_blob_stat_update(x);
-            });
-        stat_delta.new_data_stats.iter().for_each(|x| {
-            txn.record(MetaKind::DataStat, x);
-        });
-        stat_delta.new_blob_stats.iter().for_each(|x| {
-            txn.record(MetaKind::BlobStat, x);
-        });
-
-        txn.record(MetaKind::BucketFrontier, &bucket_frontier);
-        txn.record(MetaKind::Map, &result.map_table);
-        txn.record(MetaKind::Numerics, self.manifest.numerics.deref());
-
-        #[cfg(feature = "failpoints")]
-        if let Err(e) = crate::utils::failpoint::check("mace_flush_before_manifest_commit") {
-            Self::abort_flush_publish("before manifest commit", e);
-        }
-        txn.commit();
-        self.manifest.clear_retired_stat_keys(retired_stat_snapshot);
-        self.manifest.clear_synced_data();
-        self.manifest.clear_synced_blob();
-
-        #[cfg(feature = "failpoints")]
-        if let Err(e) = crate::utils::failpoint::check("mace_flush_after_manifest_commit") {
-            Self::abort_flush_publish("after manifest commit", e);
-        }
-
-        let groups = self.ctx.groups();
-        let sync = self.ctx.opt.sync_on_write;
-        let global_frontier = self.manifest.global_frontier_lower_bound(groups.len());
-
-        for (i, g) in groups.iter().enumerate() {
-            let mut pos = global_frontier[i];
-            if let Some(min) = g.active_txns.min_lsn()
-                && min < pos
-            {
-                pos = min;
-            }
-            let mut lk = g.logging.lock();
-            if lk.update_checkpoint(pos) && sync {
-                let mut f = lk.writer.clone();
-                drop(lk);
-                // checkpoint must be synced in durable mode
-                f.sync();
-            }
-        }
-    }
-}
-
-impl CheckpointObserver for StoreFlushObserver {
-    fn flush_directive(&self, bucket_id: u64) -> FlushDirective {
-        match self.manifest.bucket_runtimes.get(&bucket_id) {
-            Some(runtime) => {
-                if runtime.state.is_deleting() {
-                    return FlushDirective::Skip;
-                }
-                FlushDirective::Normal
-            }
-            None => FlushDirective::Skip,
-        }
-    }
-
-    fn stage_unsynced_data_file(&self, file_id: u64) {
-        self.manifest.stage_unsynced_data_file(file_id);
-    }
-
-    fn stage_unsynced_blob_file(&self, file_id: u64) {
-        self.manifest.stage_unsynced_blob_file(file_id);
-    }
-
-    fn stage_orphan_data_file(&self, file_id: u64) {
-        self.manifest.stage_orphan_data_file(file_id);
-    }
-
-    fn stage_orphan_blob_file(&self, file_id: u64) {
-        self.manifest.stage_orphan_blob_file(file_id);
-    }
-
-    fn update_data_mem_interval_stat(&self, ivl: IntervalPair, stat: MemDataStat) {
-        self.manifest.add_data_stat(stat, ivl);
-    }
-
-    fn update_blob_mem_interval_stat(&self, ivl: IntervalPair, stat: MemBlobStat) {
-        self.manifest.add_blob_stat(stat, ivl);
-    }
-
-    fn on_checkpoint(&self, result: FlushResult) {
-        self.publish(result)
-    }
-
-    fn finish_checkpoint(&self) {
-        let h = self.handle.lock();
-        if let Some(h) = h.as_ref() {
-            h.wal_clean(self.manifest, self.ctx);
-        }
-    }
-}
 
 pub struct Store {
     pub(crate) manifest: Handle<Manifest>,
@@ -341,7 +37,14 @@ impl Store {
         self.context.start();
     }
 
-    pub(crate) fn quit(&self) {
+    pub(crate) fn abort(&mut self) {
+        self.manifest.abort();
+        self.context.quit();
+        self.context.reclaim();
+        self.manifest.reclaim();
+    }
+
+    pub(crate) fn quit(&mut self) {
         // 1) stop new writes and flush outstanding WAL
         let _ = self.context.sync();
 
@@ -411,24 +114,6 @@ impl Inner {
         self.store.manifest.delete_bucket(name)
     }
 
-    fn vacuum_bucket(self: &Inner, name: &str) -> Result<VacuumStats, OpCode> {
-        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
-            return Err(OpCode::TooLarge);
-        }
-        let meta = self.store.manifest.load_bucket_meta(name)?;
-        let bucket_ctx = self.store.manifest.load_bucket_context(meta.id)?;
-        crate::store::gc::vacuum_bucket(self.store.clone(), bucket_ctx)
-    }
-
-    fn is_bucket_vacuuming(self: &Inner, name: &str) -> Result<bool, OpCode> {
-        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
-            return Err(OpCode::TooLarge);
-        }
-        let meta = self.store.manifest.load_bucket_meta(name)?;
-        let bucket_ctx = self.store.manifest.load_bucket_context(meta.id)?;
-        Ok(bucket_ctx.state.is_vacuuming())
-    }
-
     fn vacuum_meta(self: &Inner) -> Result<MetaVacuumStats, OpCode> {
         self.store.manifest.vacuum_meta(META_VACUUM_TARGET_BYTES)
     }
@@ -443,7 +128,7 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.gc.quit();
-        self.store.quit();
+        self.store.raw_ref().quit();
     }
 }
 
@@ -502,30 +187,48 @@ impl Mace {
         let opt = Arc::new(opt);
         let (tx, erx) = channel();
         let (etx, rx) = channel();
+        let manifest_path = opt.manifest();
+        let _ = opt
+            .fs
+            .try_exists(&manifest_path)
+            .map_err(|_| OpCode::IoError)?;
 
         let mut builder = ManifestBuilder::new_with_channels(opt.clone(), tx, rx);
-        builder.load()?;
+        let persisted_options = builder.load()?;
         let manifest = Handle::new(builder.finish());
+        if let Some(persisted_options) = persisted_options
+            && let Err(err) = manifest.store_persisted_options(&persisted_options)
+        {
+            manifest.reclaim();
+            return Err(err);
+        }
 
         let mut recover = Recovery::new(opt.clone());
-        let (wal_boot, ctx) = recover.phase1(manifest, manifest.numerics.clone())?;
-        let observer = Arc::new(StoreFlushObserver::new(manifest, ctx));
-        let reader = Arc::new(StoreDataReader::new(manifest));
+        let (wal_boot, ctx) = match recover.phase1(manifest, manifest.sequences.clone()) {
+            Ok(parts) => parts,
+            Err(err) => {
+                manifest.reclaim();
+                return Err(err);
+            }
+        };
+        let observer = Arc::new(ManifestCheckpointObserver::new(manifest, ctx));
+        let reader = Arc::new(ManifestDataReader::new(manifest));
         manifest.set_context(ctx, reader, observer.clone());
 
         let store = MutRef::new(Store::new(opt.clone(), manifest, ctx));
 
-        recover.phase2(&wal_boot, store.clone())?;
+        if let Err(err) = recover.phase2(&wal_boot, store.clone()) {
+            recover.abort(store.clone());
+            store.raw_ref().abort();
+            return Err(err);
+        }
         store.start();
         let handle = start_gc(store.clone(), store.context);
-        observer.attach_handle(handle.clone());
-        let evictor = Evictor::new(
-            opt.clone(),
-            manifest.buckets,
-            manifest.numerics.clone(),
-            erx,
-            etx,
-        );
+        let finish_handle = handle.clone();
+        observer.set_finish_hook(Arc::new(move || {
+            finish_handle.wal_clean(manifest, ctx);
+        }));
+        let evictor = Evictor::new(opt.clone(), manifest.buckets, erx, etx);
         evictor.start();
 
         Ok(Self {
@@ -579,18 +282,8 @@ impl Mace {
         Inner::del_bucket(&self.inner, name.as_ref())
     }
 
-    /// Vacuums a bucket by scavenging and compacting its pages
-    pub fn vacuum_bucket<S: AsRef<str>>(&self, name: S) -> Result<VacuumStats, OpCode> {
-        Inner::vacuum_bucket(&self.inner, name.as_ref())
-    }
-
-    /// Returns whether bucket vacuum is currently running
-    pub fn is_bucket_vacuuming<S: AsRef<str>>(&self, name: S) -> Result<bool, OpCode> {
-        Inner::is_bucket_vacuuming(&self.inner, name.as_ref())
-    }
-
-    /// Vacuums metadata by compacting the manifest btree
-    pub fn vacuum_meta(&self) -> Result<MetaVacuumStats, OpCode> {
+    /// Reduce metadata size (best-effort) by compacting the manifest btree
+    pub fn compact_meta(&self) -> Result<MetaVacuumStats, OpCode> {
         Inner::vacuum_meta(&self.inner)
     }
 
@@ -631,5 +324,42 @@ impl Mace {
     /// Synchronizes all WAL to disk.
     pub fn sync(&self) -> Result<(), OpCode> {
         self.inner.store.context.sync()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::ErrorKind, sync::Arc};
+
+    use crate::{
+        RandomPath,
+        io::testfs::{InjectOp, InjectedFileSystem},
+    };
+
+    use super::{Mace, Options};
+
+    #[test]
+    fn new_surfaces_manifest_try_exists_error_through_file_system() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        let manifest_path = opt.manifest();
+        let fs = Arc::new(InjectedFileSystem::new());
+        fs.fail_once(
+            InjectOp::TryExists,
+            manifest_path.clone(),
+            ErrorKind::PermissionDenied,
+        );
+        opt.fs = fs.clone();
+
+        let err = Mace::new(opt.validate().expect("options must validate"))
+            .err()
+            .expect("manifest try_exists fault must fail open");
+        assert_eq!(err, crate::OpCode::IoError);
+        assert!(
+            fs.calls()
+                .iter()
+                .any(|(op, path)| *op == InjectOp::TryExists && *path == manifest_path),
+            "manifest existence probe must go through FileSystem"
+        );
     }
 }

@@ -8,6 +8,7 @@ use crate::{
     io,
     utils::observe::{NoopObserver, Observer},
 };
+use serde::{Deserialize, Serialize};
 
 use super::OpCode;
 
@@ -19,27 +20,27 @@ fn dir_parent_for_sync(path: &Path) -> Option<&Path> {
     }
 }
 
-fn create_dir_all_and_sync(path: &Path) -> std::io::Result<()> {
-    if path.exists() {
+fn create_dir_all_and_sync(fs: &dyn io::FileSystem, path: &Path) -> std::io::Result<()> {
+    if fs.try_exists(path)? {
         return Ok(());
     }
 
     let mut created = Vec::new();
     let mut cursor = Some(path);
     while let Some(dir) = cursor {
-        if dir.exists() {
+        if fs.try_exists(dir)? {
             break;
         }
         created.push(dir.to_path_buf());
         cursor = dir.parent();
     }
 
-    std::fs::create_dir_all(path)?;
+    fs.create_dir_all(path)?;
 
     created.reverse();
     for dir in created {
         if let Some(parent) = dir_parent_for_sync(&dir) {
-            io::sync_dir(parent)?;
+            fs.sync_dir(parent)?;
         }
     }
     Ok(())
@@ -73,9 +74,7 @@ pub struct Options {
     /// Size limit of a blob file. Default is [`Self::BLOB_FILE_SIZE`]
     pub blob_file_size: usize,
     /// Trigger blob GC when the garbage ratio exceeds this value, in the range `[0, 100]`
-    pub blob_garbage_ratio: usize,
-    /// At each blob GC cycle, pick the lowest-utilization [`Self::blob_gc_ratio`]% of blob files as candidates.
-    pub blob_gc_ratio: usize,
+    pub blob_garbage_ratio: u32,
     /// Whether this is temporary storage.
     ///
     /// If true, `db_root` will be removed on exit.
@@ -120,6 +119,10 @@ pub struct Options {
     pub truncate_corrupted_wal: bool,
     /// Observability callback. Default is no-op.
     pub observer: Arc<dyn Observer>,
+    /// Filesystem hook for namespace operations and runtime file opens.
+    ///
+    /// The default value uses the host operating system filesystem.
+    pub(crate) fs: Arc<dyn io::FileSystem>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,10 +204,6 @@ impl BucketOptions {
             .clamp(Self::MIN_INLINE_SIZE, Self::MAX_INLINE_SIZE);
         self
     }
-
-    pub(crate) fn max_delta_len(&self) -> usize {
-        self.split_elems as usize / 4
-    }
 }
 
 impl Options {
@@ -233,7 +232,6 @@ impl Options {
             gc_eager: true,
             blob_file_size: Self::BLOB_FILE_SIZE,
             blob_garbage_ratio: 50, // 50%
-            blob_gc_ratio: 25,      // 25%
             db_root: db_root.as_ref().to_path_buf(),
             log_root: db_root.as_ref().to_path_buf(),
             lru_capacity: Self::LRU_CAPACITY,
@@ -247,6 +245,7 @@ impl Options {
             keep_stable_wal_file: false,
             truncate_corrupted_wal: true,
             observer: Arc::new(NoopObserver),
+            fs: Arc::new(io::OsFileSystem),
         }
     }
 
@@ -280,14 +279,14 @@ impl Options {
     pub fn create_dir(&self) -> std::io::Result<()> {
         let (db_root, data_root, log_root) = (self.db_root(), self.data_root(), self.log_root());
 
-        if !db_root.exists() {
-            create_dir_all_and_sync(&db_root)?;
+        if !self.fs.try_exists(&db_root)? {
+            create_dir_all_and_sync(self.fs.as_ref(), &db_root)?;
         }
-        if !data_root.exists() {
-            create_dir_all_and_sync(&data_root)?;
+        if !self.fs.try_exists(&data_root)? {
+            create_dir_all_and_sync(self.fs.as_ref(), &data_root)?;
         }
-        if !log_root.exists() {
-            create_dir_all_and_sync(&log_root)?;
+        if !self.fs.try_exists(&log_root)? {
+            create_dir_all_and_sync(self.fs.as_ref(), &log_root)?;
         }
         Ok(())
     }
@@ -365,11 +364,105 @@ impl Options {
     }
 
     pub(crate) fn sync_data_dir(&self) {
-        io::sync_dir(self.data_root()).unwrap_or_else(|e| panic!("can't fail, {:?}", e));
+        self.fs
+            .as_ref()
+            .sync_dir(&self.data_root())
+            .unwrap_or_else(|e| panic!("can't fail, {:?}", e));
     }
 
     pub(crate) fn sync_log_dir(&self) {
-        io::sync_dir(self.log_root()).unwrap_or_else(|e| panic!("can't fail, {:?}", e));
+        self.fs
+            .as_ref()
+            .sync_dir(&self.log_root())
+            .unwrap_or_else(|e| panic!("can't fail, {:?}", e));
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct PersistedOptions {
+    pub concurrent_write: u8,
+    pub sync_on_write: bool,
+    pub gc_timeout: u64,
+    pub checkpoint_nudge_ms: u64,
+    pub data_garbage_ratio: u32,
+    pub gc_eager: bool,
+    pub blob_file_size: usize,
+    pub blob_garbage_ratio: u32,
+    pub lru_capacity: usize,
+    pub stat_mask_cache_count: usize,
+    pub data_handle_cache_capacity: usize,
+    pub blob_handle_cache_capacity: usize,
+    pub data_file_size: usize,
+    pub wal_buffer_size: usize,
+    pub max_ckpt_per_txn: usize,
+    pub wal_file_size: u32,
+    pub keep_stable_wal_file: bool,
+    pub truncate_corrupted_wal: bool,
+}
+
+impl Default for PersistedOptions {
+    fn default() -> Self {
+        Self {
+            concurrent_write: Options::CONCURRENT_WRITE,
+            sync_on_write: true,
+            gc_timeout: 60 * 1000,
+            checkpoint_nudge_ms: 60 * 1000,
+            data_garbage_ratio: 20,
+            gc_eager: true,
+            blob_file_size: Options::BLOB_FILE_SIZE,
+            blob_garbage_ratio: 50,
+            lru_capacity: Options::LRU_CAPACITY,
+            stat_mask_cache_count: Options::STAT_MASK_CACHE_CNT,
+            data_handle_cache_capacity: 128,
+            blob_handle_cache_capacity: 128,
+            data_file_size: Options::DATA_FILE_SIZE,
+            wal_buffer_size: Options::WAL_BUF_SZ,
+            max_ckpt_per_txn: 1_000_000,
+            wal_file_size: Options::WAL_FILE_SZ as u32,
+            keep_stable_wal_file: false,
+            truncate_corrupted_wal: true,
+        }
+    }
+}
+
+impl PersistedOptions {
+    pub(crate) fn from_options(opt: &Options) -> Self {
+        Self {
+            concurrent_write: opt.concurrent_write,
+            sync_on_write: opt.sync_on_write,
+            gc_timeout: opt.gc_timeout,
+            checkpoint_nudge_ms: opt.checkpoint_nudge_ms,
+            data_garbage_ratio: opt.data_garbage_ratio,
+            gc_eager: opt.gc_eager,
+            blob_file_size: opt.blob_file_size,
+            blob_garbage_ratio: opt.blob_garbage_ratio,
+            lru_capacity: opt.lru_capacity,
+            stat_mask_cache_count: opt.stat_mask_cache_count,
+            data_handle_cache_capacity: opt.data_handle_cache_capacity,
+            blob_handle_cache_capacity: opt.blob_handle_cache_capacity,
+            data_file_size: opt.data_file_size,
+            wal_buffer_size: opt.wal_buffer_size,
+            max_ckpt_per_txn: opt.max_ckpt_per_txn,
+            wal_file_size: opt.wal_file_size,
+            keep_stable_wal_file: opt.keep_stable_wal_file,
+            truncate_corrupted_wal: opt.truncate_corrupted_wal,
+        }
+    }
+
+    pub(crate) fn from_json(buf: &[u8]) -> Result<Self, OpCode> {
+        serde_json::from_slice(buf).map_err(|_| OpCode::Corruption)
+    }
+
+    pub(crate) fn to_json(&self) -> Result<Vec<u8>, OpCode> {
+        serde_json::to_vec(self).map_err(|_| OpCode::Corruption)
+    }
+
+    pub(crate) fn check_compatible(&self, opt: &Options) -> Result<(), OpCode> {
+        if self.concurrent_write != opt.concurrent_write {
+            return Err(OpCode::Invalid);
+        }
+        Ok(())
     }
 }
 
@@ -379,5 +472,85 @@ impl Drop for ParsedOptions {
             log::info!("remove db_root {:?}", self.inner.db_root);
             let _ = std::fs::remove_dir_all(&self.inner.db_root);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::ErrorKind, sync::Arc};
+
+    use crate::{
+        OpCode, RandomPath,
+        io::testfs::{InjectOp, InjectedFileSystem},
+    };
+
+    use super::{Options, PersistedOptions};
+
+    #[test]
+    fn validate_returns_io_error_when_create_dir_all_fails() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        let fs = Arc::new(InjectedFileSystem::new());
+        fs.fail_once(
+            InjectOp::CreateDirAll,
+            opt.db_root(),
+            ErrorKind::PermissionDenied,
+        );
+        opt.fs = fs;
+        let err = opt.validate().err().expect("validate must fail");
+        assert_eq!(err, OpCode::IoError);
+    }
+
+    #[test]
+    fn validate_returns_io_error_when_parent_sync_fails() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        let parent = opt
+            .db_root()
+            .parent()
+            .expect("db_root must have parent")
+            .to_path_buf();
+        let fs = Arc::new(InjectedFileSystem::new());
+        fs.fail_once(InjectOp::SyncDir, parent, ErrorKind::PermissionDenied);
+        opt.fs = fs;
+        let err = opt.validate().err().expect("validate must fail");
+        assert_eq!(err, OpCode::IoError);
+    }
+
+    #[test]
+    fn persisted_options_fill_missing_fields_with_defaults() {
+        let json = br#"{"concurrent_write":8}"#;
+        let opt = PersistedOptions::from_json(json).expect("decode persisted options");
+        let expected = PersistedOptions {
+            concurrent_write: 8,
+            ..Default::default()
+        };
+        assert_eq!(opt, expected);
+    }
+
+    #[test]
+    fn persisted_options_ignore_removed_fields() {
+        let json = br#"{"concurrent_write":16,"old_field":true}"#;
+        let opt = PersistedOptions::from_json(json).expect("decode persisted options");
+        let expected = PersistedOptions {
+            concurrent_write: 16,
+            ..Default::default()
+        };
+        assert_eq!(opt, expected);
+    }
+
+    #[test]
+    fn persisted_options_reject_concurrent_write_conflicts() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 8;
+        let persisted = PersistedOptions::from_options(&opt.validate().unwrap());
+
+        let reopen_root = RandomPath::tmp();
+        let mut reopen = Options::new(&*reopen_root);
+        reopen.concurrent_write = 16;
+        let reopen = reopen.validate().unwrap();
+
+        assert_eq!(persisted.check_compatible(&reopen), Err(OpCode::Invalid));
     }
 }

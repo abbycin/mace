@@ -1,8 +1,8 @@
+use crate::hot_true;
 use crate::types::{
     header::BoxHeader,
     refbox::{BoxRef, BoxView},
 };
-use crate::utils::OpCode;
 use crate::utils::data::Position;
 
 pub trait ILoader {
@@ -12,11 +12,11 @@ pub trait ILoader {
 
     fn pin(&self, data: BoxRef);
 
-    fn load_pinned(&self, addr: u64) -> Result<BoxView, OpCode>;
+    fn load_pinned(&self, addr: u64) -> BoxView;
 
-    fn load_sibling(&self, addr: u64) -> Result<BoxRef, OpCode>;
+    fn load_sibling(&self, addr: u64) -> BoxRef;
 
-    fn load_blob(&self, addr: u64, cache: bool) -> Result<BoxRef, OpCode>;
+    fn load_blob(&self, addr: u64, cache: bool) -> BoxRef;
 }
 
 pub trait IAsBoxRef {
@@ -78,7 +78,7 @@ pub trait IAsSlice: Sized {
     }
 
     fn from_slice(x: &[u8]) -> Self {
-        assert!(x.len() >= size_of::<Self>());
+        hot_true!(x.len() >= size_of::<Self>());
         unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
     }
 

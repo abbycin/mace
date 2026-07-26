@@ -1,3 +1,5 @@
+use crate::must_true;
+pub(crate) mod adapter;
 pub(crate) mod buffer;
 pub(crate) mod cache;
 pub(crate) mod data;
@@ -15,7 +17,7 @@ use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
 
 use crate::{
-    OpCode, Options,
+    Options,
     cc::context::Context,
     map::buffer::Pool,
     static_assert,
@@ -25,7 +27,7 @@ use crate::{
     },
     utils::{
         Handle, MutRef,
-        data::{AddrPair, GroupPositions, Interval, Position},
+        data::{GroupPositions, Position},
         lru::{CachePriority, ShardPriorityLru},
     },
 };
@@ -34,6 +36,7 @@ pub(crate) type PagesMap = DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>;
 pub(crate) type JunksMap = DashMap<u64, RetiredChain, BuildHasherDefault<FxHasher>>;
 pub(crate) type Node = crate::types::node::Node<Loader>;
 pub(crate) type Page = crate::types::page::Page<Loader>;
+type NodePins = DashMap<u64, BoxRef, BuildHasherDefault<FxHasher>>;
 
 #[derive(Clone, Copy)]
 struct CacheKey(u128);
@@ -85,7 +88,7 @@ impl SparseFrontier {
     pub(crate) fn apply_to(&self, dst: &mut GroupPositions) {
         for &(group, lsn) in &self.items {
             let idx = group as usize;
-            debug_assert!(idx < dst.len());
+            must_true!(idx < dst.len());
             dst[idx] = dst[idx].max(lsn);
         }
     }
@@ -106,7 +109,7 @@ pub struct Loader {
     pub(crate) pool: Handle<Pool>,
     pub(crate) ctx: Handle<Context>,
     pub(crate) lru: Handle<ShardPriorityLru<BoxRef>>,
-    pub(crate) node_pins: MutRef<DashMap<u64, BoxRef>>,
+    pub(crate) node_pins: MutRef<NodePins>,
     pub(crate) bucket_id: u64,
     pub(crate) reader: Arc<dyn IDataReader>,
 }
@@ -117,11 +120,20 @@ impl Drop for Loader {
 
 impl Loader {
     pub const PIN_CAP: usize = 64;
+    const PIN_SHARDS: usize = 16;
 
     #[inline]
     fn cache_key(&self, addr: u64) -> u128 {
         // logical addr is only bucket-local, while this LRU is shared by all bucket contexts.
         CacheKey::new(self.bucket_id, addr).raw()
+    }
+
+    pub(crate) fn new_node_pins(cap: usize) -> NodePins {
+        DashMap::with_capacity_and_hasher_and_shard_amount(
+            cap,
+            BuildHasherDefault::<FxHasher>::default(),
+            Self::PIN_SHARDS,
+        )
     }
 }
 
@@ -131,7 +143,7 @@ impl ILoader for Loader {
             pool: self.pool,
             ctx: self.ctx,
             lru: self.lru,
-            node_pins: MutRef::new(DashMap::new()),
+            node_pins: MutRef::new(Self::new_node_pins(Self::PIN_CAP)),
             bucket_id: self.bucket_id,
             reader: self.reader.clone(),
         }
@@ -152,33 +164,33 @@ impl ILoader for Loader {
         self.node_pins.insert(data.header().addr, data);
     }
 
-    fn load_pinned(&self, addr: u64) -> Result<BoxView, OpCode> {
+    fn load_pinned(&self, addr: u64) -> BoxView {
         if let Some(p) = self.node_pins.get(&addr) {
-            return Ok(p.view());
+            return p.view();
         }
         let x = if let Some(x) = self.pool.get_dirty_page(addr) {
             x
         } else {
-            self.reader.load_data(self.bucket_id, addr, &|_| {})?
+            self.reader.load_data(self.bucket_id, addr, &|_| {})
         };
         let e = self.node_pins.entry(addr);
         match e {
-            Entry::Occupied(o) => Ok(o.get().view()),
+            Entry::Occupied(o) => o.get().view(),
             Entry::Vacant(v) => {
                 let r = x.view();
                 v.insert(x);
-                Ok(r)
+                r
             }
         }
     }
 
-    fn load_sibling(&self, addr: u64) -> Result<BoxRef, OpCode> {
+    fn load_sibling(&self, addr: u64) -> BoxRef {
         let key = self.cache_key(addr);
         if let Some(x) = self.lru.get(key) {
-            return Ok(x.clone());
+            return x.clone();
         }
         if let Some(x) = self.pool.get_dirty_page(addr) {
-            return Ok(x);
+            return x;
         }
         self.reader.load_data(self.bucket_id, addr, &|b| {
             self.lru
@@ -186,13 +198,13 @@ impl ILoader for Loader {
         })
     }
 
-    fn load_blob(&self, addr: u64, cache: bool) -> Result<BoxRef, OpCode> {
+    fn load_blob(&self, addr: u64, cache: bool) -> BoxRef {
         let key = self.cache_key(addr);
         if cache && let Some(x) = self.lru.get(key) {
-            return Ok(x.clone());
+            return x.clone();
         }
         if let Some(x) = self.pool.get_dirty_page(addr) {
-            return Ok(x);
+            return x;
         }
         self.reader.load_blob(self.bucket_id, addr, &|b| {
             if cache {
@@ -212,38 +224,8 @@ pub(crate) enum SharedState {
     Evict(u64),
 }
 
-pub(crate) trait IFooter: Default {
-    const LEN: usize = size_of::<Self>();
-
-    fn nr_interval(&self) -> usize;
-
-    fn nr_reloc(&self) -> usize;
-
-    fn reloc_crc(&self) -> u32;
-
-    fn interval_crc(&self) -> u32;
-
-    fn interval_len(&self) -> usize {
-        self.nr_interval() * Interval::LEN
-    }
-
-    fn reloc_len(&self) -> usize {
-        self.nr_reloc() * AddrPair::LEN
-    }
-}
-
 pub trait IDataReader: Send + Sync {
-    fn load_data(
-        &self,
-        bucket_id: u64,
-        addr: u64,
-        cache: &dyn Fn(BoxRef),
-    ) -> Result<BoxRef, OpCode>;
+    fn load_data(&self, bucket_id: u64, addr: u64, cache: &dyn Fn(BoxRef)) -> BoxRef;
 
-    fn load_blob(
-        &self,
-        bucket_id: u64,
-        addr: u64,
-        cache: &dyn Fn(BoxView),
-    ) -> Result<BoxRef, OpCode>;
+    fn load_blob(&self, bucket_id: u64, addr: u64, cache: &dyn Fn(BoxView)) -> BoxRef;
 }

@@ -1,5 +1,9 @@
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+static ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
 pub(crate) struct FuzzDbRoot {
     path: RandomPath,
@@ -7,9 +11,13 @@ pub(crate) struct FuzzDbRoot {
 
 impl FuzzDbRoot {
     pub(crate) fn new() -> Self {
-        Self {
-            path: RandomPath::tmp(),
-        }
+        let path = RandomPath::tmp();
+        register_cleanup();
+        roots()
+            .lock()
+            .expect("fuzz root registry poisoned")
+            .push((*path).clone());
+        Self { path }
     }
 
     pub(crate) fn path(&self) -> &RandomPath {
@@ -19,7 +27,50 @@ impl FuzzDbRoot {
 
 impl Drop for FuzzDbRoot {
     fn drop(&mut self) {
+        remove_root(self.path.as_path());
         self.path.unlink();
+    }
+}
+
+fn roots() -> &'static Mutex<Vec<PathBuf>> {
+    ROOTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_cleanup() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        #[cfg(unix)]
+        unsafe extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+
+        #[cfg(unix)]
+        extern "C" fn cleanup() {
+            if let Some(roots) = ROOTS.get() {
+                let roots = roots.lock().expect("fuzz root registry poisoned");
+                for path in roots.iter() {
+                    if path.exists() {
+                        if path.is_file() {
+                            let _ = std::fs::remove_file(path);
+                        } else {
+                            let _ = std::fs::remove_dir_all(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        unsafe {
+            let _ = atexit(cleanup);
+        }
+    });
+}
+
+fn remove_root(path: &Path) {
+    if let Some(roots) = ROOTS.get() {
+        let mut roots = roots.lock().expect("fuzz root registry poisoned");
+        roots.retain(|p| p.as_path() != path);
     }
 }
 

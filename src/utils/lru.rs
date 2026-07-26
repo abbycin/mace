@@ -108,15 +108,14 @@ impl<'a, K, V> LruShardGuard<'a, K, V>
 where
     K: Eq + Hash + Clone,
 {
-    pub(crate) fn add_if_missing<F, E>(mut self, f: F) -> Result<(), E>
+    pub(crate) fn add_if_missing<F>(mut self, f: F)
     where
-        F: Fn() -> Result<V, E>,
+        F: Fn() -> V,
     {
         if !self.map.contains_key(&self.k) {
-            let v = f()?;
+            let v = f();
             self.lru.add_unlocked(&mut self.map, self.cap, self.k, v);
         }
-        Ok(())
     }
 }
 

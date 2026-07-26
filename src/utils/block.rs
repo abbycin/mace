@@ -1,4 +1,7 @@
+use crate::must_true;
 use std::alloc::{Layout, alloc, dealloc, realloc};
+
+use crate::must_ok;
 
 use super::align_up;
 
@@ -27,14 +30,14 @@ impl Block {
     }
 
     pub(crate) fn alloc(size: usize) -> Self {
-        let layout = Layout::array::<u8>(size).expect("bad layout");
+        let layout = must_ok!(Layout::array::<u8>(size));
         Self::alloc_impl(size, 0, layout)
     }
 
     #[allow(unused)]
     pub(crate) fn aligned_alloc(size: usize, align: usize) -> Self {
         let len = align_up(size, align);
-        let layout = Layout::from_size_align(len, align).expect("bad layout");
+        let layout = must_ok!(Layout::from_size_align(len, align));
         Self::alloc_impl(size, align, layout)
     }
 
@@ -62,21 +65,21 @@ impl Block {
     }
 
     pub(crate) fn mut_slice<'a, T>(&self, off: usize, count: usize) -> &'a mut [T] {
-        debug_assert!(off + count * size_of::<T>() <= self.len);
+        must_true!(off + count * size_of::<T>() <= self.len);
 
         unsafe { std::slice::from_raw_parts_mut(self.data.add(off).cast::<T>(), count) }
     }
 
     pub(crate) fn slice<'a, T>(&self, off: usize, count: usize) -> &'a [T] {
-        debug_assert!(off + count * size_of::<T>() <= self.len);
+        must_true!(off + count * size_of::<T>() <= self.len);
 
         unsafe { std::slice::from_raw_parts(self.data.add(off).cast::<T>(), count) }
     }
 
     pub(crate) fn realloc(&mut self, size: usize) {
-        assert_eq!(self.align, 0);
+        must_true!(eq self.align, 0);
         self.data = unsafe {
-            let layout = Layout::array::<u8>(self.len).unwrap();
+            let layout = must_ok!(Layout::array::<u8>(self.len));
             realloc(self.data, layout, size)
         };
         self.len = size;
@@ -100,13 +103,13 @@ impl Drop for Block {
         *Self::get_ref(self.refs) -= 1;
         if *Self::get_ref(self.refs) == 0 {
             if self.align == 0 {
-                unsafe { dealloc(self.data, Layout::array::<u8>(self.len).unwrap()) };
+                unsafe { dealloc(self.data, must_ok!(Layout::array::<u8>(self.len))) };
             } else {
                 let align = self.align;
                 unsafe {
                     dealloc(
                         self.data,
-                        Layout::from_size_align(self.aligned_len(), align).expect("bad layout"),
+                        must_ok!(Layout::from_size_align(self.aligned_len(), align)),
                     );
                 }
             }
@@ -128,7 +131,7 @@ impl Ring {
     pub(crate) fn new(cap: usize) -> Self {
         let data = Block::alloc(cap);
         data.zero();
-        assert!(data.len().is_power_of_two());
+        must_true!(data.len().is_power_of_two());
         Self {
             data,
             head: 0,
@@ -142,7 +145,7 @@ impl Ring {
 
     // NOTE: the request buffer never wraps around
     pub(crate) fn prod<'a>(&mut self, size: usize) -> &'a mut [u8] {
-        debug_assert!(self.avail() >= size);
+        must_true!(self.avail() >= size);
         let mut b = self.tail;
         self.tail = self.tail.wrapping_add(size);
 

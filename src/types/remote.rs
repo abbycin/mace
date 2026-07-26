@@ -13,10 +13,12 @@ impl RemoteView {
         a: &mut A,
         size: usize,
     ) -> crate::types::refbox::BoxRef {
-        use crate::types::header::{RemoteHeader, TagKind};
+        use crate::types::header::{NodeType, RemoteHeader, TagKind};
 
         let mut p = a.alloc((size + size_of::<RemoteHeader>()) as u32);
-        p.header_mut().kind = TagKind::Remote;
+        let h = p.header_mut();
+        h.kind = TagKind::Remote;
+        h.node_type = NodeType::Leaf;
         p.view().as_remote().header_mut().size = size;
         p
     }

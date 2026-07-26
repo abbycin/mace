@@ -1,12 +1,13 @@
+use crate::{hot_true, must_exist};
 use std::{cmp::Ordering, marker::PhantomData};
 
 use crate::{
     types::{
-        data::{Index, Val},
+        data::{Index, IntlKey, Key, Val, Ver},
         header::SlotType,
         traits::{IDecode, IKey, IKeyCodec, ILoader},
     },
-    utils::raw_ptr_to_ref,
+    utils::{raw_ptr_to_ref, varint::Varint32},
 };
 
 use super::header::BaseHeader;
@@ -26,7 +27,7 @@ pub(crate) struct Sst<K> {
 
 impl<K> Sst<K> {
     pub(crate) fn new(data: *mut BaseHeader) -> Self {
-        debug_assert!(!data.is_null());
+        hot_true!(!data.is_null());
         Self {
             data,
             _marker: PhantomData,
@@ -57,28 +58,6 @@ where
         K::decode_from(raw)
     }
 
-    pub(crate) fn search_by<F>(&self, key: &K, f: F) -> Result<usize, usize>
-    where
-        F: Fn(&K, &K) -> Ordering,
-    {
-        let h = self.header();
-        debug_assert!(h.elems > 0);
-        let rk = key.remove_prefix(h.prefix_len as usize);
-        let (mut lo, mut hi) = (0, h.elems as usize);
-
-        while lo < hi {
-            let mid = lo + ((hi - lo) >> 1);
-            let k = self.key_at(mid);
-            match f(&k, &rk) {
-                Ordering::Equal => return Ok(mid),
-                Ordering::Greater => hi = mid,
-                Ordering::Less => lo = mid + 1,
-            }
-        }
-
-        Err(lo)
-    }
-
     pub(crate) fn lower_bound(&self, k: &K) -> Result<usize, usize> {
         let h = self.header();
         let elems = h.elems as usize;
@@ -95,6 +74,85 @@ where
         }
 
         if lo == elems { Err(lo) } else { Ok(lo) }
+    }
+}
+
+impl Sst<IntlKey<'_>> {
+    #[inline(always)]
+    fn raw_key_at(&self, pos: usize) -> &[u8] {
+        let raw = self.data_at(pos);
+        let (len, n) = must_exist!(Varint32::decode(raw), "invalid internal key");
+        &raw[n..n + len as usize]
+    }
+
+    #[inline(always)]
+    pub(crate) fn pid_at(&self, pos: usize) -> u64 {
+        let raw = self.data_at(pos);
+        let (len, n) = must_exist!(Varint32::decode(raw), "invalid internal key");
+        Index::decode_from(&raw[n + len as usize..]).pid
+    }
+
+    pub(crate) fn floor_pid_by_raw(&self, key: &[u8]) -> Option<(usize, u64)> {
+        let h = self.header();
+        if h.elems == 0 {
+            return None;
+        }
+        let prefix_len = h.prefix_len as usize;
+        let rk = &key[prefix_len..];
+        let (mut lo, mut hi) = (0, h.elems as usize);
+
+        while lo < hi {
+            let mid = lo + ((hi - lo) >> 1);
+            match self.raw_key_at(mid).cmp(rk) {
+                Ordering::Equal => return Some((mid, self.pid_at(mid))),
+                Ordering::Greater => hi = mid,
+                Ordering::Less => lo = mid + 1,
+            }
+        }
+
+        let pos = lo.max(1) - 1;
+        Some((pos, self.pid_at(pos)))
+    }
+}
+
+impl Sst<Key<'_>> {
+    #[inline(always)]
+    fn raw_key_at(&self, pos: usize) -> &[u8] {
+        let raw = self.data_at(pos);
+        let (len, n) = must_exist!(Varint32::decode(raw), "invalid leaf key");
+        let key = &raw[n..n + len as usize];
+        &key[Ver::len()..]
+    }
+
+    #[inline(always)]
+    pub(crate) fn ver_val_at(self, pos: usize) -> (Ver, Val<'static>) {
+        let raw = self.data_at(pos);
+        let (len, n) = must_exist!(Varint32::decode(raw), "invalid leaf key");
+        let key = &raw[n..n + len as usize];
+        let ver = Ver::decode_from(&key[..Ver::len()]);
+        let val = Val::decode_from(&raw[n + len as usize..]);
+        (ver, val)
+    }
+
+    pub(crate) fn search_ver_val_by_raw(&self, key: &[u8]) -> Option<(Ver, Val<'static>)> {
+        let h = self.header();
+        if h.elems == 0 {
+            return None;
+        }
+        let prefix_len = h.prefix_len as usize;
+        let rk = &key[prefix_len..];
+        let (mut lo, mut hi) = (0, h.elems as usize);
+
+        while lo < hi {
+            let mid = lo + ((hi - lo) >> 1);
+            match self.raw_key_at(mid).cmp(rk) {
+                Ordering::Equal => return Some(self.ver_val_at(mid)),
+                Ordering::Greater => hi = mid,
+                Ordering::Less => lo = mid + 1,
+            }
+        }
+
+        None
     }
 }
 

@@ -357,7 +357,7 @@ pub(crate) fn ptr_to<T>(x: *const u8) -> &'static T {
 
 #[cfg(test)]
 mod test {
-    use crate::cc::wal::{EntryType, IWalCodec, PayloadType, WalPut, WalUpdate, ptr_to};
+    use crate::cc::wal::{EntryType, IWalCodec, PayloadType, WalBegin, WalPut, WalUpdate, ptr_to};
 
     #[test]
     fn dump_load() {
@@ -468,5 +468,19 @@ mod test {
 
         ckpt.wal_type = EntryType::Unknown;
         assert!(!ckpt.is_intact());
+    }
+
+    #[test]
+    fn test_wal_scalar_layout_is_little_endian() {
+        let txid = 0x0102_0304_0506_0708u64;
+        let begin = WalBegin {
+            wal_type: EntryType::Begin,
+            txid,
+            checksum: 0,
+        };
+        let raw = begin.to_slice();
+
+        assert_eq!(raw[0], EntryType::Begin as u8);
+        assert_eq!(&raw[1..1 + size_of::<u64>()], &txid.to_le_bytes());
     }
 }
