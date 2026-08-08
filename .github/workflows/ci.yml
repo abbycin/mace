@@ -2,7 +2,7 @@ name: Cross-platform CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, btree-store ]
   pull_request:
     branches: [ master ]
 
