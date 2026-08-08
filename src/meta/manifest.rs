@@ -1,4 +1,4 @@
-use btree_store::BTree;
+use btree_store::{BTree, Error as BTreeError};
 use dashmap::{DashMap, DashSet};
 use parking_lot::{Mutex, RwLock};
 use std::{
@@ -75,6 +75,13 @@ impl Drop for Manifest {
 }
 
 impl Manifest {
+    fn ensure_btree_bucket(btree: &BTree, name: &str) {
+        match btree.new_bucket(name, false) {
+            Ok(()) | Err(BTreeError::BucketExists) => {}
+            Err(err) => panic!("can't ensure btree-store bucket {name}: {err:?}"),
+        }
+    }
+
     pub(crate) fn new(opt: Arc<ParsedOptions>, tx: Sender<SharedState>, rx: Receiver<()>) -> Self {
         let path = opt.manifest();
         let btree = must_ok!(BTree::open(path), "can't open btree-store");
@@ -91,7 +98,7 @@ impl Manifest {
         ];
 
         for name in buckets_to_ensure {
-            must_ok!(btree.exec(name, |_| Ok(())), "can't ensure bucket exists");
+            Self::ensure_btree_bucket(&btree, name);
         }
 
         Self {
@@ -123,7 +130,7 @@ impl Manifest {
     ) -> Result<Option<PersistedOptions>, OpCode> {
         match self.btree.view(BUCKET_MISC, |txn| txn.get(OPTIONS_KEY)) {
             Ok(raw) => PersistedOptions::from_json(&raw).map(Some),
-            Err(btree_store::Error::NotFound) => Ok(None),
+            Err(BTreeError::KeyNotFound) => Ok(None),
             Err(other) => Err(OpCode::from(other)),
         }
     }
@@ -335,13 +342,6 @@ impl Manifest {
         &self.files[kind.slot()]
     }
 
-    pub(crate) fn vacuum_meta(
-        &self,
-        target_bytes: u64,
-    ) -> Result<btree_store::CompactStats, OpCode> {
-        self.btree.compact(target_bytes).map_err(OpCode::from)
-    }
-
     fn load_bucket_meta_locked(&self, name: &str) -> Result<Arc<BucketMeta>, OpCode> {
         if let Some(meta) = self.bucket_metas.get(name) {
             return Ok(meta.clone());
@@ -395,6 +395,13 @@ impl Manifest {
             id: bucket_id,
             options: opt,
         });
+        for btree_bucket in [
+            super::page_table_name(bucket_id),
+            super::data_interval_name(bucket_id),
+            super::blob_interval_name(bucket_id),
+        ] {
+            Self::ensure_btree_bucket(&self.btree, &btree_bucket);
+        }
         // publish meta early so context creation sees it
         self.bucket_metas.insert(name.to_string(), meta.clone());
         self.bucket_metas_by_id.insert(bucket_id, meta.clone());
@@ -790,7 +797,7 @@ impl Manifest {
         let key = wal_recycle_key(group_id);
         match self.btree.view(BUCKET_MISC, |txn| txn.get(&key)) {
             Ok(val) => WalRecycleState::decode(&val),
-            Err(btree_store::Error::NotFound) => WalRecycleState::none(group_id),
+            Err(BTreeError::KeyNotFound) => WalRecycleState::none(group_id),
             Err(err) => panic!("load wal recycle state failed for group {group_id}: {err:?}"),
         }
     }

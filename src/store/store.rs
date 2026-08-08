@@ -7,7 +7,6 @@ use crate::meta::builder::ManifestBuilder;
 use crate::meta::{BucketMeta, Manifest};
 use crate::store::gc::{GCHandle, start_gc};
 use crate::store::recovery::Recovery;
-use crate::store::{META_VACUUM_TARGET_BYTES, MetaVacuumStats};
 use crate::utils::Handle;
 use crate::utils::MutRef;
 pub use crate::utils::OpCode;
@@ -112,10 +111,6 @@ impl Inner {
 
     fn del_bucket(self: &Inner, name: &str) -> Result<(), OpCode> {
         self.store.manifest.delete_bucket(name)
-    }
-
-    fn vacuum_meta(self: &Inner) -> Result<MetaVacuumStats, OpCode> {
-        self.store.manifest.vacuum_meta(META_VACUUM_TARGET_BYTES)
     }
 
     fn checkpoint(&self, bucket_id: u64) {
@@ -280,11 +275,6 @@ impl Mace {
     /// Deletes a bucket and all its data.
     pub fn del_bucket<S: AsRef<str>>(&self, name: S) -> Result<(), OpCode> {
         Inner::del_bucket(&self.inner, name.as_ref())
-    }
-
-    /// Reduce metadata size (best-effort) by compacting the manifest btree
-    pub fn compact_meta(&self) -> Result<MetaVacuumStats, OpCode> {
-        Inner::vacuum_meta(&self.inner)
     }
 
     /// Disables garbage collection.

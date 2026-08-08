@@ -794,9 +794,12 @@ impl GarbageCollector {
         }
 
         // table is now empty, destroy the btree bucket and remove pending record
-        let _ = self.store.manifest.btree.del_bucket(&bucket_table);
-        let _ = self.store.manifest.btree.del_bucket(&data_interval_table);
-        let _ = self.store.manifest.btree.del_bucket(&blob_interval_table);
+        for bucket in [&bucket_table, &data_interval_table, &blob_interval_table] {
+            match self.store.manifest.btree.del_bucket(bucket) {
+                Ok(()) | Err(btree_store::Error::BucketNotFound) => {}
+                Err(err) => panic!("can't delete btree-store bucket {bucket}: {err:?}"),
+            }
+        }
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(
             "mace_pending_bucket_reap_after_finalize_before_meta_commit",

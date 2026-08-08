@@ -72,15 +72,15 @@ impl From<std::io::Error> for OpCode {
 impl From<btree_store::Error> for OpCode {
     fn from(err: btree_store::Error) -> Self {
         match err {
-            btree_store::Error::NotFound => OpCode::NotFound,
-            btree_store::Error::Corruption => OpCode::Corruption,
-            btree_store::Error::TooLarge => OpCode::TooLarge,
-            btree_store::Error::Internal => OpCode::Invalid,
-            btree_store::Error::NoSpace => OpCode::NoSpace,
-            btree_store::Error::IoError => OpCode::IoError,
-            btree_store::Error::Invalid => OpCode::Invalid,
-            btree_store::Error::Duplicate => OpCode::Exist,
-            btree_store::Error::Conflict => OpCode::Again,
+            btree_store::Error::KeyNotFound | btree_store::Error::BucketNotFound => {
+                OpCode::NotFound
+            }
+            btree_store::Error::BucketExists => OpCode::Exist,
+            btree_store::Error::InvalidKey(btree_store::KeyError::TooLarge { .. })
+            | btree_store::Error::InvalidBucket(btree_store::BucketError::TooLarge { .. })
+            | btree_store::Error::ValueTooLarge { .. } => OpCode::TooLarge,
+            btree_store::Error::InvalidKey(btree_store::KeyError::Empty)
+            | btree_store::Error::InvalidBucket(btree_store::BucketError::Empty) => OpCode::Invalid,
         }
     }
 }

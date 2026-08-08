@@ -879,25 +879,3 @@ fn recovery_abort_clean_does_not_leave_bucket_loaded_after_startup() -> Result<(
     )?;
     Ok(())
 }
-
-#[test]
-fn compact_meta() -> Result<(), OpCode> {
-    let path = RandomPath::new();
-    let mut opt = Options::new(&*path);
-    opt.tmp_store = true;
-    opt.sync_on_write = false;
-    let mace = Mace::new(opt.validate().unwrap()).unwrap();
-
-    let total = 256;
-    for i in 0..total {
-        let name = format!("b{i:04}");
-        let db = mace.new_bucket(&name, BucketOptions::default()).unwrap();
-        let kv = db.begin().unwrap();
-        kv.put("k", "v")?;
-        kv.commit()?;
-    }
-
-    let stats = mace.compact_meta()?;
-    assert!(stats.moved_pages > 0);
-    Ok(())
-}

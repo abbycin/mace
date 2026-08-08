@@ -152,7 +152,7 @@ fn load_persisted_global_options(db_root: &Path) -> Option<PersistedGlobalOption
 fn manifest_bucket_exists(manifest: &BTree, bucket: &str) -> bool {
     match manifest.view(bucket, |_txn| Ok(())) {
         Ok(()) => true,
-        Err(BTreeError::NotFound) => false,
+        Err(BTreeError::BucketNotFound) => false,
         Err(err) => panic!("manifest bucket view failed for {bucket}: {err:?}"),
     }
 }
@@ -169,7 +169,7 @@ fn manifest_bucket_keys(manifest: &BTree, bucket: &str) -> Option<Vec<Vec<u8>>> 
         Ok(out)
     }) {
         Ok(keys) => Some(keys),
-        Err(BTreeError::NotFound) => None,
+        Err(BTreeError::BucketNotFound) => None,
         Err(err) => panic!("manifest bucket view failed for {bucket}: {err:?}"),
     }
 }
@@ -177,7 +177,7 @@ fn manifest_bucket_keys(manifest: &BTree, bucket: &str) -> Option<Vec<Vec<u8>>> 
 fn manifest_bucket_has_key(manifest: &BTree, bucket: &str, key: &[u8]) -> bool {
     match manifest.view(bucket, |txn| txn.get(key)) {
         Ok(_) => true,
-        Err(BTreeError::NotFound) => false,
+        Err(BTreeError::KeyNotFound | BTreeError::BucketNotFound) => false,
         Err(err) => panic!("manifest key lookup failed for {bucket}: {err:?}"),
     }
 }
@@ -190,7 +190,7 @@ fn wal_recycle_state_bytes(db_root: &Path, group_id: u8) -> Option<Vec<u8>> {
     let manifest = open_manifest(db_root);
     match manifest.view(BUCKET_MISC, |txn| txn.get(wal_recycle_key(group_id))) {
         Ok(val) => Some(val),
-        Err(BTreeError::NotFound) => None,
+        Err(BTreeError::KeyNotFound) => None,
         Err(err) => panic!("load wal recycle state failed: {err:?}"),
     }
 }

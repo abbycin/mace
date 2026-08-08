@@ -885,7 +885,8 @@ entries:
     confidence: high
     statement: >
       Bucket deletion must occur in two phases: logical delete removes the live meta entry and
-      inserts `pending_del`, then GC performs physical cleanup of page and interval tables.
+      inserts `pending_del`, then GC clears and destroys the corresponding page and interval
+      buckets in the metadata backend before removing the pending record.
       `nr_buckets` must include pending-delete buckets and may decrement only after physical cleanup completes.
     watch_points:
       - path: src/meta/manifest.rs
@@ -898,17 +899,22 @@ entries:
         note: pending-delete counter and GC cleanup behavior are tested here
       - path: tests/prod_bucket.rs
         note: production-style pending-delete counter checks live here
+      - path: tests/prod_recovery_failpoints.rs
+        note: crash windows bracket backend bucket destruction and pending-record removal
     witnesses:
       - path: src/store/gc.rs
-        note: GC clears page and interval tables before deleting buckets and decrementing nr_buckets
+        note: GC clears page and interval tables, deletes their backend buckets, then removes pending state and decrements nr_buckets
       - path: src/meta/manifest.rs
         note: bucket count is documented as including active and pending-delete buckets
       - path: tests/bucket.rs
         note: nr_buckets remains unchanged after logical delete and drops only after GC
+      - path: tests/prod_recovery_failpoints.rs
+        note: pending-bucket reap failpoints verify aux buckets exist before cleanup and stay absent after backend finalization
     failure_symptoms:
       - nr_buckets decreases before physical cleanup finishes
       - pending-delete buckets vanish from quota accounting too early
       - reopen or GC finds half-deleted bucket tables
+      - a pending record is cleared while one of its backend auxiliary buckets remains reachable
     verifiers:
       - type: regression-test
         path: tests/bucket.rs
@@ -916,6 +922,9 @@ entries:
       - type: regression-test
         path: tests/prod_bucket.rs
         note: fast_pending_delete_counter covers production-style behavior
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: pending-bucket reap failpoints cover crashes before and after backend bucket destruction
 
   - id: protocol.wal_recycle_safe_boundary
     title: WAL recycling must stay behind active txn, checkpoint, and pending abort-clean boundaries
