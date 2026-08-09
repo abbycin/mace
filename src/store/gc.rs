@@ -21,7 +21,7 @@ use crate::{
     OpCode, Options, Store,
     cc::{
         context::{AbortCleanState, AbortCleanTask, Context},
-        wal::{EntryType, WalBegin, WalCommit, WalUpdate, ptr_to, wal_record_sz},
+        wal::{EntryType, PayloadType, WalBegin, WalCommit, WalUpdate, ptr_to, wal_record_sz},
     },
     index::tree::Tree,
     io::{File, GatherIO},
@@ -320,6 +320,38 @@ struct AbortCleanProgress {
     stabilize_buckets: HashSet<u64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AbortCleanChainBounds {
+    lower: Position,
+    upper: Position,
+    step_budget: usize,
+}
+
+impl AbortCleanChainBounds {
+    fn contains(&self, pos: Position) -> bool {
+        self.lower <= pos && pos <= self.upper
+    }
+}
+
+fn validate_abort_clean_link(
+    bounds: AbortCleanChainBounds,
+    cursor: Position,
+    prev: Position,
+) -> Result<Position, OpCode> {
+    if !bounds.contains(cursor) || !bounds.contains(prev) || prev >= cursor {
+        return Err(OpCode::Corruption);
+    }
+    Ok(prev)
+}
+
+fn consume_abort_clean_step(remaining: &mut usize) -> Result<(), OpCode> {
+    if *remaining == 0 {
+        return Err(OpCode::Corruption);
+    }
+    *remaining -= 1;
+    Ok(())
+}
+
 impl GarbageCollector {
     const MAX_ELEMS: usize = 1024 * 100;
     const ABORT_CLEAN_TREE_CACHE_CAP: usize = 64;
@@ -513,6 +545,13 @@ impl GarbageCollector {
                         }
                         Err(OpCode::Again) => {}
                         Err(e) => {
+                            #[cfg(feature = "extra_check")]
+                            if e == OpCode::Corruption {
+                                crate::testing::fire_abort_clean_sync_point(
+                                    crate::testing::AbortCleanSyncPoint::AfterCorruption,
+                                    task.txid,
+                                );
+                            }
                             log::error!("abort clean failed, txid={} error={:?}", task.txid, e);
                         }
                     }
@@ -553,6 +592,11 @@ impl GarbageCollector {
                 let sink = sink.clone();
                 g.defer(move || {
                     sink.lock().push(txid);
+                    #[cfg(feature = "extra_check")]
+                    crate::testing::fire_abort_clean_sync_point(
+                        crate::testing::AbortCleanSyncPoint::AfterQuiesceCallback,
+                        txid,
+                    );
                 });
                 queued_quiesce = true;
             }
@@ -628,31 +672,19 @@ impl GarbageCollector {
         block: &mut Block,
         mode: AbortCleanLoadMode,
     ) -> Result<AbortCleanProgress, OpCode> {
-        let mut cursor = task.tail_lsn;
         let mut stabilize_buckets = HashSet::new();
         let wal_files = Lru::<u64, (File, u64)>::new();
+        let bounds = self.abort_clean_chain_bounds(&task, &wal_files)?;
+        let mut remaining_steps = bounds.step_budget;
+        let mut cursor = task.tail_lsn;
         let mut seen_keys = HashSet::<(u64, Vec<u8>)>::new();
 
         loop {
-            if wal_files.get(&cursor.file_id).is_none() {
-                let path = self.ctx.opt.wal_file(task.group_id, cursor.file_id);
-                if !self.ctx.opt.fs.try_exists(&path)? {
-                    return Err(OpCode::Corruption);
-                }
-                let file = File::options()
-                    .read(true)
-                    .open(self.ctx.opt.fs.as_ref(), &path)?;
-                let end = file.size()?;
-                wal_files.add(
-                    Self::ABORT_CLEAN_WAL_FILE_CACHE_CAP,
-                    cursor.file_id,
-                    (file, end),
-                );
-                self.ctx
-                    .opt
-                    .observer
-                    .counter(CounterMetric::GcAbortCleanWalFileOpen, 1);
+            consume_abort_clean_step(&mut remaining_steps)?;
+            if !bounds.contains(cursor) {
+                return Err(OpCode::Corruption);
             }
+            self.cache_abort_clean_wal_file(&task, cursor.file_id, &wal_files)?;
 
             let cache_guard = wal_files.get(&cursor.file_id).ok_or(OpCode::Corruption)?;
             let (file, end) = (&cache_guard.0, cache_guard.1);
@@ -664,7 +696,11 @@ impl GarbageCollector {
             file.read(header, cursor.offset)?;
             let et: EntryType = header[0].try_into()?;
             let sz = wal_record_sz(et)?;
-            if cursor.offset + sz as u64 > end {
+            let header_end = cursor
+                .offset
+                .checked_add(u64::try_from(sz).map_err(|_| OpCode::Corruption)?)
+                .ok_or(OpCode::Corruption)?;
+            if header_end > end {
                 return Err(OpCode::Corruption);
             }
             if block.len() < sz {
@@ -674,20 +710,27 @@ impl GarbageCollector {
 
             match et {
                 EntryType::Update => {
+                    PayloadType::try_from(block.slice::<u8>(1, 1)[0])?;
                     let u = ptr_to::<WalUpdate>(block.data());
-                    let payload_len = u.payload_len();
-                    let total = sz + payload_len;
-                    if cursor.offset + total as u64 > end {
+                    let payload_size = { u.size };
+                    let payload_len = WalUpdate::checked_payload_len(payload_size)?;
+                    let total = WalUpdate::checked_encoded_len(payload_len)?;
+                    let record_end = cursor
+                        .offset
+                        .checked_add(u64::try_from(total).map_err(|_| OpCode::Corruption)?)
+                        .ok_or(OpCode::Corruption)?;
+                    if record_end > end {
                         return Err(OpCode::Corruption);
                     }
                     if block.len() < total {
                         block.realloc(total);
                     }
-                    file.read(block.mut_slice(sz, payload_len), cursor.offset + sz as u64)?;
+                    file.read(block.mut_slice(sz, payload_len), header_end)?;
                     let u = ptr_to::<WalUpdate>(block.data());
                     if !u.is_intact() {
                         return Err(OpCode::Corruption);
                     }
+                    u.validate_record(block.slice(0, total))?;
 
                     let txid = { u.txid };
                     if txid != task.txid {
@@ -702,10 +745,14 @@ impl GarbageCollector {
                         stabilize_buckets.insert(bucket_id);
                         let raw = u.key();
                         if !seen_keys.insert((bucket_id, raw.to_vec())) {
-                            cursor = Position {
-                                file_id: { u.prev_id },
-                                offset: { u.prev_off },
-                            };
+                            cursor = validate_abort_clean_link(
+                                bounds,
+                                cursor,
+                                Position {
+                                    file_id: { u.prev_id },
+                                    offset: { u.prev_off },
+                                },
+                            )?;
                             continue;
                         }
                         loop {
@@ -717,10 +764,14 @@ impl GarbageCollector {
                         }
                     }
 
-                    cursor = Position {
-                        file_id: { u.prev_id },
-                        offset: { u.prev_off },
-                    };
+                    cursor = validate_abort_clean_link(
+                        bounds,
+                        cursor,
+                        Position {
+                            file_id: { u.prev_id },
+                            offset: { u.prev_off },
+                        },
+                    )?;
                 }
                 EntryType::Begin => {
                     let b = ptr_to::<WalBegin>(block.data());
@@ -739,6 +790,83 @@ impl GarbageCollector {
                 _ => return Err(OpCode::Corruption),
             }
         }
+    }
+
+    fn abort_clean_chain_bounds(
+        &self,
+        task: &AbortCleanTask,
+        wal_files: &Lru<u64, (File, u64)>,
+    ) -> Result<AbortCleanChainBounds, OpCode> {
+        if task.pin_file_id > task.tail_lsn.file_id {
+            return Err(OpCode::Corruption);
+        }
+
+        let min_record_len =
+            u64::try_from(wal_record_sz(EntryType::Begin)?).map_err(|_| OpCode::Corruption)?;
+        let mut retained_bytes = 0u64;
+        let mut file_id = task.pin_file_id;
+        loop {
+            self.cache_abort_clean_wal_file(task, file_id, wal_files)?;
+            let file_end = wal_files
+                .get(&file_id)
+                .map(|entry| entry.1)
+                .ok_or(OpCode::Corruption)?;
+            let retained_end = if file_id == task.tail_lsn.file_id {
+                let tail_record_end = task
+                    .tail_lsn
+                    .offset
+                    .checked_add(min_record_len)
+                    .ok_or(OpCode::Corruption)?;
+                file_end.min(tail_record_end)
+            } else {
+                file_end
+            };
+            retained_bytes = retained_bytes
+                .checked_add(retained_end)
+                .ok_or(OpCode::Corruption)?;
+            if file_id == task.tail_lsn.file_id {
+                break;
+            }
+            file_id = file_id.checked_add(1).ok_or(OpCode::Corruption)?;
+        }
+
+        let step_budget = retained_bytes
+            .checked_div(min_record_len)
+            .ok_or(OpCode::Corruption)?;
+        let step_budget = usize::try_from(step_budget).map_err(|_| OpCode::Corruption)?;
+        if step_budget == 0 {
+            return Err(OpCode::Corruption);
+        }
+        Ok(AbortCleanChainBounds {
+            lower: Position::new(task.pin_file_id, 0),
+            upper: task.tail_lsn,
+            step_budget,
+        })
+    }
+
+    fn cache_abort_clean_wal_file(
+        &self,
+        task: &AbortCleanTask,
+        file_id: u64,
+        wal_files: &Lru<u64, (File, u64)>,
+    ) -> Result<(), OpCode> {
+        if wal_files.get(&file_id).is_some() {
+            return Ok(());
+        }
+        let path = self.ctx.opt.wal_file(task.group_id, file_id);
+        if !self.ctx.opt.fs.try_exists(&path)? {
+            return Err(OpCode::Corruption);
+        }
+        let file = File::options()
+            .read(true)
+            .open(self.ctx.opt.fs.as_ref(), &path)?;
+        let end = file.size()?;
+        wal_files.add(Self::ABORT_CLEAN_WAL_FILE_CACHE_CAP, file_id, (file, end));
+        self.ctx
+            .opt
+            .observer
+            .counter(CounterMetric::GcAbortCleanWalFileOpen, 1);
+        Ok(())
     }
 
     fn process_pending_buckets(&mut self) {
@@ -794,9 +922,12 @@ impl GarbageCollector {
         }
 
         // table is now empty, destroy the btree bucket and remove pending record
-        let _ = self.store.manifest.btree.del_bucket(&bucket_table);
-        let _ = self.store.manifest.btree.del_bucket(&data_interval_table);
-        let _ = self.store.manifest.btree.del_bucket(&blob_interval_table);
+        for bucket in [&bucket_table, &data_interval_table, &blob_interval_table] {
+            match self.store.manifest.btree.del_bucket(bucket) {
+                Ok(()) | Err(btree_store::Error::BucketNotFound) => {}
+                Err(err) => panic!("can't delete btree-store bucket {bucket}: {err:?}"),
+            }
+        }
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(
             "mace_pending_bucket_reap_after_finalize_before_meta_commit",
@@ -1896,7 +2027,10 @@ fn rewrite_record<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, PendingReloc, RewriteBuilder, RewriteItem, build_sorted_relocs};
+    use super::{
+        AbortCleanChainBounds, Entry, PendingReloc, RewriteBuilder, RewriteItem,
+        build_sorted_relocs, consume_abort_clean_step, validate_abort_clean_link,
+    };
     use crate::{
         Options, RandomPath,
         map::data::{FileVersion, MetaReader},
@@ -1906,8 +2040,47 @@ mod tests {
             refbox::BoxRef,
             traits::IHeader,
         },
-        utils::{INIT_ID, compress::CompressorPool},
+        utils::{INIT_ID, compress::CompressorPool, data::Position},
     };
+
+    #[test]
+    fn abort_clean_chain_rejects_invalid_links_and_budget_exhaustion() {
+        let bounds = AbortCleanChainBounds {
+            lower: Position::new(3, 0),
+            upper: Position::new(4, 100),
+            step_budget: 2,
+        };
+        let cursor = Position::new(4, 80);
+
+        assert_eq!(
+            validate_abort_clean_link(bounds, cursor, cursor),
+            Err(crate::OpCode::Corruption)
+        );
+        assert_eq!(
+            validate_abort_clean_link(bounds, cursor, Position::new(4, 81)),
+            Err(crate::OpCode::Corruption)
+        );
+        assert_eq!(
+            validate_abort_clean_link(bounds, cursor, Position::new(2, 99)),
+            Err(crate::OpCode::Corruption)
+        );
+        assert_eq!(
+            validate_abort_clean_link(bounds, Position::new(5, 0), Position::new(4, 79)),
+            Err(crate::OpCode::Corruption)
+        );
+        assert_eq!(
+            validate_abort_clean_link(bounds, cursor, Position::new(4, 79)),
+            Ok(Position::new(4, 79))
+        );
+
+        let mut remaining = bounds.step_budget;
+        assert_eq!(consume_abort_clean_step(&mut remaining), Ok(()));
+        assert_eq!(consume_abort_clean_step(&mut remaining), Ok(()));
+        assert_eq!(
+            consume_abort_clean_step(&mut remaining),
+            Err(crate::OpCode::Corruption)
+        );
+    }
 
     fn sample_pages() -> [BoxRef; 2] {
         let (pid, addr) = (114514, 1919810);

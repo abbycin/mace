@@ -116,12 +116,10 @@ impl PageMap {
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 while iter.next_ref(&mut k, &mut v) {
-                    let pid_bytes: [u8; 8] = k[..8]
-                        .try_into()
-                        .map_err(|_| btree_store::Error::Corruption)?;
-                    let addr_bytes: [u8; 8] = v[..8]
-                        .try_into()
-                        .map_err(|_| btree_store::Error::Corruption)?;
+                    let pid_bytes: [u8; 8] =
+                        k[..8].try_into().expect("page table key must be a u64");
+                    let addr_bytes: [u8; 8] =
+                        v[..8].try_into().expect("page table value must be a u64");
                     let pid = <u64>::from_le_bytes(pid_bytes);
                     let addr = <u64>::from_le_bytes(addr_bytes);
                     let swip = if addr == NULL_ADDR {

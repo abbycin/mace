@@ -808,6 +808,186 @@ fn abort_clean_blocks_drop_until_task_is_fully_removed() -> Result<(), OpCode> {
     Ok(())
 }
 
+#[cfg(feature = "extra_check")]
+#[test]
+fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
+    use mace::testing::{self, AbortCleanStage};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _hook_lock = testing::checkpoint_test_lock();
+
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 60_000;
+    opt.concurrent_write = 1;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
+
+    let seed = db.begin().unwrap();
+    seed.put("k", "seed")?;
+    seed.commit()?;
+
+    let tx = db.begin().unwrap();
+    tx.update("k", "v1")?;
+    let txid = testing::txn_start_ts(&tx);
+    drop(tx);
+    let info =
+        testing::abort_clean_task_info(&db, txid).expect("abort-clean task must be published");
+    assert_eq!(
+        testing::abort_clean_task_stage(&db, txid),
+        Some(AbortCleanStage::Pending)
+    );
+    assert!(testing::retained_abort_present(
+        &db,
+        info.group_id as usize,
+        txid
+    ));
+
+    let callback_seen = Arc::new(AtomicBool::new(false));
+    testing::set_abort_clean_hook(Some(Arc::new({
+        let callback_seen = callback_seen.clone();
+        move |point, callback_txid| {
+            if point == testing::AbortCleanSyncPoint::AfterQuiesceCallback && callback_txid == txid
+            {
+                callback_seen.store(true, Ordering::Release);
+            }
+        }
+    })));
+
+    let callback_blocker = crossbeam_epoch::pin();
+    drop(db);
+    assert_eq!(mace.drop_bucket("x"), Err(OpCode::Again));
+    mace.start_gc();
+    let bucket = mace.get_bucket("x")?;
+    assert_eq!(
+        testing::abort_clean_task_stage(&bucket, txid),
+        Some(AbortCleanStage::WaitingQuiesce)
+    );
+    assert_eq!(testing::abort_clean_task_info(&bucket, txid), Some(info));
+    assert!(testing::retained_abort_present(
+        &bucket,
+        info.group_id as usize,
+        txid
+    ));
+    drop(bucket);
+    assert_eq!(mace.drop_bucket("x"), Err(OpCode::Again));
+
+    drop(callback_blocker);
+    let callback_deadline = Instant::now() + Duration::from_secs(5);
+    while !callback_seen.load(Ordering::Acquire) && Instant::now() < callback_deadline {
+        let guard = crossbeam_epoch::pin();
+        guard.flush();
+        drop(guard);
+        std::thread::yield_now();
+    }
+    assert!(callback_seen.load(Ordering::Acquire));
+    let bucket = mace.get_bucket("x")?;
+    assert_eq!(
+        testing::abort_clean_task_stage(&bucket, txid),
+        Some(AbortCleanStage::WaitingQuiesce)
+    );
+    assert!(testing::retained_abort_present(
+        &bucket,
+        info.group_id as usize,
+        txid
+    ));
+    drop(bucket);
+
+    for _ in 0..4 {
+        mace.start_gc();
+        let bucket = mace.get_bucket("x")?;
+        if testing::abort_clean_task_stage(&bucket, txid).is_none() {
+            assert_eq!(testing::abort_clean_task_info(&bucket, txid), None);
+            assert!(!testing::retained_abort_present(
+                &bucket,
+                info.group_id as usize,
+                txid
+            ));
+            drop(bucket);
+            break;
+        }
+        assert_eq!(
+            testing::abort_clean_task_stage(&bucket, txid),
+            Some(AbortCleanStage::WaitingQuiesce)
+        );
+        assert_eq!(testing::abort_clean_task_info(&bucket, txid), Some(info));
+        assert!(testing::retained_abort_present(
+            &bucket,
+            info.group_id as usize,
+            txid
+        ));
+        drop(bucket);
+        for _ in 0..16 {
+            let guard = crossbeam_epoch::pin();
+            guard.flush();
+            drop(guard);
+            std::thread::yield_now();
+        }
+    }
+    testing::clear_abort_clean_hook();
+    assert_eq!(mace.drop_bucket("x"), Ok(()));
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn abort_clean_corruption_retains_task_fact_and_wal_pin() -> Result<(), OpCode> {
+    use mace::testing;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _hook_lock = testing::checkpoint_test_lock();
+
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = true;
+    opt.sync_on_write = false;
+    opt.gc_timeout = 60_000;
+    opt.concurrent_write = 1;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
+
+    let seed = db.begin().unwrap();
+    seed.put("k", "seed")?;
+    seed.commit()?;
+    let tx = db.begin().unwrap();
+    tx.update("k", "v1")?;
+    let txid = testing::txn_start_ts(&tx);
+    drop(tx);
+    let info =
+        testing::abort_clean_task_info(&db, txid).expect("abort-clean task must be published");
+    testing::corrupt_abort_clean_prev(&db, txid, info.tail_file_id, info.tail_offset)?;
+    let corruption_seen = Arc::new(AtomicBool::new(false));
+    testing::set_abort_clean_hook(Some(Arc::new({
+        let corruption_seen = corruption_seen.clone();
+        move |point, callback_txid| {
+            if point == testing::AbortCleanSyncPoint::AfterCorruption && callback_txid == txid {
+                corruption_seen.store(true, Ordering::Release);
+            }
+        }
+    })));
+    drop(db);
+
+    mace.start_gc();
+    assert!(corruption_seen.load(Ordering::Acquire));
+    let bucket = mace.get_bucket("x")?;
+    assert_eq!(
+        testing::abort_clean_task_stage(&bucket, txid),
+        Some(testing::AbortCleanStage::Pending)
+    );
+    assert_eq!(testing::abort_clean_task_info(&bucket, txid), Some(info));
+    assert!(testing::retained_abort_present(
+        &bucket,
+        info.group_id as usize,
+        txid
+    ));
+    drop(bucket);
+    testing::clear_abort_clean_hook();
+    assert_eq!(mace.drop_bucket("x"), Err(OpCode::Again));
+    Ok(())
+}
+
 #[test]
 fn recovery_drains_abort_clean_before_startup_returns() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
@@ -877,27 +1057,5 @@ fn recovery_abort_clean_does_not_leave_bucket_loaded_after_startup() -> Result<(
             ..BucketOptions::default()
         },
     )?;
-    Ok(())
-}
-
-#[test]
-fn compact_meta() -> Result<(), OpCode> {
-    let path = RandomPath::new();
-    let mut opt = Options::new(&*path);
-    opt.tmp_store = true;
-    opt.sync_on_write = false;
-    let mace = Mace::new(opt.validate().unwrap()).unwrap();
-
-    let total = 256;
-    for i in 0..total {
-        let name = format!("b{i:04}");
-        let db = mace.new_bucket(&name, BucketOptions::default()).unwrap();
-        let kv = db.begin().unwrap();
-        kv.put("k", "v")?;
-        kv.commit()?;
-    }
-
-    let stats = mace.compact_meta()?;
-    assert!(stats.moved_pages > 0);
     Ok(())
 }

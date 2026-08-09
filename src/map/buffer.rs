@@ -523,11 +523,25 @@ impl Pool {
             return;
         }
         let retired_pages = self.retired_pages.clone();
+        #[cfg(feature = "extra_check")]
+        let deferred_addrs = retired_addrs.clone();
         g.defer(move || {
             for addr in retired_addrs {
                 let _ = retired_pages.remove(&addr);
             }
         });
+        #[cfg(feature = "extra_check")]
+        for addr in deferred_addrs {
+            crate::testing::fire_checkpoint_sync_point(
+                crate::testing::CheckpointSyncPoint::AfterRetiredPageDeferred(addr),
+                self.bucket_id,
+            );
+        }
+    }
+
+    #[cfg(feature = "extra_check")]
+    pub(crate) fn test_retire_page(&self, epoch: &WriteEpoch, g: &Guard, addr: u64) {
+        self.retire_junks(&epoch.pages, &epoch.bytes, g, &[addr]);
     }
 
     pub(crate) fn get_dirty_page(&self, addr: u64) -> Option<BoxRef> {

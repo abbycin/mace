@@ -295,7 +295,7 @@ entries:
       - path: src/map/buffer.rs
         note: only earlier-generation structural junk retires at publish time while same-generation structural junk and compaction junk stay visible until checkpoint
       - path: src/map/data.rs
-        note: new_junks filtering plus retired-page fallback reject live-junk contradictions and disappearing addrs above snap_addr
+        note: snapshot pins EBR before wait_zero through retired-page fallback traversal and Snapshot construction; new_junks filtering rejects live-junk contradictions and disappearing addrs above snap_addr
       - path: tests/junk_reachability.rs
         note: lagging-view regression guard exercises split, consolidate, and checkpoint churn
       - path: src/store/gc.rs
@@ -312,10 +312,10 @@ entries:
     verifiers:
       - type: regression-test
         path: tests/junk_reachability.rs
-        note: reachable_junk_regression_guard keeps a lagging view alive across churn
+        note: reachable_junk_regression_guard covers normal split/consolidate churn; checkpoint_snapshot_holds_ebr_guard_before_wait_zero releases the writer guard, repeatedly advances EBR, compares the deferred and fallback addresses, and verifies reopen preservation
       - type: runtime-assert
         path: src/map/data.rs
-        note: extra_check asserts on live-junk contradictions and disappearing addrs
+        note: extra_check asserts on live-junk contradictions and disappearing addrs; the snapshot EBR pin covers the fallback lookup through Snapshot construction
       - type: regression-test
         path: tests/gc.rs
         note: gc_blob_delete_checkpoint_stays_deleted_without_gc and gc_blob_single_gc_run_stays_deleted_after_reopen verify deleted blob values do not resurrect without scavenge
@@ -515,6 +515,52 @@ entries:
         path: src/store/recovery.rs
         note: analyze gate uses durable frontier before dirty-table enrollment
 
+  - id: protocol.wal_update_validation_precedes_consumption
+    title: WAL Update bounds, checksum, and layout must validate before consumption
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Every WAL Update reader must validate the payload size and total record length before reading
+      the payload, then validate entry type, checksum, and payload layout before using key, value,
+      transaction, or `prev` fields. Malformed input must stop the optional checkpoint scan and
+      terminate recovery's current file scan at the record start, so `truncate_corrupted_wal`
+      consistently selects truncation or `OpCode::Corruption`; abort-clean returns
+      `OpCode::Corruption`. It must not drive unbounded allocation, replay, or chain traversal.
+    watch_points:
+      - path: src/cc/wal.rs
+        note: shared Update length, checksum, and payload-layout codecs live here
+      - path: src/store/recovery.rs
+        note: analyze, redo, and checkpoint discovery consume persisted Update records here
+      - path: src/store/gc.rs
+        note: abort-clean follows Update prev links here
+      - path: docs/design.md
+        note: Recovery describes the required validation order here
+      - path: tests/gc.rs
+        note: abort-clean corruption retention coverage lives here
+    witnesses:
+      - path: src/cc/wal.rs
+        note: checked_payload_len, checked_encoded_len, and validate_record establish bounded Update consumption
+      - path: src/store/recovery.rs
+        note: analyze returns the bad record start to the common truncate-or-corruption path; checkpoint discovery stops its file scan; redo validates again before replay
+      - path: src/store/gc.rs
+        note: abort-clean validates Update bounds, checksum, and layout before reading prev or key
+    failure_symptoms:
+      - a corrupted size triggers allocation or I/O before bounds validation
+      - recovery replays an Update with a bad checksum or incompatible payload layout
+      - checkpoint discovery skips an invalid Update and accepts a later checkpoint
+      - abort-clean follows a malformed key or prev link
+    verifiers:
+      - type: unit-test
+        path: src/cc/wal.rs
+        note: update_record_validation_rejects_inconsistent_layout and checked_payload_len_rejects_oversized_payload_before_allocation cover payload layout and direct size-limit rejection
+      - type: unit-test
+        path: src/store/recovery.rs
+        note: checkpoint_scan_stops_at_invalid_update_checksum, invalid_update_subtype_is_truncated_when_enabled, and oversized_update_header_is_truncated_when_enabled cover checkpoint-scan stop and recovery truncation behavior
+      - type: regression-test
+        path: tests/gc.rs
+        note: abort_clean_corruption_retains_task_fact_and_wal_pin verifies malformed abort-clean WAL retains recovery obligations
+
   - id: protocol.abort_clean_visibility_and_retirement
     title: aborted versions may persist physically but must remain invisible until durability-closed abort-clean retirement
     kind: protocol
@@ -528,32 +574,34 @@ entries:
       only buckets that are already loaded. Recovery may temporarily load bucket contexts to drain
       reconstructed abort-clean tasks or inspect WAL state, but startup must unload every such context
       before returning success or surfacing a recovery error.
-      Unload or drop must remain blocked and return `OpCode::Again` while bucket-local abort-clean is
-      still `Pending`.
+      Unload or drop must remain blocked and return `OpCode::Again` while a bucket-local abort-clean
+      task exists, including the `WaitingQuiesce` state before its EBR callback removes the task.
     watch_points:
       - path: src/index/tree.rs
         note: page-wide compaction and aborted-head handling live here
       - path: src/cc/context.rs
         note: visibility and active-view state interact with abort outcomes here
       - path: src/meta/manifest.rs
-        note: unload path rejects buckets that still have pending abort-clean tasks
+        note: unload path rejects buckets while a bucket-local abort-clean task exists, including WaitingQuiesce
       - path: src/store/gc.rs
         note: abort-clean load mode, retirement, and steady-state no-reload semantics live here
+      - path: docs/design.md
+        note: Abort-Clean state order, visibility, and quiescence semantics are specified here
       - path: src/store/recovery.rs
         note: recovery reconstructs and drains abort-clean, then unloads any buckets it loaded before startup returns
       - path: src/store/store.rs
         note: phase2 failure must unload recovery-loaded buckets before store abort tears down checkpoint/context
     witnesses:
       - path: src/meta/manifest.rs
-        note: unload_bucket returns Again when the bucket still has a pending abort-clean task
+        note: unload_bucket returns Again while a bucket-local abort-clean task exists, including WaitingQuiesce
       - path: src/store/gc.rs
-        note: AbortCleanLoadMode::SteadyState refuses to load unloaded buckets, while recovery mode may load them and still requires checkpoint closure before retirement
+        note: AbortCleanLoadMode::SteadyState refuses to load unloaded buckets; Pending performs COW rewrite, fresh checkpoint closure moves the task to WaitingQuiesce, and the EBR callback closes runtime retirement
       - path: src/store/recovery.rs
         note: recovery drains reconstructed abort-clean tasks and evicts all loaded buckets before open returns or before aborting startup
       - path: src/store/store.rs
         note: Mace::new calls Recovery::abort before Store::abort when phase2 fails
       - path: tests/gc.rs
-        note: drop_bucket remains blocked during pending abort-clean, recovery drain finishes before open returns, and recovery does not leave the bucket loaded
+        note: lifecycle test covers Pending through WaitingQuiesce and callback removal; corruption test keeps drop blocked while task/fact/pin remain; recovery drain finishes after checkpoint closure
     failure_symptoms:
       - another snapshot sees an aborted value after reopen or churn
       - abort-clean drops outcome state before rewritten pages are durable
@@ -571,6 +619,51 @@ entries:
       - type: unit-test
         path: src/store/recovery.rs
         note: abort_unloads_recovery_loaded_buckets_before_store_abort proves failure teardown drops recovery-loaded buckets before store abort
+
+  - id: protocol.abort_clean_wal_chain_bounded
+    title: abort-clean WAL traversal must stay in the retained range and terminate on corruption
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Abort-clean must validate the initial tail and every WAL `prev` position against the task's
+      retained `[pin_file_id, tail_lsn]` range, require each link to move strictly backward, and
+      consume a checked step budget derived from the actual retained WAL bytes and minimum record
+      length. Missing files, invalid record bounds, self-loops, forward links, range escapes, or an
+      exhausted budget must return `OpCode::Corruption` while retaining the task, abort fact, and
+      WAL pin.
+    watch_points:
+      - path: src/store/gc.rs
+        note: abort-clean range scan, checked budget, link validation, and corruption retention live here
+      - path: docs/design.md
+        note: retained-range and finite-chain requirements are specified in the Abort-Clean design rules
+      - path: src/cc/context.rs
+        note: task pin and abort-fact ownership remain published until explicit removal here
+      - path: src/cc/wal.rs
+        note: WAL record minimum sizes and Update payload bounds used by chain scanning live here
+      - path: tests/gc.rs
+        note: deterministic chain-link and lifecycle witnesses live here
+    witnesses:
+      - path: src/store/gc.rs
+        note: abort_clean_chain_bounds sums bytes through the tail record within the retained range, consume_abort_clean_step enforces the checked budget, and validate_abort_clean_link rejects non-decreasing or out-of-range links
+      - path: src/store/gc.rs
+        note: clean_one_abort_task validates Update length/checksum/layout before reading prev or key and returns Corruption without removing the task
+      - path: src/cc/context.rs
+        note: remove_abort_clean is the only path that retires the abort fact and releases task accounting
+      - path: src/store/gc.rs
+        note: abort_clean_chain_rejects_invalid_links_and_budget_exhaustion covers helper boundaries; tests/gc.rs corrupts a real checksum-valid self-loop and verifies task/fact/pin retention
+    failure_symptoms:
+      - GC hangs or spins on a self-looping or cyclic abort chain
+      - corrupted prev links cause reads outside retained WAL files
+      - abort-clean allocates or reads beyond a malformed Update record
+      - corruption is silently treated as a completed task and releases the WAL pin or abort fact
+    verifiers:
+      - type: unit-test
+        path: src/store/gc.rs
+        note: abort_clean_chain_rejects_invalid_links_and_budget_exhaustion checks all link and budget boundaries
+      - type: regression-test
+        path: tests/gc.rs
+        note: abort_clean_lifecycle_closes_state_and_protections covers Pending -> WaitingQuiesce -> EBR callback -> removal; abort_clean_corruption_retains_task_fact_and_wal_pin covers a real malformed chain; recovery drain covers startup closure
 
   - id: protocol.runtime_checkpoint_enable_waits_for_recovery_abort_clean
     title: runtime checkpoint enable and WAL recycle must stay gated behind recovery abort-clean drain
@@ -885,7 +978,8 @@ entries:
     confidence: high
     statement: >
       Bucket deletion must occur in two phases: logical delete removes the live meta entry and
-      inserts `pending_del`, then GC performs physical cleanup of page and interval tables.
+      inserts `pending_del`, then GC clears and destroys the corresponding page and interval
+      buckets in the metadata backend before removing the pending record.
       `nr_buckets` must include pending-delete buckets and may decrement only after physical cleanup completes.
     watch_points:
       - path: src/meta/manifest.rs
@@ -898,17 +992,22 @@ entries:
         note: pending-delete counter and GC cleanup behavior are tested here
       - path: tests/prod_bucket.rs
         note: production-style pending-delete counter checks live here
+      - path: tests/prod_recovery_failpoints.rs
+        note: crash windows bracket backend bucket destruction and pending-record removal
     witnesses:
       - path: src/store/gc.rs
-        note: GC clears page and interval tables before deleting buckets and decrementing nr_buckets
+        note: GC clears page and interval tables, deletes their backend buckets, then removes pending state and decrements nr_buckets
       - path: src/meta/manifest.rs
         note: bucket count is documented as including active and pending-delete buckets
       - path: tests/bucket.rs
         note: nr_buckets remains unchanged after logical delete and drops only after GC
+      - path: tests/prod_recovery_failpoints.rs
+        note: pending-bucket reap failpoints verify aux buckets exist before cleanup and stay absent after backend finalization
     failure_symptoms:
       - nr_buckets decreases before physical cleanup finishes
       - pending-delete buckets vanish from quota accounting too early
       - reopen or GC finds half-deleted bucket tables
+      - a pending record is cleared while one of its backend auxiliary buckets remains reachable
     verifiers:
       - type: regression-test
         path: tests/bucket.rs
@@ -916,6 +1015,9 @@ entries:
       - type: regression-test
         path: tests/prod_bucket.rs
         note: fast_pending_delete_counter covers production-style behavior
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: pending-bucket reap failpoints cover crashes before and after backend bucket destruction
 
   - id: protocol.wal_recycle_safe_boundary
     title: WAL recycling must stay behind active txn, checkpoint, and pending abort-clean boundaries

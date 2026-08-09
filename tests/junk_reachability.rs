@@ -1,6 +1,14 @@
 use mace::observe::{CounterMetric, InMemoryObserver, ObserveSnapshot};
+#[cfg(feature = "extra_check")]
+use mace::testing::{self, CheckpointRootRestore, CheckpointSyncPoint};
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
+#[cfg(feature = "extra_check")]
+use std::sync::Barrier;
+#[cfg(feature = "extra_check")]
+use std::sync::mpsc::channel;
+#[cfg(feature = "extra_check")]
+use std::time::Duration;
 
 // Regression guard for the reachable-junk lifecycle changes bug class:
 // reachable junk pages (via sibling/remote edges) were retired too early, so read path
@@ -68,6 +76,8 @@ fn upsert_parity_retry(
 
 #[test]
 fn reachable_junk_regression_guard() -> Result<(), OpCode> {
+    #[cfg(feature = "extra_check")]
+    let _checkpoint_test_lock = testing::checkpoint_test_lock();
     // Purpose:
     // 1) force sibling/remote-producing churn (split + consolidate),
     // 2) keep lagging readers alive across rounds and checkpoints,
@@ -160,5 +170,133 @@ fn reachable_junk_regression_guard() -> Result<(), OpCode> {
     // If these stay zero, this test is no longer covering the intended risky path.
     assert!(split_count > 0, "split was not exercised");
     assert!(consolidate_count > 0, "compaction path was not exercised");
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+struct CheckpointHookReset;
+
+#[cfg(feature = "extra_check")]
+impl Drop for CheckpointHookReset {
+    fn drop(&mut self) {
+        testing::clear_checkpoint_hook();
+    }
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn checkpoint_snapshot_holds_ebr_guard_before_wait_zero() -> Result<(), OpCode> {
+    let _checkpoint_test_lock = testing::checkpoint_test_lock();
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = false;
+    opt.sync_on_write = false;
+    opt.concurrent_write = 1;
+    let reopen_opt = opt.clone();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let bucket = mace.new_bucket(
+        "x",
+        BucketOptions {
+            checkpoint_size: 256 << 10,
+            ..BucketOptions::default()
+        },
+    )?;
+
+    for i in 0..32 {
+        let tx = bucket.begin()?;
+        tx.put(format!("k_{i:04}"), vec![b'x'; 1024])?;
+        tx.commit()?;
+    }
+    testing::checkpoint_and_wait(&bucket);
+
+    let (deferred_tx, deferred_rx) = channel();
+    let (snapshot_tx, snapshot_rx) = channel();
+    let (fallback_tx, fallback_rx) = channel();
+    let (guard_dropped_tx, guard_dropped_rx) = channel();
+    let (built_tx, built_rx) = channel();
+    let writer_ready = Arc::new(Barrier::new(2));
+    let start_writer = Arc::new(Barrier::new(2));
+    let release_writer = Arc::new(Barrier::new(2));
+    let restore = Arc::new(CheckpointRootRestore::new());
+    let target_bucket = bucket.id();
+    let _reset = CheckpointHookReset;
+    testing::set_checkpoint_hook(Some(Arc::new({
+        let deferred_tx = deferred_tx.clone();
+        let snapshot_tx = snapshot_tx.clone();
+        let fallback_tx = fallback_tx.clone();
+        let guard_dropped_tx = guard_dropped_tx.clone();
+        let built_tx = built_tx.clone();
+        let release_writer = release_writer.clone();
+        let restore = restore.clone();
+        move |point, _bucket_id| {
+            if _bucket_id != target_bucket {
+                return;
+            }
+            match point {
+                CheckpointSyncPoint::AfterRetiredPageDeferred(addr) => {
+                    let _ = deferred_tx.send(addr);
+                    release_writer.wait();
+                }
+                CheckpointSyncPoint::BeforeSnapshotWaitZero => {
+                    let _ = snapshot_tx.send(());
+                }
+                CheckpointSyncPoint::AfterRetiredPageFallbackRead(addr) => {
+                    restore.restore();
+                    let _ = fallback_tx.send(addr);
+                }
+                CheckpointSyncPoint::AfterRetiredPageGuardDropped => {
+                    let _ = guard_dropped_tx.send(());
+                }
+                CheckpointSyncPoint::AfterSnapshotBuilt => {
+                    let _ = built_tx.send(());
+                }
+            }
+        }
+    })));
+
+    let writer = testing::spawn_checkpoint_retired_page_writer(
+        &bucket,
+        writer_ready.clone(),
+        start_writer.clone(),
+        restore,
+    );
+    writer_ready.wait();
+
+    let checkpoint_bucket = bucket.clone();
+    let checkpoint = std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
+    snapshot_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("snapshot must reach wait_zero while writer is blocked");
+    start_writer.wait();
+    let deferred_addr = deferred_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("writer must defer a real retired page");
+    release_writer.wait();
+    guard_dropped_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("writer must release its guard and advance the epoch");
+    let fallback_addr = fallback_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("snapshot must read a real retired_pages fallback");
+    assert_eq!(fallback_addr, deferred_addr);
+    built_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("snapshot must finish after fallback read");
+    checkpoint.join().expect("checkpoint thread must not panic");
+    writer.join().expect("writer thread must not panic");
+
+    drop(_reset);
+    drop(bucket);
+    drop(mace);
+    let reopened = Mace::new(reopen_opt.validate().unwrap())?;
+    let reopened_bucket = reopened.get_bucket("x")?;
+    assert_eq!(
+        reopened_bucket.view()?.get("k_0000")?.slice(),
+        b"x".repeat(1024)
+    );
+    assert_eq!(
+        reopened_bucket.view()?.get("k_0031")?.slice(),
+        b"x".repeat(1024)
+    );
     Ok(())
 }

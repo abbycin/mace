@@ -29,51 +29,43 @@ impl<'a> Txn<'a> {
         if self.ops.is_empty() {
             return;
         }
-        loop {
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_manifest_before_multi_commit");
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_manifest_before_multi_commit");
 
-            let mut missed_updates = Vec::new();
-            // perform an atomic multi-bucket commit
-            // all updates across different buckets are applied and flushed to disk
-            // in a single SuperBlock write, significantly reducing I/O overhead
-            let res = self.manifest.btree.exec_multi(|multi_txn| {
-                for (bucket, bucket_ops) in &self.ops {
-                    multi_txn.exec(bucket, |tree_txn| {
-                        for op in bucket_ops {
-                            match op {
-                                MetaOp::Put(k, v) => tree_txn.put(k, v)?,
-                                MetaOp::Update(k, v, miss_metric) => {
-                                    if !tree_txn.update(k, v)? {
-                                        missed_updates.push(*miss_metric);
-                                    }
+        let mut missed_updates = Vec::new();
+        // perform an atomic multi-bucket commit
+        // all updates across different buckets are applied and flushed to disk
+        // in a single SuperBlock write, significantly reducing I/O overhead
+        let res = self.manifest.btree.exec_multi(|multi_txn| {
+            for (bucket, bucket_ops) in &self.ops {
+                multi_txn.exec(bucket, |tree_txn| {
+                    for op in bucket_ops {
+                        match op {
+                            MetaOp::Put(k, v) => tree_txn.put(k, v)?,
+                            MetaOp::Update(k, v, miss_metric) => {
+                                if !tree_txn.update(k, v)? {
+                                    missed_updates.push(*miss_metric);
                                 }
-                                MetaOp::Del(k) => tree_txn.del(k)?,
                             }
+                            MetaOp::Del(k) => tree_txn.del(k)?,
                         }
-                        Ok(())
-                    })?;
-                }
-                Ok(())
-            });
-
-            match res {
-                Ok(_) => {
-                    for metric in missed_updates {
-                        self.manifest.opt.observer.counter(metric, 1);
                     }
-                    self.ops.clear();
-                    break;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        });
+
+        match res {
+            Ok(_) => {
+                for metric in missed_updates {
+                    self.manifest.opt.observer.counter(metric, 1);
                 }
-                Err(btree_store::Error::Conflict) => {
-                    // retry with a refreshed session handle
-                    std::thread::yield_now();
-                    continue;
-                }
-                Err(e) => {
-                    log::error!("Metadata multi-bucket commit fail: {:?}", e);
-                    panic!("Metadata multi-bucket commit fail: {:?}", e)
-                }
+                self.ops.clear();
+            }
+            Err(e) => {
+                log::error!("Metadata multi-bucket commit fail: {:?}", e);
+                panic!("Metadata multi-bucket commit fail: {:?}", e)
             }
         }
     }

@@ -586,6 +586,11 @@ The startup flow is:
 6. redo committed records that are not yet durable under the bucket frontier
 7. finish reconstructed abort-clean work before open returns
 
+Every WAL Update reader must first derive checked record bounds, then read the complete record and
+validate its checksum and payload layout before using its key, value, transaction, or chain-link
+fields. A malformed Update terminates the affected scan or returns corruption; it must not drive an
+allocation or read outside the engine's checked record maximum, replay, or abort-clean traversal.
+
 Startup namespace repair, orphan cleanup, WAL recycle, and other path-level recovery steps are part
 of the same filesystem boundary described above.
 Recovery must distinguish "not found" from other IO failures instead of treating every failed
@@ -610,25 +615,29 @@ compaction, not by inverse-value undo.
 Design rules:
 
 - abort-clean follows the transactional WAL chain backward
+- abort-clean validates every chain position against the retained WAL range and a checked finite
+  step budget; malformed links surface as corruption and retain the task
 - page-touching cleanup is not considered retired until its durability barrier is crossed
 - recovery must drain reconstructed abort-clean before normal runtime GC begins
 - recovery must finish reconstructed abort-clean before post-start checkpoint recording and WAL
   recycle are trusted again
 - GC must not reload a bucket that the user explicitly unloaded
-- if a bucket still has page-touching abort-clean work pending, unload is blocked instead
+- if a bucket has an abort-clean task that has not been removed, including `WaitingQuiesce`,
+  unload is blocked instead
 
-An abort-clean task moves through two states before it may begin page rewriting:
+An abort-clean task uses two states around a copy-on-write rewrite:
 
-- Pending — the task has been recorded in the WAL but the checkpoint covering that WAL record
-  has not yet completed; the task waits here so that a crash before the checkpoint would simply
-  re-derive it from the WAL rather than leave a half-applied rewrite behind
-- WaitingQuiesce — the covering checkpoint has completed; the task now waits for all readers
-  whose snapshots predate the abort to drain, ensuring no live reader can observe an aborted
-  version during or after the rewrite
+- Pending — the abort fact and WAL pin remain retained while cleanup is incomplete. Runtime GC may
+  rewrite the affected pages in this state, then must complete a fresh checkpoint for every touched
+  bucket. If the rewrite or checkpoint fails, the task remains Pending and retains both protections.
+- WaitingQuiesce — every touched bucket's fresh checkpoint has completed, so the rewrite is durable.
+  The task now waits for the EBR readers that existed before the rewrite to drain. Once the EBR
+  callback marks it quiesced, the task is removed and the retained abort fact is retired. Recovery
+  has no runtime readers, so it may remove a successfully checkpointed task during its closed
+  startup drain.
 
-Only after leaving WaitingQuiesce does the task acquire write access and begin the rewrite.
-This ordering guarantees that the page rewrite never races with a concurrent reader that
-legitimately needs the aborted version for snapshot isolation.
+Aborted versions are never visible to snapshots; quiescence protects page replacement and
+retirement, not visibility of an aborted value.
 
 Abort-clean therefore interacts with bucket lifecycle, recovery, and GC as one shared correctness
 surface.
@@ -846,4 +855,3 @@ Low-frequency maintenance and recovery events are expected to be reported direct
 - Larger-Than-Memory Range Index
 - Optimistic Lock Coupling: A Scalable and Efficient General-Purpose Synchronization Method
 ...
-

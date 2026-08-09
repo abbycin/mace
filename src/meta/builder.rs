@@ -115,7 +115,7 @@ impl ManifestBuilder {
                 while iter.next_ref(&mut k, &mut v) {
                     let meta = BucketMeta::decode(&v);
                     let name =
-                        std::str::from_utf8(&k).map_err(|_| btree_store::Error::Corruption)?;
+                        std::str::from_utf8(&k).expect("bucket metadata key must be valid utf-8");
                     let meta = Arc::new(meta);
                     let bucket_id = meta.id;
                     self.inner
@@ -199,9 +199,8 @@ impl ManifestBuilder {
                         let mut v = Vec::new();
                         let mut obs = self.inner.file_state(kind).obsolete.lock();
                         while iter.next_ref(&mut k, &mut v) {
-                            let id_bytes: [u8; 8] = k[..8]
-                                .try_into()
-                                .map_err(|_| btree_store::Error::Corruption)?;
+                            let id_bytes: [u8; 8] =
+                                k[..8].try_into().expect("obsolete file key must be a u64");
                             let id = u64::from_le_bytes(id_bytes);
                             obs.push(id);
                         }

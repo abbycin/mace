@@ -270,9 +270,12 @@ impl Recovery {
         );
         f.read(block.mut_slice(0, loc.len as usize), loc.pos.offset)?;
 
+        if PayloadType::try_from(block.slice::<u8>(1, 1)[0]).is_err() {
+            return Ok(false);
+        }
         let u = ptr_to::<WalUpdate>(block.data());
 
-        if !u.is_intact() {
+        if !u.is_intact() || u.validate_record(block.slice(0, loc.len as usize)).is_err() {
             return Ok(false);
         }
 
@@ -416,16 +419,54 @@ impl Recovery {
                         }
                     }
                     EntryType::Update => {
+                        if PayloadType::try_from(block.slice::<u8>(1, 1)[0]).is_err() {
+                            pos = start_pos;
+                            break;
+                        }
                         let u = ptr_to::<WalUpdate>(ptr);
-                        let payload_len = u.payload_len();
-                        if pos + payload_len as u64 > end {
+                        let payload_size = { u.size };
+                        let payload_len = match WalUpdate::checked_payload_len(payload_size) {
+                            Ok(len) => len,
+                            Err(_) => {
+                                pos = start_pos;
+                                break;
+                            }
+                        };
+                        let total = match WalUpdate::checked_encoded_len(payload_len) {
+                            Ok(total) => total,
+                            Err(_) => {
+                                pos = start_pos;
+                                break;
+                            }
+                        };
+                        let payload_len_u64 = match u64::try_from(payload_len) {
+                            Ok(len) => len,
+                            Err(_) => {
+                                pos = start_pos;
+                                break;
+                            }
+                        };
+                        let record_end = match pos.checked_add(payload_len_u64) {
+                            Some(end) => end,
+                            None => {
+                                pos = start_pos;
+                                break;
+                            }
+                        };
+                        if record_end > end {
                             pos = start_pos;
                             break;
                         }
                         // copy before possible realloc
                         let bucket_id = u.bucket_id;
                         let txid = u.txid;
-                        loc.len = (sz + payload_len) as u32;
+                        loc.len = match u32::try_from(total) {
+                            Ok(len) => len,
+                            Err(_) => {
+                                pos = start_pos;
+                                break;
+                            }
+                        };
                         loc.bucket_id = bucket_id;
                         if block.len() < loc.len as usize {
                             block.realloc(loc.len as usize);
@@ -457,7 +498,7 @@ impl Recovery {
                             let _ = self.in_progress_txns.insert(txid);
                         }
 
-                        pos += payload_len as u64;
+                        pos = record_end;
                     }
                     _ => {
                         return Err(OpCode::Corruption);
@@ -521,8 +562,9 @@ impl Recovery {
             };
             must_true!(len as usize <= block.len());
             f.read(block.mut_slice(0, len as usize), pos.offset)?;
+            PayloadType::try_from(block.slice::<u8>(1, 1)[0])?;
             let c = ptr_to::<WalUpdate>(block.data());
-            if !c.is_intact() {
+            if !c.is_intact() || c.validate_record(block.slice(0, len as usize)).is_err() {
                 return Err(OpCode::Corruption);
             }
             let txid = { c.txid };
@@ -694,7 +736,7 @@ impl Recovery {
         min_file: u64,
         max_file: u64,
     ) -> Result<Option<Position>, OpCode> {
-        let block = Block::alloc(Self::INIT_BLOCK_SIZE);
+        let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
         for file_id in (min_file..=max_file).rev() {
             let path = self.opt.wal_file(group_id, file_id);
             if !self.opt.fs.try_exists(&path)? {
@@ -709,11 +751,10 @@ impl Recovery {
                 continue;
             }
             let mut pos = 0;
-            let buf = block.mut_slice(0, block.len());
             let mut latest = None;
             while pos < end {
                 let hdr = {
-                    let hdr = &mut buf[0..1];
+                    let hdr = block.mut_slice(0, 1);
                     file.read(hdr, pos)?;
                     hdr[0]
                 };
@@ -723,9 +764,9 @@ impl Recovery {
                 let Some(sz) = Self::get_size(et, (end - pos) as usize)? else {
                     break;
                 };
-                file.read(&mut buf[0..sz], pos)?;
+                file.read(block.mut_slice(0, sz), pos)?;
                 pos += sz as u64;
-                let ptr = buf.as_ptr();
+                let ptr = block.data();
                 match et {
                     EntryType::Commit => {
                         let c = ptr_to::<WalCommit>(ptr);
@@ -753,11 +794,36 @@ impl Recovery {
                         latest = Some(c.checkpoint);
                     }
                     EntryType::Update => {
-                        let u = ptr_to::<WalUpdate>(ptr);
-                        if pos + u.payload_len() as u64 > end {
+                        if PayloadType::try_from(block.slice::<u8>(1, 1)[0]).is_err() {
                             break;
                         }
-                        pos += u.payload_len() as u64;
+                        let u = ptr_to::<WalUpdate>(ptr);
+                        let payload_size = { u.size };
+                        let payload_len = match WalUpdate::checked_payload_len(payload_size) {
+                            Ok(len) => len,
+                            Err(_) => break,
+                        };
+                        let total = match WalUpdate::checked_encoded_len(payload_len) {
+                            Ok(total) => total,
+                            Err(_) => break,
+                        };
+                        let payload_len_u64 = match u64::try_from(payload_len) {
+                            Ok(len) => len,
+                            Err(_) => break,
+                        };
+                        let record_end = match pos.checked_add(payload_len_u64) {
+                            Some(candidate) if candidate <= end => candidate,
+                            _ => break,
+                        };
+                        if block.len() < total {
+                            block.realloc(total);
+                        }
+                        file.read(block.mut_slice(sz, payload_len), pos)?;
+                        let u = ptr_to::<WalUpdate>(block.data());
+                        if !u.is_intact() || u.validate_record(block.slice(0, total)).is_err() {
+                            break;
+                        }
+                        pos = record_end;
                     }
                     _ => break,
                 }
@@ -780,6 +846,7 @@ mod tests {
 
     use crate::{
         BucketOptions, Mace, RandomPath, Store,
+        cc::wal::{EntryType, IWalCodec, PayloadType, WalCheckpoint, WalUpdate},
         io::testfs::{InjectOp, InjectedFileSystem},
         map::adapter::{ManifestCheckpointObserver, ManifestDataReader},
         meta::WalRecycleIntent,
@@ -871,6 +938,145 @@ mod tests {
         )
         .expect_err("remove_wal_prefix must fail");
         assert_eq!(err, crate::OpCode::IoError);
+    }
+
+    #[test]
+    fn checkpoint_scan_stops_at_invalid_update_checksum() {
+        let (_root, _fs, opt) = new_opt();
+        let path = opt.wal_file(0, 0);
+        let update = WalUpdate {
+            wal_type: EntryType::Update,
+            sub_type: PayloadType::Delete,
+            bucket_id: 0,
+            group_id: 0,
+            size: 0,
+            cmd_id: 0,
+            klen: 0,
+            txid: 1,
+            prev_id: 0,
+            prev_off: 0,
+            checksum: 0,
+        };
+        let mut checkpoint = WalCheckpoint {
+            wal_type: EntryType::CheckPoint,
+            checkpoint: crate::utils::data::Position::new(0, 0),
+            checksum: 0,
+        };
+        checkpoint.checksum = checkpoint.calc_checksum();
+
+        let mut wal = Vec::new();
+        wal.extend_from_slice(update.to_slice());
+        wal.extend_from_slice(checkpoint.to_slice());
+        std::fs::write(path, wal).expect("wal seed write must succeed");
+
+        let recovery = Recovery::new(opt);
+        assert_eq!(
+            recovery
+                .find_latest_checkpoint(0, 0, 0)
+                .expect("checkpoint scan must complete"),
+            None,
+            "a bad update must stop checkpoint discovery before later records"
+        );
+    }
+
+    #[test]
+    fn invalid_update_subtype_is_truncated_when_enabled() {
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.concurrent_write = 1;
+        let initial = Mace::new(
+            options
+                .clone()
+                .validate()
+                .expect("initial open must validate"),
+        )
+        .expect("initial open must succeed");
+        drop(initial);
+
+        let parsed = options
+            .clone()
+            .validate()
+            .expect("recovery options must validate");
+        let path = parsed.wal_file(0, 0);
+        let update = WalUpdate {
+            wal_type: EntryType::Update,
+            sub_type: PayloadType::Delete,
+            bucket_id: 0,
+            group_id: 0,
+            size: 0,
+            cmd_id: 0,
+            klen: 0,
+            txid: 1,
+            prev_id: 0,
+            prev_off: 0,
+            checksum: 0,
+        };
+        let mut raw = update.to_slice().to_vec();
+        raw[1] = u8::MAX;
+        std::fs::write(&path, raw).expect("wal seed write must succeed");
+
+        let reopened = Mace::new(options.validate().expect("reopen options must validate"));
+        assert!(
+            reopened.is_ok(),
+            "invalid subtype must follow truncate_corrupted_wal"
+        );
+        drop(reopened);
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("truncated wal must exist")
+                .len(),
+            0,
+            "invalid subtype must truncate from the bad record start"
+        );
+    }
+
+    #[test]
+    fn oversized_update_header_is_truncated_when_enabled() {
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.concurrent_write = 1;
+        let initial = Mace::new(
+            options
+                .clone()
+                .validate()
+                .expect("initial open must validate"),
+        )
+        .expect("initial open must succeed");
+        drop(initial);
+
+        let parsed = options
+            .clone()
+            .validate()
+            .expect("recovery options must validate");
+        let path = parsed.wal_file(0, 0);
+        let update = WalUpdate {
+            wal_type: EntryType::Update,
+            sub_type: PayloadType::Delete,
+            bucket_id: 0,
+            group_id: 0,
+            size: u32::MAX,
+            cmd_id: 0,
+            klen: 0,
+            txid: 1,
+            prev_id: 0,
+            prev_off: 0,
+            checksum: 0,
+        };
+        std::fs::write(&path, update.to_slice()).expect("wal seed write must succeed");
+
+        let reopened = Mace::new(options.validate().expect("reopen options must validate"));
+        assert!(
+            reopened.is_ok(),
+            "oversized header must follow truncate_corrupted_wal"
+        );
+        drop(reopened);
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("truncated wal must exist")
+                .len(),
+            0,
+            "oversized header must truncate from the bad record start"
+        );
     }
 
     #[test]

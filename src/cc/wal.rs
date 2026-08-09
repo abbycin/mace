@@ -4,7 +4,7 @@ use std::hash::Hasher;
 
 use crate::{
     static_assert,
-    utils::{OpCode, data::Position},
+    utils::{OpCode, data::Position, options::Options},
 };
 
 pub(crate) trait IWalCodec {
@@ -161,6 +161,68 @@ impl_checksum!(WalAbort);
 impl_checksum!(WalCheckpoint);
 
 impl WalUpdate {
+    pub(crate) fn checked_payload_len(payload_size: u32) -> Result<usize, OpCode> {
+        let payload_len = usize::try_from(payload_size).map_err(|_| OpCode::Corruption)?;
+        let max_payload = Options::MAX_KV_SIZE
+            .checked_add(size_of::<WalReplace>())
+            .ok_or(OpCode::Corruption)?;
+        if payload_len <= max_payload {
+            Ok(payload_len)
+        } else {
+            Err(OpCode::Corruption)
+        }
+    }
+
+    pub(crate) fn checked_encoded_len(payload_len: usize) -> Result<usize, OpCode> {
+        Self::size()
+            .checked_add(payload_len)
+            .ok_or(OpCode::Corruption)
+    }
+
+    pub(crate) fn validate_record(&self, record: &[u8]) -> Result<(), OpCode> {
+        let header_len = Self::size();
+        if record.len() < header_len || record[0] != EntryType::Update as u8 {
+            return Err(OpCode::Corruption);
+        }
+
+        let payload_size = { self.size };
+        let payload_len = Self::checked_payload_len(payload_size)?;
+        let total_len = Self::checked_encoded_len(payload_len)?;
+        if record.len() != total_len {
+            return Err(OpCode::Corruption);
+        }
+
+        let key_size = { self.klen };
+        let key_len = usize::try_from(key_size).map_err(|_| OpCode::Corruption)?;
+        if key_len > Options::MAX_KEY_SIZE {
+            return Err(OpCode::Corruption);
+        }
+        let payload = &record[header_len..];
+        let value = payload.get(key_len..).ok_or(OpCode::Corruption)?;
+        match PayloadType::try_from(record[1])? {
+            PayloadType::Delete if value.is_empty() => Ok(()),
+            PayloadType::Insert | PayloadType::Update => {
+                if value.len() < size_of::<u32>() {
+                    return Err(OpCode::Corruption);
+                }
+                let value_len = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                let expected = size_of::<u32>()
+                    .checked_add(usize::try_from(value_len).map_err(|_| OpCode::Corruption)?)
+                    .ok_or(OpCode::Corruption)?;
+                if value.len() == expected
+                    && key_len
+                        .checked_add(usize::try_from(value_len).map_err(|_| OpCode::Corruption)?)
+                        .is_some_and(|len| len <= Options::MAX_KV_SIZE)
+                {
+                    Ok(())
+                } else {
+                    Err(OpCode::Corruption)
+                }
+            }
+            _ => Err(OpCode::Corruption),
+        }
+    }
+
     pub(crate) fn sub_type(&self) -> PayloadType {
         self.sub_type
     }
@@ -357,7 +419,10 @@ pub(crate) fn ptr_to<T>(x: *const u8) -> &'static T {
 
 #[cfg(test)]
 mod test {
-    use crate::cc::wal::{EntryType, IWalCodec, PayloadType, WalBegin, WalPut, WalUpdate, ptr_to};
+    use crate::cc::wal::{
+        EntryType, IWalCodec, PayloadType, WalBegin, WalPut, WalReplace, WalUpdate, ptr_to,
+    };
+    use crate::utils::options::Options;
 
     #[test]
     fn dump_load() {
@@ -420,6 +485,52 @@ mod test {
             let np = nc.put();
             assert_eq!(np.val(), VAL);
         }
+    }
+
+    #[test]
+    fn update_record_validation_rejects_inconsistent_layout() {
+        let header_len = WalUpdate::size();
+        let payload_len = size_of::<u32>() + 3;
+        let mut update = WalUpdate {
+            wal_type: EntryType::Update,
+            sub_type: PayloadType::Insert,
+            bucket_id: 0,
+            group_id: 0,
+            size: payload_len as u32,
+            cmd_id: 0,
+            klen: 0,
+            txid: 1,
+            prev_id: 0,
+            prev_off: 0,
+            checksum: 0,
+        };
+        let mut record = vec![0; header_len + payload_len];
+        record[..header_len].copy_from_slice(update.to_slice());
+        record[header_len..header_len + size_of::<u32>()].copy_from_slice(&3u32.to_le_bytes());
+        record[header_len + size_of::<u32>()..].copy_from_slice(b"val");
+        let stored = ptr_to::<WalUpdate>(record.as_ptr());
+        update.checksum = stored.calc_checksum();
+        record[..header_len].copy_from_slice(update.to_slice());
+
+        let stored = ptr_to::<WalUpdate>(record.as_ptr());
+        assert!(stored.is_intact());
+        assert_eq!(stored.validate_record(&record), Ok(()));
+
+        record[header_len..header_len + size_of::<u32>()].copy_from_slice(&4u32.to_le_bytes());
+        let stored = ptr_to::<WalUpdate>(record.as_ptr());
+        assert_eq!(
+            stored.validate_record(&record),
+            Err(crate::OpCode::Corruption)
+        );
+    }
+
+    #[test]
+    fn checked_payload_len_rejects_oversized_payload_before_allocation() {
+        let too_large = Options::MAX_KV_SIZE + size_of::<WalReplace>() + 1;
+        assert_eq!(
+            WalUpdate::checked_payload_len(too_large as u32),
+            Err(crate::OpCode::Corruption)
+        );
     }
 
     #[test]

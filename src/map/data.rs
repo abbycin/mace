@@ -97,6 +97,14 @@ impl PidMap {
             .and_modify(|cur| *cur = (*cur).max(addr))
             .or_insert(addr);
     }
+
+    #[cfg(feature = "extra_check")]
+    pub(crate) fn first_live(&self) -> Option<(u64, u64)> {
+        self.live
+            .iter()
+            .next()
+            .map(|entry| (*entry.key(), *entry.value()))
+    }
 }
 
 pub(crate) struct PidSet {
@@ -328,6 +336,13 @@ impl CheckpointTask {
     }
 
     pub(crate) fn snapshot(&mut self) -> Snapshot {
+        // protect retired_pages defers registered before and during the checkpoint cut
+        let _snapshot_guard = crossbeam_epoch::pin();
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_checkpoint_sync_point(
+            crate::testing::CheckpointSyncPoint::BeforeSnapshotWaitZero,
+            self.bucket_id,
+        );
         self.epoch_inflight.wait_zero();
         // old-generation writers can still append to sealed_bytes between epoch cut and wait_zero
         // baseline must be sampled after wait_zero; from here sealed_bytes should only decrease
@@ -403,6 +418,11 @@ impl CheckpointTask {
             } else if addr > self.snap_addr
                 && let Some(x) = self.retired_pages.get(&addr)
             {
+                #[cfg(feature = "extra_check")]
+                crate::testing::fire_checkpoint_sync_point(
+                    crate::testing::CheckpointSyncPoint::AfterRetiredPageFallbackRead(addr),
+                    self.bucket_id,
+                );
                 // same-checkpoint writers can retire structural junk into the temporary fallback
                 // map before the sealed snapshot finishes walking stale edges above snap_addr
                 (x.value().clone(), true)
@@ -513,6 +533,12 @@ impl CheckpointTask {
                 );
             }
         }
+
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_checkpoint_sync_point(
+            crate::testing::CheckpointSyncPoint::AfterSnapshotBuilt,
+            self.bucket_id,
+        );
 
         *self.last_chkpt_lsn.raw_ref() = chkpt_lsn;
         Snapshot {
