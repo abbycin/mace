@@ -1,3 +1,9 @@
+## [0.1.1] 2026-08-18
+### Bug Fixes
+- Eliminated the CCPool free-list ABA race by serializing each free shard with a mutex
+- Fixed collector safe-boundary regression on weakly ordered CPUs by globally ordering writer begin registration, timestamp allocation, and collector cuts
+- Fixed PageMap publication visibility on weakly ordered CPUs by acquiring a page mapping before dereferencing the published page
+
 ## [0.1.0] 2026-07-26
 ### New Features
 - Reworked concurrency control into a fact-based MVCC model

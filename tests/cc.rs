@@ -5,8 +5,61 @@ use std::{
     collections::HashSet,
     sync::{Arc, Barrier, RwLock},
     thread::{JoinHandle, sleep},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+#[test]
+#[ignore = "benchmark: run explicitly to compare concurrent view churn throughput"]
+fn concurrent_short_lived_views_throughput() -> Result<(), OpCode> {
+    let elapsed = concurrent_short_lived_views(16, 25_000)?;
+    let views = 16 * 25_000;
+    println!(
+        "concurrent short-lived views: {views} in {elapsed:?} ({:.0} views/s)",
+        views as f64 / elapsed.as_secs_f64()
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_short_lived_views_never_reuse_active_pins() -> Result<(), OpCode> {
+    concurrent_short_lived_views(16, 100_000)?;
+    Ok(())
+}
+
+fn concurrent_short_lived_views(
+    threads: usize,
+    views_per_thread: usize,
+) -> Result<Duration, OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.sync_on_write = false;
+    let mace = Mace::new(opt.validate().unwrap())?;
+    let db = mace.new_bucket("views", BucketOptions::default())?;
+    let tx = db.begin()?;
+    tx.put(b"k", b"v")?;
+    tx.commit()?;
+
+    let barrier = Arc::new(Barrier::new(threads + 1));
+    let mut workers = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..views_per_thread {
+                let view = db.view().expect("open view");
+                assert_eq!(view.get(b"k").expect("read seeded value").slice(), b"v");
+            }
+        }));
+    }
+
+    barrier.wait();
+    let started = Instant::now();
+    for thread in workers {
+        thread.join().expect("view worker panicked");
+    }
+    Ok(started.elapsed())
+}
 
 #[test]
 fn put_get() -> Result<(), OpCode> {

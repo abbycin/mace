@@ -12,10 +12,9 @@ use crate::utils::seqlock::SeqLock;
 use crate::utils::{CachePad, Handle, NULL_ORACLE};
 
 use super::group::{RegistrationTs, TxnFact, WriterGroup};
-use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -238,6 +237,11 @@ impl Context {
 
     pub(crate) fn alloc_oracle(&self) -> u64 {
         self.sequences.oracle.fetch_add(1, AcqRel)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_begin_oracle(&self) -> u64 {
+        self.sequences.oracle.fetch_add(1, SeqCst) // must use seqcst
     }
 
     #[inline]
@@ -467,16 +471,16 @@ fn run_collect_cycle(
     registry_nodes: &mut Vec<*mut CCNode>,
 ) -> Duration {
     let proof_scan_started = Instant::now();
-    // `SeqCst` linearizes this cut with view registration and timestamp sampling (`oracle` and
-    // `CCNode::state`)
+    // `SeqCst` linearizes this cut with writer/view registration and timestamp sampling (`oracle`,
+    // `WriterGroup::txn_seq`, and `CCNode::state`)
     //
-    // forbidden execution: the collector misses a live view registration while that view samples
-    // start_ts < cut
+    // forbidden execution: the collector misses a live writer or view registration while it
+    // samples start_ts < cut
     //
-    // if the scan does not cover a view that stays live, its state load must precede the
+    // if the scan does not cover a registration that stays live, its state load must precede the
     // `Registering` store in the `SeqCst` order; because this cut precedes the scan and registration
-    // precedes the view's oracle load, the resulting cut < scan < registration < sample order proves
-    // start_ts >= cut
+    // precedes the oracle allocation/sample, the resulting cut < scan < registration < oracle order
+    // proves start_ts >= cut
     let cut = sequences.oracle.load(SeqCst);
     #[cfg(feature = "extra_check")]
     crate::testing::fire_collector_sync_point(
@@ -635,7 +639,6 @@ fn decode_view_state(raw: u64) -> ViewState {
 
 pub(crate) struct CCNode {
     state: AtomicU64,
-    next: AtomicPtr<CCNode>,
     shard_index: usize,
     registry_index: usize,
 }
@@ -644,7 +647,6 @@ impl CCNode {
     fn new() -> Self {
         Self {
             state: AtomicU64::new(encode_view_state(ViewState::Idle)),
-            next: AtomicPtr::new(null_mut()),
             shard_index: 0,
             registry_index: 0,
         }
@@ -686,7 +688,7 @@ impl CCNode {
 }
 
 struct CCPool {
-    shards: [AtomicPtr<CCNode>; CCPOOL_SHARD],
+    shards: [Mutex<Vec<Handle<CCNode>>>; CCPOOL_SHARD],
     shard_index: CachePad<AtomicUsize>,
     // TODO: maybe change to seqlock ?
     registry: RwLock<Vec<Handle<CCNode>>>,
@@ -696,12 +698,13 @@ struct CCPool {
 impl CCPool {
     fn new() -> Self {
         let mut registry = Vec::with_capacity(CCPOOL_SHARD);
-        let shards = std::array::from_fn(|_| {
+        let mut shards = std::array::from_fn(|_| Mutex::new(Vec::new()));
+        for shard in shards.iter_mut() {
             let mut h = Handle::new(CCNode::new());
             h.registry_index = registry.len();
             registry.push(h);
-            AtomicPtr::new(h.inner())
-        });
+            shard.get_mut().push(h);
+        }
         Self {
             shards,
             shard_index: CachePad::default(),
@@ -714,46 +717,23 @@ impl CCPool {
         self.shard_index.fetch_add(1, Relaxed)
     }
 
-    fn try_pop_shard(&self, index: usize, _guard: &Guard) -> Option<Handle<CCNode>> {
-        loop {
-            let head = self.shards[index].load(Acquire);
-            if head.is_null() {
-                return None;
-            }
-            let next = unsafe { (*head).next.load(Acquire) };
-            if self.shards[index]
-                .compare_exchange_weak(head, next, AcqRel, Relaxed)
-                .is_ok()
-            {
-                let mut h = Handle::from(head);
-                h.shard_index = index;
-                return Some(h);
-            }
-        }
+    fn try_pop_shard(&self, index: usize) -> Option<Handle<CCNode>> {
+        let mut h = self.shards[index].lock().pop()?;
+        h.shard_index = index;
+        Some(h)
     }
 
     fn push_shard(&self, index: usize, cc: Handle<CCNode>) {
-        let ptr = cc.inner();
-        loop {
-            let head = self.shards[index].load(Acquire);
-            unsafe { (*ptr).next.store(head, Release) };
-            if self.shards[index]
-                .compare_exchange_weak(head, ptr, AcqRel, Relaxed)
-                .is_ok()
-            {
-                return;
-            }
-        }
+        self.shards[index].lock().push(cc);
     }
 
     fn alloc(&self) -> Handle<CCNode> {
         let ticket = self.next_ticket();
         let (shard, second) = two_choices(ticket, CCPOOL_SHARD);
-        let guard = crossbeam_epoch::pin();
 
-        if let Some(x) = self.try_pop_shard(shard, &guard) {
+        if let Some(x) = self.try_pop_shard(shard) {
             x
-        } else if let Some(x) = self.try_pop_shard(second, &guard) {
+        } else if let Some(x) = self.try_pop_shard(second) {
             x
         } else {
             let mut cc = Handle::new(CCNode::new());
@@ -774,7 +754,7 @@ impl CCPool {
         let mut victim = None;
         for i in 0..CCPOOL_SHARD {
             let idx = (start + i) & CCPOOL_SHARD_MASK;
-            if let Some(cc) = self.try_pop_shard(idx, guard) {
+            if let Some(cc) = self.try_pop_shard(idx) {
                 victim = Some((idx, cc));
                 break;
             }
