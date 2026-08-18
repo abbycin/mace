@@ -16,7 +16,7 @@ Mace is a high-performance, embedded key-value storage engine written in Rust, c
 - **Optional Zstd Compression**: Per-bucket `enable_compression` (default: `false`).
 - **Data Integrity**: CRC checksums on persisted records, verified across restarts and crashes.
 - **Flow Control**: Optional foreground write backpressure to bound memory growth.
-- **Cross-Platform**: Linux, Windows, and macOS.
+- **Cross-Platform**: Linux, Windows, FreeBSD and macOS.
 ## Quick Start
 
 The following example demonstrates basic transaction management and data retrieval:

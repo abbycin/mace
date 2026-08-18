@@ -318,9 +318,11 @@ Foreground writer begin is serialized within its writer group and follows this p
 A read-only view transitions through registering, active, and idle states. Its snapshot pin remains
 active until the view and every iterator or borrowed read derived from it are dropped.
 
-The collector timestamp cut, writer registration publication, and reader registration publication
-must have one global order. A collector round takes its cut before scanning writer registration
-state, exact transaction outcomes, and the reader registry captured for that round.
+The collector timestamp cut, writer registration publication, writer start timestamp allocation,
+and reader registration publication must have one global order. A collector round takes its cut
+before scanning writer registration state, exact transaction outcomes, and the reader registry
+captured for that round. If a writer is absent from that scan, the order proves its start timestamp
+was allocated at or after the cut.
 
 ### 8.2 visibility evaluation
 

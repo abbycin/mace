@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use std::sync::atomic::{
     AtomicU64, AtomicUsize,
-    Ordering::{AcqRel, Acquire, Relaxed, Release},
+    Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
 };
 
 const FACT_SHARDS: usize = 16;
@@ -102,7 +102,7 @@ impl WriterGroup {
         self.stable_ts.store(NULL_ORACLE, Relaxed);
         let seq = self.txn_seq.load(Relaxed);
         must_true!(seq.is_multiple_of(2));
-        self.txn_seq.store(seq + 1, Relaxed);
+        self.txn_seq.store(seq + 1, SeqCst); // must use SeqCst
     }
 
     // safety: guard by logging mutex
@@ -127,7 +127,7 @@ impl WriterGroup {
     }
 
     pub fn stable_ts(&self) -> RegistrationTs {
-        let seq = self.txn_seq.load(Acquire);
+        let seq = self.txn_seq.load(SeqCst); // must use SeqCst
         if seq.is_multiple_of(2) {
             return RegistrationTs::None;
         }
@@ -312,6 +312,20 @@ mod tests {
         let mut log = group.logging.lock();
         assert_eq!(group.min_active_lsn(&mut log), None);
         assert_eq!(group.min_active_wal_file_id(&mut log), u64::MAX);
+    }
+
+    #[test]
+    fn begin_registration_blocks_collection_until_start_ts_is_published() {
+        let group = new_group();
+
+        group.start_reg();
+        assert_eq!(group.stable_ts(), RegistrationTs::Pending);
+
+        group.reg_start_ts(10);
+        assert_eq!(group.stable_ts(), RegistrationTs::Published(10));
+
+        group.reg_end();
+        assert_eq!(group.stable_ts(), RegistrationTs::None);
     }
 }
 

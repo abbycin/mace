@@ -750,44 +750,53 @@ entries:
         note: the publication-window micro-model covers commit-ts allocation, terminal publication, and safe re-read windows
 
   - id: protocol.snapshot_registration_cut_covers_every_live_reader
-    title: collector cut must include every live reader before publishing a safe snapshot boundary
+    title: collector cut must include every live writer and reader before publishing a safe snapshot boundary
     kind: protocol
     status: active
     confidence: medium
     statement: >
       If the collector publishes a snapshot-safe boundary, it must first take an oracle cut and then
-      include every live reader source that can still observe an older snapshot before advancing the
-      boundary. No reader registration source may be omitted from the cut computation.
+      include every live writer and reader source that can still observe an older snapshot before advancing the
+      boundary. The cut, writer registration, writer start-timestamp allocation, and reader
+      registration must share one global order, so a writer absent from the scan has a start
+      timestamp at or after the cut. No registration source may be omitted from the cut
+      computation.
     watch_points:
       - path: src/cc/context.rs
         note: collector cut, CCPool registry snapshot, and safe publication live here
       - path: src/index/txn.rs
-        note: TxnView acquisition and drop publish the Registering Active Idle lifecycle here
+        note: writer begin and TxnView acquisition/drop publish collector-visible registration lifecycles here
       - path: src/cc/group.rs
         note: txn_seq and stable_ts publish writer begin registration here
       - path: tests/si.rs
         note: collector-cut and multi-view churn witnesses live here
     witnesses:
       - path: src/cc/context.rs
-        note: run_collect_cycle takes a SeqCst oracle cut before its SeqCst CCNode state scan; Registering blocks publication and Active contributes start_ts
+        note: run_collect_cycle takes a SeqCst oracle cut before its SeqCst writer/view registration scans; Registering blocks publication and Active contributes start_ts
+      - path: src/cc/group.rs
+        note: start_reg publishes the odd writer registration and stable_ts scans it with SeqCst; a later begin oracle allocation therefore cannot be older than a collector cut that missed it
       - path: tests/si.rs
-        note: collector_cut_includes_begin_registration_before_fact_publish, post_cut_view_registration_does_not_pin_safe_boundary, and newer_live_view_keeps_snapshot_when_older_view_is_still_alive_during_churn cover the reader cut
+        note: collector_cut_includes_begin_registration_before_fact_publish covers writer begin; post_cut_view_registration_does_not_pin_safe_boundary and newer_live_view_keeps_snapshot_when_older_view_is_still_alive_during_churn cover the reader cut
       - path: src/cc/context.rs
         note: ccnode_registration_state_is_visible_to_collector directly covers Idle Registering Active Idle state observation
     failure_symptoms:
       - a non-oldest live snapshot loses visibility after another reader or collector cycle advances the floor
       - collector advances reclamation past a reader that was live at the cut
+      - collector publishes past a writer begin and a later scan computes a candidate below the published safe boundary
       - churn in the pool registry drops a live view from the safe-boundary computation
     verifiers:
       - type: regression-test
         path: tests/si.rs
-        note: deterministic registration-cut and multi-view churn schedules cover writer and CCPool reader sources
+        note: collector_cut_includes_begin_registration_before_fact_publish covers the writer begin window; multi-view churn schedules cover CCPool reader sources
       - type: unit-test
         path: src/cc/context.rs
         note: ccnode_registration_state_is_visible_to_collector covers the single-atomic CCNode state machine
+      - type: unit-test
+        path: src/cc/group.rs
+        note: begin_registration_blocks_collection_until_start_ts_is_published covers the writer registration state machine
       - type: model
         path: docs/proposals/cc_bounded_si.tla
-        note: the bounded SI model covers cut-first safe publication against live reader registrations
+        note: the bounded SI model covers cut-first safe publication against live registrations
 
   - id: protocol.positive_proof_rechecks_abort_state
     title: a positive visibility proof must still reject versions that abort concurrently
@@ -884,6 +893,41 @@ entries:
       - type: regression-test
         path: tests/si.rs
         note: iterator lifetime tests cover same-group holes, cross-commit churn, and forward or reverse traversal on a pinned snapshot
+
+  - id: protocol.ccpool_free_list_excludes_live_pins
+    title: CCPool free shards must never publish a live view pin
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      A CCNode may enter a CCPool free shard only after its view has transitioned to Idle, and each
+      shard must serialize pop and push so that a stale pop cannot republish a node held by another
+      live view.
+    watch_points:
+      - path: src/cc/context.rs
+        note: CCPool shard storage and alloc/free ownership transfer live here
+      - path: src/index/txn.rs
+        note: TxnView construction and Drop acquire and release CCPool pins here
+      - path: tests/cc.rs
+        note: concurrent short-lived view churn regression lives here
+    witnesses:
+      - path: src/cc/context.rs
+        note: each free shard is a Mutex<Vec<Handle<CCNode>>>; pop and push complete under the same shard mutex
+      - path: src/cc/context.rs
+        note: free_view_pin clears the CCNode state to Idle before returning it to the pool
+      - path: tests/cc.rs
+        note: concurrent_short_lived_views_never_reuse_active_pins runs the issue-1 view/get/drop workload on 16 OS threads
+    failure_symptoms:
+      - CCNode::begin_reg observes a non-Idle state for a newly allocated view pin
+      - a collector shrink sees a registry pointer mismatch after free-list corruption
+      - two live views concurrently modify the state of one CCNode
+    verifiers:
+      - type: regression-test
+        path: tests/cc.rs
+        note: concurrent_short_lived_views_never_reuse_active_pins covers concurrent view allocation, point read, and Drop
+      - type: benchmark-test
+        path: tests/cc.rs
+        note: concurrent_short_lived_views_throughput reports 16-thread short-lived view throughput for regression comparison
 
   - id: protocol.snapshot_candidate_traversal_complete
     title: point and iterator traversal must enumerate every candidate that can satisfy a snapshot

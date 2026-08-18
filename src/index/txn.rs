@@ -142,7 +142,7 @@ impl<'a> TxnKV<'a> {
             let mut log = g.logging.lock();
             let mut begin_guard = RegGuard::new(g);
             g.start_reg();
-            let start_ts = ctx.alloc_oracle();
+            let start_ts = ctx.alloc_begin_oracle();
             state.start_ts = start_ts;
             g.reg_start_ts(start_ts);
             #[cfg(feature = "extra_check")]

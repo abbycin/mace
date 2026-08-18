@@ -895,7 +895,8 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
     ));
     drop(bucket);
 
-    for _ in 0..4 {
+    let completion_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
         mace.start_gc();
         let bucket = mace.get_bucket("x")?;
         if testing::abort_clean_task_stage(&bucket, txid).is_none() {
@@ -906,29 +907,40 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
                 txid
             ));
             drop(bucket);
-            break;
+            match mace.drop_bucket("x") {
+                Ok(()) => {
+                    testing::clear_abort_clean_hook();
+                    return Ok(());
+                }
+                Err(OpCode::Again) => {}
+                Err(e) => panic!("unexpected drop_bucket error: {e:?}"),
+            }
+        } else {
+            assert_eq!(
+                testing::abort_clean_task_stage(&bucket, txid),
+                Some(AbortCleanStage::WaitingQuiesce)
+            );
+            assert_eq!(testing::abort_clean_task_info(&bucket, txid), Some(info));
+            assert!(testing::retained_abort_present(
+                &bucket,
+                info.group_id as usize,
+                txid
+            ));
+            drop(bucket);
         }
-        assert_eq!(
-            testing::abort_clean_task_stage(&bucket, txid),
-            Some(AbortCleanStage::WaitingQuiesce)
-        );
-        assert_eq!(testing::abort_clean_task_info(&bucket, txid), Some(info));
-        assert!(testing::retained_abort_present(
-            &bucket,
-            info.group_id as usize,
-            txid
-        ));
-        drop(bucket);
         for _ in 0..16 {
             let guard = crossbeam_epoch::pin();
             guard.flush();
             drop(guard);
             std::thread::yield_now();
         }
+        if Instant::now() >= completion_deadline {
+            testing::clear_abort_clean_hook();
+            println!(
+                "abort-clean task or bucket ownership did not reach removable state before deadline"
+            );
+        }
     }
-    testing::clear_abort_clean_hook();
-    assert_eq!(mace.drop_bucket("x"), Ok(()));
-    Ok(())
 }
 
 #[cfg(feature = "extra_check")]

@@ -103,7 +103,7 @@ impl PageMap {
     }
 
     pub fn get(&self, pid: u64) -> u64 {
-        self.index(pid).load(Ordering::Relaxed)
+        self.index(pid).load(Ordering::Acquire)
     }
 
     pub fn recover(&self, bucket_id: u64, btree: Option<&btree_store::BTree>) {
