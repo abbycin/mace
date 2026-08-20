@@ -620,6 +620,48 @@ entries:
         path: tests/prod_gc.rs
         note: oversized data and blob rewrites verify multi-output interval, stat, and reloc state survives reopen
 
+  - id: protocol.persist_stat_inactive_bitmap_monotonic
+    title: persisted inactive bitmap must retain every prior junk sequence
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      For every retained data or blob file, the persisted `PersistStat.inactive_elems` value must
+      encode the complete inactive sequence set represented by the in-memory stat bitmap at the
+      manifest publish boundary. A later checkpoint may add inactive sequences but must never drop
+      an already persisted sequence while the file remains retained. Reopen must reconstruct the
+      same inactive set, so a page that was durably retired cannot become GC-active again solely
+      because a later stat update overwrote the metadata value.
+    watch_points:
+      - path: src/meta/stat.rs
+        note: apply_junks updates the in-memory bitmap and constructs the persisted stat value
+      - path: src/meta/entry.rs
+        note: PersistStat encodes and decodes inactive sequence lists
+      - path: src/meta/txn.rs
+        note: stat metadata Update replaces an entire backend value rather than merging a bitmap delta
+      - path: src/map/adapter.rs
+        note: checkpoint publish records the resulting stat update in the manifest transaction
+      - path: src/store/gc.rs
+        note: rewrite selection trusts recovered active and total stat bytes
+    witnesses:
+      - path: src/meta/stat.rs
+        note: persist_full_mask derives every set sequence from the loaded bitmap before a replacing metadata update
+      - path: src/meta/entry.rs
+        note: decode_mask_only reconstructs the bitmap from the complete persisted sequence list
+      - path: src/meta/txn.rs
+        note: record_stat_update uses MetaOp::Update, making complete-value persistence mandatory
+    failure_symptoms:
+      - a later checkpoint drops old inactive sequences and a reopen treats durable junk as active
+      - data or blob GC stops selecting files that still contain physically reclaimable garbage
+      - repeated GC rounds retain substantially more disk space than the durable reachable set
+    verifiers:
+      - type: unit-test
+        path: src/meta/stat.rs
+        note: full_mask_persistence_keeps_prior_inactive_sequences verifies an old inactive sequence remains after a later one is added
+      - type: integration-test
+        path: tests/gc.rs
+        note: GC checkpoint and reopen coverage exercises durable stat consumption during reclaim
+
   - id: protocol.history_region_key_locality
     title: history traversal must stay inside each key's declared history region
     kind: protocol
@@ -1031,9 +1073,6 @@ entries:
       - type: regression-test
         path: tests/si.rs
         note: snapshot_cut_commit_publication_witness and txn_exact_read_waits_for_commit_publication_after_commit_timestamp_alloc cover pre- and post-publication readers
-      - type: model
-        path: docs/proposals/cc_window_micro.tla
-        note: the publication-window micro-model covers commit-ts allocation, terminal publication, and safe re-read windows
       - type: regression-test
         path: tests/generation.rs
         note: concurrent_commits_coalesce_into_one_generation_with_single_sync and generation_sync_failure_broadcasts_and_isolates_next_generation re-verify the publication order after the generation gate
@@ -1124,9 +1163,6 @@ entries:
       - type: unit-test
         path: src/cc/group.rs
         note: begin_registration_blocks_collection_until_start_ts_is_published covers the writer registration state machine
-      - type: model
-        path: docs/proposals/cc_bounded_si.tla
-        note: the bounded SI model covers cut-first safe publication against live registrations
 
   - id: protocol.positive_proof_rechecks_abort_state
     title: a positive visibility proof must still reject versions that abort concurrently
@@ -1191,9 +1227,6 @@ entries:
       - type: regression-test
         path: tests/si.rs
         note: lagging snapshot, iterator churn, exact-miss, and reopen witnesses exercise safe publication and prune ordering
-      - type: model
-        path: docs/proposals/cc_bounded_si.tla
-        note: the bounded SI model covers safe publication and prune-after-publish invariants
 
   - id: protocol.snapshot_pin_covers_iterator_lifetime
     title: the snapshot pin must outlive every iterator or borrowed read using that snapshot

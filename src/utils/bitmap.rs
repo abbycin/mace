@@ -37,6 +37,23 @@ impl BitMap {
         self.data[(bit >> POWER) as usize] & (1 << (bit & MASK)) != 0
     }
 
+    pub(crate) fn set_bits(&self, limit: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (word_idx, &word) in self.data.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros();
+                let seq = (word_idx as u32) * BITS + bit;
+                if seq >= limit {
+                    return out;
+                }
+                out.push(seq);
+                remaining &= remaining - 1;
+            }
+        }
+        out
+    }
+
     #[allow(unused)]
     pub(crate) fn len(&self) -> usize {
         self.data.len()
@@ -127,5 +144,7 @@ mod test {
 
         let cnt = m.iter().filter(|x| x.0).count();
         assert_eq!(cnt, 12);
+
+        assert_eq!(m.set_bits(12), (0..12).collect::<Vec<_>>());
     }
 }

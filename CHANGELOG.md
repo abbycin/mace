@@ -5,6 +5,9 @@
 - Added safe route switching and legacy WAL layout migration without changing the WAL record or manifest formats
 - Reworked data and blob GC rewrite packing so oversized victims are split at record boundaries into multiple files near the configured target size; only an individual oversized record may exceed that target
 
+### Bug Fixes
+- Fixed data/blob garbage-stat persistence dropping inactive sequences from earlier checkpoints, which could make reopen classify durable junk as live and prevent GC space reclamation
+
 ## [0.1.1] 2026-08-18
 ### Bug Fixes
 - Eliminated the CCPool free-list ABA race by serializing each free shard with a mutex

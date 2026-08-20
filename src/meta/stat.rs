@@ -327,7 +327,7 @@ impl StatCtx {
                 continue;
             }
             if let Some(mut stat) = self.map.get_mut(&file_id) {
-                let mut seqs = Vec::new();
+                let mut changed = false;
                 for addr in addrs {
                     // race condition: gc might have already removed the interval containing this junk
                     let Some(reloc) = self.try_get_reloc(file_id, addr) else {
@@ -339,10 +339,13 @@ impl StatCtx {
                         continue;
                     }
                     self.update_stat(&mut stat, addr, &reloc, tick);
-                    seqs.push(reloc.seq);
+                    changed = true;
                 }
-                if !seqs.is_empty() {
-                    v.push(PersistStat::from_parts(stat.inner, seqs));
+                if changed {
+                    // Metadata updates replace the complete stat value. Persist every inactive
+                    // sequence, not just this checkpoint's delta, so a later checkpoint cannot
+                    // resurrect previously collected garbage after reopen.
+                    v.push(persist_full_mask(&stat));
                 }
             }
         }
@@ -381,6 +384,15 @@ impl StatCtx {
         }
         Some((total - active) * 100 / total)
     }
+}
+
+fn persist_full_mask(stat: &MemStat) -> PersistStat {
+    let inactive = stat
+        .mask
+        .as_ref()
+        .expect("mask loaded")
+        .set_bits(stat.total_elems);
+    PersistStat::from_parts(stat.inner, inactive)
 }
 
 struct JunkCollector {
@@ -577,5 +589,35 @@ impl FileReader {
             ),
         }
         page
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        meta::{MemStat, StatInner},
+        utils::bitmap::BitMap,
+    };
+
+    use super::persist_full_mask;
+
+    #[test]
+    fn full_mask_persistence_keeps_prior_inactive_sequences() {
+        let inner = StatInner {
+            file_id: 7,
+            up1: 0,
+            up2: 0,
+            active_elems: 2,
+            total_elems: 4,
+            active_size: 20,
+            total_size: 40,
+            bucket_id: 1,
+        };
+        let mut mask = BitMap::new(inner.total_elems);
+        mask.set(0);
+        let mut stat = MemStat::from_parts(inner, Some(mask));
+        stat.mask.as_mut().unwrap().set(3);
+
+        assert_eq!(persist_full_mask(&stat).inactive_elems, vec![0, 3]);
     }
 }
