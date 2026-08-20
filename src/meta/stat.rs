@@ -223,37 +223,54 @@ impl StatCtx {
         self.insert_loaded_stat(stat);
     }
 
-    pub(crate) fn update_stat_interval(
+    pub(crate) fn update_stat_intervals(
         &self,
-        mut fstat: MemStat,
-        relocs: HashMap<u64, LenSeq>,
-        obsoleted: &[u64], // no longer referenced
-    ) -> PersistStat {
-        must_true!(eq fstat.active_size, fstat.total_size);
+        mut fstats: Vec<MemStat>,
+        relocs: HashMap<u64, (u64, LenSeq)>,
+        obsoleted: &[u64],
+    ) -> Vec<PersistStat> {
+        for fstat in &fstats {
+            must_true!(eq fstat.active_size, fstat.total_size);
+        }
+        let output_index: HashMap<u64, usize> = fstats
+            .iter()
+            .enumerate()
+            .map(|(idx, stat)| (stat.file_id, idx))
+            .collect();
 
         // apply deactived frames while we are performing compaction
         let mut seqs = vec![];
         let mut junks = self.common.junk.take();
         for (_, q) in junks.iter_mut() {
             for &addr in q.iter() {
-                if let Some(ls) = relocs.get(&addr) {
-                    fstat.active_size -= ls.active_len() as usize;
+                if let Some(ls) = relocs.get(&addr)
+                    && let Some(&idx) = output_index.get(&ls.0)
+                {
+                    let fstat = &mut fstats[idx];
+                    fstat.active_size -= ls.1.active_len() as usize;
                     fstat.active_elems -= 1;
-                    fstat.mask.as_mut().expect("mask loaded").set(ls.seq);
-                    seqs.push(ls.seq);
+                    fstat.mask.as_mut().expect("mask loaded").set(ls.1.seq);
+                    seqs.push((ls.0, ls.1.seq));
                 }
             }
         }
-
-        let stat = PersistStat::from_parts(fstat.inner, seqs);
 
         for &id in obsoleted {
             self.remove_stat(id);
             self.common.cache.del(id);
         }
 
-        self.add_stat_mem(fstat);
-        stat
+        let mut stats = Vec::with_capacity(fstats.len());
+        for fstat in fstats {
+            let inactive = seqs
+                .iter()
+                .filter_map(|(file_id, seq)| (*file_id == fstat.file_id).then_some(*seq))
+                .collect();
+            let stat = PersistStat::from_parts(fstat.inner, inactive);
+            self.add_stat_mem(fstat);
+            stats.push(stat);
+        }
+        stats
     }
 
     pub(crate) fn remove_stat_interval(&self, data: &[u64]) {

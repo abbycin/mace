@@ -1028,28 +1028,28 @@ impl Manifest {
         self.stat_ctx(kind).add_stat_mem(stat);
     }
 
-    pub(crate) fn update_stat_interval(
+    pub(crate) fn update_stat_intervals(
         &self,
         kind: FileKind,
-        fstat: MemStat,
-        relocs: HashMap<u64, LenSeq>,
+        fstats: Vec<MemStat>,
+        relocs: HashMap<u64, (u64, LenSeq)>,
         obsoleted: &[u64],
         del_intervals: &[u64],
         remap_intervals: &[IntervalPair],
-    ) -> PersistStat {
-        let bucket_id = fstat.bucket_id;
-        if let Some(ctx) = self.buckets.buckets.get(&bucket_id) {
+    ) -> Vec<PersistStat> {
+        if let Some(ctx) = self.buckets.buckets.get(&fstats[0].bucket_id) {
             let mut lk = stat_intervals(kind, ctx.value()).write();
             for &lo in del_intervals {
                 lk.remove(lo);
             }
+            // split rewrite replaces each old interval with one or more output sub-intervals,
+            // so these lower bounds are new keys rather than existing entries to update
             for i in remap_intervals {
-                lk.update(i.lo_addr, i.hi_addr, i.file_id);
+                lk.insert(i.lo_addr, i.hi_addr, i.file_id);
             }
         }
-
         self.stat_ctx(kind)
-            .update_stat_interval(fstat, relocs, obsoleted)
+            .update_stat_intervals(fstats, relocs, obsoleted)
     }
 
     pub(crate) fn apply_junks(

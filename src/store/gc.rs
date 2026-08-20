@@ -1333,31 +1333,50 @@ impl GarbageCollector {
             if !Self::should_run_rewrite_for_bucket(bucket_id, tgt_ratio, bucket_usage) {
                 continue;
             }
-            if let Some(p) = Self::select_rewrite_batch_for_bucket(ranked, tgt_size, eager) {
+            for p in Self::select_rewrite_batches_for_bucket(ranked, tgt_size, eager) {
                 plans.push((bucket_id, p));
             }
         }
         plans
     }
 
-    fn select_rewrite_batch_for_bucket(
+    fn select_rewrite_batches_for_bucket(
         ranked: Vec<Score>,
         tgt_size: usize,
         eager: bool,
-    ) -> Option<Vec<Score>> {
+    ) -> Vec<Vec<Score>> {
         let mut current = Vec::new();
         let mut current_size = 0usize;
+        let mut batches = Vec::new();
+        let target = tgt_size.max(1);
+
         for s in ranked {
+            // isolate an oversized victim so record-level packing can split it independently
+            if s.size >= target {
+                if eager && current.len() > 1 {
+                    batches.push(std::mem::take(&mut current));
+                    current_size = 0;
+                }
+                batches.push(vec![s]);
+                continue;
+            }
+
+            if eager && !current.is_empty() && current_size + s.size > target && current.len() > 1 {
+                batches.push(std::mem::take(&mut current));
+                current_size = 0;
+            }
             current_size += s.size;
             current.push(s);
-            if current_size >= tgt_size && current.len() > 1 {
-                return Some(current);
+            if current_size >= target && current.len() > 1 {
+                batches.push(std::mem::take(&mut current));
+                current_size = 0;
             }
         }
+
         if eager && current.len() > 1 {
-            return Some(current);
+            batches.push(current);
         }
-        None
+        batches
     }
 
     fn rank_candidates<T, F>(candidates: Vec<T>, tick_for_bucket: F) -> Vec<Score>
@@ -1418,27 +1437,13 @@ impl GarbageCollector {
         let Some(permit) = self.store.manifest.try_acquire_rewrite(bucket_id) else {
             return;
         };
-        let file_id = self.alloc_file_id();
         let tick = self
             .store
             .manifest
             .get_bucket_runtime(bucket_id)
             .next_update_epoch(kind);
-        // stage orphan intent before rewrite output is flushed
-        // crash can happen after file sync but before manifest commit
-        self.store.manifest.stage_orphan_file(kind, file_id);
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash(Self::rewrite_stage_marker_failpoint(kind));
-        let mut builder = RewriteBuilder::new(
-            file_id,
-            opt,
-            candidate.len(),
-            bucket_id,
-            tick,
-            permit.enable_compression,
-            permit.compressors.clone(),
-        );
-        let mut remap_intervals = Vec::with_capacity(candidate.len());
+        let mut items = Vec::new();
+        let mut remap_intervals = Vec::new();
         let mut del_intervals = DelInterval {
             lo: Vec::new(),
             bucket_id,
@@ -1473,9 +1478,10 @@ impl GarbageCollector {
                     .iter()
                     .filter(|m| !bitmap.test(m.val.seq))
                     .map(|m| {
-                        im.test(m.key);
+                        let interval_lo = im.test(m.key);
                         Entry {
                             key: m.key,
+                            interval_lo,
                             raw_len: m.val.raw_len(),
                             compressed_len: m.val.compressed_len(),
                         }
@@ -1486,16 +1492,11 @@ impl GarbageCollector {
                     obsoleted.push(x.id);
                     return None;
                 }
-                im.collect(|unref, ivl| {
-                    let Interval { lo, hi } = ivl;
-                    if unref {
-                        del_intervals.push(lo);
-                    } else {
-                        remap_intervals.push(IntervalPair::new(lo, hi, file_id, bucket_id));
-                        builder.add_interval(lo, hi);
-                    }
+                im.collect(|_, ivl| {
+                    // every old interval is replaced with exact record intervals below
+                    del_intervals.push(ivl.lo);
                 });
-                builder.add_item(RewriteItem::new(x.id, x.up2, active));
+                items.push(RewriteItem::new(x.id, x.up2, active));
                 Some(x.id)
             })
             .collect();
@@ -1504,8 +1505,56 @@ impl GarbageCollector {
         // it's possible that another thread deactivated all live items while we were processing
         self.process_obsoleted_files(kind, &obsoleted, bucket_id);
 
-        let (mut fstat, relocs) = must_ok!(builder.build(kind));
-        fstat.inner.bucket_id = bucket_id;
+        let target = self.target_file_size(kind).max(1);
+        let chunks = split_rewrite_items(items, target, permit.enable_compression);
+        if chunks.is_empty() {
+            return;
+        }
+
+        let mut fstats = Vec::with_capacity(chunks.len());
+        let mut output_ids = Vec::with_capacity(chunks.len());
+        let mut reloc_targets = HashMap::new();
+        for chunk in chunks {
+            let file_id = self.alloc_file_id();
+            // stage orphan intent before rewrite output is flushed
+            self.store.manifest.stage_orphan_file(kind, file_id);
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash(Self::rewrite_stage_marker_failpoint(kind));
+
+            let mut builder = RewriteBuilder::new(
+                file_id,
+                opt,
+                chunk.len(),
+                bucket_id,
+                tick,
+                permit.enable_compression,
+                permit.compressors.clone(),
+            );
+            for item in chunk {
+                let mut begin = 0;
+                while begin < item.pos.len() {
+                    let interval_lo = item.pos[begin].interval_lo;
+                    let mut end = begin + 1;
+                    while end < item.pos.len() && item.pos[end].interval_lo == interval_lo {
+                        end += 1;
+                    }
+                    let lo = item.pos[begin].key;
+                    let hi = item.pos[end - 1].key;
+                    remap_intervals.push(IntervalPair::new(lo, hi, file_id, bucket_id));
+                    builder.add_interval(lo, hi);
+                    begin = end;
+                }
+                builder.add_item(item);
+            }
+            let (mut fstat, relocs) = must_ok!(builder.build(kind));
+            fstat.inner.bucket_id = bucket_id;
+            for (key, reloc) in relocs {
+                must_true!(reloc_targets.insert(key, (file_id, reloc)).is_none());
+            }
+            fstats.push(fstat);
+            output_ids.push(file_id);
+        }
+
         self.store.opt.sync_data_dir();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::rewrite_after_dir_sync_failpoint(kind));
@@ -1513,16 +1562,18 @@ impl GarbageCollector {
         let mut txn = self.store.manifest.begin();
         txn.record(MetaKind::Sequences, self.store.manifest.sequences.deref());
 
-        let stat = self.store.manifest.update_stat_interval(
+        let stats = self.store.manifest.update_stat_intervals(
             kind,
-            fstat,
-            relocs,
+            fstats,
+            reloc_targets,
             &victims,
             &del_intervals,
             &remap_intervals,
         );
 
-        txn.record(Self::stat_meta_kind(kind), &stat);
+        for stat in &stats {
+            txn.record(Self::stat_meta_kind(kind), stat);
+        }
 
         if !del_intervals.is_empty() {
             txn.record(Self::delete_interval_meta_kind(kind), &del_intervals);
@@ -1532,9 +1583,11 @@ impl GarbageCollector {
         }
         let tmp: Delete = victims.into();
         txn.record(Self::delete_meta_kind(kind), &tmp);
-        self.store
-            .manifest
-            .clear_orphan_file(kind, &mut txn, file_id);
+        for &file_id in &output_ids {
+            self.store
+                .manifest
+                .clear_orphan_file(kind, &mut txn, file_id);
+        }
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::rewrite_before_meta_commit_failpoint(kind));
         txn.commit();
@@ -1560,7 +1613,7 @@ impl GarbageCollector {
             kind: Self::rewrite_complete_event(kind),
             bucket_id,
             txid: 0,
-            file_id,
+            file_id: output_ids[0],
             value: victim_count,
         });
     }
@@ -1613,7 +1666,7 @@ fn build_sorted_relocs(pending: &mut [PendingReloc]) -> (Vec<AddrPair>, HashMap<
 struct RewriteBuilder<'a> {
     file_id: u64,
     items: Vec<RewriteItem>,
-    intervals: Vec<u8>,
+    intervals: Vec<Interval>,
     nr_interval: u32,
     weighted_up2_sum: u128,
     weighted_up2_size: u128,
@@ -1657,8 +1710,7 @@ impl<'a> RewriteBuilder<'a> {
     }
 
     fn add_interval(&mut self, lo: u64, hi: u64) {
-        let ivl = Interval::new(lo, hi);
-        self.intervals.extend_from_slice(ivl.as_slice());
+        self.intervals.push(Interval::new(lo, hi));
         self.nr_interval += 1;
     }
 
@@ -1735,8 +1787,13 @@ impl<'a> RewriteBuilder<'a> {
             reloc.extend_from_slice(entry.as_slice());
         }
 
+        self.intervals.sort_unstable_by_key(|ivl| ivl.lo);
+        let mut intervals = Vec::with_capacity(self.intervals.len() * Interval::LEN);
+        for interval in &self.intervals {
+            intervals.extend_from_slice(interval.as_slice());
+        }
         let mut interval_crc = Crc32cHasher::default();
-        let is = self.intervals.as_slice();
+        let is = intervals.as_slice();
         interval_crc.write(is);
         writer.queue(is);
 
@@ -1788,6 +1845,56 @@ struct RewriteItem {
     pos: Vec<Entry>,
 }
 
+fn split_rewrite_items(
+    items: Vec<RewriteItem>,
+    target: usize,
+    enable_compression: bool,
+) -> Vec<Vec<RewriteItem>> {
+    let target = target.max(1);
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    let mut chunk_size = 0usize;
+
+    for item in items {
+        for entry in item.pos {
+            let record_size = if enable_compression && entry.compressed_len != 0 {
+                entry.compressed_len as usize
+            } else {
+                entry.raw_len as usize
+            };
+
+            if record_size >= target {
+                if !chunk.is_empty() {
+                    chunks.push(std::mem::take(&mut chunk));
+                    chunk_size = 0;
+                }
+                chunks.push(vec![RewriteItem::new(item.id, item.up2, vec![entry])]);
+                continue;
+            }
+
+            if chunk_size != 0 && chunk_size + record_size > target {
+                chunks.push(std::mem::take(&mut chunk));
+                chunk_size = 0;
+            }
+            chunk_size += record_size;
+            if let Some(last) = chunk.last_mut()
+                && last.id == item.id
+                && last.up2 == item.up2
+            {
+                last.live_bytes += entry.raw_len as usize;
+                last.pos.push(entry);
+            } else {
+                chunk.push(RewriteItem::new(item.id, item.up2, vec![entry]));
+            }
+        }
+    }
+
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
 impl RewriteItem {
     fn new(id: u64, up2: u64, pos: Vec<Entry>) -> Self {
         let live_bytes = pos.iter().map(|e| e.raw_len as usize).sum();
@@ -1803,6 +1910,8 @@ impl RewriteItem {
 struct Entry {
     /// logical address
     key: u64,
+    /// lower bound of the source interval containing this address
+    interval_lo: u64,
     /// decoded or stored bytes to read
     raw_len: u32,
     /// stored compressed length, 0 means raw
@@ -1826,19 +1935,21 @@ impl InactiveMap {
     }
 
     /// test if interval still has active addr, otherwise those interval will be collected and removed
-    fn test(&mut self, addr: u64) {
+    fn test(&mut self, addr: u64) -> u64 {
         let pos = match self.ivls.binary_search_by(|x| { x.lo }.cmp(&addr)) {
             Ok(pos) => pos,
             Err(pos) => {
                 if pos == 0 {
-                    return;
+                    unreachable!("active address must belong to an interval");
                 }
                 pos - 1
             }
         };
         must_true!(pos < self.ivls.len());
         must_true!(addr >= self.ivls[pos].lo);
+        must_true!(addr <= self.ivls[pos].hi);
         self.map[pos] = true;
+        self.ivls[pos].lo
     }
 
     fn collect<F>(&self, mut f: F)
@@ -2106,8 +2217,9 @@ fn rewrite_record<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AbortCleanChainBounds, Entry, PendingReloc, RewriteBuilder, RewriteItem,
-        build_sorted_relocs, consume_abort_clean_step, validate_abort_clean_link,
+        AbortCleanChainBounds, Entry, PendingReloc, RewriteBuilder, RewriteItem, Score,
+        build_sorted_relocs, consume_abort_clean_step, split_rewrite_items,
+        validate_abort_clean_link,
     };
     use crate::{
         OpCode, Options, RandomPath,
@@ -2237,6 +2349,113 @@ mod tests {
         assert_eq!(data_score.up2, blob_score.up2);
     }
 
+    fn test_score(id: u64, size: usize) -> Score {
+        Score {
+            id,
+            size,
+            rate: 1.0,
+            up2: 0,
+            bucket_id: 0,
+        }
+    }
+
+    #[test]
+    fn rewrite_batches_split_eager_tail_near_target() {
+        let batches = super::GarbageCollector::select_rewrite_batches_for_bucket(
+            vec![
+                test_score(1, 40),
+                test_score(2, 40),
+                test_score(3, 40),
+                test_score(4, 40),
+            ],
+            100,
+            true,
+        );
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].iter().map(|x| x.size).sum::<usize>(), 80);
+        assert_eq!(batches[1].iter().map(|x| x.size).sum::<usize>(), 80);
+    }
+
+    #[test]
+    fn rewrite_batches_non_eager_wait_for_target() {
+        let batches = super::GarbageCollector::select_rewrite_batches_for_bucket(
+            vec![test_score(1, 40), test_score(2, 40), test_score(3, 40)],
+            100,
+            false,
+        );
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].iter().map(|x| x.size).sum::<usize>(), 120);
+    }
+
+    #[test]
+    fn rewrite_batches_non_eager_keeps_underfilled_batch_across_oversized_victim() {
+        let batches = super::GarbageCollector::select_rewrite_batches_for_bucket(
+            vec![
+                test_score(1, 40),
+                test_score(2, 40),
+                test_score(3, 150),
+                test_score(4, 40),
+            ],
+            100,
+            false,
+        );
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].iter().map(|x| x.id).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(
+            batches[1].iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+        assert_eq!(batches[1].iter().map(|x| x.size).sum::<usize>(), 120);
+    }
+
+    #[test]
+    fn rewrite_batches_keep_oversized_victim_alone() {
+        let batches = super::GarbageCollector::select_rewrite_batches_for_bucket(
+            vec![test_score(1, 150), test_score(2, 40), test_score(3, 40)],
+            100,
+            true,
+        );
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].iter().map(|x| x.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            batches[1].iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn oversized_rewrite_victim_is_split_by_records() {
+        let items = vec![RewriteItem::new(
+            7,
+            1,
+            vec![
+                Entry {
+                    key: 10,
+                    interval_lo: 10,
+                    raw_len: 60,
+                    compressed_len: 0,
+                },
+                Entry {
+                    key: 20,
+                    interval_lo: 10,
+                    raw_len: 60,
+                    compressed_len: 0,
+                },
+                Entry {
+                    key: 30,
+                    interval_lo: 10,
+                    raw_len: 150,
+                    compressed_len: 0,
+                },
+            ],
+        )];
+        let chunks = split_rewrite_items(items, 100, false);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].iter().map(|x| x.live_bytes).sum::<usize>(), 60);
+        assert_eq!(chunks[1].iter().map(|x| x.live_bytes).sum::<usize>(), 60);
+        assert_eq!(chunks[2].iter().map(|x| x.live_bytes).sum::<usize>(), 150);
+    }
+
     #[test]
     fn rewrite_builder_emits_v1() {
         let path = RandomPath::new();
@@ -2278,6 +2497,7 @@ mod tests {
             .iter()
             .map(|m| Entry {
                 key: m.key,
+                interval_lo: intervals[0].lo,
                 raw_len: m.val.raw_len(),
                 compressed_len: m.val.compressed_len(),
             })
@@ -2335,6 +2555,7 @@ mod tests {
             .iter()
             .map(|m| Entry {
                 key: m.key,
+                interval_lo: intervals[0].lo,
                 raw_len: m.val.raw_len(),
                 compressed_len: m.val.compressed_len(),
             })

@@ -62,7 +62,7 @@ entries:
       - path: src/store/store.rs
         note: sync built writers before beginning the manifest transaction
       - path: src/store/gc.rs
-        note: rewrite stages orphan intent before rewrite output is flushed and clears it in metadata publish
+        note: multi-output rewrite stages every orphan marker, syncs all replacement files, then clears every marker in one metadata publish
     failure_symptoms:
       - reopen or recovery sees metadata pointing to a file that is missing or truncated
       - crash window leaves a published interval whose payload file is not durable
@@ -70,7 +70,10 @@ entries:
     verifiers:
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
-        note: crash windows around flush publish validate orphan cleanup and durable file survival
+        note: data and blob rewrite crash windows cover marker staging, all-output directory sync, and metadata commit; the data marker case aborts on the second output
+      - type: regression-test
+        path: tests/prod_gc.rs
+        note: oversized_data_rewrite_splits_outputs_and_reopens and oversized_blob_rewrite_splits_outputs_and_reopens verify multi-output publish and reopen visibility
       - type: runtime-order
         path: src/store/store.rs
         note: publish flow orders sync before manifest commit in code
@@ -348,7 +351,7 @@ entries:
       - path: src/meta/manifest.rs
         note: stage_orphan_file and clear_orphan_file are the manifest-side carrier of the protocol
       - path: src/store/gc.rs
-        note: rewrite path reuses the same orphan marker protocol for replacement files
+        note: each multi-output rewrite stages one marker per replacement file and clears all markers in its single publish transaction
     failure_symptoms:
       - orphan files remain after recovery despite marker-driven cleanup
       - recovery deletes non-orphan files because cleanup became heuristic
@@ -356,7 +359,7 @@ entries:
     verifiers:
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
-        note: recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear validates marker-driven cleanup across crash windows
+        note: rewrite crash windows validate marker-driven cleanup across staged multi-output data and blob replacements; the data marker case reaches the second output
       - type: runtime-assert
         path: src/meta/builder.rs
         note: orphan marker update failure panics instead of silently weakening the protocol
@@ -385,7 +388,7 @@ entries:
       - path: src/store/store.rs
         note: publish path records interval metadata and updates in-memory interval state together
       - path: src/store/gc.rs
-        note: rewrite path deletes stale intervals before publishing remapped intervals
+        note: split rewrite deletes every source interval, then inserts sorted non-overlapping output sub-intervals with new lower bounds
     failure_symptoms:
       - interval lookups resolve the wrong file id for a logical address
       - overlap panic under extra_check
@@ -397,6 +400,9 @@ entries:
       - type: runtime-assert
         path: src/utils/interval.rs
         note: insert asserts no overlap under extra_check
+      - type: regression-test
+        path: tests/prod_gc.rs
+        note: oversized data and blob rewrites replace one old interval set with multiple outputs and verify reads after reopen
 
   - id: protocol.reloc_completeness_for_mapped_addrs
     title: every mapped address in a published flush batch must resolve through reloc metadata
@@ -428,7 +434,7 @@ entries:
       - path: src/meta/stat.rs
         note: stat apply uses interval lookup plus reloc lookup as the read-side correctness assumption
       - path: src/store/gc.rs
-        note: rewrite builder sorts reloc entries and asserts uniqueness
+        note: split rewrite rebuilds one unique reloc target per active address and writes address-sorted output interval metadata
     failure_symptoms:
       - can't find addr in reloc panic during reopen, recovery, or GC
       - stat apply or read path observes an interval hit with no matching reloc entry
@@ -440,6 +446,9 @@ entries:
       - type: runtime-assert
         path: src/meta/stat.rs
         note: read/stat paths panic when reloc completeness is violated
+      - type: regression-test
+        path: tests/prod_gc.rs
+        note: oversized data and blob multi-output rewrites reopen and read every updated and untouched record through the new interval and reloc metadata
 
   - id: emergent.checkpoint_live_set_only
     title: checkpoint snapshot must flush only the current live dirty set
@@ -565,6 +574,9 @@ entries:
       - type: regression-test
         path: tests/gc.rs
         note: gc_blob_delete_checkpoint_stays_deleted_without_gc and gc_blob_single_gc_run_stays_deleted_after_reopen verify deleted blob values do not resurrect without scavenge
+      - type: regression-test
+        path: tests/prod_gc.rs
+        note: oversized blob rewrite forces foreground consolidation before GC and verifies the durable junk set is rewritten into multiple outputs without reopen loss
 
   - id: protocol.flush_junk_atomic_with_owner_durability
     title: junk retirement must be atomic with the durability of the owner page closure
@@ -592,7 +604,7 @@ entries:
       - path: src/map/data.rs
         note: checkpoint emits logically unique junk output only after live graph traversal
       - path: src/meta/stat.rs
-        note: junk apply updates stats only while matching interval and reloc metadata remain coherent
+        note: multi-output rewrite applies concurrent junk to the owning output stat before all output stats and interval replacements publish together
     failure_symptoms:
       - durable page images reference an owner closure whose junk retirement is missing
       - GC or publish resurrects or double-retires addresses because junk retirement crossed an invalid boundary
@@ -603,7 +615,10 @@ entries:
         note: lagging-view churn guards against half-persisted reachable junk states
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
-        note: manifest crash windows validate metadata atomicity around publish boundaries
+        note: data and blob rewrite crash windows validate metadata atomicity around staged multi-output publish boundaries
+      - type: regression-test
+        path: tests/prod_gc.rs
+        note: oversized data and blob rewrites verify multi-output interval, stat, and reloc state survives reopen
 
   - id: protocol.history_region_key_locality
     title: history traversal must stay inside each key's declared history region

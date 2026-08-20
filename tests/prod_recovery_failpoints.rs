@@ -332,6 +332,53 @@ fn child_setup_data_gc(db_root: &Path) -> (Mace, Bucket) {
     (mace, bucket)
 }
 
+fn prepare_oversized_data_gc_victim(db_root: &Path) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 256 << 10;
+        opt.wal_buffer_size = 1 << 20;
+        opt.wal_file_size = 1 << 20;
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = false;
+        opt.data_garbage_ratio = 100;
+    });
+    mace.disable_gc();
+    let bucket = mace
+        .new_bucket(
+            "prod",
+            BucketOptions {
+                inline_size: 8192,
+                split_elems: 64,
+                consolidate_threshold: 16,
+                checkpoint_size: 256 << 10,
+                pool_capacity: 512 << 10,
+                enable_backpressure: false,
+                ..BucketOptions::default()
+            },
+        )
+        .expect("create oversized-victim bucket failed");
+    let initial = vec![b'a'; 128];
+    for idx in 0..512 {
+        let txn = bucket.begin().expect("begin oversized-victim seed failed");
+        txn.put(format!("oversized_{idx:04}"), &initial)
+            .expect("put oversized-victim seed failed");
+        txn.commit().expect("commit oversized-victim seed failed");
+    }
+    mace.sync().expect("sync oversized-victim seed failed");
+
+    let updated = vec![b'b'; 128];
+    for idx in (0..512).step_by(4) {
+        let txn = bucket
+            .begin()
+            .expect("begin oversized-victim update failed");
+        txn.upsert(format!("oversized_{idx:04}"), &updated)
+            .expect("update oversized-victim key failed");
+        txn.commit().expect("commit oversized-victim update failed");
+    }
+    mace.sync().expect("sync oversized-victim update failed");
+}
+
 fn child_setup_retire(db_root: &Path) -> (Mace, Bucket) {
     let mace = open_with_tune(db_root, |opt| {
         opt.sync_on_write = true;
@@ -1066,6 +1113,7 @@ fn child_case_txn_commit_abort_window(db_root: &Path) -> ! {
 }
 
 fn child_case_gc_data_before_meta_commit(db_root: &Path) -> ! {
+    prepare_oversized_data_gc_victim(db_root);
     let (mace, bucket) = child_setup_data_gc(db_root);
     seed_committed_and_uncommitted(&bucket, 64, 0);
     drive_gc_pressure(&bucket, 256);
@@ -2001,7 +2049,7 @@ fn chaos_failpoint_gc_data_rewrite_after_stage_marker() {
     let status = spawn_child(
         "gc_data_rewrite_after_stage_marker",
         &path,
-        "mace_gc_data_rewrite_after_stage_marker=abort@1",
+        "mace_gc_data_rewrite_after_stage_marker=abort@2",
     );
     assert_child_aborted(status, "gc-data-after-marker failpoint child should abort");
     assert_bucket_readable(&path);

@@ -42,6 +42,7 @@ impl IntervalMap {
         }
     }
 
+    #[allow(dead_code)]
     pub fn update(&mut self, lo: u64, _hi: u64, val: u64) {
         let e = self.map.entry(lo);
         match e {
