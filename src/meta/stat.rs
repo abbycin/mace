@@ -138,14 +138,9 @@ impl StatCtx {
         total_elems: u32,
         btree: &BTree,
     ) -> Result<BitMap, OpCode> {
-        let mut buf = None;
-        let _ = btree.view(stat_bucket(self.kind), |txn| {
-            if let Ok(v) = txn.get(file_id.to_le_bytes()) {
-                buf = Some(v);
-            }
-            Ok(())
-        });
-        let buf = buf.ok_or(OpCode::NotFound)?;
+        let buf = btree
+            .view(stat_bucket(self.kind), |txn| txn.get(file_id.to_le_bytes()))
+            .map_err(OpCode::from)?;
         Ok(PersistStat::decode_mask_only(&buf, total_elems))
     }
 
@@ -174,6 +169,9 @@ impl StatCtx {
             }
             stat.total_elems
         };
+
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_stat_mask_before_load");
 
         let mask = self.load_mask_from_btree(file_id, total_elems, btree)?;
         let mut loaded = false;
@@ -299,7 +297,7 @@ impl StatCtx {
         ctx: &BucketContext,
         btree: &BTree,
         is_retired: impl Fn(u64) -> bool,
-    ) -> Vec<PersistStat> {
+    ) -> Result<Vec<PersistStat>, OpCode> {
         let grouped: BTreeMap<u64, Vec<u64>> = {
             let lk = stat_intervals(self.kind, ctx).read();
             let mut grouped = BTreeMap::<u64, Vec<u64>>::new();
@@ -323,8 +321,14 @@ impl StatCtx {
             if is_retired(file_id) {
                 continue;
             }
-            if self.ensure_mask(file_id, btree).is_err() {
-                continue;
+            if let Err(err) = self.ensure_mask(file_id, btree) {
+                // reclaim marks a file retired before removing its in-memory stat. A
+                // second check distinguishes that valid handoff from a retained file
+                // whose newly observed junk would otherwise be silently forgotten.
+                if is_retired(file_id) {
+                    continue;
+                }
+                return Err(err);
             }
             if let Some(mut stat) = self.map.get_mut(&file_id) {
                 let mut changed = false;
@@ -349,7 +353,7 @@ impl StatCtx {
                 }
             }
         }
-        v
+        Ok(v)
     }
 
     pub(crate) fn update_stat(&self, stat: &mut MemStat, junk: u64, reloc: &Reloc, tick: u64) {

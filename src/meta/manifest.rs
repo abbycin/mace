@@ -1058,9 +1058,9 @@ impl Manifest {
         bucket_id: u64,
         tick: u64,
         junks: &[u64],
-    ) -> Vec<PersistStat> {
+    ) -> Result<Vec<PersistStat>, OpCode> {
         if junks.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let ctx = self.get_bucket_context_must_exist(bucket_id);
         self.stat_ctx(kind)

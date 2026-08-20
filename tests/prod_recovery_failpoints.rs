@@ -5,6 +5,8 @@ mod common;
 use btree_store::{BTree, Error as BTreeError};
 use common::child_test_command;
 use mace::observe::{CounterMetric, InMemoryObserver};
+#[cfg(feature = "extra_check")]
+use mace::testing;
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -575,7 +577,12 @@ fn drive_blob_gc_pressure(bucket: &Bucket, rounds: usize, blob_size: usize) {
 }
 
 fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted: usize) {
-    let mace = open_with_tune(db_root, |_opt| {});
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = true;
+    });
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
 
@@ -592,7 +599,12 @@ fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted:
 }
 
 fn assert_bucket_readable(db_root: &Path) {
-    let mace = open_with_tune(db_root, |_opt| {});
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = true;
+    });
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
 
@@ -603,20 +615,26 @@ fn assert_bucket_readable(db_root: &Path) {
 }
 
 fn assert_bucket_exists_after_reopen(db_root: &Path, name: &str) {
-    let mace = open_with_tune(db_root, |_opt| {});
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+    });
     let bucket = mace
         .get_bucket(name)
         .expect("bucket should exist after reopen");
     let _view = bucket.view().expect("open bucket view after reopen failed");
+    assert_stable_gc_space_accounting(&mace, db_root);
 }
 
 fn assert_bucket_missing_after_reopen(db_root: &Path, name: &str) {
-    let mace = open_with_tune(db_root, |_opt| {});
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+    });
     match mace.get_bucket(name) {
         Err(OpCode::NotFound) => {}
         Err(err) => panic!("bucket reopen should return NotFound, got {err:?}"),
         Ok(_) => panic!("bucket should be missing after reopen"),
     }
+    assert_stable_gc_space_accounting(&mace, db_root);
 }
 
 fn assert_pending_bucket_survives_reopen(db_root: &Path, bucket_id: u64) {
@@ -630,6 +648,7 @@ fn assert_pending_bucket_survives_reopen(db_root: &Path, bucket_id: u64) {
         has_page || has_data_ivl || has_blob_ivl,
         "pending bucket should keep at least one aux bucket before reap commit"
     );
+    assert_pending_bucket_cleanup_reaches_stable_accounting(db_root, bucket_id);
 }
 
 fn assert_pending_bucket_survives_reopen_without_aux(db_root: &Path, bucket_id: u64) {
@@ -643,6 +662,7 @@ fn assert_pending_bucket_survives_reopen_without_aux(db_root: &Path, bucket_id: 
         !has_page && !has_data_ivl && !has_blob_ivl,
         "pending bucket should keep no aux bucket after finalize-before-commit crash"
     );
+    assert_pending_bucket_cleanup_reaches_stable_accounting(db_root, bucket_id);
 }
 
 fn assert_pending_bucket_reaped_after_reopen(db_root: &Path, bucket_id: u64) {
@@ -656,13 +676,55 @@ fn assert_pending_bucket_reaped_after_reopen(db_root: &Path, bucket_id: u64) {
         !has_page && !has_data_ivl && !has_blob_ivl,
         "reaped bucket should not keep aux buckets after reopen"
     );
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+    });
+    assert_stable_gc_space_accounting(&mace, db_root);
+}
+
+fn assert_pending_bucket_cleanup_reaches_stable_accounting(db_root: &Path, bucket_id: u64) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+    });
+    assert!(
+        pending_bucket_ids(db_root).contains(&bucket_id),
+        "pending bucket id {bucket_id} should remain until recovery GC runs"
+    );
+    assert_stable_gc_space_accounting(&mace, db_root);
+    assert!(
+        !pending_bucket_ids(db_root).contains(&bucket_id),
+        "pending bucket id {bucket_id} should be cleared after recovery GC"
+    );
+    let (has_page, has_data_ivl, has_blob_ivl) = aux_bucket_presence(db_root, bucket_id);
+    assert!(
+        !has_page && !has_data_ivl && !has_blob_ivl,
+        "recovered pending bucket should not keep auxiliary metadata buckets"
+    );
+}
+
+fn assert_stable_gc_space_accounting(mace: &Mace, db_root: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        mace.start_gc();
+        if pending_bucket_ids(db_root).is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pending bucket cleanup did not converge before space accounting check"
+        );
+    }
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(mace);
 }
 
 fn assert_rewrite_visibility_after_reopen(db_root: &Path) {
     let mace = open_with_tune(db_root, |opt| {
-        opt.gc_timeout = 20;
+        opt.gc_timeout = 60_000;
         opt.gc_eager = true;
     });
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
     let payload = vec![b'r'; 1024];
@@ -675,13 +737,17 @@ fn assert_rewrite_visibility_after_reopen(db_root: &Path) {
         mace.start_gc();
         std::thread::sleep(Duration::from_millis(20));
     }
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
 }
 
 fn assert_rewrite_visibility_after_reopen_multi_bucket(db_root: &Path) {
     let mace = open_with_tune(db_root, |opt| {
-        opt.gc_timeout = 20;
+        opt.gc_timeout = 60_000;
         opt.gc_eager = true;
     });
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
     let bucket1 = mace.get_bucket("prod").expect("bucket prod should exist");
     let bucket2 = mace.get_bucket("prod2").expect("bucket prod2 should exist");
     let view1 = bucket1.view().expect("open post-crash view1 failed");
@@ -703,6 +769,8 @@ fn assert_rewrite_visibility_after_reopen_multi_bucket(db_root: &Path) {
         mace.start_gc();
         std::thread::sleep(Duration::from_millis(20));
     }
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
 }
 
 fn data_blob_files(db_root: &Path) -> Vec<PathBuf> {
@@ -875,6 +943,57 @@ fn child_case_flush_after_manifest_commit_with_retire_multi_bucket(db_root: &Pat
     }
 
     wait_for_crash(Duration::from_secs(20))
+}
+
+fn child_case_stat_mask_before_load(db_root: &Path) -> ! {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 16 << 10;
+        opt.wal_buffer_size = 1 << 20;
+        opt.wal_file_size = 1 << 20;
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = false;
+        opt.data_garbage_ratio = 100;
+        opt.stat_mask_cache_count = 1;
+    });
+    mace.disable_gc();
+    let bucket = mace
+        .new_bucket(
+            "prod",
+            BucketOptions {
+                inline_size: 8192,
+                checkpoint_size: 32 << 10,
+                pool_capacity: 64 << 10,
+                enable_backpressure: false,
+                ..BucketOptions::default()
+            },
+        )
+        .expect("create stat-mask failpoint bucket failed");
+    let payload = vec![b's'; 1024];
+
+    let seed = bucket.begin().expect("begin stat-mask seed failed");
+    for idx in 0..256 {
+        seed.put(format!("sm_{idx:04}"), &payload)
+            .expect("seed stat-mask key failed");
+    }
+    seed.commit().expect("commit stat-mask seed failed");
+    bucket.checkpoint();
+    wait_for_data_dir_quiet(db_root, Duration::from_millis(300), Duration::from_secs(20));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let update = bucket.begin().expect("begin stat-mask update failed");
+        for idx in (0..256).step_by(2) {
+            update
+                .upsert(format!("sm_{idx:04}"), &payload)
+                .expect("update stat-mask key failed");
+        }
+        update.commit().expect("commit stat-mask update failed");
+        bucket.checkpoint();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("stat-mask load failpoint did not fire")
 }
 
 fn child_case_data_obsolete_reclaim(db_root: &Path) -> ! {
@@ -1337,6 +1456,7 @@ fn failpoint_child() {
         "flush_after_old_stat_delta" => {
             child_case_flush_after_manifest_commit_with_retire(&db_root)
         }
+        "stat_mask_before_load" => child_case_stat_mask_before_load(&db_root),
         "data_obsolete_reclaim" => child_case_data_obsolete_reclaim(&db_root),
         "blob_obsolete_reclaim" => child_case_blob_obsolete_reclaim(&db_root),
         "wal_after_checkpoint_write" => child_case_wal_after_checkpoint_write(&db_root),
@@ -1556,6 +1676,19 @@ fn chaos_failpoint_flush_after_old_stat_delta() {
     );
     assert_child_aborted(status, "flush-after-old-stat-delta child should abort");
     assert_rewrite_visibility_after_reopen(&path);
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_stat_mask_before_load() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "stat_mask_before_load",
+        &path,
+        "mace_stat_mask_before_load=abort@1",
+    );
+    assert_child_aborted(status, "stat-mask-load child should abort");
+    assert_bucket_readable(&path);
 }
 
 #[test]

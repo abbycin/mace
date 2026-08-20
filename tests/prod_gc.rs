@@ -2,6 +2,8 @@ mod common;
 
 use common::{TestEnv, wait_until};
 use mace::observe::{CounterMetric, InMemoryObserver};
+#[cfg(feature = "extra_check")]
+use mace::testing;
 use mace::{Bucket, BucketOptions, OpCode, Options};
 use std::path::Path;
 use std::sync::Arc;
@@ -170,6 +172,8 @@ fn oversized_data_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         .filter(|(id, _)| *id > before_max)
         .collect::<Vec<_>>();
     assert_rewrite_outputs_near_target(&outputs, rewrite_target as u64);
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&engine);
     drop(bucket);
     drop(engine);
 
@@ -183,6 +187,8 @@ fn oversized_data_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
     let bucket = engine
         .get_bucket("oversized_data")
         .expect("load rewritten data bucket");
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&engine);
     let view = bucket.view()?;
     for (idx, key) in keys.iter().enumerate() {
         let expected = if idx % 2 == 0 { &updated } else { &initial };
@@ -277,6 +283,8 @@ fn oversized_blob_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         .filter(|(id, _)| *id > before_max)
         .collect::<Vec<_>>();
     assert_rewrite_outputs_near_target(&outputs, rewrite_target as u64);
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&engine);
     drop(bucket);
     drop(engine);
 
@@ -286,6 +294,8 @@ fn oversized_blob_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         options.blob_file_size = rewrite_target;
     })?;
     let bucket = engine.get_bucket("oversized_blob")?;
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&engine);
     let view = bucket.view()?;
     for (idx, key) in keys.iter().enumerate() {
         let expected = if idx % 2 == 0 { &updated } else { &initial };

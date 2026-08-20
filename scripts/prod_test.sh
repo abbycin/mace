@@ -37,6 +37,41 @@ fast_targets=(
   prod_recovery_failpoints
 )
 
+gc_space_accounting_cases=(
+  "gc:persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen:normal"
+  "gc:compressed_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen:normal"
+  "gc:persisted_gc_stats_are_bucket_scoped:normal"
+  "prod_recovery_failpoints:chaos_failpoint_stat_mask_before_load:crash"
+  "prod_recovery_failpoints:chaos_failpoint_flush_after_data_sync:crash"
+  "prod_recovery_failpoints:chaos_failpoint_flush_after_data_dir_sync:crash"
+  "prod_recovery_failpoints:chaos_failpoint_flush_before_manifest_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_flush_after_manifest_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_flush_after_manifest_commit_with_retire:crash"
+  "prod_recovery_failpoints:chaos_failpoint_flush_after_data_sync_with_retire:crash"
+  "prod_recovery_failpoints:chaos_failpoint_flush_before_manifest_commit_with_retire:crash"
+  "prod_recovery_failpoints:chaos_failpoint_flush_after_manifest_commit_with_retire_multi_bucket:crash"
+  "prod_recovery_failpoints:chaos_failpoint_flush_after_old_stat_delta:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_rewrite_before_meta_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_rewrite_after_stage_marker:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_rewrite_after_data_dir_sync:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_rewrite_after_meta_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_blob_rewrite_before_meta_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_blob_rewrite_after_stage_marker:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_blob_rewrite_after_data_dir_sync:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_blob_rewrite_after_meta_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_after_meta_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_after_retired_mark:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_after_remove_stat:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_blob_obsolete_after_meta_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_blob_obsolete_after_retired_mark:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_blob_obsolete_after_remove_stat:crash"
+  "prod_recovery_failpoints:chaos_failpoint_bucket_delete_before_manifest_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_bucket_delete_after_manifest_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_pending_bucket_reap_after_batch_before_finalize:crash"
+  "prod_recovery_failpoints:chaos_failpoint_pending_bucket_reap_after_finalize_before_meta_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_pending_bucket_reap_after_meta_commit:crash"
+)
+
 stress_cases=(
   "prod_bucket:stress_create_delete"
   "prod_concurrency:stress_bucket_churn"
@@ -131,6 +166,39 @@ run_cmd() {
   return "$code"
 }
 
+run_gc_space_accounting_case() {
+  local target="$1"
+  local test_name="$2"
+  local mode="$3"
+  local case_features="failpoints,extra_check"
+  local listed
+  local list_code=0
+
+  set +e
+  listed="$(timeout "$fast_timeout" cargo test --features "$case_features" --test "$target" "$test_name" -- --list 2>/dev/null)"
+  list_code=$?
+  set -e
+  if [[ "$list_code" -ne 0 ]]; then
+    echo "==> [fast:gc_space_accounting:${test_name}:list] failed with exit code ${list_code}"
+    return "$list_code"
+  fi
+
+  local count
+  count="$(printf '%s\n' "$listed" | grep -Fxc "${test_name}: test" || true)"
+  if [[ "$count" != "1" ]]; then
+    echo "==> [fast:gc_space_accounting:${test_name}:list] expected one test with --features ${case_features}, found ${count}"
+    run_cmd "fast:gc_space_accounting:${test_name}:list-diagnostic" "$fast_timeout" \
+      cargo test --features "$case_features" --test "$target" "$test_name" -- --list || true
+    return 1
+  fi
+
+  local args=(test --features "$case_features" --test "$target" "$test_name" -- --exact --nocapture --test-threads="$test_threads")
+  if [[ "$mode" == "crash" ]]; then
+    args=(test --features "$case_features" --test "$target" "$test_name" -- --ignored --exact --nocapture --test-threads="$test_threads")
+  fi
+  run_cmd "fast:gc_space_accounting:${test_name}" "$fast_timeout" cargo "${args[@]}"
+}
+
 run_fast() {
   local args=(test --features "$features")
   for target in "${fast_targets[@]}"; do
@@ -179,6 +247,17 @@ run_fast() {
     cargo test --features "$gen_features" --test "$gen_target" -- --nocapture --test-threads="$test_threads"; then
     failures+=("fast:prod_generation_failpoints")
   fi
+
+  # gc space accounting needs the physical payload oracle, which is intentionally
+  # compiled only with extra_check. keep this explicit so the failpoints-only
+  # default cannot silently turn the recovery checks into visibility-only tests.
+  local entry target test_name mode
+  for entry in "${gc_space_accounting_cases[@]}"; do
+    IFS=':' read -r target test_name mode <<<"$entry"
+    if ! run_gc_space_accounting_case "$target" "$test_name" "$mode"; then
+      failures+=("fast:gc_space_accounting:${test_name}")
+    fi
+  done
 }
 
 run_stress() {

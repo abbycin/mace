@@ -4,6 +4,8 @@
 - Added route-aware WAL recovery with separate per-group and shared-WAL namespaces
 - Added safe route switching and legacy WAL layout migration without changing the WAL record or manifest formats
 - Reworked data and blob GC rewrite packing so oversized victims are split at record boundaries into multiple files near the configured target size; only an individual oversized record may exceed that target
+- Added an `extra_check` persisted GC space-accounting constraint: independently parse retained data/blob relocation payloads and require exact agreement with persisted active/inactive stats, bucket-scoped interval metadata, durable reachability, obsolete/orphan cleanup state, and files visible through the configured filesystem
+- Added normal, graceful-reopen, and crash-recovery coverage for that constraint, including flush, data/blob rewrite and obsolete-reclaim windows, logical bucket deletion, and interrupted pending-bucket reaping; the production fast gate runs these cases with `failpoints,extra_check`
 
 ### Bug Fixes
 - Fixed data/blob garbage-stat persistence dropping inactive sequences from earlier checkpoints, which could make reopen classify durable junk as live and prevent GC space reclamation

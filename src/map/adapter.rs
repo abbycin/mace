@@ -126,10 +126,12 @@ impl ManifestCheckpointObserver {
                 })
                 .unwrap_or_else(|| self.next_tick(bucket_id, kind));
             let mut by_file = BTreeMap::<u64, PersistStat>::new();
-            for stat in self
-                .manifest
-                .apply_junks(kind, bucket_id, tick, &result.kind(kind).junk)
-            {
+            let stats =
+                must_ok!(
+                    self.manifest
+                        .apply_junks(kind, bucket_id, tick, &result.kind(kind).junk)
+                );
+            for stat in stats {
                 by_file.insert(stat.file_id, stat);
             }
             delta.kind_mut(kind).old_stats = by_file.into_values().collect();

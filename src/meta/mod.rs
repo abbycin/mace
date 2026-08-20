@@ -7,6 +7,8 @@ mod txn;
 use crate::map::buffer::BucketContext;
 use crate::utils::interval::IntervalMap;
 use crate::utils::options::ParsedOptions;
+#[cfg(feature = "extra_check")]
+pub(crate) use entry::IMetaCodec;
 pub use entry::{
     BucketDurableFrontier, BucketMeta, DelInterval, Delete, FileKind, IntervalPair, MemStat,
     MetaKind, MetaOp, PageTable, PersistStat, Sequences, StatInner, WalRecycleState,

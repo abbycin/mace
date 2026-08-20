@@ -631,7 +631,10 @@ entries:
       manifest publish boundary. A later checkpoint may add inactive sequences but must never drop
       an already persisted sequence while the file remains retained. Reopen must reconstruct the
       same inactive set, so a page that was durably retired cannot become GC-active again solely
-      because a later stat update overwrote the metadata value.
+      because a later stat update overwrote the metadata value. If a retained file needs a lazy
+      bitmap load while recording newly observed junk, a missing or unreadable stat is a failed
+      checkpoint publish, not permission to omit that junk; only a file already retired by GC may
+      be skipped because its reclaim/rewrite owner has taken over accounting.
     watch_points:
       - path: src/meta/stat.rs
         note: apply_junks updates the in-memory bitmap and constructs the persisted stat value
@@ -650,8 +653,11 @@ entries:
         note: decode_mask_only reconstructs the bitmap from the complete persisted sequence list
       - path: src/meta/txn.rs
         note: record_stat_update uses MetaOp::Update, making complete-value persistence mandatory
+      - path: src/map/adapter.rs
+        note: retained bitmap-load failure reaches the checkpoint fatal boundary before task completion
     failure_symptoms:
       - a later checkpoint drops old inactive sequences and a reopen treats durable junk as active
+      - a retained stat bitmap load fails and the checkpoint silently confirms without recording its junk
       - data or blob GC stops selecting files that still contain physically reclaimable garbage
       - repeated GC rounds retain substantially more disk space than the durable reachable set
     verifiers:
@@ -660,7 +666,74 @@ entries:
         note: full_mask_persistence_keeps_prior_inactive_sequences verifies an old inactive sequence remains after a later one is added
       - type: integration-test
         path: tests/gc.rs
-        note: GC checkpoint and reopen coverage exercises durable stat consumption during reclaim
+        note: two independent junk checkpoints, GC invocation, and graceful reopen validate data/blob stat consumption
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: stat-mask lazy-load crash proves recovery keeps the last complete metadata state
+
+  - id: protocol.persist_stat_matches_payload_relocations
+    title: GC space accounting must exactly match retained data/blob payloads
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      The physical relocation tables in retained data/blob files are the authoritative GC space
+      ledger. At a stable point after checkpoint/GC or recovery, durable reachability is derived
+      independently from page-table roots, page links, history references, and leaf remote-blob
+      references, scoped by `(bucket_id, logical_addr)`. For every retained relocation, its sequence is in `PersistStat.inactive_elems`
+      if and only if its physical address is absent from that reachable set. `total_elems` equals
+      relocation count, `total_size` equals stored active-length sum, and `active_elems` and
+      `active_size` equal the corresponding count and bytes after excluding exactly that inactive
+      set. Every payload interval must exactly match manifest interval metadata for its bucket/file.
+      Interval metadata is enumerated from both retained stats and the complete metadata-bucket
+      catalog, so an interval-only or orphan interval bucket is rejected too. At the same stable point, obsolete
+      data/blob sets and orphan markers must be empty, and every physical payload file discovered
+      through the configured filesystem must have retained stat metadata. This equality must survive graceful
+      shutdown/reopen and failpoint-induced process abort/recovery, before and after another GC
+      round, including logical bucket deletion and recovery of an interrupted pending-bucket reap.
+      A mismatch is a space-accounting leak: garbage may become permanently invisible to selection
+      or cleanup may permanently retain a payload file.
+    watch_points:
+      - path: src/meta/entry.rs
+        note: PersistStat layout and inactive sequence encoding define the durable accounting image
+      - path: src/meta/stat.rs
+        note: apply_junks changes active counts and builds replacing persisted stats
+      - path: src/map/adapter.rs
+        note: checkpoint publish atomically records old stat updates with new files and intervals
+      - path: src/map/data.rs
+        note: flush writes physical relocation and interval tables
+      - path: src/store/gc.rs
+        note: rewrite builds replacement relocation/stat/interval metadata and retires victims
+      - path: src/testing.rs
+        note: extra_check oracle derives physical reachability and compares it with stat, interval, obsolete, and orphan metadata through the configured filesystem
+    witnesses:
+      - path: src/map/data.rs
+        note: file builder derives initial stat elements and bytes from emitted relocation records
+      - path: src/meta/stat.rs
+        note: persisted inactive sequences are drawn from the file-local bitmap before a stat replacement
+      - path: src/store/gc.rs
+        note: rewrite derives replacement stats and relocations from the active victim entries
+      - path: src/testing.rs
+        note: assert_persisted_gc_stats walks bucket-scoped page-table/link/history/remote reachability and requires inactive sequences to be its exact physical complement
+    failure_symptoms:
+      - a reachable relocation is marked inactive, or an unreachable relocation remains active
+      - stat active or total counts disagree with physical records after checkpoint or reopen
+      - an inactive sequence is duplicated, out of range, or missing from a retained file's stat
+      - a retained file lacks stat or interval metadata, or a stat references a missing payload file
+      - obsolete metadata, orphan markers, or payload files remain after stable recovery cleanup
+    verifiers:
+      - type: integration-test
+        path: tests/gc.rs
+        note: compressed and uncompressed single- and multi-bucket data/blob checkpoint, GC, and reopen tests verify physical accounting and bucket-local address isolation
+      - type: regression-test
+        path: tests/prod_gc.rs
+        note: oversized data/blob rewrite tests invoke the physical accounting oracle before and after graceful reopen
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: stat-mask, all flush and data/blob rewrite, all data/blob obsolete-reclaim, and bucket delete/pending-reap crash recovery paths reopen under failpoints,extra_check, finish recovery GC where pending deletion is allowed, and invoke the same physical reachability/accounting oracle
+      - type: production-gate
+        path: scripts/prod_test.sh
+        note: fast list-count guards run compressed and uncompressed normal cases plus stat-mask, all flush/rewrite, all six obsolete-reclaim, and every bucket delete/pending-reap abort recovery probe explicitly with failpoints,extra_check
 
   - id: protocol.history_region_key_locality
     title: history traversal must stay inside each key's declared history region

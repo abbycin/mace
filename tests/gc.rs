@@ -15,6 +15,247 @@ fn counter_value(observer: &InMemoryObserver, metric: CounterMetric) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "extra_check")]
+#[test]
+fn persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen() -> Result<(), OpCode> {
+    run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(false)
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn compressed_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen()
+-> Result<(), OpCode> {
+    run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(true)
+}
+
+#[cfg(feature = "extra_check")]
+fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
+    enable_compression: bool,
+) -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.sync_on_write = true;
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = true;
+    opt.data_garbage_ratio = 1;
+    opt.blob_garbage_ratio = 1;
+    opt.data_file_size = 64 << 10;
+    opt.blob_file_size = 64 << 10;
+    let mace = Mace::new(opt.validate()?)?;
+    mace.disable_gc();
+    let bucket = mace.new_bucket(
+        "stats",
+        BucketOptions {
+            inline_size: 1024,
+            checkpoint_size: 64 << 10,
+            pool_capacity: 128 << 10,
+            enable_backpressure: false,
+            enable_compression,
+            ..BucketOptions::default()
+        },
+    )?;
+    let blob_keys = (0..96).map(|idx| format!("b_{idx:03}")).collect::<Vec<_>>();
+    let data_keys = (0..384)
+        .map(|idx| format!("d_{idx:03}"))
+        .collect::<Vec<_>>();
+    let make_blob = |seed: u8| {
+        let mut value = vec![0; 8 << 10];
+        let mut state = u32::from(seed);
+        for (idx, byte) in value[..4 << 10].iter_mut().enumerate() {
+            state = state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223u32.wrapping_add(idx as u32));
+            *byte = (state >> 24) as u8;
+        }
+        value.copy_within(..4 << 10, 4 << 10);
+        value
+    };
+    let v1 = make_blob(b'a');
+    let v2 = make_blob(b'b');
+    let v3 = make_blob(b'c');
+    let d1 = vec![b'x'; 512];
+    let d2 = vec![b'y'; 512];
+    let d3 = vec![b'z'; 512];
+
+    let tx = bucket.begin()?;
+    for key in &blob_keys {
+        tx.put(key, &v1)?;
+    }
+    for key in &data_keys {
+        tx.put(key, &d1)?;
+    }
+    tx.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+    testing::assert_persisted_gc_stats(&mace);
+
+    let tx = bucket.begin()?;
+    for key in blob_keys.iter().step_by(2) {
+        tx.update(key, &v2)?;
+    }
+    for key in data_keys.iter().step_by(2) {
+        tx.update(key, &d2)?;
+    }
+    tx.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+    testing::assert_persisted_gc_stats(&mace);
+
+    let tx = bucket.begin()?;
+    for key in blob_keys.iter().step_by(4) {
+        tx.update(key, &v3)?;
+    }
+    for key in data_keys.iter().step_by(4) {
+        tx.update(key, &d3)?;
+    }
+    tx.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+    testing::assert_persisted_gc_stats(&mace);
+
+    mace.enable_gc();
+    let data_gc_before = mace.data_gc_count();
+    let blob_gc_before = mace.blob_gc_count();
+    let gc_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < gc_deadline
+        && (mace.data_gc_count() == data_gc_before || mace.blob_gc_count() == blob_gc_before)
+    {
+        mace.start_gc();
+    }
+    assert!(
+        mace.data_gc_count() > data_gc_before,
+        "expected data GC to run"
+    );
+    assert!(
+        mace.blob_gc_count() > blob_gc_before,
+        "expected blob GC to run"
+    );
+    testing::assert_persisted_gc_stats(&mace);
+
+    drop(bucket);
+    drop(mace);
+
+    let mut reopen = Options::new(&*path);
+    reopen.sync_on_write = true;
+    reopen.gc_timeout = 60_000;
+    reopen.gc_eager = true;
+    reopen.data_garbage_ratio = 1;
+    reopen.blob_garbage_ratio = 1;
+    reopen.data_file_size = 64 << 10;
+    reopen.blob_file_size = 64 << 10;
+    let mace = Mace::new(reopen.validate()?)?;
+    let bucket = mace.get_bucket("stats")?;
+    testing::assert_persisted_gc_stats(&mace);
+    let view = bucket.view()?;
+    for (idx, key) in blob_keys.iter().enumerate() {
+        let expected = if idx % 4 == 0 {
+            &v3
+        } else if idx % 2 == 0 {
+            &v2
+        } else {
+            &v1
+        };
+        assert_eq!(view.get(key)?.slice(), expected.as_slice());
+    }
+    for (idx, key) in data_keys.iter().enumerate() {
+        let expected = if idx % 4 == 0 {
+            &d3
+        } else if idx % 2 == 0 {
+            &d2
+        } else {
+            &d1
+        };
+        assert_eq!(view.get(key)?.slice(), expected.as_slice());
+    }
+    mace.start_gc();
+    testing::assert_persisted_gc_stats(&mace);
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.sync_on_write = true;
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = true;
+    opt.data_garbage_ratio = 1;
+    opt.blob_garbage_ratio = 1;
+    opt.data_file_size = 64 << 10;
+    opt.blob_file_size = 64 << 10;
+    let mace = Mace::new(opt.validate()?)?;
+    mace.disable_gc();
+    let bucket_options = BucketOptions {
+        inline_size: 1024,
+        checkpoint_size: 64 << 10,
+        pool_capacity: 128 << 10,
+        enable_backpressure: false,
+        ..BucketOptions::default()
+    };
+    let alpha = mace.new_bucket("alpha", bucket_options)?;
+    let beta = mace.new_bucket("beta", bucket_options)?;
+    let data_v1 = vec![b'a'; 512];
+    let data_v2 = vec![b'b'; 512];
+    let blob_v1 = vec![b'x'; 8 << 10];
+    let blob_v2 = vec![b'y'; 8 << 10];
+
+    for bucket in [&alpha, &beta] {
+        let tx = bucket.begin()?;
+        for idx in 0..96 {
+            tx.put(format!("data_{idx:03}"), &data_v1)?;
+            tx.put(format!("blob_{idx:03}"), &blob_v1)?;
+        }
+        tx.commit()?;
+        testing::checkpoint_and_wait(bucket);
+    }
+    for bucket in [&alpha, &beta] {
+        let tx = bucket.begin()?;
+        for idx in (0..96).step_by(2) {
+            tx.update(format!("data_{idx:03}"), &data_v2)?;
+            tx.update(format!("blob_{idx:03}"), &blob_v2)?;
+        }
+        tx.commit()?;
+        testing::checkpoint_and_wait(bucket);
+    }
+    testing::assert_persisted_gc_stats(&mace);
+
+    mace.enable_gc();
+    let data_gc_before = mace.data_gc_count();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && mace.data_gc_count() == data_gc_before {
+        mace.start_gc();
+    }
+    assert!(
+        mace.data_gc_count() > data_gc_before,
+        "expected data GC to run"
+    );
+    testing::assert_persisted_gc_stats(&mace);
+
+    drop(alpha);
+    drop(beta);
+    drop(mace);
+
+    let mut reopen = Options::new(&*path);
+    reopen.sync_on_write = true;
+    reopen.gc_timeout = 60_000;
+    reopen.gc_eager = true;
+    reopen.data_garbage_ratio = 1;
+    reopen.blob_garbage_ratio = 1;
+    reopen.data_file_size = 64 << 10;
+    reopen.blob_file_size = 64 << 10;
+    let mace = Mace::new(reopen.validate()?)?;
+    testing::assert_persisted_gc_stats(&mace);
+    for name in ["alpha", "beta"] {
+        let bucket = mace.get_bucket(name)?;
+        let view = bucket.view()?;
+        assert_eq!(view.get("data_000")?.slice(), data_v2.as_slice());
+        assert_eq!(view.get("data_001")?.slice(), data_v1.as_slice());
+        assert_eq!(view.get("blob_000")?.slice(), blob_v2.as_slice());
+        assert_eq!(view.get("blob_001")?.slice(), blob_v1.as_slice());
+    }
+    mace.start_gc();
+    testing::assert_persisted_gc_stats(&mace);
+    Ok(())
+}
+
 #[test]
 fn gc_data() -> Result<(), OpCode> {
     let path = RandomPath::new();
