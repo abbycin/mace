@@ -17,6 +17,7 @@ Mace is a high-performance, embedded key-value storage engine written in Rust, c
 - **Data Integrity**: CRC checksums on persisted records, verified across restarts and crashes.
 - **Flow Control**: Optional foreground write backpressure to bound memory growth.
 - **Cross-Platform**: Linux, Windows, FreeBSD and macOS.
+
 ## Quick Start
 
 The following example demonstrates basic transaction management and data retrieval:
@@ -56,23 +57,6 @@ Detailed usage can be found in [examples/demo.rs](./examples/demo.rs).
 Latest results: https://o2c.fun/benchmark.html
 
 Methodology and comparison with other engines: [kv_bench](https://github.com/abbycin/kv_bench).
-
-## Validation
-
-- Correctness/crash matrix: `./scripts/prod_test.sh all 8`
-- Script details: [scripts/README.md](./scripts/README.md)
-
-### Stateful Fuzzing
-
-Mace uses `cargo-fuzz` for stateful lifecycle fuzzing. The target is not decoder robustness against
-random bytes, but whether Mace's own write, checkpoint, GC, reopen, and bucket-lifecycle paths can
-produce state that later becomes unreadable, invisible, or inconsistent:
-
-- lagging snapshot views must not lose versions that should still be visible
-- checkpoint and reopen must not make committed state disappear or change visibility
-- publish, GC, and bucket churn must not produce broken metadata or self-inconsistent durable state
-
-Targets and replay commands are in [fuzz/README.md](./fuzz/README.md).
 
 ## Design Notes
 

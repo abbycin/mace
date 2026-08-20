@@ -171,13 +171,29 @@ impl ManifestCheckpointObserver {
             .map(|x| *x.value())
             .unwrap_or_else(init_group_pos);
         let groups = self.ctx.groups();
+        let durable = self.ctx.opt.sync_on_write;
 
         // page checkpoint can fold uncleaned txn versions into durable pages, recovery still needs
         // the corresponding WAL tail to rebuild tx outcomes before safe_txid can expose them
-        for (i, g) in groups.iter().enumerate() {
-            if i < frontier_delta.len() && frontier_delta[i] > previous_frontier[i] {
-                let mut log = g.logging.lock();
-                must_ok!(log.sync_checkpoint_barrier());
+        if durable {
+            if frontier_delta
+                .iter()
+                .zip(previous_frontier.iter())
+                .take(groups.len())
+                .any(|(pos, prev)| *pos > *prev)
+            {
+                let ticket = {
+                    let mut log = self.ctx.lock_shared_logging(0);
+                    must_ok!(log.barrier_register())
+                };
+                must_ok!(self.ctx.drive_sync(&ticket));
+            }
+        } else {
+            for (i, g) in groups.iter().enumerate() {
+                if i < frontier_delta.len() && frontier_delta[i] > previous_frontier[i] {
+                    let mut log = g.logging.lock();
+                    must_ok!(log.sync_checkpoint_barrier());
+                }
             }
         }
 
@@ -228,23 +244,29 @@ impl ManifestCheckpointObserver {
             Self::abort_flush_publish("after manifest commit", e);
         }
 
-        let groups = self.ctx.groups();
-        let sync = self.ctx.opt.sync_on_write;
         let global_frontier = self.manifest.global_frontier_lower_bound(groups.len());
 
-        for (i, g) in groups.iter().enumerate() {
-            let mut pos = global_frontier[i];
-            let mut lk = g.logging.lock();
-            if let Some(min) = g.min_active_lsn(&mut lk)
-                && min < pos
-            {
-                pos = min;
+        if durable {
+            let mut lk = self.ctx.lock_shared_logging(0);
+            for (i, g) in groups.iter().enumerate() {
+                let mut pos = global_frontier[i];
+                if let Some(min) = g.min_active_lsn(&mut lk) {
+                    pos = pos.min(min);
+                }
+                lk.update_checkpoint_for(pos, i);
             }
-            if lk.update_checkpoint(pos) && sync {
-                let mut f = lk.writer.clone();
-                drop(lk);
-                // checkpoint must be synced in durable mode
-                f.sync();
+            // durable checkpoints only flush the hint
+        } else {
+            // relaxed checkpoints update only the owning group's floor
+            for (i, g) in groups.iter().enumerate() {
+                let mut lk = g.logging.lock();
+                let mut pos = global_frontier[i];
+                if let Some(min) = g.min_active_lsn(&mut lk)
+                    && min < pos
+                {
+                    pos = min;
+                }
+                lk.update_checkpoint_for(pos, i);
             }
         }
     }

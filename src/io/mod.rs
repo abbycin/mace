@@ -44,8 +44,6 @@ pub(crate) trait FileSystem: Send + Sync {
 
     fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, io::Error>;
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<(), io::Error>;
-
     fn remove_file(&self, path: &Path) -> Result<(), io::Error>;
 
     fn sync_dir(&self, path: &Path) -> Result<(), io::Error>;
@@ -160,12 +158,6 @@ impl FileSystem for OsFileSystem {
             .collect()
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<(), io::Error> {
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::check_fs(FsOp::Rename, from)?;
-        std::fs::rename(from, to)
-    }
-
     fn remove_file(&self, path: &Path) -> Result<(), io::Error> {
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check_fs(FsOp::RemoveFile, path)?;
@@ -195,7 +187,6 @@ pub(crate) mod testfs {
         TryExists,
         CreateDirAll,
         ReadDir,
-        Rename,
         RemoveFile,
         SyncDir,
     }
@@ -299,11 +290,6 @@ pub(crate) mod testfs {
         fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, io::Error> {
             self.check(InjectOp::ReadDir, path)?;
             self.os.read_dir(path)
-        }
-
-        fn rename(&self, from: &Path, to: &Path) -> Result<(), io::Error> {
-            self.check(InjectOp::Rename, from)?;
-            self.os.rename(from, to)
         }
 
         fn remove_file(&self, path: &Path) -> Result<(), io::Error> {

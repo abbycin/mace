@@ -30,7 +30,7 @@ fn concurrent_short_lived_views(
     threads: usize,
     views_per_thread: usize,
 ) -> Result<Duration, OpCode> {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.sync_on_write = false;
     let mace = Mace::new(opt.validate().unwrap())?;

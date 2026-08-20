@@ -41,7 +41,6 @@ struct PersistedGlobalOptions {
     wal_buffer_size: usize,
     max_ckpt_per_txn: usize,
     wal_file_size: u32,
-    keep_stable_wal_file: bool,
     truncate_corrupted_wal: bool,
 }
 
@@ -63,7 +62,6 @@ impl PersistedGlobalOptions {
         opt.wal_buffer_size = self.wal_buffer_size;
         opt.max_ckpt_per_txn = self.max_ckpt_per_txn;
         opt.wal_file_size = self.wal_file_size;
-        opt.keep_stable_wal_file = self.keep_stable_wal_file;
         opt.truncate_corrupted_wal = self.truncate_corrupted_wal;
     }
 }
@@ -453,37 +451,6 @@ fn child_setup_wal_recycle(db_root: &Path) -> (Mace, Bucket) {
     (mace, bucket)
 }
 
-fn child_setup_wal_recycle_keep_stable(db_root: &Path) -> (Mace, Bucket) {
-    let mace = open_with_tune(db_root, |opt| {
-        opt.concurrent_write = 1;
-        opt.sync_on_write = true;
-        opt.data_file_size = 16 << 10;
-        opt.wal_buffer_size = 8 << 10;
-        opt.wal_file_size = 4 << 10;
-        opt.gc_timeout = 60_000;
-        opt.gc_eager = false;
-        opt.keep_stable_wal_file = true;
-    });
-
-    let bucket = match mace.get_bucket("prod") {
-        Ok(bucket) => bucket,
-        Err(OpCode::NotFound) => mace
-            .new_bucket(
-                "prod",
-                BucketOptions {
-                    inline_size: 512,
-                    cache_evict_pct: 10,
-                    enable_backpressure: false,
-                    ..BucketOptions::default()
-                },
-            )
-            .expect("create prod bucket failed"),
-        Err(err) => panic!("open prod bucket failed: {err:?}"),
-    };
-
-    (mace, bucket)
-}
-
 fn seed_committed_and_uncommitted(bucket: &Bucket, committed: usize, uncommitted: usize) {
     let txn = bucket.begin().expect("begin committed txn failed");
     for idx in 0..committed {
@@ -712,10 +679,14 @@ fn data_blob_files(db_root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn wal_files(db_root: &Path, group: u8) -> Vec<PathBuf> {
+fn wal_files(db_root: &Path, physical: u8) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let root = db_root.join("log");
-    let prefix = format!("wal_{group}_");
+    let prefix = if physical == Options::SHARED_ID {
+        "group_wal_".to_string()
+    } else {
+        format!("wal_{physical}_")
+    };
     let entries = std::fs::read_dir(&root).expect("read log dir failed");
     for entry in entries {
         let entry = entry.expect("read log dir entry failed");
@@ -1052,41 +1023,12 @@ fn child_case_wal_recycle_before_dir_sync(db_root: &Path) -> ! {
     panic!("wal recycle failpoint did not fire")
 }
 
-fn child_case_wal_recycle_before_dir_sync_keep_stable(db_root: &Path) -> ! {
-    let (mace, bucket) = child_setup_wal_recycle_keep_stable(db_root);
-    seed_committed_and_uncommitted(&bucket, 64, 24);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let payload = vec![b'w'; 1024];
-    let mut round = 0usize;
-
-    while Instant::now() < deadline {
-        let txn = bucket.begin().expect("begin wal recycle txn failed");
-        for idx in 0..64 {
-            txn.upsert(format!("rw_{round}_{idx}"), &payload)
-                .expect("upsert wal recycle key failed");
-        }
-        txn.commit().expect("commit wal recycle txn failed");
-        if round.is_multiple_of(4) {
-            bucket.checkpoint();
-            mace.start_gc();
-        }
-        round += 1;
-    }
-
-    panic!("wal recycle keep-stable failpoint did not fire")
-}
-
 fn child_case_wal_recycle_reopen(db_root: &Path) -> ! {
     let _ = child_setup_wal_recycle(db_root);
     panic!("recovery wal recycle failpoint did not fire")
 }
 
-fn child_case_wal_recycle_reopen_keep_stable(db_root: &Path) -> ! {
-    let _ = child_setup_wal_recycle_keep_stable(db_root);
-    panic!("recovery wal recycle keep-stable failpoint did not fire")
-}
-
-fn child_case_wal_recycle_reopen_expect_io(db_root: &Path, keep_stable: bool) {
+fn child_case_wal_recycle_reopen_expect_io(db_root: &Path) {
     let mut opt = Options::new(db_root);
     opt.concurrent_write = 1;
     opt.sync_on_write = true;
@@ -1095,7 +1037,6 @@ fn child_case_wal_recycle_reopen_expect_io(db_root: &Path, keep_stable: bool) {
     opt.wal_file_size = 4 << 10;
     opt.gc_timeout = 60_000;
     opt.gc_eager = false;
-    opt.keep_stable_wal_file = keep_stable;
     let res = Mace::new(opt.validate().expect("validate options failed"));
     let err = res.err().expect("recovery reopen must fail with io error");
     assert_eq!(err, OpCode::IoError);
@@ -1357,18 +1298,9 @@ fn failpoint_child() {
             child_case_wal_recycle_before_dir_sync(&db_root)
         }
         "wal_recycle_done_windows" => child_case_wal_recycle_before_dir_sync(&db_root),
-        "wal_recycle_done_windows_keep_stable" => {
-            child_case_wal_recycle_before_dir_sync_keep_stable(&db_root)
-        }
         "recovery_wal_recycle_done_windows" => child_case_wal_recycle_reopen(&db_root),
-        "recovery_wal_recycle_done_windows_keep_stable" => {
-            child_case_wal_recycle_reopen_keep_stable(&db_root)
-        }
         "recovery_wal_recycle_expect_remove_io" => {
-            child_case_wal_recycle_reopen_expect_io(&db_root, false)
-        }
-        "recovery_wal_recycle_expect_rename_io" => {
-            child_case_wal_recycle_reopen_expect_io(&db_root, true)
+            child_case_wal_recycle_reopen_expect_io(&db_root)
         }
         "gc_data_rewrite_before_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_stage_marker" => child_case_gc_data_before_meta_commit(&db_root),
@@ -1702,7 +1634,7 @@ fn chaos_failpoint_wal_recycle_before_intent_commit() {
         "wal-recycle-before-intent-commit failpoint child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         None,
         "before-intent crash must not leave a durable recycle record",
     );
@@ -1723,7 +1655,7 @@ fn chaos_failpoint_wal_recycle_after_remove_before_dir_sync() {
         "wal-recycle-after-remove-before-dir-sync failpoint child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(1),
         "partial-unlink crash must leave durable recycle intent",
     );
@@ -1744,7 +1676,7 @@ fn chaos_failpoint_wal_recycle_after_dir_sync_before_done_commit() {
         "wal-recycle-after-dir-sync-before-done-commit child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(1),
         "dir-sync-before-done crash must still expose intent stage",
     );
@@ -1765,7 +1697,7 @@ fn chaos_failpoint_wal_recycle_after_done_commit_before_publish() {
         "wal-recycle-after-done-commit-before-publish child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "done-commit crash must preserve durable recycle frontier",
     );
@@ -1783,7 +1715,7 @@ fn seed_wal_recycle_intent_after_dir_sync(db_root: &Path) {
         "wal-recycle-after-dir-sync-before-done-commit child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(db_root, 0),
+        wal_recycle_stage(db_root, Options::SHARED_ID),
         Some(1),
         "seed crash must leave durable recycle intent",
     );
@@ -1800,26 +1732,9 @@ fn seed_wal_recycle_intent_after_first_remove(db_root: &Path) {
         "wal-recycle-after-remove-before-dir-sync child should abort after partial recycle",
     );
     assert_eq!(
-        wal_recycle_stage(db_root, 0),
+        wal_recycle_stage(db_root, Options::SHARED_ID),
         Some(1),
         "seed crash must leave durable recycle intent after a partial remove",
-    );
-}
-
-fn seed_wal_recycle_intent_after_first_rename(db_root: &Path) {
-    let status = spawn_child(
-        "wal_recycle_done_windows_keep_stable",
-        db_root,
-        "mace_wal_recycle_after_remove_before_dir_sync=abort@2",
-    );
-    assert_child_aborted(
-        status,
-        "wal-recycle-after-remove-before-dir-sync child should abort after partial rename",
-    );
-    assert_eq!(
-        wal_recycle_stage(db_root, 0),
-        Some(1),
-        "seed crash must leave durable recycle intent after a partial rename",
     );
 }
 
@@ -1839,14 +1754,14 @@ fn chaos_failpoint_recovery_wal_recycle_after_dir_sync_before_done_commit() {
         "recovery wal-recycle-after-dir-sync-before-done-commit child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(1),
         "recovery dir-sync-before-done crash must keep intent stage durable",
     );
 
     assert_visibility_after_reopen(&path, 64, 24);
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "clean reopen should finish pending recycle after recovery crash",
     );
@@ -1868,14 +1783,14 @@ fn chaos_failpoint_recovery_wal_recycle_after_done_commit_before_publish() {
         "recovery wal-recycle-after-done-commit-before-publish child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "recovery done-commit crash must persist durable done frontier",
     );
 
     assert_visibility_after_reopen(&path, 64, 24);
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "clean reopen should keep durable done frontier after recovery crash",
     );
@@ -1897,31 +1812,9 @@ fn chaos_failpoint_recovery_fs_remove_file_io() {
         "recovery remove_file child should report io error"
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(1),
         "failed recovery remove must keep recycle intent durable",
-    );
-}
-
-#[test]
-#[ignore]
-fn chaos_failpoint_recovery_fs_rename_io() {
-    let path = RandomPath::new();
-    seed_wal_recycle_intent_after_first_rename(&path);
-
-    let status = spawn_child(
-        "recovery_wal_recycle_expect_rename_io",
-        &path,
-        "mace_fs_rename=io(permission_denied)@1",
-    );
-    assert!(
-        status.success(),
-        "recovery rename child should report io error"
-    );
-    assert_eq!(
-        wal_recycle_stage(&path, 0),
-        Some(1),
-        "failed recovery rename must keep recycle intent durable",
     );
 }
 
@@ -2288,7 +2181,7 @@ fn chaos_failpoint_recovery_abort_clean_does_not_recycle_wal_before_runtime_chec
     let status = spawn_child("recovery_abort_clean_seed", &path, "");
     assert!(status.success(), "seed child should finish normally");
 
-    let before = wal_files(&path, 0);
+    let before = wal_files(&path, Options::SHARED_ID);
     assert!(
         !before.is_empty(),
         "expected recovery-abort-clean seed to create wal files"
@@ -2314,11 +2207,17 @@ fn chaos_failpoint_recovery_abort_clean_does_not_recycle_wal_before_runtime_chec
         "post-start gc should not recycle wal before a runtime checkpoint exists: {status:?}"
     );
 
-    let after = wal_files(&path, 0);
-    assert_eq!(
-        before, after,
-        "wal inventory changed even though post-start gc should not have recycled any file"
-    );
+    let after = wal_files(&path, Options::SHARED_ID);
+    // same-route reopens create no files, so the inventory only grows by
+    // rotation/new-era files; the invariant under test is that post-start gc
+    // never REMOVES a wal file before a runtime checkpoint exists
+    for file in &before {
+        assert!(
+            after.contains(file),
+            "post-start gc must not recycle wal file {:?} before a runtime checkpoint exists",
+            file
+        );
+    }
 }
 
 #[test]
@@ -2365,7 +2264,7 @@ fn recovery_rejects_sparse_wal_gap_after_checkpoint() {
         }
     }
 
-    let mut files = wal_files(&path, 0);
+    let mut files = wal_files(&path, Options::SHARED_ID);
     assert!(
         files.len() >= 3,
         "need at least 3 wal files to form a sparse sequence, got {}",
@@ -2401,14 +2300,14 @@ fn wal_recycle_done_reopen_is_idempotent() {
         "wal-recycle-after-done-commit-before-publish child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "first crash should preserve durable done frontier",
     );
 
     assert_visibility_after_reopen(&path, 64, 24);
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "reopen must keep durable recycle frontier for later boots",
     );
@@ -2430,7 +2329,7 @@ fn wal_recycle_done_does_not_weaken_gap_detection_after_frontier() {
     );
     assert_visibility_after_reopen(&path, 64, 24);
 
-    let mut files = wal_files(&path, 0);
+    let mut files = wal_files(&path, Options::SHARED_ID);
     assert!(
         !files.is_empty(),
         "expected at least one wal file after durable recycle frontier"

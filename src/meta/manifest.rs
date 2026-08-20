@@ -234,10 +234,19 @@ impl Manifest {
 
     pub(crate) fn current_group_checkpoints(&self) -> GroupPositions {
         let mut out = init_group_pos();
-        let groups = self.buckets.ctx.groups();
+        let ctx = self.buckets.ctx;
+        let groups = ctx.groups();
         let n = groups.len().min(Options::MAX_CONCURRENT_WRITE as usize);
-        for i in 0..n {
-            out[i] = groups[i].logging.lock().last_ckpt();
+        if let Some(shared) = ctx.shared_logging() {
+            // shared WAL floors remain group-specific
+            let lk = shared.lock();
+            for (i, slot) in out.iter_mut().enumerate().take(n) {
+                *slot = lk.logical_checkpoint_at(i);
+            }
+        } else {
+            for (i, slot) in out.iter_mut().enumerate().take(n) {
+                *slot = groups[i].logging.lock().last_ckpt();
+            }
         }
         out
     }
@@ -408,7 +417,13 @@ impl Manifest {
 
         // ensure state and pagemap are initialized
         let bucket_ctx = self.load_bucket_context_locked(bucket_id);
-        let frontier = self.current_group_checkpoints();
+        // inactive floors are not durable positions
+        let mut frontier = self.current_group_checkpoints();
+        for slot in frontier.iter_mut() {
+            if *slot == Position::MAX {
+                *slot = Position::MIN;
+            }
+        }
         self.bucket_frontier.insert(bucket_id, frontier);
         let frontier_rec = BucketDurableFrontier::new(bucket_id, frontier);
 
@@ -642,7 +657,7 @@ impl Manifest {
             .get(&bucket_id)
             .map(|x| x.value().clone())
         {
-            ctx.checkpoint_before_reclaim();
+            ctx.checkpoint_before_reclaim(false);
         }
         let _ = self.buckets.buckets.remove(&bucket_id);
 
@@ -653,12 +668,16 @@ impl Manifest {
     pub(crate) fn delete_bucket(&self, name: &str) -> Result<(), OpCode> {
         // serialize deletions and creations
         let _lock = self.structural_lock.lock();
+        let bucket_id = self.load_bucket_meta_locked(name)?.id;
+        if self.buckets.ctx.has_pending_abort_clean_bucket(bucket_id) {
+            return Err(OpCode::Again);
+        }
 
         // remove from maps (unpublish)
         let bucket_id = self.begin_bucket_remove_locked(name, BucketRemoveMode::Delete)?;
 
         // cleanup page maps and resources via manager
-        self.buckets.del_bucket(bucket_id);
+        self.buckets.del_bucket(bucket_id, false);
 
         // collect and record obsolete files
         let mut files = [Vec::new(), Vec::new()];
@@ -802,31 +821,70 @@ impl Manifest {
         }
     }
 
-    pub(crate) fn record_wal_recycle_state(&self, txn: &mut Txn<'_>, state: WalRecycleState) {
-        let mut buf = vec![0u8; state.packed_size()];
-        state.encode(&mut buf);
-        txn.ops_mut()
-            .entry(BUCKET_MISC.to_string())
-            .or_default()
-            .push(MetaOp::Put(wal_recycle_key(state.group_id), buf));
+    pub(crate) fn commit_wal_recycle_intent(
+        &self,
+        intent: WalRecycleIntent,
+    ) -> Option<WalRecycleIntent> {
+        let key = wal_recycle_key(intent.group_id);
+        self.btree
+            .exec(BUCKET_MISC, |txn| {
+                let state = match txn.get(&key) {
+                    Ok(raw) => WalRecycleState::decode(&raw),
+                    Err(BTreeError::KeyNotFound) => WalRecycleState::none(intent.group_id),
+                    Err(err) => return Err(err),
+                };
+                // an intent serializes recycle completion
+                if state.stage == WalRecycleState::STAGE_INTENT {
+                    return Ok(None);
+                }
+                let from_file_id = intent.from_file_id.max(state.oldest_id());
+                if from_file_id >= intent.to_file_id {
+                    return Ok(None);
+                }
+                let intent = WalRecycleIntent {
+                    group_id: intent.group_id,
+                    from_file_id,
+                    to_file_id: intent.to_file_id,
+                };
+                let state = WalRecycleState::intent(
+                    intent.group_id,
+                    intent.from_file_id,
+                    intent.to_file_id,
+                );
+                let mut buf = vec![0u8; state.packed_size()];
+                state.encode(&mut buf);
+                txn.put(&key, &buf)?;
+                Ok(Some(intent))
+            })
+            .unwrap_or_else(|err| panic!("commit wal recycle intent failed: {err:?}"))
     }
 
-    pub(crate) fn commit_wal_recycle_intent(&self, intent: WalRecycleIntent) {
-        let mut txn = self.begin();
-        self.record_wal_recycle_state(
-            &mut txn,
-            WalRecycleState::intent(intent.group_id, intent.from_file_id, intent.to_file_id),
-        );
-        txn.commit();
-    }
-
-    pub(crate) fn commit_wal_recycle_done(&self, intent: WalRecycleIntent) {
-        let mut txn = self.begin();
-        self.record_wal_recycle_state(
-            &mut txn,
-            WalRecycleState::done(intent.group_id, intent.from_file_id, intent.to_file_id),
-        );
-        txn.commit();
+    pub(crate) fn commit_wal_recycle_done(&self, intent: WalRecycleIntent) -> bool {
+        let key = wal_recycle_key(intent.group_id);
+        self.btree
+            .exec(BUCKET_MISC, |txn| {
+                let state = match txn.get(&key) {
+                    Ok(raw) => WalRecycleState::decode(&raw),
+                    Err(BTreeError::KeyNotFound) => return Ok(false),
+                    Err(err) => return Err(err),
+                };
+                if state
+                    != WalRecycleState::intent(
+                        intent.group_id,
+                        intent.from_file_id,
+                        intent.to_file_id,
+                    )
+                {
+                    return Ok(false);
+                }
+                let state =
+                    WalRecycleState::done(intent.group_id, intent.from_file_id, intent.to_file_id);
+                let mut buf = vec![0u8; state.packed_size()];
+                state.encode(&mut buf);
+                txn.put(&key, &buf)?;
+                Ok(true)
+            })
+            .unwrap_or_else(|err| panic!("commit wal recycle done failed: {err:?}"))
     }
 
     fn stage_orphan_marker(&self, key: Vec<u8>, kind: FileKind, file_id: u64) {

@@ -7,6 +7,9 @@ use crate::map::{
 use crate::types::refbox::BoxRef;
 use crate::types::traits::IFrameAlloc;
 use crate::utils::NULL_ADDR;
+#[cfg(feature = "extra_check")]
+use crate::utils::NULL_PID;
+use crate::utils::data::Position;
 use crate::{must_ok, must_true};
 use crossbeam_epoch::Guard;
 use rustc_hash::FxHashMap;
@@ -34,7 +37,7 @@ impl<'a> Publish<'a> {
 
     fn touch_pid(&mut self, pid: u64, addr: u64) {
         #[cfg(feature = "extra_check")]
-        assert_ne!(pid, crate::utils::NULL_PID);
+        assert_ne!(pid, NULL_PID);
         self.dirty_roots
             .entry(pid)
             .and_modify(|cur| *cur = (*cur).max(addr))
@@ -190,7 +193,7 @@ impl IFrameAlloc for AllocGuard<'_> {
         self.bucket.opt.inline_size
     }
 
-    fn checkpoint_lsn(&self, group: u8) -> crate::utils::data::Position {
+    fn checkpoint_lsn(&self, group: u8) -> Position {
         self.bucket.pool.checkpoint_lsn(group)
     }
 }

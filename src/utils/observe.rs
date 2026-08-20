@@ -55,10 +55,14 @@ pub enum CounterMetric {
     FlushConditionalDataStatPutMiss,
     FlushConditionalBlobStatPutMiss,
     FlowFgAdmissionWait,
+    WalGeneration,
+    WalGenerationLeader,
+    WalGenerationFollower,
+    WalGenerationError,
 }
 
 impl CounterMetric {
-    pub const COUNT: usize = 33;
+    pub const COUNT: usize = 37;
     pub const ALL: [CounterMetric; Self::COUNT] = [
         CounterMetric::TxnBegin,
         CounterMetric::TxnCommit,
@@ -93,6 +97,10 @@ impl CounterMetric {
         CounterMetric::FlushConditionalDataStatPutMiss,
         CounterMetric::FlushConditionalBlobStatPutMiss,
         CounterMetric::FlowFgAdmissionWait,
+        CounterMetric::WalGeneration,
+        CounterMetric::WalGenerationLeader,
+        CounterMetric::WalGenerationFollower,
+        CounterMetric::WalGenerationError,
     ];
 
     #[inline]
@@ -141,10 +149,13 @@ pub enum HistogramMetric {
     GcDataRewriteVictimFiles,
     GcBlobRewriteVictimFiles,
     FlowFgAdmissionWaitMicros,
+    WalGenerationBatch,
+    WalGenerationWaitMicros,
+    WalLockWaitMicros,
 }
 
 impl HistogramMetric {
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 18;
     pub const ALL: [HistogramMetric; Self::COUNT] = [
         HistogramMetric::TxnCommitMicros,
         HistogramMetric::TxnRollbackMicros,
@@ -161,6 +172,9 @@ impl HistogramMetric {
         HistogramMetric::GcDataRewriteVictimFiles,
         HistogramMetric::GcBlobRewriteVictimFiles,
         HistogramMetric::FlowFgAdmissionWaitMicros,
+        HistogramMetric::WalGenerationBatch,
+        HistogramMetric::WalGenerationWaitMicros,
+        HistogramMetric::WalLockWaitMicros,
     ];
 
     #[inline]

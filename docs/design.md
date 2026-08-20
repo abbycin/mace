@@ -349,6 +349,9 @@ Each collector round takes one globally ordered timestamp cut and performs one p
 - all exact transaction outcomes
 - all live reader registrations
 
+The collector starts only after recovery has published its final oracle and safe boundary. It must
+not scan recovery-created state or publish a candidate derived from the pre-recovery oracle.
+
 From that single scan it derives:
 
 - the next global safe-boundary candidate
@@ -556,7 +559,103 @@ It does not require loading old value images merely to decide whether a write ma
 Aborted versions may remain physically present for some time.
 Correctness depends on visibility rules hiding them until abort-clean eventually rewrites them away.
 
-### 13.1 WAL recycling protocol
+### 13.1 WAL route: physical stream vs logical group
+
+The runtime selects one active WAL route from the `sync_on_write` engine option, immutable for
+the lifetime of an open instance:
+
+- relaxed route: every logical group writes its own physical stream. A relaxed commit flushes
+  its records to the file/page cache and publishes the fact without any fsync, generation
+  coordination, or wait.
+- durable route: all logical groups funnel through one shared physical stream. The shared
+  stream uses a dedicated namespace separate from every per-group namespace, identified by a
+  reserved stream identifier above the per-group range so the two namespaces can never collide.
+  Each record still carries the logical group id inside the record itself; the physical stream
+  id only decides the file namespace.
+
+Two concepts must never be conflated:
+
+- physical stream id — which WAL file namespace a record lives in; recovery and abort-clean
+  reopen files by this id
+- logical group id — which writer group owns the record's frontier, fact, and visibility; it is
+  read from the record, never inferred from the file name
+
+WAL record format, manifest schema, and encoded record sizes are unchanged by the route split.
+
+### 13.2 Durable generation sync
+
+In the durable route, the shared stream coordinates a caller-led sync generation:
+
+- a commit, a modified abort, or a barrier appends its terminal record, flushes the ring,
+  and registers its target position under the shared logging mutex; an unmodified abort
+  (a transaction with no update chain) stays record-only: no generation, no sync, no wait
+- the first register whose target is not yet covered by the durable stream position becomes
+  the generation leader; registers arriving before the leader seals join the same generation
+  as followers
+- a register whose target is already covered by the durable stream position short-circuits to
+  a completed ticket: no generation, no leader, no wait, no sync counter
+- the leader holds a bounded merge window between registering and sealing without holding the
+  shared logging mutex, so writers already advancing toward the stream can register as followers;
+  the window exits after a short quiet period when no follower joins
+  (solo leaders pay only that quiet period) and otherwise runs up to its hard cap so the whole
+  burst coalesces into one generation. the cap is a configurable duration (a default in the low
+  hundreds of microseconds; zero disables the window and relies on natural lock contention only)
+- the leader re-acquires the shared logging mutex, seals the flushed position as the cut, syncs
+  every writer detached by rotation plus the current writer plus the log directory, and advances
+  the durable stream position to the cut only on success; only then does it publish the
+  per-generation completion and wake the waiters
+- every successful ticket therefore observes that the durable stream position covers its
+  target; a failed generation broadcasts the same error to all participants and no fact is
+  published
+- completion results are isolated per generation (reference-counted completion objects); a
+  later generation never overwrites an earlier result
+
+Only generation leaders perform physical syncs in the durable route. Ring advancement, ring
+overflow, auto-stable flush, large records, and the checkpoint hint append are flush-only and
+never advance the durable stream position. A checkpoint hint record in the shared stream
+carries the minimum over all per-logical-group checkpoint floors and is a conservative scan
+hint, not a redo gate.
+
+**Checkpoint counters stay per logical group.** The physical logger is shared, but
+`max_ckpt_per_txn` is a per-logical-group age limit: each writer group reads only its own
+counter. Begin, Update, Commit, and Abort append activity is tracked independently for every
+logical group. A publish round appends at most one shared checkpoint record, but advances only
+the counters of groups with activity since their previous publish; a group is then marked clean.
+This preserves the old per-group logger rhythm: if that group's old logger would have emitted a
+checkpoint, its counter advances once, while records and checkpoint activity belonging only to
+another group cannot age it. A disabled or no-activity publish ages no group. Relaxed mode keeps
+one logger and one counter per group unchanged.
+
+### 13.3 Sync barrier and shutdown
+
+A force barrier (the explicit sync entry point, the checkpoint publish barrier, or shutdown)
+registers its own target, releases the shared logging mutex, and waits for its own generation;
+a barrier never holds the shared logging mutex while waiting for another leader. Shutdown order
+is: stop the gc thread -> wait admitted transactions to reach terminal publication
+-> synchronously drain all pending abort-clean tasks (recovery-style; the drain
+must complete before shutdown continues) -> final checkpoint of every loaded
+bucket (sealing and
+flushing all dirty pages, with a full fsync of the files written by that final
+checkpoint even when `sync_on_write = false`, so a graceful close leaves the
+final dirty set on disk; files synced by earlier run-time relaxed checkpoints
+keep their fdatasync state) -> force barrier on the active route -> stop the
+collector.
+
+There is no runtime admission gate: shutdown runs only when the last database or bucket handle
+is dropped, and a transaction or view requires a live bucket borrow, so no thread can be on an
+admission path at that point. The in-flight drain (an acquire/release handshake) still precedes
+the force barrier. If a public close/quit API that can run while buckets are alive, or a
+drop-order change that releases the store before the buckets, is ever introduced, an admission
+gate must be restored first.
+
+Because the exit path flushes everything, a graceful close is WAL-independent: deleting every
+WAL file of both namespaces — the legacy per-group `wal_<group>_<seq>` and the durable shared
+`group_wal_<seq>` stream — and reopening must expose exactly the committed model. The exit
+verifier deletes both namespaces and asserts zero files remain before the reopen, so recovery
+cannot lean on any WAL record and the committed-only result is proof the final checkpoint
+published everything.
+
+### 13.4 WAL recycling protocol
 
 WAL recycling is a two-phase commit protocol executed within a durable metadata transaction.
 
@@ -568,10 +667,54 @@ The phases are:
 3. done — mark the intent complete and advance the durable WAL recycle frontier in the same
    metadata commit that clears the intent
 
+The durable recycle frontier is monotonic. A runtime logger may retain a pre-switch in-memory
+oldest id, but its later recycle intent is clamped to the current durable boundary; an empty
+clamped range creates no intent and cannot regress the next boot's scan start.
+The intent transition reads that boundary and writes the normalized intent in one metadata
+transaction. An active intent owns its physical stream until only the matching done transition
+can advance the boundary, so a shutdown fallback collector cannot overwrite a concurrent GC
+round's newer state.
+
 A crash between phases 1 and 3 is safe: recovery finds the intent, re-executes the deletion,
 then clears it. A crash after phase 3 leaves no intent to re-execute. The durable recycle
 frontier is therefore always a reliable lower bound on which WAL files have been permanently
 removed.
+
+The recycle intent names a physical stream and a file range. In the durable route only the
+shared stream is writable, so GC issues exactly one intent for it per round; per-group streams
+do not exist in durable steady state (a route switch wipes the previous era), and the shared
+stream's recycle state lives in its own slot, separate from every per-group slot so the two
+never collide. The shared stream's safe boundary is the minimum over every logical group's
+active-transaction pin, every pending abort-clean pin (matched by physical stream id), and the
+durable checkpoint floor; the checkpoint floor is tracked per logical group because a single
+scalar hint may come from a historical relaxed group logger.
+
+**Per-logical-group floor slots are inactive until first use.** Each slot is a
+two-state cell: `inactive` (Position::MAX, the group has no record in the retained stream)
+or `active` (a finite position, the group has records that the cut must respect). There is no
+persisted bitmap; the state is maintained in memory:
+
+- recovery analyze collects the logical groups that hold at least one valid update record in
+  the retained shared stream; after analyze, redo, and abort-clean finish — and before runtime
+  checkpoint/GC starts — the slots are published: groups with retained updates keep their
+  manifest checkpoint lower bound (Position::MIN when the manifest has no frontier evidence
+  for them), groups without retained updates stay inactive at MAX;
+- the first update a logical group appends to the stream activates its slot in the same
+  logging-mutex critical section as the append, setting it to the transaction's begin LSN
+  (the prev_lsn of the first update), so the cut can never pass a record whose checkpoint
+  evidence does not exist yet; the active-txn pin covers the begin→first-update window;
+- a checkpoint publish advances an active slot by max() and can never activate an inactive
+  slot (a MAX position is rejected, and MAX.max(pos) stays MAX);
+- an era wipe (route switch or layout migration) deactivates every slot afterwards, so stale
+  old-era floors never pin the fresh stream; the new era reactivates each group on its first
+  update.
+
+Because inactive slots never participate in the min, a logical group that never wrote an Update
+cannot pin the shared stream at file 0, while a group's begin-to-first-checkpoint window stays
+fully protected. If every slot is inactive and there is no active transaction or pending
+abort-clean pin, the stream may still contain Begin/Commit/Abort records from unmodified
+transactions. GC uses the current append file id as the finite cut: complete older files are
+recycled through intent/delete/done, and the current file remains as the recovery anchor.
 
 ## 14. Recovery
 
@@ -584,9 +727,69 @@ The startup flow is:
 2. clean orphan-file markers and remove stray payload files
 3. finish any durable pending WAL recycle intent
 4. bootstrap WAL scanning from conservative retained boundaries
-5. analyze WAL to rebuild transaction outcomes and pending abort-clean work
-6. redo committed records that are not yet durable under the bucket frontier
-7. finish reconstructed abort-clean work before open returns
+5. handle a route switch when the requested route differs from the persisted last-completed
+   route (see below); no transaction is admitted before recovery completes
+6. analyze WAL to rebuild transaction outcomes and pending abort-clean work
+7. redo committed records that are not yet durable under the bucket frontier
+8. finish reconstructed abort-clean work before open returns
+
+Recovery scans every physical stream — all per-group streams plus the shared stream —
+regardless of the current `sync_on_write` value, so both shared and per-group history are
+always discovered. Every scanned record carries a physical stream id (from the file it was
+read from) and a logical group id (from the record itself); redo and abort-clean open files
+by the physical id and resolve frontier/fact ownership by the logical id.
+
+**Route switches, layout migration, and the file-id epoch**: an epoch runs when the requested
+route differs from the persisted last-completed route (a route switch), or when a durable open
+finds legacy per-group `wal_<group>_<seq>` files (a same-route physical layout migration —
+the durable steady state never writes the per-group namespace, so such files are always
+leftover history from an older durable format or an interrupted migration). A same-route
+reopen with a matched layout skips the epoch entirely and continues each active stream in its
+existing latest file. On a rebuild, the high water `H` is the maximum file id over all WAL
+files (per-group and shared), persisted bucket frontiers, and recycle states; the new era
+starts at `H + 1` (or 0 for a database with no history). Before the delete, the old WAL must
+be fully recyclable: a graceful exit already checkpointed everything (frontier covers every
+record, no pins), and a crash exit forces a full-fsync checkpoint of the recovery-redone tail
+first, with every eviction and abort-clean flush during recovery also full-fsync. The rebuild
+then deletes every old WAL file via the two-phase recycle protocol — shared stream first,
+legacy per-group streams last, so the last surviving legacy file keeps re-triggering the
+migration until the wipe is complete — and starts the new era at `H + 1` — no empty prefix
+files are ever created. Deletion enumerates actual matching directory entries in the intent
+range instead of probing every numeric id up to `H`; every stream's durable done state still
+advances to the new era start. A missing file inside a retained stream's range, or an `H + 1`
+overflow, is reported as corruption. The options write-back happens only after a route switch
+completes, so the persisted route always means "last completed route"; a crash mid-switch
+leaves the old route persisted and the next open re-detects the switch idempotently. A
+same-route migration needs no marker: while any legacy file exists the next open re-runs the
+migration; a crash mid-wipe leaves pending recycle intents that the next open completes
+first (finish_pending_wal_recycle), then re-runs the migration while legacy files remain.
+Once the legacy files are gone the frontier and recycle states alone are enough to start the
+shared stream safely at a higher file id.
+
+A shared stream with no files (for example a switch wipe that removed them, or a database that
+never ran the durable route) starts its era strictly above the highest persisted bucket
+frontier file id, so fresh records can never land at positions the redo gate would treat as
+already covered.
+
+WAL tail handling is per physical stream: records are validated in order (header, length,
+payload, checksum); at the first malformed or incomplete record the scan stops at that
+record's start, truncates there when the truncation policy is enabled, and does not scan
+later files of that stream. If recovery truncates an active file after its runtime writer was
+opened, it must rebase every runtime position for that writer to the truncated physical EOF
+before any checkpoint, cleanup, or foreground append can run. There is no persisted fsync
+watermark; the runtime durable stream position is not a truncation boundary. A newly created
+active stream's first file may be
+empty — it is not a malformed tail.
+
+Recovery-created tree roots carry `Position::MIN`. The recovery marker remains set until
+analyze, redo, abort-clean drain, forced checkpoint/eviction, route wipe, and checkpoint-floor
+publication have all completed; only then may runtime tree roots use the append position.
+
+In relaxed mode, WAL recycle may read the live active pin under the group logging mutex and read
+the pending abort-clean pin after releasing it. A completed modified abort has already published
+the task pin in that same mutex critical section; an abort still in progress retains its active
+begin pin, whose file id is no later than the task pin it will transfer to. Either observation is
+therefore a conservative recycle boundary.
 
 Every WAL Update reader must first derive checked record bounds, then read the complete record and
 validate its checksum and payload layout before using its key, value, transaction, or chain-link
@@ -619,6 +822,10 @@ Design rules:
 - abort-clean follows the transactional WAL chain backward
 - abort-clean validates every chain position against the retained WAL range and a checked finite
   step budget; malformed links surface as corruption and retain the task
+- in a shared stream, chain traversal opens files by the task's physical wal id and compares
+  every link strictly backward in the stream's `Position` total order (`file_id` + offset);
+  interleaved records from other logical groups do not change the range or the direction
+  judgment, and the logical group id only decides retained-abort ownership
 - page-touching cleanup is not considered retired until its durability barrier is crossed
 - recovery must drain reconstructed abort-clean before normal runtime GC begins
 - recovery must finish reconstructed abort-clean before post-start checkpoint recording and WAL

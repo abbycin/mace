@@ -1,3 +1,9 @@
+## [0.1.2] 2026-08-20
+### Changes
+- Added a durable shared-WAL route for `sync_on_write = true`, with caller-led generation sync to combine concurrent commits into one durable cut
+- Added route-aware WAL recovery with separate per-group and shared-WAL namespaces
+- Added safe route switching and legacy WAL layout migration without changing the WAL record or manifest formats
+
 ## [0.1.1] 2026-08-18
 ### Bug Fixes
 - Eliminated the CCPool free-list ABA race by serializing each free shard with a mutex

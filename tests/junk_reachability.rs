@@ -86,7 +86,7 @@ fn reachable_junk_regression_guard() -> Result<(), OpCode> {
     const VALUE_SIZE: usize = 4096;
     const ROUNDS: usize = 48;
 
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let observer = Arc::new(InMemoryObserver::new(256));
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
@@ -187,7 +187,7 @@ impl Drop for CheckpointHookReset {
 #[test]
 fn checkpoint_snapshot_holds_ebr_guard_before_wait_zero() -> Result<(), OpCode> {
     let _checkpoint_test_lock = testing::checkpoint_test_lock();
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.tmp_store = false;
     opt.sync_on_write = false;

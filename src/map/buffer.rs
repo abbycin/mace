@@ -299,7 +299,7 @@ impl Pool {
     pub(crate) fn try_checkpoint(&self) {
         let (hot_bytes, dirty_bytes) = self.dirty_bytes_snapshot();
         if hot_bytes >= self.max_hot_size || dirty_bytes >= self.max_mem_size {
-            self.checkpoint();
+            self.checkpoint(false);
         }
     }
 
@@ -566,7 +566,7 @@ impl Pool {
         self.last_chkpt_lsn[idx]
     }
 
-    fn checkpoint(&self) {
+    fn checkpoint(&self, force_fsync: bool) {
         // allow at most one checkpoint entry at a time
         let flushed = self.flush_out.load(Acquire);
         if self
@@ -662,18 +662,19 @@ impl Pool {
             count: self.flush_out.clone(),
             last_chkpt_lsn: self.last_chkpt_lsn.clone(),
             flow,
+            force_fsync,
         };
 
         must_ok!(self.chkpt.tx.send(task));
     }
 
-    fn checkpoint_and_wait_fresh(&self) {
+    fn checkpoint_and_wait_fresh(&self, force_fsync: bool) {
         // first wait any existing checkpoint round to finish
         self.wait_checkpoint();
         // then force observing at least one completed round after this barrier
         let mut seen = self.flush_out.load(Acquire);
         loop {
-            self.checkpoint();
+            self.checkpoint(force_fsync);
             self.wait_checkpoint();
             let now = self.flush_out.load(Acquire);
             if now > seen {
@@ -702,7 +703,7 @@ impl Pool {
                 (hot_bytes, dirty_bytes, checkpoint_inflight)
             };
             self.flow
-                .acquire_foreground_permit(bytes, snapshot, || self.checkpoint())
+                .acquire_foreground_permit(bytes, snapshot, || self.checkpoint(false))
         } else {
             self.flow.noop()
         }
@@ -726,7 +727,7 @@ impl Pool {
         if mono_ms().saturating_sub(last) < min_interval_ms {
             return;
         }
-        self.checkpoint();
+        self.checkpoint(false);
     }
 }
 
@@ -816,7 +817,7 @@ impl BucketContext {
     }
 
     pub(crate) fn checkpoint(&self) {
-        self.pool.checkpoint();
+        self.pool.checkpoint(false);
     }
 
     pub(crate) fn loader(&self, ctx: Handle<Context>) -> Loader {
@@ -945,23 +946,24 @@ impl BucketContext {
         }
     }
 
-    pub(crate) fn checkpoint_and_wait(&self) {
+    pub(crate) fn checkpoint_and_wait(&self, force_fsync: bool) {
         if self.reclaimed.load(Acquire) {
             return;
         }
-        self.pool.checkpoint_and_wait_fresh();
+        self.pool.checkpoint_and_wait_fresh(force_fsync);
     }
 
     fn flush_and_wait(&self) {
-        self.pool.checkpoint();
+        self.pool.checkpoint(false);
         self.pool.wait_checkpoint();
     }
 
-    pub(crate) fn checkpoint_before_reclaim(&self) {
-        if self.reclaimed.load(Acquire) {
+    pub(crate) fn checkpoint_before_reclaim(&self, force_fsync: bool) {
+        // a reclaim cycle needs at most one final checkpoint
+        if self.reclaimed.load(Acquire) || self.final_checkpointed.load(Acquire) {
             return;
         }
-        self.pool.checkpoint_and_wait_fresh();
+        self.pool.checkpoint_and_wait_fresh(force_fsync);
         self.final_checkpointed.store(true, Release);
     }
 
@@ -1056,9 +1058,9 @@ impl BucketMgr {
         let _ = self.tx.send(SharedState::Quit);
         let _ = self.rx.recv();
 
-        // 2) do the final checkpoint for each bucket while flusher is still alive
+        // 2) checkpoint buckets before stopping the flusher
         for ctx in self.buckets.iter() {
-            ctx.checkpoint_before_reclaim();
+            ctx.checkpoint_before_reclaim(true);
         }
 
         // 3) stop flusher after outstanding flush tasks are drained
@@ -1073,9 +1075,9 @@ impl BucketMgr {
         self.reclaim_lru();
     }
 
-    pub(crate) fn del_bucket(&self, bucket_id: u64) {
+    pub(crate) fn del_bucket(&self, bucket_id: u64, force_fsync: bool) {
         if let Some(ctx) = self.buckets.get(&bucket_id).map(|x| x.value().clone()) {
-            ctx.checkpoint_before_reclaim();
+            ctx.checkpoint_before_reclaim(force_fsync);
         }
         let _ = self.buckets.remove(&bucket_id);
     }
@@ -1083,7 +1085,7 @@ impl BucketMgr {
     pub(crate) fn unload_all(&self) {
         let bucket_ids: Vec<u64> = self.buckets.iter().map(|x| *x.key()).collect();
         for bucket_id in bucket_ids {
-            self.del_bucket(bucket_id);
+            self.del_bucket(bucket_id, false);
         }
     }
 

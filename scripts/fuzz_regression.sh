@@ -21,5 +21,6 @@ run_target() {
 run_target publish_gc_reopen 600
 run_target txn_checkpoint_reopen 300
 run_target bucket_lifecycle 300
+run_target crash_reopen 600
 
 echo "[fuzz] all targets passed"

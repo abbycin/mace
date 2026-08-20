@@ -408,7 +408,10 @@ pub(crate) fn wal_record_sz(e: EntryType) -> Result<usize, OpCode> {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Location {
     pub(crate) bucket_id: u64,
-    pub(crate) group_id: u32,
+    /// physical WAL stream
+    pub(crate) physical_wal_id: u32,
+    /// logical group owning facts and frontier
+    pub(crate) logical_group_id: u32,
     pub(crate) len: u32,
     pub(crate) pos: Position,
 }
@@ -422,6 +425,8 @@ mod test {
     use crate::cc::wal::{
         EntryType, IWalCodec, PayloadType, WalBegin, WalPut, WalReplace, WalUpdate, ptr_to,
     };
+    use crate::utils::OpCode;
+    use crate::utils::data::Position;
     use crate::utils::options::Options;
 
     #[test]
@@ -518,10 +523,7 @@ mod test {
 
         record[header_len..header_len + size_of::<u32>()].copy_from_slice(&4u32.to_le_bytes());
         let stored = ptr_to::<WalUpdate>(record.as_ptr());
-        assert_eq!(
-            stored.validate_record(&record),
-            Err(crate::OpCode::Corruption)
-        );
+        assert_eq!(stored.validate_record(&record), Err(OpCode::Corruption));
     }
 
     #[test]
@@ -529,7 +531,7 @@ mod test {
         let too_large = Options::MAX_KV_SIZE + size_of::<WalReplace>() + 1;
         assert_eq!(
             WalUpdate::checked_payload_len(too_large as u32),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
     }
 
@@ -568,7 +570,7 @@ mod test {
         // checkpoint
         let mut ckpt = WalCheckpoint {
             wal_type: EntryType::CheckPoint,
-            checkpoint: crate::utils::data::Position {
+            checkpoint: Position {
                 file_id: 7,
                 offset: 11,
             },

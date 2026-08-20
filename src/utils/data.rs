@@ -1,5 +1,5 @@
 use crate::types::traits::IAsSlice;
-use crate::{Options, must_ok};
+use crate::{OpCode, Options, must_ok};
 
 use crate::io::{self, FileSystem, GatherIO, IoVec};
 use std::fmt::Debug;
@@ -240,6 +240,11 @@ impl GatherWriter {
         must_ok!(self.file.sync(), "path {:?}", self.path);
     }
 
+    /// fallible sync for generation-wide error handling
+    pub fn try_sync(&mut self) -> Result<(), OpCode> {
+        self.file.sync().map_err(OpCode::from)
+    }
+
     pub fn sync_data(&mut self) {
         must_ok!(self.file.sync_data(), "path: {:?}", self.path);
     }
@@ -251,7 +256,7 @@ impl Drop for GatherWriter {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Position {
     pub file_id: u64,
@@ -265,6 +270,7 @@ pub const fn init_group_pos() -> GroupPositions {
 
 impl Position {
     pub const MIN: Self = Position::new(u64::MIN, u64::MIN);
+    pub const MAX: Self = Position::new(u64::MAX, u64::MAX);
 
     pub const fn new(id: u64, off: u64) -> Self {
         Self {

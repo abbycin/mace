@@ -75,6 +75,252 @@ entries:
         path: src/store/store.rs
         note: publish flow orders sync before manifest commit in code
 
+  - id: wal_position_epoch_monotonic_across_route_switch
+    title: every route-switch or layout-migration reopen starts the new era at a globally monotonic file-id epoch; same-route matched-layout reopens continue in-stream
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      A route-switch reopen (requested sync_on_write differs from the persisted
+      last-completed route) or a same-route physical layout migration (a durable open
+      finds legacy per-group wal_<group>_<seq> files, which the durable steady state never
+      writes) computes the global file-id high water H over all wal_* files, persisted
+      bucket frontiers, and wal recycle states, ensures the old wal is fully recyclable
+      (graceful-exit checkpoint, or a forced full-fsync checkpoint of the recovery-redone
+      tail on a crash exit), deletes every old wal file via the two-phase recycle protocol —
+      shared stream first, legacy per-group streams last, so a mixed namespace can never
+      enter steady state — and starts the new era at H+1 (0 for a clean database). The
+      previous era's WAL files are never appended. A same-route reopen with a matched
+      layout skips the epoch entirely and continues each active stream in its existing
+      latest file; the retained scan of a stream starts at its durable done boundary, and
+      the wipe advances every physical stream's done state to the new era start (including
+      streams with no files at the wipe time), so when files exist the done boundary always
+      equals the oldest present file and a real missing file at or above it is a detectable
+      gap. Wipe deletion enumerates only actual namespace entries inside the intent range rather
+      than probing every numeric id up to H; the intent/done boundary still advances to H+1.
+      A shared stream with no files at boot starts at the greater of its durable done boundary
+      and one plus the largest persisted bucket-frontier file id (with zero as the implementation
+      seed when no frontier exists), so fresh records can never land at or below any bucket
+      frontier. Recycle intent from-file-ids are clamped by the persisted done boundary
+      (from = max(intent.from, state.oldest_id())), so a stale in-memory oldest_wal_id lagging
+      behind a completed wipe can never regress the boundary.
+      A real missing file inside a stream range or an H+1 overflow is OpCode::Corruption.
+    watch_points:
+      - path: src/store/recovery.rs
+        note: phase1 computes H/start and detects the rebuild; phase2 forces the checkpoint and wipes the old wal; epoch_high_water computes H; evict_bucket forces full-fsync eviction flushes under a pending rebuild; wipe_old_wal advances every stream's done state; load_physical_stream_boot scans from the done boundary
+      - path: src/meta/manifest.rs
+        note: options writeback timing (after switch processing) carries the persisted route signal
+      - path: src/store/store.rs
+        note: Mace::new detects route_switch and legacy per-group layout files (has_legacy_per_group_wal) and writes back the current options after recovery
+      - path: src/map/buffer.rs
+        note: BucketMgr::del_bucket(force_fsync) and BucketContext::checkpoint_and_wait(force) implement the full-fsync tail flush the wipe depends on
+      - path: src/store/gc.rs
+        note: drain_abort_clean_during_recovery(force_fsync) and stabilize_cleaned_pages force-fsync the scrub of drain-loaded buckets before the wipe
+      - path: src/index/tree.rs
+        note: recovery-created roots carry Position::MIN (Context::recovering), so recovery flushes only advance the frontier to materialized records
+      - path: src/cc/context.rs
+        note: Context::recovering gates the recovery-root lsn until phase2 completes every root-creating or root-flushing recovery action
+      - path: tests/epoch_route.rs
+        note: route switch and gap rejection coverage lives here
+      - path: tests/layout_migration.rs
+        note: same-route migration includes a true two-stream legacy fixture, malformed legacy WAL behavior, monotonic new ids, and mixed-namespace coverage
+      - path: tests/prod_generation_failpoints.rs
+        note: route-switch and same-route layout-migration recycle crash windows live here
+    witnesses:
+      - path: src/store/recovery.rs
+        note: wipe_old_wal deletes [oldest, start) per stream via two-phase recycle in shared-first/legacy-last order; seed_checkpoint_floors runs on every open; same-route matched-layout opens keep start_id = latest_id; recovery evictions under a pending rebuild flush full-fsync (del_bucket force) and recovery-created tree roots carry Position::MIN (Context::recovering), so the frontier only advances to materialized records; load_physical_stream_boot starts a file-less shared stream at max(oldest, max frontier file id with zero seed + 1)
+      - path: src/meta/manifest.rs
+        note: commit_wal_recycle_intent clamps intent.from by the persisted oldest (done) boundary, so a stale in-memory oldest cannot regress recycle safety
+      - path: src/cc/log.rs
+        note: advance_oldest_wal_id only moves forward and only after a completed recycle round
+      - path: src/store/store.rs
+        note: has_legacy_per_group_wal triggers layout migration on durable opens that find wal_<group>_<seq> files
+      - path: src/index/tree.rs
+        note: Tree::init stamps recovery roots with Position::MIN and runtime roots with the current append position
+      - path: src/cc/context.rs
+        note: Context::recovering gates the recovery-root lsn; init_safe_exclusive clears it only after phase2 completes forced checkpoint/eviction, wipe, and recovery floor publication
+      - path: tests/epoch_route.rs
+        note: route_switch_starts_new_era_at_higher_contiguous_file_ids and group_wal_gap_rejected_on_reopen cover the ordering
+      - path: tests/layout_migration.rs
+        note: true_multi_group_legacy_wal_is_recovered_and_migrated proves real wal_0/wal_1 redo and H+1 ordering; malformed_true_legacy_wal_obeys_truncation_option_during_migration covers strict and truncating corruption handling; rename and mixed-namespace tests retain compatibility coverage
+      - path: tests/prod_generation_failpoints.rs
+        note: route-switch tests cover cross-route windows; layout_migration_crash_* covers remove-before-dir-sync, final-stream done, and route-writeback windows for same-route migration
+    failure_symptoms:
+      - a route-switch or layout-migration reopen appends to the previous era's last WAL file or leaves old files behind
+      - recovery compares positions across physical streams without a monotonic file-id order
+      - a missing file inside a stream range is silently skipped instead of Corruption
+      - a mid-wipe crash leaves a pending recycle intent that the next boot does not complete
+      - legacy wal_<group>_<seq> files survive a durable same-route reopen forever
+    verifiers:
+      - type: regression-test
+        path: tests/epoch_route.rs
+        note: route switch, higher contiguous era, and real-gap tests
+      - type: regression-test
+        path: tests/layout_migration.rs
+        note: true multi-group, malformed-tail, monotonic epoch, graceful, crash-recovery, and mixed-namespace migrations wipe legacy streams and continue on the shared namespace
+      - type: failpoint-test
+        path: tests/prod_generation_failpoints.rs
+        note: route-switch matrix plus layout_migration_crash_* intent/delete/done/final-writeback windows; these tests need both failpoints and extra_check and run as a dedicated prod_test.sh fast/all target with a non-zero test-count guard
+
+  - id: durable_generation_sync_covers_all_sealed_writers
+    title: only a generation leader syncs, and it syncs every writer sealed by its cut
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      In the durable route, advance, ring overflow, auto-stable flush, large-record
+      append, and the checkpoint hint are flush-only and never advance durable_pos.
+      A generation leader must sync every writer detached by rotation before its
+      sealed cut plus the current writer and the log directory, and advance
+      durable_pos to the sealed cut only after success; the wal sync counter
+      increments only when a leader attempts a physical sync round.
+    watch_points:
+      - path: src/cc/log.rs
+        note: leader_seal_sync_and_complete, try_sync_generation_files, and the flush-only paths live here
+      - path: src/index/txn.rs
+        note: durable commit and abort route through the generation protocol
+      - path: src/cc/context.rs
+        note: drive_sync and the merge window orchestrate the leader round
+      - path: src/store/gc.rs
+        note: the durable recycle boundary holds the shared logging lock, matching the generation critical section
+    witnesses:
+      - path: src/cc/log.rs
+        note: try_sync_generation_files syncs pending rotation writers, the current writer, and the dir; non-generation paths only flush
+      - path: tests/generation.rs
+        note: rotation_writers_are_synced_by_generation_and_survive_reopen asserts WalSync == WalGeneration under rotation
+    failure_symptoms:
+      - advance, large-record, or checkpoint append triggers a private fsync
+      - a rotation-detached writer is never synced and data is lost on crash
+      - durable_pos advances without a successful sealed-cut sync
+    verifiers:
+      - type: regression-test
+        path: tests/generation.rs
+        note: rotation_writers_are_synced_by_generation_and_survive_reopen
+      - type: regression-test
+        path: tests/wal_route.rs
+        note: durable_large_record_commit_performs_single_wal_sync and durable_large_record_across_rotation_survives_reopen
+      - type: failpoint-test
+        path: tests/prod_generation_failpoints.rs
+        note: generation and rotation crash windows; gated by the prod_test.sh failpoints+extra_check target (non-zero test-count guard)
+
+  - id: wal_recovery_truncates_at_first_malformed_record
+    title: recovery truncates each physical stream at the first malformed record start
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Recovery validates records per physical stream in order (header, length,
+      payload, checksum). At the first malformed or incomplete record the scan
+      stops at that record's start; with truncate_corrupted_wal enabled the file
+      is truncated there and later files of the stream are not scanned; otherwise
+      OpCode::Corruption is returned. There is no persisted fsync watermark and
+      runtime durable_pos is not a truncation boundary. When truncation occurs
+      after an active writer was opened, recovery must rebase that writer's
+      runtime positions to the truncated physical EOF before any checkpoint,
+      cleanup, or foreground append can use them.
+    watch_points:
+      - path: src/store/recovery.rs
+        note: analyze truncate-or-corruption decision and stop-scan semantics live here
+      - path: src/cc/log.rs
+        note: generation seal crash windows can leave flushed but unsynced tails; logger position rebasing keeps an already-open writer aligned after recovery truncation
+      - path: src/cc/context.rs
+        note: recovery rebases each active physical logger once after analyze and abort-clean complete
+      - path: tests/prod_generation_failpoints.rs
+        note: torn-tail crash window lives here
+    witnesses:
+      - path: src/store/recovery.rs
+        note: analyze stops at start_pos of the first bad record, truncates when enabled, breaks out of the file scan, then rebases active logger positions before runtime work
+      - path: src/store/recovery.rs
+        note: unit tests cover invalid subtype, oversized header, and invalid entry type
+      - path: tests/prod_generation_failpoints.rs
+        note: wal_tail_corruption_truncates_at_first_bad_record asserts truncation, discard of later records, post-truncation append position, and second-reopen visibility
+    failure_symptoms:
+      - recovery scans past the first malformed record into later records or files
+      - truncation uses a non-persisted sync watermark instead of the bad record start
+      - a torn tail triggers Corruption even when truncate_corrupted_wal is enabled
+      - a post-truncation append uses stale pre-truncation positions and makes checkpoint, recovery, or abort-clean address bytes beyond the physical EOF
+    verifiers:
+      - type: unit-test
+        path: src/store/recovery.rs
+        note: invalid_entry_type_is_truncated_when_enabled, invalid_entry_type_returns_corruption_when_truncate_disabled, oversized_update_header_is_truncated_when_enabled
+      - type: failpoint-test
+        path: tests/prod_generation_failpoints.rs
+        note: wal_tail_corruption_truncates_at_first_bad_record (post-truncation append/checkpoint/reopen) and truncated_tail_runtime_abort_clean_completes_and_unpins (runtime abort-clean chain and wal-pin release after truncation); both gated by the prod_test.sh failpoints+extra_check target (non-zero test-count guard)
+
+  - id: relaxed_commit_bypasses_sync_coordination
+    title: relaxed commits never touch generation state
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      With sync_on_write=false, a commit only flushes its records to the
+      file/page cache and publishes the fact; it never registers a generation,
+      elects a leader, waits on a completion, or increments the wal sync counter.
+      Relaxed mode never creates a writable logger beyond each logical group's
+      own stream.
+    watch_points:
+      - path: src/index/txn.rs
+        note: relaxed commit and abort keep the flush-only sync(false) path
+      - path: src/cc/log.rs
+        note: register_sync and barrier_register assert they are only used in the durable route
+      - path: src/cc/context.rs
+        note: drive_sync and the merge window are durable-route only
+    witnesses:
+      - path: src/index/txn.rs
+        note: relaxed commit calls log.sync(false) (flush only) and never register_sync
+      - path: tests/generation.rs
+        note: relaxed_commits_never_touch_generation_state asserts zero generations and zero wal syncs for relaxed commits
+    failure_symptoms:
+      - a relaxed commit triggers a generation registration or a wal sync
+      - relaxed mode creates a shared writable logger
+      - generation counters become nonzero under a relaxed workload
+    verifiers:
+      - type: regression-test
+        path: tests/generation.rs
+        note: relaxed_commits_never_touch_generation_state
+
+  - id: durable_fact_waits_for_shared_wal_cut
+    title: modified commit publishes its fact only after the shared wal cut covers its target
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      A modified transaction's commit fact becomes Committed only after the
+      generation sealing a cut >= the commit record's target completes
+      successfully; every successful ticket observes durable_pos >= target. A
+      failed generation broadcasts the same error to all participants and no
+      fact is published. An orphaned generation (leader ticket dropped before
+      complete) is failed with the error and the sync state is reset, so no
+      waiter hangs and no fact is published for it.
+    watch_points:
+      - path: src/index/txn.rs
+        note: commit registers the target and publishes the fact after drive_sync
+      - path: src/cc/log.rs
+        note: leader_seal_sync_and_complete advances durable_pos to the sealed cut only on success
+      - path: src/cc/context.rs
+        note: drive_sync re-checks durable_pos >= target under extra_check
+      - path: tests/si.rs
+        note: durable commit cut witnesses live here
+    witnesses:
+      - path: src/index/txn.rs
+        note: commit_fact runs only after drive_sync returns Ok
+      - path: src/cc/log.rs
+        note: SyncTicket::drop publishes Err(IoError) for an orphaned unpublished leader generation, resets the phase, and notifies all waiters; extra_check re-checks durable_pos against both the ticket target and the sealed cut
+      - path: tests/si.rs
+        note: durable_commit_publishes_fact_only_after_wal_cut_is_durable
+      - path: tests/generation.rs
+        note: generation_sync_failure_broadcasts_and_isolates_next_generation proves no fact on sync failure; orphaned_leader_generation_is_reset_on_ticket_drop covers the drop guard
+    failure_symptoms:
+      - a commit returns success while durable_pos is below its target
+      - a failed generation still publishes a committed fact
+      - a follower receives a different result than the leader for the same generation
+    verifiers:
+      - type: regression-test
+        path: tests/si.rs
+        note: durable_commit_publishes_fact_only_after_wal_cut_is_durable
+      - type: regression-test
+        path: tests/generation.rs
+        note: generation_sync_failure_broadcasts_and_isolates_next_generation
   - id: protocol.orphan_marker_is_only_cleanup_source
     title: orphan files are cleaned only through explicit Sequences markers
     kind: protocol
@@ -458,6 +704,8 @@ entries:
         note: multi-bucket manifest commit lives here
       - path: src/meta/manifest.rs
         note: frontier merge and persistent frontier record types live here
+      - path: src/map/adapter.rs
+        note: durable publish runs the wal barrier before the manifest transaction; the conservative checkpoint hint is flushed only
     witnesses:
       - path: src/store/store.rs
         note: publish records intervals, stats, map, frontier, and Sequences in one transaction
@@ -523,32 +771,41 @@ entries:
     statement: >
       Every WAL Update reader must validate the payload size and total record length before reading
       the payload, then validate entry type, checksum, and payload layout before using key, value,
-      transaction, or `prev` fields. Malformed input must stop the optional checkpoint scan and
-      terminate recovery's current file scan at the record start, so `truncate_corrupted_wal`
-      consistently selects truncation or `OpCode::Corruption`; abort-clean returns
-      `OpCode::Corruption`. It must not drive unbounded allocation, replay, or chain traversal.
+      transaction, or `prev` fields. Before recovery uses group-owned state, the logical group id
+      must be below `concurrent_write`, and a record whose `(txid, cmd_id)` is already enrolled
+      in the dirty table must return `OpCode::Corruption` rather than panic. Malformed input must
+      terminate recovery's current file
+      scan at the record start, so `truncate_corrupted_wal` consistently selects truncation or
+      `OpCode::Corruption`; a missing redo file or failed group/dirty-table check is
+      `OpCode::Corruption`.
+      Abort-clean returns `OpCode::Corruption`. Invalid input must not drive unbounded allocation,
+      replay, or chain traversal.
     watch_points:
       - path: src/cc/wal.rs
         note: shared Update length, checksum, and payload-layout codecs live here
       - path: src/store/recovery.rs
-        note: analyze, redo, and checkpoint discovery consume persisted Update records here
+        note: checkpoint discovery validates records before deriving the conservative scan hint; analyze validates semantic group/version ownership before manifest or Context access; redo revalidates before replay
       - path: src/store/gc.rs
         note: abort-clean follows Update prev links here
       - path: docs/design.md
         note: Recovery describes the required validation order here
       - path: tests/gc.rs
         note: abort-clean corruption retention coverage lives here
+      - path: src/store/recovery.rs
+        note: analyze resolves record ownership by logical group id while reopening files by physical wal id on shared streams
     witnesses:
       - path: src/cc/wal.rs
         note: checked_payload_len, checked_encoded_len, and validate_record establish bounded Update consumption
       - path: src/store/recovery.rs
-        note: analyze returns the bad record start to the common truncate-or-corruption path; checkpoint discovery stops its file scan; redo validates again before replay
+        note: checkpoint discovery stops at malformed input and clamps its hint to the durable recycle boundary; analyze returns the bad record start to the common truncate-or-corruption path, rejects an out-of-range logical group or duplicate redo candidate, and redo validates again before replay
       - path: src/store/gc.rs
         note: abort-clean validates Update bounds, checksum, and layout before reading prev or key
     failure_symptoms:
       - a corrupted size triggers allocation or I/O before bounds validation
       - recovery replays an Update with a bad checksum or incompatible payload layout
-      - checkpoint discovery skips an invalid Update and accepts a later checkpoint
+      - a checksum-valid Update panics through an out-of-range logical group or duplicate redo entry
+      - redo silently skips remaining dirty entries after a retained WAL file disappears
+      - a malformed checkpoint scan advances recovery beyond its last validated hint
       - abort-clean follows a malformed key or prev link
     verifiers:
       - type: unit-test
@@ -556,7 +813,7 @@ entries:
         note: update_record_validation_rejects_inconsistent_layout and checked_payload_len_rejects_oversized_payload_before_allocation cover payload layout and direct size-limit rejection
       - type: unit-test
         path: src/store/recovery.rs
-        note: checkpoint_scan_stops_at_invalid_update_checksum, invalid_update_subtype_is_truncated_when_enabled, and oversized_update_header_is_truncated_when_enabled cover checkpoint-scan stop and recovery truncation behavior
+        note: checkpoint_scan_stops_at_invalid_update_checksum, invalid_update_subtype_is_truncated_when_enabled, and oversized_update_header_is_truncated_when_enabled cover checkpoint-hint and recovery truncation behavior
       - type: regression-test
         path: tests/gc.rs
         note: abort_clean_corruption_retains_task_fact_and_wal_pin verifies malformed abort-clean WAL retains recovery obligations
@@ -574,7 +831,7 @@ entries:
       only buckets that are already loaded. Recovery may temporarily load bucket contexts to drain
       reconstructed abort-clean tasks or inspect WAL state, but startup must unload every such context
       before returning success or surfacing a recovery error.
-      Unload or drop must remain blocked and return `OpCode::Again` while a bucket-local abort-clean
+      Unload, drop, or delete must remain blocked and return `OpCode::Again` while a bucket-local abort-clean
       task exists, including the `WaitingQuiesce` state before its EBR callback removes the task.
     watch_points:
       - path: src/index/tree.rs
@@ -582,7 +839,7 @@ entries:
       - path: src/cc/context.rs
         note: visibility and active-view state interact with abort outcomes here
       - path: src/meta/manifest.rs
-        note: unload path rejects buckets while a bucket-local abort-clean task exists, including WaitingQuiesce
+        note: unload and delete paths reject buckets while a bucket-local abort-clean task exists, including WaitingQuiesce
       - path: src/store/gc.rs
         note: abort-clean load mode, retirement, and steady-state no-reload semantics live here
       - path: docs/design.md
@@ -591,9 +848,11 @@ entries:
         note: recovery reconstructs and drains abort-clean, then unloads any buckets it loaded before startup returns
       - path: src/store/store.rs
         note: phase2 failure must unload recovery-loaded buckets before store abort tears down checkpoint/context
+      - path: src/index/txn.rs
+        note: durable modified abort publishes the abort fact and enqueues the abort-clean task inside one re-acquired shared logging critical section after the generation completes
     witnesses:
       - path: src/meta/manifest.rs
-        note: unload_bucket returns Again while a bucket-local abort-clean task exists, including WaitingQuiesce
+        note: unload_bucket and delete_bucket return Again while a bucket-local abort-clean task exists, including WaitingQuiesce
       - path: src/store/gc.rs
         note: AbortCleanLoadMode::SteadyState refuses to load unloaded buckets; Pending performs COW rewrite, fresh checkpoint closure moves the task to WaitingQuiesce, and the EBR callback closes runtime retirement
       - path: src/store/recovery.rs
@@ -608,17 +867,20 @@ entries:
       - steady-state GC silently reloads a user-unloaded bucket just to run abort-clean
       - recovery returns with abort-clean buckets still loaded in the runtime cache
       - recovery error teardown panics while dropping a recovery-loaded bucket after checkpoint infrastructure is already shut down
-      - drop_bucket or unload succeeds while page-touching abort-clean is still pending
+      - drop_bucket, delete_bucket, or unload succeeds while page-touching abort-clean is still pending
     verifiers:
       - type: regression-test
         path: tests/gc.rs
-        note: recovery_drains_abort_clean_before_startup_returns, recovery_abort_clean_does_not_leave_bucket_loaded_after_startup, and related drop_bucket tests cover the lifecycle
+        note: recovery_drains_abort_clean_before_startup_returns, recovery_abort_clean_does_not_leave_bucket_loaded_after_startup, and related bucket lifecycle tests cover the lifecycle
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
         note: recovery abort-clean crash windows validate ordering around drain and runtime GC start
       - type: unit-test
         path: src/store/recovery.rs
         note: abort_unloads_recovery_loaded_buckets_before_store_abort proves failure teardown drops recovery-loaded buckets before store abort
+      - type: regression-test
+        path: tests/generation.rs
+        note: modified_abort_joins_generation_and_handles_pin_under_logging_lock proves gc cannot observe a pinless handoff window
 
   - id: protocol.abort_clean_wal_chain_bounded
     title: abort-clean WAL traversal must stay in the retained range and terminate on corruption
@@ -643,6 +905,8 @@ entries:
         note: WAL record minimum sizes and Update payload bounds used by chain scanning live here
       - path: tests/gc.rs
         note: deterministic chain-link and lifecycle witnesses live here
+      - path: src/store/gc.rs
+        note: shared-stream chain traversal compares links strictly backward in the stream Position total order; interleaved records from other groups do not change range judgment
     witnesses:
       - path: src/store/gc.rs
         note: abort_clean_chain_bounds sums bytes through the tail record within the retained range, consume_abort_clean_step enforces the checked budget, and validate_abort_clean_link rejects non-decreasing or out-of-range links
@@ -664,6 +928,9 @@ entries:
       - type: regression-test
         path: tests/gc.rs
         note: abort_clean_lifecycle_closes_state_and_protections covers Pending -> WaitingQuiesce -> EBR callback -> removal; abort_clean_corruption_retains_task_fact_and_wal_pin covers a real malformed chain; recovery drain covers startup closure
+      - type: regression-test
+        path: tests/gc_shared_wal.rs
+        note: shared_stream_abort_clean_walks_interleaved_chain_without_range_escape covers interleaved shared-stream chains
 
   - id: protocol.runtime_checkpoint_enable_waits_for_recovery_abort_clean
     title: runtime checkpoint enable and WAL recycle must stay gated behind recovery abort-clean drain
@@ -680,13 +947,15 @@ entries:
       - path: src/store/store.rs
         note: startup order decides when recovery phase2, checkpoint enable, and GC start become visible
       - path: src/store/recovery.rs
-        note: phase2 drains abort-clean and unloads recovery-loaded buckets here
+        note: phase2 drains abort-clean and unloads recovery-loaded buckets here; it also publishes the shared-stream per-logical-group floor slots (or deactivates every slot after an era wipe) only after analyze/redo/abort-clean complete, so runtime checkpoint/GC never sees pre-publication floors
       - path: src/cc/context.rs
         note: context.start enables per-group checkpoint recording here
       - path: src/cc/log.rs
         note: update_checkpoint is gated by enable_checkpoint here
       - path: src/store/gc.rs
         note: WAL recycle uses last_ckpt and pending abort-clean file boundaries here
+      - path: src/cc/log.rs
+        note: shared logger initializes per-logical-group checkpoint floors from manifest frontiers, not from historical scalar hints
     witnesses:
       - path: src/store/store.rs
         note: Mace::new runs recovery phase2 before calling store.start and before launching runtime GC
@@ -732,6 +1001,8 @@ entries:
         note: Logging serializes WAL terminal handling and exact fact publication here
       - path: tests/si.rs
         note: deterministic publication-window witnesses live here
+      - path: src/index/txn.rs
+        note: modified commit publishes the fact only after the shared-wal generation covering the target completes (durable route)
     witnesses:
       - path: src/index/txn.rs
         note: modified commit writes Committed(commit_ts) before releasing the fact guard and before readers can rely on later proofs
@@ -748,7 +1019,49 @@ entries:
       - type: model
         path: docs/proposals/cc_window_micro.tla
         note: the publication-window micro-model covers commit-ts allocation, terminal publication, and safe re-read windows
+      - type: regression-test
+        path: tests/generation.rs
+        note: concurrent_commits_coalesce_into_one_generation_with_single_sync and generation_sync_failure_broadcasts_and_isolates_next_generation re-verify the publication order after the generation gate
 
+  - id: protocol.collector_start_waits_for_recovery_waterline
+    title: the collector must not run before recovery establishes the oracle/safe waterline
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      The collector thread must not start before recovery phase2 has stored the
+      recovered oracle and published the initial safe_exclusive waterline
+      (init_safe_exclusive). A collector running during recovery can read a
+      pre-recovery oracle cut while init_safe_exclusive raises safe_exclusive,
+      so candidate is below published_safe and the monotonicity assert fails;
+      the same race can regress safe_exclusive if the collector stores a
+      pre-recovery candidate after recovery raised it. Context::new therefore
+      only keeps the receiver; Context::start (called after phase2) spawns the
+      collector. init_safe_exclusive must raise safe_exclusive monotonically
+      (fetch_max), never regress a boundary a collector round may already have
+      published.
+    watch_points:
+      - path: src/cc/context.rs
+        note: Context::new keeps the receiver without spawning; Context::start spawns the collector and enables checkpointing; init_safe_exclusive uses fetch_max
+      - path: src/store/store.rs
+        note: Mace::new runs recovery phase2 before store.start, which drives Context::start
+    witnesses:
+      - path: src/cc/context.rs
+        note: Context::new stores the receiver in collector_rx and leaves collector None; Context::start takes the receiver, spawns collect_thread, then enables per-group checkpoint recording
+      - path: src/cc/context.rs
+        note: init_safe_exclusive uses fetch_max(recovered_oracle, AcqRel) so recovery can only raise the waterline
+      - path: src/cc/context.rs
+        note: quit_waits_for_inflight_then_joins_collector calls start() first so the join path is actually exercised
+    failure_symptoms:
+      - collector panics on candidate >= published_safe during or right after open (fuzz crash_reopen artifact, 2026-08)
+      - safe_exclusive regresses below a value a collector round published during recovery
+    verifiers:
+      - type: runtime-order
+        path: src/store/store.rs
+        note: phase2 (recovery) runs before store.start to Context::start (collector spawn)
+      - type: regression-test
+        path: src/cc/context.rs
+        note: quit_waits_for_inflight_then_joins_collector exercises the start-spawn-join lifecycle
   - id: protocol.snapshot_registration_cut_covers_every_live_reader
     title: collector cut must include every live writer and reader before publishing a safe snapshot boundary
     kind: protocol
@@ -760,10 +1073,11 @@ entries:
       boundary. The cut, writer registration, writer start-timestamp allocation, and reader
       registration must share one global order, so a writer absent from the scan has a start
       timestamp at or after the cut. No registration source may be omitted from the cut
-      computation.
+      computation. The collector must start only after recovery has published the final oracle
+      and safe boundary, so a pre-recovery cut cannot race that publication.
     watch_points:
       - path: src/cc/context.rs
-        note: collector cut, CCPool registry snapshot, and safe publication live here
+        note: collector startup, cut, CCPool registry snapshot, and safe publication live here
       - path: src/index/txn.rs
         note: writer begin and TxnView acquisition/drop publish collector-visible registration lifecycles here
       - path: src/cc/group.rs
@@ -772,15 +1086,16 @@ entries:
         note: collector-cut and multi-view churn witnesses live here
     witnesses:
       - path: src/cc/context.rs
-        note: run_collect_cycle takes a SeqCst oracle cut before its SeqCst writer/view registration scans; Registering blocks publication and Active contributes start_ts
+        note: Context::start consumes the collector receiver and spawns the collector; Mace::new invokes it only after recovery phase2. run_collect_cycle takes a SeqCst oracle cut before its SeqCst writer/view registration scans, every CCNode lifecycle transition is SeqCst, Registering blocks publication, and Active contributes start_ts
       - path: src/cc/group.rs
-        note: start_reg publishes the odd writer registration and stable_ts scans it with SeqCst; a later begin oracle allocation therefore cannot be older than a collector cut that missed it
+        note: start_reg, reg_end, and reg_abot publish every txn_seq lifecycle transition with SeqCst; stable_ts scans it with SeqCst, so a later begin oracle allocation cannot be older than a collector cut that missed it
       - path: tests/si.rs
         note: collector_cut_includes_begin_registration_before_fact_publish covers writer begin; post_cut_view_registration_does_not_pin_safe_boundary and newer_live_view_keeps_snapshot_when_older_view_is_still_alive_during_churn cover the reader cut
       - path: src/cc/context.rs
         note: ccnode_registration_state_is_visible_to_collector directly covers Idle Registering Active Idle state observation
     failure_symptoms:
       - a non-oldest live snapshot loses visibility after another reader or collector cycle advances the floor
+      - a recovery-era collector scan derives a candidate below the recovered safe boundary
       - collector advances reclamation past a reader that was live at the cut
       - collector publishes past a writer begin and a later scan computes a candidate below the published safe boundary
       - churn in the pool registry drops a live view from the safe-boundary computation
@@ -790,7 +1105,7 @@ entries:
         note: collector_cut_includes_begin_registration_before_fact_publish covers the writer begin window; multi-view churn schedules cover CCPool reader sources
       - type: unit-test
         path: src/cc/context.rs
-        note: ccnode_registration_state_is_visible_to_collector covers the single-atomic CCNode state machine
+        note: ccnode_registration_state_is_visible_to_collector covers the single-atomic CCNode state machine; recovery startup ordering is covered by the Store runtime-order verifier above
       - type: unit-test
         path: src/cc/group.rs
         note: begin_registration_blocks_collection_until_start_ts_is_published covers the writer registration state machine
@@ -1038,6 +1353,8 @@ entries:
         note: production-style pending-delete counter checks live here
       - path: tests/prod_recovery_failpoints.rs
         note: crash windows bracket backend bucket destruction and pending-record removal
+      - path: src/meta/manifest.rs
+        note: bucket logical groups keep per-group frontier ownership on the shared wal cut
     witnesses:
       - path: src/store/gc.rs
         note: GC clears page and interval tables, deletes their backend buckets, then removes pending state and decrements nr_buckets
@@ -1075,9 +1392,33 @@ entries:
       abort must publish its pending abort-clean task before releasing the group Logging mutex that
       prevents collector maintenance from clearing the active-transaction WAL pin; the two pins must
       overlap without an unprotected handoff window.
+      The durable recycle boundary is monotonic: a runtime logger carrying a pre-switch oldest id
+      must clamp its intent start to the persisted done boundary, and an empty clamped range must not
+      replace that done state. Otherwise a route-switch wipe can be undone by a later empty GC pass,
+      making the next boot treat the deleted old-era prefix as a real WAL gap. The clamp and intent
+      write are one metadata transaction; an active intent exclusively owns its physical stream and
+      only a matching done transition may advance it, so concurrent shutdown fallback and GC paths
+      cannot overwrite each other's recycle boundary.
+      Once a route-switch wipe commits its done boundary, recovery must refresh every affected
+      runtime logger's oldest-id cache before runtime GC is enabled.
+      Per-logical-group shared-stream floor slots are two-state: a slot is inactive
+      (Position::MAX) until the group's first update activates it at that transaction's begin LSN
+      in the same logging-mutex critical section as the append, and a checkpoint publish can only
+      advance an active slot (a MAX position never activates one). Recovery publishes the slots from
+      retained shared-stream update evidence after analyze/redo/abort-clean and before runtime
+      checkpoint/GC starts; an era wipe deactivates every slot afterwards. Inactive slots never
+      participate in the recycle min, so a logical group that never wrote cannot pin the shared
+      stream at file 0. If every slot and runtime pin is inactive, GC recycles complete files up
+      to the current append file id and retains that current file as the finite recovery anchor;
+      control-only WAL from unmodified transactions therefore cannot grow without bound.
+      In relaxed mode, GC may read active-fact bounds under the group Logging mutex, then read
+      pending abort-clean pins after releasing it: a modified abort completed before the first
+      lock has already published its task pin in that same mutex critical section, while one not
+      yet completed remains protected by its active-fact begin pin, whose file id is no later than
+      the task pin it will transfer to.
     watch_points:
       - path: src/meta/manifest.rs
-        note: durable recycle frontier and global frontier lower bound live here
+        note: single-bucket transactions atomically normalize intent starts and require a matching intent to commit done; global frontier lower bound also lives here
       - path: src/io/unix.rs
         note: unix read/open flag mapping for retained WAL scan and recycle-open paths lives here
       - path: src/io/win.rs
@@ -1093,18 +1434,26 @@ entries:
       - path: src/index/txn.rs
         note: modified abort transfers WAL retention from the live active-fact pin to pending abort-clean here
       - path: src/store/recovery.rs
-        note: startup recovery uses recycle state when earlier WAL files are already gone
+        note: startup recovery uses recycle state when earlier WAL files are already gone, refreshes logger oldest-id caches after a wipe, and rejects overflow when deriving a shared-stream bootstrap id
       - path: src/io/mod.rs
-        note: recycle bootstrap and file removal now rely on centralized try_exists/read_dir/rename/remove_file semantics here
+        note: recycle bootstrap and file removal now rely on centralized try_exists/read_dir/remove_file semantics here
+      - path: src/cc/log.rs
+        note: shared stream keeps per-logical-group checkpoint floors; recycle cut is the min over all groups' floors and pins
+      - path: src/store/gc.rs
+        note: the durable shared stream recycles via one aggregate intent; when every floor and pin is inactive, current_pos.file_id is the finite cut
+      - path: src/store/recovery.rs
+        note: analyze collects logical groups with retained shared-stream updates; phase2 publishes inactive (MAX) slots for the rest or deactivates every slot after an era wipe
+      - path: src/cc/log.rs
+        note: record_update activates an inactive slot at the first update's begin LSN under the logging mutex; update_checkpoint_for rejects a MAX position so a slot never deactivates
     witnesses:
       - path: src/meta/manifest.rs
-        note: global frontier lower bound includes active buckets with pending flush and fallback checkpoints
+        note: commit_wal_recycle_intent atomically clamps stale starts and owns the stream through commit_wal_recycle_done; global frontier lower bound includes active buckets with pending flush and fallback checkpoints
       - path: src/cc/group.rs
         note: live active facts remain the source of truth for current active wal file and lsn bounds
       - path: src/map/adapter.rs
         note: checkpoint publish uses live active lsn bounds while holding Logging before updating wal checkpoints
       - path: src/store/gc.rs
-        note: GC reads live active wal file bounds while holding Logging and then applies pending abort-clean and checkpoint limits
+        note: relaxed GC reads live active bounds under Logging, then applies pending abort-clean and checkpoint limits; same-mutex abort pin handoff makes either observation conservative
       - path: src/index/txn.rs
         note: abort-clean task enqueue occurs while Logging still overlaps the active-fact pin and the pending abort-clean pin
       - path: tests/prod_recovery_failpoints.rs
@@ -1116,7 +1465,9 @@ entries:
       - abort-clean loses older WAL it still needs
       - recycle frontier persistence becomes weaker across crash windows
       - WAL recycle sees no active pin before the matching abort-clean task becomes visible
-      - stable wal backup creation stalls behind a long-gone active txn pin
+      - a recycled wal file is retained on disk as a backup instead of being removed past its safe boundary
+      - a route-switch wipe advances done to the new era, then an empty runtime recycle regresses it and makes the next boot report a deleted old-era prefix as Corruption
+      - concurrent runtime and shutdown recycle paths replace an active intent or let a stale done transition overwrite a newer boundary
     verifiers:
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
@@ -1129,7 +1480,28 @@ entries:
         note: abort_clean_pin_is_published_before_logging_handoff_releases verifies task publication before Logging release
       - type: regression-test
         path: tests/gc.rs
-        note: gc_wal verifies stable wal backup creation is not pinned by stale active txn state after checkpoint
+        note: gc_wal verifies recycled wal files are removed (never kept as backups) once past the safe recycle boundary
+      - type: regression-test
+        path: tests/gc_shared_wal.rs
+        note: durable_shared_gc_respects_group1_active_pin waits for group 0's durable checkpoint floor to cross the earliest shared WAL file, then verifies aggregate GC recycles that earlier file while retaining the group 1 active pin; route_switch_checkpoints_tail_then_wipes_old_wal covers the v3 switch path (tail made durable, then wal wiped)
+      - type: regression-test
+        path: tests/gc_shared_wal.rs
+        note: unused_logical_groups_do_not_pin_the_shared_wal_stream covers partial inactivity; all_inactive_groups_recycle_unmodified_transaction_wal covers control-only WAL and current-file retention
+      - type: regression-test
+        path: tests/gc.rs
+        note: "relaxed_multi_group_wal_is_recycled_after_checkpoints proves the per-logical-group checkpoint floors advance in relaxed mode with concurrent_write > 1 (regression: the recycle cut must not freeze at the open-time manifest floor)"
+      - type: regression-test
+        path: tests/epoch_route.rs
+        note: route_switch_gc_keeps_recycle_boundary_at_new_epoch_start and relaxed_to_durable_gc_keeps_recycle_boundary_at_new_epoch_start cover both route-switch directions after a runtime GC round
+      - type: unit-test
+        path: src/store/recovery.rs
+        note: stale_recycle_intent_cannot_regress_done_boundary and wal_recycle_intent_owns_matching_done_transition cover stale starts and concurrent collector ownership
+      - type: regression-test
+        path: tests/layout_migration.rs
+        note: true_multi_group_legacy_wal_is_recovered_and_migrated runs GC after migration and keeps every physical stream's done boundary at the new epoch start
+      - type: failpoint-test
+        path: tests/prod_generation_failpoints.rs
+        note: all_inactive_shared_recycle_crash_reopens_without_a_wal_gap covers the control-only finite cut; switch and layout-migration crash tests cover intent/done completion and forced-fsync prerequisites
 
   - id: protocol.wal_recycle_state_bootstrap_completion
     title: durable wal recycle intent and done state must complete before bootstrap scanning
@@ -1140,7 +1512,20 @@ entries:
       Durable WAL recycle state in `wrc_*` is the startup source of truth for recycle progress.
       Recovery must complete any durable pending recycle intent before WAL bootstrap scanning, and
       `Done` state must remain durable enough to serve as the retained frontier when earlier WAL
-      files have already been removed.
+      files have already been removed. The retained scan of a stream starts at its durable
+      `Done` boundary. Checkpoint discovery starts at that retained boundary, and analyze may
+      start later at the latest validated checkpoint hint, clamped not to precede `Done`; the
+      bucket durable frontier remains the redo correctness gate. The era wipe advances every
+      physical stream's `Done` state to the
+      new era start (even streams with no files at the wipe time), so a stream that has files
+      always boots with `Done` equal to its oldest present file and a missing file at or above
+      that boundary is a real gap, never a stale-boundary artifact. Physical removal enumerates
+      actual matching directory entries in the intent range, so empty or sparse streams do not
+      perform work proportional to the global high-water id. The reserved shared-stream
+      slot `wrc_255` (Options::SHARED_ID,
+      above MAX_CONCURRENT_WRITE) carries the durable shared stream's recycle progress: the key is
+      additive (a fresh key is `none` for old databases, and old code never enumerates slot 255),
+      so group_wal_x cleanup needs no manifest migration.
     watch_points:
       - path: src/meta/manifest.rs
         note: wal recycle state load and commit operations live here
@@ -1149,26 +1534,33 @@ entries:
       - path: src/io/win.rs
         note: windows read/open flag mapping for bootstrap WAL enumeration follow-up opens lives here
       - path: src/store/recovery.rs
-        note: recovery completes recycle intent before bootstrap scan here
+        note: recovery completes recycle intent before bootstrap scan; checkpoint discovery starts at Done and the validated hint becomes analyze's scan_start; remove_wal_prefix enumerates actual namespace entries instead of numeric ids
       - path: src/store/gc.rs
-        note: runtime recycle creates intent and done state here
+        note: runtime recycle creates intent and done state here; the durable shared stream recycles via `wrc_255` (aggregate boundary), and relaxed mode recycles per-group streams only (leftover group_wal files cannot exist in a relaxed open, since a route switch wipes every physical stream of the previous era, including the shared SHARED_ID stream, re-executed by finish_pending_wal_recycle on a mid-wipe crash)
       - path: src/utils/options.rs
-        note: explicit log-dir sync helper used by recycle closure remains here
+        note: explicit log-dir sync helper used by recycle closure remains here; physical_wal_path maps slot 255 to the group_wal_<seq> namespace
       - path: src/io/mod.rs
         note: recycle bootstrap file enumeration and physical delete semantics now route through the filesystem boundary here
       - path: tests/prod_recovery_failpoints.rs
         note: crash windows around intent and done state persistence live here
+      - path: src/store/gc.rs
+        note: WalRecycleIntent.group_id is interpreted as the physical stream id; durable mode issues one intent for the shared stream (slot 255), relaxed mode issues per-group intents
     witnesses:
       - path: src/meta/manifest.rs
-        note: load_wal_recycle_state and commit_wal_recycle_intent/done carry durable Sequences state
+        note: load_wal_recycle_state and commit_wal_recycle_intent/done carry durable Sequences state; slot 255 loads as none on legacy databases
       - path: src/store/recovery.rs
-        note: recovery uses durable recycle state during bootstrap and later recycle completion
+        note: recovery uses durable recycle state during bootstrap and later recycle completion; load_physical_stream_boot clamps scan_start to Done and phase2 passes it to analyze
       - path: tests/prod_recovery_failpoints.rs
         note: done-frontier crash windows assert durable recycle bootstrap behavior across reopens
+      - path: tests/gc_shared_wal.rs
+        note: shared-stream recycle crash tests exercise the `wrc_255` intent/done windows
+      - path: src/store/recovery.rs
+        note: remove_wal_prefix_enumerates_present_files_instead_of_sparse_ids proves probe count follows matching entries, not a million-id range
     failure_symptoms:
       - recovery starts scanning from a frontier that assumes recycle completed when it did not
       - restart loses durable recycle progress and reopens with an invalid oldest retained wal boundary
       - done frontier is not durable enough to protect later boots after earlier wal files are removed
+      - layout migration startup time grows with concurrent_write multiplied by a sparse global file id
     verifiers:
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
@@ -1176,6 +1568,9 @@ entries:
       - type: runtime-order
         path: src/meta/manifest.rs
         note: recycle state is stored and loaded from Sequences as explicit durable state
+      - type: unit-test
+        path: src/store/recovery.rs
+        note: remove_wal_prefix_enumerates_present_files_instead_of_sparse_ids
 
   - id: protocol.filesystem_io_errors_do_not_collapse_to_absence
     title: startup directory prep, recovery bootstrap, and runtime probe/open paths must not collapse fs faults into absence
@@ -1214,19 +1609,21 @@ entries:
         note: recovery bootstrap, WAL enumeration, and recycle cleanup must surface fs failures here
       - path: src/store/store.rs
         note: startup manifest existence probe must preserve FileSystem try_exists faults here
+      - path: src/store/recovery.rs
+        note: epoch bootstrap file creation and stream enumeration keep FileSystem error semantics
     witnesses:
       - path: src/io/mod.rs
         note: remove_file_if_exists only absorbs explicit NotFound while preserving all other fs errors
       - path: src/utils/options.rs
         note: create_dir_all_and_sync and sync_*_dir propagate fs failures instead of collapsing them to directory absence
       - path: src/store/recovery.rs
-        note: wal_file_range, get_file, find_latest_checkpoint, and remove_wal_prefix now use FileSystem and return OpCode::IoError on fs faults
+        note: wal_file_range, get_file, find_latest_checkpoint, and remove_wal_prefix use FileSystem and return OpCode::IoError on fs faults
       - path: src/cc/log.rs
         note: WAL rotate/open probes use FileSystem and panic through must_ok on unexpected fs faults
       - path: src/store/store.rs
         note: Mace::new probes manifest existence through FileSystem before opening the manifest btree
     failure_symptoms:
-      - validate or reopen succeeds after a permission-denied create_dir_all, sync_dir, read_dir, open, rename, or remove_file fault on the scoped startup or recovery path
+      - validate or reopen succeeds after a permission-denied create_dir_all, sync_dir, read_dir, open, or remove_file fault on the scoped startup or recovery path
       - recovery silently skips WAL enumeration or retained-WAL discovery because a filesystem error was flattened into absence
       - runtime file builders or readers treat a non-NotFound fs fault as an empty file set or a missing file
     verifiers:
@@ -1247,7 +1644,7 @@ entries:
         note: chaos_failpoint_fs_create_dir_all_io, chaos_failpoint_fs_sync_dir_io, and chaos_failpoint_fs_read_dir_io validate startup/open error surfacing
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
-        note: chaos_failpoint_recovery_fs_remove_file_io and chaos_failpoint_recovery_fs_rename_io validate recovery recycle cleanup error surfacing
+        note: chaos_failpoint_recovery_fs_remove_file_io validates recovery recycle cleanup error surfacing
       - type: unit-test
         path: src/store/store.rs
         note: new_surfaces_manifest_try_exists_error_through_file_system keeps manifest stat faults visible through FileSystem
@@ -1264,8 +1661,11 @@ entries:
       as corruption and must reject immutable global-option mismatches, currently `concurrent_write`,
       before recovery starts. A visible but otherwise pristine manifest file that still lacks both
       records must bootstrap them instead of being treated as corruption. Mutable persisted fields
-      follow the current open call's normalized `Options`; if the persisted subset changes, the
-      manifest must be rewritten before recovery begins.
+      follow the current open call's normalized `Options`; if the persisted subset changes (including
+      sync_on_write, the WAL route), the manifest is rewritten no later than the first
+      route-switch-processing-completing reopen, so the persisted sync_on_write always means the
+      last completed route; a crash before that writeback leaves the previous route recorded and the
+      next open re-detects the switch idempotently.
     watch_points:
       - path: src/utils/options.rs
         note: persisted options schema, defaults, json decode, and immutable compatibility checks live here
@@ -1274,7 +1674,7 @@ entries:
       - path: src/meta/builder.rs
         note: open-time persisted options load and compatibility gate live here
       - path: src/store/store.rs
-        note: options writeback is sequenced before recovery here
+        note: options writeback is sequenced after recovery/switch processing here
       - path: tests/bucket.rs
         note: manifest misc/options regressions and immutable mismatch reopens live here
     witnesses:
@@ -1283,7 +1683,7 @@ entries:
       - path: src/meta/builder.rs
         note: load bootstraps only pristine manifests and otherwise rejects missing or incompatible persisted options before bucket metadata and recovery proceed
       - path: src/store/store.rs
-        note: Mace::new probes manifest state through FileSystem and writes updated mutable persisted options before Recovery::phase1 starts
+        note: Mace::new probes manifest state through FileSystem, detects route_switch from the persisted sync_on_write, and writes back updated mutable persisted options after phase2/switch processing completes
       - path: tests/bucket.rs
         note: bootstrap, visible-but-uninitialized bootstrap, mutable rewrite, missing key, bad json, and concurrent_write conflict reopens are asserted here
     failure_symptoms:
@@ -1301,7 +1701,7 @@ entries:
         note: global_options_* tests validate bootstrap writeback, visible-but-uninitialized bootstrap, mutable rewrites, corruption cases, and immutable mismatch rejection
       - type: runtime-order
         path: src/store/store.rs
-        note: Mace::new writes persisted options before Recovery::phase1
+        note: Mace::new writes persisted options after phase2/switch processing (route-switch idempotence covered by the prod_generation_failpoints route-switch crash tests, gated by the prod_test.sh failpoints+extra_check target with non-zero test-count guard)
 
   - id: protocol.foreground_admission_before_tree_update
     title: foreground admission wait must happen before entering tree.update mutation paths
@@ -1339,6 +1739,125 @@ entries:
       - type: runtime-order
         path: src/index/txn.rs
         note: write paths call before_write_budget before tree.update
+
+  - id: protocol.graceful_exit_flushes_all_dirty_pages
+    title: graceful exit must flush every dirty page with a full fsync
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      A graceful close (last handle drop) must persist every live dirty page
+      into the data/blob files written by the final checkpoint with a full
+      fsync before that checkpoint's manifest publish, regardless of
+      sync_on_write. The exit path must drain every pending abort-clean task
+      (recovery-style) before the final checkpoint so a clean close leaves no
+      aborted bytes in the data files; the drain itself may dirty pages, and
+      those pages are included in the subsequent final checkpoint. Recovery
+      also redoes abort-clean from the wal on every open (old wal is wiped only
+      after the recovery abort-clean drain, and wal recycle honors pending
+      abort-clean pins). Run-time
+      relaxed checkpoints keep the fdatasync-only contract; only the exit path
+      forces fsync, so the relaxed runtime guarantee (page-cache writes remain
+      valid) is untouched. Failure or abort paths (Store::abort, reclaim
+      fallback) are not covered: they keep the fdatasync-only flush and may
+      leave aborted versions behind (invisible, recovered on next open).
+    watch_points:
+      - path: src/map/buffer.rs
+        note: BucketMgr::quit drives checkpoint_before_reclaim(true) per bucket before the flusher stops
+      - path: src/map/flush.rs
+        note: FlushResult::sync picks fsync when force_fsync is set (exit-path tasks only)
+      - path: src/store/store.rs
+        note: quit order drains in-flight transactions, then final checkpoints, then WAL barrier
+    witnesses:
+      - path: src/map/flush.rs
+        note: FlushResult::sync applies force_fsync only to exit-path tasks; run-time checkpoints stay fdatasync
+      - path: src/map/buffer.rs
+        note: only BucketMgr::quit passes true; every run-time trigger passes false
+      - path: tests/exit_flush.rs
+        note: deleting every WAL file of both namespaces (per-group wal_<group>_<seq> and shared group_wal_<seq>) after a graceful exit still exposes the full committed set, durable and relaxed (WAL-independent recovery; same-process page cache cannot distinguish fsync from fdatasync, so this test pins the flush-all + manifest-publish half of the rule)
+    failure_symptoms:
+      - read-only view after reopen misses committed data after WAL files are removed
+      - relaxed exit leaves dirty pages only in page cache (data files stale after power loss)
+    verifiers:
+      - type: behavior
+        path: tests/exit_flush.rs
+        note: exit_flush deletes every WAL file in both namespaces and asserts zero remain before reopening; the committed set must survive in both modes (WAL-independent recovery)
+      - type: runtime-order
+        path: src/map/flush.rs
+        note: FlushResult::sync branches on force_fsync to fsync; the fsync-vs-fdatasync distinction is enforced by code review, not by the behavior test
+  - id: protocol.wal_format_upgrade_requires_wal_independent_exit
+    title: graceful exit must leave the store WAL-independent so WAL format upgrades are safe
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      After a graceful close (last handle drop) and removal of every WAL file of
+      both namespaces (legacy per-group `wal_<group>_<seq>` and the durable
+      shared `group_wal_<seq>` stream), reopening must expose exactly the
+      committed model: every commit-returned transaction visible with its value,
+      and every aborted version invisible (including versions an aborted
+      transaction wrote over a committed value).
+      Recovery without WAL derives its safe waterline from persisted sequences
+      and the final checkpoint's manifest publish. Aborted versions stay
+      invisible because the exit path removes them physically: the mandatory
+      abort-clean drain completes before the final checkpoint, so the serialized
+      pages hold no aborted versions at all. With the wal still present,
+      recovery redoes abort-clean from the wal on the next open. Checkpoint
+      serialization itself does not filter aborted versions (a leftover
+      aborted version would stay reachable, not archived, which is exactly why
+      the drain and the wal-replay path matter).
+    watch_points:
+      - path: src/store/gc.rs
+        note: drain_abort_clean_at_exit physically removes aborted versions before the final checkpoint serializes pages
+      - path: src/store/recovery.rs
+        note: no-WAL recovery derives oracle/safe from persisted sequences; with the wal present it redoes abort-clean from the wal
+      - path: src/map/buffer.rs
+        note: BucketMgr::quit final checkpoint is the last write before WAL removal
+    witnesses:
+      - path: tests/exit_flush.rs
+        note: delete-every-WAL-in-both-namespaces reopen tests (durable + relaxed) plus aborted-version and aborted-override upgrade scenarios; the helper asserts both namespaces hold zero files before reopening
+    failure_symptoms:
+      - committed value lost after WAL removal when an aborted txn overwrote it
+      - aborted key becomes visible after WAL removal
+      - reopen after WAL removal needs any WAL record to rebuild tx outcomes
+    verifiers:
+      - type: behavior
+        path: tests/exit_flush.rs
+        note: upgrade_scenario tests delete every WAL file in both namespaces after graceful exit and assert committed-only visibility
+  - id: protocol.shutdown_admission_exclusion
+    title: transaction admission never races with shutdown in the public API
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      The public API offers no path where transaction or view admission can run
+      concurrently with shutdown. Store::quit is reachable only from Inner::drop,
+      which executes when the last Arc<Inner> handle (Mace or Bucket) is dropped;
+      begin()/view() require a live bucket borrow, so no thread can be on an
+      admission path when quit runs. There is deliberately no runtime admission
+      gate. If a public close/quit API that can run while buckets are alive, or a
+      drop-order change that releases the store before the buckets, is ever
+      introduced, an admission gate must be restored before that path ships.
+    watch_points:
+      - path: src/store/store.rs
+        note: any new public close/quit method on Mace or Store, or a change to Inner::drop ordering, reopens the admission/shutdown race
+      - path: src/cc/context.rs
+        note: next_group_id / alloc_view_pin are the admission entry points; quit drains in-flight transactions before the force barrier here
+    witnesses:
+      - path: src/store/store.rs
+        note: Store::quit is pub(crate) and called only from Inner::drop; Bucket holds Arc<Inner>, begin()/view() borrow the bucket
+      - path: src/cc/context.rs
+        note: quit drains in-flight transactions (acquire/release handshake) before the force barrier and joins the collector last
+    failure_symptoms:
+      - a new public close API admits a transaction after the force barrier or while the collector is stopped
+      - a transaction outlives store teardown and touches freed checkpoint/context state
+    verifiers:
+      - type: runtime-order
+        path: src/store/store.rs
+        note: quit is reachable only from Inner::drop (last handle); no public close/quit API exists
+      - type: regression-test
+        path: src/cc/context.rs
+        note: quit_waits_for_inflight_then_joins_collector proves the in-flight drain and collector join
 
   - id: dependency.manifest_conditional_update_semantics
     title: manifest stat apply depends on btree-store conditional update and atomic multi-bucket commit
@@ -1384,3 +1903,50 @@ entries:
     next_actions:
       - add a narrow contract test that proves update-on-miss returns false without inserting
       - add a meta-store adapter boundary so dependency semantics are audited in one place
+
+  - id: protocol.transaction_checkpoint_span_follows_group_counter
+    title: max_ckpt_per_txn enforcement follows the transaction's own logical-group checkpoint counter
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      A transaction's checkpoint-span limit is measured against the checkpoint counter of its
+      own logical group. Shared Logging tracks Begin/Update/Commit/Abort activity independently
+      for each group. A publish round may append one physical checkpoint record, but advances a
+      group's counter exactly once only when that group had WAL activity since its prior publish;
+      unrelated-group activity cannot age it. A disabled or no-activity publish ages no group.
+      Relaxed per-group loggers keep their single own-group counter and the same activity rule.
+    watch_points:
+      - path: src/cc/log.rs
+        note: logical_wal_dirty and ckpt_cnts implement per-group activity-triggered aging
+      - path: src/cc/context.rs
+        note: durable wiring passes every group's counter to the shared logger; relaxed wiring passes one counter per logger
+      - path: src/index/txn.rs
+        note: should_abort reads the transaction's own group counter against the begin-time snapshot
+      - path: src/map/adapter.rs
+        note: checkpoint publish calls update_checkpoint_for for every group each round
+    witnesses:
+      - path: src/cc/log.rs
+        note: record methods mark only their logical group dirty; update_checkpoint_for clears and advances only that group's counter
+      - path: src/cc/context.rs
+        note: the durable shared logger is constructed with the full ckpt_cnts vec; WriterGroup keeps its own counter Arc
+      - path: tests/gc.rs
+        note: durable_group1_transaction_enforces_max_ckpt_per_txn proves group 1 ages; unrelated_group_checkpoints_do_not_age_group1_transaction proves group 0-only rounds do not age it
+    failure_symptoms:
+      - a transaction on logical group 1..N keeps committing past max_ckpt_per_txn and pins MVCC history and WAL
+      - group 1..N checkpoint counters never advance while group 0's does
+      - a group with WAL activity fails to age during its logical publish because it reuses a shared physical checkpoint hint
+      - group 0-only checkpoint activity prematurely aborts a quiet group 1 transaction
+    verifiers:
+      - type: regression-test
+        path: tests/gc.rs
+        note: durable_group1_transaction_enforces_max_ckpt_per_txn (group 1, durable, limit 1)
+      - type: regression-test
+        path: tests/gc.rs
+        note: unrelated_group_checkpoints_do_not_age_group1_transaction
+      - type: regression-test
+        path: tests/gc.rs
+        note: abort_txn (group 0 path unchanged)
+      - type: unit-test
+        path: src/cc/log.rs
+        note: shared_checkpoint_ages_only_logical_groups_with_wal_activity and update_checkpoint_advances_after_checkpoint_is_enabled

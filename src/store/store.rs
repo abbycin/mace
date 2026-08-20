@@ -5,14 +5,14 @@ use crate::map::adapter::{ManifestCheckpointObserver, ManifestDataReader};
 use crate::map::evictor::Evictor;
 use crate::meta::builder::ManifestBuilder;
 use crate::meta::{BucketMeta, Manifest};
-use crate::store::gc::{GCHandle, start_gc};
+use crate::store::gc::{GCHandle, drain_abort_clean_at_exit, start_gc};
 use crate::store::recovery::Recovery;
 use crate::utils::Handle;
 use crate::utils::MutRef;
 pub use crate::utils::OpCode;
 use crate::utils::ROOT_PID;
 pub use crate::utils::options::Options;
-use crate::utils::options::{BucketOptions, ParsedOptions};
+use crate::utils::options::{BucketOptions, ParsedOptions, PersistedOptions};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::mpsc::channel;
@@ -44,14 +44,14 @@ impl Store {
     }
 
     pub(crate) fn quit(&mut self) {
-        // 1) stop new writes and flush outstanding WAL
-        let _ = self.context.sync();
+        // wait for terminal publication while flushing remains available
+        self.context.drain_inflight();
 
         // 2) stop background workers in order: evictor -> flusher -> buckets
         // bucket.quit will send Quit to evictor thread and wait ack
         self.manifest.buckets.quit();
 
-        // 3) after evictor/flush threads stopped, shut down WAL threads
+        // force the WAL barrier and stop the collector
         self.context.quit();
 
         // 4) reclaim contexts (arena/page caches) first, then manifest
@@ -122,7 +122,12 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        // stop GC before draining abort-clean tasks
         self.gc.quit();
+        self.store.raw_ref().context.drain_inflight();
+        // drain abort-clean before the final checkpoint
+        let ctx = self.store.raw_ref().context;
+        drain_abort_clean_at_exit(self.store.clone(), ctx);
         self.store.raw_ref().quit();
     }
 }
@@ -191,14 +196,16 @@ impl Mace {
         let mut builder = ManifestBuilder::new_with_channels(opt.clone(), tx, rx);
         let persisted_options = builder.load()?;
         let manifest = Handle::new(builder.finish());
-        if let Some(persisted_options) = persisted_options
-            && let Err(err) = manifest.store_persisted_options(&persisted_options)
-        {
-            manifest.reclaim();
-            return Err(err);
-        }
+        // persisted route records the last completed recovery/switch
+        let persisted_sync_on_write = manifest
+            .load_persisted_options_if_present()?
+            .map(|p| p.sync_on_write);
+        let route_switch = persisted_sync_on_write.is_some_and(|p| p != opt.sync_on_write);
+        // legacy per-group files require durable-layout migration
+        let layout_migration = opt.sync_on_write && has_legacy_per_group_wal(opt.as_ref())?;
+        let rebuild_epoch = route_switch || layout_migration;
 
-        let mut recover = Recovery::new(opt.clone());
+        let mut recover = Recovery::new(opt.clone(), rebuild_epoch);
         let (wal_boot, ctx) = match recover.phase1(manifest, manifest.sequences.clone()) {
             Ok(parts) => parts,
             Err(err) => {
@@ -217,6 +224,17 @@ impl Mace {
             store.raw_ref().abort();
             return Err(err);
         }
+        // write options only after recovery and switching complete
+        if let Some(_persisted_options) = persisted_options
+            && let Err(err) =
+                manifest.store_persisted_options(&PersistedOptions::from_options(opt.as_ref()))
+        {
+            recover.abort(store.clone());
+            store.raw_ref().abort();
+            return Err(err);
+        }
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_switch_after_options_writeback");
         store.start();
         let handle = start_gc(store.clone(), store.context);
         let finish_handle = handle.clone();
@@ -317,6 +335,23 @@ impl Mace {
     }
 }
 
+/// whether a durable open found legacy per-group WAL files
+fn has_legacy_per_group_wal(opt: &ParsedOptions) -> Result<bool, OpCode> {
+    let prefix = format!("{}{}", Options::WAL_PREFIX, Options::SEP);
+    for entry in opt.fs.read_dir(&opt.log_root())? {
+        let Some(name) = entry.file_name() else {
+            continue;
+        };
+        let Some(raw) = name.to_str() else {
+            continue;
+        };
+        if raw.starts_with(&prefix) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{io::ErrorKind, sync::Arc};
@@ -327,6 +362,7 @@ mod tests {
     };
 
     use super::{Mace, Options};
+    use crate::OpCode;
 
     #[test]
     fn new_surfaces_manifest_try_exists_error_through_file_system() {
@@ -344,7 +380,7 @@ mod tests {
         let err = Mace::new(opt.validate().expect("options must validate"))
             .err()
             .expect("manifest try_exists fault must fail open");
-        assert_eq!(err, crate::OpCode::IoError);
+        assert_eq!(err, OpCode::IoError);
         assert!(
             fs.calls()
                 .iter()

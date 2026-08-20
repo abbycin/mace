@@ -109,14 +109,12 @@ pub struct Options {
     pub max_ckpt_per_txn: usize,
     /// WAL file size limit that triggers switching to a new WAL file, up to 2GB.
     pub wal_file_size: u32,
-    /// If true, remove unused stable WAL files (never used in recovery).
-    ///
-    /// Default is `false`.
-    pub keep_stable_wal_file: bool,
     /// If true, corrupted WAL is truncated during recovery; otherwise recovery panics.
     ///
     /// Default is true.
     pub truncate_corrupted_wal: bool,
+    /// durable-route merge window in microseconds
+    pub sync_merge_window_us: u64,
     /// Observability callback. Default is no-op.
     pub observer: Arc<dyn Observer>,
     /// Filesystem hook for namespace operations and runtime file opens.
@@ -242,8 +240,8 @@ impl Options {
             wal_buffer_size: Self::WAL_BUF_SZ,
             max_ckpt_per_txn: 1_000_000, // 1 million
             wal_file_size: Self::WAL_FILE_SZ as u32,
-            keep_stable_wal_file: false,
             truncate_corrupted_wal: true,
+            sync_merge_window_us: 125,
             observer: Arc::new(NoopObserver),
             fs: Arc::new(io::OsFileSystem),
         }
@@ -308,8 +306,10 @@ impl Options {
     pub const DATA_PREFIX: &'static str = "data";
     pub const BLOB_PREFIX: &'static str = "blob";
     pub const WAL_PREFIX: &'static str = "wal";
-    pub const WAL_STABLE: &'static str = "stable-wal";
+    pub const GROUP_WAL_PREFIX: &'static str = "group_wal";
     pub const MANIFEST: &'static str = "manifest";
+    /// reserved physical id for the durable shared stream
+    pub const SHARED_ID: u8 = 255;
 
     pub fn data_root(&self) -> PathBuf {
         self.db_root().join("data")
@@ -348,15 +348,19 @@ impl Options {
         ))
     }
 
-    pub fn wal_backup(&self, group_id: u8, seq: u64) -> PathBuf {
-        self.log_root().join(format!(
-            "{}{}{}{}{}",
-            Self::WAL_STABLE,
-            Self::SEP,
-            group_id,
-            Self::SEP,
-            seq
-        ))
+    /// durable shared stream file: `group_wal_<seq>`
+    pub fn group_wal_file(&self, seq: u64) -> PathBuf {
+        self.log_root()
+            .join(format!("{}{}{}", Self::GROUP_WAL_PREFIX, Self::SEP, seq))
+    }
+
+    /// path for a physical WAL stream
+    pub fn physical_wal_path(&self, physical_wal_id: u8, seq: u64) -> PathBuf {
+        if physical_wal_id == Self::SHARED_ID {
+            self.group_wal_file(seq)
+        } else {
+            self.wal_file(physical_wal_id, seq)
+        }
     }
 
     pub fn manifest(&self) -> PathBuf {
@@ -397,7 +401,6 @@ pub(crate) struct PersistedOptions {
     pub wal_buffer_size: usize,
     pub max_ckpt_per_txn: usize,
     pub wal_file_size: u32,
-    pub keep_stable_wal_file: bool,
     pub truncate_corrupted_wal: bool,
 }
 
@@ -420,7 +423,6 @@ impl Default for PersistedOptions {
             wal_buffer_size: Options::WAL_BUF_SZ,
             max_ckpt_per_txn: 1_000_000,
             wal_file_size: Options::WAL_FILE_SZ as u32,
-            keep_stable_wal_file: false,
             truncate_corrupted_wal: true,
         }
     }
@@ -445,7 +447,6 @@ impl PersistedOptions {
             wal_buffer_size: opt.wal_buffer_size,
             max_ckpt_per_txn: opt.max_ckpt_per_txn,
             wal_file_size: opt.wal_file_size,
-            keep_stable_wal_file: opt.keep_stable_wal_file,
             truncate_corrupted_wal: opt.truncate_corrupted_wal,
         }
     }

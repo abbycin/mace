@@ -1,4 +1,6 @@
 use mace::observe::{CounterMetric, HistogramMetric, InMemoryObserver};
+#[cfg(feature = "extra_check")]
+use mace::testing;
 use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -595,6 +597,110 @@ fn abort_txn() {
     assert!(r.is_err() && r.err().unwrap() == OpCode::AbortTx);
 }
 
+#[cfg(feature = "extra_check")]
+#[test]
+fn durable_group1_transaction_enforces_max_ckpt_per_txn() {
+    // the shared durable stream is one physical logger, but max_ckpt_per_txn
+    // must stay per-logical-group: a transaction on group 1 must observe its
+    // own group's checkpoint counter advancing, otherwise it can pin MVCC
+    // history and WAL past the configured limit
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.sync_on_write = true;
+    opt.concurrent_write = 2;
+    opt.max_ckpt_per_txn = 1;
+    opt.data_file_size = 50 << 10; // make sure checkpoint was taken
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
+
+    // one commit on group 0 so the next transaction lands on group 1
+    let tx = db.begin().unwrap();
+    assert_eq!(testing::txn_group(&db, testing::txn_start_ts(&tx)), Some(0));
+    tx.put("g0", b"v").unwrap();
+    tx.commit().unwrap();
+
+    let tx = db.begin().unwrap();
+    assert_eq!(testing::txn_group(&db, testing::txn_start_ts(&tx)), Some(1));
+    tx.put("a", b"1").unwrap();
+
+    // every checkpoint cut advances group 1's own counter; the next put must
+    // observe the limit and abort (the publish is asynchronous, so poll)
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut aborted = false;
+    while Instant::now() < deadline {
+        db.checkpoint();
+        if tx.put("b", b"2") == Err(OpCode::AbortTx) {
+            aborted = true;
+            break;
+        }
+    }
+    assert!(
+        aborted,
+        "group 1 transaction must be limited by max_ckpt_per_txn"
+    );
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn unrelated_group_checkpoints_do_not_age_group1_transaction() {
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.sync_on_write = true;
+    opt.concurrent_write = 2;
+    opt.max_ckpt_per_txn = 2;
+    opt.data_file_size = 50 << 10;
+    opt.checkpoint_nudge_ms = 0;
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
+
+    let tx0 = db.begin().unwrap();
+    tx0.put("seed", b"v").unwrap();
+    tx0.commit().unwrap();
+
+    let tx1 = db.begin().unwrap();
+    let txid1 = testing::txn_start_ts(&tx1);
+    assert_eq!(testing::txn_group(&db, txid1), Some(1));
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while testing::group_checkpoint_count(&db, 1) < 1 && Instant::now() < deadline {
+        db.checkpoint();
+        std::thread::yield_now();
+    }
+    assert_eq!(testing::group_checkpoint_count(&db, 1), 1);
+
+    for i in 0..8 {
+        let tx = db.begin().unwrap();
+        assert_eq!(testing::txn_group(&db, testing::txn_start_ts(&tx)), Some(0));
+        tx.put(format!("g0_{i}"), b"v").unwrap();
+        tx.commit().unwrap();
+        db.checkpoint();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while testing::group_checkpoint_count(&db, 0) < 2 && Instant::now() < deadline {
+        db.checkpoint();
+        std::thread::yield_now();
+    }
+    assert!(testing::group_checkpoint_count(&db, 0) >= 2);
+    assert_eq!(
+        testing::group_checkpoint_count(&db, 1),
+        1,
+        "group 0-only WAL activity must not age group 1"
+    );
+    // drain any in-flight checkpoint publish before the final witness write:
+    // tx1's own put arms group 1's dirty flag, and a publish observing it
+    // charges group 1's counter, which would abort tx1's commit at the
+    // max_ckpt_per_txn boundary even though no group 0 activity aged it
+    testing::checkpoint_and_wait(&db);
+    assert_eq!(
+        testing::group_checkpoint_count(&db, 1),
+        1,
+        "draining the publish must not age group 1 either"
+    );
+    tx1.put("survives", b"v").unwrap();
+    tx1.commit().unwrap();
+}
+
 #[test]
 fn gc_wal() {
     let path = RandomPath::tmp();
@@ -602,7 +708,6 @@ fn gc_wal() {
     opt.wal_file_size = 4096;
     opt.gc_timeout = 2;
     opt.concurrent_write = 1;
-    opt.keep_stable_wal_file = true;
     opt.data_file_size = 100 << 10; // make sure checkpoint was taken
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -626,11 +731,12 @@ fn gc_wal() {
 
     db.checkpoint();
 
-    let backup = db.options().wal_backup(0, 1);
+    // recycled wal files must be removed, never kept as backups
+    let first = db.options().wal_file(0, 1);
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
         mace.start_gc();
-        if backup.exists() {
+        if !first.exists() {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -644,8 +750,8 @@ fn gc_wal() {
         files.sort_unstable();
     }
     panic!(
-        "stable wal backup did not appear in time: backup={:?}, files={:?}, data_gc_count={}, blob_gc_count={}",
-        backup,
+        "recycled wal file was not removed in time: first={:?}, files={:?}, data_gc_count={}, blob_gc_count={}",
+        first,
         files,
         mace.data_gc_count(),
         mace.blob_gc_count()
@@ -800,6 +906,7 @@ fn abort_clean_blocks_drop_until_task_is_fully_removed() -> Result<(), OpCode> {
     let tx = db.begin().unwrap();
     tx.update("k", "v1")?;
     drop(tx);
+    assert_eq!(mace.del_bucket("x"), Err(OpCode::Again));
     drop(db);
 
     assert_eq!(mace.drop_bucket("x"), Err(OpCode::Again));
@@ -895,7 +1002,10 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
     ));
     drop(bucket);
 
-    let completion_deadline = Instant::now() + Duration::from_secs(5);
+    // removal requires an EBR callback plus a GC round; under parallel test
+    // load a fixed round count can run out, so wait on a bounded deadline
+    // (same pattern as the callback_seen wait above). pre-existing flake fix
+    let removal_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         mace.start_gc();
         let bucket = mace.get_bucket("x")?;
@@ -907,26 +1017,15 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
                 txid
             ));
             drop(bucket);
-            match mace.drop_bucket("x") {
-                Ok(()) => {
-                    testing::clear_abort_clean_hook();
-                    return Ok(());
-                }
-                Err(OpCode::Again) => {}
-                Err(e) => panic!("unexpected drop_bucket error: {e:?}"),
-            }
-        } else {
-            assert_eq!(
-                testing::abort_clean_task_stage(&bucket, txid),
-                Some(AbortCleanStage::WaitingQuiesce)
-            );
-            assert_eq!(testing::abort_clean_task_info(&bucket, txid), Some(info));
-            assert!(testing::retained_abort_present(
-                &bucket,
-                info.group_id as usize,
-                txid
-            ));
-            drop(bucket);
+            break;
+        }
+        assert_eq!(
+            testing::abort_clean_task_stage(&bucket, txid),
+            Some(AbortCleanStage::WaitingQuiesce)
+        );
+        drop(bucket);
+        if Instant::now() >= removal_deadline {
+            panic!("abort-clean task must be removed within the removal deadline");
         }
         for _ in 0..16 {
             let guard = crossbeam_epoch::pin();
@@ -934,13 +1033,10 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
             drop(guard);
             std::thread::yield_now();
         }
-        if Instant::now() >= completion_deadline {
-            testing::clear_abort_clean_hook();
-            println!(
-                "abort-clean task or bucket ownership did not reach removable state before deadline"
-            );
-        }
     }
+    testing::clear_abort_clean_hook();
+    assert_eq!(mace.drop_bucket("x"), Ok(()));
+    Ok(())
 }
 
 #[cfg(feature = "extra_check")]
@@ -969,7 +1065,8 @@ fn abort_clean_corruption_retains_task_fact_and_wal_pin() -> Result<(), OpCode> 
     drop(tx);
     let info =
         testing::abort_clean_task_info(&db, txid).expect("abort-clean task must be published");
-    testing::corrupt_abort_clean_prev(&db, txid, info.tail_file_id, info.tail_offset)?;
+    let original_prev =
+        testing::corrupt_abort_clean_prev(&db, txid, info.tail_file_id, info.tail_offset)?;
     let corruption_seen = Arc::new(AtomicBool::new(false));
     testing::set_abort_clean_hook(Some(Arc::new({
         let corruption_seen = corruption_seen.clone();
@@ -994,8 +1091,10 @@ fn abort_clean_corruption_retains_task_fact_and_wal_pin() -> Result<(), OpCode> 
         info.group_id as usize,
         txid
     ));
+    testing::corrupt_abort_clean_prev(&bucket, txid, original_prev.0, original_prev.1)?;
     drop(bucket);
     testing::clear_abort_clean_hook();
+    mace.start_gc();
     assert_eq!(mace.drop_bucket("x"), Err(OpCode::Again));
     Ok(())
 }
@@ -1069,5 +1168,80 @@ fn recovery_abort_clean_does_not_leave_bucket_loaded_after_startup() -> Result<(
             ..BucketOptions::default()
         },
     )?;
+    Ok(())
+}
+
+fn wal_file_ids(log_root: &std::path::Path, physical: u8) -> Vec<u64> {
+    let prefix = format!("wal_{physical}_");
+    let mut ids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(log_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(rest) = name.strip_prefix(&prefix)
+                && let Ok(file_id) = rest.parse::<u64>()
+            {
+                ids.push(file_id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn relaxed_multi_group_wal_is_recycled_after_checkpoints() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.sync_on_write = false;
+    opt.concurrent_write = 2;
+    opt.wal_file_size = 4 << 10;
+    opt.gc_timeout = 60_000;
+    opt.checkpoint_nudge_ms = 0;
+    opt.data_file_size = 1 << 30;
+    let log_root = opt.log_root();
+    let mace = Mace::new(opt.validate()?)?;
+    let db = mace.new_bucket("x", BucketOptions::default())?;
+
+    // both logical groups write; every checkpoint must advance each per-group
+    // floor so old wal files become recyclable
+    let payload = vec![b'w'; 1 << 10];
+    for round in 0..64 {
+        let tx = db.begin()?;
+        tx.upsert(format!("a_{round}"), &payload)?;
+        tx.commit()?;
+        let tx = db.begin()?;
+        tx.upsert(format!("b_{round}"), &payload)?;
+        tx.commit()?;
+    }
+    db.checkpoint();
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut recycled = false;
+    while Instant::now() < deadline {
+        mace.start_gc();
+        let stream0 = wal_file_ids(&log_root, 0);
+        let stream1 = wal_file_ids(&log_root, 1);
+        if stream0.len() < 4 && stream1.len() < 4 {
+            recycled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        recycled,
+        "relaxed multi-group wal must be recycled: stream0={:?} stream1={:?}",
+        wal_file_ids(&log_root, 0),
+        wal_file_ids(&log_root, 1)
+    );
+
+    // all data must stay readable after recycling
+    let view = db.view()?;
+    for round in 0..64 {
+        assert_eq!(view.get(format!("a_{round}"))?.slice(), payload.as_slice());
+        assert_eq!(view.get(format!("b_{round}"))?.slice(), payload.as_slice());
+    }
     Ok(())
 }

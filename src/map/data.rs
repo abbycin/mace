@@ -189,6 +189,8 @@ pub(crate) struct CheckpointTask {
     pub(crate) count: Arc<AtomicU64>,
     pub(crate) last_chkpt_lsn: MutRef<GroupPositions>,
     pub(crate) flow: CheckpointFlow,
+    /// force a full fsync only for exit checkpoints
+    pub(crate) force_fsync: bool,
 }
 
 unsafe impl Send for CheckpointTask {}

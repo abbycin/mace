@@ -21,6 +21,7 @@ use crate::{
     OpCode, Options, Store,
     cc::{
         context::{AbortCleanState, AbortCleanTask, Context},
+        log::Logging,
         wal::{EntryType, PayloadType, WalBegin, WalCommit, WalUpdate, ptr_to, wal_record_sz},
     },
     index::tree::Tree,
@@ -28,8 +29,8 @@ use crate::{
     map::data::{FileFooter, FileVersion, MetaReader},
     meta::{
         BUCKET_PENDING_DEL, DelInterval, Delete, FileKind, FileReader, IntervalPair, Manifest,
-        MemStat, MetaKind, Sequences, blob_interval_name, data_interval_name, new_reader,
-        page_table_name,
+        MemStat, MetaKind, Sequences, WalRecycleIntent, blob_interval_name, data_interval_name,
+        new_reader, page_table_name,
     },
     must_exist, must_true,
     types::{refbox::BoxRef, traits::IAsSlice},
@@ -142,7 +143,7 @@ impl GCHandle {
         self.sem.wait();
     }
 
-    pub(crate) fn wal_clean(&self, manifest: Handle<crate::meta::Manifest>, ctx: Handle<Context>) {
+    pub(crate) fn wal_clean(&self, manifest: Handle<Manifest>, ctx: Handle<Context>) {
         if self.tx.send(GC_WAL).is_err() {
             let mut gc = GarbageCollector {
                 sequences: ctx.sequences.clone(),
@@ -188,6 +189,15 @@ pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
 pub(crate) fn drain_abort_clean_during_recovery(
     store: MutRef<Store>,
     ctx: Handle<Context>,
+    force_fsync: bool,
+) -> Result<(), OpCode> {
+    drain_abort_clean(store, ctx, force_fsync)
+}
+
+fn drain_abort_clean(
+    store: MutRef<Store>,
+    ctx: Handle<Context>,
+    force_fsync: bool,
 ) -> Result<(), OpCode> {
     let mut gc = GarbageCollector {
         sequences: ctx.sequences.clone(),
@@ -196,7 +206,12 @@ pub(crate) fn drain_abort_clean_during_recovery(
         data_runs: Arc::new(AtomicU64::new(0)),
         blob_runs: Arc::new(AtomicU64::new(0)),
     };
-    gc.run_abort_clean_recovery()
+    gc.run_abort_clean_recovery(force_fsync)
+}
+
+/// drain abort-clean before the final exit checkpoint
+pub(crate) fn drain_abort_clean_at_exit(store: MutRef<Store>, ctx: Handle<Context>) {
+    must_ok!(drain_abort_clean(store, ctx, false));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,7 +375,7 @@ impl GarbageCollector {
     fn run(&mut self) {
         let started = Instant::now();
         self.store.opt.observer.counter(CounterMetric::GcRun, 1);
-        self.process_abort_clean();
+        let _ = self.process_abort_clean();
         self.process_wal_clean();
         for kind in FileKind::ALL {
             self.process_files(kind);
@@ -379,18 +394,16 @@ impl GarbageCollector {
 
     fn process_wal_clean_with_manifest(&mut self, manifest: Handle<Manifest>) {
         let ctx = self.ctx;
+        if ctx.opt.sync_on_write {
+            self.process_shared_wal_clean(ctx, manifest);
+            return;
+        }
         for g in ctx.groups().iter() {
             let (oldest_id, last_ckpt_file, mut checkpoint_id) = {
                 let mut logging = g.logging.lock();
-                if ctx.opt.sync_on_write
-                    && let Err(e) = logging.sync(false)
-                {
-                    log::error!("wal sync fail, group {}, error {:?}", g.id, e);
-                    continue;
-                }
                 (
                     logging.oldest_wal_id(),
-                    logging.last_ckpt().file_id,
+                    logging.checkpoint_floor().file_id,
                     g.min_active_wal_file_id(&mut logging),
                 )
             };
@@ -402,57 +415,100 @@ impl GarbageCollector {
                 continue;
             }
 
-            let intent = crate::meta::WalRecycleIntent {
+            let intent = WalRecycleIntent {
                 group_id: g.id as u8,
                 from_file_id: oldest_id,
                 to_file_id: checkpoint_id,
             };
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_before_intent_commit");
-            manifest.commit_wal_recycle_intent(intent);
-
-            // [oldest_id, checkpoint_id)
-            let recycled = Self::process_one_wal(ctx, intent);
-            if recycled == 0 {
-                manifest.commit_wal_recycle_done(intent);
-                g.logging.lock().advance_oldest_wal_id(checkpoint_id);
-                continue;
-            }
-            ctx.opt.sync_log_dir();
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
-            manifest.commit_wal_recycle_done(intent);
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_done_commit_before_publish");
-            g.logging.lock().advance_oldest_wal_id(checkpoint_id);
-            ctx.opt
-                .observer
-                .counter(CounterMetric::GcWalRecycleFile, recycled);
+            let mut logging = g.logging.lock();
+            self.process_wal_recycle_intent(ctx, manifest, intent, Some(&mut logging));
         }
     }
 
-    fn process_one_wal(ctx: Handle<Context>, intent: crate::meta::WalRecycleIntent) -> u64 {
+    fn process_shared_wal_clean(&mut self, ctx: Handle<Context>, manifest: Handle<Manifest>) {
+        let shared = ctx
+            .shared_logging()
+            .expect("durable mode has a shared logging");
+        let mut logging = shared.lock();
+        let oldest_id = logging.oldest_wal_id();
+        let mut checkpoint_id = logging.checkpoint_floor().file_id;
+        // retain every active, abort-clean, and checkpoint pin
+        for g in ctx.groups().iter() {
+            checkpoint_id = checkpoint_id.min(g.min_active_wal_file_id(&mut logging));
+        }
+        if let Some(min_pending_file) = ctx.min_abort_clean_file_id(Options::SHARED_ID) {
+            checkpoint_id = checkpoint_id.min(min_pending_file);
+        }
+        if checkpoint_id == u64::MAX {
+            // retain the current file as the recovery anchor
+            checkpoint_id = logging.current_pos().file_id;
+        }
+        if oldest_id >= checkpoint_id {
+            return;
+        }
+        let intent = WalRecycleIntent {
+            group_id: Options::SHARED_ID,
+            from_file_id: oldest_id,
+            to_file_id: checkpoint_id,
+        };
+        self.process_wal_recycle_intent(ctx, manifest, intent, Some(&mut logging));
+    }
+
+    fn process_wal_recycle_intent(
+        &mut self,
+        ctx: Handle<Context>,
+        manifest: Handle<Manifest>,
+        intent: WalRecycleIntent,
+        logging: Option<&mut Logging>,
+    ) {
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_wal_recycle_before_intent_commit");
+        let Some(intent) = manifest.commit_wal_recycle_intent(intent) else {
+            return;
+        };
+
+        // [oldest_id, checkpoint_id)
+        let recycled = Self::process_one_wal(ctx, intent);
+        if recycled == 0 {
+            assert!(
+                manifest.commit_wal_recycle_done(intent),
+                "wal recycle owner must complete its matching intent"
+            );
+            if let Some(logging) = logging {
+                logging.advance_oldest_wal_id(intent.to_file_id);
+            }
+            return;
+        }
+        ctx.opt.sync_log_dir();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
+        assert!(
+            manifest.commit_wal_recycle_done(intent),
+            "wal recycle owner must complete its matching intent"
+        );
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_wal_recycle_after_done_commit_before_publish");
+        if let Some(logging) = logging {
+            logging.advance_oldest_wal_id(intent.to_file_id);
+        }
+        ctx.opt
+            .observer
+            .counter(CounterMetric::GcWalRecycleFile, recycled);
+    }
+
+    fn process_one_wal(ctx: Handle<Context>, intent: WalRecycleIntent) -> u64 {
         let mut recycled = 0;
         // NOTE: not including `end`
         for seq in intent.from_file_id..intent.to_file_id {
-            let from = ctx.opt.wal_file(intent.group_id, seq);
+            let from = ctx.opt.physical_wal_path(intent.group_id, seq);
             if !must_ok!(ctx.opt.fs.try_exists(&from), "can't stat {:?}", from) {
                 continue;
             }
-            let to = ctx.opt.wal_backup(intent.group_id, seq);
-            if ctx.opt.keep_stable_wal_file {
-                log::info!("rename {from:?} to {to:?}");
-                must_ok!(
-                    ctx.opt.fs.rename(&from, &to),
-                    "can't rename {from:?} to {to:?}"
-                );
-            } else {
-                log::info!("unlink {from:?}");
-                must_ok!(
-                    ctx.opt.fs.remove_file_if_exists(&from),
-                    "can't remove {from:?}"
-                );
-            }
+            log::info!("unlink {from:?}");
+            must_ok!(
+                ctx.opt.fs.remove_file_if_exists(&from),
+                "can't remove {from:?}"
+            );
             recycled += 1;
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_wal_recycle_after_remove_before_dir_sync");
@@ -460,7 +516,7 @@ impl GarbageCollector {
         recycled
     }
 
-    fn run_abort_clean_recovery(&mut self) -> Result<(), OpCode> {
+    fn run_abort_clean_recovery(&mut self, force_fsync: bool) -> Result<(), OpCode> {
         loop {
             let tasks = self.ctx.abort_clean_tasks();
             if tasks.is_empty() {
@@ -500,6 +556,7 @@ impl GarbageCollector {
                     &round_stabilize_buckets,
                     &trees,
                     AbortCleanLoadMode::Recovery,
+                    force_fsync,
                 )?;
             }
 
@@ -509,7 +566,8 @@ impl GarbageCollector {
         }
     }
 
-    fn process_abort_clean(&mut self) {
+    /// process one steady-state abort-clean round
+    fn process_abort_clean(&mut self) -> usize {
         let drained_events = self.ctx.drain_abort_clean_events();
         for &txid in &drained_events {
             self.ctx.mark_abort_clean_quiesced(txid);
@@ -517,10 +575,11 @@ impl GarbageCollector {
 
         let tasks = self.ctx.abort_clean_tasks();
         if tasks.is_empty() {
+            let removed = drained_events.len();
             for txid in drained_events {
                 self.ctx.remove_abort_clean(txid);
             }
-            return;
+            return removed;
         }
 
         let mut block = Block::alloc(1024);
@@ -571,6 +630,7 @@ impl GarbageCollector {
                 &round_stabilize_buckets,
                 &trees,
                 AbortCleanLoadMode::SteadyState,
+                false,
             ) {
                 Ok(()) => true,
                 Err(e) => {
@@ -585,6 +645,11 @@ impl GarbageCollector {
             }
         };
 
+        let cleaned = if checkpoint_ok {
+            cleaned_txids.len()
+        } else {
+            0
+        };
         if checkpoint_ok {
             let sink = self.ctx.abort_clean_event_sink();
             for txid in cleaned_txids {
@@ -606,9 +671,11 @@ impl GarbageCollector {
             g.flush();
         }
 
+        let removed_quiesced = drained_events.len();
         for txid in drained_events {
             self.ctx.remove_abort_clean(txid);
         }
+        cleaned + removed_quiesced
     }
 
     fn stabilize_cleaned_pages(
@@ -616,6 +683,7 @@ impl GarbageCollector {
         dirty_buckets: &HashSet<u64>,
         trees: &Lru<u64, Option<Tree>>,
         mode: AbortCleanLoadMode,
+        force_fsync: bool,
     ) -> Result<(), OpCode> {
         for &bucket_id in dirty_buckets {
             let tree = match trees.get(&bucket_id) {
@@ -623,7 +691,14 @@ impl GarbageCollector {
                 None => self.get_tree(trees, bucket_id, mode)?,
             };
             if let Some(tree) = tree {
-                tree.bucket.checkpoint_and_wait();
+                // a switch wipe requires a durable abort-clean rewrite
+                tree.bucket.checkpoint_and_wait(force_fsync);
+                #[cfg(feature = "failpoints")]
+                if force_fsync {
+                    crate::utils::failpoint::crash(
+                        "mace_recovery_abort_clean_stabilize_force_fsync",
+                    );
+                }
                 self.ctx
                     .opt
                     .observer
@@ -853,7 +928,10 @@ impl GarbageCollector {
         if wal_files.get(&file_id).is_some() {
             return Ok(());
         }
-        let path = self.ctx.opt.wal_file(task.group_id, file_id);
+        let path = self
+            .ctx
+            .opt
+            .physical_wal_path(task.physical_wal_id, file_id);
         if !self.ctx.opt.fs.try_exists(&path)? {
             return Err(OpCode::Corruption);
         }
@@ -2032,11 +2110,11 @@ mod tests {
         build_sorted_relocs, consume_abort_clean_step, validate_abort_clean_link,
     };
     use crate::{
-        Options, RandomPath,
-        map::data::{FileVersion, MetaReader},
+        OpCode, Options, RandomPath,
+        map::data::{FileBuilder, FileVersion, MetaReader},
         meta::{FileKind, StatInner},
         types::{
-            header::{NodeType, TagKind},
+            header::{DeltaHeader, NodeType, TagKind},
             refbox::BoxRef,
             traits::IHeader,
         },
@@ -2054,19 +2132,19 @@ mod tests {
 
         assert_eq!(
             validate_abort_clean_link(bounds, cursor, cursor),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
         assert_eq!(
             validate_abort_clean_link(bounds, cursor, Position::new(4, 81)),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
         assert_eq!(
             validate_abort_clean_link(bounds, cursor, Position::new(2, 99)),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
         assert_eq!(
             validate_abort_clean_link(bounds, Position::new(5, 0), Position::new(4, 79)),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
         assert_eq!(
             validate_abort_clean_link(bounds, cursor, Position::new(4, 79)),
@@ -2078,7 +2156,7 @@ mod tests {
         assert_eq!(consume_abort_clean_step(&mut remaining), Ok(()));
         assert_eq!(
             consume_abort_clean_step(&mut remaining),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
     }
 
@@ -2169,8 +2247,7 @@ mod tests {
 
         let [p, p1] = sample_pages();
         let mut file_id = INIT_ID;
-        let mut writer =
-            crate::map::data::FileBuilder::new(0, false, CompressorPool::new(), opt.fs.clone());
+        let mut writer = FileBuilder::new(0, false, CompressorPool::new(), opt.fs.clone());
         writer.add(p);
         writer.add(p1);
         let files = writer.flush_files(
@@ -2224,11 +2301,10 @@ mod tests {
         page.header_mut().pid = 1919810;
         page.header_mut().kind = TagKind::Delta;
         page.header_mut().node_type = NodeType::Leaf;
-        page.data_slice_mut::<u8>()[size_of::<crate::types::header::DeltaHeader>()..].fill(b'x');
+        page.data_slice_mut::<u8>()[size_of::<DeltaHeader>()..].fill(b'x');
 
         let mut file_id = INIT_ID;
-        let mut writer =
-            crate::map::data::FileBuilder::new(0, true, CompressorPool::new(), opt.fs.clone());
+        let mut writer = FileBuilder::new(0, true, CompressorPool::new(), opt.fs.clone());
         writer.add(page);
         let files = writer.flush_files(
             FileKind::Data,

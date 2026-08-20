@@ -76,7 +76,6 @@ chaos_cases=(
   "prod_recovery_failpoints:chaos_failpoint_recovery_wal_recycle_after_dir_sync_before_done_commit"
   "prod_recovery_failpoints:chaos_failpoint_recovery_wal_recycle_after_done_commit_before_publish"
   "prod_recovery_failpoints:chaos_failpoint_recovery_fs_remove_file_io"
-  "prod_recovery_failpoints:chaos_failpoint_recovery_fs_rename_io"
   "prod_recovery_failpoints:wal_recycle_done_reopen_is_idempotent"
   "prod_recovery_failpoints:wal_recycle_done_does_not_weaken_gap_detection_after_frontier"
   "prod_recovery_failpoints:chaos_failpoint_txn_commit_after_wal_file_sync_before_dir_sync"
@@ -141,6 +140,44 @@ run_fast() {
 
   if ! run_cmd "fast" "$fast_timeout" cargo "${args[@]}"; then
     failures+=("fast")
+  fi
+
+  # the shared-durable-wal generation/route-switch crash windows require BOTH
+  # failpoints and extra_check; neither the default matrix (extra_check only)
+  # nor this script's failpoints-only feature set runs them, so they are gated
+  # here as a dedicated invocation. a --list count guard prevents a feature
+  # gate drift from silently turning this into a passing "0 tests"
+  local gen_features="failpoints,extra_check"
+  local gen_target="prod_generation_failpoints"
+  local gen_list
+  local gen_list_code=0
+  set +e
+  gen_list="$(timeout "$fast_timeout" cargo test --features "$gen_features" --test "$gen_target" -- --list 2>/dev/null)"
+  gen_list_code=$?
+  set -e
+  if [[ "$gen_list_code" -ne 0 ]]; then
+    if [[ "$gen_list_code" -eq 124 ]]; then
+      echo "==> [fast:prod_generation_failpoints:list] timeout"
+    else
+      echo "==> [fast:prod_generation_failpoints:list] failed with exit code ${gen_list_code}"
+    fi
+    failures+=("fast:prod_generation_failpoints:list")
+    return 0
+  fi
+  local gen_count
+  gen_count="$(printf '%s\n' "$gen_list" | grep -c ': test$' || true)"
+  echo "==> [fast:prod_generation_failpoints] feature-gated tests found: ${gen_count}"
+  if [[ -z "${gen_count}" || "${gen_count}" -le 0 ]]; then
+    echo "==> [fast:prod_generation_failpoints] FAILED: zero tests with --features ${gen_features} (feature gate drift?)"
+    echo "==> [fast:prod_generation_failpoints] re-running the --list probe with stderr visible:"
+    run_cmd "fast:prod_generation_failpoints:list-diagnostic" "$fast_timeout" \
+      cargo test --features "$gen_features" --test "$gen_target" -- --list || true
+    failures+=("fast:prod_generation_failpoints")
+    return 0
+  fi
+  if ! run_cmd "fast:prod_generation_failpoints" "$fast_timeout" \
+    cargo test --features "$gen_features" --test "$gen_target" -- --nocapture --test-threads="$test_threads"; then
+    failures+=("fast:prod_generation_failpoints")
   fi
 }
 
