@@ -5,7 +5,6 @@ use crate::utils::CachePad;
 use crate::utils::INIT_CMD;
 use crate::utils::NULL_ORACLE;
 use crate::utils::data::Position;
-use crate::utils::options::ParsedOptions;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
@@ -34,8 +33,8 @@ struct ActiveBounds {
 pub struct WriterGroup {
     /// group id used to route transactions to a fixed writer group
     pub id: usize,
-    /// the sole logging entry for this group
-    pub logging: Mutex<Logging>,
+    /// shared logger in durable mode, group-local logger otherwise
+    pub logging: Arc<Mutex<Logging>>,
     /// published txn facts in this group, keyed by start_ts
     pub facts: DashMap<u64, TxnFact, FxBuildHasher>,
     /// exact set of retained aborts that can still appear in reachable tree state
@@ -63,24 +62,10 @@ pub enum RegistrationTs {
 }
 
 impl WriterGroup {
-    pub fn new(
-        id: usize,
-        checkpoint: Position,
-        latest_id: u64,
-        oldest_id: u64,
-        opt: Arc<ParsedOptions>,
-    ) -> Self {
-        let ckpt_cnt = Arc::new(AtomicUsize::new(0));
+    pub fn new(id: usize, logging: Arc<Mutex<Logging>>, ckpt_cnt: Arc<AtomicUsize>) -> Self {
         Self {
             id,
-            logging: Mutex::new(Logging::new(
-                id as u8,
-                latest_id,
-                oldest_id,
-                checkpoint,
-                opt,
-                ckpt_cnt.clone(),
-            )),
+            logging,
             facts: DashMap::with_hasher_and_shard_amount(FxBuildHasher, FACT_SHARDS),
             retained_aborts: DashMap::with_hasher_and_shard_amount(FxBuildHasher, FACT_SHARDS),
             retained_abort_floor: CachePad::from(AtomicU64::new(u64::MAX)),
@@ -114,7 +99,7 @@ impl WriterGroup {
     pub fn reg_end(&self) {
         let seq = self.txn_seq.load(Relaxed);
         must_true!(!seq.is_multiple_of(2));
-        self.txn_seq.store(seq + 1, Release);
+        self.txn_seq.store(seq + 1, SeqCst); // must use SeqCst
     }
 
     // safety: guard by logging mutex
@@ -122,7 +107,7 @@ impl WriterGroup {
         self.stable_ts.store(NULL_ORACLE, Relaxed);
         let seq = self.txn_seq.load(Relaxed);
         if !seq.is_multiple_of(2) {
-            self.txn_seq.store(seq + 1, Release);
+            self.txn_seq.store(seq + 1, SeqCst); // must use SeqCst
         }
     }
 
@@ -260,13 +245,19 @@ impl WriterGroup {
 
     #[inline]
     pub fn leave_inflight(&self) {
-        let prev = self.inflight.fetch_sub(1, Relaxed);
+        let prev = self.inflight.fetch_sub(1, Release);
         must_true!(prev > 0);
     }
 
     #[inline]
     pub fn inflight(&self) -> usize {
         self.inflight.load(Relaxed)
+    }
+
+    /// acquire load for the shutdown barrier
+    #[inline]
+    pub fn inflight_acquire(&self) -> usize {
+        self.inflight.load(Acquire)
     }
 }
 
@@ -281,13 +272,17 @@ mod tests {
         let root = RandomPath::tmp();
         let mut opt = Options::new(&*root);
         opt.concurrent_write = 1;
-        WriterGroup::new(
+        let opt = Arc::new(opt.validate().expect("group options must validate"));
+        let ckpt_cnt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let logging = Arc::new(Mutex::new(Logging::new(
             0,
-            Position::default(),
             0,
             0,
-            Arc::new(opt.validate().expect("group options must validate")),
-        )
+            Position::MIN,
+            opt,
+            vec![ckpt_cnt.clone()],
+        )));
+        WriterGroup::new(0, logging, ckpt_cnt)
     }
 
     #[test]
@@ -367,8 +362,8 @@ impl TxnState {
         Self {
             start_ts,
             modified: false,
-            begin_lsn: Position::default(),
-            prev_lsn: Position::default(),
+            begin_lsn: Position::MIN,
+            prev_lsn: Position::MIN,
             group_id,
             cmd_id: INIT_CMD,
             start_ckpt,

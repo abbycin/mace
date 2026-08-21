@@ -139,7 +139,7 @@ impl<'a> TxnKV<'a> {
         tree.bucket.state.inc_txn_ref();
 
         {
-            let mut log = g.logging.lock();
+            let mut log = ctx.group(gid).logging.lock();
             let mut begin_guard = RegGuard::new(g);
             g.start_reg();
             let start_ts = ctx.alloc_begin_oracle();
@@ -150,7 +150,7 @@ impl<'a> TxnKV<'a> {
                 crate::testing::TxnBeginSyncPoint::AfterBeginTimestampBeforeFactPublish,
                 start_ts,
             );
-            match log.record_begin(start_ts) {
+            match log.record_begin(gid, start_ts) {
                 Ok(lsn) => {
                     state.begin_lsn = lsn;
                     state.prev_lsn = lsn;
@@ -328,8 +328,6 @@ impl<'a> TxnKV<'a> {
             let mut abort_cause = FailCause::Conflict;
 
             let res = self.tree.update(&g, key, val, |opt| {
-                let g = self.ctx.group(gid);
-
                 let current = match self.resolve_latest_meta_for_write(opt, state) {
                     Ok(current) => current,
                     Err(cause) => {
@@ -351,8 +349,9 @@ impl<'a> TxnKV<'a> {
                 if r.is_ok() && !*logged {
                     *logged = true;
                     state.modified = true;
-                    let mut log = g.logging.lock();
+                    let mut log = self.ctx.group(gid).logging.lock();
                     let new_pos = log.record_update(
+                        gid as u8,
                         &Key::new(k, key.ver().to_owned()),
                         WalPut::new(v.len()),
                         v,
@@ -395,7 +394,6 @@ impl<'a> TxnKV<'a> {
             let mut abort_cause = FailCause::Conflict;
 
             let res = self.tree.update(&g, key, val, |opt| {
-                let g = self.ctx.group(gid);
                 let current = match self.resolve_latest_meta_for_write(opt, state) {
                     Ok(current) => current,
                     Err(cause) => {
@@ -413,8 +411,9 @@ impl<'a> TxnKV<'a> {
                 if !*logged {
                     state.modified = true;
                     *logged = true;
-                    let mut log = g.logging.lock();
+                    let mut log = self.ctx.group(gid).logging.lock();
                     let new_pos = log.record_update(
+                        gid as u8,
                         &Key::new(k, key.ver().to_owned()),
                         WalReplace::new(v.len()),
                         v,
@@ -487,8 +486,6 @@ impl<'a> TxnKV<'a> {
             let mut abort_cause = FailCause::Conflict;
 
             let res = self.tree.update(&g, key, val, |opt| {
-                let g = self.ctx.group(gid);
-
                 let current = match self.resolve_latest_meta_for_write(opt, state) {
                     Ok(current) => current,
                     Err(cause) => {
@@ -500,9 +497,10 @@ impl<'a> TxnKV<'a> {
                 if !logged {
                     logged = true;
                     state.modified = true;
-                    let mut log = g.logging.lock();
+                    let mut log = self.ctx.group(gid).logging.lock();
                     let new_pos = match current {
                         None => log.record_update(
+                            gid as u8,
                             &Key::new(k, key.ver().to_owned()),
                             WalPut::new(v.len()),
                             v,
@@ -510,6 +508,7 @@ impl<'a> TxnKV<'a> {
                             self.bucket_id,
                         )?,
                         Some(_) => log.record_update(
+                            gid as u8,
                             &Key::new(k, key.ver().to_owned()),
                             WalReplace::new(v.len()),
                             v,
@@ -559,7 +558,6 @@ impl<'a> TxnKV<'a> {
             let mut abort_cause = FailCause::Conflict;
 
             let res = self.tree.update(&g, key, val, |opt| {
-                let g = self.ctx.group(gid);
                 let current = match self.resolve_latest_meta_for_write(opt, state) {
                     Ok(current) => current,
                     Err(cause) => {
@@ -577,8 +575,9 @@ impl<'a> TxnKV<'a> {
                 if !logged {
                     logged = true;
                     state.modified = true;
-                    let mut log = g.logging.lock();
+                    let mut log = self.ctx.group(gid).logging.lock();
                     let new_pos = log.record_update(
+                        gid as u8,
                         &key,
                         WalDel::new(),
                         [].as_slice(),
@@ -613,8 +612,8 @@ impl<'a> TxnKV<'a> {
 
         if !state.modified {
             {
-                let mut log = g.logging.lock();
-                log.record_commit(state.start_ts)?;
+                let mut log = self.ctx.group(state.group()).logging.lock();
+                log.record_commit(state.group(), state.start_ts)?;
                 g.remove_fact(state.start_ts);
             }
             self.is_end.set(true);
@@ -627,11 +626,23 @@ impl<'a> TxnKV<'a> {
             return Ok(());
         }
 
-        let mut log = g.logging.lock();
-        log.record_commit(state.start_ts)?;
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::check("mace_txn_commit_after_record_commit")?;
-        log.sync(false)?;
+        let ticket = {
+            let mut log = self.ctx.lock_wal_logging(state.group(), state.start_ts);
+            log.record_commit(state.group(), state.start_ts)?;
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::check("mace_txn_commit_after_record_commit")?;
+            if self.ctx.opt.sync_on_write {
+                let target = log.current_pos();
+                Some(log.register_sync(target)?)
+            } else {
+                log.sync(false)?;
+                None
+            }
+        };
+        // publish facts only after the durable generation completes
+        if let Some(ticket) = ticket {
+            self.ctx.drive_sync(&ticket)?;
+        }
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check("mace_txn_commit_after_wal_sync")?;
         g.commit_fact(state.start_ts, || self.ctx.alloc_oracle());
@@ -689,35 +700,75 @@ impl Drop for TxnKV<'_> {
             let state = self.state_ref();
             let g = self.ctx.group(state.group());
             let modified = state.modified;
+            let durable = self.ctx.opt.sync_on_write;
 
-            let mut log = g.logging.lock();
-            must_ok!(log.record_abort(state.start_ts));
-            if modified {
-                must_ok!(log.sync(false));
-            }
-            let abort_clean_task = modified.then(|| {
-                self.ctx.build_abort_clean_task(
+            if modified && durable {
+                // publish the abort fact and cleanup pin atomically to GC
+                let ticket = {
+                    let mut log = self.ctx.lock_wal_logging(state.group(), state.start_ts);
+                    must_ok!(log.record_abort(state.group(), state.start_ts));
+                    let target = log.current_pos();
+                    must_ok!(log.register_sync(target))
+                };
+                must_ok!(self.ctx.drive_sync(&ticket));
+                // recovery reconstructs durable aborts not yet published in memory
+                #[cfg(feature = "failpoints")]
+                crate::utils::failpoint::crash("mace_txn_abort_after_wal_sync");
+                let log = self.ctx.lock_wal_logging(state.group(), state.start_ts);
+                let physical_wal_id = log.wal_id;
+                let abort_clean_task = self.ctx.build_abort_clean_task(
                     state.start_ts,
                     self.bucket_id,
                     state.group() as u8,
+                    physical_wal_id,
                     state.prev_lsn,
                     state.begin_lsn.file_id,
-                )
-            });
-            if modified {
+                );
                 g.abort_fact(state.start_ts);
-            } else {
-                g.remove_fact(state.start_ts);
-            }
-            if let Some(task) = abort_clean_task {
-                self.ctx.enqueue_abort_clean_task(task);
+                #[cfg(feature = "extra_check")]
+                crate::testing::fire_txn_abort_sync_point(
+                    crate::testing::TxnAbortSyncPoint::AfterAbortFactBeforeAbortCleanEnqueue,
+                    state.start_ts,
+                );
+                self.ctx.enqueue_abort_clean_task(abort_clean_task);
                 #[cfg(feature = "extra_check")]
                 crate::testing::fire_txn_abort_sync_point(
                     crate::testing::TxnAbortSyncPoint::AfterAbortCleanEnqueueBeforeLoggingRelease,
                     state.start_ts,
                 );
+                drop(log);
+            } else {
+                let mut log = self.ctx.lock_wal_logging(state.group(), state.start_ts);
+                must_ok!(log.record_abort(state.group(), state.start_ts));
+                if modified {
+                    must_ok!(log.sync(false));
+                }
+                let physical_wal_id = log.wal_id;
+                let abort_clean_task = modified.then(|| {
+                    self.ctx.build_abort_clean_task(
+                        state.start_ts,
+                        self.bucket_id,
+                        state.group() as u8,
+                        physical_wal_id,
+                        state.prev_lsn,
+                        state.begin_lsn.file_id,
+                    )
+                });
+                if modified {
+                    g.abort_fact(state.start_ts);
+                } else {
+                    g.remove_fact(state.start_ts);
+                }
+                if let Some(task) = abort_clean_task {
+                    self.ctx.enqueue_abort_clean_task(task);
+                    #[cfg(feature = "extra_check")]
+                    crate::testing::fire_txn_abort_sync_point(
+                        crate::testing::TxnAbortSyncPoint::AfterAbortCleanEnqueueBeforeLoggingRelease,
+                        state.start_ts,
+                    );
+                }
+                drop(log);
             }
-            drop(log);
             self.observe_counter(CounterMetric::TxnAbort, 1);
             self.is_end.set(true);
         }

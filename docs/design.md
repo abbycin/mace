@@ -1,849 +1,679 @@
 # Mace Design
 
-This document records Mace's stable architecture, persistence boundaries, lifecycle rules, and
-format-upgrade model.
+This document describes how the current Mace storage engine is designed and how its major runtime
+and persistence flows work.
 
-It intentionally describes protocol and design, not function-level implementation.
+The live correctness constraints, their evidence, and their verifier coverage are maintained in
+`docs/constraints/registry.yaml`. This document does not duplicate that ledger and does not serve
+as a source-code tour.
 
-## 1. Goals
+## 1. System Overview
 
-Mace is an embedded key-value engine with the following design goals:
+Mace is an embedded key-value engine built around:
 
-- predictable point-read latency
-- high write throughput through append-only WAL plus asynchronous durable publish
-- snapshot isolation with MVCC visibility
-- bucket-local runtime state and lazy bucket loading
-- key/value separation, with large values stored in blob files
-- optional per-bucket compression for persisted data/blob files
-- crash-safe startup, publish, cleanup, and file-rewrite behavior
+- a Bw-Tree style ordered index
+- snapshot isolation with multi-version records
+- an append-only redo WAL
+- asynchronous checkpoint publication
+- key/value separation for large values
+- bucket-local runtime state
+- background file reclamation and rewrite
 
-## 2. System Model
+The database is divided into named buckets. A bucket owns its logical page address space, index
+state, checkpoint generations, persisted frontier, cache policy, and data/blob accounting. Global
+services coordinate transaction timestamps, WAL streams, recovery, and background maintenance
+across buckets.
 
-Mace is organized around four persistent domains and three long-lived runtime domains.
+### 1.1 Persistent domains
 
-Persistent domains:
+Mace stores state in four persistent domains:
 
-- metadata
-  - stored in a stable B-tree metadata store
-  - records bucket catalog, numeric state, address maps, file stats, durable frontiers, and
-    cleanup queues
-- WAL
-  - append-only redo log for transactional updates
+- metadata store
+  - bucket catalog and options
+  - global sequences and persisted engine options
+  - page tables and logical-address intervals
+  - per-file accounting
+  - per-bucket durable frontiers
+  - pending bucket deletion, orphan cleanup, obsolete files, and WAL recycle state
+- WAL files
+  - transactional redo records and checkpoint hints
 - data files
-  - persisted page and structural records
+  - persisted index pages and structural records
 - blob files
-  - persisted large-value payload records
+  - persisted large-value payloads
 
-Runtime domains:
+The metadata store is authoritative for reconstructing the durable database. Data and blob files
+become part of the database only through metadata publication.
 
-- foreground transaction path
-  - reads, writes, conflict checks, view creation, and commit/abort
-- bucket runtime
-  - dirty generations, page cache, address allocation, backpressure, and checkpoint preparation
-- background services
-  - checkpoint publish, recovery, abort-clean, GC rewrite, and durable file deletion
+### 1.2 Runtime domains
 
-The bucket is the main unit of runtime isolation.
-Logical addresses, dirty state, backpressure, durable frontier, and most GC decisions are scoped
-per bucket.
+The runtime has three main domains:
 
-### Filesystem Boundary
+- foreground transactions and read-only views
+- bucket runtimes containing index, cache, dirty generations, and checkpoint state
+- background services for checkpoint completion, recovery, abort-clean, WAL recycling, payload GC,
+  and bucket cleanup
 
-Mace has an internal filesystem boundary for runtime namespace operations and runtime file opens.
+Bucket runtimes are loaded lazily. Opening a database reconstructs global durable state and WAL
+state without eagerly loading every bucket index.
 
-This boundary is intentionally narrow.
-It exists to make correctness-sensitive path operations explicit and injectable, not to provide a
-general virtual filesystem layer.
+## 2. Metadata And Addressing
 
-Its design scope is:
+Mace separates logical identity from physical placement.
 
-- opening runtime-owned files
-- existence checks
-- directory enumeration
-- directory creation
-- rename and file removal
-- directory sync
+The main identities are:
 
-Its design non-goals are:
+- bucket ID: durable identity of a named bucket
+- page ID: logical identity of an index page inside a bucket
+- logical address: durable identity of a persisted record inside a bucket address space
+- file ID: identity of a data, blob, or WAL file
 
-- extending path-level injection into the opened-file read/write layer
-- hiding durability barriers inside a black-box abstraction
-- becoming a public extension surface for user-defined filesystems
-- forcing the metadata store dependency to share the same filesystem boundary
+A persisted page is resolved in three steps:
 
-The boundary is internal to Mace.
-Opened-file IO remains outside this boundary, while path-level operations go through it.
+1. the bucket page table maps page ID to logical address
+2. the bucket interval map maps logical address to a data or blob file
+3. the file relocation table maps logical address to a byte range in that file
 
-Existence checks must preserve the difference between:
+GC rewrite changes physical placement while preserving logical addresses. Page references and
+history references therefore remain stable across file rewrite.
 
-- a path that is genuinely absent
-- an IO failure while checking that path
+### 2.1 Metadata groups
 
-Correctness-sensitive code must not collapse those two outcomes into the same "does not exist"
-result.
+The metadata store contains separate logical groups for:
 
-The filesystem boundary also serves fault injection.
-Its role is different from crash failpoints:
+- global sequences and persisted options
+- bucket names, IDs, options, and lifecycle state
+- per-bucket page tables
+- per-bucket data and blob interval maps
+- per-file data and blob statistics
+- per-bucket durable WAL frontiers
+- orphan, obsolete-file, pending-delete, and WAL-recycle records
 
-- crash failpoints model where the process stops inside a protocol window
-- filesystem injection models what syscall-level error a path operation returns
+Changes that form one durable checkpoint closure are committed in one metadata transaction. This
+includes the page map, address intervals, file statistics, bucket frontier, and related global
+sequences.
 
-Both are required.
-Crash-window coverage alone is not enough to validate namespace and IO error handling.
+### 2.2 File accounting
 
-## 3. Persistent Metadata Model
+Each retained data or blob file has persisted accounting for:
 
-Metadata is stored separately from data/blob payload files.
-Its job is to describe which payload files are durable, which logical addresses map to which files,
-and which cleanup work is still pending.
+- total record count and bytes
+- active record count and bytes
+- inactive record sequences
+- bucket ownership and recency information used by GC
 
-The metadata model contains these conceptual groups:
+The relocation table is the physical inventory of records in a file. Checkpoint and GC update the
+persisted accounting as logical addresses become unreachable or move to replacement files.
 
-- numeric state
-  - global ID allocation
-  - orphan-file markers
-  - durable WAL recycle state
-- bucket catalog
-  - bucket identity
-  - bucket options
-  - pending-delete state
-- durable frontier
-  - per bucket, per writer-group durable boundary
-- durable address mapping
-  - page table from logical page identity to durable logical address
-  - interval maps from logical address ranges to data/blob file IDs
-- file accounting
-  - per-file live/total bytes and element accounting
-  - obsolete-file queues
+## 3. Bucket Lifecycle
 
-This metadata is authoritative for durable reopen and recovery.
-Runtime-only caches may be dropped and rebuilt from it.
+### 3.1 Creation
 
-Mace relies on the metadata store for atomic commit and conditional-update semantics.
-Those semantics are part of Mace's correctness boundary, not an interchangeable implementation
-detail.
+Creating a bucket allocates a durable bucket ID, stores the bucket options, initializes its durable
+frontier, and increments global bucket accounting in one metadata publication.
 
-## 4. Addressing And File Mapping
+The bucket becomes visible after that publication. Its runtime index is then created on demand.
 
-Mace uses several different identities that must not be conflated:
+### 3.2 Loading
 
-- bucket ID
-  - identifies a bucket in metadata
-- file ID
-  - identifies one persisted data/blob file
-- page ID
-  - identifies a logical page within a bucket
-- logical address
-  - identifies one persisted record position in the bucket's logical address space
+Loading a bucket reconstructs its runtime from:
 
-Design rules:
+- bucket options
+- page table entries
+- data and blob interval maps
+- durable frontier and file-accounting state
 
-- each bucket owns an independent logical address space
-- page table entries resolve page IDs to the currently durable logical address
-- interval maps resolve logical address ranges to the owning data/blob file
-- each data/blob file carries a relocation table that resolves a logical address to a byte offset
-  inside that file
+The loaded runtime owns the bucket cache, dirty generations, address allocator, checkpoint state,
+and flow-control state.
 
-The address-resolution path is therefore:
+### 3.3 Unloading
 
-1. page ID to logical address
-2. logical address to file ID
-3. logical address to file-local byte offset
+Unloading removes only the cached bucket runtime. Durable metadata and payload files remain
+unchanged.
 
-This layering allows file rewrite without changing logical identities.
+Before unload, the active WAL route is synchronized. A bucket with pending abort-clean work remains
+loaded until that work has completed its page rewrite, durable checkpoint, and reader-quiescence
+phase.
 
-## 5. Bucket Lifecycle
+### 3.4 Deletion
 
-### 5.1 creation
+Deletion has two phases:
 
-Bucket creation is an atomic metadata publication that:
+1. logical deletion removes the bucket from the visible catalog and records a pending-delete entry
+2. background cleanup removes page-table state, interval metadata, file accounting, obsolete files,
+   and the remaining bucket metadata in bounded batches
 
-- allocates a bucket ID
-- persists bucket options
-- initializes the durable frontier
-- updates global bucket accounting
+Global bucket accounting includes pending-delete buckets. It is decremented when physical cleanup
+finishes.
 
-Creation must fail cleanly if the bucket already exists or if global bucket limits are exceeded.
+### 3.5 Bucket options
 
-### 5.2 loading
+Bucket options are persisted with the bucket.
 
-Bucket runtime state is lazy-loaded.
-Opening the database does not require eagerly materializing every bucket runtime.
+The inline-value boundary and node split cardinality define persisted page interpretation and cannot
+be changed after bucket creation. Other bucket options are runtime or output policies and may be
+updated while the bucket is unloaded and no rewrite is active. The updated values take effect on
+the next load.
 
-Loading a bucket reconstructs runtime state from metadata, especially:
+Compression is an output policy. Enabling or disabling it affects newly written data/blob records;
+existing raw and compressed records remain readable in the same bucket.
 
-- page table state
-- data/blob interval maps
-- bucket options that affect runtime policy
+### 3.6 Global options
 
-### 5.3 unload
+An initialized metadata store contains a persisted subset of global engine options. Opening the
+database validates the persisted record before recovery.
 
-Unload is a runtime-only operation.
-It removes cached runtime state but does not change durable metadata or payload files.
+Writer-group cardinality defines persistent transaction ownership and is fixed for an initialized
+database. Runtime and maintenance policies are refreshed from the current open options. The
+persisted WAL route records the last route whose startup transition completed.
 
-Unload must not weaken recovery or background-clean correctness.
-If page-touching abort-clean work is still pending for a bucket, unload is blocked until that work
-crosses its durability barrier.
+Process-local objects, such as the observer and filesystem instance, are not persisted.
 
-### 5.4 delete
+## 4. Index And Value Layout
 
-Bucket deletion is two-phase:
+Each bucket uses a Bw-Tree style ordered index with immutable page images and delta-based updates.
+Tree mutation publishes replacement pages rather than modifying durable pages in place.
 
-1. logical delete
-   - remove the bucket from the visible bucket catalog
-   - mark the bucket as pending physical cleanup
-   - record all durable auxiliary state that must later be removed
-2. physical cleanup
-   - delete durable page table, interval state, obsolete files, and related metadata in bounded
-     background work
+Leaf records contain versioned key/value state. Values below the bucket inline boundary remain in
+the leaf representation. Larger values are stored as blob records and referenced by logical
+address.
 
-The global bucket count is decremented only after physical cleanup is complete.
+Page consolidation, split, merge, and eviction can produce replacement page images. These images
+enter the normal dirty-generation and checkpoint flow; there is no separate whole-bucket vacuum
+path.
 
-### 5.5 option updates
+### 4.1 Version history
 
-Bucket options fall into two design classes:
+Older versions of a key are stored in a key-local history region. A history descriptor identifies
+the first history page, the first slot, and the number of versions belonging to that key. A region
+may continue across linked history pages.
 
-- compatibility-sensitive options
-  - changing them would alter how persisted bytes are interpreted
-  - they are not updated across already-created durable state
-- runtime-policy options
-  - they affect future runtime behavior but do not invalidate old persisted bytes
-  - they may be updated and take effect on the next bucket load
+Different keys may share a history page, but each key is traversed only within its own declared
+region. History-page retirement and blob-payload retirement are accounted independently.
 
-Compression enablement belongs to the second class.
-Turning compression on or off is mixed-format safe because each persisted record remains
-self-describing.
+### 4.2 Lookup and iteration
 
-### 5.6 global engine options
+Point lookup and range iteration evaluate all candidate versions for a raw key against one fixed
+snapshot. Forward and reverse iteration use the same visibility model as point lookup.
 
-Initialized databases must also carry durable global engine configuration.
+The snapshot remains pinned for the lifetime of a transaction or read-only view and for the
+lifetime of iterators and borrowed values derived from it.
 
-Global options follow the same split as bucket options:
+## 5. Transactions And Snapshot Isolation
 
-- compatibility-sensitive options
-  - they define persisted runtime shape or recovery expectations
-  - reopening an existing database must not silently change them
-- runtime-policy options
-  - they tune future runtime behavior without invalidating previously persisted bytes
-  - reopening may update their durable baseline for subsequent opens
+Writer transactions are distributed across logical writer groups. Group selection compares two
+candidate groups and chooses the less loaded one. A writer keeps the selected group for its entire
+lifetime.
 
-Transient process-local inputs are not part of the durable global configuration.
+A transaction records:
 
-If durable global configuration is missing or malformed for an otherwise initialized database,
-startup must treat that as metadata corruption instead of rebuilding defaults implicitly.
+- a start timestamp
+- logical writer-group ownership
+- a WAL begin position
+- an exact outcome: active, committed with commit timestamp, or aborted
 
-## 6. Dirty Generations And Checkpoint Cut
+A read-only view has a snapshot timestamp but no writer-group ownership.
 
-Mace uses a two-generation dirty-state model:
+### 5.1 Writer start and outcome publication
 
-- hot generation
-  - receives new writes and publications
-- sealed generation
-  - retains the previous hot state while a checkpoint publish is in flight
+Writer start first marks its registration as in progress, then allocates and exposes the start
+timestamp, appends the WAL begin record, publishes the active outcome, and finally marks the
+registration stable. The visibility collector treats an in-progress registration as an unfinished
+scan source and does not publish a new safe boundary from that scan.
 
-The checkpoint cut is an atomic transition from one hot generation to the next.
+Commit records the terminal WAL entry, completes the selected WAL durability policy, allocates the
+commit timestamp, and publishes the committed outcome. Abort publishes the aborted outcome and,
+for a modified transaction, transfers WAL retention to an abort-clean task.
 
-The two-generation model applies across multiple independent dirty-state channels: page
-identities, retired address chains, junk address sets, and dirty root / inflight / unmap
-markers. All channels rotate together under the same cut gate. Each channel type accumulates
-independently; the cut is a single gate operation that atomically seals all of them.
+### 5.2 Visibility
 
-Design requirements:
+Visibility is evaluated in this order:
 
-- foreground writers must not straddle the cut
-- live pages must never disappear from both hot and sealed generations at the same time
-- pages newer than the checkpoint snapshot boundary must remain discoverable until they are either
-  carried forward or durably published
+1. a transaction sees its own versions
+2. versions whose writer started at or after the snapshot are excluded
+3. versions below the published safe boundary use the positive visibility path
+4. retained abort state is checked before a positive result is accepted
+5. versions outside the safe boundary use their exact transaction outcome
+6. if an exact committed outcome has already been pruned, a newer safe-boundary publication may
+   provide the result
 
-The checkpoint process therefore has two responsibilities:
+An exact commit is visible only when its commit timestamp precedes the snapshot. Active and aborted
+versions are not visible.
 
-1. establish a closed snapshot boundary
-2. carry forward any still-live state that cannot yet be considered durably published
+### 5.3 Safe-boundary collection
 
-When a bucket is being unloaded or deleted at cut time, its sealed batch is skipped rather than
-published. This is safe because the bucket's durable state is already consistent and no new
-mutations can enter a bucket that is leaving the active set.
+The background collector takes one timestamp cut and scans:
 
-## 7. Reachability And Dirty-State Safety
+- writer registrations
+- exact transaction outcomes
+- live read-only views
 
-Dirty state is not only about roots.
-It must also preserve reachability through structural links that keep old or auxiliary pages alive
-during ongoing publication.
+The resulting safe boundary applies to every snapshot covered by that scan. Committed outcomes below
+the published boundary may then be pruned. Retained abort state remains available until abort-clean
+finishes.
 
-There are two important classes of retired addresses:
+The collector starts after recovery has installed the recovered transaction oracle and initial safe
+boundary.
 
-- structural junk
-  - old versions or pages retired directly by replacement or eviction
-- compaction junk
-  - addresses discovered while reorganizing a structure, but still potentially reachable until the
-    checkpoint publish boundary closes
+### 5.4 Write conflicts
 
-Design rule:
+Same-key writers use first-writer-wins conflict handling. Every retry or page-replacement path checks
+the latest key head again before publishing a mutation, so an earlier successful writer cannot be
+silently overwritten by a stale retry.
 
-- structural junk may be retired from hot state under the normal deferred-reclamation rules
-- compaction junk must remain discoverable until durable closure proves it is no longer reachable
+## 6. Dirty State And Checkpoint
 
-If this rule is broken, a reader may still hold a path to an old address that no longer exists in
-dirty memory and is not yet reflected in durable interval metadata.
+Each loaded bucket keeps two dirty generations:
 
-## 8. MVCC And History Model
+- hot generation: receives current mutations
+- sealed generation: is owned by the checkpoint currently being published
 
-Mace provides snapshot isolation through fact-based MVCC.
+The generation cut rotates all checkpoint inputs together:
 
-Stable rules:
+- dirty page images and their byte accounting
+- retired page lineage
+- newly discovered junk addresses
+- dirty roots
+- page-unmap markers
+- in-flight writer-root state
 
-- every writer transaction has a unique start timestamp and belongs to one writer group
-- writer group assignment uses two-choices load balancing: each new writer samples two candidate
-  groups and joins the one with the lower inflight count, keeping groups balanced without a
-  centralized scheduler
-- a transactional reader carries its snapshot timestamp and ownership identity, while a read-only
-  view carries an independent lifetime pin without writer ownership
-- every writer group tracks the exact active, committed, or aborted outcome of its transactions
-- group-local and global resolved boundaries are positive proofs only; they never bypass abort
-  validation
-- the published abort boundary is a conservative negative proof and may lag safely behind exact
-  transaction outcomes
+After the cut, new writers use the new hot generation. The checkpoint owns the sealed generation
+until publication finishes.
 
-### 8.1 writer begin and reader registration
+### 6.1 Checkpoint snapshot
 
-Foreground writer begin is serialized within its writer group and follows this publication order:
+The checkpoint walks the sealed dirty-root graph and materializes the live pages that are not yet
+durable. Pages created after the snapshot address boundary remain in the hot generation or are
+carried forward to a later checkpoint.
 
-1. mark the registration as unstable
-2. allocate the transaction start timestamp
-3. expose that timestamp to background collection
-4. record the WAL begin
-5. publish the active transaction outcome
-6. mark the registration as stable before returning
+Structural links, retired lineage, and compaction-produced junk remain associated with the page
+generation that still owns their reachability. The checkpoint separates addresses that can retire
+with the current closure from addresses that still belong to a live or newer page image.
 
-A read-only view transitions through registering, active, and idle states. Its snapshot pin remains
-active until the view and every iterator or borrowed read derived from it are dropped.
+When a bucket is leaving the loaded set, its sealed batch is discarded instead of being published;
+the unload/delete path has already excluded new mutations and retains the previous durable state.
 
-The collector timestamp cut, writer registration publication, writer start timestamp allocation,
-and reader registration publication must have one global order. A collector round takes its cut
-before scanning writer registration state, exact transaction outcomes, and the reader registry
-captured for that round. If a writer is absent from that scan, the order proves its start timestamp
-was allocated at or after the cut.
+### 6.2 Bucket durable frontier
 
-### 8.2 visibility evaluation
+Every checkpoint derives a per-bucket frontier with one position for each logical writer group. It
+includes the WAL effects folded into the durable page closure, including effects from groups other
+than the group recorded in an individual page header.
 
-For a fixed snapshot, visibility uses this proof order:
+The frontier is published together with the page map and file metadata. Recovery uses it to decide
+whether a WAL update is already represented in durable pages.
 
-1. a version written by that same transaction is visible to provide read-your-writes
-2. a version whose writer started at or after the snapshot is invisible
-3. an older version covered by the global safe boundary has a positive commit proof
-4. every positive proof still passes abort validation
-5. when no boundary proves the outcome, the exact transaction outcome decides visibility:
-   committed before the snapshot is visible, while active or aborted is invisible
-6. if the exact outcome has already been pruned, the global safe boundary is read again; only a
-   boundary published after the first lookup may justify treating the missing outcome as committed
+### 6.3 Checkpoint completion
 
-The global safe boundary is a proof accelerator, not an alternate source of truth. It may lag
-conservatively, but it must not admit a version that exact outcome or abort validation would
-reject.
+After metadata publication:
 
-### 8.3 collector-safe boundary and reclamation
+- the sealed generation is released
+- still-live state is carried into the current hot generation
+- retired page images move to deferred reclamation
+- WAL checkpoint floors are advanced for logical groups that participated in the closure
+- checkpoint progress updates bucket flow control
 
-Each collector round takes one globally ordered timestamp cut and performs one proof scan over:
+## 7. Data And Blob Publication
 
-- all writer begin-registration states
-- all exact transaction outcomes
-- all live reader registrations
+Checkpoint and rewrite both publish payload files with data first and metadata last.
 
-From that single scan it derives:
+For each output file, the flow is:
 
-- the next global safe-boundary candidate
-- maintenance hints for active presence, minimum WAL position, and minimum WAL file id
-- abort-boundary refresh candidates
+1. persist an orphan marker
+2. build the file
+3. synchronize the file and required directory state
+4. commit intervals, relocations, statistics, map/frontier updates, and orphan-marker removal in
+   metadata
+5. publish the new runtime interval and accounting state
 
-Group-local resolution backlog is drained separately under the writer group's serialization
-boundary. The collector samples a fresh prefix-publication timestamp only after it owns that
-boundary, so a terminal outcome published after the proof-scan cut cannot be exposed to a snapshot
-at that older cut.
+Before metadata commit, the output is an orphan and is not reachable through durable metadata.
+After metadata commit, the output is the authoritative owner of its published logical-address
+intervals.
 
-The global safe boundary may advance only after the collector has covered every reader that was
-live at the cut. Committed outcomes may be pruned only after the new boundary is published.
+### 7.1 Data/blob file structure
 
-Compaction and GC must stay behind both visibility safety and abort-clean durability:
-
-- the reclamation boundary is the older of the visibility-safe boundary and the oldest pending
-  abort-clean boundary
-- WAL checkpoint and recycle retention use collector-published maintenance hints instead of
-  foreground scans
-
-### 8.4 history, traversal, and write conflicts
-
-Old versions are stored in history regions with the following contract:
-
-- a key owns an explicit history region descriptor
-- the region is logically contiguous for that key
-- the region may span multiple linked history pages
-- traversal must remain inside the key's declared region window
-- there is no global version ordering across different keys sharing the same history page
-
-Point lookup and forward or reverse iterators must keep enumerating candidates for one raw key
-until either:
-
-- one version satisfies the fixed snapshot predicate, or
-- the key is proven absent for that snapshot
-
-Overlapping same-key writers enforce first-writer-wins by re-checking the latest version for that
-key on every retry path before publishing a new write.
-
-Retiring a history page and reclaiming blob payloads are separate decisions.
-History-page reclamation never implies that all referenced blob payloads are collectible.
-
-## 9. Durable Boundary: Bucket Frontier
-
-The durable correctness boundary is not a single global WAL position.
-It is a per-bucket, per-writer-group frontier.
-
-This is necessary because one durable page or materialized record may absorb updates from multiple
-writer groups, while any individual page-local header can describe only a narrower write history.
-
-Design rules:
-
-- the durable boundary is tracked per bucket and per writer group
-- that frontier is persisted atomically with durable map/stat publication
-- recovery uses the bucket frontier as the correctness gate for deciding whether a WAL record is
-  already durable
-
-WAL checkpoint positions remain useful, but only as scan-start and retention hints.
-They are not the source of truth for durable visibility.
-
-## 10. Flush Publish Protocol
-
-Checkpoint publish follows the fundamental rule:
-
-- data first
-- metadata last
-
-Metadata must never point to payload files that are not durably written.
-
-### 10.1 data/blob file layout
-
-Each data/blob file is a self-describing persisted artifact with four logical regions:
+A data or blob file contains four regions:
 
 1. payload frames
-2. interval table
-3. relocation table
-4. footer
+2. logical-address intervals
+3. relocation entries
+4. a fixed footer at end of file
 
-The footer is the stable discovery anchor for the file.
+The footer records the file format version, reserved bytes, interval and relocation cardinalities,
+and checksums for both tables. The footer is the discovery point used when reopening a file.
 
-Namespace operations around these files, such as creation, rename, deletion, and directory sync,
-are part of the same correctness surface and therefore remain explicit in the design.
-
-### 10.2 record-level payload contract
-
-Each relocation entry describes how to interpret one persisted record:
+Each relocation entry records:
 
 - file offset
-- logical raw length
+- raw logical length
 - stored compressed length
-- checksum
+- payload checksum
+- sequence used by inactive-record accounting
 
-The interpretation rule is:
+A zero compressed length means the payload is stored raw. A nonzero compressed length means the
+payload is decoded to the recorded raw length before page or value decoding.
 
-- stored compressed length is zero
-  - the payload bytes are stored raw
-- stored compressed length is nonzero
-  - the payload bytes are stored in compressed form and decode back to the raw length
+### 7.2 Compression
 
-The WAL format is independent from this rule.
-Compression applies only to persisted data/blob files.
+Compression is selected per record when the bucket output policy is enabled. Records that do not
+benefit sufficiently remain raw.
 
-### 10.3 publish sequence
+Raw and compressed records can coexist in one file and across files of the same bucket. WAL records
+are not compressed by the bucket data/blob compression policy.
 
-For each newly built data/blob file:
+## 8. WAL Design
 
-1. record an orphan marker in metadata before the file becomes durable
-2. build and write the file contents
-3. durably sync the file
-4. publish metadata that makes the file reachable and clears the orphan marker in the same atomic
-   metadata transaction
-5. only after metadata commit may the runtime treat the file as part of the durable address space
+The WAL is redo-only. It contains begin, update, commit, abort, and checkpoint-hint records.
+Insert and update records carry the new value image; delete records carry the tombstone operation.
 
-This ordering guarantees that crash windows are closed in the safe direction:
+Every WAL record has two ownership dimensions:
 
-- crash before metadata commit
-  - payload file may exist, but metadata does not reference it
-- crash after metadata commit
-  - payload file is already durable
+- logical group: transaction facts, visibility, frontier, and checkpoint-age ownership
+- physical stream: WAL file namespace used for append, recovery, and abort-chain traversal
 
-Directory durability barriers remain explicit.
-When namespace persistence matters, directory sync is treated as a first-class part of the publish
-protocol rather than an implementation detail hidden behind the filesystem boundary.
+The logical group is encoded in the record and is not inferred from its physical stream.
 
-### 10.4 old-file stat updates
+### 8.1 Relaxed route
 
-Checkpoint publish may make previously live file entries newly obsolete.
-Those stat updates must observe concurrent background retirement correctly:
+With `sync_on_write` disabled, each logical group writes its own physical WAL stream. Commit flushes
+the WAL bytes to the file/page cache and publishes the outcome without a WAL fsync generation or a
+durability wait.
 
-- publish works against a stable snapshot of retire state
-- it must not recreate file-stat metadata that GC has already retired
-- retire state is cleared only after the enclosing metadata commit closes
+Each group maintains its own checkpoint counter and retained WAL floor.
 
-## 11. Compression Model
+### 8.2 Durable route
 
-Compression is a bucket policy for persisted data/blob files.
+With `sync_on_write` enabled, all logical groups append to one shared physical stream. The shared
+stream has a namespace distinct from the per-group streams used by the relaxed route.
 
-Stable rules:
+Concurrent terminal records and explicit barriers join a caller-led sync generation. The generation
+seals one stream cut, synchronizes every file writer contributing bytes through that cut plus the log
+directory, and then completes every participant whose target is covered by the cut. Transaction
+outcomes are published after their durability target completes.
 
-- compression is optional and bucket-local
-- compression decisions are made record by record
-- records are compressed only when the stored bytes become meaningfully smaller than the raw image
-- the WAL remains byte-identical regardless of bucket compression policy
-- one bucket directory may contain a mix of raw and compressed data/blob records at the same time
+WAL buffer rotation and ordinary flushing do not advance the durable stream position. Only a
+successful sync generation advances it.
 
-This mixed state is always valid because each relocation entry is self-describing.
+### 8.3 Logical checkpoint age
 
-## 12. Foreground Admission And Backpressure
+Checkpoint age remains per logical group in both routes. WAL activity is tracked independently for
+each group. A checkpoint publication advances the counter only for groups with activity since their
+previous publication.
 
-Backpressure is enforced before entering tree mutation paths.
+The durable route may append one physical checkpoint-hint record for the shared stream, but the
+counter and retained floor for each logical group remain independent.
 
-Design rules:
+### 8.4 WAL recycling
 
-- admission is bucket-local and opt-in per bucket; buckets with backpressure disabled bypass
-  the wait entirely
-- a foreground write reserves dirty-memory budget before it mutates durable structures
-- the admission limit is not a fixed threshold; it is derived from an exponentially weighted
-  moving average of observed checkpoint progress, with an asymmetric alpha that reacts faster to
-  deteriorating throughput than to recovering throughput
-- on top of the average, a burst quota allows short spikes above the smoothed limit without
-  immediately stalling writers; when abort-clean or other checkpoint progress is detected,
-  an additional progress extra burst is granted at a multiple of the baseline burst quota to
-  avoid thundering-herd wake behavior after a backpressure release
-- writers are not woken individually on every progress event; instead a collective wake threshold
-  ensures that the condition is broadcast only when enough pressure has been released to make
-  progress meaningful for a batch of waiters
-- checkpoint progress is the primary pressure-release signal
+WAL recycling uses three durable phases:
 
-This makes backpressure a correctness-preserving flow-control mechanism rather than a late
-best-effort throttle. The EWMA model adapts the limit to observed system throughput rather than
-relying on a static capacity estimate.
+1. intent records the physical stream and file range selected for deletion
+2. deletion removes the files and synchronizes the namespace
+3. done clears the intent and advances the retained lower boundary
 
-## 13. Transactions And WAL
+Startup completes an unfinished intent before scanning the affected stream.
 
-The WAL is redo-only.
-Mace does not rely on physical undo or CLR records.
+The recycle cut combines:
 
-Stable WAL semantics:
+- active transaction WAL pins
+- pending abort-clean pins
+- durable checkpoint floors
+- the already-persisted recycle boundary
 
-- insertion
-  - carries the new value image
-- update
-  - carries the new value image
-- deletion
-  - records the tombstone operation only
+In the shared stream, logical groups without retained update history have inactive checkpoint-floor
+slots. A group's first update activates its slot from the transaction's begin position. Checkpoint
+publication advances only active slots. Route migration clears the old-era slots before new-era WAL
+activity begins.
 
-Transaction design:
+If no logical group or task pins an older file, complete files before the current append file can be
+recycled while the current file remains as the stream anchor.
 
-- a writer transaction is assigned to a writer group
-- begin is logged first
-- the first mutation creates the transactional WAL update chain
-- commit publishes commit order after WAL durability
-- abort records abort outcome and, if necessary, schedules abort-clean using the WAL chain
-- a modified abort publishes its pending abort-clean WAL retention before releasing the group
-  serialization boundary, so the active-transaction retention and pending-task retention always
-  overlap
-- transaction length is bounded; a single transaction may not span more than a configured
-  maximum number of checkpoint units, preventing runaway write amplification from unusually
-  long-lived writers
+## 9. Recovery
 
-Conflict checking on the foreground path is metadata-based.
-It does not require loading old value images merely to decide whether a write may proceed.
-
-Aborted versions may remain physically present for some time.
-Correctness depends on visibility rules hiding them until abort-clean eventually rewrites them away.
-
-### 13.1 WAL recycling protocol
-
-WAL recycling is a two-phase commit protocol executed within a durable metadata transaction.
-
-The phases are:
-
-1. intent — record a durable recycle intent naming the WAL files to be removed; this intent
-   survives a crash and will be re-executed on recovery before normal operation resumes
-2. deletion — physically remove the named WAL files from the filesystem
-3. done — mark the intent complete and advance the durable WAL recycle frontier in the same
-   metadata commit that clears the intent
-
-A crash between phases 1 and 3 is safe: recovery finds the intent, re-executes the deletion,
-then clears it. A crash after phase 3 leaves no intent to re-execute. The durable recycle
-frontier is therefore always a reliable lower bound on which WAL files have been permanently
-removed.
-
-## 14. Recovery
-
-Recovery is responsible for reconstructing a correct runtime state before the database becomes
-usable.
+Recovery finishes before foreground transaction or view admission begins.
 
 The startup flow is:
 
-1. load durable metadata
-2. clean orphan-file markers and remove stray payload files
-3. finish any durable pending WAL recycle intent
-4. bootstrap WAL scanning from conservative retained boundaries
-5. analyze WAL to rebuild transaction outcomes and pending abort-clean work
-6. redo committed records that are not yet durable under the bucket frontier
-7. finish reconstructed abort-clean work before open returns
+1. load and validate metadata version and persisted options
+2. complete orphan-file cleanup from durable markers
+3. complete pending bucket and WAL recycle work needed for bootstrap
+4. discover retained WAL streams and their durable lower boundaries
+5. validate and analyze WAL records to reconstruct transaction outcomes and abort-clean tasks
+6. redo committed updates not covered by each bucket frontier
+7. drain reconstructed abort-clean work
+8. checkpoint recovery-produced pages when the startup transition requires durable closure
+9. finish any WAL route or layout transition
+10. publish runtime checkpoint floors and safe visibility state
+11. unload bucket runtimes loaded only for recovery
+12. start the normal collector, checkpoint, and GC services
 
-Every WAL Update reader must first derive checked record bounds, then read the complete record and
-validate its checksum and payload layout before using its key, value, transaction, or chain-link
-fields. A malformed Update terminates the affected scan or returns corruption; it must not drive an
-allocation or read outside the engine's checked record maximum, replay, or abort-clean traversal.
+### 9.1 WAL discovery
 
-Startup namespace repair, orphan cleanup, WAL recycle, and other path-level recovery steps are part
-of the same filesystem boundary described above.
-Recovery must distinguish "not found" from other IO failures instead of treating every failed
-existence check as absence.
-
-Three different boundaries must remain distinct:
+Recovery scans every retained physical stream, independent of the route requested for the new open.
+This allows it to discover history from both per-group and shared namespaces.
 
-- bucket durable frontier
-  - correctness gate for "already durable or not"
-- WAL checkpoint position
-  - scan-start optimization
-- WAL recycle frontier
-  - durable lower bound for already-removed old WAL files
+The durable recycle boundary defines the first file that can still exist. A validated checkpoint
+hint may move record analysis forward, while the bucket frontier remains the redo decision boundary.
 
-Recovery correctness depends on keeping those three concepts separate.
+### 9.2 WAL validation and tail handling
 
-## 15. Abort-Clean
+Records are validated in physical-stream order. Header, length, payload layout, checksum, logical
+group, and chain fields are checked before a record is consumed.
 
-Abort-clean removes the durable effects of aborted or incomplete transactions by page rewrite and
-compaction, not by inverse-value undo.
+The first incomplete or malformed record ends that stream scan at the record start. With WAL tail
+truncation enabled, recovery truncates there and ignores later files in the same stream. Otherwise
+startup returns corruption. Runtime append positions are rebased to the truncated end before any
+new append or checkpoint work begins.
 
-Design rules:
+### 9.3 Route and layout transition
 
-- abort-clean follows the transactional WAL chain backward
-- abort-clean validates every chain position against the retained WAL range and a checked finite
-  step budget; malformed links surface as corruption and retain the task
-- page-touching cleanup is not considered retired until its durability barrier is crossed
-- recovery must drain reconstructed abort-clean before normal runtime GC begins
-- recovery must finish reconstructed abort-clean before post-start checkpoint recording and WAL
-  recycle are trusted again
-- GC must not reload a bucket that the user explicitly unloaded
-- if a bucket has an abort-clean task that has not been removed, including `WaitingQuiesce`,
-  unload is blocked instead
+The persisted `sync_on_write` value identifies the last WAL route whose transition completed. A
+different requested value starts a route transition. Opening the durable route while legacy
+per-group durable-layout files still exist starts the same rebuild process.
 
-An abort-clean task uses two states around a copy-on-write rewrite:
+The rebuild computes a file-ID high-water mark from WAL files, bucket frontiers, and recycle state.
+It closes recovery-produced state durably, removes the old WAL era through the normal recycle
+protocol, and starts the new era above that high-water mark.
 
-- Pending — the abort fact and WAL pin remain retained while cleanup is incomplete. Runtime GC may
-  rewrite the affected pages in this state, then must complete a fresh checkpoint for every touched
-  bucket. If the rewrite or checkpoint fails, the task remains Pending and retains both protections.
-- WaitingQuiesce — every touched bucket's fresh checkpoint has completed, so the rewrite is durable.
-  The task now waits for the EBR readers that existed before the rewrite to drain. Once the EBR
-  callback marks it quiesced, the task is removed and the retained abort fact is retired. Recovery
-  has no runtime readers, so it may remove a successfully checkpointed task during its closed
-  startup drain.
+The route option is written back after the transition completes. If startup stops earlier, the next
+open sees the old persisted route or remaining legacy files and repeats the transition.
 
-Aborted versions are never visible to snapshots; quiescence protects page replacement and
-retirement, not visibility of an aborted value.
+### 9.4 Recovery boundaries
 
-Abort-clean therefore interacts with bucket lifecycle, recovery, and GC as one shared correctness
-surface.
+Recovery uses three separate WAL-related boundaries:
 
-## 16. GC, Rewrite, And Metadata Compaction
+- bucket frontier: whether an update is already durable in bucket data
+- checkpoint hint: where WAL analysis may start
+- recycle boundary: which older WAL files have already been removed
 
-Background maintenance has three distinct responsibilities:
+These boundaries are loaded and advanced independently.
 
-- reclaim fully obsolete payload files
-- rewrite high-garbage data/blob files into denser files
-- physically delete obsolete files and fully deleted buckets
+## 10. Abort-Clean
 
-Loaded-page compaction still exists, but it is produced by foreground tree replace, split, merge,
-and consolidate publishes and closed by the normal checkpoint durability boundary.
-There is no separate background scavenge pass and no bucket-wide manual vacuum interface.
+Abort-clean removes versions belonging to aborted or incomplete transactions by rewriting pages. It
+does not apply inverse-value undo.
 
-### 16.1 victim selection
+A modified abort retains:
 
-Victim ranking is bucket-local in execution, even if candidate discovery is global.
+- the aborted transaction outcome
+- the physical WAL stream and chain range
+- the set of buckets touched by cleanup
 
-Stable rules:
+Abort-clean follows the transaction update chain backward. Chain positions are interpreted in the
+physical stream's file-and-offset order, while logical group ownership selects the retained abort
+state. Traversal stays inside the task's retained WAL range and consumes a finite step budget derived
+from the retained bytes. An invalid or non-decreasing link, missing retained file, or exhausted budget
+returns corruption while leaving the task and its retained state in place.
 
-- fully obsolete files are reclaimed immediately
-- partial-rewrite work is gated by per-bucket garbage ratios
-- a rewrite batch normally requires at least two files and enough live bytes to justify a rewrite
-- eager GC may bypass the usual size threshold but not correctness checks
+### 10.1 Runtime phases
 
-Candidate files are scored to rank rewrite priority. The score rewards files that are both
-space-dense with garbage and relatively stale. Density is weighted more heavily than age: a file
-that is almost entirely garbage is an urgent candidate regardless of how recently it was written,
-while a file that is mostly live data is a poor target even if it is old. Age serves as a
-tiebreaker between files at similar density levels, and live element count damps the score for
-files that hold many small live entries — rewriting them produces high write amplification for
-little reclaim benefit.
+An abort-clean task moves through two conceptual phases:
 
-### 16.2 rewrite safety
+- pending rewrite
+  - affected pages are rewritten
+  - every touched bucket completes a fresh checkpoint
+  - the abort outcome and WAL pin remain retained
+- waiting for quiescence
+  - the rewritten pages are durable
+  - readers that could still hold old page images are allowed to drain
+  - the task, WAL pin, and retained abort outcome are then removed
 
-Rewrite is a publish protocol, not an in-place edit.
+An unloaded bucket is not reloaded solely for steady-state abort-clean. Its task remains pending and
+blocks unload/delete completion. Recovery may load a bucket to finish reconstructed cleanup, then
+unloads that recovery-only runtime before open returns.
 
-Its crash-safety model is:
+Aborted versions remain invisible throughout both phases.
 
-1. build a new file under orphan protection
-2. publish new interval/stat metadata and delete intent atomically
-3. retire old files through the normal obsolete-file pipeline
+## 11. Garbage Collection And Rewrite
 
-Old files remain valid until metadata commit makes the new file authoritative.
+Background GC performs four kinds of maintenance:
 
-Before committing to a full rewrite pass, the rewriter performs a pre-flight live-ratio check
-against the current state of the candidate files. The garbage ratio can change substantially
-between when a victim was selected and when the rewrite actually starts — other concurrent
-operations may have already rendered the file mostly clean or fully obsolete. If the pre-flight
-check finds that the file no longer meets the rewrite threshold, the pass is abandoned rather
-than producing unnecessary write amplification.
+- reclaim fully obsolete data/blob files
+- rewrite partially live data/blob files
+- recycle WAL files
+- finish physical cleanup of deleted buckets
 
-Only one rewrite may be active per bucket at a time. This constraint prevents multiple concurrent
-passes from competing over the same candidate set, inflating write amplification, and producing
-redundant output files that all need to be reconciled at publish time.
+Payload-file selection and rewrite execution are bucket-local. Candidate discovery may scan global
+file accounting, after which files are grouped by bucket.
 
-### 16.3 manual metadata compaction
+### 11.1 Fully obsolete files
 
-Manual maintenance currently exposes one best-effort interface:
+A file with no active relocation is removed from durable statistics and interval metadata, published
+as retired in runtime state, removed from runtime interval/accounting maps, and then moved through
+the obsolete-file deletion pipeline.
 
-- metadata-store compaction
+Checkpoint old-file accounting uses conditional metadata updates, so a checkpoint prepared before
+retirement does not recreate accounting for a file whose deletion committed first.
 
-It does not load bucket runtime state and is not part of the foreground consistency protocol.
+### 11.2 Partial rewrite
 
-## 17. Storage Format Versioning And Upgrade
+Partial rewrite selects files using bucket garbage ratio, target output size, recency, and live-byte
+cost. The selected set is rechecked against current accounting immediately before rewrite.
 
-This section defines the stable upgrade model for persisted formats.
+The rewriter:
 
-### 17.1 compatibility boundary
+1. reads active relocations from the selected files
+2. groups records into one or more replacement outputs
+3. stages every output as an orphan
+4. writes and synchronizes the replacement files
+5. publishes replacement statistics and intervals together with victim removal
+6. switches runtime ownership to the replacement files
+7. deletes the old files through the obsolete-file pipeline
 
-Mace has three persistent format families:
+Only one rewrite runs for a bucket at a time.
 
-- data/blob payload files
-- metadata organization in the metadata store
-- WAL
+### 11.3 Concurrent junk accounting
 
-Their compatibility policies are intentionally different.
+Rewrite registers its selected victim files before reading their inactive-record state. While output
+is being built, newly retired logical addresses are collected with the rewrite ownership state.
 
-### 17.2 platform boundary
+When replacement relocations are complete, collected addresses that were copied are transferred to
+the corresponding replacement-file accounting. A checkpoint that reaches the ownership switch
+waits for rewrite publication, resolves the logical address again, and applies the retirement to its
+new file owner.
 
-Mace supports only 64-bit machines.
+The ownership state returns to idle after durable metadata and runtime interval/accounting state both
+refer to the replacement files. A rewrite with no replacement output cancels the ownership transfer.
 
-Under that boundary, durable use of machine-word-sized unsigned integers is acceptable.
-The format contract is "stable on supported 64-bit Mace platforms", not "portable across arbitrary
-machine architectures".
+## 12. Cache, Eviction, And Backpressure
 
-### 17.3 data/blob format policy
+Each bucket has independent cache, page-pool, checkpoint-size, and foreground-admission policies.
 
-The current stable data/blob format version is 1.
+Eviction selects resident pages, consolidates them when needed, and publishes the resulting page
+images through the same dirty-generation flow as foreground tree changes. Eviction does not create a
+separate durability path.
 
-Data/blob files are self-describing at file scope.
-Their stable discovery anchor is the fixed footer at EOF, which records:
+When bucket backpressure is enabled, a writer reserves dirty-memory budget before entering tree
+mutation. Admission is based on current dirty bytes, checkpoint progress, and a short burst allowance.
+Checkpoint completion releases pressure and wakes waiting writers in batches.
 
-- file format version
-- reserved padding for future use
-- relocation-table cardinality and checksum
-- interval-table cardinality and checksum
+Buckets with backpressure disabled enter mutation directly.
 
-The format does not require a separate magic value.
-Structural validation comes from the fixed footer position, version field, table lengths, and
-checksums.
+## 13. Startup And Shutdown Lifecycle
 
-There is no per-frame or per-record version byte inside one file.
-All payloads in a file are interpreted under that file's single version.
+Database startup completes metadata loading, recovery, route transition, and recovery-only cleanup
+before background services and foreground admission begin.
 
-### 17.4 reader and writer contract
+Shutdown begins when the final database or bucket handle is dropped. The runtime then:
 
-The long-term contract is:
+1. stops background GC admission
+2. waits for admitted transactions to publish terminal outcomes
+3. drains pending abort-clean work
+4. checkpoints every loaded bucket
+5. fully synchronizes files written by the final checkpoint
+6. completes a WAL barrier on the active route
+7. stops the visibility collector and releases metadata state
 
-- the writer emits only the current data/blob version
-- the reader supports every still-supported historical data/blob version
-- old runtimes are not required to read newer files
-- new runtimes must be able to open mixed-version directories produced by supported upgrade chains
+The final checkpoint runs with full file synchronization even when relaxed WAL commit mode was used
+during normal operation. After a successful graceful shutdown, persisted pages represent the
+committed model without relying on retained WAL files.
 
-This is a read-old, write-current model.
+## 14. Filesystem Boundary
 
-### 17.5 why read support must accumulate
+Mace uses an internal filesystem boundary for:
 
-Mace does not assume that all old payload files are rewritten during one release upgrade.
+- runtime file opens
+- path existence checks
+- directory enumeration and creation
+- rename and removal
+- directory synchronization
 
-Therefore a later runtime may encounter:
+Opened-file read/write behavior remains part of the data, blob, WAL, and metadata components rather
+than a general virtual filesystem interface. The metadata-store dependency also manages its own file
+access.
 
-- files written several releases ago
-- files written by an intermediate release
-- files written by the current release
+Path probes distinguish absence from other I/O errors. Namespace synchronization remains explicit in
+payload publication, WAL rotation/recycle, route transition, and recovery cleanup.
 
-All of them may coexist until ordinary checkpoint or GC rewrite converges them.
+The filesystem object is process-local and is not part of persisted engine options.
 
-For that reason, data/blob compatibility is not "adjacent version only".
-Reader support accumulates across all historical versions that remain within the supported online
-upgrade window.
+## 15. Persistent Format And Upgrade Model
 
-### 17.6 rewrite as online upgrade
+Mace currently supports 64-bit little-endian platforms. Persisted scalar and packed-layout handling
+is defined under that platform boundary.
 
-Checkpoint publish and GC rewrite are the normal online format-convergence paths.
+There are three format families:
 
-Design rules:
+- data/blob files
+- metadata organization
+- WAL records
 
-- old files may be read in place
-- any rewritten output is emitted only in the current version
-- if source and target version differ, payload bytes must be decoded and re-encoded
-- raw byte carry-over across a version boundary is forbidden
+### 15.1 Data/blob format
 
-As a result, ordinary maintenance gradually upgrades the directory to the newest payload-file
-format without a dedicated online migration step.
+The current data/blob file version is 1. The version is stored once in the fixed footer; individual
+payload frames do not carry a separate format version.
 
-### 17.7 future version evolution
+The writer emits the current version. Readers dispatch from the file version and retain support for
+every data/blob version still inside the supported online-upgrade window. A directory may therefore
+contain files from more than one supported version.
 
-Future data/blob versions should preserve one simple dispatch model:
+Checkpoint and GC rewrite emit the current version. When source and target versions differ, rewrite
+decodes the source record and encodes it in the target version instead of copying encoded bytes.
 
-- file-level version switch
-- footer-based discovery
-- versioned payload decode
-- write-current only
+Retiring historical reader support requires an explicit migration boundary.
 
-If later versions need more footer meaning, they should prefer reusing or reinterpreting reserved
-footer space before inventing a new discovery protocol.
+### 15.2 Metadata format
 
-### 17.8 version retirement
+The metadata store has one current Mace metadata version. Startup validates it before loading
+database state.
 
-Historical data/blob reader support may be retired only at an explicit migration boundary.
+An incompatible metadata organization change uses a new metadata version and an offline metadata
+migration. Runtime startup does not rewrite an unsupported metadata organization in place.
 
-That boundary must be deliberate and documented.
-It is not the default behavior of ordinary releases.
+### 15.3 WAL format
 
-If a historical data/blob version is retired, the release that retires it must require an offline
-migration or an equivalent explicit operational step.
+The current route split changes physical stream placement but not WAL record encoding. Both routes
+use the same WAL record format and recovery decoder.
 
-### 17.9 metadata format policy
+WAL format evolution is handled independently from data/blob file evolution. A WAL format change
+requires a migration design that first reaches a WAL-independent durable state.
 
-Metadata follows a stricter policy than data/blob payload files.
+## 16. Observability
 
-If metadata organization changes incompatibly:
+Mace exposes fixed-cardinality counters, gauges, histograms, and events.
 
-- bump the metadata version
-- reject the old metadata at runtime
-- require an offline metadata migration step
-
-This tradeoff is acceptable because metadata volume is small and the underlying metadata-store file
-format is considered stable.
-
-### 17.10 WAL format policy
-
-The WAL remains byte-identical under the current design.
-
-There is no WAL format branching in this versioning model.
-If WAL format evolution is ever needed, it should be designed independently rather than inheriting
-the data/blob compatibility policy by accident.
-
-## 18. Observability
-
-Mace exposes a fixed-cardinality observability surface:
-
-- counters
-- gauges
-- histograms
-- events
-
-The design goal is to make always-on instrumentation cheap, bounded, and predictable.
-
-High-frequency latency metrics may be sampled.
-Low-frequency maintenance and recovery events are expected to be reported directly.
+High-frequency latency observations may be sampled. Lifecycle, recovery, checkpoint, GC, and
+durability events are emitted directly. Metric identities remain bounded and do not include
+unbounded bucket, key, or transaction labels.
 
 ## References
 
@@ -853,7 +683,7 @@ Low-frequency maintenance and recovery events are expected to be reported direct
 - Efficiently Reclaiming Space in a Log Structured Store
 - LeanStore: In-Memory Data Management Beyond Main Memory
 - Scalable and Robust Snapshot Isolation for High-Performance Storage Engines
-- Rethinking Logging, Checkpoints, and Recovery for High-Performance Storage engines
+- Rethinking Logging, Checkpoints, and Recovery for High-Performance Storage Engines
 - Larger-Than-Memory Range Index
 - Optimistic Lock Coupling: A Scalable and Efficient General-Purpose Synchronization Method
 ...

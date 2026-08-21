@@ -1,36 +1,51 @@
+use crate::cc::log::{Logging, SyncTicket};
 use crate::meta::Sequences;
 use crate::{must_ok, must_true};
 use crossbeam_epoch::Guard;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 
 use crate::OpCode;
 use crate::utils::data::Position;
-use crate::utils::options::ParsedOptions;
+use crate::utils::observe::{
+    HistogramMetric, LATENCY_SAMPLE_SHIFT, observe_elapsed, sampled_instant,
+};
+use crate::utils::options::{Options, ParsedOptions};
 use crate::utils::seqlock::SeqLock;
 use crate::utils::{CachePad, Handle, NULL_ORACLE};
 
 use super::group::{RegistrationTs, TxnFact, WriterGroup};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GroupBoot {
+    /// physical WAL stream id
+    pub physical_wal_id: u8,
     pub oldest_id: u64,
     pub latest_id: u64,
-    pub checkpoint: Position,
+    /// conservative recovery scan start
+    pub scan_start: Position,
+    pub has_files: bool,
+    /// first file id of the active epoch
+    pub start_id: u64,
+    /// manifest checkpoint floor for this logical group
+    pub checkpoint_floor: Position,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AbortCleanTask {
     pub txid: u64,
     pub bucket_id: u64,
-    pub group_id: u8,
+    /// physical wal stream containing the abort-clean chain
+    pub physical_wal_id: u8,
+    /// logical group owning the retained-abort fact
+    pub logical_group_id: u8,
     pub tail_lsn: Position,
     pub pin_file_id: u64,
     pub state: AbortCleanState,
@@ -69,6 +84,10 @@ pub struct Context {
     pub(crate) opt: Arc<ParsedOptions>,
     pub(crate) sequences: Arc<Sequences>,
     safe_exclusive: Arc<AtomicU64>,
+    /// recovery roots use `Position::MIN` until phase2 completes
+    recovering: AtomicBool,
+    /// shared durable WAL logger
+    shared_logging: Option<Arc<Mutex<Logging>>>,
     pool: Arc<CCPool>,
     groups: Arc<Vec<WriterGroup>>,
     group_rr: CachePad<AtomicUsize>,
@@ -79,6 +98,7 @@ pub struct Context {
     pending_abort_clean_seqlock: SeqLock,
     abort_clean_events: Arc<Mutex<Vec<u64>>>,
     tx: Sender<CollectorSignal>,
+    collector_rx: Mutex<Option<Receiver<CollectorSignal>>>,
     collector: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -96,39 +116,98 @@ impl Context {
         group_boot: &[GroupBoot],
     ) -> Self {
         let cores = opt.concurrent_write as usize;
+        // per-group boots followed by the shared-stream boot
+        let default_boot = |physical_wal_id: u8| GroupBoot {
+            oldest_id: 0,
+            latest_id: 0,
+            scan_start: Position::MIN,
+            has_files: false,
+            start_id: 0,
+            checkpoint_floor: Position::MIN,
+            physical_wal_id,
+        };
+        let per_group_boot = |i: usize| {
+            group_boot
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| default_boot(i as u8))
+        };
+
+        let ckpt_cnts: Vec<Arc<AtomicUsize>> =
+            (0..cores).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+
+        let mut groups_logging: Vec<Arc<Mutex<Logging>>> = Vec::with_capacity(cores);
+        let mut shared_logging = None;
+        if opt.sync_on_write {
+            // durable mode shares one logger across all logical groups
+            let shared_boot = group_boot
+                .get(cores)
+                .copied()
+                .unwrap_or_else(|| default_boot(Options::SHARED_ID));
+            let shared = Arc::new(Mutex::new(Logging::new(
+                Options::SHARED_ID,
+                shared_boot.start_id,
+                shared_boot.oldest_id,
+                Position::MIN,
+                opt.clone(),
+                ckpt_cnts.clone(),
+            )));
+            for _ in 0..cores {
+                groups_logging.push(shared.clone());
+            }
+            shared_logging = Some(shared);
+        } else {
+            // relaxed: every writer group owns its writable per-group stream
+            for (i, ckpt_cnt) in ckpt_cnts.iter().enumerate() {
+                let boot = per_group_boot(i);
+                groups_logging.push(Arc::new(Mutex::new(Logging::new(
+                    i as u8,
+                    boot.start_id,
+                    boot.oldest_id,
+                    Position::MIN,
+                    opt.clone(),
+                    vec![ckpt_cnt.clone()],
+                ))));
+            }
+        }
+
         let mut groups = Vec::with_capacity(cores);
         for i in 0..cores {
-            let boot = group_boot.get(i).copied().unwrap_or(GroupBoot {
-                oldest_id: 0,
-                latest_id: 0,
-                checkpoint: Position::default(),
-            });
-            let g = WriterGroup::new(
+            groups.push(WriterGroup::new(
                 i,
-                boot.checkpoint,
-                boot.latest_id,
-                boot.oldest_id,
-                opt.clone(),
-            );
-            groups.push(g);
+                groups_logging[i].clone(),
+                ckpt_cnts[i].clone(),
+            ));
+        }
+
+        let manifest_floors: Vec<Position> = (0..cores)
+            .map(|i| per_group_boot(i).checkpoint_floor)
+            .collect();
+        if opt.sync_on_write {
+            if let Some(shared) = &shared_logging {
+                shared
+                    .lock()
+                    .set_logical_checkpoint_floors(&manifest_floors);
+            }
+        } else {
+            for (i, g) in groups.iter().enumerate() {
+                let mut floors = vec![Position::MAX; cores];
+                floors[i] = manifest_floors[i];
+                g.logging.lock().set_logical_checkpoint_floors(&floors);
+            }
         }
 
         let pool = Arc::new(CCPool::new());
         let groups = Arc::new(groups);
         let safe_exclusive = Arc::new(AtomicU64::new(sequences.oracle.load(Acquire)));
         let (tx, rx) = channel();
-        let collector = collect_thread(
-            rx,
-            sequences.clone(),
-            groups.clone(),
-            safe_exclusive.clone(),
-            pool.clone(),
-        );
 
         Self {
             opt: opt.clone(),
             sequences,
             safe_exclusive,
+            recovering: AtomicBool::new(true),
+            shared_logging,
             pool,
             groups,
             group_rr: CachePad::default(),
@@ -143,7 +222,8 @@ impl Context {
             pending_abort_clean_seqlock: SeqLock::new(),
             abort_clean_events: Arc::new(Mutex::new(Vec::new())),
             tx,
-            collector: Mutex::new(Some(collector)),
+            collector_rx: Mutex::new(Some(rx)),
+            collector: Mutex::new(None),
         }
     }
 
@@ -198,6 +278,38 @@ impl Context {
         &self.groups[gid]
     }
 
+    /// the shared durable logging (group_wal_x) in durable mode; None in
+    /// relaxed mode
+    #[inline]
+    pub fn shared_logging(&self) -> Option<&Arc<Mutex<Logging>>> {
+        self.shared_logging.as_ref()
+    }
+
+    /// publish shared-stream floors before runtime checkpointing or GC
+    pub(crate) fn publish_shared_logical_checkpoint_floors(&self, floors: &[Position]) {
+        if let Some(shared) = &self.shared_logging {
+            shared.lock().set_logical_checkpoint_floors(floors);
+        }
+    }
+
+    /// deactivate shared-stream floors after an era wipe
+    pub(crate) fn reset_shared_logical_checkpoint_floors(&self) {
+        if let Some(shared) = &self.shared_logging {
+            shared.lock().reset_logical_checkpoint_floors();
+        }
+    }
+
+    /// rebase writers after recovery truncation
+    pub(crate) fn rebase_logging_positions_to_physical_eof(&self) {
+        if let Some(shared) = &self.shared_logging {
+            shared.lock().rebase_positions_to_physical_eof();
+        } else {
+            for group in self.groups.iter() {
+                group.logging.lock().rebase_positions_to_physical_eof();
+            }
+        }
+    }
+
     pub fn groups(&self) -> &Vec<WriterGroup> {
         &self.groups
     }
@@ -206,15 +318,17 @@ impl Context {
         let nr = self.groups.len();
         let ticket = self.group_rr.fetch_add(1, Relaxed);
         let (home, second) = two_choices(ticket, nr);
-        let home_load = self.groups[home].inflight();
-        let chosen = if nr == 1 {
-            home
-        } else {
-            let second_load = self.groups[second].inflight();
-            if second_load < home_load {
-                second
-            } else {
+        let chosen = {
+            let home_load = self.groups[home].inflight();
+            if nr == 1 {
                 home
+            } else {
+                let second_load = self.groups[second].inflight();
+                if second_load < home_load {
+                    second
+                } else {
+                    home
+                }
             }
         };
         self.groups[chosen].enter_inflight();
@@ -226,8 +340,14 @@ impl Context {
         self.safe_exclusive.load(Acquire)
     }
 
+    pub(crate) fn recovering(&self) -> bool {
+        self.recovering.load(Acquire)
+    }
+
     pub(crate) fn init_safe_exclusive(&self, recovered_oracle: u64) {
-        self.safe_exclusive.store(recovered_oracle, Release);
+        // recovery must not regress a collector-published boundary
+        self.safe_exclusive.fetch_max(recovered_oracle, AcqRel);
+        self.recovering.store(false, Release);
     }
 
     #[inline]
@@ -249,14 +369,16 @@ impl Context {
         &self,
         txid: u64,
         bucket_id: u64,
-        group_id: u8,
+        logical_group_id: u8,
+        physical_wal_id: u8,
         tail_lsn: Position,
         pin_file_id: u64,
     ) -> AbortCleanTask {
         AbortCleanTask {
             txid,
             bucket_id,
-            group_id,
+            physical_wal_id,
+            logical_group_id,
             tail_lsn,
             pin_file_id: pin_file_id.min(tail_lsn.file_id),
             state: AbortCleanState::Pending,
@@ -285,14 +407,16 @@ impl Context {
         &self,
         txid: u64,
         bucket_id: u64,
-        group_id: u8,
+        logical_group_id: u8,
+        physical_wal_id: u8,
         tail_lsn: Position,
         pin_file_id: u64,
     ) {
         self.enqueue_abort_clean_task(self.build_abort_clean_task(
             txid,
             bucket_id,
-            group_id,
+            logical_group_id,
+            physical_wal_id,
             tail_lsn,
             pin_file_id,
         ));
@@ -324,7 +448,7 @@ impl Context {
             }
         };
         if let Some(task) = old {
-            self.groups[task.group_id as usize].retire_aborted_fact(txid);
+            self.groups[task.logical_group_id as usize].retire_aborted_fact(txid);
         }
     }
 
@@ -361,13 +485,13 @@ impl Context {
         std::mem::take(&mut *self.abort_clean_events.lock())
     }
 
-    pub(crate) fn min_abort_clean_file_id(&self, group_id: u8) -> Option<u64> {
+    pub(crate) fn min_abort_clean_file_id(&self, physical_wal_id: u8) -> Option<u64> {
         let mut min_id = None;
         for shard in &self.pending_abort_clean {
             let candidate = shard
                 .read()
                 .values()
-                .filter(|x| x.group_id == group_id)
+                .filter(|x| x.physical_wal_id == physical_wal_id)
                 .map(|x| x.pin_file_id)
                 .min();
             if let Some(candidate) = candidate {
@@ -398,16 +522,47 @@ impl Context {
     }
 
     pub(crate) fn start(&self) {
-        self.groups.iter().for_each(|w| {
-            w.logging.lock().enable_checkpoint();
-        })
+        // phase2 establishes the collector's initial safe waterline
+        let rx = self
+            .collector_rx
+            .lock()
+            .take()
+            .expect("collector receiver must exist once");
+        let collector = collect_thread(
+            rx,
+            self.sequences.clone(),
+            self.groups.clone(),
+            self.safe_exclusive.clone(),
+            self.pool.clone(),
+        );
+        *self.collector.lock() = Some(collector);
+        for w in self.groups.iter() {
+            let log = w.logging.lock();
+            log.enable_checkpoint();
+        }
+    }
+
+    /// wait for terminal publication before the shutdown barrier
+    pub(crate) fn drain_inflight(&self) {
+        while self.groups.iter().any(|g| g.inflight_acquire() != 0) {
+            std::thread::yield_now();
+        }
     }
 
     pub(crate) fn quit(&self) {
-        self.groups.iter().for_each(|x| {
-            let mut log = x.logging.lock();
-            must_ok!(log.sync(true));
-        });
+        self.drain_inflight();
+        if self.opt.sync_on_write {
+            let ticket = {
+                let mut log = self.lock_shared_logging(0);
+                must_ok!(log.barrier_register())
+            };
+            must_ok!(self.drive_sync(&ticket));
+        } else {
+            for x in self.groups.iter() {
+                let mut log = x.logging.lock();
+                must_ok!(log.sync(true));
+            }
+        }
         must_ok!(self.tx.send(CollectorSignal::Quit));
 
         if let Some(h) = self.collector.lock().take() {
@@ -415,10 +570,117 @@ impl Context {
         }
     }
 
+    /// bounded merge window without holding the logging mutex
+    fn merge_window(&self, ticket: &SyncTicket) {
+        if !self.opt.sync_on_write {
+            return;
+        }
+        let cap_us = self.opt.sync_merge_window_us;
+        if cap_us == 0 {
+            return;
+        }
+        let cap = Duration::from_micros(cap_us);
+        let quiet = cap.min(Duration::from_micros(40));
+        let started = Instant::now();
+        while started.elapsed() < cap {
+            if !ticket.has_followers() && started.elapsed() > quiet {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(1));
+        }
+    }
+
+    /// lock a logical group's WAL logger
+    #[inline]
+    pub(crate) fn lock_wal_logging(&self, gid: usize, seed: u64) -> MutexGuard<'_, Logging> {
+        let logging = &self.groups[gid].logging;
+        if self.opt.sync_on_write {
+            let started = sampled_instant(seed, LATENCY_SAMPLE_SHIFT);
+            let guard = logging.lock();
+            observe_elapsed(
+                self.opt.observer.as_ref(),
+                HistogramMetric::WalLockWaitMicros,
+                started,
+            );
+            guard
+        } else {
+            logging.lock()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn lock_shared_logging(&self, seed: u64) -> MutexGuard<'_, Logging> {
+        let shared = self
+            .shared_logging()
+            .expect("durable mode must construct the shared logging");
+        let started = sampled_instant(seed, LATENCY_SAMPLE_SHIFT);
+        let guard = shared.lock();
+        observe_elapsed(
+            self.opt.observer.as_ref(),
+            HistogramMetric::WalLockWaitMicros,
+            started,
+        );
+        guard
+    }
+
+    /// complete a leader ticket or wait for a follower ticket
+    pub(crate) fn drive_sync(&self, ticket: &SyncTicket) -> Result<(), OpCode> {
+        if ticket.is_completed() {
+            return Ok(());
+        }
+        let wait_started = sampled_instant(
+            ticket.target().file_id ^ ticket.target().offset,
+            LATENCY_SAMPLE_SHIFT,
+        );
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_wal_sync_point(if ticket.is_leader() {
+            crate::testing::WalSyncPoint::AfterLeaderRegisterBeforeSeal
+        } else {
+            crate::testing::WalSyncPoint::AfterFollowerRegister
+        });
+        if ticket.is_leader() {
+            self.merge_window(ticket);
+            let mut log =
+                self.lock_shared_logging(ticket.target().file_id ^ ticket.target().offset);
+            log.leader_seal_sync_and_complete(ticket);
+        } else {
+            ticket.wait();
+        }
+        observe_elapsed(
+            self.opt.observer.as_ref(),
+            HistogramMetric::WalGenerationWaitMicros,
+            wait_started,
+        );
+        let result = ticket.check_result();
+        #[cfg(feature = "extra_check")]
+        if result.is_ok() {
+            let log = self.lock_shared_logging(0);
+            must_true!(
+                log.durable_pos() >= ticket.target(),
+                "generation ticket must be covered by durable_pos"
+            );
+            if let Some(cut) = ticket.sealed_cut() {
+                must_true!(
+                    log.durable_pos() >= cut,
+                    "durable_pos must reach the sealed generation cut"
+                );
+            }
+        }
+        result
+    }
+
     pub fn sync(&self) -> Result<(), OpCode> {
-        for group in self.groups.iter() {
-            let mut log = group.logging.lock();
-            log.sync(true)?;
+        if self.opt.sync_on_write {
+            let ticket = {
+                let mut log = self.lock_shared_logging(0);
+                log.barrier_register()?
+            };
+            self.drive_sync(&ticket)?;
+        } else {
+            for group in self.groups.iter() {
+                let mut log = group.logging.lock();
+                log.sync(true)?;
+            }
         }
         Ok(())
     }
@@ -940,6 +1202,42 @@ mod tests {
         ctx.group(1).leave_inflight();
         ctx.group(1).leave_inflight();
         ctx.quit();
+    }
+
+    #[test]
+    fn quit_waits_for_inflight_then_joins_collector() {
+        let (_root, ctx) = new_context_with_groups(2);
+        // start() spawns the collector (it must not run during recovery);
+        // the test needs it alive to prove quit joins it
+        ctx.start();
+        let ctx = Arc::new(ctx);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+
+        let holder_ctx = ctx.clone();
+        let holder = std::thread::spawn(move || {
+            holder_ctx.group(0).enter_inflight();
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            holder_ctx.group(0).leave_inflight();
+        });
+        started_rx.recv().unwrap();
+
+        let quitter_ctx = ctx.clone();
+        let quitter = std::thread::spawn(move || quitter_ctx.quit());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !quitter.is_finished(),
+            "quit must wait for in-flight transactions before force barrier"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        quitter.join().unwrap();
+
+        assert!(
+            ctx.collector.lock().is_none(),
+            "collector must be joined before quit returns"
+        );
     }
 
     #[test]

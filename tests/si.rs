@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use mace::testing::{
     CollectorSyncPoint, TreeUpdateSyncPoint, TxnAbortSyncPoint, TxnBeginSyncPoint,
-    TxnCommitSyncPoint, ViewSyncPoint, VisibilitySyncPoint,
+    TxnCommitSyncPoint, ViewSyncPoint, VisibilitySyncPoint, WalRecordKind,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
@@ -1630,6 +1630,56 @@ fn snapshot_cut_commit_publication_witness() -> Result<(), OpCode> {
 
         let got = snapshot.get("k")?;
         assert_eq!(got.slice(), b"v0");
+        Ok(())
+    })
+}
+
+#[test]
+fn durable_commit_publishes_fact_only_after_wal_cut_is_durable() -> Result<(), OpCode> {
+    let _guard = suite_lock();
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.sync_on_write = true;
+    opt.concurrent_write = 1;
+    let log_root = opt.log_root();
+    let mace = mace::Mace::new(opt.validate()?)?;
+    let db = mace.new_bucket("x", BucketOptions::default())?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let _reset = HookReset;
+    testing::set_txn_commit_hook(Some(Arc::new({
+        let entered = entered.clone();
+        let release = release.clone();
+        move |point, _start_ts| {
+            if point != TxnCommitSyncPoint::AfterFactWriteGuardBeforeCommitTimestamp {
+                return;
+            }
+            entered.wait();
+            release.wait();
+        }
+    })));
+
+    std::thread::scope(|s| -> Result<(), OpCode> {
+        let tx = db.begin()?;
+        let txid = testing::txn_start_ts(&tx);
+        tx.put("k", b"v")?;
+        let writer = s.spawn(move || tx.commit());
+
+        entered.wait();
+        let durable = testing::wal_durable_pos(&db, 0);
+        let probes = testing::wal_record_probes(&log_root, 1);
+        let commit = probes
+            .iter()
+            .find(|p| p.kind == WalRecordKind::Commit && p.txid == txid)
+            .expect("durable commit record must exist before fact publication");
+        let cut = (commit.file_id, commit.offset + commit.len as u64);
+        assert!(
+            durable >= cut,
+            "durable_pos {durable:?} must cover commit cut {cut:?}"
+        );
+        release.wait();
+        writer.join().unwrap()?;
         Ok(())
     })
 }

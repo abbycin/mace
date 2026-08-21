@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+libc = "0.2.189"
 
 [dependencies.mace-kv]
 path = ".."
@@ -30,6 +31,13 @@ bench = false
 [[bin]]
 name = "bucket_lifecycle"
 path = "fuzz_targets/bucket_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crash_reopen"
+path = "fuzz_targets/crash_reopen.rs"
 test = false
 doc = false
 bench = false

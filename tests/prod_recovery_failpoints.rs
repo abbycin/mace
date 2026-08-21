@@ -5,6 +5,8 @@ mod common;
 use btree_store::{BTree, Error as BTreeError};
 use common::child_test_command;
 use mace::observe::{CounterMetric, InMemoryObserver};
+#[cfg(feature = "extra_check")]
+use mace::testing;
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -41,7 +43,6 @@ struct PersistedGlobalOptions {
     wal_buffer_size: usize,
     max_ckpt_per_txn: usize,
     wal_file_size: u32,
-    keep_stable_wal_file: bool,
     truncate_corrupted_wal: bool,
 }
 
@@ -63,7 +64,6 @@ impl PersistedGlobalOptions {
         opt.wal_buffer_size = self.wal_buffer_size;
         opt.max_ckpt_per_txn = self.max_ckpt_per_txn;
         opt.wal_file_size = self.wal_file_size;
-        opt.keep_stable_wal_file = self.keep_stable_wal_file;
         opt.truncate_corrupted_wal = self.truncate_corrupted_wal;
     }
 }
@@ -334,6 +334,53 @@ fn child_setup_data_gc(db_root: &Path) -> (Mace, Bucket) {
     (mace, bucket)
 }
 
+fn prepare_oversized_data_gc_victim(db_root: &Path) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 256 << 10;
+        opt.wal_buffer_size = 1 << 20;
+        opt.wal_file_size = 1 << 20;
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = false;
+        opt.data_garbage_ratio = 100;
+    });
+    mace.disable_gc();
+    let bucket = mace
+        .new_bucket(
+            "prod",
+            BucketOptions {
+                inline_size: 8192,
+                split_elems: 64,
+                consolidate_threshold: 16,
+                checkpoint_size: 256 << 10,
+                pool_capacity: 512 << 10,
+                enable_backpressure: false,
+                ..BucketOptions::default()
+            },
+        )
+        .expect("create oversized-victim bucket failed");
+    let initial = vec![b'a'; 128];
+    for idx in 0..512 {
+        let txn = bucket.begin().expect("begin oversized-victim seed failed");
+        txn.put(format!("oversized_{idx:04}"), &initial)
+            .expect("put oversized-victim seed failed");
+        txn.commit().expect("commit oversized-victim seed failed");
+    }
+    mace.sync().expect("sync oversized-victim seed failed");
+
+    let updated = vec![b'b'; 128];
+    for idx in (0..512).step_by(4) {
+        let txn = bucket
+            .begin()
+            .expect("begin oversized-victim update failed");
+        txn.upsert(format!("oversized_{idx:04}"), &updated)
+            .expect("update oversized-victim key failed");
+        txn.commit().expect("commit oversized-victim update failed");
+    }
+    mace.sync().expect("sync oversized-victim update failed");
+}
+
 fn child_setup_retire(db_root: &Path) -> (Mace, Bucket) {
     let mace = open_with_tune(db_root, |opt| {
         opt.sync_on_write = true;
@@ -453,37 +500,6 @@ fn child_setup_wal_recycle(db_root: &Path) -> (Mace, Bucket) {
     (mace, bucket)
 }
 
-fn child_setup_wal_recycle_keep_stable(db_root: &Path) -> (Mace, Bucket) {
-    let mace = open_with_tune(db_root, |opt| {
-        opt.concurrent_write = 1;
-        opt.sync_on_write = true;
-        opt.data_file_size = 16 << 10;
-        opt.wal_buffer_size = 8 << 10;
-        opt.wal_file_size = 4 << 10;
-        opt.gc_timeout = 60_000;
-        opt.gc_eager = false;
-        opt.keep_stable_wal_file = true;
-    });
-
-    let bucket = match mace.get_bucket("prod") {
-        Ok(bucket) => bucket,
-        Err(OpCode::NotFound) => mace
-            .new_bucket(
-                "prod",
-                BucketOptions {
-                    inline_size: 512,
-                    cache_evict_pct: 10,
-                    enable_backpressure: false,
-                    ..BucketOptions::default()
-                },
-            )
-            .expect("create prod bucket failed"),
-        Err(err) => panic!("open prod bucket failed: {err:?}"),
-    };
-
-    (mace, bucket)
-}
-
 fn seed_committed_and_uncommitted(bucket: &Bucket, committed: usize, uncommitted: usize) {
     let txn = bucket.begin().expect("begin committed txn failed");
     for idx in 0..committed {
@@ -561,7 +577,12 @@ fn drive_blob_gc_pressure(bucket: &Bucket, rounds: usize, blob_size: usize) {
 }
 
 fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted: usize) {
-    let mace = open_with_tune(db_root, |_opt| {});
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = true;
+    });
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
 
@@ -578,7 +599,12 @@ fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted:
 }
 
 fn assert_bucket_readable(db_root: &Path) {
-    let mace = open_with_tune(db_root, |_opt| {});
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = true;
+    });
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
 
@@ -589,20 +615,26 @@ fn assert_bucket_readable(db_root: &Path) {
 }
 
 fn assert_bucket_exists_after_reopen(db_root: &Path, name: &str) {
-    let mace = open_with_tune(db_root, |_opt| {});
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+    });
     let bucket = mace
         .get_bucket(name)
         .expect("bucket should exist after reopen");
     let _view = bucket.view().expect("open bucket view after reopen failed");
+    assert_stable_gc_space_accounting(&mace, db_root);
 }
 
 fn assert_bucket_missing_after_reopen(db_root: &Path, name: &str) {
-    let mace = open_with_tune(db_root, |_opt| {});
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+    });
     match mace.get_bucket(name) {
         Err(OpCode::NotFound) => {}
         Err(err) => panic!("bucket reopen should return NotFound, got {err:?}"),
         Ok(_) => panic!("bucket should be missing after reopen"),
     }
+    assert_stable_gc_space_accounting(&mace, db_root);
 }
 
 fn assert_pending_bucket_survives_reopen(db_root: &Path, bucket_id: u64) {
@@ -616,6 +648,7 @@ fn assert_pending_bucket_survives_reopen(db_root: &Path, bucket_id: u64) {
         has_page || has_data_ivl || has_blob_ivl,
         "pending bucket should keep at least one aux bucket before reap commit"
     );
+    assert_pending_bucket_cleanup_reaches_stable_accounting(db_root, bucket_id);
 }
 
 fn assert_pending_bucket_survives_reopen_without_aux(db_root: &Path, bucket_id: u64) {
@@ -629,6 +662,7 @@ fn assert_pending_bucket_survives_reopen_without_aux(db_root: &Path, bucket_id: 
         !has_page && !has_data_ivl && !has_blob_ivl,
         "pending bucket should keep no aux bucket after finalize-before-commit crash"
     );
+    assert_pending_bucket_cleanup_reaches_stable_accounting(db_root, bucket_id);
 }
 
 fn assert_pending_bucket_reaped_after_reopen(db_root: &Path, bucket_id: u64) {
@@ -642,13 +676,55 @@ fn assert_pending_bucket_reaped_after_reopen(db_root: &Path, bucket_id: u64) {
         !has_page && !has_data_ivl && !has_blob_ivl,
         "reaped bucket should not keep aux buckets after reopen"
     );
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+    });
+    assert_stable_gc_space_accounting(&mace, db_root);
+}
+
+fn assert_pending_bucket_cleanup_reaches_stable_accounting(db_root: &Path, bucket_id: u64) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+    });
+    assert!(
+        pending_bucket_ids(db_root).contains(&bucket_id),
+        "pending bucket id {bucket_id} should remain until recovery GC runs"
+    );
+    assert_stable_gc_space_accounting(&mace, db_root);
+    assert!(
+        !pending_bucket_ids(db_root).contains(&bucket_id),
+        "pending bucket id {bucket_id} should be cleared after recovery GC"
+    );
+    let (has_page, has_data_ivl, has_blob_ivl) = aux_bucket_presence(db_root, bucket_id);
+    assert!(
+        !has_page && !has_data_ivl && !has_blob_ivl,
+        "recovered pending bucket should not keep auxiliary metadata buckets"
+    );
+}
+
+fn assert_stable_gc_space_accounting(mace: &Mace, db_root: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        mace.start_gc();
+        if pending_bucket_ids(db_root).is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pending bucket cleanup did not converge before space accounting check"
+        );
+    }
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(mace);
 }
 
 fn assert_rewrite_visibility_after_reopen(db_root: &Path) {
     let mace = open_with_tune(db_root, |opt| {
-        opt.gc_timeout = 20;
+        opt.gc_timeout = 60_000;
         opt.gc_eager = true;
     });
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
     let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
     let payload = vec![b'r'; 1024];
@@ -661,13 +737,17 @@ fn assert_rewrite_visibility_after_reopen(db_root: &Path) {
         mace.start_gc();
         std::thread::sleep(Duration::from_millis(20));
     }
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
 }
 
 fn assert_rewrite_visibility_after_reopen_multi_bucket(db_root: &Path) {
     let mace = open_with_tune(db_root, |opt| {
-        opt.gc_timeout = 20;
+        opt.gc_timeout = 60_000;
         opt.gc_eager = true;
     });
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
     let bucket1 = mace.get_bucket("prod").expect("bucket prod should exist");
     let bucket2 = mace.get_bucket("prod2").expect("bucket prod2 should exist");
     let view1 = bucket1.view().expect("open post-crash view1 failed");
@@ -689,6 +769,8 @@ fn assert_rewrite_visibility_after_reopen_multi_bucket(db_root: &Path) {
         mace.start_gc();
         std::thread::sleep(Duration::from_millis(20));
     }
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
 }
 
 fn data_blob_files(db_root: &Path) -> Vec<PathBuf> {
@@ -712,10 +794,14 @@ fn data_blob_files(db_root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn wal_files(db_root: &Path, group: u8) -> Vec<PathBuf> {
+fn wal_files(db_root: &Path, physical: u8) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let root = db_root.join("log");
-    let prefix = format!("wal_{group}_");
+    let prefix = if physical == Options::SHARED_ID {
+        "group_wal_".to_string()
+    } else {
+        format!("wal_{physical}_")
+    };
     let entries = std::fs::read_dir(&root).expect("read log dir failed");
     for entry in entries {
         let entry = entry.expect("read log dir entry failed");
@@ -857,6 +943,57 @@ fn child_case_flush_after_manifest_commit_with_retire_multi_bucket(db_root: &Pat
     }
 
     wait_for_crash(Duration::from_secs(20))
+}
+
+fn child_case_stat_mask_before_load(db_root: &Path) -> ! {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 16 << 10;
+        opt.wal_buffer_size = 1 << 20;
+        opt.wal_file_size = 1 << 20;
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = false;
+        opt.data_garbage_ratio = 100;
+        opt.stat_mask_cache_count = 1;
+    });
+    mace.disable_gc();
+    let bucket = mace
+        .new_bucket(
+            "prod",
+            BucketOptions {
+                inline_size: 8192,
+                checkpoint_size: 32 << 10,
+                pool_capacity: 64 << 10,
+                enable_backpressure: false,
+                ..BucketOptions::default()
+            },
+        )
+        .expect("create stat-mask failpoint bucket failed");
+    let payload = vec![b's'; 1024];
+
+    let seed = bucket.begin().expect("begin stat-mask seed failed");
+    for idx in 0..256 {
+        seed.put(format!("sm_{idx:04}"), &payload)
+            .expect("seed stat-mask key failed");
+    }
+    seed.commit().expect("commit stat-mask seed failed");
+    bucket.checkpoint();
+    wait_for_data_dir_quiet(db_root, Duration::from_millis(300), Duration::from_secs(20));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let update = bucket.begin().expect("begin stat-mask update failed");
+        for idx in (0..256).step_by(2) {
+            update
+                .upsert(format!("sm_{idx:04}"), &payload)
+                .expect("update stat-mask key failed");
+        }
+        update.commit().expect("commit stat-mask update failed");
+        bucket.checkpoint();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("stat-mask load failpoint did not fire")
 }
 
 fn child_case_data_obsolete_reclaim(db_root: &Path) -> ! {
@@ -1052,41 +1189,12 @@ fn child_case_wal_recycle_before_dir_sync(db_root: &Path) -> ! {
     panic!("wal recycle failpoint did not fire")
 }
 
-fn child_case_wal_recycle_before_dir_sync_keep_stable(db_root: &Path) -> ! {
-    let (mace, bucket) = child_setup_wal_recycle_keep_stable(db_root);
-    seed_committed_and_uncommitted(&bucket, 64, 24);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let payload = vec![b'w'; 1024];
-    let mut round = 0usize;
-
-    while Instant::now() < deadline {
-        let txn = bucket.begin().expect("begin wal recycle txn failed");
-        for idx in 0..64 {
-            txn.upsert(format!("rw_{round}_{idx}"), &payload)
-                .expect("upsert wal recycle key failed");
-        }
-        txn.commit().expect("commit wal recycle txn failed");
-        if round.is_multiple_of(4) {
-            bucket.checkpoint();
-            mace.start_gc();
-        }
-        round += 1;
-    }
-
-    panic!("wal recycle keep-stable failpoint did not fire")
-}
-
 fn child_case_wal_recycle_reopen(db_root: &Path) -> ! {
     let _ = child_setup_wal_recycle(db_root);
     panic!("recovery wal recycle failpoint did not fire")
 }
 
-fn child_case_wal_recycle_reopen_keep_stable(db_root: &Path) -> ! {
-    let _ = child_setup_wal_recycle_keep_stable(db_root);
-    panic!("recovery wal recycle keep-stable failpoint did not fire")
-}
-
-fn child_case_wal_recycle_reopen_expect_io(db_root: &Path, keep_stable: bool) {
+fn child_case_wal_recycle_reopen_expect_io(db_root: &Path) {
     let mut opt = Options::new(db_root);
     opt.concurrent_write = 1;
     opt.sync_on_write = true;
@@ -1095,7 +1203,6 @@ fn child_case_wal_recycle_reopen_expect_io(db_root: &Path, keep_stable: bool) {
     opt.wal_file_size = 4 << 10;
     opt.gc_timeout = 60_000;
     opt.gc_eager = false;
-    opt.keep_stable_wal_file = keep_stable;
     let res = Mace::new(opt.validate().expect("validate options failed"));
     let err = res.err().expect("recovery reopen must fail with io error");
     assert_eq!(err, OpCode::IoError);
@@ -1125,6 +1232,7 @@ fn child_case_txn_commit_abort_window(db_root: &Path) -> ! {
 }
 
 fn child_case_gc_data_before_meta_commit(db_root: &Path) -> ! {
+    prepare_oversized_data_gc_victim(db_root);
     let (mace, bucket) = child_setup_data_gc(db_root);
     seed_committed_and_uncommitted(&bucket, 64, 0);
     drive_gc_pressure(&bucket, 256);
@@ -1138,6 +1246,56 @@ fn child_case_gc_data_before_meta_commit(db_root: &Path) -> ! {
     }
 
     panic!("gc data failpoint did not fire")
+}
+
+#[cfg(feature = "extra_check")]
+fn child_case_gc_data_with_collecting_junk(db_root: &Path) -> ! {
+    prepare_oversized_data_gc_victim(db_root);
+    let (mace, bucket) = child_setup_data_gc(db_root);
+    let bucket_id = bucket.id();
+    let expected_root = db_root.to_path_buf();
+    let checkpoint_bucket = bucket.clone();
+    testing::set_gc_rewrite_hook(Some(Arc::new(
+        move |point, observed_bucket_id, observed_root| {
+            if point != testing::GcRewriteSyncPoint::BeforeDataPublish
+                || observed_bucket_id != bucket_id
+                || observed_root != expected_root
+            {
+                return;
+            }
+
+            // make addresses copied from the victim obsolete while the collector is collecting
+            let collected_before = testing::data_rewrite_collected_junk_count(&checkpoint_bucket);
+            let latest = vec![b'c'; 128];
+            let txn = checkpoint_bucket
+                .begin()
+                .expect("begin collecting-junk update failed");
+            for idx in 0..512 {
+                txn.upsert(format!("oversized_{idx:04}"), &latest)
+                    .expect("update collecting-junk key failed");
+            }
+            txn.commit().expect("commit collecting-junk update failed");
+            testing::checkpoint_and_wait(&checkpoint_bucket);
+            let collected_after = testing::data_rewrite_collected_junk_count(&checkpoint_bucket);
+            assert!(
+                collected_after > collected_before,
+                "checkpoint must collect junk owned by the current rewrite victims"
+            );
+        },
+    )));
+
+    seed_committed_and_uncommitted(&bucket, 64, 0);
+    drive_gc_pressure(&bucket, 256);
+    mace.sync().expect("sync before collecting-junk gc failed");
+    wait_for_data_dir_quiet(db_root, Duration::from_millis(300), Duration::from_secs(20));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        mace.start_gc();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!("collecting-junk gc failpoint did not fire")
 }
 
 fn child_case_gc_blob_before_meta_commit(db_root: &Path) -> ! {
@@ -1348,6 +1506,7 @@ fn failpoint_child() {
         "flush_after_old_stat_delta" => {
             child_case_flush_after_manifest_commit_with_retire(&db_root)
         }
+        "stat_mask_before_load" => child_case_stat_mask_before_load(&db_root),
         "data_obsolete_reclaim" => child_case_data_obsolete_reclaim(&db_root),
         "blob_obsolete_reclaim" => child_case_blob_obsolete_reclaim(&db_root),
         "wal_after_checkpoint_write" => child_case_wal_after_checkpoint_write(&db_root),
@@ -1357,23 +1516,22 @@ fn failpoint_child() {
             child_case_wal_recycle_before_dir_sync(&db_root)
         }
         "wal_recycle_done_windows" => child_case_wal_recycle_before_dir_sync(&db_root),
-        "wal_recycle_done_windows_keep_stable" => {
-            child_case_wal_recycle_before_dir_sync_keep_stable(&db_root)
-        }
         "recovery_wal_recycle_done_windows" => child_case_wal_recycle_reopen(&db_root),
-        "recovery_wal_recycle_done_windows_keep_stable" => {
-            child_case_wal_recycle_reopen_keep_stable(&db_root)
-        }
         "recovery_wal_recycle_expect_remove_io" => {
-            child_case_wal_recycle_reopen_expect_io(&db_root, false)
-        }
-        "recovery_wal_recycle_expect_rename_io" => {
-            child_case_wal_recycle_reopen_expect_io(&db_root, true)
+            child_case_wal_recycle_reopen_expect_io(&db_root)
         }
         "gc_data_rewrite_before_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_stage_marker" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_data_dir_sync" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
+        #[cfg(feature = "extra_check")]
+        "gc_data_rewrite_collecting_junk_before_meta_commit" => {
+            child_case_gc_data_with_collecting_junk(&db_root)
+        }
+        #[cfg(feature = "extra_check")]
+        "gc_data_rewrite_collecting_junk_after_meta_commit" => {
+            child_case_gc_data_with_collecting_junk(&db_root)
+        }
         "gc_blob_rewrite_before_meta_commit" => child_case_gc_blob_before_meta_commit(&db_root),
         "gc_blob_rewrite_after_stage_marker" => child_case_gc_blob_before_meta_commit(&db_root),
         "gc_blob_rewrite_after_data_dir_sync" => child_case_gc_blob_before_meta_commit(&db_root),
@@ -1580,6 +1738,19 @@ fn chaos_failpoint_flush_after_old_stat_delta() {
 
 #[test]
 #[ignore]
+fn chaos_failpoint_stat_mask_before_load() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "stat_mask_before_load",
+        &path,
+        "mace_stat_mask_before_load=abort@1",
+    );
+    assert_child_aborted(status, "stat-mask-load child should abort");
+    assert_bucket_readable(&path);
+}
+
+#[test]
+#[ignore]
 fn chaos_failpoint_gc_data_obsolete_after_meta_commit() {
     let path = RandomPath::new();
     let status = spawn_child(
@@ -1702,7 +1873,7 @@ fn chaos_failpoint_wal_recycle_before_intent_commit() {
         "wal-recycle-before-intent-commit failpoint child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         None,
         "before-intent crash must not leave a durable recycle record",
     );
@@ -1723,7 +1894,7 @@ fn chaos_failpoint_wal_recycle_after_remove_before_dir_sync() {
         "wal-recycle-after-remove-before-dir-sync failpoint child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(1),
         "partial-unlink crash must leave durable recycle intent",
     );
@@ -1744,7 +1915,7 @@ fn chaos_failpoint_wal_recycle_after_dir_sync_before_done_commit() {
         "wal-recycle-after-dir-sync-before-done-commit child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(1),
         "dir-sync-before-done crash must still expose intent stage",
     );
@@ -1765,7 +1936,7 @@ fn chaos_failpoint_wal_recycle_after_done_commit_before_publish() {
         "wal-recycle-after-done-commit-before-publish child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "done-commit crash must preserve durable recycle frontier",
     );
@@ -1783,7 +1954,7 @@ fn seed_wal_recycle_intent_after_dir_sync(db_root: &Path) {
         "wal-recycle-after-dir-sync-before-done-commit child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(db_root, 0),
+        wal_recycle_stage(db_root, Options::SHARED_ID),
         Some(1),
         "seed crash must leave durable recycle intent",
     );
@@ -1800,26 +1971,9 @@ fn seed_wal_recycle_intent_after_first_remove(db_root: &Path) {
         "wal-recycle-after-remove-before-dir-sync child should abort after partial recycle",
     );
     assert_eq!(
-        wal_recycle_stage(db_root, 0),
+        wal_recycle_stage(db_root, Options::SHARED_ID),
         Some(1),
         "seed crash must leave durable recycle intent after a partial remove",
-    );
-}
-
-fn seed_wal_recycle_intent_after_first_rename(db_root: &Path) {
-    let status = spawn_child(
-        "wal_recycle_done_windows_keep_stable",
-        db_root,
-        "mace_wal_recycle_after_remove_before_dir_sync=abort@2",
-    );
-    assert_child_aborted(
-        status,
-        "wal-recycle-after-remove-before-dir-sync child should abort after partial rename",
-    );
-    assert_eq!(
-        wal_recycle_stage(db_root, 0),
-        Some(1),
-        "seed crash must leave durable recycle intent after a partial rename",
     );
 }
 
@@ -1839,14 +1993,14 @@ fn chaos_failpoint_recovery_wal_recycle_after_dir_sync_before_done_commit() {
         "recovery wal-recycle-after-dir-sync-before-done-commit child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(1),
         "recovery dir-sync-before-done crash must keep intent stage durable",
     );
 
     assert_visibility_after_reopen(&path, 64, 24);
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "clean reopen should finish pending recycle after recovery crash",
     );
@@ -1868,14 +2022,14 @@ fn chaos_failpoint_recovery_wal_recycle_after_done_commit_before_publish() {
         "recovery wal-recycle-after-done-commit-before-publish child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "recovery done-commit crash must persist durable done frontier",
     );
 
     assert_visibility_after_reopen(&path, 64, 24);
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "clean reopen should keep durable done frontier after recovery crash",
     );
@@ -1897,31 +2051,9 @@ fn chaos_failpoint_recovery_fs_remove_file_io() {
         "recovery remove_file child should report io error"
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(1),
         "failed recovery remove must keep recycle intent durable",
-    );
-}
-
-#[test]
-#[ignore]
-fn chaos_failpoint_recovery_fs_rename_io() {
-    let path = RandomPath::new();
-    seed_wal_recycle_intent_after_first_rename(&path);
-
-    let status = spawn_child(
-        "recovery_wal_recycle_expect_rename_io",
-        &path,
-        "mace_fs_rename=io(permission_denied)@1",
-    );
-    assert!(
-        status.success(),
-        "recovery rename child should report io error"
-    );
-    assert_eq!(
-        wal_recycle_stage(&path, 0),
-        Some(1),
-        "failed recovery rename must keep recycle intent durable",
     );
 }
 
@@ -2108,7 +2240,7 @@ fn chaos_failpoint_gc_data_rewrite_after_stage_marker() {
     let status = spawn_child(
         "gc_data_rewrite_after_stage_marker",
         &path,
-        "mace_gc_data_rewrite_after_stage_marker=abort@1",
+        "mace_gc_data_rewrite_after_stage_marker=abort@2",
     );
     assert_child_aborted(status, "gc-data-after-marker failpoint child should abort");
     assert_bucket_readable(&path);
@@ -2141,6 +2273,57 @@ fn chaos_failpoint_gc_data_rewrite_after_meta_commit() {
     );
     assert_child_aborted(status, "gc-data-after-meta failpoint child should abort");
     assert_bucket_readable(&path);
+}
+
+#[cfg(feature = "extra_check")]
+fn assert_collecting_junk_after_reopen(db_root: &Path) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = true;
+    });
+    testing::assert_persisted_gc_stats(&mace);
+    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let view = bucket.view().expect("open collecting-junk view failed");
+    let latest = vec![b'c'; 128];
+    for idx in 0..512 {
+        let key = format!("oversized_{idx:04}");
+        let val = view.get(&key).expect("collecting-junk key missing");
+        assert_eq!(val.slice(), latest.as_slice());
+    }
+    drop(view);
+    for _ in 0..4 {
+        mace.start_gc();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    testing::assert_persisted_gc_stats(&mace);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "extra_check")]
+fn chaos_failpoint_gc_data_rewrite_collecting_junk_before_meta_commit() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "gc_data_rewrite_collecting_junk_before_meta_commit",
+        &path,
+        "mace_gc_data_rewrite_before_meta_commit=abort@1",
+    );
+    assert_child_aborted(status, "collecting-junk-before-meta child should abort");
+    assert_collecting_junk_after_reopen(&path);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "extra_check")]
+fn chaos_failpoint_gc_data_rewrite_collecting_junk_after_meta_commit() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "gc_data_rewrite_collecting_junk_after_meta_commit",
+        &path,
+        "mace_gc_data_rewrite_after_meta_commit=abort@1",
+    );
+    assert_child_aborted(status, "collecting-junk-after-meta child should abort");
+    assert_collecting_junk_after_reopen(&path);
 }
 
 #[test]
@@ -2288,7 +2471,7 @@ fn chaos_failpoint_recovery_abort_clean_does_not_recycle_wal_before_runtime_chec
     let status = spawn_child("recovery_abort_clean_seed", &path, "");
     assert!(status.success(), "seed child should finish normally");
 
-    let before = wal_files(&path, 0);
+    let before = wal_files(&path, Options::SHARED_ID);
     assert!(
         !before.is_empty(),
         "expected recovery-abort-clean seed to create wal files"
@@ -2314,11 +2497,17 @@ fn chaos_failpoint_recovery_abort_clean_does_not_recycle_wal_before_runtime_chec
         "post-start gc should not recycle wal before a runtime checkpoint exists: {status:?}"
     );
 
-    let after = wal_files(&path, 0);
-    assert_eq!(
-        before, after,
-        "wal inventory changed even though post-start gc should not have recycled any file"
-    );
+    let after = wal_files(&path, Options::SHARED_ID);
+    // same-route reopens create no files, so the inventory only grows by
+    // rotation/new-era files; the invariant under test is that post-start gc
+    // never REMOVES a wal file before a runtime checkpoint exists
+    for file in &before {
+        assert!(
+            after.contains(file),
+            "post-start gc must not recycle wal file {:?} before a runtime checkpoint exists",
+            file
+        );
+    }
 }
 
 #[test]
@@ -2365,7 +2554,7 @@ fn recovery_rejects_sparse_wal_gap_after_checkpoint() {
         }
     }
 
-    let mut files = wal_files(&path, 0);
+    let mut files = wal_files(&path, Options::SHARED_ID);
     assert!(
         files.len() >= 3,
         "need at least 3 wal files to form a sparse sequence, got {}",
@@ -2401,14 +2590,14 @@ fn wal_recycle_done_reopen_is_idempotent() {
         "wal-recycle-after-done-commit-before-publish child should abort",
     );
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "first crash should preserve durable done frontier",
     );
 
     assert_visibility_after_reopen(&path, 64, 24);
     assert_eq!(
-        wal_recycle_stage(&path, 0),
+        wal_recycle_stage(&path, Options::SHARED_ID),
         Some(2),
         "reopen must keep durable recycle frontier for later boots",
     );
@@ -2430,7 +2619,7 @@ fn wal_recycle_done_does_not_weaken_gap_detection_after_frontier() {
     );
     assert_visibility_after_reopen(&path, 64, 24);
 
-    let mut files = wal_files(&path, 0);
+    let mut files = wal_files(&path, Options::SHARED_ID);
     assert!(
         !files.is_empty(),
         "expected at least one wal file after durable recycle frontier"

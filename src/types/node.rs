@@ -1831,7 +1831,7 @@ mod test {
         let mut a = A::new();
         let txid = AtomicU64::new(1);
         const CONSOLIDATE_THRESHOLD: usize = 64;
-        let lsn = Position::default();
+        let lsn = Position::MIN;
         let mut j = Junk::new();
 
         {
@@ -1972,7 +1972,7 @@ mod test {
     fn compact_drops_latest_tombstone_instead_of_revealing_older_value() {
         let mut a = A::new();
         let l = a.clone();
-        let lsn = Position::default();
+        let lsn = Position::MIN;
         let mut node = Node::new_leaf(&mut a, l, 0, lsn);
         let mut txid = 1_u64;
         let v1 = vec![b'x'; BucketOptions::MIN_INLINE_SIZE + 1024];

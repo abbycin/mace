@@ -1219,7 +1219,7 @@ mod test {
             &Key::new("foo".as_bytes(), Ver::new(1, 0)),
             &Record::normal(1, "bar".as_bytes()),
             0,
-            Position::default(),
+            Position::MIN,
         );
         im = im.update(delta.view().as_delta());
 

@@ -5,6 +5,7 @@ use crate::map::{Loader, Node, Page};
 use crate::types::data::{HistRef, IterItem, Record, Val};
 use crate::types::node::{Junk, MergeOp, RawLeafIter, RawLeafRevIter};
 use crate::types::refbox::DeltaView;
+use crate::types::sst::Sst;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::data::Position;
 use crate::utils::observe::{
@@ -87,7 +88,12 @@ impl Tree {
     fn init(&self, root_pid: u64) {
         let g = crossbeam_epoch::pin();
         let mut build = self.begin_build();
-        let lsn = self.store.context.group(0).logging.lock().current_pos();
+        // recovery roots must not advance a frontier beyond materialized WAL
+        let lsn = if self.store.context.recovering() {
+            Position::MIN
+        } else {
+            self.store.context.group(0).logging.lock().current_pos()
+        };
         let node = Node::new_leaf(&mut build, self.bucket.loader(self.store.context), 0, lsn);
         let mut page = Page::new(node);
         let mut publish = build.into_publish(&g);
@@ -689,7 +695,7 @@ impl Tree {
         let page = self.find_leaf(g, key.raw())?;
 
         // it never write log, so use default value is always OK
-        self.link(g, page, key, val, |_, _| Ok((0, Position::default())))?;
+        self.link(g, page, key, val, |_, _| Ok((0, Position::MIN)))?;
         Ok(())
     }
 
@@ -953,7 +959,7 @@ impl Tree {
     }
 
     fn lower_bound_hist_subrange(
-        sst: &crate::types::sst::Sst<Ver>,
+        sst: &Sst<Ver>,
         mut lo: usize,
         mut hi: usize,
         target: &Ver,

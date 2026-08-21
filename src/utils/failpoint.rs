@@ -19,7 +19,6 @@ pub(crate) enum FsOp {
     TryExists,
     CreateDirAll,
     ReadDir,
-    Rename,
     RemoveFile,
     SyncDir,
 }
@@ -31,7 +30,6 @@ impl FsOp {
             "try_exists" => Some(Self::TryExists),
             "create_dir_all" => Some(Self::CreateDirAll),
             "read_dir" => Some(Self::ReadDir),
-            "rename" => Some(Self::Rename),
             "remove_file" => Some(Self::RemoveFile),
             "sync_dir" => Some(Self::SyncDir),
             _ => None,
@@ -44,7 +42,6 @@ impl FsOp {
             Self::TryExists => "mace_fs_try_exists",
             Self::CreateDirAll => "mace_fs_create_dir_all",
             Self::ReadDir => "mace_fs_read_dir",
-            Self::Rename => "mace_fs_rename",
             Self::RemoveFile => "mace_fs_remove_file",
             Self::SyncDir => "mace_fs_sync_dir",
         }
@@ -111,6 +108,8 @@ struct State {
     raw: String,
     named_rules: HashMap<String, Rule>,
     fs_rules: Vec<FsRule>,
+    /// in-process rules override environment rules
+    override_rules: HashMap<String, Rule>,
 }
 
 impl State {
@@ -119,6 +118,7 @@ impl State {
             raw: String::new(),
             named_rules: HashMap::new(),
             fs_rules: Vec::new(),
+            override_rules: HashMap::new(),
         }
     }
 
@@ -131,6 +131,10 @@ impl State {
         let parsed = parse_rules(&current);
         self.named_rules = parsed.named_rules;
         self.fs_rules = parsed.fs_rules;
+        // preserve override hit counters across refreshes
+        for (name, rule) in self.override_rules.iter() {
+            self.named_rules.insert(name.clone(), *rule);
+        }
     }
 
     fn hit_named(&mut self, name: &str) -> Option<FailAction> {
@@ -312,6 +316,16 @@ pub(crate) fn check(name: &str) -> Result<(), OpCode> {
     }
 }
 
+/// arm in-process rules that override environment rules
+pub(crate) fn arm_rules(raw: &str) {
+    let mut lk = global_state().lock().expect("failpoint lock poisoned");
+    let parsed = parse_rules(raw);
+    for (name, rule) in parsed.named_rules {
+        lk.named_rules.insert(name.clone(), rule);
+        lk.override_rules.insert(name, rule);
+    }
+}
+
 pub(crate) fn crash(name: &str) {
     let mut lk = global_state().lock().expect("failpoint lock poisoned");
     lk.refresh();
@@ -353,7 +367,7 @@ pub(crate) fn check_fs(op: FsOp, path: &Path) -> Result<(), io::Error> {
 #[cfg(test)]
 mod tests {
     use super::{ActionSpec, FailAction, FsOp, ParsedRules, State, normalize_path, parse_rules};
-    use std::{io::ErrorKind, path::Path};
+    use std::{collections::HashMap, io::ErrorKind, path::Path};
 
     fn state_with(raw: &str) -> State {
         let ParsedRules {
@@ -364,6 +378,7 @@ mod tests {
             raw: raw.to_string(),
             named_rules,
             fs_rules,
+            override_rules: HashMap::new(),
         }
     }
 

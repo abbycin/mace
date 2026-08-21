@@ -1,6 +1,6 @@
 [package]
 name = "mace-kv"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.95"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
@@ -10,7 +10,7 @@ repository = "https://github.com/abbycin/mace"
 description = "A fast, cross-platform embedded key-value storage engine with ACID, MVCC, and flash-optimized storage"
 license = "MIT"
 categories = ["database-implementations", "database"]
-keywords = ["database", "lmdb", "sled", "rocksdb", "redis"]
+keywords = ["database", "lmdb", "sled", "rocksdb", "mace"]
 
 [lib]
 name = "mace"
@@ -36,7 +36,6 @@ libc = "0.2.189"
 logger = { path = "deps/logger" }
 
 [features]
-default = []
 extra_check = []
 failpoints = []
 

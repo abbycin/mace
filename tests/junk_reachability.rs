@@ -4,9 +4,11 @@ use mace::testing::{self, CheckpointRootRestore, CheckpointSyncPoint};
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
 #[cfg(feature = "extra_check")]
-use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "extra_check")]
 use std::sync::mpsc::channel;
+#[cfg(feature = "extra_check")]
+use std::sync::{Barrier, Mutex};
 #[cfg(feature = "extra_check")]
 use std::time::Duration;
 
@@ -86,7 +88,7 @@ fn reachable_junk_regression_guard() -> Result<(), OpCode> {
     const VALUE_SIZE: usize = 4096;
     const ROUNDS: usize = 48;
 
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let observer = Arc::new(InMemoryObserver::new(256));
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
@@ -187,7 +189,7 @@ impl Drop for CheckpointHookReset {
 #[test]
 fn checkpoint_snapshot_holds_ebr_guard_before_wait_zero() -> Result<(), OpCode> {
     let _checkpoint_test_lock = testing::checkpoint_test_lock();
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.tmp_store = false;
     opt.sync_on_write = false;
@@ -298,5 +300,72 @@ fn checkpoint_snapshot_holds_ebr_guard_before_wait_zero() -> Result<(), OpCode> 
         reopened_bucket.view()?.get("k_0031")?.slice(),
         b"x".repeat(1024)
     );
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn checkpoint_cut_keeps_post_cut_writer_visible() -> Result<(), OpCode> {
+    let _checkpoint_test_lock = testing::checkpoint_test_lock();
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.tmp_store = false;
+    opt.sync_on_write = false;
+    opt.concurrent_write = 1;
+    let reopen_opt = opt.clone();
+    let mace = Mace::new(opt.validate().unwrap())?;
+    let bucket = mace.new_bucket("x", BucketOptions::default())?;
+
+    let seed = bucket.begin()?;
+    seed.put("before_cut", "v0")?;
+    seed.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+
+    let (cut_tx, cut_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let fired = Arc::new(AtomicBool::new(false));
+    let target_bucket = bucket.id();
+    let _reset = CheckpointHookReset;
+    testing::set_checkpoint_hook(Some(Arc::new({
+        let fired = fired.clone();
+        let release_rx = release_rx.clone();
+        move |point, bucket_id| {
+            if bucket_id != target_bucket || point != CheckpointSyncPoint::BeforeSnapshotWaitZero {
+                return;
+            }
+            if !fired.swap(true, Ordering::SeqCst) {
+                cut_tx.send(()).expect("signal checkpoint cut");
+                release_rx
+                    .lock()
+                    .expect("lock checkpoint release receiver")
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release checkpoint snapshot");
+            }
+        }
+    })));
+
+    let checkpoint_bucket = bucket.clone();
+    let checkpoint = std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
+    cut_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("checkpoint must reach the post-cut snapshot window");
+
+    let post_cut = bucket.begin()?;
+    post_cut.put("after_cut", "v1")?;
+    post_cut.commit()?;
+    release_tx.send(()).expect("release checkpoint snapshot");
+    checkpoint.join().expect("checkpoint must not panic");
+
+    // The first cut owns the old dirty-root set; a second checkpoint must publish the new hot root.
+    testing::checkpoint_and_wait(&bucket);
+    drop(bucket);
+    drop(mace);
+
+    let reopened = Mace::new(reopen_opt.validate().unwrap())?;
+    let reopened_bucket = reopened.get_bucket("x")?;
+    let view = reopened_bucket.view()?;
+    assert_eq!(view.get("before_cut")?.slice(), b"v0");
+    assert_eq!(view.get("after_cut")?.slice(), b"v1");
     Ok(())
 }

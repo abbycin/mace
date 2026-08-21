@@ -7,6 +7,8 @@ mod txn;
 use crate::map::buffer::BucketContext;
 use crate::utils::interval::IntervalMap;
 use crate::utils::options::ParsedOptions;
+#[cfg(feature = "extra_check")]
+pub(crate) use entry::IMetaCodec;
 pub use entry::{
     BucketDurableFrontier, BucketMeta, DelInterval, Delete, FileKind, IntervalPair, MemStat,
     MetaKind, MetaOp, PageTable, PersistStat, Sequences, StatInner, WalRecycleState,
@@ -38,6 +40,7 @@ pub(crate) const CURRENT_VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalRecycleIntent {
+    /// physical WAL stream id
     pub(crate) group_id: u8,
     pub(crate) from_file_id: u64,
     pub(crate) to_file_id: u64,

@@ -21,6 +21,7 @@ use crate::{
     OpCode, Options, Store,
     cc::{
         context::{AbortCleanState, AbortCleanTask, Context},
+        log::Logging,
         wal::{EntryType, PayloadType, WalBegin, WalCommit, WalUpdate, ptr_to, wal_record_sz},
     },
     index::tree::Tree,
@@ -28,8 +29,8 @@ use crate::{
     map::data::{FileFooter, FileVersion, MetaReader},
     meta::{
         BUCKET_PENDING_DEL, DelInterval, Delete, FileKind, FileReader, IntervalPair, Manifest,
-        MemStat, MetaKind, Sequences, blob_interval_name, data_interval_name, new_reader,
-        page_table_name,
+        MemStat, MetaKind, Sequences, WalRecycleIntent, blob_interval_name, data_interval_name,
+        new_reader, page_table_name,
     },
     must_exist, must_true,
     types::{refbox::BoxRef, traits::IAsSlice},
@@ -142,7 +143,7 @@ impl GCHandle {
         self.sem.wait();
     }
 
-    pub(crate) fn wal_clean(&self, manifest: Handle<crate::meta::Manifest>, ctx: Handle<Context>) {
+    pub(crate) fn wal_clean(&self, manifest: Handle<Manifest>, ctx: Handle<Context>) {
         if self.tx.send(GC_WAL).is_err() {
             let mut gc = GarbageCollector {
                 sequences: ctx.sequences.clone(),
@@ -188,6 +189,15 @@ pub(crate) fn start_gc(store: MutRef<Store>, ctx: Handle<Context>) -> GCHandle {
 pub(crate) fn drain_abort_clean_during_recovery(
     store: MutRef<Store>,
     ctx: Handle<Context>,
+    force_fsync: bool,
+) -> Result<(), OpCode> {
+    drain_abort_clean(store, ctx, force_fsync)
+}
+
+fn drain_abort_clean(
+    store: MutRef<Store>,
+    ctx: Handle<Context>,
+    force_fsync: bool,
 ) -> Result<(), OpCode> {
     let mut gc = GarbageCollector {
         sequences: ctx.sequences.clone(),
@@ -196,7 +206,12 @@ pub(crate) fn drain_abort_clean_during_recovery(
         data_runs: Arc::new(AtomicU64::new(0)),
         blob_runs: Arc::new(AtomicU64::new(0)),
     };
-    gc.run_abort_clean_recovery()
+    gc.run_abort_clean_recovery(force_fsync)
+}
+
+/// drain abort-clean before the final exit checkpoint
+pub(crate) fn drain_abort_clean_at_exit(store: MutRef<Store>, ctx: Handle<Context>) {
+    must_ok!(drain_abort_clean(store, ctx, false));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,7 +375,7 @@ impl GarbageCollector {
     fn run(&mut self) {
         let started = Instant::now();
         self.store.opt.observer.counter(CounterMetric::GcRun, 1);
-        self.process_abort_clean();
+        let _ = self.process_abort_clean();
         self.process_wal_clean();
         for kind in FileKind::ALL {
             self.process_files(kind);
@@ -379,18 +394,16 @@ impl GarbageCollector {
 
     fn process_wal_clean_with_manifest(&mut self, manifest: Handle<Manifest>) {
         let ctx = self.ctx;
+        if ctx.opt.sync_on_write {
+            self.process_shared_wal_clean(ctx, manifest);
+            return;
+        }
         for g in ctx.groups().iter() {
             let (oldest_id, last_ckpt_file, mut checkpoint_id) = {
                 let mut logging = g.logging.lock();
-                if ctx.opt.sync_on_write
-                    && let Err(e) = logging.sync(false)
-                {
-                    log::error!("wal sync fail, group {}, error {:?}", g.id, e);
-                    continue;
-                }
                 (
                     logging.oldest_wal_id(),
-                    logging.last_ckpt().file_id,
+                    logging.checkpoint_floor().file_id,
                     g.min_active_wal_file_id(&mut logging),
                 )
             };
@@ -402,57 +415,100 @@ impl GarbageCollector {
                 continue;
             }
 
-            let intent = crate::meta::WalRecycleIntent {
+            let intent = WalRecycleIntent {
                 group_id: g.id as u8,
                 from_file_id: oldest_id,
                 to_file_id: checkpoint_id,
             };
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_before_intent_commit");
-            manifest.commit_wal_recycle_intent(intent);
-
-            // [oldest_id, checkpoint_id)
-            let recycled = Self::process_one_wal(ctx, intent);
-            if recycled == 0 {
-                manifest.commit_wal_recycle_done(intent);
-                g.logging.lock().advance_oldest_wal_id(checkpoint_id);
-                continue;
-            }
-            ctx.opt.sync_log_dir();
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
-            manifest.commit_wal_recycle_done(intent);
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_done_commit_before_publish");
-            g.logging.lock().advance_oldest_wal_id(checkpoint_id);
-            ctx.opt
-                .observer
-                .counter(CounterMetric::GcWalRecycleFile, recycled);
+            let mut logging = g.logging.lock();
+            self.process_wal_recycle_intent(ctx, manifest, intent, Some(&mut logging));
         }
     }
 
-    fn process_one_wal(ctx: Handle<Context>, intent: crate::meta::WalRecycleIntent) -> u64 {
+    fn process_shared_wal_clean(&mut self, ctx: Handle<Context>, manifest: Handle<Manifest>) {
+        let shared = ctx
+            .shared_logging()
+            .expect("durable mode has a shared logging");
+        let mut logging = shared.lock();
+        let oldest_id = logging.oldest_wal_id();
+        let mut checkpoint_id = logging.checkpoint_floor().file_id;
+        // retain every active, abort-clean, and checkpoint pin
+        for g in ctx.groups().iter() {
+            checkpoint_id = checkpoint_id.min(g.min_active_wal_file_id(&mut logging));
+        }
+        if let Some(min_pending_file) = ctx.min_abort_clean_file_id(Options::SHARED_ID) {
+            checkpoint_id = checkpoint_id.min(min_pending_file);
+        }
+        if checkpoint_id == u64::MAX {
+            // retain the current file as the recovery anchor
+            checkpoint_id = logging.current_pos().file_id;
+        }
+        if oldest_id >= checkpoint_id {
+            return;
+        }
+        let intent = WalRecycleIntent {
+            group_id: Options::SHARED_ID,
+            from_file_id: oldest_id,
+            to_file_id: checkpoint_id,
+        };
+        self.process_wal_recycle_intent(ctx, manifest, intent, Some(&mut logging));
+    }
+
+    fn process_wal_recycle_intent(
+        &mut self,
+        ctx: Handle<Context>,
+        manifest: Handle<Manifest>,
+        intent: WalRecycleIntent,
+        logging: Option<&mut Logging>,
+    ) {
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_wal_recycle_before_intent_commit");
+        let Some(intent) = manifest.commit_wal_recycle_intent(intent) else {
+            return;
+        };
+
+        // [oldest_id, checkpoint_id)
+        let recycled = Self::process_one_wal(ctx, intent);
+        if recycled == 0 {
+            assert!(
+                manifest.commit_wal_recycle_done(intent),
+                "wal recycle owner must complete its matching intent"
+            );
+            if let Some(logging) = logging {
+                logging.advance_oldest_wal_id(intent.to_file_id);
+            }
+            return;
+        }
+        ctx.opt.sync_log_dir();
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
+        assert!(
+            manifest.commit_wal_recycle_done(intent),
+            "wal recycle owner must complete its matching intent"
+        );
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_wal_recycle_after_done_commit_before_publish");
+        if let Some(logging) = logging {
+            logging.advance_oldest_wal_id(intent.to_file_id);
+        }
+        ctx.opt
+            .observer
+            .counter(CounterMetric::GcWalRecycleFile, recycled);
+    }
+
+    fn process_one_wal(ctx: Handle<Context>, intent: WalRecycleIntent) -> u64 {
         let mut recycled = 0;
         // NOTE: not including `end`
         for seq in intent.from_file_id..intent.to_file_id {
-            let from = ctx.opt.wal_file(intent.group_id, seq);
+            let from = ctx.opt.physical_wal_path(intent.group_id, seq);
             if !must_ok!(ctx.opt.fs.try_exists(&from), "can't stat {:?}", from) {
                 continue;
             }
-            let to = ctx.opt.wal_backup(intent.group_id, seq);
-            if ctx.opt.keep_stable_wal_file {
-                log::info!("rename {from:?} to {to:?}");
-                must_ok!(
-                    ctx.opt.fs.rename(&from, &to),
-                    "can't rename {from:?} to {to:?}"
-                );
-            } else {
-                log::info!("unlink {from:?}");
-                must_ok!(
-                    ctx.opt.fs.remove_file_if_exists(&from),
-                    "can't remove {from:?}"
-                );
-            }
+            log::info!("unlink {from:?}");
+            must_ok!(
+                ctx.opt.fs.remove_file_if_exists(&from),
+                "can't remove {from:?}"
+            );
             recycled += 1;
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_wal_recycle_after_remove_before_dir_sync");
@@ -460,7 +516,7 @@ impl GarbageCollector {
         recycled
     }
 
-    fn run_abort_clean_recovery(&mut self) -> Result<(), OpCode> {
+    fn run_abort_clean_recovery(&mut self, force_fsync: bool) -> Result<(), OpCode> {
         loop {
             let tasks = self.ctx.abort_clean_tasks();
             if tasks.is_empty() {
@@ -500,6 +556,7 @@ impl GarbageCollector {
                     &round_stabilize_buckets,
                     &trees,
                     AbortCleanLoadMode::Recovery,
+                    force_fsync,
                 )?;
             }
 
@@ -509,7 +566,8 @@ impl GarbageCollector {
         }
     }
 
-    fn process_abort_clean(&mut self) {
+    /// process one steady-state abort-clean round
+    fn process_abort_clean(&mut self) -> usize {
         let drained_events = self.ctx.drain_abort_clean_events();
         for &txid in &drained_events {
             self.ctx.mark_abort_clean_quiesced(txid);
@@ -517,10 +575,11 @@ impl GarbageCollector {
 
         let tasks = self.ctx.abort_clean_tasks();
         if tasks.is_empty() {
+            let removed = drained_events.len();
             for txid in drained_events {
                 self.ctx.remove_abort_clean(txid);
             }
-            return;
+            return removed;
         }
 
         let mut block = Block::alloc(1024);
@@ -571,6 +630,7 @@ impl GarbageCollector {
                 &round_stabilize_buckets,
                 &trees,
                 AbortCleanLoadMode::SteadyState,
+                false,
             ) {
                 Ok(()) => true,
                 Err(e) => {
@@ -585,6 +645,11 @@ impl GarbageCollector {
             }
         };
 
+        let cleaned = if checkpoint_ok {
+            cleaned_txids.len()
+        } else {
+            0
+        };
         if checkpoint_ok {
             let sink = self.ctx.abort_clean_event_sink();
             for txid in cleaned_txids {
@@ -606,9 +671,11 @@ impl GarbageCollector {
             g.flush();
         }
 
+        let removed_quiesced = drained_events.len();
         for txid in drained_events {
             self.ctx.remove_abort_clean(txid);
         }
+        cleaned + removed_quiesced
     }
 
     fn stabilize_cleaned_pages(
@@ -616,6 +683,7 @@ impl GarbageCollector {
         dirty_buckets: &HashSet<u64>,
         trees: &Lru<u64, Option<Tree>>,
         mode: AbortCleanLoadMode,
+        force_fsync: bool,
     ) -> Result<(), OpCode> {
         for &bucket_id in dirty_buckets {
             let tree = match trees.get(&bucket_id) {
@@ -623,7 +691,14 @@ impl GarbageCollector {
                 None => self.get_tree(trees, bucket_id, mode)?,
             };
             if let Some(tree) = tree {
-                tree.bucket.checkpoint_and_wait();
+                // a switch wipe requires a durable abort-clean rewrite
+                tree.bucket.checkpoint_and_wait(force_fsync);
+                #[cfg(feature = "failpoints")]
+                if force_fsync {
+                    crate::utils::failpoint::crash(
+                        "mace_recovery_abort_clean_stabilize_force_fsync",
+                    );
+                }
                 self.ctx
                     .opt
                     .observer
@@ -853,7 +928,10 @@ impl GarbageCollector {
         if wal_files.get(&file_id).is_some() {
             return Ok(());
         }
-        let path = self.ctx.opt.wal_file(task.group_id, file_id);
+        let path = self
+            .ctx
+            .opt
+            .physical_wal_path(task.physical_wal_id, file_id);
         if !self.ctx.opt.fs.try_exists(&path)? {
             return Err(OpCode::Corruption);
         }
@@ -1156,19 +1234,47 @@ impl GarbageCollector {
         txn.commit();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::obsolete_after_meta_commit_failpoint(kind));
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterMetaCommit,
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterMetaCommit,
+            },
+            bucket_id,
+            &self.store.opt.db_root,
+        );
 
-        // only ordinary obsolete reclaim publishes retired keys for flush races
         self.store
             .manifest
             .mark_retired_stats(kind, bucket_id, &unlinked);
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::obsolete_after_retired_mark_failpoint(kind));
-        self.store
-            .manifest
-            .stat_ctx(kind)
-            .remove_stat_interval(&unlinked);
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterRetiredMark,
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterRetiredMark,
+            },
+            bucket_id,
+            &self.store.opt.db_root,
+        );
+        self.store.manifest.remove_retired_stat_intervals(
+            kind,
+            bucket_id,
+            &unlinked,
+            &del_intervals.lo,
+        );
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::obsolete_after_remove_stat_failpoint(kind));
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterRuntimeRemove,
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterRuntimeRemove,
+            },
+            bucket_id,
+            &self.store.opt.db_root,
+        );
         self.store.manifest.save_obsolete_files(kind, &unlinked);
         self.store.manifest.delete_files();
         self.store
@@ -1255,31 +1361,50 @@ impl GarbageCollector {
             if !Self::should_run_rewrite_for_bucket(bucket_id, tgt_ratio, bucket_usage) {
                 continue;
             }
-            if let Some(p) = Self::select_rewrite_batch_for_bucket(ranked, tgt_size, eager) {
+            for p in Self::select_rewrite_batches_for_bucket(ranked, tgt_size, eager) {
                 plans.push((bucket_id, p));
             }
         }
         plans
     }
 
-    fn select_rewrite_batch_for_bucket(
+    fn select_rewrite_batches_for_bucket(
         ranked: Vec<Score>,
         tgt_size: usize,
         eager: bool,
-    ) -> Option<Vec<Score>> {
+    ) -> Vec<Vec<Score>> {
         let mut current = Vec::new();
         let mut current_size = 0usize;
+        let mut batches = Vec::new();
+        let target = tgt_size.max(1);
+
         for s in ranked {
+            // isolate an oversized victim so record-level packing can split it independently
+            if s.size >= target {
+                if eager && current.len() > 1 {
+                    batches.push(std::mem::take(&mut current));
+                    current_size = 0;
+                }
+                batches.push(vec![s]);
+                continue;
+            }
+
+            if eager && !current.is_empty() && current_size + s.size > target && current.len() > 1 {
+                batches.push(std::mem::take(&mut current));
+                current_size = 0;
+            }
             current_size += s.size;
             current.push(s);
-            if current_size >= tgt_size && current.len() > 1 {
-                return Some(current);
+            if current_size >= target && current.len() > 1 {
+                batches.push(std::mem::take(&mut current));
+                current_size = 0;
             }
         }
+
         if eager && current.len() > 1 {
-            return Some(current);
+            batches.push(current);
         }
-        None
+        batches
     }
 
     fn rank_candidates<T, F>(candidates: Vec<T>, tick_for_bucket: F) -> Vec<Score>
@@ -1340,34 +1465,24 @@ impl GarbageCollector {
         let Some(permit) = self.store.manifest.try_acquire_rewrite(bucket_id) else {
             return;
         };
-        let file_id = self.alloc_file_id();
         let tick = self
             .store
             .manifest
             .get_bucket_runtime(bucket_id)
             .next_update_epoch(kind);
-        // stage orphan intent before rewrite output is flushed
-        // crash can happen after file sync but before manifest commit
-        self.store.manifest.stage_orphan_file(kind, file_id);
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash(Self::rewrite_stage_marker_failpoint(kind));
-        let mut builder = RewriteBuilder::new(
-            file_id,
-            opt,
-            candidate.len(),
-            bucket_id,
-            tick,
-            permit.enable_compression,
-            permit.compressors.clone(),
-        );
-        let mut remap_intervals = Vec::with_capacity(candidate.len());
+        let mut items = Vec::new();
+        let mut remap_intervals = Vec::new();
         let mut del_intervals = DelInterval {
             lo: Vec::new(),
             bucket_id,
         };
         let mut obsoleted = Vec::new();
 
-        self.store.manifest.stat_ctx(kind).start_collect_junks(); // stop in update_stat_interval
+        let collect_ids: Vec<u64> = candidate.iter().map(|x| x.id).collect();
+        self.store
+            .manifest
+            .stat_ctx(kind)
+            .start_collect_junks(&collect_ids);
         let victims: Vec<u64> = candidate
             .iter()
             .filter_map(|x| {
@@ -1395,9 +1510,10 @@ impl GarbageCollector {
                     .iter()
                     .filter(|m| !bitmap.test(m.val.seq))
                     .map(|m| {
-                        im.test(m.key);
+                        let interval_lo = im.test(m.key);
                         Entry {
                             key: m.key,
+                            interval_lo,
                             raw_len: m.val.raw_len(),
                             compressed_len: m.val.compressed_len(),
                         }
@@ -1408,16 +1524,11 @@ impl GarbageCollector {
                     obsoleted.push(x.id);
                     return None;
                 }
-                im.collect(|unref, ivl| {
-                    let Interval { lo, hi } = ivl;
-                    if unref {
-                        del_intervals.push(lo);
-                    } else {
-                        remap_intervals.push(IntervalPair::new(lo, hi, file_id, bucket_id));
-                        builder.add_interval(lo, hi);
-                    }
+                im.collect(|_, ivl| {
+                    // every old interval is replaced with exact record intervals below
+                    del_intervals.push(ivl.lo);
                 });
-                builder.add_item(RewriteItem::new(x.id, x.up2, active));
+                items.push(RewriteItem::new(x.id, x.up2, active));
                 Some(x.id)
             })
             .collect();
@@ -1426,25 +1537,94 @@ impl GarbageCollector {
         // it's possible that another thread deactivated all live items while we were processing
         self.process_obsoleted_files(kind, &obsoleted, bucket_id);
 
-        let (mut fstat, relocs) = must_ok!(builder.build(kind));
-        fstat.inner.bucket_id = bucket_id;
+        let target = self.target_file_size(kind).max(1);
+        let chunks = split_rewrite_items(items, target, permit.enable_compression);
+        if chunks.is_empty() {
+            self.store.manifest.stat_ctx(kind).cancel_collect_junks();
+            return;
+        }
+
+        let mut fstats = Vec::with_capacity(chunks.len());
+        let mut output_ids = Vec::with_capacity(chunks.len());
+        let mut reloc_targets = HashMap::new();
+        for chunk in chunks {
+            let file_id = self.alloc_file_id();
+            // stage orphan intent before rewrite output is flushed
+            self.store.manifest.stage_orphan_file(kind, file_id);
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash(Self::rewrite_stage_marker_failpoint(kind));
+
+            let mut builder = RewriteBuilder::new(
+                file_id,
+                opt,
+                chunk.len(),
+                bucket_id,
+                tick,
+                permit.enable_compression,
+                permit.compressors.clone(),
+            );
+            for item in chunk {
+                let mut begin = 0;
+                while begin < item.pos.len() {
+                    let interval_lo = item.pos[begin].interval_lo;
+                    let mut end = begin + 1;
+                    while end < item.pos.len() && item.pos[end].interval_lo == interval_lo {
+                        end += 1;
+                    }
+                    let lo = item.pos[begin].key;
+                    let hi = item.pos[end - 1].key;
+                    remap_intervals.push(IntervalPair::new(lo, hi, file_id, bucket_id));
+                    builder.add_interval(lo, hi);
+                    begin = end;
+                }
+                builder.add_item(item);
+            }
+            let (mut fstat, relocs) = must_ok!(builder.build(kind));
+            fstat.inner.bucket_id = bucket_id;
+            for (key, reloc) in relocs {
+                must_true!(reloc_targets.insert(key, (file_id, reloc)).is_none());
+            }
+            fstats.push(fstat);
+            output_ids.push(file_id);
+        }
+
         self.store.opt.sync_data_dir();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::rewrite_after_dir_sync_failpoint(kind));
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_rewrite_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcRewriteSyncPoint::BeforeDataPublish,
+                FileKind::Blob => crate::testing::GcRewriteSyncPoint::BeforeBlobPublish,
+            },
+            bucket_id,
+            &opt.db_root,
+        );
 
         let mut txn = self.store.manifest.begin();
         txn.record(MetaKind::Sequences, self.store.manifest.sequences.deref());
 
-        let stat = self.store.manifest.update_stat_interval(
-            kind,
-            fstat,
-            relocs,
-            &victims,
-            &del_intervals,
-            &remap_intervals,
+        let (fstats, stats) =
+            self.store
+                .manifest
+                .prepare_stat_intervals(kind, fstats, reloc_targets);
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataRewritePublishing {
+                    output_count: fstats.len(),
+                },
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobRewritePublishing {
+                    output_count: fstats.len(),
+                },
+            },
+            bucket_id,
+            &opt.db_root,
         );
 
-        txn.record(Self::stat_meta_kind(kind), &stat);
+        for stat in &stats {
+            txn.record(Self::stat_meta_kind(kind), stat);
+        }
 
         if !del_intervals.is_empty() {
             txn.record(Self::delete_interval_meta_kind(kind), &del_intervals);
@@ -1454,14 +1634,24 @@ impl GarbageCollector {
         }
         let tmp: Delete = victims.into();
         txn.record(Self::delete_meta_kind(kind), &tmp);
-        self.store
-            .manifest
-            .clear_orphan_file(kind, &mut txn, file_id);
+        for &file_id in &output_ids {
+            self.store
+                .manifest
+                .clear_orphan_file(kind, &mut txn, file_id);
+        }
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::rewrite_before_meta_commit_failpoint(kind));
         txn.commit();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::rewrite_after_meta_commit_failpoint(kind));
+
+        self.store.manifest.publish_stat_intervals(
+            kind,
+            fstats,
+            &tmp,
+            &del_intervals,
+            &remap_intervals,
+        );
 
         self.store.manifest.save_obsolete_files(kind, &tmp);
         self.store.manifest.delete_files();
@@ -1482,7 +1672,7 @@ impl GarbageCollector {
             kind: Self::rewrite_complete_event(kind),
             bucket_id,
             txid: 0,
-            file_id,
+            file_id: output_ids[0],
             value: victim_count,
         });
     }
@@ -1535,7 +1725,7 @@ fn build_sorted_relocs(pending: &mut [PendingReloc]) -> (Vec<AddrPair>, HashMap<
 struct RewriteBuilder<'a> {
     file_id: u64,
     items: Vec<RewriteItem>,
-    intervals: Vec<u8>,
+    intervals: Vec<Interval>,
     nr_interval: u32,
     weighted_up2_sum: u128,
     weighted_up2_size: u128,
@@ -1579,8 +1769,7 @@ impl<'a> RewriteBuilder<'a> {
     }
 
     fn add_interval(&mut self, lo: u64, hi: u64) {
-        let ivl = Interval::new(lo, hi);
-        self.intervals.extend_from_slice(ivl.as_slice());
+        self.intervals.push(Interval::new(lo, hi));
         self.nr_interval += 1;
     }
 
@@ -1657,8 +1846,13 @@ impl<'a> RewriteBuilder<'a> {
             reloc.extend_from_slice(entry.as_slice());
         }
 
+        self.intervals.sort_unstable_by_key(|ivl| ivl.lo);
+        let mut intervals = Vec::with_capacity(self.intervals.len() * Interval::LEN);
+        for interval in &self.intervals {
+            intervals.extend_from_slice(interval.as_slice());
+        }
         let mut interval_crc = Crc32cHasher::default();
-        let is = self.intervals.as_slice();
+        let is = intervals.as_slice();
         interval_crc.write(is);
         writer.queue(is);
 
@@ -1710,6 +1904,56 @@ struct RewriteItem {
     pos: Vec<Entry>,
 }
 
+fn split_rewrite_items(
+    items: Vec<RewriteItem>,
+    target: usize,
+    enable_compression: bool,
+) -> Vec<Vec<RewriteItem>> {
+    let target = target.max(1);
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    let mut chunk_size = 0usize;
+
+    for item in items {
+        for entry in item.pos {
+            let record_size = if enable_compression && entry.compressed_len != 0 {
+                entry.compressed_len as usize
+            } else {
+                entry.raw_len as usize
+            };
+
+            if record_size >= target {
+                if !chunk.is_empty() {
+                    chunks.push(std::mem::take(&mut chunk));
+                    chunk_size = 0;
+                }
+                chunks.push(vec![RewriteItem::new(item.id, item.up2, vec![entry])]);
+                continue;
+            }
+
+            if chunk_size != 0 && chunk_size + record_size > target {
+                chunks.push(std::mem::take(&mut chunk));
+                chunk_size = 0;
+            }
+            chunk_size += record_size;
+            if let Some(last) = chunk.last_mut()
+                && last.id == item.id
+                && last.up2 == item.up2
+            {
+                last.live_bytes += entry.raw_len as usize;
+                last.pos.push(entry);
+            } else {
+                chunk.push(RewriteItem::new(item.id, item.up2, vec![entry]));
+            }
+        }
+    }
+
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
 impl RewriteItem {
     fn new(id: u64, up2: u64, pos: Vec<Entry>) -> Self {
         let live_bytes = pos.iter().map(|e| e.raw_len as usize).sum();
@@ -1725,6 +1969,8 @@ impl RewriteItem {
 struct Entry {
     /// logical address
     key: u64,
+    /// lower bound of the source interval containing this address
+    interval_lo: u64,
     /// decoded or stored bytes to read
     raw_len: u32,
     /// stored compressed length, 0 means raw
@@ -1748,19 +1994,21 @@ impl InactiveMap {
     }
 
     /// test if interval still has active addr, otherwise those interval will be collected and removed
-    fn test(&mut self, addr: u64) {
+    fn test(&mut self, addr: u64) -> u64 {
         let pos = match self.ivls.binary_search_by(|x| { x.lo }.cmp(&addr)) {
             Ok(pos) => pos,
             Err(pos) => {
                 if pos == 0 {
-                    return;
+                    unreachable!("active address must belong to an interval");
                 }
                 pos - 1
             }
         };
         must_true!(pos < self.ivls.len());
         must_true!(addr >= self.ivls[pos].lo);
+        must_true!(addr <= self.ivls[pos].hi);
         self.map[pos] = true;
+        self.ivls[pos].lo
     }
 
     fn collect<F>(&self, mut f: F)
@@ -2028,15 +2276,16 @@ fn rewrite_record<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AbortCleanChainBounds, Entry, PendingReloc, RewriteBuilder, RewriteItem,
-        build_sorted_relocs, consume_abort_clean_step, validate_abort_clean_link,
+        AbortCleanChainBounds, Entry, PendingReloc, RewriteBuilder, RewriteItem, Score,
+        build_sorted_relocs, consume_abort_clean_step, split_rewrite_items,
+        validate_abort_clean_link,
     };
     use crate::{
-        Options, RandomPath,
-        map::data::{FileVersion, MetaReader},
+        OpCode, Options, RandomPath,
+        map::data::{FileBuilder, FileVersion, MetaReader},
         meta::{FileKind, StatInner},
         types::{
-            header::{NodeType, TagKind},
+            header::{DeltaHeader, NodeType, TagKind},
             refbox::BoxRef,
             traits::IHeader,
         },
@@ -2054,19 +2303,19 @@ mod tests {
 
         assert_eq!(
             validate_abort_clean_link(bounds, cursor, cursor),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
         assert_eq!(
             validate_abort_clean_link(bounds, cursor, Position::new(4, 81)),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
         assert_eq!(
             validate_abort_clean_link(bounds, cursor, Position::new(2, 99)),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
         assert_eq!(
             validate_abort_clean_link(bounds, Position::new(5, 0), Position::new(4, 79)),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
         assert_eq!(
             validate_abort_clean_link(bounds, cursor, Position::new(4, 79)),
@@ -2078,7 +2327,7 @@ mod tests {
         assert_eq!(consume_abort_clean_step(&mut remaining), Ok(()));
         assert_eq!(
             consume_abort_clean_step(&mut remaining),
-            Err(crate::OpCode::Corruption)
+            Err(OpCode::Corruption)
         );
     }
 
@@ -2159,6 +2408,113 @@ mod tests {
         assert_eq!(data_score.up2, blob_score.up2);
     }
 
+    fn test_score(id: u64, size: usize) -> Score {
+        Score {
+            id,
+            size,
+            rate: 1.0,
+            up2: 0,
+            bucket_id: 0,
+        }
+    }
+
+    #[test]
+    fn rewrite_batches_split_eager_tail_near_target() {
+        let batches = super::GarbageCollector::select_rewrite_batches_for_bucket(
+            vec![
+                test_score(1, 40),
+                test_score(2, 40),
+                test_score(3, 40),
+                test_score(4, 40),
+            ],
+            100,
+            true,
+        );
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].iter().map(|x| x.size).sum::<usize>(), 80);
+        assert_eq!(batches[1].iter().map(|x| x.size).sum::<usize>(), 80);
+    }
+
+    #[test]
+    fn rewrite_batches_non_eager_wait_for_target() {
+        let batches = super::GarbageCollector::select_rewrite_batches_for_bucket(
+            vec![test_score(1, 40), test_score(2, 40), test_score(3, 40)],
+            100,
+            false,
+        );
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].iter().map(|x| x.size).sum::<usize>(), 120);
+    }
+
+    #[test]
+    fn rewrite_batches_non_eager_keeps_underfilled_batch_across_oversized_victim() {
+        let batches = super::GarbageCollector::select_rewrite_batches_for_bucket(
+            vec![
+                test_score(1, 40),
+                test_score(2, 40),
+                test_score(3, 150),
+                test_score(4, 40),
+            ],
+            100,
+            false,
+        );
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].iter().map(|x| x.id).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(
+            batches[1].iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+        assert_eq!(batches[1].iter().map(|x| x.size).sum::<usize>(), 120);
+    }
+
+    #[test]
+    fn rewrite_batches_keep_oversized_victim_alone() {
+        let batches = super::GarbageCollector::select_rewrite_batches_for_bucket(
+            vec![test_score(1, 150), test_score(2, 40), test_score(3, 40)],
+            100,
+            true,
+        );
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].iter().map(|x| x.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            batches[1].iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn oversized_rewrite_victim_is_split_by_records() {
+        let items = vec![RewriteItem::new(
+            7,
+            1,
+            vec![
+                Entry {
+                    key: 10,
+                    interval_lo: 10,
+                    raw_len: 60,
+                    compressed_len: 0,
+                },
+                Entry {
+                    key: 20,
+                    interval_lo: 10,
+                    raw_len: 60,
+                    compressed_len: 0,
+                },
+                Entry {
+                    key: 30,
+                    interval_lo: 10,
+                    raw_len: 150,
+                    compressed_len: 0,
+                },
+            ],
+        )];
+        let chunks = split_rewrite_items(items, 100, false);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].iter().map(|x| x.live_bytes).sum::<usize>(), 60);
+        assert_eq!(chunks[1].iter().map(|x| x.live_bytes).sum::<usize>(), 60);
+        assert_eq!(chunks[2].iter().map(|x| x.live_bytes).sum::<usize>(), 150);
+    }
+
     #[test]
     fn rewrite_builder_emits_v1() {
         let path = RandomPath::new();
@@ -2169,8 +2525,7 @@ mod tests {
 
         let [p, p1] = sample_pages();
         let mut file_id = INIT_ID;
-        let mut writer =
-            crate::map::data::FileBuilder::new(0, false, CompressorPool::new(), opt.fs.clone());
+        let mut writer = FileBuilder::new(0, false, CompressorPool::new(), opt.fs.clone());
         writer.add(p);
         writer.add(p1);
         let files = writer.flush_files(
@@ -2201,6 +2556,7 @@ mod tests {
             .iter()
             .map(|m| Entry {
                 key: m.key,
+                interval_lo: intervals[0].lo,
                 raw_len: m.val.raw_len(),
                 compressed_len: m.val.compressed_len(),
             })
@@ -2224,11 +2580,10 @@ mod tests {
         page.header_mut().pid = 1919810;
         page.header_mut().kind = TagKind::Delta;
         page.header_mut().node_type = NodeType::Leaf;
-        page.data_slice_mut::<u8>()[size_of::<crate::types::header::DeltaHeader>()..].fill(b'x');
+        page.data_slice_mut::<u8>()[size_of::<DeltaHeader>()..].fill(b'x');
 
         let mut file_id = INIT_ID;
-        let mut writer =
-            crate::map::data::FileBuilder::new(0, true, CompressorPool::new(), opt.fs.clone());
+        let mut writer = FileBuilder::new(0, true, CompressorPool::new(), opt.fs.clone());
         writer.add(page);
         let files = writer.flush_files(
             FileKind::Data,
@@ -2259,6 +2614,7 @@ mod tests {
             .iter()
             .map(|m| Entry {
                 key: m.key,
+                interval_lo: intervals[0].lo,
                 raw_len: m.val.raw_len(),
                 compressed_len: m.val.compressed_len(),
             })

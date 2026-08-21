@@ -39,6 +39,7 @@ pub struct FlushResult {
     pub kinds: [FlushKindResult; 2],
     pub writers: Vec<GatherWriter>,
     pub latest_chkpoint_lsn: MutRef<GroupPositions>,
+    force_fsync: bool,
 }
 
 impl FlushResult {
@@ -47,6 +48,7 @@ impl FlushResult {
         bucket_id: u64,
         map_table: PageTable,
         latest_chkpoint_lsn: MutRef<GroupPositions>,
+        force_fsync: bool,
     ) -> Self {
         Self {
             opt,
@@ -55,6 +57,7 @@ impl FlushResult {
             kinds: [FlushKindResult::default(), FlushKindResult::default()],
             writers: Vec::new(),
             latest_chkpoint_lsn,
+            force_fsync,
         }
     }
 
@@ -74,7 +77,8 @@ impl FlushResult {
 
     pub fn sync(&mut self) {
         let has_outputs = !self.writers.is_empty();
-        if self.opt.sync_on_write {
+        // exit checkpoints force a full fsync
+        if self.opt.sync_on_write || self.force_fsync {
             for mut x in self.writers.drain(..) {
                 x.sync();
             }
@@ -134,6 +138,7 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
             bucket_id,
             mapping,
             task.last_chkpt_lsn.clone(),
+            task.force_fsync,
         );
         result.kind_mut(FileKind::Data).junk = std::mem::take(&mut snapshot.data_junk);
         result.kind_mut(FileKind::Blob).junk = std::mem::take(&mut snapshot.blob_junk);
@@ -147,6 +152,7 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
         bucket_id,
         mapping,
         task.last_chkpt_lsn.clone(),
+        task.force_fsync,
     );
     result.kind_mut(FileKind::Data).junk = std::mem::take(&mut snapshot.data_junk);
     result.kind_mut(FileKind::Blob).junk = std::mem::take(&mut snapshot.blob_junk);
