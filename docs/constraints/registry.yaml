@@ -584,7 +584,7 @@ entries:
         note: gc_blob_delete_checkpoint_stays_deleted_without_gc and gc_blob_single_gc_run_stays_deleted_after_reopen verify deleted blob values do not resurrect without scavenge
       - type: regression-test
         path: tests/prod_gc.rs
-        note: oversized blob rewrite forces foreground consolidation before GC and verifies the durable junk set is rewritten into multiple outputs without reopen loss
+        note: oversized blob rewrite and stress_blob_cycle wait for a fresh checkpoint before GC, proving selection sees the durable junk set rather than an asynchronous checkpoint request
 
   - id: protocol.flush_junk_atomic_with_owner_durability
     title: junk retirement must be atomic with the durability of the owner page closure

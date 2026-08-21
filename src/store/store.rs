@@ -156,6 +156,11 @@ impl Bucket {
         self.inner.checkpoint(self.id());
     }
 
+    /// Flushes dirty pages in a fresh checkpoint and waits for it to finish
+    pub fn checkpoint_and_wait(&self) {
+        self.tree.bucket.checkpoint_and_wait(false);
+    }
+
     /// Returns the unique identifier of this bucket.
     pub fn id(&self) -> u64 {
         self.tree.bucket_id()

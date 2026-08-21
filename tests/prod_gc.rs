@@ -408,7 +408,7 @@ fn stress_blob_cycle() -> Result<(), OpCode> {
         txn.put(&key, &payload)?;
         txn.commit()?;
     }
-    bucket.checkpoint();
+    bucket.checkpoint_and_wait();
 
     let blob_root = bucket.options().data_root();
     let files_ready = wait_until(Duration::from_secs(6), Duration::from_millis(50), || {
@@ -424,7 +424,8 @@ fn stress_blob_cycle() -> Result<(), OpCode> {
     }
 
     drive_foreground_compaction(&bucket, &payload, &observer)?;
-    bucket.checkpoint();
+    // GC selects only manifest-published junk from a completed checkpoint.
+    bucket.checkpoint_and_wait();
 
     let before_gc = prefixed_files(&blob_root, Options::BLOB_PREFIX);
     assert!(!before_gc.is_empty(), "expected blob files before gc");
