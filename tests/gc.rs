@@ -3,6 +3,12 @@ use mace::observe::{CounterMetric, HistogramMetric, InMemoryObserver};
 use mace::testing;
 use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
+#[cfg(feature = "extra_check")]
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc::channel,
+};
 use std::time::{Duration, Instant};
 
 fn counter_value(observer: &InMemoryObserver, metric: CounterMetric) -> u64 {
@@ -13,6 +19,16 @@ fn counter_value(observer: &InMemoryObserver, metric: CounterMetric) -> u64 {
         .find(|(m, _)| *m == metric)
         .map(|(_, v)| *v)
         .unwrap_or(0)
+}
+
+#[cfg(feature = "extra_check")]
+struct HookReset;
+
+#[cfg(feature = "extra_check")]
+impl Drop for HookReset {
+    fn drop(&mut self) {
+        testing::clear_hooks();
+    }
 }
 
 #[cfg(feature = "extra_check")]
@@ -32,6 +48,7 @@ fn compressed_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen
 fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
     enable_compression: bool,
 ) -> Result<(), OpCode> {
+    let _hook_lock = testing::checkpoint_test_lock();
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
     opt.sync_on_write = true;
@@ -73,9 +90,11 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
     let v1 = make_blob(b'a');
     let v2 = make_blob(b'b');
     let v3 = make_blob(b'c');
+    let v4 = make_blob(b'd');
     let d1 = vec![b'x'; 512];
     let d2 = vec![b'y'; 512];
     let d3 = vec![b'z'; 512];
+    let d4 = vec![b'w'; 512];
 
     let tx = bucket.begin()?;
     for key in &blob_keys {
@@ -109,6 +128,41 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
     tx.commit()?;
     testing::checkpoint_and_wait(&bucket);
     testing::assert_persisted_gc_stats(&mace);
+
+    let tx = bucket.begin()?;
+    for key in &blob_keys {
+        tx.update(key, &v4)?;
+    }
+    for key in &data_keys {
+        tx.update(key, &d4)?;
+    }
+    tx.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+    testing::assert_persisted_gc_stats(&mace);
+
+    drop(bucket);
+    drop(mace);
+
+    let mut gc_opt = Options::new(&*path);
+    gc_opt.sync_on_write = true;
+    gc_opt.gc_timeout = 60_000;
+    gc_opt.gc_eager = true;
+    gc_opt.data_garbage_ratio = 1;
+    gc_opt.blob_garbage_ratio = 1;
+    gc_opt.data_file_size = 64 << 10;
+    gc_opt.blob_file_size = 64 << 10;
+    let mace = Mace::new(gc_opt.validate()?)?;
+    mace.disable_gc();
+    let bucket = mace.get_bucket("stats")?;
+    testing::assert_persisted_gc_stats(&mace);
+    let view = bucket.view()?;
+    for key in &blob_keys {
+        assert_eq!(view.get(key)?.slice(), v4.as_slice());
+    }
+    for key in &data_keys {
+        assert_eq!(view.get(key)?.slice(), d4.as_slice());
+    }
+    drop(view);
 
     mace.enable_gc();
     let data_gc_before = mace.data_gc_count();
@@ -144,27 +198,672 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
     let bucket = mace.get_bucket("stats")?;
     testing::assert_persisted_gc_stats(&mace);
     let view = bucket.view()?;
-    for (idx, key) in blob_keys.iter().enumerate() {
-        let expected = if idx % 4 == 0 {
-            &v3
-        } else if idx % 2 == 0 {
-            &v2
-        } else {
-            &v1
-        };
-        assert_eq!(view.get(key)?.slice(), expected.as_slice());
+    for key in &blob_keys {
+        assert_eq!(view.get(key)?.slice(), v4.as_slice());
     }
-    for (idx, key) in data_keys.iter().enumerate() {
-        let expected = if idx % 4 == 0 {
-            &d3
-        } else if idx % 2 == 0 {
-            &d2
-        } else {
-            &d1
-        };
-        assert_eq!(view.get(key)?.slice(), expected.as_slice());
+    for key in &data_keys {
+        assert_eq!(view.get(key)?.slice(), d4.as_slice());
     }
     mace.start_gc();
+    testing::assert_persisted_gc_stats(&mace);
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<(), OpCode> {
+    let _hook_lock = testing::checkpoint_test_lock();
+    let _hook_reset = HookReset;
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.concurrent_write = 1;
+    opt.sync_on_write = true;
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = false;
+    opt.data_garbage_ratio = 100;
+    opt.data_file_size = 256 << 10;
+    let mace = Mace::new(opt.validate()?)?;
+    mace.disable_gc();
+    let bucket = mace.new_bucket(
+        "rewrite_junk_handoff",
+        BucketOptions {
+            split_elems: 64,
+            consolidate_threshold: 8,
+            checkpoint_size: 256 << 10,
+            pool_capacity: 512 << 10,
+            enable_backpressure: false,
+            ..BucketOptions::default()
+        },
+    )?;
+    let keys = (0..256)
+        .map(|idx| format!("key_{idx:04}"))
+        .collect::<Vec<_>>();
+    let initial = vec![b'a'; 256];
+    let middle = vec![b'b'; 256];
+    let latest = vec![b'c'; 256];
+
+    let txn = bucket.begin()?;
+    for key in &keys {
+        txn.put(key, &initial)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+
+    let txn = bucket.begin()?;
+    for key in keys.iter().step_by(2) {
+        txn.update(key, &middle)?;
+    }
+    txn.commit()?;
+    drop(bucket);
+    drop(mace);
+
+    let mut rewrite = Options::new(&*path);
+    rewrite.concurrent_write = 1;
+    rewrite.sync_on_write = true;
+    rewrite.gc_timeout = 60_000;
+    rewrite.gc_eager = true;
+    rewrite.data_garbage_ratio = 1;
+    rewrite.data_file_size = 16 << 10;
+    let mace = Mace::new(rewrite.validate()?)?;
+    let bucket = mace.get_bucket("rewrite_junk_handoff")?;
+
+    let (ready_tx, ready_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let fired = Arc::new(AtomicBool::new(false));
+    let bucket_id = bucket.id();
+    let db_root = path.to_path_buf();
+    testing::set_gc_rewrite_hook(Some(Arc::new({
+        let fired = fired.clone();
+        let release_rx = release_rx.clone();
+        move |point, observed_bucket_id, observed_db_root| {
+            if point == testing::GcRewriteSyncPoint::BeforeDataPublish
+                && observed_bucket_id == bucket_id
+                && observed_db_root == db_root
+                && !fired.swap(true, Ordering::SeqCst)
+            {
+                ready_tx.send(()).expect("signal rewrite publish cut");
+                let _ = release_rx
+                    .lock()
+                    .expect("lock rewrite release receiver")
+                    .recv_timeout(Duration::from_secs(10));
+            }
+        }
+    })));
+
+    let before = mace.data_gc_count();
+    let gc_mace = mace.clone();
+    let gc_thread = std::thread::spawn(move || gc_mace.start_gc());
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("data rewrite must reach publish cut");
+
+    let txn = bucket.begin()?;
+    for key in &keys {
+        txn.update(key, &latest)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+    release_tx.send(()).expect("release data rewrite");
+    gc_thread.join().expect("data rewrite thread must finish");
+    assert!(mace.data_gc_count() > before, "data rewrite did not finish");
+    testing::checkpoint_and_wait(&bucket);
+    testing::assert_persisted_gc_stats(&mace);
+
+    let view = bucket.view()?;
+    for key in &keys {
+        assert_eq!(view.get(key)?.slice(), latest.as_slice());
+    }
+    drop(view);
+    drop(bucket);
+    drop(mace);
+
+    let mut reopen = Options::new(&*path);
+    reopen.concurrent_write = 1;
+    reopen.sync_on_write = true;
+    reopen.gc_timeout = 60_000;
+    reopen.gc_eager = true;
+    reopen.data_garbage_ratio = 1;
+    reopen.data_file_size = 16 << 10;
+    let mace = Mace::new(reopen.validate()?)?;
+    testing::assert_persisted_gc_stats(&mace);
+    let bucket = mace.get_bucket("rewrite_junk_handoff")?;
+    let view = bucket.view()?;
+    for key in &keys {
+        assert_eq!(view.get(key)?.slice(), latest.as_slice());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[derive(Clone, Copy, Debug)]
+enum TestFileKind {
+    Data,
+    Blob,
+}
+
+#[cfg(feature = "extra_check")]
+#[derive(Clone, Copy, Debug)]
+enum RetireCut {
+    MetaCommit,
+    RetiredMark,
+    RuntimeRemove,
+}
+
+#[cfg(feature = "extra_check")]
+fn retire_sync_point(kind: TestFileKind, cut: RetireCut) -> testing::GcStatSyncPoint {
+    use testing::GcStatSyncPoint::*;
+    match (kind, cut) {
+        (TestFileKind::Data, RetireCut::MetaCommit) => DataObsoleteAfterMetaCommit,
+        (TestFileKind::Data, RetireCut::RetiredMark) => DataObsoleteAfterRetiredMark,
+        (TestFileKind::Data, RetireCut::RuntimeRemove) => DataObsoleteAfterRuntimeRemove,
+        (TestFileKind::Blob, RetireCut::MetaCommit) => BlobObsoleteAfterMetaCommit,
+        (TestFileKind::Blob, RetireCut::RetiredMark) => BlobObsoleteAfterRetiredMark,
+        (TestFileKind::Blob, RetireCut::RuntimeRemove) => BlobObsoleteAfterRuntimeRemove,
+    }
+}
+
+#[cfg(feature = "extra_check")]
+fn conditional_stat_miss_metric(kind: TestFileKind) -> CounterMetric {
+    match kind {
+        TestFileKind::Data => CounterMetric::FlushConditionalDataStatPutMiss,
+        TestFileKind::Blob => CounterMetric::FlushConditionalBlobStatPutMiss,
+    }
+}
+
+#[cfg(feature = "extra_check")]
+#[derive(Clone, Copy, Debug)]
+enum CheckpointSchedule {
+    BeforeGc,
+    AfterGcCut,
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn lagging_checkpoint_cannot_resurrect_retired_stats_at_any_reclaim_cut() -> Result<(), OpCode> {
+    let _hook_lock = testing::checkpoint_test_lock();
+    let _hook_reset = HookReset;
+    for kind in [TestFileKind::Data, TestFileKind::Blob] {
+        let schedules = match kind {
+            TestFileKind::Data => [true, true],
+            TestFileKind::Blob => [false, true],
+        };
+        for (schedule, enabled) in [
+            (CheckpointSchedule::BeforeGc, schedules[0]),
+            (CheckpointSchedule::AfterGcCut, schedules[1]),
+        ] {
+            if !enabled {
+                continue;
+            }
+            for cut in [
+                RetireCut::MetaCommit,
+                RetireCut::RetiredMark,
+                RetireCut::RuntimeRemove,
+            ] {
+                run_lagging_checkpoint_retire_cut(kind, cut, schedule)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+fn run_lagging_checkpoint_retire_cut(
+    kind: TestFileKind,
+    cut: RetireCut,
+    schedule: CheckpointSchedule,
+) -> Result<(), OpCode> {
+    testing::clear_hooks();
+    let path = RandomPath::new();
+    let observer = Arc::new(InMemoryObserver::new(1024));
+    let mut opt = Options::new(&*path);
+    opt.concurrent_write = 1;
+    opt.sync_on_write = true;
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = true;
+    opt.data_garbage_ratio = 1;
+    opt.blob_garbage_ratio = 1;
+    opt.data_file_size = 256 << 10;
+    opt.blob_file_size = 256 << 10;
+    opt.observer = observer.clone();
+    let mace = Mace::new(opt.validate()?)?;
+    let bucket = mace.new_bucket(
+        "retire_cut",
+        BucketOptions {
+            inline_size: 1024,
+            split_elems: 32,
+            consolidate_threshold: 2,
+            checkpoint_size: 2 << 20,
+            pool_capacity: 4 << 20,
+            enable_backpressure: false,
+            ..BucketOptions::default()
+        },
+    )?;
+    let keys = (0..96)
+        .map(|idx| format!("key_{idx:04}"))
+        .collect::<Vec<_>>();
+    let value_len = match kind {
+        TestFileKind::Data => 512,
+        TestFileKind::Blob => 8 << 10,
+    };
+    let initial = vec![b'a'; value_len];
+
+    let txn = bucket.begin()?;
+    for key in &keys {
+        txn.put(key, &initial)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+
+    if matches!(kind, TestFileKind::Blob) {
+        let replacement = vec![b'b'; value_len];
+        let txn = bucket.begin()?;
+        for key in &keys {
+            txn.update(key, &replacement)?;
+        }
+        txn.commit()?;
+        testing::checkpoint_and_wait(&bucket);
+    }
+
+    let initial_checkpoint =
+        !(matches!(kind, TestFileKind::Blob) && matches!(schedule, CheckpointSchedule::AfterGcCut));
+
+    if matches!(kind, TestFileKind::Blob) {
+        for seed in [b'c', b'd'] {
+            let replacement = vec![seed; value_len];
+            let txn = bucket.begin()?;
+            for key in &keys {
+                txn.upsert(key, &replacement)?;
+            }
+            txn.commit()?;
+            testing::checkpoint_and_wait(&bucket);
+        }
+    }
+    let txn = bucket.begin()?;
+    for key in &keys {
+        txn.del(key)?;
+    }
+    txn.commit()?;
+    if !initial_checkpoint {
+        testing::checkpoint_and_wait(&bucket);
+    }
+
+    let (checkpoint_ready_tx, checkpoint_ready_rx) = channel();
+    let (checkpoint_release_tx, checkpoint_release_rx) = channel();
+    let checkpoint_release_rx = Arc::new(Mutex::new(checkpoint_release_rx));
+    let (gc_ready_tx, gc_ready_rx) = channel();
+    let (gc_release_tx, gc_release_rx) = channel();
+    let gc_release_rx = Arc::new(Mutex::new(gc_release_rx));
+    let checkpoint_fired = Arc::new(AtomicBool::new(false));
+    let gc_fired = Arc::new(AtomicBool::new(false));
+    let target = retire_sync_point(kind, cut);
+    let bucket_id = bucket.id();
+    let db_root = path.to_path_buf();
+    testing::set_gc_stat_hook(Some(Arc::new({
+        let checkpoint_fired = checkpoint_fired.clone();
+        let gc_fired = gc_fired.clone();
+        let checkpoint_release_rx = checkpoint_release_rx.clone();
+        let gc_release_rx = gc_release_rx.clone();
+        move |point, observed_bucket_id, observed_db_root| {
+            if observed_bucket_id != bucket_id || observed_db_root != db_root {
+                return;
+            }
+            if point == testing::GcStatSyncPoint::CheckpointBeforeManifestCommit
+                && !checkpoint_fired.swap(true, Ordering::SeqCst)
+            {
+                checkpoint_ready_tx
+                    .send(())
+                    .expect("signal lagging checkpoint");
+                let _ = checkpoint_release_rx
+                    .lock()
+                    .expect("lock checkpoint release receiver")
+                    .recv_timeout(Duration::from_secs(10));
+            }
+            if point == target && !gc_fired.swap(true, Ordering::SeqCst) {
+                gc_ready_tx.send(()).expect("signal reclaim cut");
+                let _ = gc_release_rx
+                    .lock()
+                    .expect("lock gc release receiver")
+                    .recv_timeout(Duration::from_secs(10));
+            }
+        }
+    })));
+
+    let miss_before = counter_value(&observer, conditional_stat_miss_metric(kind));
+    let checkpoint_thread = if initial_checkpoint {
+        let checkpoint_bucket = bucket.clone();
+        let thread = std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
+        checkpoint_ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("checkpoint must prepare the old stat update");
+        Some(thread)
+    } else {
+        None
+    };
+
+    let gc_mace = mace.clone();
+    let gc_loop_fired = gc_fired.clone();
+    let gc_thread = std::thread::spawn(move || {
+        while !gc_loop_fired.load(Ordering::Acquire) {
+            gc_mace.start_gc();
+        }
+    });
+    gc_ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|_| panic!("gc must reach {kind:?} {cut:?} ordinary reclaim cut"));
+
+    match schedule {
+        CheckpointSchedule::BeforeGc => {
+            checkpoint_release_tx
+                .send(())
+                .expect("release lagging checkpoint");
+            checkpoint_thread
+                .expect("pre-cut checkpoint thread must exist")
+                .join()
+                .expect("lagging checkpoint must finish");
+            assert!(
+                counter_value(&observer, conditional_stat_miss_metric(kind)) > miss_before,
+                "old stat update must miss after reclaim delete commits first"
+            );
+        }
+        CheckpointSchedule::AfterGcCut => {
+            if let Some(checkpoint_thread) = checkpoint_thread {
+                checkpoint_release_tx
+                    .send(())
+                    .expect("release pre-cut checkpoint");
+                checkpoint_thread
+                    .join()
+                    .expect("pre-cut checkpoint must finish");
+            }
+
+            let late_key = "late_checkpoint_key";
+            let late_value = vec![b'b'; value_len];
+            let txn = bucket.begin()?;
+            txn.upsert(late_key, &late_value)?;
+            txn.commit()?;
+            checkpoint_fired.store(false, Ordering::SeqCst);
+            let checkpoint_bucket = bucket.clone();
+            let checkpoint_thread =
+                std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
+            checkpoint_ready_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("post-cut checkpoint must reach manifest commit");
+            checkpoint_release_tx
+                .send(())
+                .expect("release post-cut checkpoint");
+            checkpoint_thread
+                .join()
+                .expect("post-cut checkpoint must finish");
+        }
+    }
+
+    gc_release_tx.send(()).expect("release ordinary reclaim");
+    gc_thread.join().expect("ordinary reclaim must finish");
+    testing::clear_gc_stat_hook();
+
+    testing::checkpoint_and_wait(&bucket);
+    mace.start_gc();
+    testing::assert_persisted_gc_stats(&mace);
+    let view = bucket.view()?;
+    for key in &keys {
+        assert!(
+            matches!(view.get(key), Err(OpCode::NotFound)),
+            "{kind:?} {schedule:?} key {key} must be deleted"
+        );
+    }
+    if matches!(schedule, CheckpointSchedule::AfterGcCut) {
+        assert_eq!(
+            view.get("late_checkpoint_key")?.slice(),
+            vec![b'b'; value_len]
+        );
+    }
+    drop(view);
+    drop(bucket);
+    drop(mace);
+
+    let mut reopen = Options::new(&*path);
+    reopen.concurrent_write = 1;
+    reopen.sync_on_write = true;
+    reopen.gc_timeout = 60_000;
+    reopen.gc_eager = true;
+    reopen.data_garbage_ratio = 1;
+    reopen.blob_garbage_ratio = 1;
+    reopen.data_file_size = 256 << 10;
+    reopen.blob_file_size = 256 << 10;
+    let mace = Mace::new(reopen.validate()?)?;
+    testing::assert_persisted_gc_stats(&mace);
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn publishing_checkpoint_reresolves_multi_output_data_owner() -> Result<(), OpCode> {
+    run_publishing_checkpoint_reresolves_owner(TestFileKind::Data, false)
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn compressed_blob_publishing_checkpoint_reresolves_multi_output_owner() -> Result<(), OpCode> {
+    run_publishing_checkpoint_reresolves_owner(TestFileKind::Blob, true)
+}
+
+#[cfg(feature = "extra_check")]
+fn run_publishing_checkpoint_reresolves_owner(
+    kind: TestFileKind,
+    enable_compression: bool,
+) -> Result<(), OpCode> {
+    let _hook_lock = testing::checkpoint_test_lock();
+    let _hook_reset = HookReset;
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.concurrent_write = 1;
+    opt.sync_on_write = true;
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = false;
+    opt.data_garbage_ratio = 100;
+    opt.blob_garbage_ratio = 100;
+    opt.data_file_size = 2 << 20;
+    opt.blob_file_size = 4 << 20;
+    let mace = Mace::new(opt.validate()?)?;
+    mace.disable_gc();
+    let bucket = mace.new_bucket(
+        "publishing_owner",
+        BucketOptions {
+            inline_size: 1024,
+            split_elems: 64,
+            consolidate_threshold: 8,
+            checkpoint_size: 4 << 20,
+            pool_capacity: 8 << 20,
+            enable_backpressure: false,
+            enable_compression,
+            ..BucketOptions::default()
+        },
+    )?;
+    let key_count = match kind {
+        TestFileKind::Data => 512,
+        TestFileKind::Blob => 96,
+    };
+    let value_len = match kind {
+        TestFileKind::Data => 512,
+        TestFileKind::Blob => 8 << 10,
+    };
+    let keys = (0..key_count)
+        .map(|idx| format!("key_{idx:04}"))
+        .collect::<Vec<_>>();
+    let make_value = |seed: u8| {
+        if matches!(kind, TestFileKind::Blob) && enable_compression {
+            let mut value = vec![0; value_len];
+            let half = value_len / 2;
+            let mut state = u32::from(seed);
+            for (idx, byte) in value[..half].iter_mut().enumerate() {
+                state = state
+                    .wrapping_mul(1_664_525)
+                    .wrapping_add(1_013_904_223u32.wrapping_add(idx as u32));
+                *byte = (state >> 24) as u8;
+            }
+            value.copy_within(..half, half);
+            value
+        } else {
+            vec![seed; value_len]
+        }
+    };
+    let initial = make_value(b'a');
+    let middle = make_value(b'b');
+    let latest = make_value(b'c');
+
+    let txn = bucket.begin()?;
+    for key in &keys {
+        txn.put(key, &initial)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+    let churn_rounds = match kind {
+        TestFileKind::Data => 1,
+        TestFileKind::Blob => 4,
+    };
+    for _ in 0..churn_rounds {
+        let txn = bucket.begin()?;
+        for key in keys.iter().step_by(2) {
+            txn.update(key, &middle)?;
+        }
+        txn.commit()?;
+        testing::checkpoint_and_wait(&bucket);
+    }
+    drop(bucket);
+    drop(mace);
+
+    let mut rewrite = Options::new(&*path);
+    rewrite.concurrent_write = 1;
+    rewrite.sync_on_write = true;
+    rewrite.gc_timeout = 60_000;
+    rewrite.gc_eager = true;
+    rewrite.data_garbage_ratio = match kind {
+        TestFileKind::Data => 1,
+        TestFileKind::Blob => 100,
+    };
+    rewrite.blob_garbage_ratio = match kind {
+        TestFileKind::Data => 100,
+        TestFileKind::Blob => 1,
+    };
+    rewrite.data_file_size = 16 << 10;
+    rewrite.blob_file_size = 16 << 10;
+    let mace = Mace::new(rewrite.validate()?)?;
+    let bucket = mace.get_bucket("publishing_owner")?;
+
+    let (publishing_tx, publishing_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let (wait_tx, wait_rx) = channel();
+    let publishing_fired = Arc::new(AtomicBool::new(false));
+    let wait_fired = Arc::new(AtomicBool::new(false));
+    let output_count = Arc::new(AtomicUsize::new(0));
+    let bucket_id = bucket.id();
+    let db_root = path.to_path_buf();
+    testing::set_gc_stat_hook(Some(Arc::new({
+        let publishing_fired = publishing_fired.clone();
+        let wait_fired = wait_fired.clone();
+        let output_count = output_count.clone();
+        let release_rx = release_rx.clone();
+        move |point, observed_bucket_id, observed_db_root| {
+            if observed_bucket_id != bucket_id || observed_db_root != db_root {
+                return;
+            }
+            let outputs = match (kind, point) {
+                (
+                    TestFileKind::Data,
+                    testing::GcStatSyncPoint::DataRewritePublishing { output_count },
+                ) => Some(output_count),
+                (
+                    TestFileKind::Blob,
+                    testing::GcStatSyncPoint::BlobRewritePublishing { output_count },
+                ) => Some(output_count),
+                _ => None,
+            };
+            if let Some(outputs) = outputs
+                && !publishing_fired.swap(true, Ordering::SeqCst)
+            {
+                output_count.store(outputs, Ordering::Release);
+                publishing_tx.send(()).expect("signal rewrite publishing");
+                let _ = release_rx
+                    .lock()
+                    .expect("lock rewrite release receiver")
+                    .recv_timeout(Duration::from_secs(10));
+                return;
+            }
+            let is_wait = matches!(
+                (kind, point),
+                (
+                    TestFileKind::Data,
+                    testing::GcStatSyncPoint::DataCheckpointPublishingWait
+                ) | (
+                    TestFileKind::Blob,
+                    testing::GcStatSyncPoint::BlobCheckpointPublishingWait
+                )
+            );
+            if is_wait && !wait_fired.swap(true, Ordering::SeqCst) {
+                wait_tx.send(()).expect("signal checkpoint publishing wait");
+            }
+        }
+    })));
+
+    let before = match kind {
+        TestFileKind::Data => mace.data_gc_count(),
+        TestFileKind::Blob => mace.blob_gc_count(),
+    };
+    let gc_mace = mace.clone();
+    let gc_thread = std::thread::spawn(move || gc_mace.start_gc());
+    publishing_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("rewrite must enter publishing");
+    assert!(
+        output_count.load(Ordering::Acquire) > 1,
+        "integration workload must produce multiple rewrite outputs"
+    );
+
+    let txn = bucket.begin()?;
+    for key in &keys {
+        txn.update(key, &latest)?;
+    }
+    txn.commit()?;
+    let checkpoint_bucket = bucket.clone();
+    let checkpoint_thread =
+        std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
+    wait_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("checkpoint must wait on publishing ownership");
+
+    release_tx.send(()).expect("release rewrite publishing");
+    gc_thread.join().expect("rewrite gc must finish");
+    checkpoint_thread
+        .join()
+        .expect("checkpoint must re-resolve replacement ownership");
+    testing::clear_gc_stat_hook();
+    let after = match kind {
+        TestFileKind::Data => mace.data_gc_count(),
+        TestFileKind::Blob => mace.blob_gc_count(),
+    };
+    assert!(after > before, "selected rewrite kind must finish");
+    testing::checkpoint_and_wait(&bucket);
+    mace.start_gc();
+    testing::assert_persisted_gc_stats(&mace);
+    let view = bucket.view()?;
+    for key in &keys {
+        assert_eq!(view.get(key)?.slice(), latest.as_slice());
+    }
+    drop(view);
+    drop(bucket);
+    drop(mace);
+
+    let mut reopen = Options::new(&*path);
+    reopen.concurrent_write = 1;
+    reopen.sync_on_write = true;
+    reopen.gc_timeout = 60_000;
+    reopen.gc_eager = true;
+    reopen.data_garbage_ratio = 1;
+    reopen.blob_garbage_ratio = 1;
+    reopen.data_file_size = 16 << 10;
+    reopen.blob_file_size = 16 << 10;
+    let mace = Mace::new(reopen.validate()?)?;
     testing::assert_persisted_gc_stats(&mace);
     Ok(())
 }

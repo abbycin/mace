@@ -55,6 +55,8 @@ gc_space_accounting_cases=(
   "prod_recovery_failpoints:chaos_failpoint_gc_data_rewrite_after_stage_marker:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_data_rewrite_after_data_dir_sync:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_data_rewrite_after_meta_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_rewrite_collecting_junk_before_meta_commit:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_rewrite_collecting_junk_after_meta_commit:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_blob_rewrite_before_meta_commit:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_blob_rewrite_after_stage_marker:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_blob_rewrite_after_data_dir_sync:crash"

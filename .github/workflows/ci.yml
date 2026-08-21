@@ -2,7 +2,7 @@ name: Cross-platform CI
 
 on:
   push:
-    branches: [ master, feat-0.1.2 ]
+    branches: [ master ]
   pull_request:
     branches: [ master ]
 

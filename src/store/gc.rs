@@ -1234,19 +1234,47 @@ impl GarbageCollector {
         txn.commit();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::obsolete_after_meta_commit_failpoint(kind));
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterMetaCommit,
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterMetaCommit,
+            },
+            bucket_id,
+            &self.store.opt.db_root,
+        );
 
-        // only ordinary obsolete reclaim publishes retired keys for flush races
         self.store
             .manifest
             .mark_retired_stats(kind, bucket_id, &unlinked);
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::obsolete_after_retired_mark_failpoint(kind));
-        self.store
-            .manifest
-            .stat_ctx(kind)
-            .remove_stat_interval(&unlinked);
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterRetiredMark,
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterRetiredMark,
+            },
+            bucket_id,
+            &self.store.opt.db_root,
+        );
+        self.store.manifest.remove_retired_stat_intervals(
+            kind,
+            bucket_id,
+            &unlinked,
+            &del_intervals.lo,
+        );
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::obsolete_after_remove_stat_failpoint(kind));
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterRuntimeRemove,
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterRuntimeRemove,
+            },
+            bucket_id,
+            &self.store.opt.db_root,
+        );
         self.store.manifest.save_obsolete_files(kind, &unlinked);
         self.store.manifest.delete_files();
         self.store
@@ -1450,7 +1478,11 @@ impl GarbageCollector {
         };
         let mut obsoleted = Vec::new();
 
-        self.store.manifest.stat_ctx(kind).start_collect_junks(); // stop in update_stat_interval
+        let collect_ids: Vec<u64> = candidate.iter().map(|x| x.id).collect();
+        self.store
+            .manifest
+            .stat_ctx(kind)
+            .start_collect_junks(&collect_ids);
         let victims: Vec<u64> = candidate
             .iter()
             .filter_map(|x| {
@@ -1508,6 +1540,7 @@ impl GarbageCollector {
         let target = self.target_file_size(kind).max(1);
         let chunks = split_rewrite_items(items, target, permit.enable_compression);
         if chunks.is_empty() {
+            self.store.manifest.stat_ctx(kind).cancel_collect_junks();
             return;
         }
 
@@ -1558,17 +1591,35 @@ impl GarbageCollector {
         self.store.opt.sync_data_dir();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::rewrite_after_dir_sync_failpoint(kind));
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_rewrite_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcRewriteSyncPoint::BeforeDataPublish,
+                FileKind::Blob => crate::testing::GcRewriteSyncPoint::BeforeBlobPublish,
+            },
+            bucket_id,
+            &opt.db_root,
+        );
 
         let mut txn = self.store.manifest.begin();
         txn.record(MetaKind::Sequences, self.store.manifest.sequences.deref());
 
-        let stats = self.store.manifest.update_stat_intervals(
-            kind,
-            fstats,
-            reloc_targets,
-            &victims,
-            &del_intervals,
-            &remap_intervals,
+        let (fstats, stats) =
+            self.store
+                .manifest
+                .prepare_stat_intervals(kind, fstats, reloc_targets);
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataRewritePublishing {
+                    output_count: fstats.len(),
+                },
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobRewritePublishing {
+                    output_count: fstats.len(),
+                },
+            },
+            bucket_id,
+            &opt.db_root,
         );
 
         for stat in &stats {
@@ -1593,6 +1644,14 @@ impl GarbageCollector {
         txn.commit();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::rewrite_after_meta_commit_failpoint(kind));
+
+        self.store.manifest.publish_stat_intervals(
+            kind,
+            fstats,
+            &tmp,
+            &del_intervals,
+            &remap_intervals,
+        );
 
         self.store.manifest.save_obsolete_files(kind, &tmp);
         self.store.manifest.delete_files();

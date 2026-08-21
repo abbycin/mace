@@ -15,30 +15,58 @@ impl IntervalMap {
     /// the range must not overlap
     pub fn insert(&mut self, lo: u64, hi: u64, val: u64) {
         #[cfg(feature = "extra_check")]
-        assert!(
-            self.find(lo).is_none(),
-            "interval overlap: lo={} hi={} val={} hit={:?}",
-            lo,
-            hi,
-            val,
-            self.find(lo)
-        );
+        self.assert_disjoint(lo, hi, val);
         self.map.insert(lo, (hi, val));
     }
 
     /// used by recovery only, because it's possible that same interval point to another val
     pub fn upsert(&mut self, lo: u64, hi: u64, val: u64) {
-        let e = self.map.entry(lo);
-        match e {
-            Entry::Vacant(v) => {
-                v.insert((hi, val));
-            }
-            Entry::Occupied(mut o) => {
-                let old = o.get_mut();
-                #[cfg(feature = "extra_check")]
-                assert_eq!(old.0, hi);
-                old.1 = val;
-            }
+        if let Some(old) = self.map.get_mut(&lo) {
+            #[cfg(feature = "extra_check")]
+            assert_eq!(old.0, hi);
+            old.1 = val;
+            return;
+        }
+
+        #[cfg(feature = "extra_check")]
+        self.assert_disjoint(lo, hi, val);
+        self.map.insert(lo, (hi, val));
+    }
+
+    #[cfg(feature = "extra_check")]
+    fn assert_disjoint(&self, lo: u64, hi: u64, val: u64) {
+        assert!(
+            lo <= hi,
+            "invalid interval: lo={} hi={} val={}",
+            lo,
+            hi,
+            val
+        );
+
+        if let Some((&prev_lo, &(prev_hi, prev_val))) = self.map.range(..=lo).next_back() {
+            assert!(
+                prev_hi < lo,
+                "interval overlaps predecessor: new=[{}, {}]=>{} prev=[{}, {}]=>{}",
+                lo,
+                hi,
+                val,
+                prev_lo,
+                prev_hi,
+                prev_val
+            );
+        }
+
+        if let Some((&next_lo, &(next_hi, next_val))) = self.map.range(lo..).next() {
+            assert!(
+                hi < next_lo,
+                "interval overlaps successor: new=[{}, {}]=>{} next=[{}, {}]=>{}",
+                lo,
+                hi,
+                val,
+                next_lo,
+                next_hi,
+                next_val
+            );
         }
     }
 
@@ -68,6 +96,11 @@ impl IntervalMap {
             return Some(*val);
         }
         None
+    }
+
+    #[cfg(feature = "extra_check")]
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        self.map.iter().map(|(&lo, &(hi, val))| (lo, hi, val))
     }
 
     #[allow(dead_code)]
@@ -130,6 +163,24 @@ mod test {
 
         let x = b.find(6436);
         assert_eq!(x, Some(5));
+    }
+
+    #[cfg(feature = "extra_check")]
+    #[test]
+    #[should_panic(expected = "interval overlaps successor")]
+    fn rejects_interval_containing_existing_range() {
+        let mut b = IntervalMap::new();
+        b.insert(100, 200, 1);
+        b.insert(0, 250, 2);
+    }
+
+    #[cfg(feature = "extra_check")]
+    #[test]
+    #[should_panic(expected = "interval overlaps successor")]
+    fn recovery_upsert_rejects_new_overlapping_range() {
+        let mut b = IntervalMap::new();
+        b.upsert(100, 200, 1);
+        b.upsert(0, 250, 2);
     }
 
     #[test]

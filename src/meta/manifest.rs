@@ -1028,15 +1028,23 @@ impl Manifest {
         self.stat_ctx(kind).add_stat_mem(stat);
     }
 
-    pub(crate) fn update_stat_intervals(
+    pub(crate) fn prepare_stat_intervals(
         &self,
         kind: FileKind,
         fstats: Vec<MemStat>,
         relocs: HashMap<u64, (u64, LenSeq)>,
+    ) -> (Vec<MemStat>, Vec<PersistStat>) {
+        self.stat_ctx(kind).prepare_stat_intervals(fstats, relocs)
+    }
+
+    pub(crate) fn publish_stat_intervals(
+        &self,
+        kind: FileKind,
+        fstats: Vec<MemStat>,
         obsoleted: &[u64],
         del_intervals: &[u64],
         remap_intervals: &[IntervalPair],
-    ) -> Vec<PersistStat> {
+    ) {
         if let Some(ctx) = self.buckets.buckets.get(&fstats[0].bucket_id) {
             let mut lk = stat_intervals(kind, ctx.value()).write();
             for &lo in del_intervals {
@@ -1049,7 +1057,23 @@ impl Manifest {
             }
         }
         self.stat_ctx(kind)
-            .update_stat_intervals(fstats, relocs, obsoleted)
+            .publish_stat_intervals(fstats, obsoleted);
+    }
+
+    pub(crate) fn remove_retired_stat_intervals(
+        &self,
+        kind: FileKind,
+        bucket_id: u64,
+        retired: &[u64],
+        del_intervals: &[u64],
+    ) {
+        if let Some(ctx) = self.buckets.buckets.get(&bucket_id) {
+            let mut lk = stat_intervals(kind, ctx.value()).write();
+            for &lo in del_intervals {
+                lk.remove(lo);
+            }
+        }
+        self.stat_ctx(kind).remove_stat_interval(retired);
     }
 
     pub(crate) fn apply_junks(

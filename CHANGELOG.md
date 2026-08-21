@@ -1,4 +1,4 @@
-## [0.1.2] 2026-08-20
+## [0.1.2] 2026-08-21
 ### Changes
 - Added a durable shared-WAL route for `sync_on_write = true`, with caller-led generation sync to combine concurrent commits into one durable cut
 - Added route-aware WAL recovery with separate per-group and shared-WAL namespaces
@@ -9,6 +9,7 @@
 
 ### Bug Fixes
 - Fixed data/blob garbage-stat persistence dropping inactive sequences from earlier checkpoints, which could make reopen classify durable junk as live and prevent GC space reclamation
+- Fixed checkpoint/GC races during data/blob file retirement and rewrite that could resurrect retired stats or retain unreachable payload space; preserved stat ownership and space accounting across concurrent checkpoint and crash recovery
 
 ## [0.1.1] 2026-08-18
 ### Bug Fixes

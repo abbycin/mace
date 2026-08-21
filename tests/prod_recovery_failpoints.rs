@@ -1248,6 +1248,56 @@ fn child_case_gc_data_before_meta_commit(db_root: &Path) -> ! {
     panic!("gc data failpoint did not fire")
 }
 
+#[cfg(feature = "extra_check")]
+fn child_case_gc_data_with_collecting_junk(db_root: &Path) -> ! {
+    prepare_oversized_data_gc_victim(db_root);
+    let (mace, bucket) = child_setup_data_gc(db_root);
+    let bucket_id = bucket.id();
+    let expected_root = db_root.to_path_buf();
+    let checkpoint_bucket = bucket.clone();
+    testing::set_gc_rewrite_hook(Some(Arc::new(
+        move |point, observed_bucket_id, observed_root| {
+            if point != testing::GcRewriteSyncPoint::BeforeDataPublish
+                || observed_bucket_id != bucket_id
+                || observed_root != expected_root
+            {
+                return;
+            }
+
+            // make addresses copied from the victim obsolete while the collector is collecting
+            let collected_before = testing::data_rewrite_collected_junk_count(&checkpoint_bucket);
+            let latest = vec![b'c'; 128];
+            let txn = checkpoint_bucket
+                .begin()
+                .expect("begin collecting-junk update failed");
+            for idx in 0..512 {
+                txn.upsert(format!("oversized_{idx:04}"), &latest)
+                    .expect("update collecting-junk key failed");
+            }
+            txn.commit().expect("commit collecting-junk update failed");
+            testing::checkpoint_and_wait(&checkpoint_bucket);
+            let collected_after = testing::data_rewrite_collected_junk_count(&checkpoint_bucket);
+            assert!(
+                collected_after > collected_before,
+                "checkpoint must collect junk owned by the current rewrite victims"
+            );
+        },
+    )));
+
+    seed_committed_and_uncommitted(&bucket, 64, 0);
+    drive_gc_pressure(&bucket, 256);
+    mace.sync().expect("sync before collecting-junk gc failed");
+    wait_for_data_dir_quiet(db_root, Duration::from_millis(300), Duration::from_secs(20));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        mace.start_gc();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!("collecting-junk gc failpoint did not fire")
+}
+
 fn child_case_gc_blob_before_meta_commit(db_root: &Path) -> ! {
     let (mace, bucket) = child_setup_gc(db_root);
 
@@ -1474,6 +1524,14 @@ fn failpoint_child() {
         "gc_data_rewrite_after_stage_marker" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_data_dir_sync" => child_case_gc_data_before_meta_commit(&db_root),
         "gc_data_rewrite_after_meta_commit" => child_case_gc_data_before_meta_commit(&db_root),
+        #[cfg(feature = "extra_check")]
+        "gc_data_rewrite_collecting_junk_before_meta_commit" => {
+            child_case_gc_data_with_collecting_junk(&db_root)
+        }
+        #[cfg(feature = "extra_check")]
+        "gc_data_rewrite_collecting_junk_after_meta_commit" => {
+            child_case_gc_data_with_collecting_junk(&db_root)
+        }
         "gc_blob_rewrite_before_meta_commit" => child_case_gc_blob_before_meta_commit(&db_root),
         "gc_blob_rewrite_after_stage_marker" => child_case_gc_blob_before_meta_commit(&db_root),
         "gc_blob_rewrite_after_data_dir_sync" => child_case_gc_blob_before_meta_commit(&db_root),
@@ -2215,6 +2273,57 @@ fn chaos_failpoint_gc_data_rewrite_after_meta_commit() {
     );
     assert_child_aborted(status, "gc-data-after-meta failpoint child should abort");
     assert_bucket_readable(&path);
+}
+
+#[cfg(feature = "extra_check")]
+fn assert_collecting_junk_after_reopen(db_root: &Path) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = true;
+    });
+    testing::assert_persisted_gc_stats(&mace);
+    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let view = bucket.view().expect("open collecting-junk view failed");
+    let latest = vec![b'c'; 128];
+    for idx in 0..512 {
+        let key = format!("oversized_{idx:04}");
+        let val = view.get(&key).expect("collecting-junk key missing");
+        assert_eq!(val.slice(), latest.as_slice());
+    }
+    drop(view);
+    for _ in 0..4 {
+        mace.start_gc();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    testing::assert_persisted_gc_stats(&mace);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "extra_check")]
+fn chaos_failpoint_gc_data_rewrite_collecting_junk_before_meta_commit() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "gc_data_rewrite_collecting_junk_before_meta_commit",
+        &path,
+        "mace_gc_data_rewrite_before_meta_commit=abort@1",
+    );
+    assert_child_aborted(status, "collecting-junk-before-meta child should abort");
+    assert_collecting_junk_after_reopen(&path);
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "extra_check")]
+fn chaos_failpoint_gc_data_rewrite_collecting_junk_after_meta_commit() {
+    let path = RandomPath::new();
+    let status = spawn_child(
+        "gc_data_rewrite_collecting_junk_after_meta_commit",
+        &path,
+        "mace_gc_data_rewrite_after_meta_commit=abort@1",
+    );
+    assert_child_aborted(status, "collecting-junk-after-meta child should abort");
+    assert_collecting_junk_after_reopen(&path);
 }
 
 #[test]

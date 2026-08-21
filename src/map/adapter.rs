@@ -235,6 +235,12 @@ impl ManifestCheckpointObserver {
         if let Err(e) = crate::utils::failpoint::check("mace_flush_before_manifest_commit") {
             Self::abort_flush_publish("before manifest commit", e);
         }
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            crate::testing::GcStatSyncPoint::CheckpointBeforeManifestCommit,
+            bucket_id,
+            &self.ctx.opt.db_root,
+        );
         txn.commit();
         self.manifest.clear_retired_stat_keys(retired_stat_snapshot);
         for kind in FileKind::ALL {

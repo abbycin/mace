@@ -384,7 +384,7 @@ entries:
         note: rewrite/remap intervals are produced here
     witnesses:
       - path: src/utils/interval.rs
-        note: extra_check asserts reject overlap on insert and constrain upsert to recovery semantics
+        note: extra_check checks both predecessor and successor ranges on insert, and checks new recovery upsert keys; same-key upsert remains limited to recovery replacement
       - path: src/store/store.rs
         note: publish path records interval metadata and updates in-memory interval state together
       - path: src/store/gc.rs
@@ -396,7 +396,7 @@ entries:
     verifiers:
       - type: unit-test
         path: src/utils/interval.rs
-        note: moha and merge_split cover overlap rejection and find behavior
+        note: moha and merge_split cover overlap rejection and find behavior; containment-overlap and recovery-upsert tests cover the opposite overlap direction
       - type: runtime-assert
         path: src/utils/interval.rs
         note: insert asserts no overlap under extra_check
@@ -408,7 +408,7 @@ entries:
     title: every mapped address in a published flush batch must resolve through reloc metadata
     kind: protocol
     status: active
-    confidence: high
+    confidence: medium
     statement: >
       For any logical address exposed by the published map and interval metadata for a flush batch,
       relocation lookup must succeed. `ivl_map.find(addr)` and reloc lookup must jointly remain valid
@@ -442,7 +442,7 @@ entries:
     verifiers:
       - type: unit-test
         path: src/map/data.rs
-        note: flush metadata test asserts interval and reloc completeness for flushed addrs
+        note: data_dump_load asserts file-builder interval and relocation entries for every sample page; published map-to-reloc coverage remains integration-level
       - type: runtime-assert
         path: src/meta/stat.rs
         note: read/stat paths panic when reloc completeness is violated
@@ -454,7 +454,7 @@ entries:
     title: checkpoint snapshot must flush only the current live dirty set
     kind: emergent
     status: active
-    confidence: high
+    confidence: medium
     statement: >
       Checkpoint snapshot may flush only pages reachable from the dirty-root live graph that are not
       already durable. For `addr > snap_addr`, disappearing from both sealed and hot generations is an
@@ -478,6 +478,9 @@ entries:
       - checkpoint flushes stale or unreachable pages as if they were live
       - readers observe a page as neither hot nor sealed during churn
     verifiers:
+      - type: regression-test
+        path: tests/junk_reachability.rs
+        note: checkpoint_cut_keeps_post_cut_writer_visible proves a writer after the epoch cut is carried by the next checkpoint instead of disappearing from both generations
       - type: runtime-assert
         path: src/map/data.rs
         note: extra_check asserts on disappearing live addrs above snap_addr
@@ -489,7 +492,7 @@ entries:
     title: checkpoint epoch cut must atomically rotate writable and sealed generations
     kind: protocol
     status: active
-    confidence: high
+    confidence: medium
     statement: >
       Starting a checkpoint must atomically swap hot generations, publish sealed generations, and
       rotate writer root and inflight slots under one cut. Writers must not straddle that cut, and
@@ -509,6 +512,9 @@ entries:
       - checkpoint finish panics because sealed generations are still shared
       - dirty roots or inflight state leak across checkpoint boundaries
     verifiers:
+      - type: regression-test
+        path: tests/junk_reachability.rs
+        note: checkpoint_cut_keeps_post_cut_writer_visible pauses after the cut, commits a new hot-generation writer, then requires a second checkpoint and reopen to retain it
       - type: runtime-assert
         path: src/map/data.rs
         note: sealed generation uniqueness is asserted with Arc::try_unwrap
@@ -555,6 +561,8 @@ entries:
         note: lagging-view regression guard exercises split, consolidate, and checkpoint churn
       - path: src/store/gc.rs
         note: GC file reclaim and rewrite operate from durable manifest stats and no longer perform loaded-page stabilization
+      - path: src/meta/manifest.rs
+        note: ordinary obsolete reclaim removes the retired file's in-memory interval and stat while ownership remains published
       - path: tests/gc.rs
         note: checkpoint-only and single-GC reopen regressions keep deleted blob values from resurrecting without a scavenge phase
     failure_symptoms:
@@ -604,7 +612,7 @@ entries:
       - path: src/map/data.rs
         note: checkpoint emits logically unique junk output only after live graph traversal
       - path: src/meta/stat.rs
-        note: multi-output rewrite applies concurrent junk to the owning output stat before all output stats and interval replacements publish together
+        note: the collecting-to-publishing handoff transfers concurrent junk to the owning output stat before all output stats and interval replacements publish together
     failure_symptoms:
       - durable page images reference an owner closure whose junk retirement is missing
       - GC or publish resurrects or double-retires addresses because junk retirement crossed an invalid boundary
@@ -619,6 +627,108 @@ entries:
       - type: regression-test
         path: tests/prod_gc.rs
         note: oversized data and blob rewrites verify multi-output interval, stat, and reloc state survives reopen
+
+  - id: protocol.stat_retirement_and_rewrite_junk_handoff
+    title: retired stat ownership and rewrite junk transfer must remain gap-free without a handoff lock
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Old-file junk accounting has two distinct ownership transitions. Ordinary fully-obsolete
+      reclaim must first commit the durable stat and interval deletion, then publish the file in the
+      process-local retired set, then remove the runtime interval and stat. Checkpoint may skip that
+      file only after retired ownership is visible, and may clear only the per-bucket retired snapshot
+      captured by a checkpoint whose manifest commit completed. A checkpoint old-stat delta built
+      before retirement must use conditional update: checkpoint-first is followed by reclaim delete,
+      while reclaim-first makes the late update miss rather than recreate the stat. Rewrite victims
+      must never use the retired skip rule. Before reading candidate bitmaps, rewrite registers the
+      exact selected candidate IDs in the existing per-kind junk collector; candidates that become
+      fully obsolete use ordinary reclaim, and queued addresses without replacement relocations are
+      discarded. Checkpoint updates during `collecting` update the old stat and enqueue each victim
+      address as one action under the collector mutex. After replacement relocs are complete, rewrite
+      changes `collecting` to `publishing`, freezes the queue, and marks each copied address inactive
+      in its replacement stat. A checkpoint that observes `publishing` must not change the old stat or
+      aggregate accounting; it waits for the durable rewrite commit and runtime interval/stat switch,
+      then resolves the address again and applies it to the new owner. A conditional old-stat delta
+      already built during `collecting` must miss if rewrite deletes the victim first. Rewrite
+      publishes durable replacement stats, intervals, victim deletion, and orphan cleanup atomically
+      before switching runtime intervals/stats and returning the collector to `idle`; an empty-output
+      rewrite cancels collection. The protocol must use the collector's existing mutex and atomic
+      state and must not add an independent handoff lock.
+    watch_points:
+      - path: src/meta/stat.rs
+        note: JunkCollector states, apply_junks retry, collected-junk transfer, and replacement stat installation define runtime ownership
+      - path: src/meta/manifest.rs
+        note: ordinary interval/stat removal and rewrite prepare/publish split define the runtime publication order
+      - path: src/store/gc.rs
+        note: fully-obsolete durable-delete/retire/remove order and rewrite register/build/commit/publish/cancel order live here
+      - path: src/map/adapter.rs
+        note: checkpoint old-stat apply, retired filtering, conditional update, and retired-snapshot clearing live here
+      - path: src/meta/txn.rs
+        note: conditional stat update-on-miss semantics prevent a late checkpoint delta from recreating a reclaimed or rewritten victim
+      - path: src/testing.rs
+        note: db-root-scoped extra_check sync points expose ordinary reclaim and rewrite ownership cuts without cross-store interference, and the physical oracle checks runtime aggregates
+      - path: tests/gc.rs
+        note: deterministic checkpoint-versus-rewrite handoff and physical space-accounting verification live here
+      - path: tests/prod_recovery_failpoints.rs
+        note: ordinary reclaim and rewrite crash cuts verify durable ownership survives restart
+      - path: scripts/prod_test.sh
+        note: the production space-accounting matrix keeps ordinary, rewrite, and concurrent-junk crash verifiers in the required gate
+    witnesses:
+      - path: src/store/gc.rs
+        note: process_obsoleted_files commits deletion before mark_retired_stats and remove_retired_stat_intervals; rewrite_files registers victims before bitmap reads and commits metadata before runtime publish
+      - path: src/meta/stat.rs
+        note: JunkCollector serializes state classification with old-stat mutation using its existing mutex, apply_collected_junks transfers copied junk, publishing retries re-resolve ownership, and replacement installation preserves inactive masks
+      - path: src/meta/manifest.rs
+        note: remove_retired_stat_intervals removes interval and stat together while prepare_stat_intervals and publish_stat_intervals keep durable and runtime rewrite publication ordered
+      - path: src/meta/txn.rs
+        note: checkpoint old-stat writes are conditional updates, so a rewrite or reclaim delete that commits first cannot recreate the victim stat
+      - path: src/map/adapter.rs
+        note: checkpoint filters currently retired ordinary files and clears only its pre-commit retired snapshot after successful manifest commit
+      - path: docs/design.md
+        note: sections 10.4 and 16.2 define the separate ordinary-retirement and rewrite-transfer timelines
+    failure_symptoms:
+      - a stale runtime interval resolves to a stat already removed by fully-obsolete reclaim and checkpoint fails with NotFound or later GC opens a deleted payload file
+      - checkpoint skips a rewrite victim address that was copied into a replacement, leaving unreachable bytes permanently active and unselectable by later GC
+      - a replacement stat loses a collected inactive sequence or is installed as if active bytes still equal total bytes
+      - a publishing retry decrements aggregate active bytes once for the old owner and again for the replacement owner
+      - a checkpoint old-stat delta inserts after reclaim or rewrite deletion and durably resurrects the victim stat
+      - runtime intervals or stats switch before rewrite metadata commit and readers observe half-published ownership
+      - collector remains collecting or publishing after an empty or completed rewrite and a later checkpoint spins or captures junk for the wrong round
+    verifiers:
+      - type: unit-test
+        path: src/meta/stat.rs
+        note: rewrite_junk_collector_registers_victims_and_closes_publish_cut fixes registration, publishing, idle, cancellation, and the rule that publishing defers without changing stat accounting
+      - type: unit-test
+        path: src/meta/stat.rs
+        note: collected_rewrite_junk_is_applied_once_to_each_output_stat fixes copied-address transfer and duplicate handling
+      - type: integration-test
+        path: tests/gc.rs
+        note: checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats pauses rewrite after output build, commits checkpoint junk during collection, then checks exact physical accounting before and after reopen
+      - type: integration-test
+        path: tests/gc.rs
+        note: lagging_checkpoint_cannot_resurrect_retired_stats_at_any_reclaim_cut covers all three durable-delete/retired/runtime cuts with checkpoints both before and after the cut for data, and after every cut for blob; the pre-cut cases require the late conditional stat update to miss
+      - type: integration-test
+        path: tests/gc.rs
+        note: publishing checkpoint data/blob tests prove wait-and-reresolve against multiple outputs, compressed blob ownership, exact physical accounting, runtime aggregate equality, and reopen
+      - type: integration-test
+        path: tests/gc.rs
+        note: persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen and its compressed variant check exact physical accounting across ordinary reclaim, rewrite, and reopen
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: data/blob obsolete-reclaim cuts after durable delete, retired publication, and runtime removal verify restart correctness at every ordinary-retirement boundary
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: data/blob rewrite cuts before and after manifest commit verify recovery across the durable replacement ownership boundary
+      - type: failpoint-test
+        path: tests/prod_recovery_failpoints.rs
+        note: collecting-junk data rewrite cuts require the checkpoint to grow the current victim collector queue, crash before and after manifest commit, then verify latest-value visibility and exact physical accounting after reopen
+      - type: fuzz-regression
+        path: fuzz/fuzz_targets/publish_gc_reopen.rs
+        note: publish_gc_reopen exercises lagging-view checkpoint, fully-obsolete reclaim, rewrite, and reopen lifecycle combinations
+      - type: production-oracle
+        path: src/testing.rs
+        note: assert_persisted_gc_stats rejects retained unreachable relocations, missing durable stats or intervals, runtime/durable interval or aggregate drift, runtime intervals without stats, and incomplete obsolete/orphan cleanup
 
   - id: protocol.persist_stat_inactive_bitmap_monotonic
     title: persisted inactive bitmap must retain every prior junk sequence
@@ -658,6 +768,7 @@ entries:
     failure_symptoms:
       - a later checkpoint drops old inactive sequences and a reopen treats durable junk as active
       - a retained stat bitmap load fails and the checkpoint silently confirms without recording its junk
+      - a stale in-memory interval resolves to a stat already removed by GC and aborts checkpoint publish
       - data or blob GC stops selecting files that still contain physically reclaimable garbage
       - repeated GC rounds retain substantially more disk space than the durable reachable set
     verifiers:
@@ -670,6 +781,9 @@ entries:
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
         note: stat-mask lazy-load crash proves recovery keeps the last complete metadata state
+      - type: fuzz-regression
+        path: fuzz/fuzz_targets/publish_gc_reopen.rs
+        note: publish_gc_reopen covers lagging-view checkpoint and fully-obsolete reclaim/reopen handoff churn
 
   - id: protocol.persist_stat_matches_payload_relocations
     title: GC space accounting must exactly match retained data/blob payloads
@@ -821,8 +935,8 @@ entries:
   - id: protocol.map_and_frontier_publish_atomicity
     title: map metadata and bucket frontier must publish in the same manifest transaction
     kind: protocol
-    status: active
-    confidence: high
+    status: suspect
+    confidence: medium
     statement: >
       Page map, interval/stat metadata, bucket frontier, and related Sequences for a flush round must
       publish atomically in one manifest transaction. Crash after commit must leave a consistent
@@ -850,10 +964,10 @@ entries:
     verifiers:
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
-        note: manifest crash windows validate atomicity around multi-bucket commit
+        note: manifest-before-multi-commit crash windows validate the pre-commit boundary; they do not prove backend behavior after a partial exec_multi write
       - type: evidence-gap
         path: src/meta/txn.rs
-        note: backend multi-bucket atomicity still depends on btree-store contract and should keep being audited
+        note: backend multi-bucket atomicity still depends on the btree-store contract; no dedicated adapter/backend contract test exists
 
   - id: protocol.recovery_gate_uses_bucket_frontier
     title: recovery must gate redo by bucket durable frontier instead of group checkpoint alone
@@ -918,7 +1032,7 @@ entries:
       - path: src/store/gc.rs
         note: abort-clean follows Update prev links here
       - path: docs/design.md
-        note: Recovery describes the required validation order here
+        note: Recovery describes the current record-validation and tail-handling flow here
       - path: tests/gc.rs
         note: abort-clean corruption retention coverage lives here
       - path: src/store/recovery.rs
@@ -973,7 +1087,7 @@ entries:
       - path: src/store/gc.rs
         note: abort-clean load mode, retirement, and steady-state no-reload semantics live here
       - path: docs/design.md
-        note: Abort-Clean state order, visibility, and quiescence semantics are specified here
+        note: Abort-Clean describes the current rewrite, durability, visibility, and quiescence flow here
       - path: src/store/recovery.rs
         note: recovery reconstructs and drains abort-clean, then unloads any buckets it loaded before startup returns
       - path: src/store/store.rs
@@ -1028,7 +1142,7 @@ entries:
       - path: src/store/gc.rs
         note: abort-clean range scan, checked budget, link validation, and corruption retention live here
       - path: docs/design.md
-        note: retained-range and finite-chain requirements are specified in the Abort-Clean design rules
+        note: Abort-Clean describes the current retained-range and finite-chain traversal here
       - path: src/cc/context.rs
         note: task pin and abort-fact ownership remain published until explicit removal here
       - path: src/cc/wal.rs
@@ -1154,7 +1268,7 @@ entries:
     title: the collector must not run before recovery establishes the oracle/safe waterline
     kind: protocol
     status: active
-    confidence: high
+    confidence: medium
     statement: >
       The collector thread must not start before recovery phase2 has stored the
       recovered oracle and published the initial safe_exclusive waterline
@@ -1188,7 +1302,7 @@ entries:
         note: phase2 (recovery) runs before store.start to Context::start (collector spawn)
       - type: regression-test
         path: src/cc/context.rs
-        note: quit_waits_for_inflight_then_joins_collector exercises the start-spawn-join lifecycle
+        note: quit_waits_for_inflight_then_joins_collector exercises the start-spawn-join lifecycle; it does not independently schedule collector startup against phase2
   - id: protocol.snapshot_registration_cut_covers_every_live_reader
     title: collector cut must include every live writer and reader before publishing a safe snapshot boundary
     kind: protocol
@@ -1907,7 +2021,7 @@ entries:
         path: src/map/flush.rs
         note: FlushResult::sync branches on force_fsync to fsync; the fsync-vs-fdatasync distinction is enforced by code review, not by the behavior test
   - id: protocol.wal_format_upgrade_requires_wal_independent_exit
-    title: graceful exit must leave the store WAL-independent so WAL format upgrades are safe
+    title: graceful exit must leave the store WAL-independent with committed-only visibility
     kind: protocol
     status: active
     confidence: high
@@ -1949,7 +2063,7 @@ entries:
     title: transaction admission never races with shutdown in the public API
     kind: protocol
     status: active
-    confidence: high
+    confidence: medium
     statement: >
       The public API offers no path where transaction or view admission can run
       concurrently with shutdown. Store::quit is reachable only from Inner::drop,
@@ -1978,7 +2092,7 @@ entries:
         note: quit is reachable only from Inner::drop (last handle); no public close/quit API exists
       - type: regression-test
         path: src/cc/context.rs
-        note: quit_waits_for_inflight_then_joins_collector proves the in-flight drain and collector join
+        note: quit_waits_for_inflight_then_joins_collector proves the in-flight drain and collector join; admission exclusion is established primarily by the public API/drop topology
 
   - id: dependency.manifest_conditional_update_semantics
     title: manifest stat apply depends on btree-store conditional update and atomic multi-bucket commit
@@ -2015,14 +2129,16 @@ entries:
       - recovery or GC observes metadata that crossed an invalid durability boundary
       - upgrading btree-store changes semantics without any local compile error
     verifiers:
+      - type: integration-test
+        path: tests/gc.rs
+        note: lagging_checkpoint_cannot_resurrect_retired_stats_at_any_reclaim_cut observes the conditional-update miss and proves the deleted stat is not recreated
       - type: failpoint-partial
         path: tests/prod_recovery_failpoints.rs
         note: manifest_before_multi_commit exercises atomicity under crash timing, but not the full contract
       - type: evidence-gap
         path: src/meta/txn.rs
-        note: there is no dedicated contract test today for update-on-miss or exec_multi semantics
+        note: update-on-miss is covered through the manifest adapter, but there is no dedicated backend contract test for full exec_multi atomicity
     next_actions:
-      - add a narrow contract test that proves update-on-miss returns false without inserting
       - add a meta-store adapter boundary so dependency semantics are audited in one place
 
   - id: protocol.transaction_checkpoint_span_follows_group_counter

@@ -11,7 +11,7 @@ use std::{
     sync::{
         Arc,
         atomic::{
-            AtomicBool, AtomicU64,
+            AtomicU8, AtomicU64,
             Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
         },
     },
@@ -71,14 +71,30 @@ impl StatCtx {
         self.common.cache.del(file_id);
     }
 
-    pub(crate) fn start_collect_junks(&self) {
-        // Release is enough for ARM, but it's no-op on x86, so use SeqCst instead
-        self.common.junk.start();
+    pub(crate) fn start_collect_junks(&self, file_ids: &[u64]) {
+        self.common.junk.start(file_ids);
+    }
+
+    pub(crate) fn cancel_collect_junks(&self) {
+        self.common.junk.cancel();
+    }
+
+    #[cfg(feature = "extra_check")]
+    pub(crate) fn collected_junk_count(&self) -> usize {
+        self.common.junk.collected_count()
     }
 
     pub(crate) fn update_size(&self, active_size: u64, total_size: u64) {
         self.active_size.fetch_add(active_size, Relaxed);
         self.total_size.fetch_add(total_size, Relaxed);
+    }
+
+    #[cfg(feature = "extra_check")]
+    pub(crate) fn sizes(&self) -> (u64, u64) {
+        (
+            self.active_size.load(Acquire),
+            self.total_size.load(Acquire),
+        )
     }
 
     fn decrease(&self, active_size: u64, total_size: u64) {
@@ -221,12 +237,19 @@ impl StatCtx {
         self.insert_loaded_stat(stat);
     }
 
-    pub(crate) fn update_stat_intervals(
+    fn add_replacement_stat_mem(&self, stat: MemStat) {
+        must_true!(stat.active_size <= stat.total_size);
+        must_true!(stat.active_elems <= stat.total_elems);
+        must_true!(stat.mask.is_some());
+        self.update_size(stat.active_size as u64, stat.total_size as u64);
+        self.insert_loaded_stat(stat);
+    }
+
+    pub(crate) fn prepare_stat_intervals(
         &self,
         mut fstats: Vec<MemStat>,
         relocs: HashMap<u64, (u64, LenSeq)>,
-        obsoleted: &[u64],
-    ) -> Vec<PersistStat> {
+    ) -> (Vec<MemStat>, Vec<PersistStat>) {
         for fstat in &fstats {
             must_true!(eq fstat.active_size, fstat.total_size);
         }
@@ -237,38 +260,25 @@ impl StatCtx {
             .collect();
 
         // apply deactived frames while we are performing compaction
-        let mut seqs = vec![];
-        let mut junks = self.common.junk.take();
-        for (_, q) in junks.iter_mut() {
-            for &addr in q.iter() {
-                if let Some(ls) = relocs.get(&addr)
-                    && let Some(&idx) = output_index.get(&ls.0)
-                {
-                    let fstat = &mut fstats[idx];
-                    fstat.active_size -= ls.1.active_len() as usize;
-                    fstat.active_elems -= 1;
-                    fstat.mask.as_mut().expect("mask loaded").set(ls.1.seq);
-                    seqs.push((ls.0, ls.1.seq));
-                }
-            }
-        }
+        let junks = self.common.junk.begin_publish();
+        apply_collected_junks(&mut fstats, &output_index, &relocs, junks);
 
+        let mut stats = Vec::with_capacity(fstats.len());
+        for fstat in &fstats {
+            stats.push(persist_full_mask(fstat));
+        }
+        (fstats, stats)
+    }
+
+    pub(crate) fn publish_stat_intervals(&self, fstats: Vec<MemStat>, obsoleted: &[u64]) {
         for &id in obsoleted {
             self.remove_stat(id);
             self.common.cache.del(id);
         }
-
-        let mut stats = Vec::with_capacity(fstats.len());
         for fstat in fstats {
-            let inactive = seqs
-                .iter()
-                .filter_map(|(file_id, seq)| (*file_id == fstat.file_id).then_some(*seq))
-                .collect();
-            let stat = PersistStat::from_parts(fstat.inner, inactive);
-            self.add_stat_mem(fstat);
-            stats.push(stat);
+            self.add_replacement_stat_mem(fstat);
         }
-        stats
+        self.common.junk.finish_publish();
     }
 
     pub(crate) fn remove_stat_interval(&self, data: &[u64]) {
@@ -298,69 +308,108 @@ impl StatCtx {
         btree: &BTree,
         is_retired: impl Fn(u64) -> bool,
     ) -> Result<Vec<PersistStat>, OpCode> {
-        let grouped: BTreeMap<u64, Vec<u64>> = {
-            let lk = stat_intervals(self.kind, ctx).read();
-            let mut grouped = BTreeMap::<u64, Vec<u64>>::new();
-            for &addr in junks {
-                // race condition: gc might have already removed the interval containing this junk
-                // 1. flush thread holds a junk addr
-                // 2. gc thread rewrites the file containing addr, and since it is junk, it is not moved
-                // 3. gc thread removes the interval from interval map if it becomes empty
-                // 4. flush thread tries to find the file_id of the junk, but the interval is gone
-                if let Some(file_id) = lk.find(addr) {
-                    grouped.entry(file_id).or_default().push(addr);
+        let mut pending = junks.to_vec();
+        let mut updates = BTreeMap::<u64, PersistStat>::new();
+        while !pending.is_empty() {
+            let (grouped, mut retry) = {
+                let lk = stat_intervals(self.kind, ctx).read();
+                let mut grouped = BTreeMap::<u64, Vec<u64>>::new();
+                let mut retry = Vec::new();
+                for &addr in &pending {
+                    let Some(file_id) = lk.find(addr) else {
+                        continue;
+                    };
+                    if self.common.junk.is_publishing() {
+                        retry.push(addr);
+                    } else {
+                        grouped.entry(file_id).or_default().push(addr);
+                    }
                 }
-            }
-            grouped
-        };
+                (grouped, retry)
+            };
 
-        // Merge all updates on the same file_id into one stat record to avoid
-        // generating many duplicate per-file meta puts in a single publish round.
-        let mut v: Vec<PersistStat> = Vec::with_capacity(grouped.len());
-        for (file_id, addrs) in grouped {
-            if is_retired(file_id) {
-                continue;
-            }
-            if let Err(err) = self.ensure_mask(file_id, btree) {
-                // reclaim marks a file retired before removing its in-memory stat. A
-                // second check distinguishes that valid handoff from a retained file
-                // whose newly observed junk would otherwise be silently forgotten.
+            for (file_id, addrs) in grouped {
                 if is_retired(file_id) {
                     continue;
                 }
-                return Err(err);
-            }
-            if let Some(mut stat) = self.map.get_mut(&file_id) {
-                let mut changed = false;
-                for addr in addrs {
-                    // race condition: gc might have already removed the interval containing this junk
-                    let Some(reloc) = self.try_get_reloc(file_id, addr) else {
-                        // interval ranges can cover sparse logical addresses, so a junk addr may
-                        // resolve to a file without having ever been written into its reloc table
-                        continue;
-                    };
-                    if stat.mask.as_ref().expect("mask loaded").test(reloc.seq) {
+                if let Err(err) = self.ensure_mask(file_id, btree) {
+                    if is_retired(file_id) {
                         continue;
                     }
-                    self.update_stat(&mut stat, addr, &reloc, tick);
-                    changed = true;
+                    let lk = stat_intervals(self.kind, ctx).read();
+                    let mut stale = false;
+                    for addr in addrs {
+                        match lk.find(addr) {
+                            Some(current) if current == file_id => return Err(err),
+                            Some(_) => retry.push(addr),
+                            None => stale = true,
+                        }
+                    }
+                    if stale {
+                        continue;
+                    }
+                    continue;
                 }
-                if changed {
-                    // Metadata updates replace the complete stat value. Persist every inactive
-                    // sequence, not just this checkpoint's delta, so a later checkpoint cannot
-                    // resurrect previously collected garbage after reopen.
-                    v.push(persist_full_mask(&stat));
+                if let Some(mut stat) = self.map.get_mut(&file_id) {
+                    let mut changed = false;
+                    for addr in addrs {
+                        let Some(reloc) = self.try_get_reloc(file_id, addr) else {
+                            continue;
+                        };
+                        if stat.mask.as_ref().expect("mask loaded").test(reloc.seq) {
+                            continue;
+                        }
+                        let capture = self.update_stat(&mut stat, addr, &reloc, tick);
+                        if capture == JunkCapture::Publishing {
+                            retry.push(addr);
+                            continue;
+                        }
+                        changed = true;
+                    }
+                    if changed {
+                        updates.insert(file_id, persist_full_mask(&stat));
+                    }
+                } else {
+                    let lk = stat_intervals(self.kind, ctx).read();
+                    for addr in addrs {
+                        match lk.find(addr) {
+                            Some(current) if current == file_id => return Err(OpCode::NotFound),
+                            Some(_) => retry.push(addr),
+                            None => {}
+                        }
+                    }
                 }
             }
+
+            if !retry.is_empty() {
+                #[cfg(feature = "extra_check")]
+                if self.common.junk.is_publishing() {
+                    crate::testing::fire_gc_stat_sync_point(
+                        match self.kind {
+                            FileKind::Data => {
+                                crate::testing::GcStatSyncPoint::DataCheckpointPublishingWait
+                            }
+                            FileKind::Blob => {
+                                crate::testing::GcStatSyncPoint::BlobCheckpointPublishingWait
+                            }
+                        },
+                        ctx.bucket_id,
+                        &self.common.opt.db_root,
+                    );
+                }
+                self.common.junk.wait_publish();
+            }
+            pending = retry;
         }
-        Ok(v)
+        Ok(updates.into_values().collect())
     }
 
-    pub(crate) fn update_stat(&self, stat: &mut MemStat, junk: u64, reloc: &Reloc, tick: u64) {
-        self.active_size
-            .fetch_sub(reloc.active_len() as u64, Release);
-        stat.update(tick, reloc);
-        self.common.junk.push_if_collecting(stat.file_id, junk);
+    fn update_stat(&self, stat: &mut MemStat, junk: u64, reloc: &Reloc, tick: u64) -> JunkCapture {
+        self.common.junk.apply_or_defer(stat.file_id, junk, || {
+            self.active_size
+                .fetch_sub(reloc.active_len() as u64, Release);
+            stat.update(tick, reloc);
+        })
     }
 
     pub(crate) fn bucket_ratio(
@@ -399,9 +448,41 @@ fn persist_full_mask(stat: &MemStat) -> PersistStat {
     PersistStat::from_parts(stat.inner, inactive)
 }
 
+fn apply_collected_junks(
+    fstats: &mut [MemStat],
+    output_index: &HashMap<u64, usize>,
+    relocs: &HashMap<u64, (u64, LenSeq)>,
+    junks: HashMap<u64, Vec<u64>>,
+) {
+    for q in junks.into_values() {
+        for addr in q {
+            let Some((file_id, reloc)) = relocs.get(&addr) else {
+                continue;
+            };
+            let Some(&idx) = output_index.get(file_id) else {
+                continue;
+            };
+            let fstat = &mut fstats[idx];
+            if fstat.mask.as_ref().expect("mask loaded").test(reloc.seq) {
+                continue;
+            }
+            fstat.active_size -= reloc.active_len() as usize;
+            fstat.active_elems -= 1;
+            fstat.mask.as_mut().expect("mask loaded").set(reloc.seq);
+        }
+    }
+}
+
 struct JunkCollector {
-    should_collect_junk: AtomicBool,
+    state: AtomicU8,
     junks: Mutex<HashMap<u64, Vec<u64>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JunkCapture {
+    Idle,
+    Collected,
+    Publishing,
 }
 
 struct StatCommon {
@@ -415,34 +496,80 @@ struct StatCommon {
 }
 
 impl JunkCollector {
+    const IDLE: u8 = 0;
+    const COLLECTING: u8 = 1;
+    const PUBLISHING: u8 = 2;
+
     fn new() -> Self {
         Self {
-            should_collect_junk: AtomicBool::new(false),
+            state: AtomicU8::new(Self::IDLE),
             junks: Mutex::new(HashMap::new()),
         }
     }
 
-    fn start(&self) {
-        self.should_collect_junk.store(true, SeqCst);
+    fn start(&self, file_ids: &[u64]) {
+        let mut junks = self.junks.lock();
+        must_true!(eq self.state.load(Acquire), Self::IDLE);
+        must_true!(junks.is_empty());
+        for &file_id in file_ids {
+            junks.entry(file_id).or_default();
+        }
+        self.state.store(Self::COLLECTING, SeqCst);
     }
 
-    fn stop(&self) {
-        self.should_collect_junk.store(false, SeqCst);
+    fn cancel(&self) {
+        let mut junks = self.junks.lock();
+        must_true!(eq self.state.load(Acquire), Self::COLLECTING);
+        junks.clear();
+        self.state.store(Self::IDLE, SeqCst);
     }
 
-    fn take(&self) -> HashMap<u64, Vec<u64>> {
-        let mut junklk = self.junks.lock();
-        self.stop();
-        std::mem::take(&mut *junklk)
+    fn begin_publish(&self) -> HashMap<u64, Vec<u64>> {
+        let mut junks = self.junks.lock();
+        must_true!(eq self.state.load(Acquire), Self::COLLECTING);
+        self.state.store(Self::PUBLISHING, SeqCst);
+        std::mem::take(&mut *junks)
     }
 
-    fn push_if_collecting(&self, file_id: u64, junk: u64) {
-        let mut m = self.junks.lock();
-        #[allow(clippy::collapsible_if)]
-        if self.should_collect_junk.load(Acquire)
-            && let Some(q) = m.get_mut(&file_id)
-        {
-            q.push(junk);
+    fn finish_publish(&self) {
+        must_true!(eq self.state.load(Acquire), Self::PUBLISHING);
+        self.state.store(Self::IDLE, SeqCst);
+    }
+
+    fn is_publishing(&self) -> bool {
+        self.state.load(Acquire) == Self::PUBLISHING
+    }
+
+    fn wait_publish(&self) {
+        while self.is_publishing() {
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(feature = "extra_check")]
+    fn collected_count(&self) -> usize {
+        self.junks.lock().values().map(Vec::len).sum()
+    }
+
+    fn apply_or_defer(&self, file_id: u64, junk: u64, update: impl FnOnce()) -> JunkCapture {
+        let mut junks = self.junks.lock();
+        match self.state.load(Acquire) {
+            Self::IDLE => {
+                update();
+                JunkCapture::Idle
+            }
+            Self::COLLECTING => {
+                if let Some(q) = junks.get_mut(&file_id) {
+                    update();
+                    q.push(junk);
+                    JunkCapture::Collected
+                } else {
+                    update();
+                    JunkCapture::Idle
+                }
+            }
+            Self::PUBLISHING => JunkCapture::Publishing,
+            _ => unreachable!("invalid junk collector state"),
         }
     }
 }
@@ -598,12 +725,28 @@ impl FileReader {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, collections::HashMap};
+
     use crate::{
         meta::{MemStat, StatInner},
-        utils::bitmap::BitMap,
+        utils::{bitmap::BitMap, data::LenSeq},
     };
 
-    use super::persist_full_mask;
+    use super::{JunkCapture, JunkCollector, apply_collected_junks, persist_full_mask};
+
+    fn mem_stat(file_id: u64) -> MemStat {
+        let inner = StatInner {
+            file_id,
+            up1: 0,
+            up2: 0,
+            active_elems: 2,
+            total_elems: 2,
+            active_size: 20,
+            total_size: 20,
+            bucket_id: 1,
+        };
+        MemStat::from_parts(inner, Some(BitMap::new(inner.total_elems)))
+    }
 
     #[test]
     fn full_mask_persistence_keeps_prior_inactive_sequences() {
@@ -623,5 +766,65 @@ mod tests {
         stat.mask.as_mut().unwrap().set(3);
 
         assert_eq!(persist_full_mask(&stat).inactive_elems, vec![0, 3]);
+    }
+
+    #[test]
+    fn rewrite_junk_collector_registers_victims_and_closes_publish_cut() {
+        let collector = JunkCollector::new();
+        let updates = Cell::new(0);
+        collector.start(&[3, 5]);
+
+        assert_eq!(
+            collector.apply_or_defer(3, 100, || updates.set(updates.get() + 1)),
+            JunkCapture::Collected
+        );
+        assert_eq!(
+            collector.apply_or_defer(4, 200, || updates.set(updates.get() + 1)),
+            JunkCapture::Idle
+        );
+
+        let collected = collector.begin_publish();
+        assert_eq!(collected.get(&3), Some(&vec![100]));
+        assert_eq!(collected.get(&5), Some(&Vec::new()));
+        assert_eq!(
+            collector.apply_or_defer(3, 300, || updates.set(updates.get() + 1)),
+            JunkCapture::Publishing
+        );
+        assert_eq!(updates.get(), 2, "publishing must defer the stat update");
+
+        collector.finish_publish();
+        assert_eq!(
+            collector.apply_or_defer(3, 400, || updates.set(updates.get() + 1)),
+            JunkCapture::Idle
+        );
+        assert_eq!(updates.get(), 3);
+
+        collector.start(&[7]);
+        collector.cancel();
+        assert_eq!(
+            collector.apply_or_defer(7, 500, || updates.set(updates.get() + 1)),
+            JunkCapture::Idle
+        );
+        assert_eq!(updates.get(), 4);
+    }
+
+    #[test]
+    fn collected_rewrite_junk_is_applied_once_to_each_output_stat() {
+        let mut fstats = vec![mem_stat(10), mem_stat(11)];
+        let output_index = HashMap::from([(10, 0), (11, 1)]);
+        let relocs = HashMap::from([
+            (100, (10, LenSeq::new(10, 0, 0))),
+            (200, (11, LenSeq::new(10, 0, 1))),
+        ]);
+        let junks = HashMap::from([(3, vec![100, 100]), (5, vec![200, 999])]);
+
+        apply_collected_junks(&mut fstats, &output_index, &relocs, junks);
+
+        assert_eq!(fstats[0].active_elems, 1);
+        assert_eq!(fstats[0].active_size, 10);
+        assert_eq!(persist_full_mask(&fstats[0]).inactive_elems, vec![0]);
+        assert_eq!(fstats[1].active_elems, 1);
+        assert_eq!(fstats[1].active_size, 10);
+        assert_eq!(persist_full_mask(&fstats[1]).inactive_elems, vec![1]);
     }
 }

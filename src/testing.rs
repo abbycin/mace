@@ -10,7 +10,7 @@ use crate::meta::builder::ManifestBuilder;
 use crate::meta::{
     BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_MISC, BUCKET_OBSOLETE_BLOB, BUCKET_OBSOLETE_DATA,
     FileKind, IMetaCodec, IntervalPair, PersistStat, interval_bucket_name, page_table_name,
-    stat_file_path,
+    stat_file_path, stat_intervals,
 };
 use crate::types::data::{Key, Val, Ver};
 use crate::types::header::{NodeType, RemoteHeader, TagFlag, TagKind};
@@ -145,6 +145,27 @@ pub enum WalSyncPoint {
     AfterGenerationComplete,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GcRewriteSyncPoint {
+    BeforeDataPublish,
+    BeforeBlobPublish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GcStatSyncPoint {
+    CheckpointBeforeManifestCommit,
+    DataObsoleteAfterMetaCommit,
+    DataObsoleteAfterRetiredMark,
+    DataObsoleteAfterRuntimeRemove,
+    BlobObsoleteAfterMetaCommit,
+    BlobObsoleteAfterRetiredMark,
+    BlobObsoleteAfterRuntimeRemove,
+    DataRewritePublishing { output_count: usize },
+    BlobRewritePublishing { output_count: usize },
+    DataCheckpointPublishingWait,
+    BlobCheckpointPublishingWait,
+}
+
 pub struct CheckpointRootRestore {
     root: Mutex<Option<(BoxRef, u64)>>,
 }
@@ -234,6 +255,15 @@ pub fn checkpoint_and_wait(bucket: &Bucket) {
     bucket.tree.bucket.checkpoint_and_wait(false);
 }
 
+pub fn data_rewrite_collected_junk_count(bucket: &Bucket) -> usize {
+    bucket
+        .inner
+        .store
+        .manifest
+        .stat_ctx(FileKind::Data)
+        .collected_junk_count()
+}
+
 /// verifies that the stable persisted GC ledger exactly matches physical reachability
 pub fn assert_persisted_gc_stats(mace: &crate::Mace) {
     for kind in FileKind::ALL {
@@ -274,6 +304,21 @@ fn assert_persisted_gc_stats_for_kind(mace: &crate::Mace, kind: FileKind) {
             Ok(())
         })
         .expect("read persisted stat metadata");
+
+    let expected_active = stats
+        .values()
+        .map(|stat| stat.active_size as u64)
+        .sum::<u64>();
+    let expected_total = stats
+        .values()
+        .map(|stat| stat.total_size as u64)
+        .sum::<u64>();
+    let (runtime_active, runtime_total) = manifest.stat_ctx(kind).sizes();
+    assert_eq!(
+        (runtime_active, runtime_total),
+        (expected_active, expected_total),
+        "runtime {kind:?} aggregate sizes must match durable stats"
+    );
 
     let mut obsolete = HashSet::new();
     manifest
@@ -327,6 +372,30 @@ fn assert_persisted_gc_stats_for_kind(mace: &crate::Mace, kind: FileKind) {
                 Ok(())
             })
             .expect("read persisted interval metadata");
+    }
+
+    for loaded in manifest.buckets.buckets.iter() {
+        let bucket_id = *loaded.key();
+        let expected = interval_meta
+            .iter()
+            .filter(|entry| entry.3 == bucket_id)
+            .copied()
+            .collect::<HashSet<_>>();
+        let actual = stat_intervals(kind, loaded.value())
+            .read()
+            .entries()
+            .map(|(lo, hi, file_id)| (lo, hi, file_id, bucket_id))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "runtime {kind:?} intervals must match durable intervals for bucket {bucket_id}"
+        );
+        for (_, _, file_id, _) in actual {
+            assert!(
+                manifest.stat_ctx(kind).contains_key(&file_id),
+                "runtime {kind:?} interval references missing stat file {file_id}"
+            );
+        }
     }
 
     let mut payload_intervals = HashSet::new();
@@ -751,6 +820,8 @@ type AbortCleanHook = dyn Fn(AbortCleanSyncPoint, u64) + Send + Sync + 'static;
 type TreeUpdateHook = dyn Fn(TreeUpdateSyncPoint, u64) + Send + Sync + 'static;
 type CheckpointHook = dyn Fn(CheckpointSyncPoint, u64) + Send + Sync + 'static;
 type WalSyncHook = dyn Fn(WalSyncPoint) + Send + Sync + 'static;
+type GcRewriteHook = dyn Fn(GcRewriteSyncPoint, u64, &Path) + Send + Sync + 'static;
+type GcStatHook = dyn Fn(GcStatSyncPoint, u64, &Path) + Send + Sync + 'static;
 
 #[derive(Default)]
 struct TestingHooks {
@@ -764,6 +835,8 @@ struct TestingHooks {
     tree_update: Option<Arc<TreeUpdateHook>>,
     checkpoint: Option<Arc<CheckpointHook>>,
     wal_sync: Option<Arc<WalSyncHook>>,
+    gc_rewrite: Option<Arc<GcRewriteHook>>,
+    gc_stat: Option<Arc<GcStatHook>>,
 }
 
 fn hooks() -> &'static Mutex<TestingHooks> {
@@ -811,6 +884,14 @@ pub fn set_wal_sync_hook(hook: Option<Arc<WalSyncHook>>) {
     hooks().lock().wal_sync = hook;
 }
 
+pub fn set_gc_rewrite_hook(hook: Option<Arc<GcRewriteHook>>) {
+    hooks().lock().gc_rewrite = hook;
+}
+
+pub fn set_gc_stat_hook(hook: Option<Arc<GcStatHook>>) {
+    hooks().lock().gc_stat = hook;
+}
+
 pub fn clear_txn_commit_hook() {
     set_txn_commit_hook(None);
 }
@@ -851,6 +932,14 @@ pub fn clear_wal_sync_hook() {
     set_wal_sync_hook(None);
 }
 
+pub fn clear_gc_rewrite_hook() {
+    set_gc_rewrite_hook(None);
+}
+
+pub fn clear_gc_stat_hook() {
+    set_gc_stat_hook(None);
+}
+
 pub fn clear_hooks() {
     clear_txn_commit_hook();
     clear_txn_begin_hook();
@@ -862,6 +951,8 @@ pub fn clear_hooks() {
     clear_tree_update_hook();
     clear_checkpoint_hook();
     clear_wal_sync_hook();
+    clear_gc_rewrite_hook();
+    clear_gc_stat_hook();
 }
 
 pub(crate) fn fire_txn_commit_sync_point(point: TxnCommitSyncPoint, start_ts: u64) {
@@ -931,6 +1022,24 @@ pub(crate) fn fire_wal_sync_point(point: WalSyncPoint) {
     let hook = hooks().lock().wal_sync.clone();
     if let Some(hook) = hook {
         hook(point);
+    }
+}
+
+pub(crate) fn fire_gc_rewrite_sync_point(
+    point: GcRewriteSyncPoint,
+    bucket_id: u64,
+    db_root: &Path,
+) {
+    let hook = hooks().lock().gc_rewrite.clone();
+    if let Some(hook) = hook {
+        hook(point, bucket_id, db_root);
+    }
+}
+
+pub(crate) fn fire_gc_stat_sync_point(point: GcStatSyncPoint, bucket_id: u64, db_root: &Path) {
+    let hook = hooks().lock().gc_stat.clone();
+    if let Some(hook) = hook {
+        hook(point, bucket_id, db_root);
     }
 }
 
