@@ -10,6 +10,8 @@ pub use utils::{
 
 mod cc;
 mod error;
+#[cfg(any(feature = "extra_check", feature = "failpoints"))]
+pub mod failpoint_testing;
 mod index;
 mod io;
 mod map;

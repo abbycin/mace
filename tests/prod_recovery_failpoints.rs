@@ -368,6 +368,7 @@ fn prepare_oversized_data_gc_victim(db_root: &Path) {
         txn.commit().expect("commit oversized-victim seed failed");
     }
     mace.sync().expect("sync oversized-victim seed failed");
+    bucket.checkpoint_and_wait();
 
     let updated = vec![b'b'; 128];
     for idx in (0..512).step_by(4) {
@@ -379,6 +380,7 @@ fn prepare_oversized_data_gc_victim(db_root: &Path) {
         txn.commit().expect("commit oversized-victim update failed");
     }
     mace.sync().expect("sync oversized-victim update failed");
+    bucket.checkpoint_and_wait();
 }
 
 fn child_setup_retire(db_root: &Path) -> (Mace, Bucket) {
@@ -863,18 +865,37 @@ fn wait_for_data_dir_quiet(db_root: &Path, quiet: Duration, timeout: Duration) {
 }
 
 fn wait_for_crash(timeout: Duration) -> ! {
+    // the armed failpoint aborts on its acting consultation -- the nth-th hit
+    // for nth rules, the first otherwise; benign pre-nth consultations are
+    // expected during setup and must not fail the window early. past the
+    // deadline either some rule acted without the abort landing, or none got
+    // that far -- both shapes attribute via the rule snapshot
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+    loop {
+        if mace::failpoint_testing::any_rule_actioned() {
+            // the acting consultation and its abort run on an engine thread;
+            // give an in-flight abort a beat to land before declaring failure
+            std::thread::sleep(Duration::from_millis(200));
+            panic!(
+                "failpoint reached its acting consultation but the process survived; {}",
+                mace::failpoint_testing::snapshot()
+            )
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "no failpoint reached its acting consultation within {timeout:?}; {}",
+                mace::failpoint_testing::snapshot()
+            )
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
-    panic!("failpoint did not fire in expected window")
 }
 
 fn child_case_flush_after_data_sync(db_root: &Path) -> ! {
     let (_mace, bucket) = child_setup_common(db_root);
     seed_committed_and_uncommitted(&bucket, 64, 24);
     drive_flush_pressure(&bucket, 128, 2048);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_case_flush_after_manifest_commit_with_retire(db_root: &Path) -> ! {
@@ -900,7 +921,7 @@ fn child_case_flush_after_manifest_commit_with_retire(db_root: &Path) -> ! {
         }
     }
 
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_case_flush_after_manifest_commit_with_retire_multi_bucket(db_root: &Path) -> ! {
@@ -942,7 +963,7 @@ fn child_case_flush_after_manifest_commit_with_retire_multi_bucket(db_root: &Pat
         }
     }
 
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_case_stat_mask_before_load(db_root: &Path) -> ! {
@@ -1155,14 +1176,14 @@ fn child_case_wal_after_checkpoint_write(db_root: &Path) -> ! {
         txn.commit().expect("commit wal txn failed");
     }
 
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_case_manifest_before_multi_commit(db_root: &Path) -> ! {
     let (_mace, bucket) = child_setup_common(db_root);
     seed_committed_and_uncommitted(&bucket, 64, 24);
     drive_flush_pressure(&bucket, 128, 1536);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_case_wal_recycle_before_dir_sync(db_root: &Path) -> ! {
@@ -1284,10 +1305,7 @@ fn child_case_gc_data_with_collecting_junk(db_root: &Path) -> ! {
         },
     )));
 
-    seed_committed_and_uncommitted(&bucket, 64, 0);
-    drive_gc_pressure(&bucket, 256);
-    mace.sync().expect("sync before collecting-junk gc failed");
-    wait_for_data_dir_quiet(db_root, Duration::from_millis(300), Duration::from_secs(20));
+    // keep the only rewrite candidates owned by the keys updated in the hook
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {

@@ -73,6 +73,14 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                 } else {
                     next_run_at.saturating_duration_since(Instant::now())
                 };
+                // extra_check test mode: gc_timeout=0 means explicit-trigger-only
+                // park on a long wait instead of a ZERO poll (which would spin)
+                #[cfg(feature = "extra_check")]
+                let wait_timeout = if timeout.is_zero() {
+                    Duration::from_secs(3600)
+                } else {
+                    wait_timeout
+                };
                 match rx.recv_timeout(wait_timeout) {
                     Ok(x) => match x {
                         GC_PAUSE => {
@@ -103,6 +111,12 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                 }
 
                 if !pause && Instant::now() >= next_run_at {
+                    // extra_check test mode: gc_timeout=0 arms no timer, the
+                    // parked tick must not run a round
+                    #[cfg(feature = "extra_check")]
+                    if timeout.is_zero() {
+                        continue;
+                    }
                     gc.run();
                     next_run_at = Instant::now() + timeout;
                 }
@@ -386,6 +400,8 @@ impl GarbageCollector {
             HistogramMetric::GcRunMicros,
             started.elapsed().as_micros() as u64,
         );
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_completed();
     }
 
     fn process_wal_clean(&mut self) {

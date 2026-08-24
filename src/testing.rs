@@ -26,6 +26,7 @@ use std::mem::{offset_of, size_of};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::sync::mpsc::channel;
 use std::thread::JoinHandle;
@@ -768,9 +769,32 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]
+    fn hooks_lock_blocks_second_holder_until_release() {
+        let guard = crate::testing::hooks_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _second = crate::testing::hooks_lock();
+            tx.send(()).expect("main thread must stay alive");
+        });
+
+        // while the first guard is held the second holder must stay blocked
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "hooks_lock must serialize holders"
+        );
+        drop(guard);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second holder must acquire after release");
+        handle.join().expect("lock thread must not panic");
+    }
+
+    #[test]
     fn persisted_gc_stats_rejects_interval_without_stat() -> Result<(), OpCode> {
         let path = crate::RandomPath::new();
-        let mace = crate::Mace::new(crate::Options::new(&*path).validate()?)?;
+        let mut opt = crate::Options::new(&*path);
+        opt.tmp_store = true;
+        let mace = crate::Mace::new(opt.validate()?)?;
         let bucket_id = 99;
         let interval = IntervalPair::new(1, 1, 99, bucket_id);
         let mut value = vec![0; interval.packed_size()];
@@ -806,8 +830,18 @@ mod tests {
 }
 
 pub fn checkpoint_test_lock() -> parking_lot::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock()
+    // legacy alias: every hook-armed test must serialize on the single global
+    // hooks lock, or a parallel HookReset::drop (clear_hooks) erases another
+    // test's slot mid-flight
+    hooks_lock()
+}
+
+/// process-wide serialization for every test that installs testing hooks;
+/// cargo runs tests in parallel and the hook table is global, so hook-based
+/// tests must hold this while registered to avoid cross-test interference
+pub fn hooks_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    LOCK.lock()
 }
 
 type TxnCommitHook = dyn Fn(TxnCommitSyncPoint, u64) + Send + Sync + 'static;
@@ -822,6 +856,9 @@ type CheckpointHook = dyn Fn(CheckpointSyncPoint, u64) + Send + Sync + 'static;
 type WalSyncHook = dyn Fn(WalSyncPoint) + Send + Sync + 'static;
 type GcRewriteHook = dyn Fn(GcRewriteSyncPoint, u64, &Path) + Send + Sync + 'static;
 type GcStatHook = dyn Fn(GcStatSyncPoint, u64, &Path) + Send + Sync + 'static;
+type GcCompletedHook = dyn Fn() + Send + Sync + 'static;
+type CollectorCompletedHook = dyn Fn() + Send + Sync + 'static;
+type EvictorCompletedHook = dyn Fn() + Send + Sync + 'static;
 
 #[derive(Default)]
 struct TestingHooks {
@@ -837,6 +874,9 @@ struct TestingHooks {
     wal_sync: Option<Arc<WalSyncHook>>,
     gc_rewrite: Option<Arc<GcRewriteHook>>,
     gc_stat: Option<Arc<GcStatHook>>,
+    gc_completed: Option<Arc<GcCompletedHook>>,
+    collector_completed: Option<Arc<CollectorCompletedHook>>,
+    evictor_completed: Option<Arc<EvictorCompletedHook>>,
 }
 
 fn hooks() -> &'static Mutex<TestingHooks> {
@@ -892,6 +932,18 @@ pub fn set_gc_stat_hook(hook: Option<Arc<GcStatHook>>) {
     hooks().lock().gc_stat = hook;
 }
 
+pub fn set_gc_completed_hook(hook: Option<Arc<GcCompletedHook>>) {
+    hooks().lock().gc_completed = hook;
+}
+
+pub fn set_collector_completed_hook(hook: Option<Arc<CollectorCompletedHook>>) {
+    hooks().lock().collector_completed = hook;
+}
+
+pub fn set_evictor_completed_hook(hook: Option<Arc<EvictorCompletedHook>>) {
+    hooks().lock().evictor_completed = hook;
+}
+
 pub fn clear_txn_commit_hook() {
     set_txn_commit_hook(None);
 }
@@ -940,6 +992,18 @@ pub fn clear_gc_stat_hook() {
     set_gc_stat_hook(None);
 }
 
+pub fn clear_gc_completed_hook() {
+    set_gc_completed_hook(None);
+}
+
+pub fn clear_collector_completed_hook() {
+    set_collector_completed_hook(None);
+}
+
+pub fn clear_evictor_completed_hook() {
+    set_evictor_completed_hook(None);
+}
+
 pub fn clear_hooks() {
     clear_txn_commit_hook();
     clear_txn_begin_hook();
@@ -953,6 +1017,30 @@ pub fn clear_hooks() {
     clear_wal_sync_hook();
     clear_gc_rewrite_hook();
     clear_gc_stat_hook();
+    clear_gc_completed_hook();
+    clear_collector_completed_hook();
+    clear_evictor_completed_hook();
+}
+
+pub(crate) fn fire_gc_completed() {
+    let hook = hooks().lock().gc_completed.clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+pub(crate) fn fire_collector_completed() {
+    let hook = hooks().lock().collector_completed.clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+pub(crate) fn fire_evictor_completed() {
+    let hook = hooks().lock().evictor_completed.clone();
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 pub(crate) fn fire_txn_commit_sync_point(point: TxnCommitSyncPoint, start_ts: u64) {
@@ -1149,6 +1237,49 @@ pub fn fail_next_wal_syncs(bucket: &Bucket, n: usize) {
 #[cfg(feature = "failpoints")]
 pub fn arm_failpoint_rule(raw: &str) {
     crate::utils::failpoint::arm_rules(raw);
+}
+
+/// total consultations of a named failpoint rule in this process, regardless
+/// of whether its action fired; zero during a crash-window timeout means the
+/// engine never reached the injection site, while hits without an abort mean
+/// the failpoint state machine failed to act
+#[cfg(feature = "failpoints")]
+pub fn failpoint_hits(name: &str) -> u64 {
+    crate::utils::failpoint::hit_count(name)
+}
+
+/// total consultations across every armed rule in this process; the
+/// crash-window wait only needs "did any injection fire"
+#[cfg(feature = "failpoints")]
+pub fn failpoint_hits_total() -> u64 {
+    crate::utils::failpoint::hits_total()
+}
+
+/// every armed rule with action, nth and hit count; append to crash-window
+/// timeout panics so the failure message attributes itself
+#[cfg(feature = "failpoints")]
+pub fn failpoint_snapshot() -> String {
+    crate::utils::failpoint::snapshot()
+}
+
+/// run `f` with named rules armed for its lifetime only; same-process tests
+/// cannot leak overrides into each other (fs rules are not supported here)
+#[cfg(feature = "failpoints")]
+pub fn failpoint_scope<R>(raw: &str, f: impl FnOnce() -> R) -> R {
+    let _scope = crate::utils::failpoint::arm_rules_scoped(raw);
+    f()
+}
+
+/// engine-authoritative state dump appended to wait-timeout panics; counters
+/// beyond these stay test-side through InMemoryObserver::snapshot because the
+/// Observer trait is write-only by design
+pub fn debug_snapshot(mace: &crate::Mace) -> String {
+    let mut out = String::from("engine snapshot:");
+    out.push_str(&format!("\n  data_gc_runs={}", mace.data_gc_count()));
+    out.push_str(&format!("\n  blob_gc_runs={}", mace.blob_gc_count()));
+    let tasks = mace.inner.store.context.abort_clean_tasks();
+    out.push_str(&format!("\n  abort_clean_tasks={}", tasks.len()));
+    out
 }
 
 /// try to acquire the stream-0 logging mutex without blocking; false means the

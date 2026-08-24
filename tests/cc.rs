@@ -324,13 +324,11 @@ fn get_compacted_shared_hist_page_keeps_key_local_old_versions() -> Result<(), O
     tx.update("b", "b1")?;
     tx.commit()?;
 
-    let tx = db.begin()?;
-    tx.update("a", "a2")?;
-    tx.commit()?;
-
-    let tx = db.begin()?;
-    tx.update("b", "b2")?;
-    tx.commit()?;
+    // lagging reader: opened BEFORE the final a2/b2 updates commit, so its
+    // snapshot sits on the old versions and the lookup must fall into the
+    // shared history region — proving traversal stays key-local after the
+    // pad churn forces those histories onto compacted shared pages
+    let snapshot = db.view()?;
 
     // force compaction so old versions go through shared hist-page path
     for i in 0..64 {
@@ -340,12 +338,17 @@ fn get_compacted_shared_hist_page_keeps_key_local_old_versions() -> Result<(), O
         tx.commit()?;
     }
 
-    // snapshot between latest and old versions, must read key-local history only
-    let snapshot = db.view()?;
+    let tx = db.begin()?;
+    tx.update("a", "a2")?;
+    tx.commit()?;
+    let tx = db.begin()?;
+    tx.update("b", "b2")?;
+    tx.commit()?;
+
     let got_a = snapshot.get("a")?;
     let got_b = snapshot.get("b")?;
-    assert_eq!(got_a.slice(), b"a2");
-    assert_eq!(got_b.slice(), b"b2");
+    assert_eq!(got_a.slice(), b"a1");
+    assert_eq!(got_b.slice(), b"b1");
     Ok(())
 }
 

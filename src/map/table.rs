@@ -1,4 +1,4 @@
-use crate::must_true;
+use crate::{must_ok, must_true};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::mem::MaybeUninit;
@@ -111,7 +111,7 @@ impl PageMap {
 
         if let Some(btree) = btree {
             let bucket_table = crate::meta::page_table_name(bucket_id);
-            let _ = btree.view(&bucket_table, |txn| {
+            let e = btree.view(&bucket_table, |txn| {
                 let mut iter = txn.iter_uncached();
                 let mut k = Vec::new();
                 let mut v = Vec::new();
@@ -133,6 +133,7 @@ impl PageMap {
                 }
                 Ok(())
             });
+            must_ok!(e, "can't load page table from {}", bucket_table);
         }
 
         self.next.fetch_max(next_pid, Ordering::Relaxed);

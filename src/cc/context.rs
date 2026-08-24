@@ -268,6 +268,10 @@ impl Context {
         self.pool.free(pin);
     }
 
+    /// test-determinism wakeup (extra_check): nudges the collector so a test
+    /// can drive safe_exclusive advancement synchronously instead of waiting
+    /// for the background duty-cycle. production keeps the pure polling
+    /// cadence — delayed reclamation is a designed tradeoff, not a leak.
     #[cfg(feature = "extra_check")]
     pub(crate) fn request_collect(&self) {
         let _ = self.tx.send(CollectorSignal::Wake);
@@ -820,6 +824,8 @@ fn run_collect_cycle(
         );
         prune_committed_facts(groups, committed, published_safe, deadline);
     }
+    #[cfg(feature = "extra_check")]
+    crate::testing::fire_collector_completed();
     if Instant::now() < deadline {
         pool.maybe_shrink_until(deadline);
     }

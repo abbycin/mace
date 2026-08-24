@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestEnv, wait_until};
+use common::{TestEnv, mace_snapshot_text};
 use mace::observe::{CounterMetric, InMemoryObserver};
 #[cfg(feature = "extra_check")]
 use mace::testing;
@@ -98,13 +98,12 @@ fn oversized_data_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         .open_with(|options| {
             options.concurrent_write = 1;
             options.sync_on_write = true;
-            options.gc_timeout = 60_000;
+            common::deterministic_gc(options);
             options.gc_eager = false;
             options.data_garbage_ratio = 100;
             options.data_file_size = source_target;
         })
         .expect("open oversized data source");
-    engine.disable_gc();
     let bucket = engine
         .new_bucket(
             "oversized_data",
@@ -123,13 +122,11 @@ fn oversized_data_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         txn.put(key, &initial)?;
         txn.commit()?;
     }
-    bucket.checkpoint();
+    bucket.checkpoint_and_wait();
     let data_root = bucket.options().data_root();
     assert!(
-        wait_until(Duration::from_secs(6), Duration::from_millis(20), || {
-            !prefixed_file_sizes(&data_root, Options::DATA_PREFIX).is_empty()
-        }),
-        "expected initial data checkpoint"
+        !prefixed_file_sizes(&data_root, Options::DATA_PREFIX).is_empty(),
+        "scenario precondition: initial data checkpoint must be on disk"
     );
     for key in keys.iter().step_by(2) {
         let txn = bucket.begin()?;
@@ -143,7 +140,7 @@ fn oversized_data_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         .open_with(|options| {
             options.concurrent_write = 1;
             options.sync_on_write = true;
-            options.gc_timeout = 60_000;
+            common::deterministic_gc(options);
             options.gc_eager = true;
             options.data_garbage_ratio = 1;
             options.data_file_size = rewrite_target;
@@ -158,14 +155,19 @@ fn oversized_data_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         before
             .iter()
             .any(|(_, size)| *size > rewrite_target as u64 * 2),
-        "fixture must contain an oversized data victim: {before:?}"
+        "scenario precondition: fixture must contain an oversized data victim: {before:?}"
     );
+    let data_gc_before = engine.data_gc_count();
+    for _ in 0..3 {
+        common::gc_round(&engine, Duration::from_secs(10));
+        if engine.data_gc_count() > data_gc_before {
+            break;
+        }
+    }
     assert!(
-        wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
-            engine.start_gc();
-            engine.data_gc_count() > 0
-        }),
-        "expected oversized data rewrite"
+        engine.data_gc_count() > data_gc_before,
+        "expected oversized data rewrite; {}",
+        mace_snapshot_text(&engine)
     );
     let outputs = prefixed_file_sizes(&data_root, Options::DATA_PREFIX)
         .into_iter()
@@ -212,13 +214,12 @@ fn oversized_blob_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
     let engine = env.open_with(|options| {
         options.concurrent_write = 1;
         options.sync_on_write = true;
-        options.gc_timeout = 60_000;
+        common::deterministic_gc(options);
         options.gc_eager = false;
         options.blob_garbage_ratio = 100;
         options.blob_file_size = source_target;
         options.observer = observer.clone();
     })?;
-    engine.disable_gc();
     let bucket = engine.new_bucket(
         "oversized_blob",
         BucketOptions {
@@ -235,13 +236,11 @@ fn oversized_blob_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         txn.put(key, &initial)?;
     }
     txn.commit()?;
-    bucket.checkpoint();
+    bucket.checkpoint_and_wait();
     let data_root = bucket.options().data_root();
     assert!(
-        wait_until(Duration::from_secs(6), Duration::from_millis(20), || {
-            !prefixed_file_sizes(&data_root, Options::BLOB_PREFIX).is_empty()
-        }),
-        "expected initial blob checkpoint"
+        !prefixed_file_sizes(&data_root, Options::BLOB_PREFIX).is_empty(),
+        "scenario precondition: initial blob checkpoint must be on disk"
     );
     for key in keys.iter().step_by(2) {
         let txn = bucket.begin()?;
@@ -249,15 +248,15 @@ fn oversized_blob_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         txn.commit()?;
     }
     drive_foreground_compaction(&bucket, &updated, &observer)?;
-    bucket.checkpoint();
-    std::thread::sleep(Duration::from_millis(100));
+    // the second checkpoint must publish the compaction junk before gc runs
+    bucket.checkpoint_and_wait();
     drop(bucket);
     drop(engine);
 
     let engine = env.open_with(|options| {
         options.concurrent_write = 1;
         options.sync_on_write = true;
-        options.gc_timeout = 60_000;
+        common::deterministic_gc(options);
         options.gc_eager = true;
         options.blob_garbage_ratio = 1;
         options.blob_file_size = rewrite_target;
@@ -269,14 +268,19 @@ fn oversized_blob_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         before
             .iter()
             .any(|(_, size)| *size > rewrite_target as u64 * 2),
-        "fixture must contain an oversized blob victim: {before:?}"
+        "scenario precondition: fixture must contain an oversized blob victim: {before:?}"
     );
+    let blob_gc_before = engine.blob_gc_count();
+    for _ in 0..3 {
+        common::gc_round(&engine, Duration::from_secs(10));
+        if engine.blob_gc_count() > blob_gc_before {
+            break;
+        }
+    }
     assert!(
-        wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
-            engine.start_gc();
-            engine.blob_gc_count() > 0
-        }),
-        "expected oversized blob rewrite"
+        engine.blob_gc_count() > blob_gc_before,
+        "expected oversized blob rewrite; {}",
+        mace_snapshot_text(&engine)
     );
     let outputs = prefixed_file_sizes(&data_root, Options::BLOB_PREFIX)
         .into_iter()
@@ -310,7 +314,7 @@ fn fast_manual_data_cycle() -> Result<(), OpCode> {
     let engine = env.open_with(|options| {
         options.sync_on_write = false;
         options.gc_eager = true;
-        options.gc_timeout = 60_000;
+        common::deterministic_gc(options);
         options.data_garbage_ratio = 1;
         options.data_file_size = 16 << 10;
     })?;
@@ -343,14 +347,24 @@ fn fast_manual_data_cycle() -> Result<(), OpCode> {
         txn.commit()?;
     }
 
-    bucket.checkpoint();
+    bucket.checkpoint_and_wait();
+    assert!(
+        !prefixed_files(&bucket.options().data_root(), Options::DATA_PREFIX).is_empty(),
+        "scenario precondition: data files must be checkpointed to disk before gc"
+    );
+    let data_gc_before = engine.data_gc_count();
+    for _ in 0..3 {
+        common::gc_round(&engine, Duration::from_secs(10));
+        if engine.data_gc_count() > data_gc_before {
+            break;
+        }
+    }
 
-    let gc_done = wait_until(Duration::from_secs(6), Duration::from_millis(50), || {
-        engine.start_gc();
-        engine.data_gc_count() > 0
-    });
-
-    assert!(gc_done, "expected at least one data gc cycle");
+    assert!(
+        engine.data_gc_count() > data_gc_before,
+        "expected at least one data gc cycle; {}",
+        mace_snapshot_text(&engine)
+    );
 
     let view = bucket.view()?;
     for key in &keys {
@@ -386,7 +400,7 @@ fn stress_blob_cycle() -> Result<(), OpCode> {
     let engine = env.open_with(|options| {
         options.sync_on_write = false;
         options.gc_eager = true;
-        options.gc_timeout = 60_000;
+        common::deterministic_gc(options);
         options.blob_garbage_ratio = 1;
         options.blob_file_size = 1 << 20;
         options.observer = observer.clone();
@@ -411,10 +425,10 @@ fn stress_blob_cycle() -> Result<(), OpCode> {
     bucket.checkpoint_and_wait();
 
     let blob_root = bucket.options().data_root();
-    let files_ready = wait_until(Duration::from_secs(6), Duration::from_millis(50), || {
-        !prefixed_files(&blob_root, Options::BLOB_PREFIX).is_empty()
-    });
-    assert!(files_ready, "expected blob files after checkpoint");
+    assert!(
+        !prefixed_files(&blob_root, Options::BLOB_PREFIX).is_empty(),
+        "scenario precondition: blob files must exist after checkpoint"
+    );
 
     for index in 0..300 {
         let key = format!("blob_{index:04}");
@@ -428,16 +442,19 @@ fn stress_blob_cycle() -> Result<(), OpCode> {
     bucket.checkpoint_and_wait();
 
     let before_gc = prefixed_files(&blob_root, Options::BLOB_PREFIX);
-    assert!(!before_gc.is_empty(), "expected blob files before gc");
-    let gc_done = wait_until(Duration::from_secs(20), Duration::from_millis(100), || {
-        engine.start_gc();
+    assert!(
+        !before_gc.is_empty(),
+        "scenario precondition: blob files must exist before gc"
+    );
+    let reclaimed = common::gc_rounds_until(&engine, 8, || {
         let after_gc = prefixed_files(&blob_root, Options::BLOB_PREFIX);
         engine.blob_gc_count() > 0 || after_gc.len() < before_gc.len() || after_gc.is_empty()
     });
 
     assert!(
-        gc_done,
-        "expected blob gc rewrite and file reclaim to happen"
+        reclaimed,
+        "expected blob gc rewrite and file reclaim to happen; {}",
+        mace_snapshot_text(&engine)
     );
     Ok(())
 }

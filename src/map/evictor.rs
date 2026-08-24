@@ -206,6 +206,8 @@ fn evictor_loop(mut e: Evictor) {
             last_nudge_scan = Instant::now();
             e.nudge_stale_checkpoints(chkpt_ivl);
         }
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_evictor_completed();
     }
 
     let _ = e.tx.send(());

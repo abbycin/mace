@@ -337,16 +337,20 @@ impl StatCtx {
                         continue;
                     }
                     let lk = stat_intervals(self.kind, ctx).read();
-                    let mut stale = false;
                     for addr in addrs {
                         match lk.find(addr) {
+                            // gc deletes the persistent record before its
+                            // in-memory retired marker becomes observable
+                            // (meta commit -> mark gap on the gc thread);
+                            // a missing record under a live interval
+                            // mapping is that concurrent retirement itself,
+                            // not corruption -- skip like is_retired does;
+                            // any other fault still fails hard
+                            Some(current) if current == file_id && err == OpCode::NotFound => {}
                             Some(current) if current == file_id => return Err(err),
                             Some(_) => retry.push(addr),
-                            None => stale = true,
+                            None => {}
                         }
-                    }
-                    if stale {
-                        continue;
                     }
                     continue;
                 }

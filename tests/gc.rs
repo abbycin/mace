@@ -1,3 +1,5 @@
+mod common;
+
 use mace::observe::{CounterMetric, HistogramMetric, InMemoryObserver};
 #[cfg(feature = "extra_check")]
 use mace::testing;
@@ -48,11 +50,11 @@ fn compressed_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen
 fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
     enable_compression: bool,
 ) -> Result<(), OpCode> {
-    let _hook_lock = testing::checkpoint_test_lock();
+    // no hooks installed here; gc_round serializes itself via hooks_lock
     let path = RandomPath::new();
     let mut opt = Options::new(&*path);
     opt.sync_on_write = true;
-    opt.gc_timeout = 60_000;
+    common::deterministic_gc(&mut opt);
     opt.gc_eager = true;
     opt.data_garbage_ratio = 1;
     opt.blob_garbage_ratio = 1;
@@ -145,7 +147,7 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
 
     let mut gc_opt = Options::new(&*path);
     gc_opt.sync_on_write = true;
-    gc_opt.gc_timeout = 60_000;
+    common::deterministic_gc(&mut gc_opt);
     gc_opt.gc_eager = true;
     gc_opt.data_garbage_ratio = 1;
     gc_opt.blob_garbage_ratio = 1;
@@ -163,15 +165,13 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
         assert_eq!(view.get(key)?.slice(), d4.as_slice());
     }
     drop(view);
-
-    mace.enable_gc();
     let data_gc_before = mace.data_gc_count();
     let blob_gc_before = mace.blob_gc_count();
-    let gc_deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < gc_deadline
-        && (mace.data_gc_count() == data_gc_before || mace.blob_gc_count() == blob_gc_before)
-    {
-        mace.start_gc();
+    for _ in 0..3 {
+        common::gc_round(&mace, Duration::from_secs(10));
+        if mace.data_gc_count() > data_gc_before && mace.blob_gc_count() > blob_gc_before {
+            break;
+        }
     }
     assert!(
         mace.data_gc_count() > data_gc_before,
@@ -188,12 +188,14 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
 
     let mut reopen = Options::new(&*path);
     reopen.sync_on_write = true;
-    reopen.gc_timeout = 60_000;
+    common::deterministic_gc(&mut reopen);
     reopen.gc_eager = true;
     reopen.data_garbage_ratio = 1;
     reopen.blob_garbage_ratio = 1;
     reopen.data_file_size = 64 << 10;
     reopen.blob_file_size = 64 << 10;
+    // teardown-only flag: wipes db_root when this final instance drops
+    reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate()?)?;
     let bucket = mace.get_bucket("stats")?;
     testing::assert_persisted_gc_stats(&mace);
@@ -204,7 +206,7 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
     for key in &data_keys {
         assert_eq!(view.get(key)?.slice(), d4.as_slice());
     }
-    mace.start_gc();
+    common::gc_round(&mace, Duration::from_secs(30));
     testing::assert_persisted_gc_stats(&mace);
     Ok(())
 }
@@ -325,6 +327,8 @@ fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<()
     reopen.gc_eager = true;
     reopen.data_garbage_ratio = 1;
     reopen.data_file_size = 16 << 10;
+    // teardown-only flag: wipes db_root when this final instance drops
+    reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate()?)?;
     testing::assert_persisted_gc_stats(&mace);
     let bucket = mace.get_bucket("rewrite_junk_handoff")?;
@@ -480,6 +484,7 @@ fn run_lagging_checkpoint_retire_cut(
         }
     }
     let txn = bucket.begin()?;
+    let del_ts = testing::txn_start_ts(&txn);
     for key in &keys {
         txn.del(key)?;
     }
@@ -488,7 +493,17 @@ fn run_lagging_checkpoint_retire_cut(
         testing::checkpoint_and_wait(&bucket);
     }
 
+    // determinism (extra_check): production publishes the safe waterline on
+    // the collector's own polling cadence; drive cycles until the deleted
+    // versions are collectible so the gc loop below is not racing a
+    // background thread. no wall-clock sleep involved
+    assert!(
+        common::collector_rounds_until(&bucket, 8, || testing::safe_exclusive(&bucket) > del_ts),
+        "deleted versions must become collectible before the gc loop starts"
+    );
+
     let (checkpoint_ready_tx, checkpoint_ready_rx) = channel();
+
     let (checkpoint_release_tx, checkpoint_release_rx) = channel();
     let checkpoint_release_rx = Arc::new(Mutex::new(checkpoint_release_rx));
     let (gc_ready_tx, gc_ready_rx) = channel();
@@ -549,8 +564,33 @@ fn run_lagging_checkpoint_retire_cut(
         }
     });
     gc_ready_rx
-        .recv_timeout(Duration::from_secs(10))
-        .unwrap_or_else(|_| panic!("gc must reach {kind:?} {cut:?} ordinary reclaim cut"));
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            let gc_runs = counter_value(&observer, CounterMetric::GcRun);
+            let blob_obsolete = counter_value(&observer, CounterMetric::GcBlobObsoleteFile);
+            let data_obsolete = counter_value(&observer, CounterMetric::GcDataObsoleteFile);
+            let blob_files: Vec<String> = std::fs::read_dir(bucket.options().data_root())
+                .map(|iter| {
+                    iter.flatten()
+                        .filter(|e| {
+                            e.file_name()
+                                .to_string_lossy()
+                                .starts_with(Options::BLOB_PREFIX)
+                        })
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            panic!(
+                "gc must reach {kind:?} {cut:?} ordinary reclaim cut; \
+                 gc_rounds_completed={gc_runs} data_gc={} blob_gc={} \
+                 data_obsolete={data_obsolete} blob_obsolete={blob_obsolete} \
+                 blob_files={blob_files:?} {}",
+                mace.data_gc_count(),
+                mace.blob_gc_count(),
+                testing::debug_snapshot(&mace)
+            );
+        });
 
     match schedule {
         CheckpointSchedule::BeforeGc => {
@@ -630,6 +670,8 @@ fn run_lagging_checkpoint_retire_cut(
     reopen.blob_garbage_ratio = 1;
     reopen.data_file_size = 256 << 10;
     reopen.blob_file_size = 256 << 10;
+    // teardown-only flag: wipes db_root when this final instance drops
+    reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate()?)?;
     testing::assert_persisted_gc_stats(&mace);
     Ok(())
@@ -863,6 +905,8 @@ fn run_publishing_checkpoint_reresolves_owner(
     reopen.blob_garbage_ratio = 1;
     reopen.data_file_size = 16 << 10;
     reopen.blob_file_size = 16 << 10;
+    // teardown-only flag: wipes db_root when this final instance drops
+    reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate()?)?;
     testing::assert_persisted_gc_stats(&mace);
     Ok(())
@@ -916,12 +960,8 @@ fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
     }
     testing::assert_persisted_gc_stats(&mace);
 
-    mace.enable_gc();
     let data_gc_before = mace.data_gc_count();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && mace.data_gc_count() == data_gc_before {
-        mace.start_gc();
-    }
+    common::gc_rounds_until(&mace, 8, || mace.data_gc_count() > data_gc_before);
     assert!(
         mace.data_gc_count() > data_gc_before,
         "expected data GC to run"
@@ -940,6 +980,8 @@ fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
     reopen.blob_garbage_ratio = 1;
     reopen.data_file_size = 64 << 10;
     reopen.blob_file_size = 64 << 10;
+    // teardown-only flag: wipes db_root when this final instance drops
+    reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate()?)?;
     testing::assert_persisted_gc_stats(&mace);
     for name in ["alpha", "beta"] {
@@ -950,7 +992,7 @@ fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
         assert_eq!(view.get("blob_000")?.slice(), blob_v2.as_slice());
         assert_eq!(view.get("blob_001")?.slice(), blob_v1.as_slice());
     }
-    mace.start_gc();
+    common::gc_round(&mace, Duration::from_secs(30));
     testing::assert_persisted_gc_stats(&mace);
     Ok(())
 }
@@ -991,7 +1033,7 @@ fn gc_data() -> Result<(), OpCode> {
     let mut deleted = vec![];
     #[allow(clippy::needless_range_loop)]
     for i in 0..cap {
-        if rand::random_bool(0.5) {
+        if i % 2 == 0 {
             kv.del(&pair[i])?;
             deleted.push(i);
         } else {
@@ -999,15 +1041,42 @@ fn gc_data() -> Result<(), OpCode> {
         }
     }
     kv.commit()?;
+    // publish the tombstone state before churning survivors: consolidation
+    // against this checkpoint is what retires old pages and surfaces their
+    // space as junk in data-file stats
+    db.checkpoint_and_wait();
 
+    // tombstones alone never surface as junk in data-file stats: the pages
+    // holding the deleted entries are only rewritten when later writes
+    // consolidate them, retiring the old pages whose free space lets the
+    // decline-rate selector pick the file (same release step as gc_blob)
+    for &i in &rest {
+        let kv = db.begin().unwrap();
+        kv.update(&pair[i], &pair[i])?;
+        kv.commit()?;
+    }
+    db.checkpoint_and_wait();
+
+    // gc_timeout=20 arms a real background tick (production shape); the
+    // bounded settle loop bridges the aging window (stat up2 must fall
+    // behind the current tick) that back-to-back synchronous rounds cannot
     let data_gc_count = mace.data_gc_count();
+    let reclaimed =
+        common::gc_rounds_until_with_settle(&mace, 40, Duration::from_millis(120), || {
+            mace.data_gc_count() > data_gc_count
+        });
+    assert!(
+        reclaimed,
+        "scenario precondition: data gc must run once page rewrites \
+         released the deleted half"
+    );
     let mut opt = db.options().clone();
     drop(db);
     drop(mace);
     opt.tmp_store = true;
     let opt = opt.validate().unwrap();
 
-    if data_gc_count > 0 {
+    {
         let mace = Mace::new(opt).unwrap();
         let db = mace.get_bucket("x").unwrap();
         let view = db.view().unwrap();
@@ -1099,14 +1168,32 @@ fn gc_blob() -> Result<(), OpCode> {
         view.get(k).unwrap();
     }
 
-    let blob_gc_count = mace.blob_gc_count();
+    // rewriting the surviving keys' pages is what releases the deleted keys'
+    // blob references (page consolidation drops them behind the safe
+    // waterline); without a write after the deletes the old blobs stay
+    // referenced forever and no blob gc can ever select them
+    for &i in &rest {
+        let kv = db.begin().unwrap();
+        kv.update(&pair[i], &val)?;
+        kv.commit()?;
+    }
+    db.checkpoint_and_wait();
+    let reclaimed =
+        common::gc_rounds_until_with_settle(&mace, 40, Duration::from_millis(120), || {
+            mace.blob_gc_count() > 0
+        });
+    assert!(
+        reclaimed,
+        "scenario precondition: blob gc must advance once deleted-key blob \
+         references are released by page rewrites"
+    );
     let mut opt = db.options().clone();
     drop(db);
     drop(mace);
     opt.tmp_store = true;
     let opt = opt.validate().unwrap();
 
-    if blob_gc_count > 0 {
+    {
         let mace = Mace::new(opt).unwrap();
         let db = mace.get_bucket("x").unwrap();
         let view = db.view().unwrap();
@@ -1312,7 +1399,7 @@ fn gc_blob_single_gc_run_stays_deleted_after_reopen() -> Result<(), OpCode> {
     tx.commit()?;
     db.checkpoint();
 
-    mace.start_gc();
+    common::gc_round(&mace, Duration::from_secs(30));
 
     let mut reopen = db.options().clone();
     drop(db);
@@ -1400,8 +1487,7 @@ fn gc_blob_with_compression() -> Result<(), OpCode> {
     // rewrite timing is scheduler-dependent in the unified file-gc path;
     // this test only checks compressed blob visibility and reopen correctness
     for _ in 0..8 {
-        mace.start_gc();
-        std::thread::sleep(Duration::from_millis(10));
+        common::gc_round(&mace, Duration::from_secs(30));
     }
 
     let view = db.view()?;
@@ -1471,7 +1557,7 @@ fn gc_blob_toggle_compression() -> Result<(), OpCode> {
             db.checkpoint();
         }
 
-        mace.start_gc();
+        common::gc_round(&mace, Duration::from_secs(30));
         mace.disable_gc();
 
         drop(db);
@@ -1502,8 +1588,7 @@ fn gc_blob_toggle_compression() -> Result<(), OpCode> {
     kv.del("k2")?;
     kv.commit()?;
 
-    mace.start_gc();
-    std::thread::sleep(Duration::from_millis(200));
+    common::gc_round(&mace, Duration::from_secs(30));
 
     let view = db.view()?;
     assert_eq!(view.get("k1").unwrap().slice(), v1.as_slice());
@@ -1673,13 +1758,8 @@ fn gc_wal() {
 
     // recycled wal files must be removed, never kept as backups
     let first = db.options().wal_file(0, 1);
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline {
-        mace.start_gc();
-        if !first.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    if common::gc_rounds_until(&mace, 8, || !first.exists()) {
+        return;
     }
 
     let mut files = Vec::new();
@@ -2138,7 +2218,7 @@ fn relaxed_multi_group_wal_is_recycled_after_checkpoints() -> Result<(), OpCode>
     opt.sync_on_write = false;
     opt.concurrent_write = 2;
     opt.wal_file_size = 4 << 10;
-    opt.gc_timeout = 60_000;
+    common::deterministic_gc(&mut opt);
     opt.checkpoint_nudge_ms = 0;
     opt.data_file_size = 1 << 30;
     let log_root = opt.log_root();
@@ -2156,20 +2236,14 @@ fn relaxed_multi_group_wal_is_recycled_after_checkpoints() -> Result<(), OpCode>
         tx.upsert(format!("b_{round}"), &payload)?;
         tx.commit()?;
     }
-    db.checkpoint();
+    // publish the per-group floors before driving recycle rounds
+    db.checkpoint_and_wait();
 
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut recycled = false;
-    while Instant::now() < deadline {
-        mace.start_gc();
+    let recycled = common::gc_rounds_until(&mace, 8, || {
         let stream0 = wal_file_ids(&log_root, 0);
         let stream1 = wal_file_ids(&log_root, 1);
-        if stream0.len() < 4 && stream1.len() < 4 {
-            recycled = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        stream0.len() < 4 && stream1.len() < 4
+    });
     assert!(
         recycled,
         "relaxed multi-group wal must be recycled: stream0={:?} stream1={:?}",
@@ -2184,4 +2258,102 @@ fn relaxed_multi_group_wal_is_recycled_after_checkpoints() -> Result<(), OpCode>
         assert_eq!(view.get(format!("b_{round}"))?.slice(), payload.as_slice());
     }
     Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn start_gc_fires_round_completion_signal() {
+    let _hook_lock = testing::checkpoint_test_lock();
+    let _hook_reset = HookReset;
+    let path = RandomPath::tmp();
+    let observer = Arc::new(InMemoryObserver::new(8));
+    let mut opt = Options::new(&*path);
+    opt.observer = observer.clone();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    // infallible on purpose: the hook table is global and bare synchronous
+    // start_gc drivers (Again-retry arms, per-round pacing) still fire into
+    // this slot from parallel tests; after this test drops rx, a stale fire
+    // must not panic their gc threads
+    testing::set_gc_completed_hook(Some(Arc::new(move || {
+        let _ = tx.send(());
+    })));
+
+    let baseline = counter_value(&observer, CounterMetric::GcRun);
+    mace.start_gc();
+
+    // the completion hook fires inside run(), before start_gc's semaphore is
+    // posted, so the signal must already be observable when this call returns
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("explicit start_gc must report round completion");
+    assert_eq!(
+        counter_value(&observer, CounterMetric::GcRun),
+        baseline + 1,
+        "exactly one background round must have run"
+    );
+
+    let snap = testing::debug_snapshot(&mace);
+    assert!(
+        snap.contains("data_gc_runs="),
+        "snapshot must carry gc gauges: {snap}"
+    );
+    assert!(
+        snap.contains("abort_clean_tasks="),
+        "snapshot must carry abort-clean gauge: {snap}"
+    );
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn zero_gc_timeout_only_runs_on_explicit_start() {
+    let _hook_lock = testing::checkpoint_test_lock();
+    let _hook_reset = HookReset;
+    let path = RandomPath::tmp();
+    let observer = Arc::new(InMemoryObserver::new(8));
+    let mut opt = Options::new(&*path);
+    opt.observer = observer.clone();
+    common::deterministic_gc(&mut opt);
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    testing::set_gc_completed_hook(Some(Arc::new(move || {
+        let _ = tx.send(());
+    })));
+
+    let baseline = counter_value(&observer, CounterMetric::GcRun);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        counter_value(&observer, CounterMetric::GcRun),
+        baseline,
+        "gc_timeout=0 must disable the background timer branch entirely"
+    );
+
+    mace.start_gc();
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("explicit round must still complete under gc_timeout=0");
+    assert_eq!(counter_value(&observer, CounterMetric::GcRun), baseline + 1);
+
+    // the zero-timeout contract holds on both routes; this engine is durable
+    // (shared logging), so repeat the idle/explicit pair on a relaxed one
+    let relaxed_path = RandomPath::tmp();
+    let relaxed_observer = Arc::new(InMemoryObserver::new(8));
+    let mut relaxed_opt = Options::new(&*relaxed_path);
+    relaxed_opt.observer = relaxed_observer.clone();
+    relaxed_opt.sync_on_write = false;
+    common::deterministic_gc(&mut relaxed_opt);
+    let relaxed = Mace::new(relaxed_opt.validate().unwrap()).unwrap();
+
+    let relaxed_baseline = counter_value(&relaxed_observer, CounterMetric::GcRun);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        counter_value(&relaxed_observer, CounterMetric::GcRun),
+        relaxed_baseline,
+        "relaxed route must also arm no background timer under gc_timeout=0"
+    );
+    relaxed.start_gc();
+    assert_eq!(
+        counter_value(&relaxed_observer, CounterMetric::GcRun),
+        relaxed_baseline + 1
+    );
 }

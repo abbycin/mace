@@ -35,11 +35,10 @@ impl Drop for HookReset {
 }
 
 /// hook-based tests share the process-global testing hooks, so they must run
-/// one at a time (same pattern as tests/si.rs)
-fn suite_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-    LOCK.lock().expect("suite lock must work")
+/// one at a time (same pattern as tests/si.rs); routed through the single
+/// global hooks lock so parallel HookReset drops cannot erase our slots
+fn suite_lock() -> parking_lot::MutexGuard<'static, ()> {
+    mace::testing::hooks_lock()
 }
 
 #[test]

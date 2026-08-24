@@ -722,7 +722,7 @@ entries:
         note: data/blob rewrite cuts before and after manifest commit verify recovery across the durable replacement ownership boundary
       - type: failpoint-test
         path: tests/prod_recovery_failpoints.rs
-        note: collecting-junk data rewrite cuts require the checkpoint to grow the current victim collector queue, crash before and after manifest commit, then verify latest-value visibility and exact physical accounting after reopen
+        note: collecting-junk data rewrite cuts first durably isolate the oversized victim as the only rewrite candidate, require the checkpoint to grow that victim's collector queue, crash before and after manifest commit, then verify latest-value visibility and exact physical accounting after reopen
       - type: fuzz-regression
         path: fuzz/fuzz_targets/publish_gc_reopen.rs
         note: publish_gc_reopen exercises lagging-view checkpoint, fully-obsolete reclaim, rewrite, and reopen lifecycle combinations
@@ -2187,3 +2187,135 @@ entries:
       - type: unit-test
         path: src/cc/log.rs
         note: shared_checkpoint_ages_only_logical_groups_with_wal_activity and update_checkpoint_advances_after_checkpoint_is_enabled
+
+  - id: test.gc_round_completion_signal
+    title: every completed garbage-collector run must be observable as a completion event
+    kind: local
+    status: active
+    confidence: medium
+    statement: >
+      When GarbageCollector::run() executes to completion on any trigger path
+      (an explicit start_gc command or the background timer), the
+      extra_check gc_completed hook must have been invoked exactly once for
+      that run, after the GcRunMicros histogram record and outside any engine
+      mutex. A run that panics mid-way must not fire the signal. The hook is
+      test-only infrastructure; production builds compile it out.
+    watch_points:
+      - path: src/store/gc.rs
+        note: fire_gc_completed call at the end of run() is the single signal point for all trigger paths
+      - path: src/testing.rs
+        note: gc_completed hook slot, set/clear accessors, and clear_hooks coverage live here
+    witnesses:
+      - path: src/store/gc.rs
+        note: run() ends with the cfg-gated fire after the histogram record
+      - path: src/testing.rs
+        note: fire_gc_completed clones the slot under the hooks mutex and invokes outside engine locks
+    failure_symptoms:
+      - a test waiting on the completion channel times out while GcRun counter incremented, meaning the signal point moved or was skipped
+      - a signal fires for a run that later panicked, masking engine faults as successes
+    verifiers:
+      - type: regression-test
+        path: tests/gc.rs
+        note: start_gc_fires_round_completion_signal asserts signal arrival and exactly one GcRun increment per explicit start
+
+  - id: test.failpoint_hit_observable
+    title: failpoint consultations must be countable and reportable independent of their action
+    kind: local
+    status: active
+    confidence: medium
+    statement: >
+      Every consultation of an armed failpoint rule (named or fs) must increment
+      a per-rule hit counter that survives whether or not the action fired, and
+      a snapshot must list all active rules with action, nth, hit count and
+      override marker. Scoped arming must snapshot the effective rule each
+      name shadows at arm time and, on drop, restore that shadowed rule per
+      table (strict LIFO), so same-process tests can neither leak overrides
+      nor silence env-derived rules, and nested same-name scopes unwind in
+      order.
+      Counters are test-only (failpoints feature) and never affect engine
+      behavior.
+    watch_points:
+      - path: src/utils/failpoint.rs
+        note: named_hits and fs_hits accounting inside hit_named and hit_fs live here
+      - path: src/utils/failpoint.rs
+        note: disarm_scoped restores the arm-time shadowed rule per table (override_rules and named_rules independently); FailpointScope drop delegates to it
+      - path: src/testing.rs
+        note: failpoint_hits, failpoint_snapshot and failpoint_scope exposure lives here
+    witnesses:
+      - path: src/utils/failpoint.rs
+        note: hit_named and hit_fs bump the maps before nth evaluation; snapshot formats every active rule
+      - path: src/utils/failpoint.rs
+        note: unit tests cover nth-independent counting, snapshot content, scoped removal and same-name env-rule restoration
+    failure_symptoms:
+      - a crash-window timeout cannot distinguish "engine never reached the injection site" from "reached but did not abort"
+      - an armed override stays active after its scope ended and crashes an unrelated later test
+    verifiers:
+      - type: unit-test
+        path: src/utils/failpoint.rs
+        note: named_hit_count_tracks_consultations_independent_of_nth, fs_hit_counts_track_consultations, scoped_arm_removes_override_and_effective_rule_on_drop, scoped_drop_restores_shadowed_rule_lifo and nested_same_name_scopes_unwind_lifo
+      - type: failpoint-test
+        path: tests/prod_generation_failpoints.rs
+        note: wait_for_crash polls any_rule_actioned and attributes both failure shapes (never-acted versus acted-but-survived) via the rule snapshot, so benign pre-nth consultations of nth>1 rules cannot fail the window early
+
+
+  - id: test.collector_cycle_completion_signal
+    title: every completed collector cycle must be observable as a completion event
+    kind: local
+    status: active
+    confidence: medium
+    statement: >
+      When run_collect_cycle finishes a full maintenance cycle (oracle cut,
+      registration scan, possible safe publication, committed-fact prune), the
+      extra_check collector_completed hook must have been invoked exactly once
+      for that cycle, after prune_committed_facts and outside any engine mutex.
+      The signal fires even for idle cycles that published no safe boundary;
+      tests asserting boundary advancement must check safe_exclusive after the
+      signal rather than assume every signal carried a publication. The hook is
+      test-only infrastructure compiled out of production builds.
+    watch_points:
+      - path: src/cc/context.rs
+        note: fire_collector_completed call at the end of run_collect_cycle lives here
+      - path: src/testing.rs
+        note: collector_completed hook slot, set/clear accessors, and clear_hooks coverage live here
+    witnesses:
+      - path: src/cc/context.rs
+        note: the cfg-gated fire sits after the published_safe!=0 prune block, holding no lock
+      - path: src/testing.rs
+        note: fire_collector_completed clones the slot under the hooks mutex and invokes outside engine locks
+    failure_symptoms:
+      - a test waiting on the collector-completed channel times out while safe_exclusive advanced, meaning the signal point moved or was skipped
+      - a test assumes every completion signal carried a safe publication and misattributes idle cycles
+    verifiers:
+      - type: regression-test
+        path: tests/si.rs
+        note: all visibility suites consume common::collector_rounds_until; lagging-snapshot and post-cut-view tests assert safe_exclusive/fact_present after signal-driven rounds
+
+  - id: test.timeout_zero_disables_background_trigger
+    title: under extra_check, gc_timeout=0 must arm no background timer branch
+    kind: local
+    status: active
+    confidence: medium
+    statement: >
+      In extra_check builds, a garbage collector opened with gc_timeout=0 must
+      only run on explicit commands: the parked wait must be long (never a ZERO
+      poll) and the timer branch must be skipped, so an idle engine performs no
+      background rounds. Production builds compile the zero-timeout handling out
+      and keep the original loop byte-for-byte; there gc_timeout=0 degenerates
+      into a busy poll and must not be used.
+    watch_points:
+      - path: src/store/gc.rs
+        note: cfg-gated wait_timeout shadow and timer-branch continue guard inside gc_thread live here
+      - path: src/utils/options.rs
+        note: gc_timeout doc must state the extra_check-only semantics and warn other builds off zero
+    witnesses:
+      - path: src/store/gc.rs
+        note: both zero-timeout blocks are #[cfg(feature = "extra_check")]; the production loop text is unchanged
+      - path: tests/gc.rs
+        note: zero_gc_timeout_only_runs_on_explicit_start asserts an idle 300ms window performs zero rounds and an explicit start performs exactly one
+    failure_symptoms:
+      - an idle gc_timeout=0 engine runs background rounds and breaks deterministic test sequencing
+      - a production user sets gc_timeout=0 and the gc thread busy-spins
+    verifiers:
+      - type: regression-test
+        path: tests/gc.rs
+        note: zero_gc_timeout_only_runs_on_explicit_start

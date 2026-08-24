@@ -110,6 +110,11 @@ struct State {
     fs_rules: Vec<FsRule>,
     /// in-process rules override environment rules
     override_rules: HashMap<String, Rule>,
+    /// total consultations per named rule since process start, independent of
+    /// nth semantics (a rule consulted but not yet acting still counts)
+    named_hits: HashMap<String, u64>,
+    /// same accounting for fs rules, keyed by op plus matcher
+    fs_hits: HashMap<String, u64>,
 }
 
 impl State {
@@ -119,6 +124,8 @@ impl State {
             named_rules: HashMap::new(),
             fs_rules: Vec::new(),
             override_rules: HashMap::new(),
+            named_hits: HashMap::new(),
+            fs_hits: HashMap::new(),
         }
     }
 
@@ -139,6 +146,7 @@ impl State {
 
     fn hit_named(&mut self, name: &str) -> Option<FailAction> {
         let rule = self.named_rules.get_mut(name)?;
+        *self.named_hits.entry(name.to_string()).or_insert(0) += 1;
         rule.hit().then_some(rule.action)
     }
 
@@ -147,12 +155,28 @@ impl State {
             if !rule.matches(op, path) {
                 continue;
             }
+            let key = fs_hit_key(rule.op, rule.matcher.as_deref());
+            *self.fs_hits.entry(key).or_insert(0) += 1;
             if !rule.hit() {
                 return None;
             }
             return Some(rule.action);
         }
         None
+    }
+
+    /// whether any effective rule reached its acting consultation (the nth
+    /// hit for nth rules, the first otherwise); raw hit totals cannot make
+    /// this call because they also count benign pre-nth consultations
+    fn any_actioned(&self) -> bool {
+        self.named_rules.iter().any(|(name, rule)| {
+            let hits = self.named_hits.get(name).copied().unwrap_or(0);
+            hits >= rule.nth.unwrap_or(1)
+        }) || self.fs_rules.iter().any(|rule| {
+            let key = fs_hit_key(rule.op, rule.matcher.as_deref());
+            let hits = self.fs_hits.get(&key).copied().unwrap_or(0);
+            hits >= rule.nth.unwrap_or(1)
+        })
     }
 }
 
@@ -163,6 +187,11 @@ enum ParsedAction {
 
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// canonical hit-accounting key for one fs rule
+fn fs_hit_key(op: FsOp, matcher: Option<&str>) -> String {
+    format!("{}[{}]", op.rule_name(), matcher.unwrap_or(""))
 }
 
 fn parse_rules(raw: &str) -> ParsedRules {
@@ -316,7 +345,9 @@ pub(crate) fn check(name: &str) -> Result<(), OpCode> {
     }
 }
 
-/// arm in-process rules that override environment rules
+/// arm in-process rules that override environment rules; consumers live in
+/// testing (extra_check) and unit tests
+#[cfg(any(test, feature = "extra_check"))]
 pub(crate) fn arm_rules(raw: &str) {
     let mut lk = global_state().lock().expect("failpoint lock poisoned");
     let parsed = parse_rules(raw);
@@ -324,6 +355,72 @@ pub(crate) fn arm_rules(raw: &str) {
         lk.named_rules.insert(name.clone(), rule);
         lk.override_rules.insert(name, rule);
     }
+}
+
+/// scope guard for `arm_rules_scoped`: on drop, every armed name restores the
+/// rule it shadowed at arm time per table (strict LIFO), so nested same-name
+/// scopes unwind correctly, same-process tests can neither leak overrides
+/// into each other nor silence env-derived rules, and an env-derived rule is
+/// never promoted into override_rules (which refresh would keep forever)
+#[cfg(any(test, feature = "extra_check"))]
+pub(crate) struct FailpointScope {
+    /// (name, rule shadowed in override_rules, rule shadowed in named_rules)
+    armed: Vec<(String, Option<Rule>, Option<Rule>)>,
+}
+
+#[cfg(any(test, feature = "extra_check"))]
+fn disarm_scoped(lk: &mut State, armed: &[(String, Option<Rule>, Option<Rule>)]) {
+    for (name, override_prev, named_prev) in armed {
+        // restore each table to exactly what this scope covered over
+        match override_prev {
+            Some(rule) => {
+                lk.override_rules.insert(name.clone(), *rule);
+            }
+            None => {
+                lk.override_rules.remove(name);
+            }
+        }
+        match named_prev {
+            Some(rule) => {
+                lk.named_rules.insert(name.clone(), *rule);
+            }
+            None => {
+                // refresh only re-merges overrides; without removing the
+                // effective copy the armed rule would stay active until the
+                // next env change
+                lk.named_rules.remove(name);
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "extra_check"))]
+impl Drop for FailpointScope {
+    fn drop(&mut self) {
+        let mut lk = global_state().lock().expect("failpoint lock poisoned");
+        disarm_scoped(&mut lk, &self.armed);
+    }
+}
+
+/// arm named rules for the lifetime of the returned scope; fs rules are not
+/// supported (the scoped use case is in-process crash-site arming)
+#[cfg(any(test, feature = "extra_check"))]
+pub(crate) fn arm_rules_scoped(raw: &str) -> FailpointScope {
+    let parsed = parse_rules(raw);
+    assert!(
+        parsed.fs_rules.is_empty(),
+        "arm_rules_scoped does not support fs rules ({raw:?}): scoped arming targets in-process named sites only"
+    );
+    let mut lk = global_state().lock().expect("failpoint lock poisoned");
+    let mut armed = Vec::with_capacity(parsed.named_rules.len());
+    for (name, rule) in parsed.named_rules {
+        let override_prev = lk.override_rules.get(&name).cloned();
+        let named_prev = lk.named_rules.get(&name).cloned();
+        lk.override_rules.insert(name.clone(), rule);
+        lk.named_rules.insert(name.clone(), rule);
+        armed.push((name, override_prev, named_prev));
+    }
+    FailpointScope { armed }
 }
 
 pub(crate) fn crash(name: &str) {
@@ -364,9 +461,71 @@ pub(crate) fn check_fs(op: FsOp, path: &Path) -> Result<(), io::Error> {
     }
 }
 
+/// total consultations across every armed rule since process start; the
+/// crash-window wait loops only need "did any injection fire" and must not
+/// depend on knowing the rule name (env-derived and in-process armed rules
+/// coexist in the crash children)
+pub fn hits_total() -> u64 {
+    let lk = global_state().lock().expect("failpoint lock poisoned");
+    lk.named_hits.values().sum::<u64>() + lk.fs_hits.values().sum::<u64>()
+}
+
+/// total consultations of a named rule since process start, regardless of
+/// whether the action fired (nth rules only act on their nth consultation)
+pub fn hit_count(name: &str) -> u64 {
+    let lk = global_state().lock().expect("failpoint lock poisoned");
+    lk.named_hits.get(name).copied().unwrap_or(0)
+}
+
+/// whether any armed rule has been consulted enough times to act; crash-window
+/// waits use this to attribute a timeout without mistaking benign pre-nth
+/// consultations of nth>1 rules for a survived injection
+pub fn any_rule_actioned() -> bool {
+    let lk = global_state().lock().expect("failpoint lock poisoned");
+    lk.any_actioned()
+}
+
+/// every active rule with action, nth, hit count and override marker; used by
+/// tests to attribute a crash-window timeout to "site never reached" versus
+/// "reached but did not abort"
+pub fn snapshot() -> String {
+    let lk = global_state().lock().expect("failpoint lock poisoned");
+    let mut out = String::from("failpoint rules:");
+    for (name, rule) in &lk.named_rules {
+        let hits = lk.named_hits.get(name).copied().unwrap_or(0);
+        let marker = if lk.override_rules.contains_key(name) {
+            " [override]"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "\n  {name} action={:?} nth={:?} hits={hits}{marker}",
+            rule.action, rule.nth
+        ));
+    }
+    for rule in &lk.fs_rules {
+        let key = fs_hit_key(rule.op, rule.matcher.as_deref());
+        let hits = lk.fs_hits.get(&key).copied().unwrap_or(0);
+        out.push_str(&format!(
+            "\n  {} matcher={:?} nth={:?} hits={hits}",
+            rule.op.rule_name(),
+            rule.matcher,
+            rule.nth
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ActionSpec, FailAction, FsOp, ParsedRules, State, normalize_path, parse_rules};
+    use super::{
+        ActionSpec, FailAction, FsOp, ParsedRules, State, check, disarm_scoped, fs_hit_key,
+        normalize_path, parse_rules, snapshot,
+    };
+    use crate::{
+        OpCode,
+        utils::failpoint::{arm_rules, arm_rules_scoped, hit_count},
+    };
     use std::{collections::HashMap, io::ErrorKind, path::Path};
 
     fn state_with(raw: &str) -> State {
@@ -379,6 +538,8 @@ mod tests {
             named_rules,
             fs_rules,
             override_rules: HashMap::new(),
+            named_hits: HashMap::new(),
+            fs_hits: HashMap::new(),
         }
     }
 
@@ -440,7 +601,160 @@ mod tests {
     }
 
     #[test]
+    fn scoped_arm_removes_override_and_effective_rule_on_drop() {
+        {
+            let _scope = arm_rules_scoped("mace_unit_scoped_probe=io");
+            assert_eq!(check("mace_unit_scoped_probe"), Err(OpCode::IoError));
+        }
+
+        assert_eq!(check("mace_unit_scoped_probe"), Ok(()));
+        let snap = snapshot();
+        assert!(!snap.contains("mace_unit_scoped_probe"));
+    }
+
+    #[test]
+    fn actioned_predicate_requires_reaching_the_nth_consultation() {
+        const NAME: &str = "mace_unit_actioned_probe";
+        let mut state = state_with(&format!("{NAME}=io@3"));
+        assert!(
+            !state.any_actioned(),
+            "zero consultations must not count as acted"
+        );
+
+        assert_eq!(state.hit_named(NAME), None, "nth=3 swallows hit 1");
+        assert!(
+            !state.any_actioned(),
+            "pre-nth consultation must stay benign"
+        );
+        assert_eq!(state.hit_named(NAME), None, "nth=3 swallows hit 2");
+        assert!(!state.any_actioned());
+        assert_eq!(
+            state.hit_named(NAME),
+            Some(FailAction::IoError),
+            "nth=3 acts on hit 3"
+        );
+        assert!(
+            state.any_actioned(),
+            "reaching the nth consultation must report acted"
+        );
+    }
+
+    #[test]
+    fn scoped_drop_restores_shadowed_rule_lifo() {
+        // state-level simulation of the env interplay: the state carries an
+        // env-derived NAME=io (no nth) as the effective rule, then a scope
+        // arms NAME=io@3 over it (shadowing it), then the scope drops
+        const NAME: &str = "mace_unit_scoped_env_probe";
+        let mut state = state_with(&format!("{NAME}=io"));
+
+        // arm exactly as arm_rules_scoped does: capture per-table shadows
+        // the env rule lives only in named_rules, so override_prev is None —
+        // disarm must NOT promote it into override_rules
+        let scope_rule = parse_rules(&format!("{NAME}=io@3"))
+            .named_rules
+            .remove(NAME)
+            .expect("scope rule must parse");
+        let override_prev = state.override_rules.get(NAME).cloned();
+        let named_prev = state.named_rules.get(NAME).cloned();
+        assert!(
+            override_prev.is_none(),
+            "env source must not sit in overrides"
+        );
+        state.override_rules.insert(NAME.to_string(), scope_rule);
+        state.named_rules.insert(NAME.to_string(), scope_rule);
+        assert_eq!(state.hit_named(NAME), None, "nth=3 swallows hit 1");
+
+        // disarm restores each table independently (LIFO)
+        disarm_scoped(&mut state, &[(NAME.to_string(), override_prev, named_prev)]);
+        assert!(
+            !state.override_rules.contains_key(NAME),
+            "env-derived rule must never be promoted into override_rules"
+        );
+        assert_eq!(
+            state.hit_named(NAME),
+            Some(FailAction::IoError),
+            "the env-derived no-nth rule must be effective again"
+        );
+    }
+
+    #[test]
+    fn nested_same_name_scopes_unwind_lifo() {
+        // inner drop must restore the outer override, not erase it
+        const NAME: &str = "mace_unit_nested_probe";
+        let mut state = state_with("unrelated=panic");
+
+        // outer scope: io@2
+        let outer = parse_rules(&format!("{NAME}=io@2"))
+            .named_rules
+            .remove(NAME)
+            .unwrap();
+        state.override_rules.insert(NAME.to_string(), outer);
+        state.named_rules.insert(NAME.to_string(), outer);
+
+        // inner scope: panic, shadowing the outer override
+        let inner = parse_rules(&format!("{NAME}=panic"))
+            .named_rules
+            .remove(NAME)
+            .unwrap();
+        let inner_override_prev = state.override_rules.get(NAME).cloned();
+        let inner_named_prev = state.named_rules.get(NAME).cloned();
+        state.override_rules.insert(NAME.to_string(), inner);
+        state.named_rules.insert(NAME.to_string(), inner);
+
+        // inner drops first: the outer io@2 override comes back in BOTH tables
+        disarm_scoped(
+            &mut state,
+            &[(NAME.to_string(), inner_override_prev, inner_named_prev)],
+        );
+        assert!(state.override_rules.contains_key(NAME));
+        assert_eq!(state.hit_named(NAME), None, "outer nth=2 swallows hit 1");
+        assert_eq!(
+            state.hit_named(NAME),
+            Some(FailAction::IoError),
+            "outer override fires on its second consultation"
+        );
+    }
+
+    #[test]
     fn normalize_path_replaces_backslashes() {
         assert_eq!(normalize_path(Path::new(r"foo\bar\baz")), "foo/bar/baz");
+    }
+
+    #[test]
+    fn named_hit_count_tracks_consultations_independent_of_nth() {
+        arm_rules("mace_unit_hit_probe=io@2");
+
+        assert_eq!(hit_count("mace_unit_hit_probe"), 0);
+        assert_eq!(check("mace_unit_hit_probe"), Ok(()));
+        assert_eq!(hit_count("mace_unit_hit_probe"), 1);
+        assert_eq!(check("mace_unit_hit_probe"), Err(OpCode::IoError));
+        assert_eq!(hit_count("mace_unit_hit_probe"), 2);
+        assert_eq!(check("mace_unit_hit_probe"), Ok(()));
+        assert_eq!(hit_count("mace_unit_hit_probe"), 3);
+
+        let snap = snapshot();
+        assert!(snap.contains("mace_unit_hit_probe"));
+        assert!(snap.contains("hits=3"));
+        assert!(snap.contains("[override]"));
+    }
+
+    #[test]
+    fn fs_hit_counts_track_consultations() {
+        let mut state = state_with("mace_fs_sync_dir[/data/]=panic@2");
+
+        assert!(state.hit_fs(FsOp::SyncDir, "/data/x").is_none());
+        assert_eq!(
+            state
+                .fs_hits
+                .get(&fs_hit_key(FsOp::SyncDir, Some("/data/"))),
+            Some(&1)
+        );
+        assert!(state.hit_fs(FsOp::SyncDir, "/data/x").is_some());
+        assert_eq!(
+            state
+                .fs_hits
+                .get(&fs_hit_key(FsOp::SyncDir, Some("/data/"))),
+            Some(&2)
+        );
     }
 }

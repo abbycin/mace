@@ -646,6 +646,10 @@ impl<'a> TxnKV<'a> {
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check("mace_txn_commit_after_wal_sync")?;
         g.commit_fact(state.start_ts, || self.ctx.alloc_oracle());
+        // test-determinism wakeup (extra_check only; production relies on the
+        // collector's own polling cadence)
+        #[cfg(feature = "extra_check")]
+        self.ctx.request_collect();
 
         self.is_end.set(true);
         self.observe_counter(CounterMetric::TxnCommit, 1);
@@ -725,6 +729,9 @@ impl Drop for TxnKV<'_> {
                     state.begin_lsn.file_id,
                 );
                 g.abort_fact(state.start_ts);
+                // test-determinism wakeup (extra_check only)
+                #[cfg(feature = "extra_check")]
+                self.ctx.request_collect();
                 #[cfg(feature = "extra_check")]
                 crate::testing::fire_txn_abort_sync_point(
                     crate::testing::TxnAbortSyncPoint::AfterAbortFactBeforeAbortCleanEnqueue,

@@ -1,3 +1,5 @@
+mod common;
+
 use btree_store::BTree;
 use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use serde_json::Value;
@@ -197,7 +199,8 @@ fn global_options_concurrent_write_conflict_is_invalid() {
 #[test]
 fn bucket_limit_safety() {
     let path = RandomPath::tmp();
-    let opt = Options::new(&*path);
+    let mut opt = Options::new(&*path);
+    common::deterministic_gc(&mut opt);
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
 
     let mut buckets = Vec::new();
@@ -217,7 +220,7 @@ fn bucket_limit_safety() {
         loop {
             match mace.del_bucket(&name) {
                 Ok(_) => break,
-                Err(OpCode::Again) => std::thread::yield_now(),
+                Err(OpCode::Again) => mace.start_gc(),
                 Err(e) => panic!("Delete failed for {}: {:?}", name, e),
             }
         }
@@ -230,18 +233,12 @@ fn bucket_limit_safety() {
         "Counter should include pending-delete buckets"
     );
 
-    // run GC and wait for cleanup
-    mace.start_gc();
-
-    let mut success = false;
-    for _ in 0..50 {
-        if mace.nr_buckets() < after_del_count {
-            success = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(success, "nr_buckets was not decreased by GC");
+    // drive explicit rounds; each is a synchronous engine point
+    let released = common::gc_rounds_until(&mace, 8, || mace.nr_buckets() < after_del_count);
+    assert!(
+        released,
+        "engine did not release pending buckets within 8 explicit gc rounds"
+    );
 }
 
 #[test]
@@ -450,6 +447,7 @@ fn bucket_deletion_cleanup() {
     let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.data_file_size = 1024;
+    common::deterministic_gc(&mut opt);
     let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let b1 = db.begin().unwrap();
@@ -461,7 +459,8 @@ fn bucket_deletion_cleanup() {
     drop(db);
 
     while mace.del_bucket("x") == Err(OpCode::Again) {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // drive the pending-delete cleanup synchronously instead of sleeping
+        mace.start_gc();
     }
     drop(mace);
 
@@ -524,6 +523,7 @@ fn bucket_physical_file_cleanup() {
     let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.data_file_size = 1024;
+    common::deterministic_gc(&mut opt);
 
     let mut b1_files = Vec::new();
     let initial_files: std::collections::HashSet<std::ffi::OsString>;
@@ -566,23 +566,16 @@ fn bucket_physical_file_cleanup() {
         let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
         mace.del_bucket("b1").unwrap();
 
-        let mut success = false;
-        for _ in 0..10 {
-            mace.start_gc();
-            let mut has_remaining = false;
-            for name in &b1_files {
-                if opt.data_root().join(name).exists() {
-                    has_remaining = true;
-                    break;
-                }
-            }
-            if !has_remaining {
-                success = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        assert!(success, "files of b1 were not deleted: {:?}", b1_files);
+        let released = common::gc_rounds_until(&mace, 8, || {
+            b1_files
+                .iter()
+                .all(|name| !opt.data_root().join(name).exists())
+        });
+        assert!(
+            released,
+            "engine did not delete files of b1 within 8 explicit gc rounds: {:?}",
+            b1_files
+        );
     }
 }
 

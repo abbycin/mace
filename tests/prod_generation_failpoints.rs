@@ -197,11 +197,30 @@ fn assert_child_aborted(status: ExitStatus, msg: &str) {
 }
 
 fn wait_for_crash(timeout: Duration) -> ! {
+    // the armed failpoint aborts on its acting consultation -- the nth-th hit
+    // for nth rules, the first otherwise; benign pre-nth consultations are
+    // expected during setup and must not fail the window early. past the
+    // deadline either some rule acted without the abort landing, or none got
+    // that far -- both shapes attribute via the rule snapshot
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+    loop {
+        if mace::failpoint_testing::any_rule_actioned() {
+            // the acting consultation and its abort run on an engine thread;
+            // give an in-flight abort a beat to land before declaring failure
+            std::thread::sleep(Duration::from_millis(200));
+            panic!(
+                "failpoint reached its acting consultation but the process survived; {}",
+                mace::failpoint_testing::snapshot()
+            )
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "no failpoint reached its acting consultation within {timeout:?}; {}",
+                mace::failpoint_testing::snapshot()
+            )
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
-    panic!("failpoint did not fire in expected window")
 }
 
 #[test]
@@ -258,7 +277,7 @@ fn child_layout_migration(db_root: &Path) -> ! {
     let rule = std::env::var(ENV_LAYOUT_FAILPOINT).expect("missing layout failpoint");
     testing::arm_failpoint_rule(&rule);
     let _ = open_durable(db_root, None);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_all_inactive_recycle(db_root: &Path) -> ! {
@@ -273,7 +292,7 @@ fn child_all_inactive_recycle(db_root: &Path) -> ! {
     }
     mace.sync().expect("sync unmodified wal");
     mace.start_gc();
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn assert_mixed_groups_visible_after_layout_migration(db_root: &Path) {
@@ -301,21 +320,21 @@ fn child_generation_before_file_sync(db_root: &Path) -> ! {
     let mace = open_durable(db_root, None);
     let bucket = bucket(&mace);
     seed_committed(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_generation_after_file_sync(db_root: &Path) -> ! {
     let mace = open_durable(db_root, None);
     let bucket = bucket(&mace);
     seed_committed(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_generation_before_file_sync_mixed(db_root: &Path) -> ! {
     let mace = open_durable(db_root, None);
     let bucket = bucket(&mace);
     seed_mixed_groups(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_txn_abort_after_wal_sync(db_root: &Path) -> ! {
@@ -330,7 +349,7 @@ fn child_txn_abort_after_wal_sync(db_root: &Path) -> ! {
     // drop triggers the modified abort: abort record durable, then crash
     // before the abort fact and abort-clean task are published
     drop(txn);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_wal_rotation_after_file_create(db_root: &Path) -> ! {
@@ -343,7 +362,7 @@ fn child_wal_rotation_after_file_create(db_root: &Path) -> ! {
             .expect("upsert rotation key failed");
         txn.commit().expect("commit rotation txn failed");
     }
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_wal_tail_corrupt(db_root: &Path) -> ! {
@@ -391,7 +410,7 @@ fn child_wal_tail_corrupt(db_root: &Path) -> ! {
     txn.upsert("after_tail", b"lost")
         .expect("upsert after-tail key failed");
     txn.commit().expect("commit after-tail txn failed");
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// like child_wal_tail_corrupt, but the torn tail is far larger than any
@@ -462,7 +481,7 @@ fn child_wal_recycle_multi_group_shared(db_root: &Path) -> ! {
     }
     bucket.checkpoint();
     mace.start_gc();
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_route_switch_relaxed_to_durable(db_root: &Path) -> ! {
@@ -470,7 +489,7 @@ fn child_route_switch_relaxed_to_durable(db_root: &Path) -> ! {
     let bucket = bucket(&mace);
     // crash after a relaxed commit's flush, before the fact is published
     seed_committed(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_route_switch_durable_to_relaxed(db_root: &Path) -> ! {
@@ -478,7 +497,7 @@ fn child_route_switch_durable_to_relaxed(db_root: &Path) -> ! {
     let bucket = bucket(&mace);
     // crash after the durable generation sync, before the fact is published
     seed_committed(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_switch_wipe_midway(db_root: &Path) -> ! {
@@ -498,7 +517,7 @@ fn child_switch_wipe_midway(db_root: &Path) -> ! {
     // fire earlier: no runtime checkpoint runs in this child)
     testing::arm_failpoint_rule("mace_wal_recycle_after_dir_sync_before_done_commit=abort@1");
     let _mace = open_relaxed(db_root);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// tail construction for the switch durability windows: committed data in 24
@@ -513,7 +532,7 @@ fn child_switch_evict_many_buckets(db_root: &Path) -> ! {
         txn.put("k", format!("v{i}")).expect("put failed");
         txn.commit().expect("commit failed");
     }
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// run the relaxed switch open with a failpoint armed in-process so the crash
@@ -523,7 +542,7 @@ fn child_switch_open_arm(db_root: &Path) -> ! {
     let rule = std::env::var(ENV_SWITCH_FAILPOINT).expect("missing switch failpoint rule");
     testing::arm_failpoint_rule(&rule);
     let _mace = open_relaxed(db_root);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// same as child_switch_open_arm but reopens in the durable route (used to
@@ -532,7 +551,7 @@ fn child_switch_open_arm_durable(db_root: &Path) -> ! {
     let rule = std::env::var(ENV_SWITCH_FAILPOINT).expect("missing switch failpoint rule");
     testing::arm_failpoint_rule(&rule);
     let _mace = open_durable(db_root, None);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// leave one committed txn and one in-progress txn in the wal, crashing on the
@@ -549,7 +568,7 @@ fn child_switch_pending_abort(db_root: &Path) -> ! {
     txn.put("k", b"v").expect("put committed failed");
     txn.commit().expect("commit committed failed");
     drop(pending);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// 24 buckets: b23 holds ONLY an in-progress txn (no committed records), the
@@ -571,7 +590,7 @@ fn child_switch_abort_evict_many(db_root: &Path) -> ! {
         txn.commit().expect("commit failed");
     }
     drop(pending);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn assert_committed_visible(db_root: &Path, count: usize) {

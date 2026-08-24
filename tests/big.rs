@@ -143,19 +143,42 @@ fn big_kv2() {
 #[test]
 fn big_kv3() {
     let path = RandomPath::new();
-    let mut opt = Options::new(&*path);
-    opt.tmp_store = true;
-    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let opt = Options::new(&*path);
+    // non-tmp store: this test reopens after graceful close (tmp_store would
+    // wipe the whole db_root on exit, leaving nothing to reopen)
+    let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
     let val = vec![b'0'; 10240];
     let ksz = 1024;
     let count = 10000;
 
+    let mut keys = Vec::with_capacity(count);
     for i in 0..count {
         let mut tmp = format!("key_{i}").into_bytes();
         tmp.resize(ksz, b'x');
         let tx = db.begin().unwrap();
         tx.put(&tmp, &val).unwrap();
+        keys.push(tmp);
         tx.commit().unwrap();
+    }
+
+    // sampled reads before reopen
+    for i in [0, count / 2, count - 1] {
+        let view = db.view().unwrap();
+        assert_eq!(view.get(&keys[i]).unwrap().slice(), val.as_slice());
+    }
+
+    // full-scale write must survive graceful close and reopen
+    drop(db);
+    drop(mace);
+    // tmp_store only on the teardown open: the reopen assertions above need a
+    // persistent root, and this flag wipes db_root when this instance drops
+    let mut reopen_opt = opt.clone();
+    reopen_opt.tmp_store = true;
+    let mace = Mace::new(reopen_opt.validate().unwrap()).unwrap();
+    let db = mace.get_bucket("x").unwrap();
+    for i in [0, count / 4, count / 2, count - 1] {
+        let view = db.view().unwrap();
+        assert_eq!(view.get(&keys[i]).unwrap().slice(), val.as_slice());
     }
 }

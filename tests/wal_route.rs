@@ -4,7 +4,6 @@ use mace::observe::{CounterMetric, InMemoryObserver};
 use mace::testing::{self, WalRecordKind, WalUpdateProbe};
 use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
-use std::time::Duration;
 
 #[test]
 fn durable_route_sends_all_logical_groups_through_group_wal() -> Result<(), OpCode> {
@@ -231,9 +230,8 @@ fn durable_mode_shares_one_logging_with_per_group_checkpoint_floors() -> Result<
     // samples the bucket frontier only while flush data is pending); drive a
     // few rounds so both logical groups' floors separate
     for _ in 0..8 {
-        db.checkpoint();
+        db.checkpoint_and_wait();
         mace.start_gc();
-        std::thread::sleep(Duration::from_millis(10));
     }
     // the shared logger must hold one floor slot per logical group, not a
     // single scalar shared by every group

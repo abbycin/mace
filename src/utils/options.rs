@@ -59,6 +59,11 @@ pub struct Options {
     /// **Once set, it cannot be modified**
     pub concurrent_write: u8,
     /// Garbage collection cycle interval (milliseconds).
+    ///
+    /// Under `extra_check` builds, set to 0 to disable the background timer
+    /// branch entirely: the gc thread then only runs on explicit
+    /// [`crate::Mace::start_gc`] calls (deterministic-test mode). Do not set 0
+    /// in other builds: there the zero interval degenerates into a busy poll.
     pub gc_timeout: u64,
     /// Proactive page-checkpoint trigger interval (milliseconds).
     ///
