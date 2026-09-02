@@ -1,6 +1,6 @@
 use crate::hot_true;
 use std::{
-    cell::RefCell,
+    cell::UnsafeCell,
     cmp::Ordering,
     fmt::{Debug, Display},
     ops::Deref,
@@ -230,7 +230,6 @@ impl IKeyCodec for Ver {
     }
 }
 
-// TODO: varint encode/decode, space-time trade-off
 impl ICodec for Ver {
     fn packed_size(&self) -> usize {
         Self::len()
@@ -377,6 +376,16 @@ impl<'a> LeafSeg<'a> {
         self.base
     }
 
+    /// the complete user raw key (prefix + base) written into `buf`; `raw()`
+    /// returns only the prefix-stripped tail, so operator dispatch and any
+    /// user-key comparison must use this instead
+    pub(crate) fn full_key<'s>(&self, buf: &'s mut Vec<u8>) -> &'s [u8] {
+        buf.clear();
+        buf.extend_from_slice(self.prefix);
+        buf.extend_from_slice(self.base);
+        &buf[..]
+    }
+
     pub(crate) fn txid(&self) -> u64 {
         self.ver.txid
     }
@@ -475,9 +484,10 @@ pub struct Val<'a> {
 }
 
 impl<'a> Val<'a> {
-    const DEL_BIT: u8 = 0b0000_0001;
-    const HIST_BIT: u8 = 0b1000_0000;
-    const REMOTE_BIT: u8 = 0b0001_0000;
+    pub(crate) const DEL_BIT: u8 = 0b0000_0001;
+    pub(crate) const MERGE_BIT: u8 = 0b0000_0010;
+    pub(crate) const HIST_BIT: u8 = 0b1000_0000;
+    pub(crate) const REMOTE_BIT: u8 = 0b0001_0000;
     const HIST_SLOT_LEN: usize = size_of::<u16>();
     const HIST_COUNT_LEN: usize = size_of::<u32>();
     const HIST_LEN: usize = ADDR_LEN + Self::HIST_SLOT_LEN + Self::HIST_COUNT_LEN;
@@ -485,18 +495,44 @@ impl<'a> Val<'a> {
     const HDR_LEN: usize = 1;
     const GID_LEN: usize = 1;
 
+    #[inline(always)]
     pub fn is_tombstone(&self) -> bool {
+        #[cfg(feature = "extra_check")]
+        if self.data[0] & Self::DEL_BIT != 0 {
+            assert!(self.data[0] & Self::MERGE_BIT == 0);
+        }
         self.data[0] & Self::DEL_BIT != 0
+    }
+
+    #[inline(always)]
+    pub fn is_merge(&self) -> bool {
+        #[cfg(feature = "extra_check")]
+        if self.data[0] & Self::MERGE_BIT != 0 {
+            assert!(self.data[0] & Self::DEL_BIT == 0);
+        }
+        self.data[0] & Self::MERGE_BIT != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn kind(&self) -> u8 {
+        let kind = self.data[0] & (Self::DEL_BIT | Self::MERGE_BIT);
+        #[cfg(feature = "extra_check")]
+        if kind != 0 {
+            assert!(kind == Self::DEL_BIT || kind == Self::MERGE_BIT);
+        }
+        kind
     }
 
     pub fn has_hist(&self) -> bool {
         self.data[0] & Self::HIST_BIT != 0
     }
 
+    #[inline(always)]
     fn is_inline(&self) -> bool {
         self.data[0] & Self::REMOTE_BIT == 0
     }
 
+    #[inline(always)]
     fn data_offset(&self) -> usize {
         Self::HDR_LEN + Self::GID_LEN + Self::DATA_LEN + self.has_hist() as usize * Self::HIST_LEN
     }
@@ -505,6 +541,7 @@ impl<'a> Val<'a> {
         Self { data }
     }
 
+    #[inline(always)]
     pub fn data_size(&self) -> usize {
         Self::read::<u32>(self.data, Self::HDR_LEN + Self::GID_LEN) as usize
     }
@@ -519,7 +556,11 @@ impl<'a> Val<'a> {
             let r = l.load_blob(addr, cache);
             (r.view().as_remote().raw(), Some(r))
         };
-        (Record::decode_from(&src[..len]), r)
+        let mut record = Record::decode_from(&src[..len]);
+        if self.is_merge() {
+            record.set_merge_tag();
+        }
+        (record, r)
     }
 
     pub fn get_record<L: ILoader>(&self, l: &L) -> (Record, Option<BoxRef>) {
@@ -528,6 +569,16 @@ impl<'a> Val<'a> {
 
     pub fn get_record_uncached<L: ILoader>(&self, l: &L) -> (Record, Option<BoxRef>) {
         self.get_record_impl(l, false)
+    }
+
+    #[inline(always)]
+    pub(crate) fn inline_data(&self) -> Option<&'a [u8]> {
+        if !self.is_inline() {
+            return None;
+        }
+        let off = self.data_offset();
+        let len = self.data_size();
+        Some(&self.data[off + Self::GID_LEN..off + len])
     }
 
     pub fn get_hist(&self) -> Option<HistRef> {
@@ -564,8 +615,10 @@ impl<'a> Val<'a> {
             }
     }
 
+    #[inline(always)]
     pub fn encode_inline(dst: &mut [u8], hist: Option<HistRef>, v: &Record) {
-        dst[0] = v.is_tombstone() as u8;
+        let merge = v.is_merge();
+        dst[0] = v.is_tombstone() as u8 | (merge as u8) << 1;
         dst[1] = v.group_id();
         let mut off = Self::HDR_LEN + Self::GID_LEN;
         Self::write::<u32>(dst, off, v.packed_size() as u32);
@@ -582,8 +635,10 @@ impl<'a> Val<'a> {
         v.encode_to(&mut dst[off..]);
     }
 
+    #[inline(always)]
     pub fn encode_remote(dst: &mut [u8], hist: Option<HistRef>, remote: u64, v: &Record) {
-        dst[0] = v.is_tombstone() as u8;
+        let merge = v.is_merge();
+        dst[0] = v.is_tombstone() as u8 | (merge as u8) << 1;
         dst[0] |= Self::REMOTE_BIT;
         dst[1] = v.group_id();
         let mut off = Self::HDR_LEN + Self::GID_LEN;
@@ -601,6 +656,7 @@ impl<'a> Val<'a> {
         Self::write::<u64>(dst, off, remote);
     }
 
+    #[inline(always)]
     pub fn group_id(&self) -> u8 {
         self.data[1]
     }
@@ -680,6 +736,9 @@ pub struct Record {
 }
 
 impl Record {
+    /// runtime-only tag carried in the `group_id` high bit; never persisted
+    const MERGE_TAG: u8 = 0b1000_0000;
+
     pub fn normal(group_id: u8, data: &[u8]) -> Self {
         Self {
             group_id,
@@ -694,10 +753,28 @@ impl Record {
         }
     }
 
-    pub fn group_id(&self) -> u8 {
-        self.group_id
+    pub fn merge(group_id: u8, operand: &[u8]) -> Self {
+        Self {
+            group_id: group_id | Self::MERGE_TAG,
+            data: unsafe { std::mem::transmute::<&[u8], &[u8]>(operand) },
+        }
     }
 
+    #[inline(always)]
+    pub fn is_merge(&self) -> bool {
+        self.group_id & Self::MERGE_TAG != 0
+    }
+
+    #[inline(always)]
+    pub fn group_id(&self) -> u8 {
+        self.group_id & !Self::MERGE_TAG
+    }
+
+    pub(crate) fn set_merge_tag(&mut self) {
+        self.group_id |= Self::MERGE_TAG;
+    }
+
+    #[inline(always)]
     pub fn data(&self) -> &[u8] {
         self.data
     }
@@ -712,7 +789,8 @@ impl Record {
 
     pub fn as_slice(&self, s: &mut [u8]) {
         let (l, r) = s.split_at_mut(size_of::<u8>());
-        number_to_slice!(self.group_id, l);
+        // the merge tag is runtime state, the payload stores only the logical group id
+        number_to_slice!(self.group_id & !Self::MERGE_TAG, l);
         hot_true!(eq r.len(), self.data.len());
         hot_true!(ne self.data.as_ptr(), r.as_ptr());
         r.copy_from_slice(self.data);
@@ -750,6 +828,12 @@ impl Display for Record {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_tombstone() {
             f.write_fmt(format_args!("<del-{}>", self.group_id))
+        } else if self.is_merge() {
+            f.write_fmt(format_args!(
+                "<merge-{}> {}",
+                self.group_id,
+                to_str(self.data)
+            ))
         } else {
             f.write_fmt(format_args!(
                 "<normal-{}> {}",
@@ -795,9 +879,15 @@ impl Ord for Ver {
 pub struct IterItem<'a, L: ILoader> {
     cached_key: Handle<Vec<u8>>,
     prefix: &'a [u8],
-    pub(crate) base: Key<'a>,
+    pub(crate) base: &'a [u8],
+    txid: u64,
     pub(crate) val: Val<'a>,
-    val_ref: RefCell<Option<BoxRef>>,
+    /// reader-side logical value produced by the merge resolver; when set it overrides
+    /// the page-backed envelope for all value accessors
+    folded: Option<Box<(u8, Vec<u8>)>>,
+    // this item is owned by one iterator and never shared while `val` is called;
+    // avoid RefCell's borrow flag on the per-item value cache
+    val_ref: UnsafeCell<Option<BoxRef>>,
     loader: &'a L,
 }
 
@@ -827,18 +917,32 @@ where
         Self {
             cached_key,
             prefix,
-            base,
+            base: base.raw,
+            txid: base.ver.txid,
             val,
-            val_ref: RefCell::new(None),
+            folded: None,
+            val_ref: UnsafeCell::new(None),
             loader,
         }
     }
 
+    /// builds an item carrying a resolver-produced logical value
+    pub(crate) fn with_folded(mut self, gid: u8, data: Vec<u8>) -> Self {
+        self.folded = Some(Box::new((gid, data)));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_folded(&self) -> bool {
+        self.folded.is_some()
+    }
+
+    #[inline(always)]
     pub(crate) fn cmp_key(&self, other: &[u8]) -> Ordering {
         let pos = self.prefix.len().min(other.len());
         let tmp = self.prefix.cmp(&other[..pos]);
         match tmp {
-            Ordering::Equal => self.base.raw.cmp(&other[pos..]),
+            Ordering::Equal => self.base.cmp(&other[pos..]),
             _ => tmp,
         }
     }
@@ -846,39 +950,36 @@ where
     pub(crate) fn cmp(&self, other: &Self) -> Ordering {
         // fast path: most scan compares happen within the same prefix domain
         if self.prefix == other.prefix {
-            return self.base.raw.cmp(other.base.raw);
+            return self.base.cmp(other.base);
         }
 
         // keep one-side-empty path branch-local to avoid cmp_key + reverse overhead
         if self.prefix.is_empty() {
-            return cmp_raw_with_prefixed_tail(self.base.raw, other.prefix, other.base.raw);
+            return cmp_raw_with_prefixed_tail(self.base, other.prefix, other.base);
         }
         if other.prefix.is_empty() {
-            return cmp_raw_with_prefixed_tail(other.base.raw, self.prefix, self.base.raw)
-                .reverse();
+            return cmp_raw_with_prefixed_tail(other.base, self.prefix, self.base).reverse();
         }
 
         // mixed non-empty prefixes need full-key compare for correctness
-        full_raw_cmp(self.prefix, self.base.raw, other.prefix, other.base.raw)
+        full_raw_cmp(self.prefix, self.base, other.prefix, other.base)
     }
 
     pub(crate) fn txid(&self) -> u64 {
-        self.base.ver.txid
+        self.txid
     }
 
-    pub(crate) fn group_id(&self) -> u8 {
-        self.val.group_id()
+    #[inline(always)]
+    pub(crate) fn prefix_identity(&self) -> (*const u8, usize) {
+        (self.prefix.as_ptr(), self.prefix.len())
     }
 
-    pub(crate) fn is_tombstone(&self) -> bool {
-        self.val.is_tombstone()
-    }
-
+    #[inline(always)]
     pub(crate) fn assembled_key(&self) -> Handle<Vec<u8>> {
         let mut key = self.cached_key;
         key.clear();
         key.extend_from_slice(self.prefix);
-        key.extend_from_slice(self.base.raw);
+        key.extend_from_slice(self.base);
         key
     }
 
@@ -889,8 +990,16 @@ where
 
     /// NOTE: the return Slice is valid only in current iteration
     pub fn val(&self) -> &[u8] {
+        if let Some(folded) = &self.folded {
+            return folded.1.as_slice();
+        }
+        if let Some(data) = self.val.inline_data() {
+            return data;
+        }
         let (r, v) = self.val.get_record_uncached(self.loader);
-        *self.val_ref.borrow_mut() = v;
+        // SAFETY: an IterItem is only accessed through its owning iterator; callers
+        // cannot concurrently mutate the cache through the public API
+        unsafe { *self.val_ref.get() = v };
         r.data
     }
 }
@@ -1069,6 +1178,7 @@ mod test {
 
         let put = Record::normal(1, "114514".as_bytes());
         let del = Record::remove(1);
+        let merge = Record::merge(1, "+42".as_bytes());
         let sib = Record::normal(1, "1145141919810".as_bytes());
 
         let mut inline_size = 1 << 20;
@@ -1078,22 +1188,36 @@ mod test {
             let l = L::new();
             let mut put_buf = vec![0u8; Val::calc_size(false, inline_size, put.packed_size())];
             let mut del_buf = vec![0u8; Val::calc_size(false, inline_size, del.packed_size())];
+            let mut merge_buf = vec![0u8; Val::calc_size(false, inline_size, merge.packed_size())];
             let mut sib_buf = vec![0u8; Val::calc_size(true, inline_size, sib.packed_size())];
 
             Val::encode_inline(&mut put_buf, None, &put);
             Val::encode_inline(&mut del_buf, None, &del);
+            Val::encode_inline(&mut merge_buf, None, &merge);
             Val::encode_inline(&mut sib_buf, Some(hist), &sib);
 
             let vp = Val::from_raw(&put_buf);
             let vd = Val::from_raw(&del_buf);
+            let vm = Val::from_raw(&merge_buf);
             let vs = Val::from_raw(&sib_buf);
 
             let dp = vp.get_record(&l).0;
             let dd = vd.get_record(&l).0;
+            let dm = vm.get_record(&l).0;
             let ds = vs.get_record(&l).0;
 
             assert!(dp.eq(&put));
             assert!(dd.eq(&del));
+            assert!(
+                dm.eq(&merge),
+                "merge inline round trip must decode with the tag"
+            );
+            assert!(dm.is_merge());
+            assert_eq!(dm.group_id(), 1);
+            assert_eq!(dm.data(), b"+42");
+            // the persisted envelope carries MERGE_BIT, never the runtime tag
+            assert_eq!(merge_buf[0] & Val::DEL_BIT, 0);
+            assert_ne!(merge_buf[0] & Val::MERGE_BIT, 0);
             assert!(ds.eq(&sib));
 
             assert!(vp.get_hist().is_none());
@@ -1106,6 +1230,7 @@ mod test {
             let mut l = L::new();
             let mut put_buf = vec![0u8; Val::calc_size(false, inline_size, put.packed_size())];
             let mut del_buf = vec![0u8; Val::calc_size(false, inline_size, del.packed_size())];
+            let mut merge_buf = vec![0u8; Val::calc_size(false, inline_size, merge.packed_size())];
             let mut sib_buf = vec![0u8; Val::calc_size(true, inline_size, sib.packed_size())];
 
             fn encode_to(a: &mut L, x: &Record) -> u64 {
@@ -1117,33 +1242,47 @@ mod test {
 
             let pa = encode_to(&mut l, &put);
             let da = encode_to(&mut l, &del);
+            let ma = encode_to(&mut l, &merge);
             let sa = encode_to(&mut l, &sib);
 
             Val::encode_remote(&mut put_buf, None, pa, &put);
             Val::encode_remote(&mut del_buf, None, da, &del);
+            Val::encode_remote(&mut merge_buf, None, ma, &merge);
             Val::encode_remote(&mut sib_buf, Some(hist), sa, &sib);
 
             let vp = Val::from_raw(&put_buf);
             let vd = Val::from_raw(&del_buf);
+            let vm = Val::from_raw(&merge_buf);
             let vs = Val::from_raw(&sib_buf);
 
             let (dp, rp) = vp.get_record(&l);
             let (dd, rd) = vd.get_record(&l);
+            let (dm, rm) = vm.get_record(&l);
             let (ds, rs) = vs.get_record(&l);
 
             assert!(dp.eq(&put));
             assert!(dd.eq(&del));
+            assert!(
+                dm.eq(&merge),
+                "merge remote round trip must decode with the tag"
+            );
+            assert!(dm.is_merge());
+            assert_eq!(dm.group_id(), 1);
+            assert_eq!(dm.data(), b"+42");
             assert!(ds.eq(&sib));
 
             let rp = rp.unwrap();
             let rd = rd.unwrap();
+            let rm = rm.unwrap();
             let rs = rs.unwrap();
             assert_eq!(rp.header().addr, pa);
             assert_eq!(rd.header().addr, da);
+            assert_eq!(rm.header().addr, ma);
             assert_eq!(rs.header().addr, sa);
 
             assert_eq!(vp.get_remote(), pa);
             assert_eq!(vd.get_remote(), da);
+            assert_eq!(vm.get_remote(), ma);
             assert_eq!(vs.get_remote(), sa);
 
             assert!(vp.get_hist().is_none());

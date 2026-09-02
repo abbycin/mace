@@ -857,7 +857,7 @@ type WalSyncHook = dyn Fn(WalSyncPoint) + Send + Sync + 'static;
 type GcRewriteHook = dyn Fn(GcRewriteSyncPoint, u64, &Path) + Send + Sync + 'static;
 type GcStatHook = dyn Fn(GcStatSyncPoint, u64, &Path) + Send + Sync + 'static;
 type GcCompletedHook = dyn Fn() + Send + Sync + 'static;
-type CollectorCompletedHook = dyn Fn() + Send + Sync + 'static;
+type CollectorCompletedHook = dyn Fn(usize) + Send + Sync + 'static;
 type EvictorCompletedHook = dyn Fn() + Send + Sync + 'static;
 
 #[derive(Default)]
@@ -1029,10 +1029,10 @@ pub(crate) fn fire_gc_completed() {
     }
 }
 
-pub(crate) fn fire_collector_completed() {
+pub(crate) fn fire_collector_completed(collector_token: usize) {
     let hook = hooks().lock().collector_completed.clone();
     if let Some(hook) = hook {
-        hook();
+        hook(collector_token);
     }
 }
 
@@ -1137,6 +1137,14 @@ pub fn safe_exclusive(bucket: &Bucket) -> u64 {
 
 pub fn wake_cc_collector(bucket: &Bucket) {
     bucket.inner.store.context.request_collect();
+}
+
+/// stable identity of this engine's collector, used by the test harness to
+/// accept only this engine's cycle-completed signal (the hook is process
+/// global, so parallel tests' collectors must not be able to fire it)
+pub fn collector_completion_token(bucket: &Bucket) -> usize {
+    let ctx: &crate::cc::context::Context = &bucket.inner.store.context;
+    &*ctx.sequences as *const _ as usize
 }
 
 pub fn view_start_ts(view: &TxnView<'_>) -> u64 {

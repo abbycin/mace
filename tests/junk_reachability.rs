@@ -220,7 +220,7 @@ fn checkpoint_snapshot_holds_ebr_guard_before_wait_zero() -> Result<(), OpCode> 
     let start_writer = Arc::new(Barrier::new(2));
     let release_writer = Arc::new(Barrier::new(2));
     let restore = Arc::new(CheckpointRootRestore::new());
-    let target_bucket = bucket.id();
+    let taropen_bucket = bucket.id();
     let _reset = CheckpointHookReset;
     testing::set_checkpoint_hook(Some(Arc::new({
         let deferred_tx = deferred_tx.clone();
@@ -231,7 +231,7 @@ fn checkpoint_snapshot_holds_ebr_guard_before_wait_zero() -> Result<(), OpCode> 
         let release_writer = release_writer.clone();
         let restore = restore.clone();
         move |point, _bucket_id| {
-            if _bucket_id != target_bucket {
+            if _bucket_id != taropen_bucket {
                 return;
             }
             match point {
@@ -291,7 +291,7 @@ fn checkpoint_snapshot_holds_ebr_guard_before_wait_zero() -> Result<(), OpCode> 
     drop(bucket);
     drop(mace);
     let reopened = Mace::new(reopen_opt.validate().unwrap())?;
-    let reopened_bucket = reopened.get_bucket("x")?;
+    let reopened_bucket = reopened.open_bucket("x")?;
     assert_eq!(
         reopened_bucket.view()?.get("k_0000")?.slice(),
         b"x".repeat(1024)
@@ -325,13 +325,13 @@ fn checkpoint_cut_keeps_post_cut_writer_visible() -> Result<(), OpCode> {
     let (release_tx, release_rx) = channel();
     let release_rx = Arc::new(Mutex::new(release_rx));
     let fired = Arc::new(AtomicBool::new(false));
-    let target_bucket = bucket.id();
+    let taropen_bucket = bucket.id();
     let _reset = CheckpointHookReset;
     testing::set_checkpoint_hook(Some(Arc::new({
         let fired = fired.clone();
         let release_rx = release_rx.clone();
         move |point, bucket_id| {
-            if bucket_id != target_bucket || point != CheckpointSyncPoint::BeforeSnapshotWaitZero {
+            if bucket_id != taropen_bucket || point != CheckpointSyncPoint::BeforeSnapshotWaitZero {
                 return;
             }
             if !fired.swap(true, Ordering::SeqCst) {
@@ -363,7 +363,7 @@ fn checkpoint_cut_keeps_post_cut_writer_visible() -> Result<(), OpCode> {
     drop(mace);
 
     let reopened = Mace::new(reopen_opt.validate().unwrap())?;
-    let reopened_bucket = reopened.get_bucket("x")?;
+    let reopened_bucket = reopened.open_bucket("x")?;
     let view = reopened_bucket.view()?;
     assert_eq!(view.get("before_cut")?.slice(), b"v0");
     assert_eq!(view.get("after_cut")?.slice(), b"v1");

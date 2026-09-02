@@ -51,7 +51,7 @@ fn upsert_delete() {
 
     saved.tmp_store = true;
     let mace = Mace::new(saved.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
 
     for (k, _) in &kvs {
         let view = db.view().unwrap();
@@ -89,7 +89,7 @@ fn big_kv() {
 
     saved.tmp_store = true;
     let mace = Mace::new(saved.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view().unwrap();
 
     for k in &keys {
@@ -130,7 +130,7 @@ fn big_kv2() {
 
     saved.tmp_store = true;
     let mace = Mace::new(saved.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view().unwrap();
 
     let r = view.get("key1").unwrap();
@@ -176,7 +176,7 @@ fn big_kv3() {
     let mut reopen_opt = opt.clone();
     reopen_opt.tmp_store = true;
     let mace = Mace::new(reopen_opt.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     for i in [0, count / 4, count / 2, count - 1] {
         let view = db.view().unwrap();
         assert_eq!(view.get(&keys[i]).unwrap().slice(), val.as_slice());

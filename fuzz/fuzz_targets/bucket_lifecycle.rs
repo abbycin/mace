@@ -49,7 +49,7 @@ fn assert_bucket_sets(
         existing.len() + pending_delete
     );
     for name in existing.keys() {
-        assert!(mace.get_bucket(name).is_ok(), "bucket {name} should exist");
+        assert!(mace.open_bucket(name).is_ok(), "bucket {name} should exist");
     }
 }
 
@@ -93,10 +93,10 @@ fuzz_target!(|data: &[u8]| {
             }
             1 => {
                 if existing.contains_key(&name) {
-                    let bucket = mace.get_bucket(&name).expect("open bucket failed");
+                    let bucket = mace.open_bucket(&name).expect("open bucket failed");
                     loaded.insert(name.clone(), bucket);
                 } else {
-                    let res = mace.get_bucket(&name);
+                    let res = mace.open_bucket(&name);
                     assert!(
                         matches!(res, Err(OpCode::NotFound)),
                         "missing bucket get should fail"
@@ -119,7 +119,7 @@ fuzz_target!(|data: &[u8]| {
             4 => {
                 let update = compatible_update(tag);
                 if let Some(slot) = existing.get_mut(&name) {
-                    let res = mace.update_bucket_opt(&name, update);
+                    let res = mace.update_bucket_opt(&name, update.clone());
                     if loaded.contains_key(&name) {
                         assert!(
                             matches!(res, Err(OpCode::Again)),
@@ -166,13 +166,13 @@ fuzz_target!(|data: &[u8]| {
                 });
                 for existing_name in existing.keys() {
                     let bucket = mace
-                        .get_bucket(existing_name)
+                        .open_bucket(existing_name)
                         .expect("existing bucket missing after reopen");
                     loaded.insert(existing_name.clone(), bucket);
                 }
                 for missing_name in &known_names {
                     if !existing.contains_key(missing_name) {
-                        let res = mace.get_bucket(missing_name);
+                        let res = mace.open_bucket(missing_name);
                         assert!(
                             matches!(res, Err(OpCode::NotFound)),
                             "deleted bucket should stay absent"

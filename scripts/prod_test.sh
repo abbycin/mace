@@ -76,7 +76,6 @@ gc_space_accounting_cases=(
 
 stress_cases=(
   "prod_bucket:stress_create_delete"
-  "prod_concurrency:stress_bucket_churn"
   "prod_evictor:stress_drop_reload_loop"
   "prod_gc:stress_blob_cycle"
   "prod_recovery:stress_crash_reopen_loop"

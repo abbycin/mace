@@ -1,7 +1,7 @@
 mod common;
 
 use btree_store::BTree;
-use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
+use mace::{BucketOptions, Mace, OpCode, Options, PersistedBucketOptions, RandomPath};
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Clone, Copy)]
 struct PersistedBucketMeta {
     id: u64,
-    options: BucketOptions,
+    options: PersistedBucketOptions,
 }
 
-fn load_persisted_bucket_options(opt: &Options, name: &str) -> BucketOptions {
+fn load_persisted_bucket_options(opt: &Options, name: &str) -> PersistedBucketOptions {
     let tree = BTree::open(opt.manifest()).unwrap();
     let mut raw = None;
     tree.view("bucket_metas", |txn| {
@@ -75,7 +75,7 @@ fn bucket_concurrency_non_blocking() {
     let start = std::time::Instant::now();
     let mut iterations = 0;
     while iterations < 100_000 {
-        mace.get_bucket("stable").unwrap();
+        mace.open_bucket("stable").unwrap();
         iterations += 1;
 
         // if it's blocked, it might take a long time to finish 100k iterations
@@ -274,7 +274,7 @@ fn bucket_simple() {
     let val_b1 = tx.get("key1").unwrap();
     assert_eq!(val_b1.slice(), b"val1");
 
-    let d = mace.get_bucket("default").unwrap();
+    let d = mace.open_bucket("default").unwrap();
     let view = d.view().unwrap();
     let val_def = view.get("key1").unwrap();
     assert_eq!(val_def.slice(), b"default_val");
@@ -292,7 +292,7 @@ fn bucket_new_get_semantics() -> Result<(), OpCode> {
     let opt = Options::new(&*path);
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
 
-    assert_eq!(mace.get_bucket("missing").err(), Some(OpCode::NotFound));
+    assert_eq!(mace.open_bucket("missing").err(), Some(OpCode::NotFound));
 
     let b1 = mace.new_bucket("x", BucketOptions::default()).unwrap();
     assert_eq!(
@@ -307,7 +307,7 @@ fn bucket_new_get_semantics() -> Result<(), OpCode> {
         Some(OpCode::Exist)
     );
 
-    let b1 = mace.get_bucket("x")?;
+    let b1 = mace.open_bucket("x")?;
     drop(b1);
 
     mace.del_bucket("x")?;
@@ -331,11 +331,39 @@ fn bucket_persistence() {
 
     {
         let mace = Mace::new(opt.validate().unwrap()).unwrap();
-        let db = mace.get_bucket("x").unwrap();
+        let db = mace.open_bucket("x").unwrap();
         let b1 = db.view().unwrap();
         let val = b1.get("k").unwrap();
         assert_eq!(val.slice(), b"v");
     }
+}
+
+/// get_bucket_options reads the persisted subset from metadata without
+/// loading the bucket context; the runtime operator is never persisted
+#[test]
+fn get_bucket_options_reads_persisted_subset_without_loading() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let bucket_opt = BucketOptions {
+        split_elems: 128,
+        consolidate_threshold: 16,
+        inline_size: 8192,
+        ..BucketOptions::default()
+    };
+    let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+    assert!(mace.get_bucket_options("missing")?.is_none());
+
+    let bucket = mace.new_bucket("x", bucket_opt.clone())?;
+    drop(bucket);
+    let read = mace.get_bucket_options("x")?.expect("bucket must exist");
+    assert_eq!(read.split_elems, 128);
+    assert_eq!(read.consolidate_threshold, 16);
+    assert_eq!(read.inline_size, 8192);
+    assert!(
+        read.merge_operator.is_none(),
+        "the runtime operator is never persisted"
+    );
+    Ok(())
 }
 
 #[test]
@@ -359,40 +387,49 @@ fn bucket_update_opt_persists_compatible_changes() -> Result<(), OpCode> {
         cache_capacity: 128 << 10,
         cache_evict_pct: 40,
         enable_backpressure: false,
-        ..bucket_opt
+        ..bucket_opt.clone()
     };
 
     {
         let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
-        let bucket = mace.new_bucket("x", bucket_opt).unwrap();
-        assert_eq!(mace.update_bucket_opt("x", updated), Err(OpCode::Again));
+        let bucket = mace.new_bucket("x", bucket_opt.clone()).unwrap();
+        assert_eq!(
+            mace.update_bucket_opt("x", updated.clone()),
+            Err(OpCode::Again)
+        );
         drop(bucket);
         mace.drop_bucket("x")?;
-        mace.update_bucket_opt("x", updated)?;
+        mace.update_bucket_opt("x", updated.clone())?;
     }
 
-    assert_eq!(load_persisted_bucket_options(&opt, "x"), updated);
+    assert_eq!(
+        load_persisted_bucket_options(&opt, "x"),
+        PersistedBucketOptions::from(&updated)
+    );
 
     {
         let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
-        let bucket = mace.get_bucket("x")?;
+        let bucket = mace.open_bucket("x")?;
         drop(bucket);
         mace.drop_bucket("x")?;
         let conflict = BucketOptions {
             split_elems: 64,
-            ..updated
+            ..updated.clone()
         };
         assert_eq!(mace.update_bucket_opt("x", conflict), Err(OpCode::Invalid));
-        mace.update_bucket_opt("x", bucket_opt)?;
+        mace.update_bucket_opt("x", bucket_opt.clone())?;
     }
 
-    assert_eq!(load_persisted_bucket_options(&opt, "x"), bucket_opt);
+    assert_eq!(
+        load_persisted_bucket_options(&opt, "x"),
+        PersistedBucketOptions::from(&bucket_opt)
+    );
 
     {
         let mace = Mace::new(opt.validate().unwrap()).unwrap();
         let conflict = BucketOptions {
             split_elems: 64,
-            ..bucket_opt
+            ..bucket_opt.clone()
         };
         assert_eq!(mace.update_bucket_opt("x", conflict), Err(OpCode::Invalid));
     }
@@ -600,7 +637,7 @@ fn test_drop_bucket_safety() -> Result<(), OpCode> {
 
     // 2. test: cannot drop while transaction is active
     {
-        let bucket = db.get_bucket(bucket_name)?;
+        let bucket = db.open_bucket(bucket_name)?;
         let tx = bucket.begin()?;
 
         let res = db.drop_bucket(bucket_name);
@@ -632,7 +669,7 @@ fn test_drop_bucket_persistence() -> Result<(), OpCode> {
     db.drop_bucket(bucket_name)?;
 
     // re-open and verify
-    let bucket = db.get_bucket(bucket_name)?;
+    let bucket = db.open_bucket(bucket_name)?;
     let view = bucket.view()?;
     assert_eq!(view.get("k")?.slice(), b"v");
 

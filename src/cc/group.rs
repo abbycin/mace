@@ -355,6 +355,8 @@ pub struct TxnState {
     pub begin_lsn: Position,
     pub prev_lsn: Position,
     pub start_ckpt: usize,
+    /// keys deleted by this transaction; a committed delete clears their merge-blocked state
+    pub deleted_keys: Vec<Vec<u8>>,
 }
 
 impl TxnState {
@@ -367,6 +369,7 @@ impl TxnState {
             group_id,
             cmd_id: INIT_CMD,
             start_ckpt,
+            deleted_keys: Vec::new(),
         }
     }
 

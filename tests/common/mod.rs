@@ -137,9 +137,13 @@ pub fn deterministic_gc(options: &mut Options) {
 }
 
 /// drive collector cycles until `cond` holds; each round wakes the collector
-/// and consumes its cycle-completed signal. **caller must hold hooks_lock**
-/// (the si/generation suite_lock aliases already provide it) so parallel
-/// tests cannot steal the signal. no wall-clock sleep is involved.
+/// and consumes its cycle-completed signal. the hook carries the collector
+/// token of the firing engine, so parallel tests' collectors cannot fire it:
+/// the round waits for exactly this engine's collector cycle, never for a
+/// foreign signal. **caller must hold hooks_lock** (the si/generation
+/// suite_lock aliases already provide it) so a concurrent caller cannot
+/// overwrite the armed hook and steal the signal. no wall-clock sleep is
+/// involved.
 #[cfg(feature = "extra_check")]
 pub fn collector_rounds_until(
     bucket: &mace::Bucket,
@@ -147,13 +151,16 @@ pub fn collector_rounds_until(
     mut cond: impl FnMut() -> bool,
 ) -> bool {
     use mace::testing;
+    let collector_token = testing::collector_completion_token(bucket);
     for _ in 0..max_rounds {
         if cond() {
             return true;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        testing::set_collector_completed_hook(Some(std::sync::Arc::new(move || {
-            let _ = tx.send(());
+        testing::set_collector_completed_hook(Some(std::sync::Arc::new(move |token| {
+            if token == collector_token {
+                let _ = tx.send(());
+            }
         })));
         testing::wake_cc_collector(bucket);
         let completed = rx.recv_timeout(Duration::from_secs(10)).is_ok();

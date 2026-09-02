@@ -62,7 +62,7 @@ fn route_switch_reopen_recovers_across_epochs() -> Result<(), OpCode> {
         opt.sync_on_write = true;
         opt.concurrent_write = 2;
         let mace = Mace::new(opt.validate()?)?;
-        let db = mace.get_bucket("x")?;
+        let db = mace.open_bucket("x")?;
         let view = db.view()?;
         assert_eq!(view.get("a")?.slice(), b"1");
         assert_eq!(view.get("b")?.slice(), b"2");
@@ -78,7 +78,7 @@ fn route_switch_reopen_recovers_across_epochs() -> Result<(), OpCode> {
         opt.sync_on_write = false;
         opt.concurrent_write = 2;
         let mace = Mace::new(opt.validate()?)?;
-        let db = mace.get_bucket("x")?;
+        let db = mace.open_bucket("x")?;
         let view = db.view()?;
         assert_eq!(view.get("a")?.slice(), b"1");
         assert_eq!(view.get("b")?.slice(), b"2");
@@ -118,7 +118,7 @@ fn route_switch_starts_new_era_at_higher_contiguous_file_ids() -> Result<(), OpC
     opt.concurrent_write = 2;
     let log_root = opt.log_root();
     let mace = Mace::new(opt.validate()?)?;
-    let db = mace.get_bucket("x")?;
+    let db = mace.open_bucket("x")?;
     let tx = db.begin()?;
     tx.put("k2", b"v2")?;
     tx.commit()?;
@@ -174,7 +174,7 @@ fn route_switch_gc_keeps_recycle_boundary_at_new_epoch_start() -> Result<(), OpC
     relaxed.concurrent_write = 2;
     relaxed.wal_file_size = 4 << 10;
     let mace = Mace::new(relaxed.validate()?)?;
-    let db = mace.get_bucket("x")?;
+    let db = mace.open_bucket("x")?;
     mace.start_gc();
 
     assert_eq!(
@@ -217,7 +217,7 @@ fn relaxed_to_durable_gc_keeps_recycle_boundary_at_new_epoch_start() -> Result<(
     durable.concurrent_write = 2;
     durable.wal_file_size = 4 << 10;
     let mace = Mace::new(durable.validate()?)?;
-    let db = mace.get_bucket("x")?;
+    let db = mace.open_bucket("x")?;
     mace.start_gc();
 
     assert_eq!(
@@ -247,7 +247,7 @@ fn same_route_reopen_creates_no_files_and_continues_in_stream() -> Result<(), Op
     // same-route reopen: no epoch, no empty-file bootstrap, no wipe; the
     // stream continues in its existing latest file
     let mace = Mace::new(opt.clone().validate()?)?;
-    let db = mace.get_bucket("x")?;
+    let db = mace.open_bucket("x")?;
     let view = db.view()?;
     assert_eq!(view.get("k")?.slice(), b"v");
     drop(view);

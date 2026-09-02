@@ -1547,7 +1547,7 @@ fn reopen_preserves_snapshot_visibility_for_recovered_state_and_new_churn() -> R
 
     saved.tmp_store = true;
     let mace = mace::Mace::new(saved.validate().unwrap())?;
-    let db = mace.get_bucket("x").expect("bucket must reopen");
+    let db = mace.open_bucket("x").expect("bucket must reopen");
 
     let snapshot = db.view()?;
     assert_eq!(snapshot.get("k0")?.slice(), b"v1");

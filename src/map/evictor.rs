@@ -130,7 +130,16 @@ impl Evictor {
 
                     let mut build = self.begin_build(&bucket_ctx);
                     if !old.is_intl() && old.delta_len() > 0 {
-                        let (node, junk) = old.compact(&mut build, safe_txid);
+                        let mut block = |k: &[u8]| {
+                            bucket_ctx.merge_blocked_keys.insert(k.to_vec());
+                        };
+                        let (node, junk) = old.compact(
+                            &mut build,
+                            safe_txid,
+                            bucket_ctx.merge_operator(),
+                            &mut block,
+                            Some(bucket_ctx.context()),
+                        );
                         let addr = node.latest_addr();
                         must_true!(eq addr, node.base_addr());
                         let mut publish = build.into_publish(g);

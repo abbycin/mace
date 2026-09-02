@@ -155,7 +155,7 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
     gc_opt.blob_file_size = 64 << 10;
     let mace = Mace::new(gc_opt.validate()?)?;
     mace.disable_gc();
-    let bucket = mace.get_bucket("stats")?;
+    let bucket = mace.open_bucket("stats")?;
     testing::assert_persisted_gc_stats(&mace);
     let view = bucket.view()?;
     for key in &blob_keys {
@@ -197,7 +197,7 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
     // teardown-only flag: wipes db_root when this final instance drops
     reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate()?)?;
-    let bucket = mace.get_bucket("stats")?;
+    let bucket = mace.open_bucket("stats")?;
     testing::assert_persisted_gc_stats(&mace);
     let view = bucket.view()?;
     for key in &blob_keys {
@@ -267,7 +267,7 @@ fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<()
     rewrite.data_garbage_ratio = 1;
     rewrite.data_file_size = 16 << 10;
     let mace = Mace::new(rewrite.validate()?)?;
-    let bucket = mace.get_bucket("rewrite_junk_handoff")?;
+    let bucket = mace.open_bucket("rewrite_junk_handoff")?;
 
     let (ready_tx, ready_rx) = channel();
     let (release_tx, release_rx) = channel();
@@ -331,7 +331,7 @@ fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<()
     reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate()?)?;
     testing::assert_persisted_gc_stats(&mace);
-    let bucket = mace.get_bucket("rewrite_junk_handoff")?;
+    let bucket = mace.open_bucket("rewrite_junk_handoff")?;
     let view = bucket.view()?;
     for key in &keys {
         assert_eq!(view.get(key)?.slice(), latest.as_slice());
@@ -790,7 +790,7 @@ fn run_publishing_checkpoint_reresolves_owner(
     rewrite.data_file_size = 16 << 10;
     rewrite.blob_file_size = 16 << 10;
     let mace = Mace::new(rewrite.validate()?)?;
-    let bucket = mace.get_bucket("publishing_owner")?;
+    let bucket = mace.open_bucket("publishing_owner")?;
 
     let (publishing_tx, publishing_rx) = channel();
     let (release_tx, release_rx) = channel();
@@ -933,7 +933,7 @@ fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
         enable_backpressure: false,
         ..BucketOptions::default()
     };
-    let alpha = mace.new_bucket("alpha", bucket_options)?;
+    let alpha = mace.new_bucket("alpha", bucket_options.clone())?;
     let beta = mace.new_bucket("beta", bucket_options)?;
     let data_v1 = vec![b'a'; 512];
     let data_v2 = vec![b'b'; 512];
@@ -985,7 +985,7 @@ fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
     let mace = Mace::new(reopen.validate()?)?;
     testing::assert_persisted_gc_stats(&mace);
     for name in ["alpha", "beta"] {
-        let bucket = mace.get_bucket(name)?;
+        let bucket = mace.open_bucket(name)?;
         let view = bucket.view()?;
         assert_eq!(view.get("data_000")?.slice(), data_v2.as_slice());
         assert_eq!(view.get("data_001")?.slice(), data_v1.as_slice());
@@ -1078,7 +1078,7 @@ fn gc_data() -> Result<(), OpCode> {
 
     {
         let mace = Mace::new(opt).unwrap();
-        let db = mace.get_bucket("x").unwrap();
+        let db = mace.open_bucket("x").unwrap();
         let view = db.view().unwrap();
 
         for &i in &rest {
@@ -1195,7 +1195,7 @@ fn gc_blob() -> Result<(), OpCode> {
 
     {
         let mace = Mace::new(opt).unwrap();
-        let db = mace.get_bucket("x").unwrap();
+        let db = mace.open_bucket("x").unwrap();
         let view = db.view().unwrap();
 
         for &i in &rest {
@@ -1263,7 +1263,7 @@ fn gc_blob_delete_checkpoint_stays_deleted_without_gc() -> Result<(), OpCode> {
     drop(mace);
     reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view()?;
     for key in &keys {
         if let Ok(value) = view.get(key) {
@@ -1303,7 +1303,7 @@ fn remote_blob_update_from_other_group_stays_deleted_after_reopen() -> Result<()
     tx.commit()?;
     drop(db);
     mace.drop_bucket("x")?;
-    db = mace.get_bucket("x")?;
+    db = mace.open_bucket("x")?;
 
     // tickets 1 and 2 put the remote update and tombstone in different groups
     let tx = db.begin()?;
@@ -1348,7 +1348,7 @@ fn remote_blob_update_from_other_group_stays_deleted_after_reopen() -> Result<()
 
     reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x")?;
+    let db = mace.open_bucket("x")?;
     if let Ok(value) = db.view()?.get("target") {
         panic!(
             "remote blob update from another writer group resurrected after reopen with byte {}",
@@ -1406,7 +1406,7 @@ fn gc_blob_single_gc_run_stays_deleted_after_reopen() -> Result<(), OpCode> {
     drop(mace);
     reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view()?;
     for key in &keys {
         if let Ok(value) = view.get(key) {
@@ -1580,7 +1580,7 @@ fn gc_blob_toggle_compression() -> Result<(), OpCode> {
     }
 
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x")?;
+    let db = mace.open_bucket("x")?;
     let v1 = vec![b'x'; 12 << 10];
     let v3 = vec![b'z'; 12 << 10];
 
@@ -1987,7 +1987,7 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
     drop(db);
     assert_eq!(mace.drop_bucket("x"), Err(OpCode::Again));
     mace.start_gc();
-    let bucket = mace.get_bucket("x")?;
+    let bucket = mace.open_bucket("x")?;
     assert_eq!(
         testing::abort_clean_task_stage(&bucket, txid),
         Some(AbortCleanStage::WaitingQuiesce)
@@ -2010,7 +2010,7 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
         std::thread::yield_now();
     }
     assert!(callback_seen.load(Ordering::Acquire));
-    let bucket = mace.get_bucket("x")?;
+    let bucket = mace.open_bucket("x")?;
     assert_eq!(
         testing::abort_clean_task_stage(&bucket, txid),
         Some(AbortCleanStage::WaitingQuiesce)
@@ -2028,7 +2028,7 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
     let removal_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         mace.start_gc();
-        let bucket = mace.get_bucket("x")?;
+        let bucket = mace.open_bucket("x")?;
         if testing::abort_clean_task_stage(&bucket, txid).is_none() {
             assert_eq!(testing::abort_clean_task_info(&bucket, txid), None);
             assert!(!testing::retained_abort_present(
@@ -2100,7 +2100,7 @@ fn abort_clean_corruption_retains_task_fact_and_wal_pin() -> Result<(), OpCode> 
 
     mace.start_gc();
     assert!(corruption_seen.load(Ordering::Acquire));
-    let bucket = mace.get_bucket("x")?;
+    let bucket = mace.open_bucket("x")?;
     assert_eq!(
         testing::abort_clean_task_stage(&bucket, txid),
         Some(testing::AbortCleanStage::Pending)
@@ -2142,7 +2142,7 @@ fn recovery_drains_abort_clean_before_startup_returns() -> Result<(), OpCode> {
     }
 
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
-    let bucket = mace.get_bucket("x")?;
+    let bucket = mace.open_bucket("x")?;
     let view = bucket.view()?;
     assert_eq!(view.get("k")?.slice(), b"seed");
     drop(view);

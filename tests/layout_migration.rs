@@ -105,7 +105,7 @@ fn legacy_opt(path: &Path) -> Options {
 }
 
 fn assert_legacy_seeded(mace: &Mace, count: usize) {
-    let db = mace.get_bucket("legacy").expect("legacy bucket");
+    let db = mace.open_bucket("legacy").expect("legacy bucket");
     let view = db.view().expect("legacy view");
     for group in ["a", "b"] {
         for i in 0..count {
@@ -197,7 +197,7 @@ fn true_multi_group_legacy_wal_is_recovered_and_migrated() -> Result<(), OpCode>
     mace.start_gc();
     for physical_group in [0, 1, Options::SHARED_ID] {
         assert_eq!(
-            testing::wal_recycle_boundary(&mace.get_bucket("legacy")?, physical_group),
+            testing::wal_recycle_boundary(&mace.open_bucket("legacy")?, physical_group),
             new_start,
             "an empty runtime GC pass must not regress layout migration's recycle boundary"
         );
@@ -257,7 +257,7 @@ fn seed(mace: &Mace, count: usize) {
 }
 
 fn assert_seeded(mace: &Mace, count: usize) {
-    let db = mace.get_bucket("main").expect("bucket");
+    let db = mace.open_bucket("main").expect("bucket");
     let view = db.view().expect("view");
     for i in 0..count {
         let val = view
@@ -304,7 +304,7 @@ fn legacy_durable_per_group_wal_is_migrated_on_same_route_reopen() -> Result<(),
     // the new era keeps working: a second reopen is a plain same-route reopen
     drop(mace);
     let mace = Mace::new(opt.clone().validate()?)?;
-    let db = mace.get_bucket("main")?;
+    let db = mace.open_bucket("main")?;
     let tx = db.begin()?;
     tx.put("post", b"v")?;
     tx.commit()?;
@@ -361,7 +361,7 @@ fn legacy_crash_wal_is_recovered_then_migrated_on_same_route_reopen() -> Result<
     // force-checkpoint it, wipe the legacy files and continue on group_wal
     let mace = Mace::new(opt.clone().validate()?)?;
     assert_seeded(&mace, 201);
-    let db = mace.get_bucket("main")?;
+    let db = mace.open_bucket("main")?;
     let view = db.view()?;
     assert_eq!(view.get("tail").expect("tail").slice(), b"v");
     drop(view);
@@ -381,7 +381,7 @@ fn legacy_crash_wal_is_recovered_then_migrated_on_same_route_reopen() -> Result<
     drop(mace);
     let mace = Mace::new(opt.clone().validate()?)?;
     assert_seeded(&mace, 201);
-    let db = mace.get_bucket("main")?;
+    let db = mace.open_bucket("main")?;
     let view = db.view()?;
     assert_eq!(view.get("tail").expect("tail after reopen").slice(), b"v");
     Ok(())
@@ -419,7 +419,7 @@ fn mixed_namespace_is_fully_migrated() -> Result<(), OpCode> {
 
     let mace = Mace::new(opt.clone().validate()?)?;
     assert_seeded(&mace, 201);
-    let db = mace.get_bucket("main")?;
+    let db = mace.open_bucket("main")?;
     let view = db.view()?;
     assert_eq!(view.get("tail").expect("tail").slice(), b"v");
     drop(view);

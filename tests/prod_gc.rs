@@ -147,7 +147,7 @@ fn oversized_data_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         })
         .expect("reopen oversized data for rewrite");
     let bucket = engine
-        .get_bucket("oversized_data")
+        .open_bucket("oversized_data")
         .expect("load oversized data bucket for rewrite");
     let before = prefixed_file_sizes(&data_root, Options::DATA_PREFIX);
     let before_max = before.iter().map(|(id, _)| *id).max().unwrap_or(0);
@@ -187,7 +187,7 @@ fn oversized_data_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         })
         .expect("reopen rewritten data");
     let bucket = engine
-        .get_bucket("oversized_data")
+        .open_bucket("oversized_data")
         .expect("load rewritten data bucket");
     #[cfg(feature = "extra_check")]
     testing::assert_persisted_gc_stats(&engine);
@@ -261,7 +261,7 @@ fn oversized_blob_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         options.blob_garbage_ratio = 1;
         options.blob_file_size = rewrite_target;
     })?;
-    let bucket = engine.get_bucket("oversized_blob")?;
+    let bucket = engine.open_bucket("oversized_blob")?;
     let before = prefixed_file_sizes(&data_root, Options::BLOB_PREFIX);
     let before_max = before.iter().map(|(id, _)| *id).max().unwrap_or(0);
     assert!(
@@ -297,7 +297,7 @@ fn oversized_blob_rewrite_splits_outputs_and_reopens() -> Result<(), OpCode> {
         options.sync_on_write = true;
         options.blob_file_size = rewrite_target;
     })?;
-    let bucket = engine.get_bucket("oversized_blob")?;
+    let bucket = engine.open_bucket("oversized_blob")?;
     #[cfg(feature = "extra_check")]
     testing::assert_persisted_gc_stats(&engine);
     let view = bucket.view()?;

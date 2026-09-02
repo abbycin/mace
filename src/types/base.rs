@@ -6,6 +6,7 @@ use crate::{
     types::{
         data::{HistRef, Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
         header::{BaseHeader, NodeType, SLOT_LEN, SlotType, TagFlag, TagKind},
+        node::{CompactVal, LeafCompactSource, PlainValSource},
         refbox::{BaseView, BoxRef},
         sst::Sst,
         traits::{IBoxHeader, ICodec, IFrameAlloc, IHeader, IKey, IKeyCodec, ILoader},
@@ -58,7 +59,7 @@ impl BaseView {
     where
         A: IFrameAlloc,
         L: ILoader,
-        I: Iterator<Item = (LeafSeg<'a>, Val<'a>)>,
+        I: LeafCompactSource<'a> + ?Sized,
     {
         let lsn = lsn.max(a.checkpoint_lsn(group));
         let inline_size = a.inline_size();
@@ -70,11 +71,12 @@ impl BaseView {
         let mut pos = 0;
         let mut payload_sz = 0;
         let mut seekable = SeekableIter::new();
+        let mut fold_scratch: Vec<u8> = Vec::new();
         let prefix_len = Self::calc_prefix(lo, &hi);
         #[cfg(feature = "extra_check")]
         let mut last_k: Option<LeafSeg> = None;
 
-        for (ks, v) in iter {
+        while let Some((ks, cv)) = iter.next_compact(&mut fold_scratch) {
             #[cfg(feature = "extra_check")]
             {
                 if let Some(x) = last_k {
@@ -85,22 +87,26 @@ impl BaseView {
             }
 
             let k = ks.remove_prefix(prefix_len);
-            seekable.add(k, v);
-            if v.get_remote() != NULL_ADDR {
+            if cv.is_remote() {
                 remote_hint_cnt += 1;
             }
-            if let Some(ref raw) = last_raw
-                && raw.raw_cmp(&k).is_eq()
-            {
+            let vsz = cv.data_size();
+            let same_as_last = matches!(
+                (&last_raw, &k),
+                (Some(raw), kk) if raw.raw_cmp(kk).is_eq()
+            );
+
+            if same_as_last {
                 if !is_new_sibling {
                     is_new_sibling = true;
-                    payload_sz += Val::calc_size(true, inline_size, v.data_size());
+                    payload_sz += Val::calc_size(true, inline_size, vsz);
                     hints.push_back((pos - 1, 0));
                 }
 
                 let (_, cnt) = must_exist!(hints.back_mut());
                 *cnt += 1;
                 pos += 1;
+                seekable.add(k, cv);
                 continue;
             }
 
@@ -108,9 +114,9 @@ impl BaseView {
             last_raw = Some(k);
             is_new_sibling = false;
             payload_sz += k.packed_size();
-            let vsz = v.data_size();
             payload_sz += Val::calc_size(false, inline_size, vsz);
             elems += 1;
+            seekable.add(k, cv);
         }
 
         let hdr_sz = elems * SLOT_LEN + Self::HDR_LEN;
@@ -155,8 +161,16 @@ impl BaseView {
 
         pos = 0;
         while let Some((k, v)) = seekable.next() {
-            let (r, _) = v.get_record(l);
-            let remote = v.get_remote();
+            // blob-destined fold results allocate their remote box here, where the
+            // frame allocator is available; the box enters the allocator map like
+            // any large-value write (lsn/group aligned for GC retirement)
+            let (r, remote) = match v.materialize_blob(a, group, lsn) {
+                Some(x) => x,
+                None => {
+                    let (r, _) = v.get_record(l);
+                    (r, v.get_remote())
+                }
+            };
             if remote != NULL_ADDR {
                 remote_hint_addrs.push(remote);
             }
@@ -261,14 +275,14 @@ impl BaseView {
         }
 
         let mut regions = Vec::with_capacity(hints.len());
-        let mut old_vers = Vec::new();
+        let mut old_vers: Vec<(Ver, CompactVal)> = Vec::new();
         for &(idx, cnt) in hints {
             hot_true!(cnt > 0);
             let start = old_vers.len();
             iter.seek_to(idx + 1);
             for _ in 0..cnt {
                 let (k, v) = iter.next().expect("must exist");
-                old_vers.push((k.ver, *v));
+                old_vers.push((k.ver, v.clone()));
             }
             regions.push(HistRegion { start, count: cnt });
         }
@@ -285,7 +299,7 @@ impl BaseView {
             let saved = beg;
             let mut len = Self::HDR_LEN;
             while beg < old_vers.len() {
-                let (_, v) = old_vers[beg];
+                let (_, v) = &old_vers[beg];
                 let sz = Ver::len() + Val::calc_size(false, inline_size, v.data_size());
                 let tmp = len + sz + SLOT_LEN;
                 if tmp > frame_budget {
@@ -341,8 +355,16 @@ impl BaseView {
             builder.setup_boundary_keys(&[], None);
 
             for (k, v) in old_vers[start..end].iter() {
-                let (r, _) = v.get_record(l);
-                let remote = v.get_remote();
+                // blob-destined fold rows allocate their remote box here, exactly
+                // like the main second pass; get_remote() alone would encode a
+                // dangling address for them
+                let (r, remote) = match v.materialize_blob(a, group, lsn) {
+                    Some(x) => x,
+                    None => {
+                        let (r, _) = v.get_record(l);
+                        (r, v.get_remote())
+                    }
+                };
                 if remote != NULL_ADDR {
                     remote_hint_addrs.push(remote);
                 }
@@ -561,8 +583,8 @@ impl BaseView {
         } else {
             let l = self.range_iter::<L, Key>(loader, 0, elems1);
             let r = other.range_iter::<L, Key>(loader, 0, elems2);
-            let mut iter = FuseBaseIter::new(&lo1[..pl1], &lo2[..pl2], l, r);
-            Self::new_leaf(a, loader, lo1, hi, sibling, &mut iter, txid, group, lsn)
+            let mut source = PlainValSource::new(FuseBaseIter::new(&lo1[..pl1], &lo2[..pl2], l, r));
+            Self::new_leaf(a, loader, lo1, hi, sibling, &mut source, txid, group, lsn)
         }
     }
 
@@ -625,28 +647,30 @@ impl BaseView {
     }
 }
 
+#[repr(C)]
 pub(crate) struct BaseIter<'a, L, K>
 where
     L: ILoader,
     K: IKey,
 {
-    pub loader: &'a L,
-    sst: Sst<K>,
     beg: usize,
     end: usize,
+    sst: Sst<K>,
+    pub loader: &'a L,
     hist: Option<HistIter<'a>>,
     keepalive: Vec<BoxRef>,
 }
 
+#[repr(C)]
 pub(crate) struct BaseRevIter<'a, L, K>
 where
     L: ILoader,
     K: IKey,
 {
-    pub loader: &'a L,
-    sst: Sst<K>,
     cur: isize,
     end: isize,
+    sst: Sst<K>,
+    pub loader: &'a L,
     hist: Option<HistIter<'a>>,
     keepalive: Vec<BoxRef>,
 }
@@ -1013,7 +1037,7 @@ impl<'a> Builder<'a> {
 }
 
 struct SeekableIter<'a> {
-    data: Vec<(LeafSeg<'a>, Val<'a>)>,
+    data: Vec<(LeafSeg<'a>, CompactVal<'a>)>,
     index: Cell<usize>,
 }
 
@@ -1025,7 +1049,7 @@ impl<'a> SeekableIter<'a> {
         }
     }
 
-    fn add(&mut self, k: LeafSeg<'a>, v: Val<'a>) {
+    fn add(&mut self, k: LeafSeg<'a>, v: CompactVal<'a>) {
         self.data.push((k, v));
     }
 
@@ -1033,7 +1057,7 @@ impl<'a> SeekableIter<'a> {
         self.index.set(pos);
     }
 
-    fn next(&self) -> Option<&(LeafSeg<'a>, Val<'a>)> {
+    fn next(&self) -> Option<&(LeafSeg<'a>, CompactVal<'a>)> {
         let idx = self.index.get();
         if idx < self.data.len() {
             self.index.set(idx + 1);
@@ -1050,6 +1074,7 @@ mod test {
         types::{
             data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
             header::TagKind,
+            node::PlainValSource,
             refbox::{BaseView, BoxRef, BoxView},
             traits::{IBoxHeader, ICodec, IFrameAlloc, IHeader, ILoader},
         },
@@ -1156,7 +1181,7 @@ mod test {
         let th = b.header();
         assert_eq!(th.kind, TagKind::Base);
 
-        let mut empty = LeafData { data: &[], pos: 0 };
+        let empty = LeafData { data: &[], pos: 0 };
         let l = a.clone();
         let b = BaseView::new_leaf(
             &mut a,
@@ -1164,7 +1189,7 @@ mod test {
             [].as_slice(),
             None,
             NULL_PID,
-            &mut empty,
+            &mut PlainValSource::new(empty),
             NULL_ORACLE,
             0,
             Position::MIN,
@@ -1194,7 +1219,7 @@ mod test {
 
         let mut a = Allocator::new();
         // NOTE: the kv should be ordered
-        let mut kv = LeafData {
+        let kv = LeafData {
             data: &[
                 (
                     LeafSeg::new(&[], "foo".as_bytes(), Ver::new(2, 1)),
@@ -1219,7 +1244,7 @@ mod test {
             &[],
             None,
             NULL_PID,
-            &mut kv,
+            &mut PlainValSource::new(kv),
             NULL_ORACLE,
             0,
             Position::MIN,
@@ -1297,7 +1322,7 @@ mod test {
         let mut a = Allocator::new();
         let l = a.clone();
 
-        let mut left_data = LeafData {
+        let left_data = LeafData {
             data: &[(
                 LeafSeg::new(&[], "aa1".as_bytes(), Ver::new(3, 1)),
                 gen_val(&mut a, Record::normal(1, "left".as_bytes())),
@@ -1310,13 +1335,13 @@ mod test {
             "aa0".as_bytes(),
             Some("ab0".as_bytes()),
             NULL_PID,
-            &mut left_data,
+            &mut PlainValSource::new(left_data),
             NULL_ORACLE,
             0,
             Position::MIN,
         );
 
-        let mut right_data = LeafData {
+        let right_data = LeafData {
             data: &[(
                 LeafSeg::new(&[], "aba1".as_bytes(), Ver::new(2, 1)),
                 gen_val(&mut a, Record::normal(1, "right".as_bytes())),
@@ -1329,7 +1354,7 @@ mod test {
             "ab0".as_bytes(),
             Some("abz".as_bytes()),
             NULL_PID,
-            &mut right_data,
+            &mut PlainValSource::new(right_data),
             NULL_ORACLE,
             0,
             Position::MIN,
@@ -1391,7 +1416,7 @@ mod test {
             gen_val(&mut a, Record::normal(1, "vz".as_bytes())),
         ));
 
-        let mut kv = LeafData {
+        let kv = LeafData {
             data: rows.as_slice(),
             pos: 0,
         };
@@ -1402,7 +1427,7 @@ mod test {
             &[],
             None,
             NULL_PID,
-            &mut kv,
+            &mut PlainValSource::new(kv),
             NULL_ORACLE,
             0,
             Position::MIN,

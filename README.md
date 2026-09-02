@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/mace-kv.svg)](https://crates.io/crates/mace-kv)
 [![License](https://img.shields.io/crates/l/mace-kv.svg)](./LICENSE)
 
-Mace is a high-performance, embedded key-value storage engine written in Rust, combining the predictable read performance of B+ Trees with the write throughput of LSM Trees.
+Mace is a high-performance, embedded key-value database written in Rust, combining the predictable read performance of B+ Trees with the write throughput of LSM Trees.
 
 ## Key Features
 
@@ -13,6 +13,7 @@ Mace is a high-performance, embedded key-value storage engine written in Rust, c
 - **ACID Transactions**: Crash-safe commit, abort, and recovery.
 - **Flash-Optimized**: Log-structured design tailored for SSD/NVMe endurance.
 - **Large Value Separation**: Large values live outside the index, cutting maintenance I/O.
+- **Merge Operators**: Optional per-bucket operators support durable merge operands and reads.
 - **Optional Zstd Compression**: Per-bucket `enable_compression` (default: `false`).
 - **Data Integrity**: CRC checksums on persisted records, verified across restarts and crashes.
 - **Flow Control**: Optional foreground write backpressure to bound memory growth.
@@ -50,7 +51,7 @@ fn main() -> Result<(), OpCode> {
 }
 ```
 
-Detailed usage can be found in [examples/demo.rs](./examples/demo.rs).
+Additional runnable examples are available in the [examples/](./examples/) directory.
 
 ## Benchmarks
 

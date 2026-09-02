@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    BucketOptions, OpCode,
+    OpCode, PersistedBucketOptions,
     meta::{
         BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BUCKET_MISC, BUCKET_OBSOLETE_BLOB,
         BUCKET_OBSOLETE_DATA, SEQUENCES_KEY, blob_interval_name, data_interval_name,
@@ -653,7 +653,7 @@ impl IMetaCodec for DelInterval {
 #[repr(C)]
 pub struct BucketMeta {
     pub id: u64,
-    pub options: BucketOptions,
+    pub options: PersistedBucketOptions,
 }
 
 impl IMetaCodec for BucketMeta {

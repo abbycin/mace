@@ -240,7 +240,7 @@ fn checkpoint_publish_runs_durable_barrier_without_private_syncs() -> Result<(),
     reopen.sync_on_write = true;
     reopen.concurrent_write = 1;
     let mace = Mace::new(reopen.validate()?)?;
-    let db = mace.get_bucket("x").expect("bucket must reopen");
+    let db = mace.open_bucket("x").expect("bucket must reopen");
     let view = db.view()?;
     assert_eq!(view.get("k")?.slice(), b"v");
     Ok(())
@@ -585,7 +585,7 @@ fn rotation_writers_are_synced_by_generation_and_survive_reopen() -> Result<(), 
     reopen.wal_file_size = 4 << 10;
     reopen.wal_buffer_size = 8 << 10;
     let mace = Mace::new(reopen.validate()?)?;
-    let db = mace.get_bucket("x").expect("bucket must reopen");
+    let db = mace.open_bucket("x").expect("bucket must reopen");
     let view = db.view()?;
     for round in 0..3usize {
         for i in 0..4usize {
@@ -678,7 +678,7 @@ fn sync_merge_window_option_is_honored_without_breaking_durability() -> Result<(
         reopen.concurrent_write = 1;
         reopen.sync_merge_window_us = window_us;
         let mace = Mace::new(reopen.validate()?)?;
-        let db = mace.get_bucket("x").expect("bucket must reopen");
+        let db = mace.open_bucket("x").expect("bucket must reopen");
         let view = db.view()?;
         assert_eq!(view.get("k")?.slice(), b"v");
     }

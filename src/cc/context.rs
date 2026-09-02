@@ -344,6 +344,7 @@ impl Context {
         self.safe_exclusive.load(Acquire)
     }
 
+    #[inline(always)]
     pub(crate) fn recovering(&self) -> bool {
         self.recovering.load(Acquire)
     }
@@ -697,6 +698,10 @@ fn collect_thread(
     safe_exclusive: Arc<AtomicU64>,
     pool: Arc<CCPool>,
 ) -> JoinHandle<()> {
+    // one collector per mace instance; the token distinguishes this
+    // instance's collector from every other instance's in the process
+    #[cfg(feature = "extra_check")]
+    let collector_token = Arc::as_ptr(&sequences) as usize;
     std::thread::Builder::new()
         .name("collector".into())
         .spawn(move || {
@@ -713,6 +718,8 @@ fn collect_thread(
                     &pool,
                     &mut committed,
                     &mut registry_nodes,
+                    #[cfg(feature = "extra_check")]
+                    collector_token,
                 );
                 idle_delay = collector_idle_delay(cost);
                 if drain_pending_wakes(&reader) {
@@ -735,6 +742,7 @@ fn run_collect_cycle(
     pool: &CCPool,
     committed: &mut Vec<(usize, u64, u64)>,
     registry_nodes: &mut Vec<*mut CCNode>,
+    #[cfg(feature = "extra_check")] collector_token: usize,
 ) -> Duration {
     let proof_scan_started = Instant::now();
     // `SeqCst` linearizes this cut with writer/view registration and timestamp sampling (`oracle`,
@@ -825,7 +833,7 @@ fn run_collect_cycle(
         prune_committed_facts(groups, committed, published_safe, deadline);
     }
     #[cfg(feature = "extra_check")]
-    crate::testing::fire_collector_completed();
+    crate::testing::fire_collector_completed(collector_token);
     if Instant::now() < deadline {
         pool.maybe_shrink_until(deadline);
     }

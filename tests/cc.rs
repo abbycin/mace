@@ -119,7 +119,7 @@ fn put_get() -> Result<(), OpCode> {
 
     saved.tmp_store = true;
     let mace = Mace::new(saved.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("default").unwrap();
+    let db = mace.open_bucket("default").unwrap();
 
     check(&db, &elems, &put_ok, &del1, &del2);
 

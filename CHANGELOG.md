@@ -1,4 +1,7 @@
-## [0.1.2] 2026-08-21
+## [0.1.2] 2026-09-02
+### New Features
+- Added optional per-bucket merge operators with durable merge operands and the default `U64AddOperator`
+
 ### Changes
 - Added a durable shared-WAL route for `sync_on_write = true`, with caller-led generation sync to combine concurrent commits into one durable cut
 - Added route-aware WAL recovery with separate per-group and shared-WAL namespaces

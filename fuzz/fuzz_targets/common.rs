@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -124,7 +125,7 @@ pub(crate) fn get_or_create_bucket(
     name: &str,
     opt: BucketOptions,
 ) -> Result<Bucket, OpCode> {
-    match mace.get_bucket(name) {
+    match mace.open_bucket(name) {
         Ok(bucket) => Ok(bucket),
         Err(OpCode::NotFound) => mace.new_bucket(name, opt),
         Err(err) => Err(err),

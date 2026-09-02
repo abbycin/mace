@@ -76,7 +76,7 @@ fuzz_target!(|data: &[u8]| {
         opt.gc_eager = true;
     });
     let mut bucket =
-        get_or_create_bucket(&mace, "main", bucket_opt).expect("open gc bucket failed");
+        get_or_create_bucket(&mace, "main", bucket_opt.clone()).expect("open gc bucket failed");
     let mut model = BTreeMap::<String, Option<Vec<u8>>>::new();
     let mut stream = ByteStream::new(data);
     let mut lag_expected: Option<BTreeMap<String, Option<Vec<u8>>>> = None;
@@ -161,7 +161,8 @@ fuzz_target!(|data: &[u8]| {
                         opt.blob_garbage_ratio = 0;
                         opt.gc_eager = true;
                     });
-                    bucket = get_or_create_bucket(&mace, "main", bucket_opt).expect("reopen gc bucket");
+                    bucket =
+                        get_or_create_bucket(&mace, "main", bucket_opt.clone()).expect("reopen gc bucket");
                     assert_bucket_matches_model(&bucket, &model);
                     dirty_batches_since_lifecycle = 0;
                     progressed_since_verify = false;

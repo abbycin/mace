@@ -191,7 +191,7 @@ fn durable_large_record_across_rotation_survives_reopen() -> Result<(), OpCode> 
     reopen.wal_buffer_size = 8 << 10;
     reopen.wal_file_size = 4 << 10;
     let mace = Mace::new(reopen.validate()?)?;
-    let db = mace.get_bucket("x").expect("bucket must reopen");
+    let db = mace.open_bucket("x").expect("bucket must reopen");
     let view = db.view()?;
     let got = view.get("big")?;
     assert_eq!(got.slice(), payload.as_slice());

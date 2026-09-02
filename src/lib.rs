@@ -5,7 +5,8 @@ pub use store::store::{Bucket, Mace};
 pub use utils::observe;
 pub use utils::{
     OpCode, RandomPath,
-    options::{BucketOptions, Options},
+    merge_operator::{MergeOperator, U64AddOperator, u64_add_operator},
+    options::{BucketOptions, Options, PersistedBucketOptions},
 };
 
 mod cc;

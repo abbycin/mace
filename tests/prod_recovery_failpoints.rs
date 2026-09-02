@@ -241,7 +241,7 @@ fn child_setup_common(db_root: &Path) -> (Mace, Bucket) {
         opt.data_garbage_ratio = 1;
     });
 
-    let bucket = match mace.get_bucket("prod") {
+    let bucket = match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -276,7 +276,7 @@ fn child_setup_gc(db_root: &Path) -> (Mace, Bucket) {
         opt.blob_file_size = 128 << 10;
     });
 
-    let bucket = match mace.get_bucket("prod") {
+    let bucket = match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -313,7 +313,7 @@ fn child_setup_data_gc(db_root: &Path) -> (Mace, Bucket) {
         opt.blob_file_size = 128 << 10;
     });
 
-    let bucket = match mace.get_bucket("prod") {
+    let bucket = match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -394,7 +394,7 @@ fn child_setup_retire(db_root: &Path) -> (Mace, Bucket) {
         opt.data_garbage_ratio = 1;
     });
 
-    let bucket = match mace.get_bucket("prod") {
+    let bucket = match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -483,7 +483,7 @@ fn child_setup_wal_recycle(db_root: &Path) -> (Mace, Bucket) {
         opt.gc_eager = false;
     });
 
-    let bucket = match mace.get_bucket("prod") {
+    let bucket = match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -585,7 +585,7 @@ fn assert_visibility_after_reopen(db_root: &Path, committed: usize, uncommitted:
     });
     #[cfg(feature = "extra_check")]
     testing::assert_persisted_gc_stats(&mace);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
 
     for idx in 0..committed {
@@ -607,7 +607,7 @@ fn assert_bucket_readable(db_root: &Path) {
     });
     #[cfg(feature = "extra_check")]
     testing::assert_persisted_gc_stats(&mace);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
 
     for idx in 0..16 {
@@ -621,7 +621,7 @@ fn assert_bucket_exists_after_reopen(db_root: &Path, name: &str) {
         opt.gc_timeout = 60_000;
     });
     let bucket = mace
-        .get_bucket(name)
+        .open_bucket(name)
         .expect("bucket should exist after reopen");
     let _view = bucket.view().expect("open bucket view after reopen failed");
     assert_stable_gc_space_accounting(&mace, db_root);
@@ -631,7 +631,7 @@ fn assert_bucket_missing_after_reopen(db_root: &Path, name: &str) {
     let mace = open_with_tune(db_root, |opt| {
         opt.gc_timeout = 60_000;
     });
-    match mace.get_bucket(name) {
+    match mace.open_bucket(name) {
         Err(OpCode::NotFound) => {}
         Err(err) => panic!("bucket reopen should return NotFound, got {err:?}"),
         Ok(_) => panic!("bucket should be missing after reopen"),
@@ -727,7 +727,7 @@ fn assert_rewrite_visibility_after_reopen(db_root: &Path) {
     });
     #[cfg(feature = "extra_check")]
     testing::assert_persisted_gc_stats(&mace);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open post-crash view failed");
     let payload = vec![b'r'; 1024];
     for idx in 0..16 {
@@ -750,8 +750,10 @@ fn assert_rewrite_visibility_after_reopen_multi_bucket(db_root: &Path) {
     });
     #[cfg(feature = "extra_check")]
     testing::assert_persisted_gc_stats(&mace);
-    let bucket1 = mace.get_bucket("prod").expect("bucket prod should exist");
-    let bucket2 = mace.get_bucket("prod2").expect("bucket prod2 should exist");
+    let bucket1 = mace.open_bucket("prod").expect("bucket prod should exist");
+    let bucket2 = mace
+        .open_bucket("prod2")
+        .expect("bucket prod2 should exist");
     let view1 = bucket1.view().expect("open post-crash view1 failed");
     let view2 = bucket2.view().expect("open post-crash view2 failed");
     let payload = vec![b'r'; 1024];
@@ -818,7 +820,14 @@ fn wal_files(db_root: &Path, physical: u8) -> Vec<PathBuf> {
             files.push(path);
         }
     }
-    files.sort();
+    // numeric order, not lexicographic: "group_wal_100" must sort after
+    // "group_wal_86" so callers can rely on files[len-2] being the
+    // second-newest file
+    files.sort_by_key(|path| {
+        let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("");
+        let id = name.strip_prefix(&prefix).unwrap_or("");
+        id.parse::<u64>().unwrap_or(u64::MAX)
+    });
     files
 }
 
@@ -926,7 +935,7 @@ fn child_case_flush_after_manifest_commit_with_retire(db_root: &Path) -> ! {
 
 fn child_case_flush_after_manifest_commit_with_retire_multi_bucket(db_root: &Path) -> ! {
     let (mace, bucket1) = child_setup_retire(db_root);
-    let bucket2 = match mace.get_bucket("prod2") {
+    let bucket2 = match mace.open_bucket("prod2") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket("prod2", BucketOptions::default())
@@ -1029,7 +1038,7 @@ fn child_case_data_obsolete_reclaim(db_root: &Path) -> ! {
         opt.data_garbage_ratio = 100;
         opt.blob_garbage_ratio = 100;
     });
-    let bucket = match mace.get_bucket("prod") {
+    let bucket = match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -1088,7 +1097,7 @@ fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
         opt.blob_garbage_ratio = 100;
         opt.observer = observer.clone();
     });
-    let bucket = match mace.get_bucket("prod") {
+    let bucket = match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -1382,7 +1391,7 @@ fn child_case_recovery_abort_clean_seed(db_root: &Path) {
         opt.wal_buffer_size = 8 << 10;
         opt.wal_file_size = 4 << 10;
     });
-    let bucket = match mace.get_bucket("prod") {
+    let bucket = match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -1432,7 +1441,7 @@ fn child_case_recovery_abort_clean_post_start_gc(db_root: &Path) {
         opt.wal_buffer_size = 8 << 10;
         opt.wal_file_size = 4 << 10;
     });
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     let val = view.get("seed").expect("seed key missing after reopen");
     assert_eq!(val.slice(), b"base");
@@ -2300,7 +2309,7 @@ fn assert_collecting_junk_after_reopen(db_root: &Path) {
         opt.gc_eager = true;
     });
     testing::assert_persisted_gc_stats(&mace);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open collecting-junk view failed");
     let latest = vec![b'c'; 128];
     for idx in 0..512 {
@@ -2476,7 +2485,7 @@ fn chaos_failpoint_recovery_abort_clean_after_drain_before_start() {
         opt.wal_buffer_size = 8 << 10;
         opt.wal_file_size = 4 << 10;
     });
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     let val = view.get("seed").expect("seed key missing after reopen");
     assert_eq!(val.slice(), b"base");
@@ -2637,12 +2646,44 @@ fn wal_recycle_done_does_not_weaken_gap_detection_after_frontier() {
     );
     assert_visibility_after_reopen(&path, 64, 24);
 
+    // build a fresh frontier with multiple post-frontier wal files: reopen,
+    // write past the current file, checkpoint, write again, then close
+    let mace = open_with_tune(&path, |opt| {
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = false;
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 16 << 10;
+        opt.wal_buffer_size = 8 << 10;
+        opt.wal_file_size = 4 << 10;
+    });
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
+    let payload = vec![b'w'; 1024];
+    for idx in 0..16 {
+        let txn = bucket.begin().expect("begin txn");
+        txn.upsert(format!("gap_{idx}"), &payload).expect("upsert");
+        txn.commit().expect("commit");
+    }
+    bucket.checkpoint_and_wait();
+    for idx in 0..8 {
+        let txn = bucket.begin().expect("begin txn");
+        txn.upsert(format!("gap2_{idx}"), &payload).expect("upsert");
+        txn.commit().expect("commit");
+    }
+    drop(mace);
+
     let mut files = wal_files(&path, Options::SHARED_ID);
+    // 8 x 1KB records exceed one 4KB wal file, so the post-checkpoint writes
+    // always produce >= 2 files beyond the frontier file; the count depends
+    // on record byte size, keep the payload large enough
     assert!(
-        !files.is_empty(),
-        "expected at least one wal file after durable recycle frontier"
+        files.len() >= 3,
+        "expected multiple wal files after durable recycle frontier, got {files:?}"
     );
-    let hole = files.remove(0);
+    // remove a post-frontier file that is not the newest: the newest file
+    // defines the recovery scan ceiling, so deleting it would look like a
+    // clean tail truncation instead of a gap
+    let hole = files.remove(files.len() - 2);
     std::fs::remove_file(&hole).expect("remove post-frontier wal file failed");
 
     let mut opt = Options::new(&*path);

@@ -195,7 +195,7 @@ fn route_switch_checkpoints_tail_then_wipes_old_wal() -> Result<(), OpCode> {
     opt.checkpoint_nudge_ms = 0;
     opt.data_file_size = 1 << 30;
     let mace = Mace::new(opt.validate()?)?;
-    let db = mace.get_bucket("x")?;
+    let db = mace.open_bucket("x")?;
 
     // the switch open recovered the uncheckpointed tail, force-checkpointed it
     // (full fsync) and then wiped the old wal: the tail's data must be
@@ -482,7 +482,7 @@ fn empty_bucket_does_not_pin_shared_stream_at_reopen() -> Result<(), OpCode> {
     reopen.checkpoint_nudge_ms = 0;
     reopen.data_file_size = 1 << 30;
     let mace = Mace::new(reopen.validate()?)?;
-    let db = mace.get_bucket("main")?;
+    let db = mace.open_bucket("main")?;
     let floor_at_open = testing::shared_checkpoint_floor(&db, 0);
     assert!(
         floor_at_open.0 > 0,

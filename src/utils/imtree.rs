@@ -78,12 +78,12 @@ where
         RangeIter::new(self.root.clone(), k, cmp, equal)
     }
 
-    pub(crate) fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    pub(crate) fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, visit: &mut F) -> bool
     where
         F: FnMut(K) -> bool,
     {
         if let Some(root) = &self.root {
-            root.visit_from(k, cmp, f)
+            root.visit_from(k, cmp, visit)
         } else {
             false
         }
@@ -183,7 +183,7 @@ where
         }
     }
 
-    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, visit: &mut F) -> bool
     where
         F: FnMut(K) -> bool,
     {
@@ -195,14 +195,14 @@ where
         match &self.children {
             Children::Intl { intl, .. } => {
                 for i in pos..intl.len() {
-                    if intl[i].visit_from(k, cmp, f) {
+                    if intl[i].visit_from(k, cmp, visit) {
                         return true;
                     }
                 }
             }
             Children::Leaf { leaf } => {
                 for i in pos..leaf.len() {
-                    if leaf[i].visit_from(k, cmp, f) {
+                    if leaf[i].visit_from(k, cmp, visit) {
                         return true;
                     }
                 }
@@ -246,7 +246,7 @@ where
         )
     }
 
-    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, visit: &mut F) -> bool
     where
         F: FnMut(K) -> bool,
     {
@@ -255,7 +255,7 @@ where
             Err(pos) => pos,
         };
         for i in pos..self.keys.len() {
-            if f(self.keys[i]) {
+            if visit(self.keys[i]) {
                 return true;
             }
         }
@@ -303,13 +303,13 @@ where
         }
     }
 
-    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, visit: &mut F) -> bool
     where
         F: FnMut(K) -> bool,
     {
         match self {
-            Node::Intl(intl) => intl.visit_from(k, cmp, f),
-            Node::Leaf(leaf) => leaf.visit_from(k, cmp, f),
+            Node::Intl(intl) => intl.visit_from(k, cmp, visit),
+            Node::Leaf(leaf) => leaf.visit_from(k, cmp, visit),
         }
     }
 

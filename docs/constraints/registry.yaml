@@ -916,7 +916,7 @@ entries:
       - path: src/store/store.rs
         note: publish merges bucket frontier in the same transaction as map/stat metadata
       - path: src/store/recovery.rs
-        note: recovery skips redo when WAL record lsn is already <= durable frontier
+        note: recovery skips redo when WAL record lsn is already <= durable frontier; redo inserts preserve the record's logical group and WAL position in the delta envelope
     failure_symptoms:
       - recovery resurrects an older value because one absorbed writer group was not covered by frontier
       - frontier regresses and causes replay to miss or double-apply folded history
@@ -1024,6 +1024,10 @@ entries:
       `OpCode::Corruption`.
       Abort-clean returns `OpCode::Corruption`. Invalid input must not drive unbounded allocation,
       replay, or chain traversal.
+      Merge payloads follow the same gates: every consumer validates the length-prefixed operand
+      framing (non-empty, within `MAX_KV_SIZE` after the key), checksum, logical group,
+      bucket ownership, and prev link exactly like Insert/Update; no consumer may depend on a
+      runtime merge operator existing.
     watch_points:
       - path: src/cc/wal.rs
         note: shared Update length, checksum, and payload-layout codecs live here
@@ -1054,13 +1058,349 @@ entries:
     verifiers:
       - type: unit-test
         path: src/cc/wal.rs
-        note: update_record_validation_rejects_inconsistent_layout and checked_payload_len_rejects_oversized_payload_before_allocation cover payload layout and direct size-limit rejection
+        note: update_record_validation_rejects_inconsistent_layout and checked_payload_len_rejects_oversized_payload_before_allocation cover payload layout and direct size-limit rejection; merge_record_validation_accepts_len_prefixed_operand and merge_record_validation_rejects_malformed_payloads cover Merge framing, empty-operand rejection, checksum mismatch, and oversize rejection
       - type: unit-test
         path: src/store/recovery.rs
         note: checkpoint_scan_stops_at_invalid_update_checksum, invalid_update_subtype_is_truncated_when_enabled, and oversized_update_header_is_truncated_when_enabled cover checkpoint-hint and recovery truncation behavior
       - type: regression-test
         path: tests/gc.rs
         note: abort_clean_corruption_retains_task_fact_and_wal_pin verifies malformed abort-clean WAL retains recovery obligations
+
+  - id: protocol.merge_val_tag_round_trip
+    title: the persisted merge kind is Val::MERGE_BIT and the Record high bit is a runtime-only tag
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      `Val::MERGE_BIT` is the only persisted kind marker for merge operands; it is mutually
+      exclusive with `DEL_BIT`, and both writers (`Val::encode_inline`/`encode_remote`) and
+      decoders enforce that exclusivity. The persisted payload stores only the masked logical
+      group id; the `Record` group-id high bit carries the merge tag at runtime only.
+      The envelope decodes infallibly (`Val::get_record*` returns a plain
+      `(Record, Option<BoxRef>)`; there is no corruption channel at the Val layer, matching the
+      pre-merge codec contract). `MERGE|DEL` exclusivity is an engine-writer invariant:
+      `encode_inline`/`encode_remote` derive the header flags from the record kind so both bits
+      are never set, and the accessors carry extra_check assertions that a tombstone never has
+      `MERGE_BIT` and a merge envelope never has `DEL_BIT` (adversarial both-bits pages are out
+      of the stated threat model; WAL-level framing/checksum/group validation still rejects
+      malformed records before redo). Constructors of `Record::normal/remove/merge` do not
+      range-check the logical group at runtime; release relies on the `concurrent_write <= 128`
+      clamp plus the WAL/recovery consumer range check rejecting group >= concurrent_write
+      before any Record construction. `Record::group_id()` must always return the masked logical
+      group so visibility never sees the tag. Merge records must carry non-empty data because
+      empty data encodes tombstones.
+    watch_points:
+      - path: src/types/data.rs
+        note: Val bits, Record tag masking, infallible get_record_impl decode, extra_check MERGE/DEL exclusivity asserts in is_tombstone/is_merge, IterItem accessors
+      - path: src/types/base.rs
+        note: history builders re-encode decoded records; the restored tag must survive re-encoding
+      - path: src/store/recovery.rs
+        note: redo constructs merge-tagged Records from WAL operands
+      - path: src/index/tree.rs
+        note: read paths materialize records through the infallible decode; resolver errors come only from operator/engine conditions
+    witnesses:
+      - path: src/types/data.rs
+        note: get_record_impl restores the runtime tag after an infallible decode; encode_inline/encode_remote derive header flags from the record tag so MERGE|DEL are never both set; Record::merge keeps the non-empty operand guard; as_slice masks the tag bit so re-encoded payloads stay clean; is_tombstone/is_merge assert exclusivity under extra_check
+      - path: src/types/data.rs
+        note: test_val_codec now round-trips Record::merge inline and remote (tag restored, masked gid persisted, MERGE_BIT in the envelope); the removed corrupt-envelope and constructor-range tests tracked validation that no longer exists
+      - path: src/store/recovery.rs
+        note: committed_merge_redo_replays_raw_operand_without_operator proves the round trip through WAL redo into page bytes (masked gid persisted, tagged Record decoded)
+      - path: src/index/tree.rs
+        note: phase-b evidence rebuild — the FoldCollector traverse/traverse_hist rewrite materializes every candidate version through get_record before folding (scan_merge_exempt, the phase-b consolidation prescan, was replaced in phase c by the fold state machine); merge/si/cc suites green after the rewrite
+      - path: src/types/node.rs
+        note: phase-c evidence — the compact fold decodes every absorbed operand through Val::get_record and re-encodes synthesized envelopes through Record::as_slice, so the masked-gid/tagged-Record invariant is exercised on the materialization path; the compact fold tests (compact_folds_merge_run_*) read the boundary group back via get_record
+    failure_symptoms:
+      - a page containing MERGE|DEL silently decodes instead of being rejected (adversarial-only; extra_check asserts catch both-bits envelopes)
+      - visibility checks observe a group id polluted by the runtime tag bit
+      - an empty operand is written and later misread as a tombstone
+      - compact/split re-encoding drops the merge kind from the copied envelope
+    verifiers:
+      - type: unit-test
+        path: src/types/data.rs
+        note: test_val_codec covers inline and remote round trips for normal/remove/merge (kind flag and masked gid persisted, tag restored on decode)
+      - type: regression-test
+        path: src/store/recovery.rs
+        note: committed_merge_redo_replays_raw_operand_without_operator covers the durable round trip end to end
+
+  - id: protocol.merge_operator_runtime_contract
+    title: the merge operator exists only as frozen per-bucket runtime state and never persists
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      A merge operator lives only in the public runtime `BucketOptions` and in the loaded
+      `BucketContext`; it must never reach manifest metadata, BucketMeta, WAL payloads, or page
+      bytes. The serialized bucket load fixes either the supplied operator or no operator before
+      publishing the `BucketContext`, and that choice is immutable for the context lifetime.
+      Re-presenting the same Arc succeeds; presenting a different Arc, or presenting any operator
+      after the context was loaded without one, returns `OpCode::Invalid`. Opening without an
+      operator leaves an existing operator untouched. Unloading clears the runtime choice, so the
+      next load chooses again. The operator is a total user function keyed by the
+      stable user raw key: `combine_operands(key, l, r) -> Vec<u8>` and
+      `apply(key, base, operand) -> Option<Vec<u8>>` return plain values (no OpCode failure
+      channel), `None` is the only logical delete, and the same bucket may dispatch different
+      algebra per key prefix while sharing one context lifetime. The meaning of a key must remain
+      stable while its `BucketContext` is loaded; changing key semantics requires unloading and
+      reloading the bucket with the new operator. The engine never calls the
+      operator inside `TxnKV::merge`, never catches operator panics, and cannot verify
+      user-operator semantics (determinism, associativity, commutativity, base action law);
+      those are documented caller contracts, not engine-enforced properties, and no
+      name/version compatibility check may substitute for them.
+    watch_points:
+      - path: src/utils/options.rs
+        note: BucketOptions/PersistedBucketOptions split keeps merge_operator out of persisted layouts
+      - path: src/map/buffer.rs
+        note: BucketContext holds the immutable runtime options and validates later opens against the operator selected at load
+      - path: src/meta/entry.rs
+        note: BucketMeta encodes PersistedBucketOptions only
+      - path: src/meta/manifest.rs
+        note: serialized context creation selects runtime options before publishing the context and validates every already-loaded fast path
+      - path: src/store/store.rs
+        note: open_bucket and open_bucket_with_options select None or the supplied operator through the same get-or-load boundary
+      - path: src/map/evictor.rs
+        note: phase-c — eviction compaction reads the frozen operator via bucket_ctx.merge_operator() and must never observe a different one mid-context
+      - path: src/index/tree.rs
+        note: read, split, and consolidation paths borrow the immutable operator from BucketContext without a lock or Arc clone
+    witnesses:
+      - path: src/map/buffer.rs
+        note: BucketContext stores no mutable operator slot; validate_merge_operator accepts only no operator or the same Arc
+      - path: src/meta/manifest.rs
+        note: load_bucket_context_with_options performs the compatibility check both before and after taking the structural load lock
+      - path: tests/bucket.rs
+        note: load_persisted_bucket_options reads raw manifest bytes through a PersistedBucketMeta mirror, proving persisted layout holds only the persisted subset
+      - path: tests/merge.rs
+        note: buckets_keep_independent_merge_operators, concurrent_conflicting_loads_admit_exactly_one, unloaded_bucket_requires_operator_again, opening_without_operator_never_unregisters, operatorless_context_requires_reload_before_binding_operator
+    failure_symptoms:
+      - an operator identity or trait-object pointer leaks into durable metadata or WAL bytes
+      - two live opens present different operators for one context without an error
+      - reopening after unload silently inherits a stale operator
+      - update_bucket_opt persists runtime-only fields or rejects runs over them
+      - a published context changes from no operator to an operator while reads or maintenance are active
+    verifiers:
+      - type: regression-test
+        path: tests/merge.rs
+        note: lifecycle tests cover per-bucket isolation, serialized conflicting loads, immutable None and Some choices, unload rebinding, and no-unregister plain opens
+      - type: regression-test
+        path: tests/bucket.rs
+        note: bucket_update_opt_persists_compatible_changes proves persisted-field comparison ignores runtime fields after the split
+
+  - id: protocol.merge_operand_fold_is_snapshot_complete
+    title: get, seek, range, and history reads share one fallible resolver that folds exactly the snapshot-visible operand chain
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      Every logical read of a key — point get through `Tree::traverse`, forward and reverse
+      iteration, and history-region traversal — must resolve the value through one shared,
+      fallible resolver, except that iteration may return an already-visible physical head directly
+      when it is a non-merge, non-tombstone record because that visible plain value is the barrier
+      for every older version, including history. All other scan
+      candidates, including an invisible head, must enter the resolver: walk versions newest to
+      oldest, skip invisible ones, collect each visible
+      merge operand, stop at the first visible base or tombstone (or at the end of the key's
+      history), then combine the operands left-associated and apply them once onto that base.
+      Delta traversal positions the candidate walk by raw key and the complete `Ver` ordering
+      (`txid`, then `cmd`), so all same-transaction operands remain in the newest-to-oldest walk
+      even when their delta run spans ImTree leaves.
+      Encountering the first visible operand without an operator immediately returns
+      `OpCode::Invalid`; an operator delete result is
+      key absence; a resolved deletion hides the key from scans instead of surfacing a tombstone
+      item. Resolved values live only on the reader side and are never written back to pages,
+      history, or WAL. `FoldCollector::finish` returns `Result<ValRef, OpCode>`: only an absent
+      barrier with no operands or `apply(key, ...) -> None` produces `OpCode::NotFound`; point get
+      surfaces that absence and iterators map only that code to a skipped key. Every other resolver
+      error is an engine-detectable condition surfaced verbatim by `try_next`/`try_next_back`
+      and never silently skipped. Operator calls
+      receive the stable user raw key of the candidate, without version or physical layout
+      encoding. The plain `Iterator` wrappers keep the terminate-on-error convention.
+    watch_points:
+      - path: src/index/tree.rs
+        note: FoldCollector stores only operands; the first operand checks BucketContext's immutable operator, later operands skip that check, and Tree::finish_fold supplies the same operator; traverse/traverse_hist preserve collection order and the raw-key plus full-Ver lower-bound comparator; resolve_item maps only NotFound to a skip and every other error verbatim
+      - path: src/types/data.rs
+        note: IterItem folded branch and val() accessor (infallible; the resolver's errors surface through try_next/try_next_back)
+      - path: src/index/tree.rs
+        note: compat next/next_back sticky-failure wrappers
+    witnesses:
+      - path: src/index/tree.rs
+        note: single resolver shared by point get and both scan directions; the only bypass is a page-backed visible plain head, preserving sequential zero-copy scans; every finish branch uses the immutable BucketContext operator, and an invisible-head-no-hist tail folds collected operands against absence
+      - path: tests/merge.rs
+        note: key_aware_operator_dispatch_survives_compact_and_reopen pins the raw key argument across read/compact/reopen
+      - path: tests/merge.rs
+        note: merge_folds_against_base_and_tombstone_barriers, same_transaction_merge_run_crossing_imtree_leaf_folds_completely, uncommitted_merge_is_invisible_to_other_snapshots, scan_folds_merge_runs_forward_and_reverse, scan_omits_keys_deleted_by_fold, committed_operand_folds_over_uncommitted_consolidated_merge, checkpointed_invisible_head_resolves_visible_history_in_both_scan_directions
+    failure_symptoms:
+      - point get returns raw operand bytes or a stale base while scans return a different fold
+      - a same-transaction merge run crossing an ImTree leaf folds only a suffix of its operands
+      - an uncommitted or aborted operand leaks into a snapshot result
+      - a fold-deleted key still appears as an iterator item
+      - an operator error or engine violation surfaces as NotFound instead of its real code
+      - an iterator silently skips a key whose fold errored
+      - an invisible consolidated SST head discards collected delta operands instead of folding them against absence
+    verifiers:
+      - type: regression-test
+        path: tests/merge.rs
+        note: the scan/fold tests cover barriers, leak-freedom, direction symmetry, deletion-by-fold, checkpointed invisible Put/Merge heads, an invisible consolidated merge head below a committed operand, and the ordinary page-backed scan fast path
+
+  - id: protocol.recovery_defers_merge_structural_maintenance
+    title: recovery never consolidates or splits; post-recovery splits require an empty delta chain
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      While `Context::recovering()` is true, tree lookups may proceed but every structural
+      maintenance entry that could interpret merge chains is deferred: threshold consolidation,
+      leaf/international split, root split completion for half-finished roots, and cooperative
+      parent-separator installation all wait until recovery completes. Lookups stay correct
+      during recovery by following the existing right-sibling routing when descent lands below a
+      split boundary. Two completion paths are NOT deferred and must stay safe: a half-finished
+      node merge is completed on load (`load_node` -> `merge_node`) and node-merge initiation may
+      proceed, both operator-free and non-materializing; merge operands remain verbatim unless a
+      safe tombstone has already made older versions unreachable, and no folded base is produced
+      — they never interpret merge operands. Their leaf rebuilds still apply the retained-abort
+      predicate so a below-safe aborted plain head cannot hide a committed predecessor.
+      Once recovering clears, the first oversized leaf consolidates its delta chain to empty
+      before splitting (split requires delta_len == 0). Consolidation touching keys whose
+      chains carry merge operands remains operator-free and raw-preserving; operands needed by a
+      retained plain base stay verbatim, while versions older than a safe tombstone may be
+      dropped because that tombstone is an absence barrier and no operator can resurrect them.
+    watch_points:
+      - path: src/index/tree.rs
+        note: try_find_leaf recovering gates on should_split, split_root completion, parent insert_index, and threshold consolidation; split-arm pre-consolidation
+      - path: src/types/node.rs
+        note: LeafFilter and PlainLeafFilter state machines — with operator None no fold is materialized; raw operands stay verbatim around a retained plain base, while a safe tombstone establishes a barrier that drops older versions
+      - path: src/store/recovery.rs
+        note: phase2 ordering keeps redo and abort-clean drain inside the recovering window
+      - path: src/index/tree.rs
+        note: load_node completes a half-finished node merge unconditionally and try_merge may initiate merges during recovery — both remain raw-preserving by construction (merge_to_base with operator None) while receiving the retained-abort context; they must never gain an operator-bearing fold during recovery
+    witnesses:
+      - path: src/store/recovery.rs
+        note: redo_never_splits_or_consolidates_until_recovery_completes asserts zero TreeNodeSplit/TreeNodeConsolidate counters during reopen via observer deltas and their resumption on the first post-recovery writes; TreeNodeMerge (completion on load) is intentionally not gated — it remains operator-free but applies the retained-abort predicate while rebuilding leaves
+      - path: src/store/recovery.rs
+        note: raw_preserving_maintenance_keeps_merge_chain_readable asserts consolidate+split phases keep the merge chain folding to the design value across a long-lived view
+    failure_symptoms:
+      - a page count or structural counter advances while redo is still replaying
+      - a half-finished node merge completed during recovery folds, drops, or re-encodes merge operands (must stay raw-preserving)
+      - a merge operand or its base disappears after consolidation or split on an operator-less bucket
+      - a long-lived view observes a different value for a merge-bearing key after maintenance
+      - split runs on a leaf whose delta chain was not materialized
+    verifiers:
+      - type: regression-test
+        path: src/store/recovery.rs
+        note: the two tests above provide counter-delta and readability coverage for guard, resume, and raw-preserving behavior; source audit covers context propagation through set_node_merging and structural merge completion
+
+  - id: protocol.merge_compact_preserves_snapshot_and_frontier
+    title: compacted bases absorb merge runs only at the safe boundary and inherit every absorbed LSN in the page lineage frontier
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      When compaction materializes a merge run into a plain base, it must fold only the
+      contiguous run older than `compact_safe_txid` that sits above a normal base/tombstone
+      barrier, stamp the safe boundary version's (newest run member's) Ver and logical group
+      onto the result, keep every newer version verbatim, and propagate each absorbed
+      operand's WAL LSN into the compacted page lineage frontier so recovery neither redoes
+      nor skips them. A folded value past the bucket inline boundary materializes through the
+      existing remote/blob path (up to MAX_KV_SIZE); past MAX_KV_SIZE the chain stays
+      raw-preserving. The operator is total: missing-operator compaction keeps raw operands needed
+      by a retained plain base, while a safe tombstone may discard older unreachable versions; raw-preserving covers
+      only a missing operator and
+      engine-detected output contract violations (empty combine/apply results, oversized fold
+      results); there is no operator error channel. Operator calls receive the folded key's
+      stable user raw key, which must not change across page relocation, split, eviction, or
+      history folding. Merge chains whose older versions live behind the head's history
+      pointer fold together with the head. A retained-aborted version is invisible to every
+      snapshot and must never join a fold run nor act as the fold barrier: below-safe aborted
+      records are dropped before the run/barrier decision (abort-clean owns their physical
+      removal), and above-safe aborted records stay verbatim until abort-clean; otherwise the
+      synthesized row either leaks aborted bytes (committed boundary ver) or is dropped
+      wholesale by abort-clean (aborted boundary ver), losing committed operands. Publish
+      stays data-first, meta-last with junk/EBR handoff unchanged.
+    watch_points:
+      - path: src/types/node.rs
+        note: LeafFilter and PlainLeafFilter state machines (process_key, fold_run, check_out, check_plain_fast, and the plain filter barrier) fold runs at the safe boundary, keep raw operands around a retained plain base, and drop versions older than a safe tombstone; fold_run passes the run's raw key to every combine/apply; the synthesized envelope is [flags][gid][len][gid][data]; history-region versions reach the filter through the sst iterator's HistIter and join the same run; check_out drops below-safe retained-aborted records (abort_ctx predicate) before they can join a run or act as a barrier
+      - path: src/map/evictor.rs
+        note: eviction compaction passes the bucket operator and the retained-abort context so evict-path compacts share the same fold semantics
+      - path: src/index/tree.rs
+        note: try_compact and split_root thread the store context into compact (abort_ctx) alongside the operator
+      - path: src/types/base.rs
+        note: BaseView::new_leaf consumes the LeafCompactSource stream including synthesized envelopes; the second pass allocates remote boxes for blob-destined fold results via materialize_blob (RemoteHeader + allocator map, lsn/group from the page)
+      - path: src/map/publish.rs
+        note: frontier absorption of absorbed-operand LSNs rides the existing publish transaction (collect_frontier_and_junk + transfer_junks)
+      - path: docs/design.md
+        note: the merge-aware compact model describes the final materialization
+    witnesses:
+      - path: src/types/node.rs
+        note: Node::compact/merge_to_base forward the bucket operator and the retained-abort context; process_key/check_out implement design 2.7 rules 1-3 plus the retained-abort exclusion (below-safe aborted records drop before runs/barriers; above-safe aborted records stay verbatim until abort-clean); fold_run encodes the boundary Ver/group and per-key raw-preserving fallback; the operator-free filters retain operands around a plain base but honor a safe tombstone barrier; history-region chains fold through the same run because the sst iterator walks the region behind the head
+      - path: src/map/publish.rs
+        note: Publish::replace/evict call old.collect_frontier_and_junk so the old page's delta LSNs (including absorbed operands) merge into the new base lineage
+    failure_symptoms:
+      - recovery replays an operand already absorbed into a compacted base (double add)
+      - recovery skips a committed operand because the frontier advanced without absorption
+      - a long-lived view sees a folded value where its snapshot requires the pre-fold intermediate
+      - a materializing compact loses the merge chain behind the head's history pointer
+      - a retained-aborted operand's bytes appear in a durable base (leak) or the whole
+        synthesized row is dropped by abort-clean, losing committed operands
+    verifiers:
+      - path: tests/merge.rs
+        note: materializing_compact_survives_reopen_without_double_add pins no-double-add/no-loss across reopen (multi-group, concurrent_write default 16); materializing_compact_keeps_long_view_stable pins pre-fold snapshots; empty_fold_output_keeps_chain_and_isolates_the_key pins per-key raw-preserving fallback on engine-detected violation; key_aware_operator_dispatch_survives_compact_and_reopen pins the raw key argument across compact/reopen
+      - path: src/types/node.rs
+        note: compact_folds_merge_run_at_boundary_ver_and_group pins the boundary Ver and group exactly (design 2.7 example); compact_folds_hist_backed_chain_exactly_once pins exactly-once folding of region-backed chains (with and without a delta merge above the head); compact_folds_merge_run_onto_tombstone_barrier and safe_delete_shadows_stale_merges_across_compact pin tombstone barriers for materializing and operator-free paths; compact_fold_result_can_be_tombstone_shaped pins the DEL-bit envelope; compact_empty_fold_output_stays_raw_preserving pins full-chain survival on empty-output violation; compact_folds_oversized_result_into_blob pins blob materialization past the inline boundary
+      - path: tests/merge.rs
+        note: materialized_blob_fold_survives_reopen pins blob-materialized folds across checkpoint/reopen without loss or double-add
+      - path: src/index/tree.rs
+        note: aborted_operand_never_folds_into_materialized_base pins the leak direction (aborted operand below a committed merge head reads 13, never 15, across compact, abort-clean, shutdown and reopen); aborted_merge_head_keeps_committed_base_after_compact pins the loss direction (aborted head never stamps the synthesized row, the committed base survives abort-clean and reopen); aborted_plain_without_operator_keeps_committed_base pins the no-operator abort-window loss direction; above_safe_retained_abort_stays_verbatim_during_compact pins that above-safe retained aborts remain physical until abort-clean
+
+
+  - id: protocol.merge_contract_violation
+    title: empty or oversized folded values are a public contract violation that blocks further merges on the key until a committed delete resets it
+    kind: protocol
+    status: active
+    confidence: high
+    statement: >
+      When a merge operator's combine or apply result is empty or exceeds the persisted size
+      limit (MAX_KV_SIZE), reliable reads (point get, try_next, try_next_back, range) return
+      the public `OpCode::MergeContractViolation`; the value is never truncated, returned as
+      a plain value, or silently degraded to raw operands. The violating key is recorded in a
+      runtime per-bucket blocked set (exact keys, never fingerprints): `TxnKV::merge` on a
+      blocked key is rejected before any WAL or tree write. A committed `del` or
+      `reset_merge` clears the blocked status; an aborted transaction keeps it. The blocked
+      set is runtime-only — it disappears on bucket unload/reopen, and restoring the
+      prohibition across reopen is a persistence-protocol concern, not solved here. The raw
+      operand chain remains valid, crash-safe, and recoverable — a read error never deletes
+      or rewrites it. Compaction of such a key stays raw-preserving, records the key in the
+      blocked set, and does not fail the publish or any committed transaction. Folded values
+      between the bucket inline boundary and MAX_KV_SIZE materialize through the normal
+      remote/blob path.
+    watch_points:
+      - path: src/index/tree.rs
+        note: FoldCollector::finish applies the size judgment to combine and apply results; finish_fold blocks the key via block_merge_key on MergeContractViolation
+      - path: src/index/txn.rs
+        note: merge_impl rejects blocked keys before WAL/tree writes; del records deleted keys, commit unblocks them; reset_merge is an idempotent reset
+      - path: src/types/node.rs
+        note: classify_fold_size is the shared inline/blob/too-large judgment; fold_run records blocked_hits on empty output and oversized results; merge_to_base drains them into the caller's block callback (try_compact/split_root/evictor register into the bucket set)
+      - path: src/map/buffer.rs
+        note: BucketContext::merge_blocked_keys holds the exact-key runtime blocked set; cleared on bucket unload
+      - path: src/cc/group.rs
+        note: TxnState::deleted_keys carries the commit-gated unblock list
+    witnesses:
+      - path: src/index/tree.rs
+        note: FoldCollector::finish returns MergeContractViolation on empty or oversized combine/apply; block_merge_key inserts the exact key; Iter::try_next/try_next_back are public and propagate the error
+      - path: src/index/txn.rs
+        note: merge_impl checks the blocked set first; commit calls unblock_deleted_keys on both success paths; reset_merge is idempotent for already-absent keys
+      - path: src/types/node.rs
+        note: fold_run records blocked_hits on engine-detected violations; the evictor/try_compact/split_root block callbacks register them into the bucket set
+    failure_symptoms:
+      - a read returns an oversized folded value as a plain value, truncated, or silently degrades to raw operands
+      - merge() appends an operand to a key whose chain already violated the contract
+      - a violating key blocks other keys' compaction, checkpoint, GC, or recovery
+      - recovery loses or double-applies the raw chain of a violating key
+      - a blob-materialized fold is lost or double-added after checkpoint/reopen
+      - a committed del fails to run its commit-gated unblock, or an aborted del clears the blocked status
+    verifiers:
+      - path: tests/merge.rs
+        note: "oversized_fold_blocks_merge_until_committed_delete pins the public error on get and both iterator directions, merge rejection while blocked, aborted-del preserving the block, committed del/reset_merge committing successfully, non-blocking of other keys, and the runtime-only blocked set across reopen (merge admission after reopen). the commit-gated unblock mechanism is exercised but its post-del admission effect is not timing-pinned: a background reader pinned before the del may legitimately re-block from the old chain, which is designed behavior"
+      - path: src/types/node.rs
+        note: classify_fold_size_boundaries pins the inline/blob/too-large boundaries exactly; compact_folds_oversized_result_into_blob and blob_fold_as_history_sibling_materializes_remote pin blob materialization including the history-sibling case
+
 
   - id: protocol.abort_clean_visibility_and_retirement
     title: aborted versions may persist physically but must remain invisible until durability-closed abort-clean retirement
@@ -1499,6 +1839,8 @@ entries:
         note: key-local history, split, merge, and traversal regressions remain here
       - path: tests/si.rs
         note: snapshot point and forward or reverse reference schedules live here
+      - path: tests/merge.rs
+        note: checkpointed invisible Put/Merge heads must still reach their visible HistRef candidate in both scan directions
     witnesses:
       - path: src/types/node.rs
         note: find_latest_meta now probes the raw-key head independent of probe txid
@@ -1506,6 +1848,8 @@ entries:
         note: history locality, split or merge traversal, and reverse-iterator regressions cover structural candidate reachability
       - path: tests/si.rs
         note: snapshot_point_and_forward_reverse_traversal_match_reference_after_churn, iterator_page_capture_keeps_snapshot_for_forward_and_reverse_after_late_commit, and model_reference_schedules_match_point_forward_and_reverse_visibility cover point, forward, and reverse snapshot traversal plus the leaf-capture window
+      - path: tests/merge.rs
+        note: checkpointed_invisible_head_resolves_visible_history_in_both_scan_directions pins a checkpointed invisible head whose only visible value is behind HistRef
     failure_symptoms:
       - point get misses a version that should still be visible
       - forward or reverse iteration skips the only visible version for a key
@@ -1520,16 +1864,22 @@ entries:
       - type: regression-test
         path: src/types/node.rs
         note: find_latest_meta_is_independent_of_probe_txid guards raw-key latest-head selection used by point and write traversal
+      - type: regression-test
+        path: tests/merge.rs
+        note: checkpointed_invisible_head_resolves_visible_history_in_both_scan_directions covers both physical head kinds and both scan directions after checkpoint
 
   - id: protocol.snapshot_first_writer_wins
-    title: overlapping writers on the same key must enforce first-writer-wins across retries
+    title: overlapping writers on the same key enforce first-writer-wins, with merge/merge coexistence as the only exception
     kind: protocol
     status: active
     confidence: high
     statement: >
       If two overlapping write transactions attempt to modify the same logical key, at most one may
       commit; any retry or page-replacement path must re-check the latest visible head before
-      publishing a new write.
+      publishing a new write. The single exception is merge/merge under the same runtime operator:
+      a merge write may be admitted onto an invisible merge head because operands commute and the
+      folded result is order-independent. A normal write or delete over any invisible
+      head — including a merge head — still conflicts first-writer-wins.
     watch_points:
       - path: src/index/tree.rs
         note: latest-head checks, page-lock ownership, and update retry paths live here
@@ -1543,7 +1893,9 @@ entries:
         note: deterministic same-key race witnesses live here
     witnesses:
       - path: src/index/txn.rs
-        note: resolve_latest_meta_for_write rejects invisible non-aborted heads as conflicts and retries after page replacement
+        note: resolve_latest_meta_for_write rejects invisible non-aborted heads as conflicts and retries after page replacement; resolve_latest_meta_for_merge admits only invisible merge heads when an operator is registered
+      - path: tests/merge.rs
+        note: concurrent_merge_writers_both_commit_and_sum proves merge/merge coexistence; normal_writer_conflicts_with_concurrent_merge_head proves normal writes still conflict over merge heads
       - path: src/types/node.rs
         note: find_latest_meta follows the latest raw-key head instead of probe txid order
       - path: tests/si.rs
@@ -2020,7 +2372,7 @@ entries:
       - type: runtime-order
         path: src/map/flush.rs
         note: FlushResult::sync branches on force_fsync to fsync; the fsync-vs-fdatasync distinction is enforced by code review, not by the behavior test
-  - id: protocol.wal_format_upgrade_requires_wal_independent_exit
+  - id: protocol.graceful_exit_wal_independent_visibility
     title: graceful exit must leave the store WAL-independent with committed-only visibility
     kind: protocol
     status: active
@@ -2058,7 +2410,95 @@ entries:
     verifiers:
       - type: behavior
         path: tests/exit_flush.rs
-        note: upgrade_scenario tests delete every WAL file in both namespaces after graceful exit and assert committed-only visibility
+        note: durable_exit_leaves_all_committed_in_data_files, relaxed_exit_leaves_all_committed_in_data_files, exit_flush_aborted_txn_stays_invisible_without_wal, and exit_flush_aborted_override_of_committed_stays_at_committed_value delete every WAL file in both namespaces after graceful exit and assert committed-only visibility
+
+  - id: protocol.data_blob_file_version_gate
+    title: data and blob readers must reject unsupported footer versions and fields
+    kind: protocol
+    status: suspect
+    confidence: medium
+    statement: >
+      Data and blob writers emit the current `FileVersion::V1` footer format. Readers must reject
+      an unknown footer version or non-zero fields that are unsupported for that version before
+      consuming relocation or interval metadata. Checkpoint and GC rewrites must emit the current
+      version and may not copy an incompatible encoded payload without an explicit migration rule.
+      A future format may coexist only after its reader support and migration boundary are recorded
+      in the design and this ledger.
+    watch_points:
+      - path: src/map/data.rs
+        note: FileVersion dispatch, footer validation, and MetaReader metadata bounds live here
+      - path: src/meta/stat.rs
+        note: stat readers dispatch record decoding by the parsed file version
+      - path: src/store/gc.rs
+        note: rewrite chooses the current target version and decides whether encoded records can be reused
+      - path: docs/design.md
+        note: section 15.1 defines the current V1-only format and future migration boundary
+    witnesses:
+      - path: src/map/data.rs
+        note: MetaReader rejects unknown versions with BadVersion and rejects unsupported V1 footer fields
+      - path: src/store/gc.rs
+        note: rewrite_builder emits V1 and only reuses encoded records when source and target versions are compatible
+      - path: docs/design.md
+        note: data/blob writers and readers are explicitly V1-only until a future migration boundary is defined
+    failure_symptoms:
+      - a reader consumes relocation or interval metadata from an unknown or unsupported footer
+      - a rewrite copies an incompatible encoded record without decoding and re-encoding it
+      - a future format is introduced without reader support, migration rules, or compatibility tests
+    verifiers:
+      - type: unit-test
+        path: src/map/data.rs
+        note: data_dump_load and rewrite_builder_emits_v1 assert current V1 emission and parsing; malformed-version and unsupported-footer-field rejection lacks a direct test
+      - type: unit-test
+        path: src/store/gc.rs
+        note: rewrite_builder_keeps_compressed_v1_records_compressed exercises V1 rewrite compatibility
+      - type: evidence-gap
+        path: src/map/data.rs
+        note: add explicit unknown-version and unsupported-footer-field fixtures before promoting this entry to active
+    next_actions:
+      - add malformed footer/version tests and promote this entry after the rejection path is directly exercised
+
+  - id: protocol.persist_stat_decode_bounds
+    title: persisted stat metadata must be bounds-checked before unsafe decoding
+    kind: protocol
+    status: suspect
+    confidence: high
+    statement: >
+      Every persisted `PersistStat` record consumed during startup or lazy bitmap loading must
+      validate the header, body length arithmetic, inactive-sequence count, and sequence bounds
+      before reading bytes or setting bitmap entries. Malformed metadata must return
+      `OpCode::Corruption` through the caller rather than panic, over-read, or silently omit the
+      inactive set. The same validation must cover both the eager inner-stat path and the lazy mask
+      path.
+    watch_points:
+      - path: src/meta/entry.rs
+        note: PersistStat decode_inner_only, decode_mask_only, and full decode perform the unsafe metadata reads
+      - path: src/meta/builder.rs
+        note: startup eagerly decodes persisted stat bodies while rebuilding runtime stats
+      - path: src/meta/stat.rs
+        note: lazy bitmap loading decodes inactive sequence lists from the metadata bucket
+      - path: tests/bucket.rs
+        note: malformed persisted metadata reopen behavior belongs here
+    witnesses:
+      - path: src/meta/entry.rs
+        note: current decode_inner_only and decode_mask_only call unchecked IAsSlice/from_raw reads and do not validate declared body lengths
+      - path: src/meta/builder.rs
+        note: ManifestBuilder::load reaches decode_inner_only for every persisted data/blob stat
+      - path: src/meta/stat.rs
+        note: StatCtx::load_mask_from_btree reaches decode_mask_only for lazy mask loads
+    failure_symptoms:
+      - malformed stat metadata panics or reads beyond the returned value buffer
+      - a corrupt inactive sequence silently changes GC active/inactive accounting
+      - startup or lazy GC loading crashes instead of returning a typed corruption error
+    verifiers:
+      - type: evidence-gap
+        path: src/meta/entry.rs
+        note: source audit confirms unchecked reads remain; no current regression test proves malformed stat metadata returns OpCode::Corruption
+      - type: evidence-gap
+        path: tests/bucket.rs
+        note: add truncated-header, short-body, oversized-count, and out-of-range-sequence fixtures before promoting this entry to active
+    next_actions:
+      - implement checked stat layout decoding and propagate OpCode::Corruption through startup and lazy mask callers
+
   - id: protocol.shutdown_admission_exclusion
     title: transaction admission never races with shutdown in the public API
     kind: protocol

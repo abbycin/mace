@@ -57,7 +57,7 @@ fn child_crash_path() -> ! {
     let engine = Mace::new(Options::new(&db_root).validate().expect("bad options"))
         .expect("open engine failed");
 
-    let bucket = match engine.get_bucket("prod_recovery") {
+    let bucket = match engine.open_bucket("prod_recovery") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => engine
             .new_bucket("prod_recovery", BucketOptions::default())
@@ -89,7 +89,7 @@ fn child_verify_path() {
     .expect("reopen engine failed");
 
     let bucket = engine
-        .get_bucket("prod_recovery")
+        .open_bucket("prod_recovery")
         .expect("bucket should exist");
     let view = bucket.view().expect("open view failed");
 
@@ -105,7 +105,7 @@ fn child_update_chain_crash_path() -> ! {
     let engine = Mace::new(Options::new(&db_root).validate().expect("bad options"))
         .expect("open engine failed");
 
-    let bucket = match engine.get_bucket("prod_recovery_update_chain") {
+    let bucket = match engine.open_bucket("prod_recovery_update_chain") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => engine
             .new_bucket("prod_recovery_update_chain", BucketOptions::default())
@@ -134,7 +134,7 @@ fn child_update_chain_verify_path() {
     .expect("reopen engine failed");
 
     let bucket = engine
-        .get_bucket("prod_recovery_update_chain")
+        .open_bucket("prod_recovery_update_chain")
         .expect("bucket should exist");
     let view = bucket.view().expect("open view failed");
     assert_eq!(view.get("k").expect("missing key").slice(), b"base");
@@ -145,7 +145,7 @@ fn child_delete_chain_crash_path() -> ! {
     let engine = Mace::new(Options::new(&db_root).validate().expect("bad options"))
         .expect("open engine failed");
 
-    let bucket = match engine.get_bucket("prod_recovery_delete_chain") {
+    let bucket = match engine.open_bucket("prod_recovery_delete_chain") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => engine
             .new_bucket("prod_recovery_delete_chain", BucketOptions::default())
@@ -173,7 +173,7 @@ fn child_delete_chain_verify_path() {
     .expect("reopen engine failed");
 
     let bucket = engine
-        .get_bucket("prod_recovery_delete_chain")
+        .open_bucket("prod_recovery_delete_chain")
         .expect("bucket should exist");
     let view = bucket.view().expect("open view failed");
     assert_eq!(view.get("k").expect("missing key").slice(), b"base");
@@ -206,7 +206,7 @@ fn child_failpoint_io_verify_path() {
     )
     .expect("open io verify engine failed");
     let bucket = engine
-        .get_bucket("prod_failpoint_io")
+        .open_bucket("prod_failpoint_io")
         .expect("io bucket should exist");
     let view = bucket.view().expect("open io verify view failed");
     assert!(view.get("k").is_err());
@@ -241,7 +241,7 @@ fn child_failpoint_abort_verify_path() {
     )
     .expect("open abort verify engine failed");
 
-    match engine.get_bucket("prod_failpoint_abort") {
+    match engine.open_bucket("prod_failpoint_abort") {
         Ok(bucket) => {
             let view = bucket.view().expect("open abort verify view failed");
             assert!(view.get("k").is_err());
@@ -292,7 +292,7 @@ fn fast_reopen_visibility() -> Result<(), OpCode> {
 
     {
         let engine = env.open_default()?;
-        let bucket = engine.get_bucket("prod_reopen")?;
+        let bucket = engine.open_bucket("prod_reopen")?;
         let view = bucket.view()?;
 
         assert_eq!(view.get("k1")?.slice(), b"v1");

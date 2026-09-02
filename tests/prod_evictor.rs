@@ -81,7 +81,7 @@ fn stress_drop_reload_loop() -> Result<(), OpCode> {
         )
         .or_else(|err| {
             if err == OpCode::Exist {
-                engine.get_bucket(name)
+                engine.open_bucket(name)
             } else {
                 Err(err)
             }
@@ -89,7 +89,7 @@ fn stress_drop_reload_loop() -> Result<(), OpCode> {
     drop(bucket);
 
     for round in 0..rounds {
-        let bucket = engine.get_bucket(name)?;
+        let bucket = engine.open_bucket(name)?;
 
         let expected = format!("v_{round}");
         upsert_retry(&bucket, b"k", expected.as_bytes())?;
@@ -103,7 +103,7 @@ fn stress_drop_reload_loop() -> Result<(), OpCode> {
             }
         }
 
-        let reopened = engine.get_bucket(name)?;
+        let reopened = engine.open_bucket(name)?;
         let view = reopened.view()?;
         assert_eq!(view.get("k")?.slice(), expected.as_bytes());
 

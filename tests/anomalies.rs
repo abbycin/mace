@@ -526,7 +526,7 @@ impl Executor {
 
     fn session(&self, worker: usize) -> Session {
         let (cond, _) = self.map.get(&worker).expect("invalid core");
-        let db = Arc::new(self.db.get_bucket("xx").unwrap());
+        let db = Arc::new(self.db.open_bucket("xx").unwrap());
         Session {
             kv: None,
             db,
