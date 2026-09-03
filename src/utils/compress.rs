@@ -7,12 +7,17 @@ use zstd::stream::raw::{Decoder, Encoder, InBuffer, Operation, OutBuffer};
 use zstd::zstd_safe::{self, CCtx, CParameter, DCtx, ResetDirective};
 
 use crate::utils::data::GatherWriter;
+use crate::utils::instance_local::LocalSlot;
 use crate::{OpCode, io::GatherIO, types::refbox::BoxRef};
 
 pub(crate) const COMPRESS_MIN_LEN: usize = 1024;
 const COMPRESS_LEVEL: i32 = 3;
 const COMPRESS_GAIN_MARGIN: usize = 16;
 const DECOMPRESS_IO_BUF: usize = 128 << 10;
+/// shared overflow bound for the instance-local codec path: extra codecs that
+/// cannot enter the executing thread's slot (slot occupied by a reentrant or
+/// earlier put) are parked here up to this cap, then released
+const MAX_OVERFLOW_CODECS: usize = 2;
 
 pub(crate) struct EncodedRecord {
     pub(crate) bytes: Option<Vec<u8>>,
@@ -168,33 +173,47 @@ impl DerefMut for CompressorGuard<'_> {
 impl Drop for CompressorGuard<'_> {
     fn drop(&mut self) {
         if let Some(compressor) = self.compressor.take() {
-            self.pool.pool.lock().push(compressor);
+            self.pool.release(compressor);
         }
     }
 }
 
 pub(crate) struct CompressorPool {
+    /// bounded overflow buffer: codecs that cannot enter the executing thread's
+    /// slot (reentrant put won the race, or a migrated guard landed on a warm
+    /// slot) park here up to MAX_OVERFLOW_CODECS, then are released
     pool: Mutex<Vec<RecordCompressor>>,
+    /// per-thread codec cache
+    local: LocalSlot<RecordCompressor>,
 }
 
 impl CompressorPool {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             pool: Mutex::new(Vec::new()),
+            local: LocalSlot::new(),
         })
     }
 
     pub(crate) fn borrow(&self) -> Result<CompressorGuard<'_>, OpCode> {
-        let compressor = self
-            .pool
-            .lock()
-            .pop()
-            .map(Ok)
-            .unwrap_or_else(RecordCompressor::new)?;
+        // each thread borrows from its own slot, falling back to a fresh codec
+        // when the slot is empty
+        let compressor = self.local.try_take(RecordCompressor::new)?;
         Ok(CompressorGuard {
             pool: self,
             compressor: Some(compressor),
         })
+    }
+
+    fn release(&self, compressor: RecordCompressor) {
+        // put into the executing thread's slot; if that slot already holds a
+        // codec, park in bounded overflow, releasing the excess
+        if let Err(compressor) = self.local.try_put(compressor) {
+            let mut overflow = self.pool.lock();
+            if overflow.len() < MAX_OVERFLOW_CODECS {
+                overflow.push(compressor);
+            }
+        }
     }
 }
 
@@ -364,13 +383,17 @@ impl RecordDecompressor {
 }
 
 pub(crate) struct DecompressorPool {
+    /// bounded overflow buffer (see CompressorPool.pool)
     pool: Mutex<Vec<RecordDecompressor>>,
+    /// per-thread decoder cache
+    local: LocalSlot<RecordDecompressor>,
 }
 
 impl DecompressorPool {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             pool: Mutex::new(Vec::new()),
+            local: LocalSlot::new(),
         })
     }
 
@@ -378,14 +401,16 @@ impl DecompressorPool {
     where
         F: FnOnce(&mut RecordDecompressor) -> Result<T, OpCode>,
     {
-        let mut decoder = self
-            .pool
-            .lock()
-            .pop()
-            .map(Ok)
-            .unwrap_or_else(RecordDecompressor::new)?;
+        let mut decoder = self.local.try_take(RecordDecompressor::new)?;
         let ret = f(&mut decoder);
-        self.pool.lock().push(decoder);
+        // return the decoder regardless of f's result; a slot already holding a
+        // decoder (reentrant put) parks this one in bounded overflow or releases it
+        if let Err(decoder) = self.local.try_put(decoder) {
+            let mut overflow = self.pool.lock();
+            if overflow.len() < MAX_OVERFLOW_CODECS {
+                overflow.push(decoder);
+            }
+        }
         ret
     }
 }

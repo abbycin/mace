@@ -1785,36 +1785,55 @@ entries:
         note: iterator lifetime tests cover same-group holes, cross-commit churn, and forward or reverse traversal on a pinned snapshot
 
   - id: protocol.ccpool_free_list_excludes_live_pins
-    title: CCPool free shards must never publish a live view pin
+    title: CCPool free shards and instance-local idle lists must never publish a live view pin
     kind: protocol
     status: active
     confidence: high
     statement: >
-      A CCNode may enter a CCPool free shard only after its view has transitioned to Idle, and each
-      shard must serialize pop and push so that a stale pop cannot republish a node held by another
-      live view.
+      A CCNode may enter a CCPool free shard or a thread's instance-local idle list only after its
+      view has transitioned to Idle. Each shard must serialize pop and push, and the per-thread
+      LocalPins list is exclusive to its owning thread, so a stale pop cannot republish a node held
+      by another live view. On the instance-local path the idle list holds at most LOCAL_PINS_MAX
+      nodes and thread exit returns them to their original shard (or leaves them for the core
+      registry reclaim when the pool is dropping).
     watch_points:
       - path: src/cc/context.rs
-        note: CCPool shard storage and alloc/free ownership transfer live here
+        note: CCPool shard storage, LocalPins idle list, alloc/free ownership transfer and thread-exit return live here
       - path: src/index/txn.rs
         note: TxnView construction and Drop acquire and release CCPool pins here
       - path: tests/cc.rs
         note: concurrent short-lived view churn regression lives here
     witnesses:
       - path: src/cc/context.rs
-        note: each free shard is a Mutex<Vec<Handle<CCNode>>>; pop and push complete under the same shard mutex
+        note: each free shard is a Mutex<Vec<Handle<CCNode>>>; pop and push complete under the same shard mutex; the instance-local path is an Option<LocalSlot<LocalPins>> cache of <= LOCAL_PINS_MAX Idle handles per thread
       - path: src/cc/context.rs
-        note: free_view_pin clears the CCNode state to Idle before returning it to the pool
+        note: free_view_pin clears the CCNode state to Idle before returning it to the pool; cache_local_pin only accepts an already-Idle node and alloc pops the caller thread's own list
+      - path: src/cc/context.rs
+        note: ccpool_thread_exit_returns_local_pins_to_shard and ccpool_local_alloc_free_keeps_registry_bounded cover the instance-local path
+      - path: src/cc/context.rs
+        note: ccpool_local_never_hands_one_node_to_two_live_views exercises the init path and pins two live views to distinct CCNodes
+      - path: src/cc/context.rs
+        note: ccpool_local_pool_drop_concurrent_with_live_foreign_cell_does_not_deadlock covers pool drop while another thread still holds a LocalPins cell
       - path: tests/cc.rs
         note: concurrent_short_lived_views_never_reuse_active_pins runs the issue-1 view/get/drop workload on 16 OS threads
     failure_symptoms:
       - CCNode::begin_reg observes a non-Idle state for a newly allocated view pin
       - a collector shrink sees a registry pointer mismatch after free-list corruption
       - two live views concurrently modify the state of one CCNode
+      - idle nodes stranded outside shards grow the registry across thread churn (missing thread-exit return)
     verifiers:
       - type: regression-test
         path: tests/cc.rs
         note: concurrent_short_lived_views_never_reuse_active_pins covers concurrent view allocation, point read, and Drop
+      - type: regression-test
+        path: src/cc/context.rs
+        note: ccpool_local_path_reuses_same_node_on_same_thread and ccpool_local_alloc_free_keeps_registry_bounded cover local-path reuse and boundedness
+      - type: regression-test
+        path: src/cc/context.rs
+        note: ccpool_thread_exit_returns_local_pins_to_shard covers the shard return; ccpool_local_pins_drop_with_pool_reclaims_once and ccpool_local_pool_drop_concurrent_with_live_foreign_cell_does_not_deadlock cover core-drop reclaim and the drain-foreign-cell ordering without re-entering the registry lock
+      - type: regression-test
+        path: src/cc/context.rs
+        note: ccpool_local_never_hands_one_node_to_two_live_views covers the two-live-views failure symptom on the init path
       - type: benchmark-test
         path: tests/cc.rs
         note: concurrent_short_lived_views_throughput reports 16-thread short-lived view throughput for regression comparison
@@ -2533,6 +2552,52 @@ entries:
       - type: regression-test
         path: src/cc/context.rs
         note: quit_waits_for_inflight_then_joins_collector proves the in-flight drain and collector join; admission exclusion is established primarily by the public API/drop topology
+
+  - id: runtime.instance_local_slot_isolation_and_reclamation
+    title: instance-local slots isolate per-thread state and reclaim every owner entry before id reuse
+    kind: protocol
+    status: active
+    confidence: medium
+    statement: >
+      If an owner creates a LocalSlot, it must have a unique slot id while live, and a thread may
+      access only that thread's entry for the owner. If the owner reaches its documented
+      quiescent teardown point, drain must remove that slot's entry from every registered live
+      thread before returning the id to the allocator. Thread exit and drain must serialize entry
+      removal so the erased T: Send value is destroyed exactly once. This mechanism is not a
+      concurrent-close protocol: callers must exclude owner access before drain.
+    watch_points:
+      - path: src/utils/instance_local.rs
+        note: carrier registration, per-thread entry access, drain ordering, id reuse, and thread-exit destruction live here
+      - path: src/utils/compress.rs
+        note: codec pools hold LocalSlot cells and are production consumers of the carrier
+      - path: src/cc/context.rs
+        note: CCPool idle-pin cells are production consumers of the carrier
+      - path: src/utils/mod.rs
+        note: this is the only module declaration that exposes the restricted instance-local carrier to crate code
+      - path: tls.md
+        note: the plan defines the owner-quiescence and no-business-thread-local boundary
+    witnesses:
+      - path: src/utils/instance_local.rs
+        note: LocalSlot::drain removes all registered entries before it pushes the id to SlotAlloc::free; ThreadTable::drop unregisters under the same threads mutex before erased values are dropped
+      - path: src/utils/instance_local.rs
+        note: unit tests cover same-thread isolation, per-thread values, functional drain-reuse on a long-lived worker, drain/exit ordering, unwind put-back, and exit-hook execution
+      - path: src/utils/compress.rs
+        note: compressor/decompressor pools construct LocalSlot per pool; reentrant and cross-thread guard-return tests exercise take/put overflow
+    failure_symptoms:
+      - a thread accessing two live owners receives another owner's cached state
+      - a new owner reusing an id sees a value from the prior owner on a long-lived worker
+      - drain or normal thread exit destroys one cached value twice, leaks it, or touches it while the owner is active
+      - a business module declares an additional thread_local carrier and bypasses owner identity
+    verifiers:
+      - type: unit-test
+        path: src/utils/instance_local.rs
+        note: instance-local unit tests exercise isolation, functional id-reuse cleanliness, exact-once destruction, unwind, and worker-thread-exit teardown
+      - type: source-audit
+        path: src/utils/instance_local.rs
+        note: this file is the sole crate-local thread_local declaration and documents every unsafe ownership boundary
+      - type: platform-run
+        path: .github/workflows/ci.yml
+        note: extra_check runs green on linux, windows-latest, and macos-latest CI runners covering std LocalKey destructor behavior per platform
 
   - id: dependency.manifest_conditional_update_semantics
     title: manifest stat apply depends on btree-store conditional update and atomic multi-bucket commit

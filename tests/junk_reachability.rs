@@ -1,3 +1,4 @@
+#![cfg(feature = "metrics")]
 use mace::observe::{CounterMetric, InMemoryObserver, ObserveSnapshot};
 #[cfg(feature = "extra_check")]
 use mace::testing::{self, CheckpointRootRestore, CheckpointSyncPoint};

@@ -65,6 +65,12 @@ where
         self.size
     }
 
+    /// the greatest key under the comparator order, or None when empty;
+    /// follows the rightmost leaf path, O(depth)
+    pub(crate) fn max_key(&self) -> Option<K> {
+        self.root.as_ref().and_then(|root| root.max_key())
+    }
+
     pub(crate) fn iter(&self) -> Iter<'static, K> {
         Iter::new(self.root.clone())
     }
@@ -183,6 +189,13 @@ where
         }
     }
 
+    fn max_key(&self) -> Option<K> {
+        match &self.children {
+            Children::Intl { intl, .. } => intl.last().and_then(|n| n.max_key()),
+            Children::Leaf { leaf } => leaf.last().and_then(|n| n.max_key()),
+        }
+    }
+
     fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, visit: &mut F) -> bool
     where
         F: FnMut(K) -> bool,
@@ -216,6 +229,10 @@ impl<K> Leaf<K>
 where
     K: Copy,
 {
+    fn max_key(&self) -> Option<K> {
+        self.keys.last().copied()
+    }
+
     fn put<F>(&mut self, k: K, cmp: F) -> Update<K>
     where
         F: Fn(&K, &K) -> Ordering,
@@ -334,6 +351,13 @@ impl<K> Node<K>
 where
     K: Copy,
 {
+    fn max_key(&self) -> Option<K> {
+        match self {
+            Node::Intl(intl) => intl.max_key(),
+            Node::Leaf(leaf) => leaf.max_key(),
+        }
+    }
+
     fn level(&self) -> usize {
         match self {
             Node::Intl(intl) => intl.level(),

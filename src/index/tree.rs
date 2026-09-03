@@ -8,6 +8,7 @@ use crate::types::refbox::DeltaView;
 use crate::types::sst::Sst;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::data::Position;
+#[cfg(feature = "metrics")]
 use crate::utils::observe::{
     CounterMetric, EventKind, HistogramMetric, LATENCY_SAMPLE_SHIFT, ObserveEvent, observe_elapsed,
     sampled_instant,
@@ -395,6 +396,7 @@ impl Tree {
         // 5.
         self.remove_node_index(parent_ptr, child_pid, g, safe_txid);
 
+        #[cfg(feature = "metrics")]
         self.store
             .opt
             .observer
@@ -505,6 +507,7 @@ impl Tree {
             publish.replace(parent, new_node, junk);
             // publish new parent to page table
             publish.commit();
+            #[cfg(feature = "metrics")]
             self.store
                 .opt
                 .observer
@@ -565,6 +568,7 @@ impl Tree {
         publish.cache_after_commit(lpage);
         // publish new root to global
         publish.commit();
+        #[cfg(feature = "metrics")]
         self.store
             .opt
             .observer
@@ -670,6 +674,8 @@ impl Tree {
                 let mut publish = build.into_publish(g);
                 publish.replace(unsplit, split_node, junk);
                 publish.commit();
+                #[cfg(feature = "metrics")]
+                #[cfg(feature = "metrics")]
                 self.store
                     .opt
                     .observer
@@ -811,6 +817,7 @@ impl Tree {
         let mut publish = build.into_publish(g);
         publish.replace(page, new_node, junk);
         publish.commit();
+        #[cfg(feature = "metrics")]
         self.store
             .opt
             .observer
@@ -861,10 +868,12 @@ impl Tree {
             let Some(node) = page.try_lock() else {
                 continue;
             };
+            #[cfg(feature = "metrics")]
             let lock_started = sampled_instant(k.txid(), LATENCY_SAMPLE_SHIFT);
             let pid = page.pid();
             // consolidate happened, we must retry from root
             if self.bucket.table.get(pid) != page.swip() {
+                #[cfg(feature = "metrics")]
                 observe_elapsed(
                     self.store.opt.observer.as_ref(),
                     HistogramMetric::TreeLinkHoldMicros,
@@ -884,6 +893,7 @@ impl Tree {
 
             let addr = node.insert(k, v);
             build.mark_dirty(pid, addr);
+            #[cfg(feature = "metrics")]
             observe_elapsed(
                 self.store.opt.observer.as_ref(),
                 HistogramMetric::TreeLinkHoldMicros,
@@ -922,6 +932,7 @@ impl Tree {
             match self.try_put(g, &key, &val, group, pos) {
                 Ok(_) => return Ok(()),
                 Err(OpCode::Again) => {
+                    #[cfg(feature = "metrics")]
                     self.store
                         .opt
                         .observer
@@ -990,10 +1001,12 @@ impl Tree {
             match self.try_update(g, &key, &val, &mut visible) {
                 Ok(x) => return Ok(x),
                 Err(OpCode::Again) => {
+                    #[cfg(feature = "metrics")]
                     self.store
                         .opt
                         .observer
                         .counter(CounterMetric::TreeRetryAgain, 1);
+                    #[cfg(feature = "metrics")]
                     self.store
                         .opt
                         .observer
@@ -1250,17 +1263,20 @@ impl Tree {
         if !first {
             return;
         }
-        self.store
-            .opt
-            .observer
-            .counter(CounterMetric::MergeContractViolation, 1);
-        self.store.opt.observer.event(ObserveEvent {
-            kind: EventKind::MergeContractViolation,
-            bucket_id: self.bucket.bucket_id,
-            txid: 0,
-            file_id: 0,
-            value: 0,
-        });
+        #[cfg(feature = "metrics")]
+        {
+            self.store
+                .opt
+                .observer
+                .counter(CounterMetric::MergeContractViolation, 1);
+            self.store.opt.observer.event(ObserveEvent {
+                kind: EventKind::MergeContractViolation,
+                bucket_id: self.bucket.bucket_id,
+                txid: 0,
+                file_id: 0,
+                value: 0,
+            });
+        }
         if let Ok(s) = std::str::from_utf8(key) {
             log::error!(
                 "merge contract violation: bucket={} key={:?}",

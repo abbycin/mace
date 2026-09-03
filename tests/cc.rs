@@ -1,3 +1,4 @@
+#[cfg(feature = "metrics")]
 use mace::observe::{CounterMetric, InMemoryObserver, ObserveSnapshot};
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use rand::seq::SliceRandom;
@@ -1335,6 +1336,7 @@ fn smo_during_scan() -> Result<(), OpCode> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn upsert_retry(db: &Bucket, key: &str) {
     const RETRY_LIMIT: usize = 8192;
     for _ in 0..RETRY_LIMIT {
@@ -1352,6 +1354,7 @@ fn upsert_retry(db: &Bucket, key: &str) {
     panic!("upsert retry exhausted: {key}");
 }
 
+#[allow(dead_code)]
 fn del_retry(db: &Bucket, key: &str) {
     const RETRY_LIMIT: usize = 8192;
     for _ in 0..RETRY_LIMIT {
@@ -1374,6 +1377,7 @@ fn del_retry(db: &Bucket, key: &str) {
     panic!("del retry exhausted: {key}");
 }
 
+#[allow(dead_code)]
 fn assert_seek_sorted_unique(db: &Bucket, prefix: &str) {
     let view = db.view().unwrap();
     let mut last: Option<Vec<u8>> = None;
@@ -1386,6 +1390,7 @@ fn assert_seek_sorted_unique(db: &Bucket, prefix: &str) {
     }
 }
 
+#[cfg(feature = "metrics")]
 fn counter(snapshot: &ObserveSnapshot, metric: CounterMetric) -> u64 {
     snapshot
         .counters
@@ -1396,6 +1401,7 @@ fn counter(snapshot: &ObserveSnapshot, metric: CounterMetric) -> u64 {
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn smo_merge_preserves_final_state() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     let observer = Arc::new(InMemoryObserver::new(256));
@@ -1532,6 +1538,7 @@ fn smo_merge_preserves_final_state() -> Result<(), OpCode> {
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn smo_scan_remains_ordered_under_merge_churn() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     let observer = Arc::new(InMemoryObserver::new(256));

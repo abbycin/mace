@@ -1,9 +1,11 @@
 mod common;
 
+#[cfg(feature = "metrics")]
 use mace::observe::{CounterMetric, HistogramMetric, InMemoryObserver};
 #[cfg(feature = "extra_check")]
 use mace::testing;
 use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
+#[cfg(feature = "metrics")]
 use std::sync::Arc;
 #[cfg(feature = "extra_check")]
 use std::sync::{
@@ -13,6 +15,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "metrics")]
 fn counter_value(observer: &InMemoryObserver, metric: CounterMetric) -> u64 {
     observer
         .snapshot()
@@ -368,6 +371,7 @@ fn retire_sync_point(kind: TestFileKind, cut: RetireCut) -> testing::GcStatSyncP
 }
 
 #[cfg(feature = "extra_check")]
+#[cfg(feature = "metrics")]
 fn conditional_stat_miss_metric(kind: TestFileKind) -> CounterMetric {
     match kind {
         TestFileKind::Data => CounterMetric::FlushConditionalDataStatPutMiss,
@@ -384,6 +388,7 @@ enum CheckpointSchedule {
 
 #[cfg(feature = "extra_check")]
 #[test]
+#[cfg(feature = "metrics")]
 fn lagging_checkpoint_cannot_resurrect_retired_stats_at_any_reclaim_cut() -> Result<(), OpCode> {
     let _hook_lock = testing::checkpoint_test_lock();
     let _hook_reset = HookReset;
@@ -1277,6 +1282,7 @@ fn gc_blob_delete_checkpoint_stays_deleted_without_gc() -> Result<(), OpCode> {
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn remote_blob_update_from_other_group_stays_deleted_after_reopen() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let observer = Arc::new(InMemoryObserver::new(64));
@@ -1779,6 +1785,7 @@ fn gc_wal() {
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn gc_observer_metrics() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let observer = Arc::new(InMemoryObserver::new(256));
@@ -1833,6 +1840,7 @@ fn gc_observer_metrics() -> Result<(), OpCode> {
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn abort_clean_checkpoint_dedup_per_bucket_per_gc_round() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let observer = Arc::new(InMemoryObserver::new(512));
@@ -1868,6 +1876,7 @@ fn abort_clean_checkpoint_dedup_per_bucket_per_gc_round() -> Result<(), OpCode> 
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn abort_clean_wal_open_is_bounded_by_file_count() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let observer = Arc::new(InMemoryObserver::new(512));
@@ -2191,6 +2200,7 @@ fn recovery_abort_clean_does_not_leave_bucket_loaded_after_startup() -> Result<(
     Ok(())
 }
 
+#[cfg_attr(not(feature = "metrics"), allow(dead_code))]
 fn wal_file_ids(log_root: &std::path::Path, physical: u8) -> Vec<u64> {
     let prefix = format!("wal_{physical}_");
     let mut ids = Vec::new();
@@ -2212,6 +2222,7 @@ fn wal_file_ids(log_root: &std::path::Path, physical: u8) -> Vec<u64> {
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn relaxed_multi_group_wal_is_recycled_after_checkpoints() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
@@ -2262,6 +2273,7 @@ fn relaxed_multi_group_wal_is_recycled_after_checkpoints() -> Result<(), OpCode>
 
 #[cfg(feature = "extra_check")]
 #[test]
+#[cfg(feature = "metrics")]
 fn start_gc_fires_round_completion_signal() {
     let _hook_lock = testing::checkpoint_test_lock();
     let _hook_reset = HookReset;
@@ -2306,6 +2318,7 @@ fn start_gc_fires_round_completion_signal() {
 
 #[cfg(feature = "extra_check")]
 #[test]
+#[cfg(feature = "metrics")]
 fn zero_gc_timeout_only_runs_on_explicit_start() {
     let _hook_lock = testing::checkpoint_test_lock();
     let _hook_reset = HookReset;

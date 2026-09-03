@@ -1,6 +1,7 @@
-## [0.1.2] 2026-09-02
+## [0.1.2] 2026-09-05
 ### New Features
 - Added optional per-bucket merge operators with durable merge operands and the default `U64AddOperator`
+- Introduced `src/utils/instance_local.rs` as the sole permitted `thread_local!` carrier: instance-scoped `LocalSlot<T>` per-thread state with take/put semantics, unique owner slot ids, owner-quiescent `drain`, and exact-once destruction on thread exit
 
 ### Changes
 - Added a durable shared-WAL route for `sync_on_write = true`, with caller-led generation sync to combine concurrent commits into one durable cut

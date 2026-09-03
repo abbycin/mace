@@ -70,13 +70,13 @@ pub(crate) struct Node<L: ILoader> {
 
 fn intl_cmp(x: &DeltaView, y: &DeltaView) -> Ordering {
     // for internal nodes, we never use the txid for insert
-    IntlKey::encoded_raw(x.key()).cmp(IntlKey::encoded_raw(y.key()))
+    crate::types::data::cmp_raw_bytes(IntlKey::encoded_raw(x.key()), IntlKey::encoded_raw(y.key()))
 }
 
 fn leaf_cmp(x: &DeltaView, y: &DeltaView) -> Ordering {
     let (lver, lraw) = Key::encoded_key_parts(x.key());
     let (rver, rraw) = Key::encoded_key_parts(y.key());
-    match lraw.cmp(rraw) {
+    match crate::types::data::cmp_raw_bytes(lraw, rraw) {
         Equal => Ver::decode_from(lver).cmp(&Ver::decode_from(rver)),
         ord => ord,
     }
@@ -885,14 +885,20 @@ where
             *key,
             |x, y| {
                 let (ver, raw) = Key::encoded_key_parts(x.key());
-                match raw.cmp(y.raw) {
+                match crate::types::data::cmp_raw_bytes(raw, y.raw) {
                     Equal => Ver::decode_from(ver).cmp(&y.ver),
                     ord => ord,
                 }
             },
             |dv| {
                 let (ver, raw) = Key::encoded_key_parts(dv.key());
-                if raw == key.raw() {
+                // delta is sorted (raw asc, ver desc): once raw exceeds the probe
+                // no later entry can match, stop instead of scanning to the tail
+                let ord = crate::types::data::cmp_raw_bytes(raw, key.raw());
+                if ord.is_gt() {
+                    return true;
+                }
+                if ord.is_eq() {
                     let v = dv.val();
                     let ver = Ver::decode_from(ver);
                     let (v, r) = v.get_record(&self.loader);
@@ -915,32 +921,53 @@ where
 
     pub(crate) fn find_latest_meta(&self, key: &Key) -> Option<LatestMeta> {
         hot_true!(!self.inner.header().is_index);
+        // fast path: a probe key strictly above the delta's greatest key cannot
+        // collide with any delta entry (delta is ordered by raw asc), so skip the
+        // ordered delta walk and consult only the base sst
+        let delta_skip = {
+            let state = self.state.read();
+            match state.delta.max_key() {
+                None => true,
+                Some(dmax) => {
+                    let (_, dmax_raw) = Key::encoded_key_parts(dmax.key());
+                    crate::types::data::cmp_raw_bytes(key.raw(), dmax_raw).is_gt()
+                }
+            }
+        };
         let mut result = None;
-        let probe = Key::new(key.raw(), Ver::new(u64::MAX, u32::MAX));
-        self.visit_versions(
-            probe,
-            |x, y| {
-                let (ver, raw) = Key::encoded_key_parts(x.key());
-                match raw.cmp(y.raw) {
-                    Equal => Ver::decode_from(ver).cmp(&y.ver),
-                    ord => ord,
-                }
-            },
-            |dv| {
-                let (ver, raw) = Key::encoded_key_parts(dv.key());
-                if raw == key.raw() {
-                    let v = dv.val();
-                    result = Some(LatestMeta {
-                        ver: Ver::decode_from(ver),
-                        group_id: v.group_id(),
-                        is_del: v.is_tombstone(),
-                        is_merge: v.is_merge(),
-                    });
-                    return true;
-                }
-                false
-            },
-        );
+        if !delta_skip {
+            let probe = Key::new(key.raw(), Ver::new(u64::MAX, u32::MAX));
+            self.visit_versions(
+                probe,
+                |x, y| {
+                    let (ver, raw) = Key::encoded_key_parts(x.key());
+                    match crate::types::data::cmp_raw_bytes(raw, y.raw) {
+                        Equal => Ver::decode_from(ver).cmp(&y.ver),
+                        ord => ord,
+                    }
+                },
+                |dv| {
+                    let (ver, raw) = Key::encoded_key_parts(dv.key());
+                    // delta is sorted (raw asc, ver desc): once raw exceeds the probe
+                    // no later entry can match, stop instead of scanning to the tail
+                    let ord = crate::types::data::cmp_raw_bytes(raw, key.raw());
+                    if ord.is_gt() {
+                        return true;
+                    }
+                    if ord.is_eq() {
+                        let v = dv.val();
+                        result = Some(LatestMeta {
+                            ver: Ver::decode_from(ver),
+                            group_id: v.group_id(),
+                            is_del: v.is_tombstone(),
+                            is_merge: v.is_merge(),
+                        });
+                        return true;
+                    }
+                    false
+                },
+            );
+        }
 
         if result.is_some() {
             return result;
@@ -2563,6 +2590,69 @@ mod test {
         let latest = node.find_latest(&key).expect("latest value should exist");
         assert_eq!(latest.1.data(), value.as_slice());
         assert_eq!(a.inner.remote_loads.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn find_latest_meta_delta_max_fast_path_keeps_full_equivalence() {
+        let mut a = A::new();
+        let l = a.clone();
+        let node = Node::new_leaf(&mut a, l.clone(), 0, Position::MIN);
+
+        // seed the base sst with a and c, then compact (delta becomes empty)
+        for raw in ["a", "c"] {
+            let key = Key::new(raw.as_bytes(), Ver::new(1, 1));
+            let record = Record::normal(1, raw.as_bytes());
+            let (delta, remote) = DeltaView::from_key_val(&mut a, &key, &record, 0, Position::MIN);
+            node.insert_inplace(
+                delta.view().as_delta(),
+                remote
+                    .as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
+            let _ = remote;
+            node.save_delta(delta);
+        }
+        let (node, _) = node.compact(&mut a, 1, None, &mut |_| {}, None);
+
+        // delta now holds only b; the base holds a and c
+        let key_b = Key::new("b".as_bytes(), Ver::new(2, 1));
+        let record = Record::normal(1, b"b");
+        let (delta, remote) = DeltaView::from_key_val(&mut a, &key_b, &record, 0, Position::MIN);
+        node.insert_inplace(
+            delta.view().as_delta(),
+            remote
+                .as_ref()
+                .map(|x| x.header().total_size as usize)
+                .unwrap_or(0),
+        );
+        let _ = remote;
+        node.save_delta(delta);
+
+        // probe c: above the delta max (b), the fast path must still find the base copy
+        let meta_c = node
+            .find_latest_meta(&Key::new("c".as_bytes(), Ver::new(u64::MAX, u32::MAX)))
+            .expect("base key above delta max must stay visible");
+        assert_eq!(meta_c.ver.txid, 1);
+        assert!(!meta_c.is_del);
+
+        // probe b: inside the delta, must resolve through the delta (newest txid 2)
+        let meta_b = node
+            .find_latest_meta(&Key::new("b".as_bytes(), Ver::new(u64::MAX, u32::MAX)))
+            .expect("delta key must resolve through the delta");
+        assert_eq!(meta_b.ver.txid, 2);
+
+        // probe a: below the delta max and present only in base
+        let meta_a = node
+            .find_latest_meta(&Key::new("a".as_bytes(), Ver::new(u64::MAX, u32::MAX)))
+            .expect("base key below delta max must stay visible");
+        assert_eq!(meta_a.ver.txid, 1);
+
+        // probe z: above the delta max and absent everywhere
+        assert!(
+            node.find_latest_meta(&Key::new("z".as_bytes(), Ver::new(u64::MAX, u32::MAX)))
+                .is_none()
+        );
     }
 
     #[test]

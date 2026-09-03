@@ -1,3 +1,4 @@
+#![cfg(feature = "metrics")]
 mod common;
 
 use common::{TestEnv, mace_snapshot_text};

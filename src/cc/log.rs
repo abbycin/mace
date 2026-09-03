@@ -3,6 +3,7 @@ use crate::types::data::Key;
 use crate::utils::MutRef;
 use crate::utils::block::Ring;
 use crate::utils::data::Position;
+#[cfg(feature = "metrics")]
 use crate::utils::observe::{
     CounterMetric, HistogramMetric, LATENCY_SAMPLE_SHIFT, observe_elapsed, sampled_instant,
 };
@@ -461,18 +462,22 @@ impl Logging {
 
         self.flush_ring_to_writer();
 
+        #[cfg(feature = "metrics")]
         let sync_started = sampled_instant(
             self.log_pos.file_id ^ self.log_pos.offset,
             LATENCY_SAMPLE_SHIFT,
         );
         self.sync_writer_data_and_dir();
         self.durable_pos = self.flushed_pos;
-        self.opt.observer.counter(CounterMetric::WalSync, 1);
-        observe_elapsed(
-            self.opt.observer.as_ref(),
-            HistogramMetric::WalSyncMicros,
-            sync_started,
-        );
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.counter(CounterMetric::WalSync, 1);
+            observe_elapsed(
+                self.opt.observer.as_ref(),
+                HistogramMetric::WalSyncMicros,
+                sync_started,
+            );
+        }
         Ok(())
     }
 
@@ -555,10 +560,13 @@ impl Logging {
             self.last_ckpt = self.checkpoint_floor();
         }
         self.mark_logical_wal_activity(logical_group as usize);
-        self.opt.observer.counter(CounterMetric::WalAppend, 1);
-        self.opt
-            .observer
-            .histogram(HistogramMetric::WalAppendBytes, total_sz as u64);
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.counter(CounterMetric::WalAppend, 1);
+            self.opt
+                .observer
+                .histogram(HistogramMetric::WalAppendBytes, total_sz as u64);
+        }
         Ok(current_pos)
     }
 
@@ -772,14 +780,18 @@ impl Logging {
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash("mace_wal_tail_corrupt");
 
+        #[cfg(feature = "metrics")]
         let sync_started = sampled_instant(cut.file_id ^ cut.offset, LATENCY_SAMPLE_SHIFT);
         let result = self.try_sync_generation_files();
-        observe_elapsed(
-            self.opt.observer.as_ref(),
-            HistogramMetric::WalSyncMicros,
-            sync_started,
-        );
-        self.opt.observer.counter(CounterMetric::WalSync, 1);
+        #[cfg(feature = "metrics")]
+        {
+            observe_elapsed(
+                self.opt.observer.as_ref(),
+                HistogramMetric::WalSyncMicros,
+                sync_started,
+            );
+            self.opt.observer.counter(CounterMetric::WalSync, 1);
+        }
         if result.is_ok() {
             self.durable_pos = cut;
         }
@@ -790,6 +802,7 @@ impl Logging {
         crate::utils::failpoint::crash("mace_wal_generation_after_file_sync_before_complete");
 
         let mut inner = self.sync_state.inner.lock();
+        #[cfg(feature = "metrics")]
         let followers = inner.followers;
         // the lock discipline makes this unconditional publish sound: the
         // leader holds the logging mutex, phase == Syncing means inner.current
@@ -814,22 +827,25 @@ impl Logging {
         self.sync_state.has_follower.store(false, Relaxed);
         drop(inner);
 
-        self.opt.observer.counter(CounterMetric::WalGeneration, 1);
-        self.opt
-            .observer
-            .counter(CounterMetric::WalGenerationLeader, 1);
-        if followers > 0 {
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.counter(CounterMetric::WalGeneration, 1);
             self.opt
                 .observer
-                .counter(CounterMetric::WalGenerationFollower, followers as u64);
-        }
-        self.opt
-            .observer
-            .histogram(HistogramMetric::WalGenerationBatch, (followers + 1) as u64);
-        if result.is_err() {
+                .counter(CounterMetric::WalGenerationLeader, 1);
+            if followers > 0 {
+                self.opt
+                    .observer
+                    .counter(CounterMetric::WalGenerationFollower, followers as u64);
+            }
             self.opt
                 .observer
-                .counter(CounterMetric::WalGenerationError, 1);
+                .histogram(HistogramMetric::WalGenerationBatch, (followers + 1) as u64);
+            if result.is_err() {
+                self.opt
+                    .observer
+                    .counter(CounterMetric::WalGenerationError, 1);
+            }
         }
         self.sync_state.cv.notify_all();
         #[cfg(feature = "extra_check")]
@@ -856,18 +872,22 @@ impl Logging {
         );
         self.flush_ring_to_writer();
         if force {
+            #[cfg(feature = "metrics")]
             let sync_started = sampled_instant(
                 self.log_pos.file_id ^ self.log_pos.offset,
                 LATENCY_SAMPLE_SHIFT,
             );
             self.sync_writer_data_and_dir();
             self.durable_pos = self.flushed_pos;
-            self.opt.observer.counter(CounterMetric::WalSync, 1);
-            observe_elapsed(
-                self.opt.observer.as_ref(),
-                HistogramMetric::WalSyncMicros,
-                sync_started,
-            );
+            #[cfg(feature = "metrics")]
+            {
+                self.opt.observer.counter(CounterMetric::WalSync, 1);
+                observe_elapsed(
+                    self.opt.observer.as_ref(),
+                    HistogramMetric::WalSyncMicros,
+                    sync_started,
+                );
+            }
         }
         Ok(())
     }

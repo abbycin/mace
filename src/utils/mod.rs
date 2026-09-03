@@ -19,9 +19,11 @@ pub(crate) mod data;
 #[cfg(feature = "failpoints")]
 pub(crate) mod failpoint;
 pub(crate) mod imtree;
+pub(crate) mod instance_local;
 pub(crate) mod interval;
 pub(crate) mod lru;
 pub mod merge_operator;
+#[cfg(feature = "metrics")]
 pub mod observe;
 pub(crate) mod options;
 pub(crate) mod seqlock;

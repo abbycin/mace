@@ -4,6 +4,7 @@ mod common;
 
 use btree_store::{BTree, Error as BTreeError};
 use common::child_test_command;
+#[cfg(feature = "metrics")]
 use mace::observe::{CounterMetric, InMemoryObserver};
 #[cfg(feature = "extra_check")]
 use mace::testing;
@@ -68,6 +69,7 @@ impl PersistedGlobalOptions {
     }
 }
 
+#[cfg(feature = "metrics")]
 fn counter_value(observer: &InMemoryObserver, metric: CounterMetric) -> u64 {
     observer
         .snapshot()
@@ -1083,6 +1085,7 @@ fn child_case_data_obsolete_reclaim(db_root: &Path) -> ! {
 }
 
 fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
+    #[cfg(feature = "metrics")]
     let observer = Arc::new(InMemoryObserver::new(64));
     let mace = open_with_tune(db_root, |opt| {
         opt.concurrent_write = 1;
@@ -1095,7 +1098,10 @@ fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
         opt.gc_eager = false;
         opt.data_garbage_ratio = 100;
         opt.blob_garbage_ratio = 100;
-        opt.observer = observer.clone();
+        #[cfg(feature = "metrics")]
+        {
+            opt.observer = observer.clone();
+        }
     });
     let bucket = match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
@@ -1134,6 +1140,7 @@ fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
     }
     update.commit().expect("commit blob obsolete update failed");
 
+    #[cfg(feature = "metrics")]
     let before = counter_value(&observer, CounterMetric::TreeNodeConsolidate);
     for _ in 0..3 {
         let consolidate = bucket
@@ -1149,6 +1156,7 @@ fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
             .expect("commit blob consolidate trigger failed");
         std::thread::sleep(Duration::from_millis(20));
     }
+    #[cfg(feature = "metrics")]
     assert!(
         counter_value(&observer, CounterMetric::TreeNodeConsolidate) >= before + 3,
         "expected repeated foreground consolidation"

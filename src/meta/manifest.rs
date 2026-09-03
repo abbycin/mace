@@ -13,6 +13,8 @@ use std::{
     },
 };
 
+#[cfg(feature = "metrics")]
+use crate::utils::observe::{CounterMetric, EventKind, GaugeMetric, ObserveEvent};
 use crate::{
     Options,
     cc::context::Context,
@@ -32,7 +34,6 @@ use crate::{
         Handle, INIT_ADDR, MutRef, OpCode,
         compress::CompressorPool,
         data::{GroupPositions, LenSeq, Position, init_group_pos},
-        observe::{CounterMetric, EventKind, GaugeMetric, ObserveEvent},
         options::{BucketOptions, ParsedOptions, PersistedBucketOptions, PersistedOptions},
     },
 };
@@ -273,6 +274,7 @@ impl Manifest {
     }
 
     fn observe_retired_stat_keys(&self) {
+        #[cfg(feature = "metrics")]
         self.opt.observer.gauge(
             GaugeMetric::RetiredStatKeysCurrent,
             self.retired_stat_keys.len() as i64,
@@ -812,14 +814,17 @@ impl Manifest {
 
     pub(crate) fn stage_orphan_file(&self, kind: FileKind, file_id: u64) {
         self.stage_orphan_marker(self.orphan_marker_key(kind, file_id), kind, file_id);
-        self.opt.observer.counter(self.orphan_stage_metric(kind), 1);
-        self.opt.observer.event(ObserveEvent {
-            kind: self.orphan_stage_event(kind),
-            bucket_id: 0,
-            txid: 0,
-            file_id,
-            value: 0,
-        });
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.counter(self.orphan_stage_metric(kind), 1);
+            self.opt.observer.event(ObserveEvent {
+                kind: self.orphan_stage_event(kind),
+                bucket_id: 0,
+                txid: 0,
+                file_id,
+                value: 0,
+            });
+        }
     }
 
     pub(crate) fn clear_orphan_file(&self, kind: FileKind, txn: &mut Txn<'_>, file_id: u64) {
@@ -827,14 +832,17 @@ impl Manifest {
             .entry(BUCKET_MISC.to_string())
             .or_default()
             .push(MetaOp::Del(self.orphan_marker_key(kind, file_id)));
-        self.opt.observer.counter(self.orphan_clear_metric(kind), 1);
-        self.opt.observer.event(ObserveEvent {
-            kind: self.orphan_clear_event(kind),
-            bucket_id: 0,
-            txid: 0,
-            file_id,
-            value: 0,
-        });
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.counter(self.orphan_clear_metric(kind), 1);
+            self.opt.observer.event(ObserveEvent {
+                kind: self.orphan_clear_event(kind),
+                bucket_id: 0,
+                txid: 0,
+                file_id,
+                value: 0,
+            });
+        }
     }
 
     pub(crate) fn stage_unsynced_file(&self, kind: FileKind, file_id: u64) {
@@ -945,6 +953,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn orphan_stage_metric(&self, kind: FileKind) -> CounterMetric {
         match kind {
             FileKind::Data => CounterMetric::FlushOrphanDataStaged,
@@ -952,6 +961,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn orphan_clear_metric(&self, kind: FileKind) -> CounterMetric {
         match kind {
             FileKind::Data => CounterMetric::FlushOrphanDataCleared,
@@ -959,6 +969,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn orphan_stage_event(&self, kind: FileKind) -> EventKind {
         match kind {
             FileKind::Data => EventKind::FlushOrphanDataStaged,
@@ -966,6 +977,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn orphan_clear_event(&self, kind: FileKind) -> EventKind {
         match kind {
             FileKind::Data => EventKind::FlushOrphanDataCleared,
@@ -1127,6 +1139,7 @@ impl Manifest {
         self.stat_ctx(kind)
             .apply_junks(tick, junks, &ctx, &self.btree, |file_id| {
                 let retired = self.is_retired_stat(kind, bucket_id, file_id);
+                #[cfg(feature = "metrics")]
                 if retired {
                     self.opt.observer.counter(self.skip_retired_metric(kind), 1);
                 }
@@ -1134,6 +1147,7 @@ impl Manifest {
             })
     }
 
+    #[cfg(feature = "metrics")]
     fn skip_retired_metric(&self, kind: FileKind) -> CounterMetric {
         match kind {
             FileKind::Data => CounterMetric::FlushSkipRetiredDataStat,
@@ -1226,6 +1240,7 @@ impl RetiredStatKeys {
         removed
     }
 
+    #[cfg(feature = "metrics")]
     pub(crate) fn len(&self) -> usize {
         self.keys.len()
     }

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
+#[cfg(feature = "metrics")]
 use crate::utils::observe::{CounterMetric, HistogramMetric, Observer};
 use crate::utils::options::{BucketOptions, ParsedOptions};
 
@@ -99,6 +100,7 @@ impl CheckpointFlow {
 }
 
 pub(crate) struct FlowController {
+    #[cfg(feature = "metrics")]
     observer: Arc<dyn Observer>,
     backpressure_enabled: bool,
     flush_unit_bytes: u64,
@@ -129,9 +131,11 @@ impl FlowController {
     const ADMISSION_WAKE_BURST_DIVISOR: u64 = 8;
     const ADMISSION_WAKE_MIN_BYTES: u64 = 1 << 20;
 
+    #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
     pub(crate) fn new(global: &ParsedOptions, opt: &BucketOptions) -> Self {
         let flush_unit_bytes = (opt.checkpoint_size as u64).max(1);
         Self {
+            #[cfg(feature = "metrics")]
             observer: global.observer.clone(),
             backpressure_enabled: opt.enable_backpressure,
             flush_unit_bytes,
@@ -289,6 +293,7 @@ impl FlowController {
             if projected <= admission_limit {
                 state.reserved_bytes = state.reserved_bytes.saturating_add(reserved);
                 drop(state);
+                #[cfg(feature = "metrics")]
                 if let Some(started) = wait_started.take() {
                     self.observer.counter(CounterMetric::FlowFgAdmissionWait, 1);
                     self.observer.histogram(

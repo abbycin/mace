@@ -32,6 +32,29 @@ impl<'a> IntlKey<'a> {
     }
 }
 
+/// byte-lexicographic compare over decoded raw slices, replicating `[u8]::cmp`
+/// with an inline word fast path; only ever feed decoded raw slices, never
+/// encoded keys (the persisted key layout places Ver before raw, so byte
+/// order cannot reproduce the (raw asc, Ver desc) sort key of `Key`)
+#[inline(always)]
+pub(crate) fn cmp_raw_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    let n = a.len().min(b.len());
+    let mut off = 0usize;
+    while off + 8 <= n {
+        // big-endian numeric order equals byte order: load little-endian, swap
+        let wa = u64::from_le_bytes(a[off..off + 8].try_into().unwrap()).swap_bytes();
+        let wb = u64::from_le_bytes(b[off..off + 8].try_into().unwrap()).swap_bytes();
+        match wa.cmp(&wb) {
+            Ordering::Equal => off += 8,
+            ord => return ord,
+        }
+    }
+    match a[off..n].cmp(&b[off..n]) {
+        Ordering::Equal => a.len().cmp(&b.len()),
+        ord => ord,
+    }
+}
+
 impl PartialOrd for IntlKey<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -40,7 +63,7 @@ impl PartialOrd for IntlKey<'_> {
 
 impl Ord for IntlKey<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.raw.cmp(other.raw)
+        cmp_raw_bytes(self.raw, other.raw)
     }
 }
 
@@ -143,7 +166,7 @@ impl Ord for Key<'_> {
     /// NOTE: key is in ascending order, while txid is descending order, since txid is monotonically
     /// increasing, greater is newer
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.raw.cmp(other.raw) {
+        match cmp_raw_bytes(self.raw, other.raw) {
             // numbers are in descending order
             Ordering::Equal => self.ver.cmp(&other.ver),
             x => x,
@@ -1006,6 +1029,47 @@ where
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn cmp_raw_bytes_matches_slice_cmp() {
+        use crate::types::data::cmp_raw_bytes;
+        // exhaustive-ish lengths + random payloads: word fast path, tail, and
+        // length tie-break must replicate [u8]::cmp exactly
+        let mut st = 42u64;
+        let mut next = || {
+            let mut z = st.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            st = z;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut mk = |len: usize| -> Vec<u8> {
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                v.push((next() >> 56) as u8);
+            }
+            v
+        };
+        let mut cases = Vec::new();
+        for len in 0..=40usize {
+            for _ in 0..64 {
+                let mut a = mk(len);
+                let b = mk(len);
+                cases.push((a.clone(), b.clone()));
+                cases.push((a.clone(), mk(len))); // differs somewhere
+                if len > 0 {
+                    a[len - 1] = b[len - 1]; // shared prefix up to last byte
+                    cases.push((a, b));
+                }
+            }
+        }
+        cases.push((vec![0u8; 9], vec![0u8; 7])); // prefix-equal, length tie-break
+        cases.push((vec![], vec![]));
+        for (a, b) in cases {
+            assert_eq!(cmp_raw_bytes(&a, &b), a.cmp(&b), "a={a:?} b={b:?}");
+            assert_eq!(cmp_raw_bytes(&b, &a), b.cmp(&a), "rev a={a:?} b={b:?}");
+        }
+    }
+
     use std::{
         cell::RefCell,
         cmp::Ordering,

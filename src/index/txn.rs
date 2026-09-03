@@ -1,4 +1,9 @@
 use super::{ValRef, tree::LatestValMeta};
+#[cfg(feature = "metrics")]
+use crate::utils::observe::{
+    CounterMetric, EventKind, HistogramMetric, LATENCY_SAMPLE_SHIFT, ObserveEvent, observe_elapsed,
+    sampled_instant,
+};
 use crate::{
     OpCode, Options,
     cc::{
@@ -12,13 +17,7 @@ use crate::{
     map::flow::ForegroundWritePermit,
     must_ok,
     types::data::{Key, Record, Ver},
-    utils::{
-        Handle, NULL_CMD,
-        observe::{
-            CounterMetric, EventKind, HistogramMetric, LATENCY_SAMPLE_SHIFT, ObserveEvent,
-            observe_elapsed, sampled_instant,
-        },
-    },
+    utils::{Handle, NULL_CMD},
 };
 use crossbeam_epoch::Guard;
 use std::cell::{Cell, UnsafeCell};
@@ -157,6 +156,7 @@ impl<'a> TxnKV<'a> {
                 }
             }
         }
+        #[cfg(feature = "metrics")]
         ctx.opt.observer.counter(CounterMetric::TxnBegin, 1);
 
         Ok(Self {
@@ -196,11 +196,13 @@ impl<'a> TxnKV<'a> {
         unsafe { &mut *self.state.get() }
     }
 
+    #[cfg(feature = "metrics")]
     #[inline]
     fn observe_counter(&self, metric: CounterMetric, delta: u64) {
         self.ctx.opt.observer.counter(metric, delta);
     }
 
+    #[cfg(feature = "metrics")]
     #[inline]
     fn observe_event(&self, event: ObserveEvent) {
         self.ctx.opt.observer.event(event);
@@ -214,15 +216,19 @@ impl<'a> TxnKV<'a> {
     }
 
     #[inline]
+    #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
     fn conflict_abort(&self, txid: u64) -> OpCode {
-        self.observe_counter(CounterMetric::TxnConflictAbort, 1);
-        self.observe_event(ObserveEvent {
-            kind: EventKind::TxnConflictAbort,
-            bucket_id: self.bucket_id,
-            txid,
-            file_id: 0,
-            value: 0,
-        });
+        #[cfg(feature = "metrics")]
+        {
+            self.observe_counter(CounterMetric::TxnConflictAbort, 1);
+            self.observe_event(ObserveEvent {
+                kind: EventKind::TxnConflictAbort,
+                bucket_id: self.bucket_id,
+                txid,
+                file_id: 0,
+                value: 0,
+            });
+        }
         OpCode::AbortTx
     }
 
@@ -755,6 +761,7 @@ impl<'a> TxnKV<'a> {
     pub fn commit(self) -> Result<(), OpCode> {
         self.should_abort()?;
         let state = self.state_ref();
+        #[cfg(feature = "metrics")]
         let commit_started = sampled_instant(state.start_ts, LATENCY_SAMPLE_SHIFT);
         let g = self.ctx.group(state.group());
 
@@ -769,12 +776,15 @@ impl<'a> TxnKV<'a> {
             }
             self.is_end.set(true);
             self.unblock_deleted_keys();
-            self.observe_counter(CounterMetric::TxnCommit, 1);
-            observe_elapsed(
-                self.ctx.opt.observer.as_ref(),
-                HistogramMetric::TxnCommitMicros,
-                commit_started,
-            );
+            #[cfg(feature = "metrics")]
+            {
+                self.observe_counter(CounterMetric::TxnCommit, 1);
+                observe_elapsed(
+                    self.ctx.opt.observer.as_ref(),
+                    HistogramMetric::TxnCommitMicros,
+                    commit_started,
+                );
+            }
             return Ok(());
         }
 
@@ -805,12 +815,15 @@ impl<'a> TxnKV<'a> {
 
         self.is_end.set(true);
         self.unblock_deleted_keys();
-        self.observe_counter(CounterMetric::TxnCommit, 1);
-        observe_elapsed(
-            self.ctx.opt.observer.as_ref(),
-            HistogramMetric::TxnCommitMicros,
-            commit_started,
-        );
+        #[cfg(feature = "metrics")]
+        {
+            self.observe_counter(CounterMetric::TxnCommit, 1);
+            observe_elapsed(
+                self.ctx.opt.observer.as_ref(),
+                HistogramMetric::TxnCommitMicros,
+                commit_started,
+            );
+        }
         Ok(())
     }
 
@@ -948,6 +961,7 @@ impl Drop for TxnKV<'_> {
                 }
                 drop(log);
             }
+            #[cfg(feature = "metrics")]
             self.observe_counter(CounterMetric::TxnAbort, 1);
             self.is_end.set(true);
         }

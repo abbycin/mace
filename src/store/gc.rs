@@ -17,6 +17,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "metrics")]
+use crate::utils::observe::{CounterMetric, EventKind, HistogramMetric, ObserveEvent};
 use crate::{
     OpCode, Options, Store,
     cc::{
@@ -45,7 +47,6 @@ use crate::{
         countblock::Countblock,
         data::{AddrPair, GatherWriter, Interval, LenSeq, Position},
         lru::Lru,
-        observe::{CounterMetric, EventKind, HistogramMetric, ObserveEvent},
     },
 };
 use crate::{
@@ -387,7 +388,9 @@ impl GarbageCollector {
     const ABORT_CLEAN_WAL_FILE_CACHE_CAP: usize = 16;
 
     fn run(&mut self) {
+        #[cfg(feature = "metrics")]
         let started = Instant::now();
+        #[cfg(feature = "metrics")]
         self.store.opt.observer.counter(CounterMetric::GcRun, 1);
         let _ = self.process_abort_clean();
         self.process_wal_clean();
@@ -396,6 +399,7 @@ impl GarbageCollector {
         }
         self.process_pending_buckets();
         self.store.manifest.delete_files();
+        #[cfg(feature = "metrics")]
         self.store.opt.observer.histogram(
             HistogramMetric::GcRunMicros,
             started.elapsed().as_micros() as u64,
@@ -507,6 +511,7 @@ impl GarbageCollector {
         if let Some(logging) = logging {
             logging.advance_oldest_wal_id(intent.to_file_id);
         }
+        #[cfg(feature = "metrics")]
         ctx.opt
             .observer
             .counter(CounterMetric::GcWalRecycleFile, recycled);
@@ -715,6 +720,7 @@ impl GarbageCollector {
                         "mace_recovery_abort_clean_stabilize_force_fsync",
                     );
                 }
+                #[cfg(feature = "metrics")]
                 self.ctx
                     .opt
                     .observer
@@ -956,6 +962,7 @@ impl GarbageCollector {
             .open(self.ctx.opt.fs.as_ref(), &path)?;
         let end = file.size()?;
         wal_files.add(Self::ABORT_CLEAN_WAL_FILE_CACHE_CAP, file_id, (file, end));
+        #[cfg(feature = "metrics")]
         self.ctx
             .opt
             .observer
@@ -976,18 +983,22 @@ impl GarbageCollector {
         });
 
         if let Some(bucket_id) = bucket_id {
+            #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
             let removed_pages = self.clean_one_bucket(bucket_id);
-            self.store
-                .opt
-                .observer
-                .counter(CounterMetric::GcPendingBucketClean, 1);
-            self.store.opt.observer.event(ObserveEvent {
-                kind: EventKind::GcPendingBucketCleaned,
-                bucket_id,
-                txid: 0,
-                file_id: 0,
-                value: removed_pages,
-            });
+            #[cfg(feature = "metrics")]
+            {
+                self.store
+                    .opt
+                    .observer
+                    .counter(CounterMetric::GcPendingBucketClean, 1);
+                self.store.opt.observer.event(ObserveEvent {
+                    kind: EventKind::GcPendingBucketCleaned,
+                    bucket_id,
+                    txid: 0,
+                    file_id: 0,
+                    value: removed_pages,
+                });
+            }
         }
     }
 
@@ -1092,6 +1103,7 @@ impl GarbageCollector {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn obsolete_counter(kind: FileKind) -> CounterMetric {
         match kind {
             FileKind::Data => CounterMetric::GcDataObsoleteFile,
@@ -1099,6 +1111,7 @@ impl GarbageCollector {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn rewrite_counter(kind: FileKind) -> CounterMetric {
         match kind {
             FileKind::Data => CounterMetric::GcDataRewrite,
@@ -1106,6 +1119,7 @@ impl GarbageCollector {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn rewrite_micros(kind: FileKind) -> HistogramMetric {
         match kind {
             FileKind::Data => HistogramMetric::GcDataRewriteMicros,
@@ -1113,6 +1127,7 @@ impl GarbageCollector {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn rewrite_victim_hist(kind: FileKind) -> HistogramMetric {
         match kind {
             FileKind::Data => HistogramMetric::GcDataRewriteVictimFiles,
@@ -1120,6 +1135,7 @@ impl GarbageCollector {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn rewrite_complete_event(kind: FileKind) -> EventKind {
         match kind {
             FileKind::Data => EventKind::GcDataRewriteComplete,
@@ -1293,6 +1309,7 @@ impl GarbageCollector {
         );
         self.store.manifest.save_obsolete_files(kind, &unlinked);
         self.store.manifest.delete_files();
+        #[cfg(feature = "metrics")]
         self.store
             .opt
             .observer
@@ -1476,6 +1493,7 @@ impl GarbageCollector {
     }
 
     fn rewrite_files(&mut self, kind: FileKind, candidate: &[Score], bucket_id: u64) {
+        #[cfg(feature = "metrics")]
         let started = Instant::now();
         let opt = &self.store.opt;
         let Some(permit) = self.store.manifest.try_acquire_rewrite(bucket_id) else {
@@ -1548,6 +1566,7 @@ impl GarbageCollector {
                 Some(x.id)
             })
             .collect();
+        #[cfg(feature = "metrics")]
         let victim_count = victims.len() as u64;
 
         // it's possible that another thread deactivated all live items while we were processing
@@ -1672,25 +1691,28 @@ impl GarbageCollector {
         self.store.manifest.save_obsolete_files(kind, &tmp);
         self.store.manifest.delete_files();
         self.file_runs(kind).fetch_add(1, AcqRel);
-        self.store
-            .opt
-            .observer
-            .counter(Self::rewrite_counter(kind), 1);
-        self.store.opt.observer.histogram(
-            Self::rewrite_micros(kind),
-            started.elapsed().as_micros() as u64,
-        );
-        self.store
-            .opt
-            .observer
-            .histogram(Self::rewrite_victim_hist(kind), victim_count);
-        self.store.opt.observer.event(ObserveEvent {
-            kind: Self::rewrite_complete_event(kind),
-            bucket_id,
-            txid: 0,
-            file_id: output_ids[0],
-            value: victim_count,
-        });
+        #[cfg(feature = "metrics")]
+        {
+            self.store
+                .opt
+                .observer
+                .counter(Self::rewrite_counter(kind), 1);
+            self.store.opt.observer.histogram(
+                Self::rewrite_micros(kind),
+                started.elapsed().as_micros() as u64,
+            );
+            self.store
+                .opt
+                .observer
+                .histogram(Self::rewrite_victim_hist(kind), victim_count);
+            self.store.opt.observer.event(ObserveEvent {
+                kind: Self::rewrite_complete_event(kind),
+                bucket_id,
+                txid: 0,
+                file_id: output_ids[0],
+                value: victim_count,
+            });
+        }
     }
 }
 

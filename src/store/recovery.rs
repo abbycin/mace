@@ -20,11 +20,13 @@ use crate::types::data::{Key, Record, Ver};
 use crate::utils::block::Block;
 use crate::utils::data::Position;
 use crate::utils::lru::Lru;
+#[cfg(feature = "metrics")]
 use crate::utils::observe::{CounterMetric, EventKind, GaugeMetric, HistogramMetric, ObserveEvent};
 use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, MutRef, NULL_CMD, NULL_ORACLE, OpCode, ROOT_PID};
 use crate::{Options, Store, static_assert};
 use crossbeam_epoch::Guard;
+#[cfg(feature = "metrics")]
 use std::time::Instant;
 
 /// there are some cases can't recover:
@@ -214,7 +216,9 @@ impl Recovery {
         wal_boot: &[GroupBoot],
         store: MutRef<Store>,
     ) -> Result<(), OpCode> {
+        #[cfg(feature = "metrics")]
         let phase2_started = Instant::now();
+        #[cfg(feature = "metrics")]
         self.opt.observer.event(ObserveEvent {
             kind: EventKind::RecoveryPhase2Begin,
             bucket_id: 0,
@@ -232,6 +236,7 @@ impl Recovery {
             }
             // redo correctness depends on rebuilding transaction outcomes and pending abort-clean chains
             // from all retained WAL files, not just latest checkpoint window
+            #[cfg(feature = "metrics")]
             let analyze_started = Instant::now();
             let cur_oracle = self.analyze(
                 boot.physical_wal_id,
@@ -241,6 +246,7 @@ impl Recovery {
                 &mut block,
                 store.clone(),
             )?;
+            #[cfg(feature = "metrics")]
             self.opt.observer.histogram(
                 HistogramMetric::RecoveryAnalyzeMicros,
                 analyze_started.elapsed().as_micros() as u64,
@@ -259,23 +265,32 @@ impl Recovery {
         self.dirty_table
             .retain(|ver, _| self.committed_txns.contains(&ver.txid));
 
+        #[cfg(feature = "metrics")]
         let recovered =
             !self.dirty_table.is_empty() || !store.context.abort_clean_tasks().is_empty();
-        self.opt.observer.gauge(
-            GaugeMetric::RecoveryDirtyEntries,
-            self.dirty_table.len() as i64,
-        );
-        self.opt.observer.gauge(GaugeMetric::RecoveryUndoEntries, 0);
-        if !self.dirty_table.is_empty() {
-            let redo_started = Instant::now();
-            let count = self.redo(&mut block, store.clone())?;
-            self.opt
-                .observer
-                .counter(CounterMetric::RecoveryRedoRecord, count);
-            self.opt.observer.histogram(
-                HistogramMetric::RecoveryRedoMicros,
-                redo_started.elapsed().as_micros() as u64,
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.gauge(
+                GaugeMetric::RecoveryDirtyEntries,
+                self.dirty_table.len() as i64,
             );
+            self.opt.observer.gauge(GaugeMetric::RecoveryUndoEntries, 0);
+        }
+        if !self.dirty_table.is_empty() {
+            #[cfg(feature = "metrics")]
+            let redo_started = Instant::now();
+            #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
+            let count = self.redo(&mut block, store.clone())?;
+            #[cfg(feature = "metrics")]
+            {
+                self.opt
+                    .observer
+                    .counter(CounterMetric::RecoveryRedoRecord, count);
+                self.opt.observer.histogram(
+                    HistogramMetric::RecoveryRedoMicros,
+                    redo_started.elapsed().as_micros() as u64,
+                );
+            }
         }
         if !store.context.abort_clean_tasks().is_empty() {
             drain_abort_clean_during_recovery(
@@ -335,17 +350,20 @@ impl Recovery {
         // runtime roots may use append positions only after recovery finishes
         debug_assert!(context.recovering());
         context.init_safe_exclusive(oracle);
-        self.opt.observer.histogram(
-            HistogramMetric::RecoveryPhase2Micros,
-            phase2_started.elapsed().as_micros() as u64,
-        );
-        self.opt.observer.event(ObserveEvent {
-            kind: EventKind::RecoveryPhase2End,
-            bucket_id: 0,
-            txid: oracle,
-            file_id: 0,
-            value: recovered as u64,
-        });
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.histogram(
+                HistogramMetric::RecoveryPhase2Micros,
+                phase2_started.elapsed().as_micros() as u64,
+            );
+            self.opt.observer.event(ObserveEvent {
+                kind: EventKind::RecoveryPhase2End,
+                bucket_id: 0,
+                txid: oracle,
+                file_id: 0,
+                value: recovered as u64,
+            });
+        }
         Ok(())
     }
 
@@ -635,6 +653,7 @@ impl Recovery {
                 // truncate the WAL if it's incomplete
                 log::trace!("truncate {path:?} from {end} to {pos}");
                 f.truncate(pos)?;
+                #[cfg(feature = "metrics")]
                 self.opt
                     .observer
                     .counter(CounterMetric::RecoveryWalTruncate, 1);
@@ -1803,6 +1822,7 @@ mod tests {
     }
 
     /// appends many committed merge transactions to one wal file (test seed helper)
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
     fn seed_committed_merges(path: &std::path::Path, bucket_id: u64, txns: &[(u64, &[u8], &[u8])]) {
         let mut out = Vec::new();
         for (txid, key, operand) in txns {
@@ -2023,6 +2043,7 @@ mod tests {
         assert_eq!(err, OpCode::Corruption);
     }
 
+    #[cfg(feature = "metrics")]
     fn counter_of(
         snap: &crate::utils::observe::ObserveSnapshot,
         m: crate::utils::observe::CounterMetric,
@@ -2035,6 +2056,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "metrics")]
     fn redo_never_splits_or_consolidates_until_recovery_completes() {
         use crate::utils::observe::{CounterMetric, InMemoryObserver};
         use std::sync::Arc;
@@ -2117,6 +2139,7 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
     struct TestAddOp;
 
     impl crate::MergeOperator for TestAddOp {
@@ -2137,6 +2160,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "metrics")]
     fn raw_preserving_maintenance_keeps_merge_chain_readable() {
         use crate::utils::observe::{CounterMetric, InMemoryObserver};
         use std::sync::Arc;
@@ -2293,6 +2317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "metrics")]
     fn prefixed_leaf_raw_preserving_survives_consolidation() {
         use crate::utils::observe::{CounterMetric, InMemoryObserver};
         use std::sync::Arc;

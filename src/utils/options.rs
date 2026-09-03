@@ -4,13 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::{
-    io,
-    utils::{
-        merge_operator::MergeOperator,
-        observe::{NoopObserver, Observer},
-    },
-};
+use crate::io;
+use crate::utils::merge_operator::MergeOperator;
+#[cfg(feature = "metrics")]
+use crate::utils::observe::{NoopObserver, Observer};
 use serde::{Deserialize, Serialize};
 
 use super::OpCode;
@@ -123,7 +120,9 @@ pub struct Options {
     pub truncate_corrupted_wal: bool,
     /// durable-route merge window in microseconds
     pub sync_merge_window_us: u64,
-    /// Observability callback. Default is no-op.
+    /// Observability callback. Default is no-op. Only available with the
+    /// `metrics` feature; without it no observer is ever invoked.
+    #[cfg(feature = "metrics")]
     pub observer: Arc<dyn Observer>,
     /// Filesystem hook for namespace operations and runtime file opens.
     ///
@@ -330,6 +329,7 @@ impl Options {
             wal_file_size: Self::WAL_FILE_SZ as u32,
             truncate_corrupted_wal: true,
             sync_merge_window_us: 125,
+            #[cfg(feature = "metrics")]
             observer: Arc::new(NoopObserver),
             fs: Arc::new(io::OsFileSystem),
         }
