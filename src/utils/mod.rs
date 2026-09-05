@@ -19,8 +19,11 @@ pub(crate) mod data;
 #[cfg(feature = "failpoints")]
 pub(crate) mod failpoint;
 pub(crate) mod imtree;
+pub(crate) mod instance_local;
 pub(crate) mod interval;
 pub(crate) mod lru;
+pub mod merge_operator;
+#[cfg(feature = "metrics")]
 pub mod observe;
 pub(crate) mod options;
 pub(crate) mod seqlock;
@@ -53,6 +56,9 @@ pub enum OpCode {
     Invalid,
     /// already exists
     Exist,
+    /// the merge operator produced a logical value exceeding the persisted size
+    /// limits (MAX_KV_SIZE); the raw operand chain stays valid and crash-safe
+    MergeContractViolation,
 }
 
 impl std::fmt::Display for OpCode {

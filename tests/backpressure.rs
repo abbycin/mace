@@ -1,3 +1,4 @@
+#![cfg(feature = "metrics")]
 use mace::observe::{
     CounterMetric, HistogramMetric, HistogramSample, InMemoryObserver, ObserveSnapshot,
 };

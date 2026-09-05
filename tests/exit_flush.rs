@@ -65,7 +65,7 @@ fn remove_wal_files(dir: &Path) {
 }
 
 fn assert_full(mace: &Mace, count: usize) {
-    let bucket = mace.get_bucket("main").expect("bucket");
+    let bucket = mace.open_bucket("main").expect("bucket");
     let view = bucket.view().expect("view");
     for i in 0..count {
         let val = view
@@ -150,7 +150,7 @@ fn exit_flush_aborted_txn_stays_invisible_without_wal() {
     }
     remove_wal_files(&path);
     let mace = open(&path, true);
-    let bucket = mace.get_bucket("main").expect("bucket");
+    let bucket = mace.open_bucket("main").expect("bucket");
     let view = bucket.view().expect("view");
     assert_eq!(view.get("committed").expect("committed").slice(), b"v");
     for i in 0..200 {
@@ -195,7 +195,7 @@ fn exit_flush_aborted_override_of_committed_stays_at_committed_value() {
     }
     remove_wal_files(&path);
     let mace = open(&path, true);
-    let bucket = mace.get_bucket("main").expect("bucket");
+    let bucket = mace.open_bucket("main").expect("bucket");
     let view = bucket.view().expect("view");
     assert_eq!(
         view.get("k").expect("k must resolve").slice(),

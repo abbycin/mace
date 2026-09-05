@@ -1,5 +1,7 @@
 #![cfg(feature = "extra_check")]
 
+mod common;
+
 use mace::observe::{CounterMetric, InMemoryObserver, ObserveSnapshot};
 use mace::testing;
 use mace::{Bucket, BucketOptions, OpCode, Options, RandomPath};
@@ -10,14 +12,12 @@ use mace::testing::{
     TxnCommitSyncPoint, ViewSyncPoint, VisibilitySyncPoint, WalRecordKind,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Barrier, Mutex};
 
-fn suite_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+fn suite_lock() -> parking_lot::MutexGuard<'static, ()> {
+    // single global hooks lock: parallel HookReset drops must not erase our
+    // slots while a visibility test holds its orchestration window
+    mace::testing::hooks_lock()
 }
 
 fn open_visibility_bucket() -> Result<Bucket, OpCode> {
@@ -1227,10 +1227,10 @@ fn same_group_active_hole_keeps_later_commits_visible_without_range_proof() -> R
     assert_eq!(snapshot.get("s_00")?.slice(), b"v_00");
     assert_eq!(snapshot.get("s_23")?.slice(), b"v_23");
 
-    testing::wake_cc_collector(&db);
-    wait_until(Duration::from_millis(100), || {
-        testing::safe_exclusive(&db) >= hole_txid
-    });
+    assert!(
+        common::collector_rounds_until(&db, 8, || testing::safe_exclusive(&db) >= hole_txid),
+        "collector must advance the safe boundary past the hole txid"
+    );
     assert!(
         testing::fact_present(&db, 0, *short_txids.last().unwrap()),
         "the active hole keeps later facts exact instead of granting a range proof"
@@ -1547,7 +1547,7 @@ fn reopen_preserves_snapshot_visibility_for_recovered_state_and_new_churn() -> R
 
     saved.tmp_store = true;
     let mace = mace::Mace::new(saved.validate().unwrap())?;
-    let db = mace.get_bucket("x").expect("bucket must reopen");
+    let db = mace.open_bucket("x").expect("bucket must reopen");
 
     let snapshot = db.view()?;
     assert_eq!(snapshot.get("k0")?.slice(), b"v1");
@@ -1574,20 +1574,6 @@ impl Drop for HookReset {
     fn drop(&mut self) {
         testing::clear_hooks();
     }
-}
-
-fn wait_until<F>(timeout: Duration, mut pred: F)
-where
-    F: FnMut() -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if pred() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(pred(), "condition timed out after {timeout:?}");
 }
 
 #[test]
@@ -1793,9 +1779,7 @@ fn collector_cut_includes_begin_registration_before_fact_publish() -> Result<(),
         .lock()
         .unwrap()
         .expect("begin hook must publish start ts");
-    wait_until(Duration::from_millis(100), || {
-        testing::safe_exclusive(&db) == begin_ts
-    });
+    common::collector_rounds_until(&db, 8, || testing::safe_exclusive(&db) == begin_ts);
     assert_eq!(testing::safe_exclusive(&db), begin_ts);
 
     begin_release.wait();
@@ -1812,10 +1796,10 @@ fn post_cut_view_registration_does_not_pin_safe_boundary() -> Result<(), OpCode>
     tx.put("seed", "v0")?;
     tx.commit()?;
 
-    testing::wake_cc_collector(&db);
-    wait_until(Duration::from_millis(100), || {
-        testing::safe_exclusive(&db) > 0
-    });
+    assert!(
+        common::collector_rounds_until(&db, 8, || testing::safe_exclusive(&db) > 0),
+        "collector must publish an initial safe boundary for the seeded bucket"
+    );
     let old_safe = testing::safe_exclusive(&db);
 
     let view_entered = Arc::new(Barrier::new(2));
@@ -1885,9 +1869,10 @@ fn post_cut_view_registration_does_not_pin_safe_boundary() -> Result<(), OpCode>
     testing::clear_collector_hook();
 
     view_active.wait();
-    wait_until(Duration::from_millis(100), || {
-        testing::safe_exclusive(&db) > old_safe
-    });
+    assert!(
+        common::collector_rounds_until(&db, 8, || testing::safe_exclusive(&db) > old_safe),
+        "post-cut view registration must not pin the safe boundary below old_safe"
+    );
     let cut = cut_ts
         .lock()
         .unwrap()
@@ -1902,9 +1887,10 @@ fn post_cut_view_registration_does_not_pin_safe_boundary() -> Result<(), OpCode>
     view_drop.wait();
     view_worker.join().unwrap()?;
 
-    wait_until(Duration::from_millis(100), || {
-        testing::safe_exclusive(&db) > old_safe
-    });
+    assert!(
+        common::collector_rounds_until(&db, 8, || testing::safe_exclusive(&db) > old_safe),
+        "dropping the live view must leave the safe boundary free to advance"
+    );
     Ok(())
 }
 
@@ -1983,9 +1969,10 @@ fn exact_miss_rereads_safe_after_prune() -> Result<(), OpCode> {
     );
     prune_release.wait();
 
-    wait_until(Duration::from_millis(100), || {
-        !testing::fact_present(&db, 0, committed_txid)
-    });
+    assert!(
+        common::collector_rounds_until(&db, 8, || !testing::fact_present(&db, 0, committed_txid)),
+        "committed fact must be pruned once safe covers it and the reader released"
+    );
 
     exact_release.wait();
     reader.join().unwrap()?;

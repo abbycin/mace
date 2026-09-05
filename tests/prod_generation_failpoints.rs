@@ -101,7 +101,7 @@ fn open_relaxed(db_root: &Path) -> Mace {
 }
 
 fn bucket(mace: &Mace) -> Bucket {
-    match mace.get_bucket("prod") {
+    match mace.open_bucket("prod") {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -197,11 +197,30 @@ fn assert_child_aborted(status: ExitStatus, msg: &str) {
 }
 
 fn wait_for_crash(timeout: Duration) -> ! {
+    // the armed failpoint aborts on its acting consultation -- the nth-th hit
+    // for nth rules, the first otherwise; benign pre-nth consultations are
+    // expected during setup and must not fail the window early. past the
+    // deadline either some rule acted without the abort landing, or none got
+    // that far -- both shapes attribute via the rule snapshot
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+    loop {
+        if mace::failpoint_testing::any_rule_actioned() {
+            // the acting consultation and its abort run on an engine thread;
+            // give an in-flight abort a beat to land before declaring failure
+            std::thread::sleep(Duration::from_millis(200));
+            panic!(
+                "failpoint reached its acting consultation but the process survived; {}",
+                mace::failpoint_testing::snapshot()
+            )
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "no failpoint reached its acting consultation within {timeout:?}; {}",
+                mace::failpoint_testing::snapshot()
+            )
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
-    panic!("failpoint did not fire in expected window")
 }
 
 #[test]
@@ -258,7 +277,7 @@ fn child_layout_migration(db_root: &Path) -> ! {
     let rule = std::env::var(ENV_LAYOUT_FAILPOINT).expect("missing layout failpoint");
     testing::arm_failpoint_rule(&rule);
     let _ = open_durable(db_root, None);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_all_inactive_recycle(db_root: &Path) -> ! {
@@ -273,12 +292,12 @@ fn child_all_inactive_recycle(db_root: &Path) -> ! {
     }
     mace.sync().expect("sync unmodified wal");
     mace.start_gc();
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn assert_mixed_groups_visible_after_layout_migration(db_root: &Path) {
     let mace = open_durable(db_root, None);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("migration verify view");
     for prefix in ["a", "b"] {
         for idx in 0..64 {
@@ -301,21 +320,21 @@ fn child_generation_before_file_sync(db_root: &Path) -> ! {
     let mace = open_durable(db_root, None);
     let bucket = bucket(&mace);
     seed_committed(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_generation_after_file_sync(db_root: &Path) -> ! {
     let mace = open_durable(db_root, None);
     let bucket = bucket(&mace);
     seed_committed(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_generation_before_file_sync_mixed(db_root: &Path) -> ! {
     let mace = open_durable(db_root, None);
     let bucket = bucket(&mace);
     seed_mixed_groups(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_txn_abort_after_wal_sync(db_root: &Path) -> ! {
@@ -330,7 +349,7 @@ fn child_txn_abort_after_wal_sync(db_root: &Path) -> ! {
     // drop triggers the modified abort: abort record durable, then crash
     // before the abort fact and abort-clean task are published
     drop(txn);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_wal_rotation_after_file_create(db_root: &Path) -> ! {
@@ -343,7 +362,7 @@ fn child_wal_rotation_after_file_create(db_root: &Path) -> ! {
             .expect("upsert rotation key failed");
         txn.commit().expect("commit rotation txn failed");
     }
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_wal_tail_corrupt(db_root: &Path) -> ! {
@@ -391,7 +410,7 @@ fn child_wal_tail_corrupt(db_root: &Path) -> ! {
     txn.upsert("after_tail", b"lost")
         .expect("upsert after-tail key failed");
     txn.commit().expect("commit after-tail txn failed");
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// like child_wal_tail_corrupt, but the torn tail is far larger than any
@@ -462,7 +481,7 @@ fn child_wal_recycle_multi_group_shared(db_root: &Path) -> ! {
     }
     bucket.checkpoint();
     mace.start_gc();
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_route_switch_relaxed_to_durable(db_root: &Path) -> ! {
@@ -470,7 +489,7 @@ fn child_route_switch_relaxed_to_durable(db_root: &Path) -> ! {
     let bucket = bucket(&mace);
     // crash after a relaxed commit's flush, before the fact is published
     seed_committed(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_route_switch_durable_to_relaxed(db_root: &Path) -> ! {
@@ -478,7 +497,7 @@ fn child_route_switch_durable_to_relaxed(db_root: &Path) -> ! {
     let bucket = bucket(&mace);
     // crash after the durable generation sync, before the fact is published
     seed_committed(&bucket, 64);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn child_switch_wipe_midway(db_root: &Path) -> ! {
@@ -498,7 +517,7 @@ fn child_switch_wipe_midway(db_root: &Path) -> ! {
     // fire earlier: no runtime checkpoint runs in this child)
     testing::arm_failpoint_rule("mace_wal_recycle_after_dir_sync_before_done_commit=abort@1");
     let _mace = open_relaxed(db_root);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// tail construction for the switch durability windows: committed data in 24
@@ -513,7 +532,7 @@ fn child_switch_evict_many_buckets(db_root: &Path) -> ! {
         txn.put("k", format!("v{i}")).expect("put failed");
         txn.commit().expect("commit failed");
     }
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// run the relaxed switch open with a failpoint armed in-process so the crash
@@ -523,7 +542,7 @@ fn child_switch_open_arm(db_root: &Path) -> ! {
     let rule = std::env::var(ENV_SWITCH_FAILPOINT).expect("missing switch failpoint rule");
     testing::arm_failpoint_rule(&rule);
     let _mace = open_relaxed(db_root);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// same as child_switch_open_arm but reopens in the durable route (used to
@@ -532,7 +551,7 @@ fn child_switch_open_arm_durable(db_root: &Path) -> ! {
     let rule = std::env::var(ENV_SWITCH_FAILPOINT).expect("missing switch failpoint rule");
     testing::arm_failpoint_rule(&rule);
     let _mace = open_durable(db_root, None);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// leave one committed txn and one in-progress txn in the wal, crashing on the
@@ -549,7 +568,7 @@ fn child_switch_pending_abort(db_root: &Path) -> ! {
     txn.put("k", b"v").expect("put committed failed");
     txn.commit().expect("commit committed failed");
     drop(pending);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 /// 24 buckets: b23 holds ONLY an in-progress txn (no committed records), the
@@ -571,12 +590,12 @@ fn child_switch_abort_evict_many(db_root: &Path) -> ! {
         txn.commit().expect("commit failed");
     }
     drop(pending);
-    wait_for_crash(Duration::from_secs(20))
+    wait_for_crash(Duration::from_secs(2))
 }
 
 fn assert_committed_visible(db_root: &Path, count: usize) {
     let mace = open_durable(db_root, None);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     for idx in 0..count {
         let key = format!("k_{idx}");
@@ -587,7 +606,7 @@ fn assert_committed_visible(db_root: &Path, count: usize) {
 
 fn assert_mixed_visible(db_root: &Path, count: usize) {
     let mace = open_durable(db_root, None);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     for idx in 0..count {
         let val = view
@@ -648,7 +667,7 @@ fn txn_abort_crash_after_wal_sync_rolls_back_on_reopen() {
     assert_child_aborted(status, "abort child must abort");
 
     let mace = open_durable(&path, None);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     for idx in 0..64 {
         let key = format!("k_{idx}");
@@ -675,7 +694,7 @@ fn wal_rotation_crash_after_file_create_survives_reopen_without_gap() {
     assert_child_aborted(status, "rotation child must abort");
 
     let mace = open_durable(&path, None);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     let got = view.get("rot_0").expect("pre-rotation commit must survive");
     assert_eq!(got.slice(), vec![b'w'; 2048].as_slice());
@@ -703,7 +722,7 @@ fn wal_tail_corruption_truncates_at_first_bad_record() {
     assert_child_aborted(status, "tail-corrupt child must abort");
 
     let mace = open_durable(&path, Some(observer.clone()));
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     for idx in 0..16 {
         let key = format!("pre_{idx}");
@@ -767,7 +786,7 @@ fn wal_tail_corruption_truncates_at_first_bad_record() {
 
     let reopened = open_durable(&path, None);
     let reopened_bucket = reopened
-        .get_bucket("prod")
+        .open_bucket("prod")
         .expect("bucket prod should reopen after post-truncation write");
     let reopened_view = reopened_bucket
         .view()
@@ -796,7 +815,7 @@ fn truncated_tail_runtime_abort_clean_completes_and_unpins() {
     assert_child_aborted(status, "big-tail child must abort");
 
     let mace = open_durable(&path, Some(observer.clone()));
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     for idx in 0..8 {
         let key = format!("pre_{idx}");
@@ -905,7 +924,7 @@ fn truncated_tail_runtime_abort_clean_completes_and_unpins() {
 
     let reopened = open_durable(&path, None);
     let reopened_bucket = reopened
-        .get_bucket("prod")
+        .open_bucket("prod")
         .expect("bucket prod should reopen after truncation+abort");
     let reopened_view = reopened_bucket
         .view()
@@ -961,7 +980,7 @@ fn durable_to_relaxed_crash_recovers_across_epochs() {
     );
     assert_child_aborted(status, "durable-to-relaxed child must abort");
     let mace = open_relaxed(&path);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     for idx in 0..64 {
         let key = format!("k_{idx}");
@@ -980,7 +999,7 @@ fn switch_wipe_mid_crash_recovers_after_intent_commit() {
     // re-executes it) and reopen cleanly under the other route; the committed
     // key must be readable from the checkpointed data files
     let mace = open_relaxed(&path);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     assert_eq!(view.get("k").expect("pre-crash key missing").slice(), b"v");
     drop(view);
@@ -1024,7 +1043,7 @@ fn all_inactive_shared_recycle_crash_reopens_without_a_wal_gap() {
     assert_child_aborted(status, "all-inactive recycle must crash after remove");
 
     let mace = open_durable(&path, None);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let tx = bucket.begin().expect("post-recovery begin");
     tx.put("post", b"v").expect("post-recovery put");
     tx.commit().expect("post-recovery commit");
@@ -1076,7 +1095,7 @@ fn shared_stream_recycle_crash_respects_multi_group_pin() {
     // group-1 pin, the pin's wal chain would be recycled and recovery's
     // abort-clean would fail, so a successful reopen is the assertion
     let mace = open_durable(&path, None);
-    let bucket = mace.get_bucket("prod").expect("bucket prod should exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
     let view = bucket.view().expect("open verify view failed");
     for round in 0..8 {
         let key = format!("rw_{round}");
@@ -1110,7 +1129,7 @@ fn shared_stream_recycle_crash_respects_multi_group_pin() {
 const ENV_SWITCH_FAILPOINT: &str = "MACE_SWITCH_FAILPOINT";
 
 fn ensure_bucket(mace: &Mace, name: &str) -> Bucket {
-    match mace.get_bucket(name) {
+    match mace.open_bucket(name) {
         Ok(bucket) => bucket,
         Err(OpCode::NotFound) => mace
             .new_bucket(
@@ -1167,7 +1186,7 @@ fn assert_buckets_visible(mace: &Mace, count: usize) {
     let mut missing = Vec::new();
     for i in 0..count {
         let name = format!("b{i}");
-        let bucket = mace.get_bucket(&name).expect("bucket must exist");
+        let bucket = mace.open_bucket(&name).expect("bucket must exist");
         let view = bucket.view().expect("open verify view failed");
         match view.get("k") {
             Ok(val) => {
@@ -1337,7 +1356,7 @@ fn switch_crash_after_writeback_reopens_same_route() {
         after_first, after_second,
         "same-route reopen after a completed switch must keep the wal streams untouched"
     );
-    let bucket = mace.get_bucket("b0").expect("bucket must exist");
+    let bucket = mace.open_bucket("b0").expect("bucket must exist");
     let view = bucket.view().expect("open verify view failed");
     assert_eq!(view.get("k2").expect("key missing").slice(), b"v2");
     drop(view);
@@ -1370,7 +1389,7 @@ fn switch_with_pending_abort_drains_before_wipe() {
     );
 
     let mace = open_relaxed(&path);
-    let bucket = mace.get_bucket("prod").expect("bucket prod must exist");
+    let bucket = mace.open_bucket("prod").expect("bucket prod must exist");
     let view = bucket.view().expect("open verify view failed");
     assert_eq!(view.get("k").expect("committed key missing").slice(), b"v");
     assert!(
@@ -1444,7 +1463,7 @@ fn switch_abort_clean_scrub_force_fsyncs_evicted_bucket() {
 
     let mace = open_relaxed(&path);
     assert_buckets_visible(&mace, 23);
-    let bucket = mace.get_bucket("b23").expect("bucket b23 must exist");
+    let bucket = mace.open_bucket("b23").expect("bucket b23 must exist");
     let view = bucket.view().expect("open verify view failed");
     assert!(
         view.get("pending").is_err(),

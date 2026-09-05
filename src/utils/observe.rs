@@ -59,10 +59,11 @@ pub enum CounterMetric {
     WalGenerationLeader,
     WalGenerationFollower,
     WalGenerationError,
+    MergeContractViolation,
 }
 
 impl CounterMetric {
-    pub const COUNT: usize = 37;
+    pub const COUNT: usize = 38;
     pub const ALL: [CounterMetric; Self::COUNT] = [
         CounterMetric::TxnBegin,
         CounterMetric::TxnCommit,
@@ -101,6 +102,7 @@ impl CounterMetric {
         CounterMetric::WalGenerationLeader,
         CounterMetric::WalGenerationFollower,
         CounterMetric::WalGenerationError,
+        CounterMetric::MergeContractViolation,
     ];
 
     #[inline]
@@ -197,6 +199,7 @@ pub enum EventKind {
     GcPendingBucketCleaned,
     GcDataRewriteComplete,
     GcBlobRewriteComplete,
+    MergeContractViolation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

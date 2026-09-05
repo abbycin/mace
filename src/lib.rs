@@ -2,14 +2,18 @@ pub use index::txn::{TxnKV, TxnView};
 pub use store::VacuumStats;
 pub(crate) use store::store::Store;
 pub use store::store::{Bucket, Mace};
+#[cfg(feature = "metrics")]
 pub use utils::observe;
 pub use utils::{
     OpCode, RandomPath,
-    options::{BucketOptions, Options},
+    merge_operator::{MergeOperator, U64AddOperator, u64_add_operator},
+    options::{BucketOptions, Options, PersistedBucketOptions},
 };
 
 mod cc;
 mod error;
+#[cfg(any(feature = "extra_check", feature = "failpoints"))]
+pub mod failpoint_testing;
 mod index;
 mod io;
 mod map;

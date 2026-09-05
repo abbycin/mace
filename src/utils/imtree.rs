@@ -65,6 +65,12 @@ where
         self.size
     }
 
+    /// the greatest key under the comparator order, or None when empty;
+    /// follows the rightmost leaf path, O(depth)
+    pub(crate) fn max_key(&self) -> Option<K> {
+        self.root.as_ref().and_then(|root| root.max_key())
+    }
+
     pub(crate) fn iter(&self) -> Iter<'static, K> {
         Iter::new(self.root.clone())
     }
@@ -78,12 +84,12 @@ where
         RangeIter::new(self.root.clone(), k, cmp, equal)
     }
 
-    pub(crate) fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    pub(crate) fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, visit: &mut F) -> bool
     where
         F: FnMut(K) -> bool,
     {
         if let Some(root) = &self.root {
-            root.visit_from(k, cmp, f)
+            root.visit_from(k, cmp, visit)
         } else {
             false
         }
@@ -183,7 +189,14 @@ where
         }
     }
 
-    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    fn max_key(&self) -> Option<K> {
+        match &self.children {
+            Children::Intl { intl, .. } => intl.last().and_then(|n| n.max_key()),
+            Children::Leaf { leaf } => leaf.last().and_then(|n| n.max_key()),
+        }
+    }
+
+    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, visit: &mut F) -> bool
     where
         F: FnMut(K) -> bool,
     {
@@ -195,14 +208,14 @@ where
         match &self.children {
             Children::Intl { intl, .. } => {
                 for i in pos..intl.len() {
-                    if intl[i].visit_from(k, cmp, f) {
+                    if intl[i].visit_from(k, cmp, visit) {
                         return true;
                     }
                 }
             }
             Children::Leaf { leaf } => {
                 for i in pos..leaf.len() {
-                    if leaf[i].visit_from(k, cmp, f) {
+                    if leaf[i].visit_from(k, cmp, visit) {
                         return true;
                     }
                 }
@@ -216,6 +229,10 @@ impl<K> Leaf<K>
 where
     K: Copy,
 {
+    fn max_key(&self) -> Option<K> {
+        self.keys.last().copied()
+    }
+
     fn put<F>(&mut self, k: K, cmp: F) -> Update<K>
     where
         F: Fn(&K, &K) -> Ordering,
@@ -246,7 +263,7 @@ where
         )
     }
 
-    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, visit: &mut F) -> bool
     where
         F: FnMut(K) -> bool,
     {
@@ -255,7 +272,7 @@ where
             Err(pos) => pos,
         };
         for i in pos..self.keys.len() {
-            if f(self.keys[i]) {
+            if visit(self.keys[i]) {
                 return true;
             }
         }
@@ -303,13 +320,13 @@ where
         }
     }
 
-    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, f: &mut F) -> bool
+    fn visit_from<T, F>(&self, k: &T, cmp: fn(&K, &T) -> Ordering, visit: &mut F) -> bool
     where
         F: FnMut(K) -> bool,
     {
         match self {
-            Node::Intl(intl) => intl.visit_from(k, cmp, f),
-            Node::Leaf(leaf) => leaf.visit_from(k, cmp, f),
+            Node::Intl(intl) => intl.visit_from(k, cmp, visit),
+            Node::Leaf(leaf) => leaf.visit_from(k, cmp, visit),
         }
     }
 
@@ -334,6 +351,13 @@ impl<K> Node<K>
 where
     K: Copy,
 {
+    fn max_key(&self) -> Option<K> {
+        match self {
+            Node::Intl(intl) => intl.max_key(),
+            Node::Leaf(leaf) => leaf.max_key(),
+        }
+    }
+
     fn level(&self) -> usize {
         match self {
             Node::Intl(intl) => intl.level(),

@@ -8,13 +8,12 @@ use std::{
 };
 
 use crate::{
-    BucketOptions, OpCode,
+    OpCode, PersistedBucketOptions,
     meta::{
         BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BUCKET_MISC, BUCKET_OBSOLETE_BLOB,
         BUCKET_OBSOLETE_DATA, SEQUENCES_KEY, blob_interval_name, data_interval_name,
         page_table_name,
     },
-    observe::CounterMetric,
     types::traits::IAsSlice,
     utils::{
         INIT_ID, INIT_ORACLE, NULL_ADDR,
@@ -653,7 +652,7 @@ impl IMetaCodec for DelInterval {
 #[repr(C)]
 pub struct BucketMeta {
     pub id: u64,
-    pub options: BucketOptions,
+    pub options: PersistedBucketOptions,
 }
 
 impl IMetaCodec for BucketMeta {
@@ -673,9 +672,17 @@ impl IMetaCodec for BucketMeta {
 
 impl IAsSlice for BucketMeta {}
 
+/// which conditional stat-update kind missed, so retried commits can count
+/// the miss under the right metric when metrics are enabled
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StatMissKind {
+    Data,
+    Blob,
+}
+
 pub enum MetaOp {
     Put(Vec<u8>, Vec<u8>),
-    Update(Vec<u8>, Vec<u8>, CounterMetric),
+    Update(Vec<u8>, Vec<u8>, StatMissKind),
     Del(Vec<u8>),
 }
 

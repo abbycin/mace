@@ -1,3 +1,4 @@
+#[cfg(feature = "metrics")]
 use mace::observe::{CounterMetric, InMemoryObserver, ObserveSnapshot};
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options, RandomPath};
 use rand::seq::SliceRandom;
@@ -119,7 +120,7 @@ fn put_get() -> Result<(), OpCode> {
 
     saved.tmp_store = true;
     let mace = Mace::new(saved.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("default").unwrap();
+    let db = mace.open_bucket("default").unwrap();
 
     check(&db, &elems, &put_ok, &del1, &del2);
 
@@ -324,13 +325,11 @@ fn get_compacted_shared_hist_page_keeps_key_local_old_versions() -> Result<(), O
     tx.update("b", "b1")?;
     tx.commit()?;
 
-    let tx = db.begin()?;
-    tx.update("a", "a2")?;
-    tx.commit()?;
-
-    let tx = db.begin()?;
-    tx.update("b", "b2")?;
-    tx.commit()?;
+    // lagging reader: opened BEFORE the final a2/b2 updates commit, so its
+    // snapshot sits on the old versions and the lookup must fall into the
+    // shared history region — proving traversal stays key-local after the
+    // pad churn forces those histories onto compacted shared pages
+    let snapshot = db.view()?;
 
     // force compaction so old versions go through shared hist-page path
     for i in 0..64 {
@@ -340,12 +339,17 @@ fn get_compacted_shared_hist_page_keeps_key_local_old_versions() -> Result<(), O
         tx.commit()?;
     }
 
-    // snapshot between latest and old versions, must read key-local history only
-    let snapshot = db.view()?;
+    let tx = db.begin()?;
+    tx.update("a", "a2")?;
+    tx.commit()?;
+    let tx = db.begin()?;
+    tx.update("b", "b2")?;
+    tx.commit()?;
+
     let got_a = snapshot.get("a")?;
     let got_b = snapshot.get("b")?;
-    assert_eq!(got_a.slice(), b"a2");
-    assert_eq!(got_b.slice(), b"b2");
+    assert_eq!(got_a.slice(), b"a1");
+    assert_eq!(got_b.slice(), b"b1");
     Ok(())
 }
 
@@ -1332,6 +1336,7 @@ fn smo_during_scan() -> Result<(), OpCode> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn upsert_retry(db: &Bucket, key: &str) {
     const RETRY_LIMIT: usize = 8192;
     for _ in 0..RETRY_LIMIT {
@@ -1349,6 +1354,7 @@ fn upsert_retry(db: &Bucket, key: &str) {
     panic!("upsert retry exhausted: {key}");
 }
 
+#[allow(dead_code)]
 fn del_retry(db: &Bucket, key: &str) {
     const RETRY_LIMIT: usize = 8192;
     for _ in 0..RETRY_LIMIT {
@@ -1371,6 +1377,7 @@ fn del_retry(db: &Bucket, key: &str) {
     panic!("del retry exhausted: {key}");
 }
 
+#[allow(dead_code)]
 fn assert_seek_sorted_unique(db: &Bucket, prefix: &str) {
     let view = db.view().unwrap();
     let mut last: Option<Vec<u8>> = None;
@@ -1383,6 +1390,7 @@ fn assert_seek_sorted_unique(db: &Bucket, prefix: &str) {
     }
 }
 
+#[cfg(feature = "metrics")]
 fn counter(snapshot: &ObserveSnapshot, metric: CounterMetric) -> u64 {
     snapshot
         .counters
@@ -1393,6 +1401,7 @@ fn counter(snapshot: &ObserveSnapshot, metric: CounterMetric) -> u64 {
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn smo_merge_preserves_final_state() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     let observer = Arc::new(InMemoryObserver::new(256));
@@ -1529,6 +1538,7 @@ fn smo_merge_preserves_final_state() -> Result<(), OpCode> {
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn smo_scan_remains_ordered_under_merge_churn() -> Result<(), OpCode> {
     let mut opts = Options::new(&*RandomPath::new());
     let observer = Arc::new(InMemoryObserver::new(256));

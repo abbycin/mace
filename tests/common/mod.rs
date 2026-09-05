@@ -3,7 +3,7 @@
 use mace::{Mace, OpCode, Options, RandomPath};
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub struct TestEnv {
     root: RandomPath,
@@ -57,20 +57,6 @@ pub fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
-}
-
-pub fn wait_until<F>(timeout: Duration, step: Duration, mut predicate: F) -> bool
-where
-    F: FnMut() -> bool,
-{
-    let start = Instant::now();
-    while start.elapsed() <= timeout {
-        if predicate() {
-            return true;
-        }
-        std::thread::sleep(step);
-    }
-    false
 }
 
 pub fn is_retryable_txn_err(err: OpCode) -> bool {
@@ -131,5 +117,169 @@ pub fn child_test_command(exe: &Path) -> Command {
             cmd
         }
         None => Command::new(exe),
+    }
+}
+
+/// arm the deterministic-test gc mode: under extra_check every round is
+/// explicitly driven, so no background timer may fire (gc_timeout=0). other
+/// builds keep the default timer — a bare zero degenerates into a busy poll
+/// there and would run continuous background rounds (see registry
+/// test.timeout_zero_disables_background_trigger).
+pub fn deterministic_gc(options: &mut Options) {
+    #[cfg(feature = "extra_check")]
+    {
+        options.gc_timeout = 0;
+    }
+    #[cfg(not(feature = "extra_check"))]
+    {
+        let _ = options;
+    }
+}
+
+/// drive collector cycles until `cond` holds; each round wakes the collector
+/// and consumes its cycle-completed signal. the hook carries the collector
+/// token of the firing engine, so parallel tests' collectors cannot fire it:
+/// the round waits for exactly this engine's collector cycle, never for a
+/// foreign signal. **caller must hold hooks_lock** (the si/generation
+/// suite_lock aliases already provide it) so a concurrent caller cannot
+/// overwrite the armed hook and steal the signal. no wall-clock sleep is
+/// involved.
+#[cfg(feature = "extra_check")]
+pub fn collector_rounds_until(
+    bucket: &mace::Bucket,
+    max_rounds: u32,
+    mut cond: impl FnMut() -> bool,
+) -> bool {
+    use mace::testing;
+    let collector_token = testing::collector_completion_token(bucket);
+    for _ in 0..max_rounds {
+        if cond() {
+            return true;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        testing::set_collector_completed_hook(Some(std::sync::Arc::new(move |token| {
+            if token == collector_token {
+                let _ = tx.send(());
+            }
+        })));
+        testing::wake_cc_collector(bucket);
+        let completed = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        testing::clear_collector_completed_hook();
+        if cond() {
+            return true;
+        }
+        if !completed {
+            // a cycle was requested but never finished: further rounds would
+            // spin on a stuck collector, surface it via the caller's assert
+            return cond();
+        }
+    }
+    cond()
+}
+/// run one explicit gc round and verify engine-reported completion.
+///
+/// `start_gc` blocks until the collector finishes its full `run()` (the
+/// semaphore posts after completion), so this returns only after a complete
+/// engine round. under `extra_check` the round must additionally fire the
+/// gc-completed signal, which this call consumes under `hooks_lock` so
+/// parallel tests cannot steal or inject signals; a timeout panics with the
+/// engine snapshot attached for attribution.
+pub fn gc_round(mace: &Mace, timeout: Duration) {
+    #[cfg(not(feature = "extra_check"))]
+    let _ = timeout;
+    #[cfg(feature = "extra_check")]
+    let (tx, rx) = std::sync::mpsc::channel();
+    #[cfg(feature = "extra_check")]
+    let _hooks = mace_testing_lock();
+    #[cfg(feature = "extra_check")]
+    mace_testing_set_gc_completed(move || {
+        // infallible: a stale fire after this call cleared the hook must not
+        // panic an unrelated engine thread
+        let _ = tx.send(());
+    });
+
+    mace.start_gc();
+
+    #[cfg(feature = "extra_check")]
+    {
+        mace_testing_clear_gc_completed();
+        drop(_hooks);
+        if rx.recv_timeout(timeout).is_err() {
+            panic!(
+                "gc round did not report completion within {timeout:?}; {}",
+                mace_testing_debug_snapshot(mace)
+            );
+        }
+    }
+}
+
+/// drive up to `max_rounds` synchronous gc rounds until `cond` holds; no
+/// wall-clock sleep is involved (each round is a full synchronous engine
+/// point). returns the final `cond()` value so callers can assert with their
+/// own diagnostics.
+pub fn gc_rounds_until(mace: &Mace, max_rounds: u32, mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..max_rounds {
+        // route through gc_round so the completion signal stays consumed under
+        // hooks_lock; bare start_gc here would let parallel callers fire into
+        // someone else's armed window and mask a missing own fire
+        gc_round(mace, Duration::from_secs(30));
+        if cond() {
+            return true;
+        }
+    }
+    cond()
+}
+
+/// `gc_rounds_until` with an inter-round settle delay: for preconditions that
+/// depend on the engine's designed aging window (stat up2 must fall behind
+/// the current tick before the decline-rate selector will pick a file), which
+/// no number of back-to-back synchronous rounds can cross. still bounded:
+/// fixed round budget, per-round synchronous engine point.
+pub fn gc_rounds_until_with_settle(
+    mace: &Mace,
+    max_rounds: u32,
+    settle: Duration,
+    mut cond: impl FnMut() -> bool,
+) -> bool {
+    for _ in 0..max_rounds {
+        mace.start_gc();
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(settle);
+    }
+    mace.start_gc();
+    cond()
+}
+
+#[cfg(feature = "extra_check")]
+fn mace_testing_lock() -> parking_lot::MutexGuard<'static, ()> {
+    mace::testing::hooks_lock()
+}
+
+#[cfg(feature = "extra_check")]
+fn mace_testing_set_gc_completed(hook: impl Fn() + Send + Sync + 'static) {
+    mace::testing::set_gc_completed_hook(Some(std::sync::Arc::new(hook)));
+}
+
+#[cfg(feature = "extra_check")]
+fn mace_testing_clear_gc_completed() {
+    mace::testing::clear_gc_completed_hook();
+}
+
+#[cfg(feature = "extra_check")]
+fn mace_testing_debug_snapshot(mace: &Mace) -> String {
+    mace::testing::debug_snapshot(mace)
+}
+
+/// engine snapshot text for assertion diagnostics; the rich form exists only
+/// under extra_check (Observer trait is write-only, counters live test-side)
+pub fn mace_snapshot_text(mace: &Mace) -> String {
+    #[cfg(feature = "extra_check")]
+    return mace::testing::debug_snapshot(mace);
+    #[cfg(not(feature = "extra_check"))]
+    {
+        let _ = mace;
+        String::from("(engine snapshot requires extra_check)")
     }
 }

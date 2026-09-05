@@ -148,12 +148,53 @@ finishes.
 
 ### 3.5 Bucket options
 
-Bucket options are persisted with the bucket.
+Bucket options are persisted with the bucket. The persisted fields define page interpretation and
+maintenance policy: the inline-value boundary, node split cardinality, cache and pool budgets,
+checkpoint sizing, eviction and consolidation thresholds, compression, and backpressure. The merge
+operator is runtime-only and never reaches manifest metadata, WAL records, or pages.
 
 The inline-value boundary and node split cardinality define persisted page interpretation and cannot
-be changed after bucket creation. Other bucket options are runtime or output policies and may be
-updated while the bucket is unloaded and no rewrite is active. The updated values take effect on
-the next load.
+be changed after bucket creation. Other persisted bucket options are runtime or output policies and
+may be updated while the bucket is unloaded and no rewrite is active. The updated values take effect
+on the next load.
+
+A bucket runtime chooses either one merge operator or no operator before it becomes visible to
+foreground operations. That choice is immutable for the lifetime of the runtime. Re-opening an
+already loaded bucket without an operator leaves its choice unchanged; presenting the same operator
+is compatible, while presenting a different operator or adding one to an operator-less runtime is
+rejected. Unloading removes the runtime choice, so the next load may choose again. Operator identity
+is not persisted and semantic compatibility across process restarts belongs to the caller.
+
+The operator is a total user function with no failure channel. It combines a chain of operands and
+then applies that result to an optional base; `None` is the only logical deletion. Empty results
+are contract violations. The same bucket may use different algebra for different stable user keys,
+but the meaning of a key must not change while its runtime is loaded. Merge admission never invokes
+the operator, and operator panics are not caught by the engine.
+
+Merge-aware compaction uses the selected operator to materialize merge runs at the snapshot-safe
+boundary: a contiguous run older than that boundary folds into one plain base row carrying the
+boundary version identity, while newer versions remain verbatim. The replacement retains the
+lineage of every absorbed WAL position, so recovery neither redoes nor skips an operand. Retained
+aborted versions are invisible to snapshots and never participate in a fold or serve as its barrier:
+below-safe aborted versions are removed only by abort-clean, while above-safe aborted versions remain
+verbatim until then. This prevents both leaking aborted bytes into a synthesized row and dropping a
+row whose boundary version is still needed by abort-clean. Folded values use the normal inline or
+large-value persistence rules.
+
+When no operator is selected, compaction remains raw-preserving. Reads that encounter a visible
+merge operand return an invalid-operation result rather than interpreting its bytes. If folding
+produces an empty or oversized result, compaction also remains raw-preserving and reads report a
+contract violation. In both cases the operand chain remains available for a later runtime loaded
+with a compatible operator. A safe tombstone is an absence barrier; versions older than it,
+including raw merge operands, may be discarded as unreachable history.
+
+A folded value past the global value-size limit, or an empty fold output, is a merge contract
+violation. Compaction of such a key never fails publication or a committed transaction. Reliable
+reads report the contract-violation result instead of a truncated or degraded value, and subsequent
+merges on that key are rejected until a committed delete resets it; an aborted delete does not reset
+it. This prohibition is runtime-only and need not survive unloading. The raw operand chain remains
+crash-safe, and a later compaction may retry materialization. Recovery replays operands without
+folding or structural maintenance, then defers those operations until normal runtime has started.
 
 Compression is an output policy. Enabling or disabling it affects newly written data/blob records;
 existing raw and compressed records remain readable in the same bucket.
@@ -640,16 +681,11 @@ There are three format families:
 ### 15.1 Data/blob format
 
 The current data/blob file version is 1. The version is stored once in the fixed footer; individual
-payload frames do not carry a separate format version.
+payload frames do not carry a separate format version. Writers emit version 1, and readers reject
+unknown versions or unsupported footer fields.
 
-The writer emits the current version. Readers dispatch from the file version and retain support for
-every data/blob version still inside the supported online-upgrade window. A directory may therefore
-contain files from more than one supported version.
-
-Checkpoint and GC rewrite emit the current version. When source and target versions differ, rewrite
-decodes the source record and encodes it in the target version instead of copying encoded bytes.
-
-Retiring historical reader support requires an explicit migration boundary.
+Checkpoint and GC rewrite emit version 1. A future format version must define its reader support and
+an explicit migration boundary before it can coexist with the current format.
 
 ### 15.2 Metadata format
 
@@ -664,8 +700,14 @@ migration. Runtime startup does not rewrite an unsupported metadata organization
 The current route split changes physical stream placement but not WAL record encoding. Both routes
 use the same WAL record format and recovery decoder.
 
-WAL format evolution is handled independently from data/blob file evolution. A WAL format change
-requires a migration design that first reaches a WAL-independent durable state.
+WAL format evolution under the current release model is one-way: only newer binaries open a
+directory after merge-capable payloads are written, so additive record kinds (such as the merge
+operand payload) require no migration barrier and no old-binary compatibility window. Deploying a
+binary that writes new WAL payload kinds therefore commits that directory to binaries of at least
+that capability level; downgrades are unsupported. This boundary applies to additive payload types
+under an unchanged record envelope. Any change to the shared Update envelope itself, or any other
+non-additive encoding change, still requires a migration design that first reaches a WAL-independent
+durable state.
 
 ## 16. Observability
 

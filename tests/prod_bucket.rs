@@ -1,9 +1,7 @@
 mod common;
 
-use common::{TestEnv, env_usize, wait_until};
+use common::{TestEnv, env_usize};
 use mace::{BucketOptions, OpCode};
-use std::thread;
-use std::time::Duration;
 
 #[test]
 fn fast_lifecycle_quota_guard() -> Result<(), OpCode> {
@@ -11,6 +9,7 @@ fn fast_lifecycle_quota_guard() -> Result<(), OpCode> {
     let engine = env.open_with(|options| {
         options.sync_on_write = false;
         options.data_file_size = 4096;
+        common::deterministic_gc(options);
     })?;
 
     let rounds = env_usize("MACE_PROD_BUCKET_FAST_ROUNDS", 96);
@@ -27,7 +26,7 @@ fn fast_lifecycle_quota_guard() -> Result<(), OpCode> {
         loop {
             match engine.del_bucket(&name) {
                 Ok(()) => break,
-                Err(OpCode::Again) => thread::sleep(Duration::from_millis(4)),
+                Err(OpCode::Again) => engine.start_gc(),
                 Err(err) => return Err(err),
             }
         }
@@ -47,7 +46,7 @@ fn fast_pending_delete_counter() -> Result<(), OpCode> {
     let env = TestEnv::new();
     let engine = env.open_with(|options| {
         options.sync_on_write = false;
-        options.gc_timeout = 10;
+        common::deterministic_gc(options);
     })?;
 
     let rounds = env_usize("MACE_PROD_BUCKET_PENDING_ROUNDS", 64).max(24);
@@ -65,13 +64,17 @@ fn fast_pending_delete_counter() -> Result<(), OpCode> {
     }
 
     let baseline = engine.nr_buckets();
+    // extra_check: gc_timeout=0 arms no timer. other builds keep the default
+    // timer, so pause the collector to protect the pending-count assertion;
+    // explicit start_gc rounds still run while paused
+    #[cfg(not(feature = "extra_check"))]
     engine.disable_gc();
 
     for name in created.iter().take(24) {
         loop {
             match engine.del_bucket(name) {
                 Ok(()) => break,
-                Err(OpCode::Again) => thread::sleep(Duration::from_millis(2)),
+                Err(OpCode::Again) => engine.start_gc(),
                 Err(err) => return Err(err),
             }
         }
@@ -83,14 +86,10 @@ fn fast_pending_delete_counter() -> Result<(), OpCode> {
         "pending delete should keep bucket count before gc"
     );
 
-    engine.enable_gc();
-    let released = wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
-        engine.start_gc();
-        engine.nr_buckets() < baseline
-    });
+    let released = common::gc_rounds_until(&engine, 8, || engine.nr_buckets() < baseline);
     assert!(
         released,
-        "gc should eventually release pending deleted buckets"
+        "gc should release pending deleted buckets within 8 explicit rounds"
     );
 
     Ok(())
@@ -113,7 +112,6 @@ fn stress_create_delete() -> Result<(), OpCode> {
                 Ok(bucket) => break bucket,
                 Err(OpCode::NoSpace) => {
                     engine.start_gc();
-                    thread::sleep(Duration::from_millis(2));
                 }
                 Err(err) => return Err(err),
             }
@@ -127,7 +125,7 @@ fn stress_create_delete() -> Result<(), OpCode> {
         loop {
             match engine.del_bucket(&name) {
                 Ok(()) => break,
-                Err(OpCode::Again) => thread::sleep(Duration::from_millis(2)),
+                Err(OpCode::Again) => engine.start_gc(),
                 Err(err) => return Err(err),
             }
         }

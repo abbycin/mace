@@ -41,3 +41,10 @@ path = "fuzz_targets/crash_reopen.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "merge_checkpoint_reopen"
+path = "fuzz_targets/merge_checkpoint_reopen.rs"
+test = false
+doc = false
+bench = false

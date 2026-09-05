@@ -3,10 +3,10 @@
 mod common;
 
 use common::child_test_command;
-use mace::testing::{self, WalRecordKind};
+use mace::testing::{self, AbortCleanStage, AbortCleanSyncPoint, WalRecordKind};
 use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const ENV_CRASH_CHILD: &str = "MACE_GC_CRASH_CHILD";
 const ENV_CRASH_DB: &str = "MACE_GC_CRASH_DB";
@@ -149,27 +149,12 @@ fn durable_shared_gc_respects_group1_active_pin() -> Result<(), OpCode> {
     // GC can only recycle before the group 1 pin after group 0's checkpoint
     // publication has crossed the earliest WAL file.  Wait for that async
     // publication explicitly instead of racing it with the GC assertion.
-    let checkpoint_deadline = Instant::now() + Duration::from_secs(8);
-    while testing::shared_checkpoint_floor(&db, 0).0 <= first_file_id
-        && Instant::now() < checkpoint_deadline
-    {
-        db.checkpoint();
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    db.checkpoint_and_wait();
     assert!(
         testing::shared_checkpoint_floor(&db, 0).0 > first_file_id,
-        "group 0 checkpoint must pass the earliest WAL file before gc"
+        "scenario precondition: group 0 checkpoint must pass the earliest WAL file before gc"
     );
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut recycled_earlier = false;
-    while Instant::now() < deadline {
-        mace.start_gc();
-        recycled_earlier = !first_file.exists();
-        if recycled_earlier {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let recycled_earlier = common::gc_rounds_until(&mace, 8, || !first_file.exists());
     assert!(
         recycled_earlier,
         "the shared group_wal stream gc should recycle files before the group 1 active pin"
@@ -210,7 +195,7 @@ fn route_switch_checkpoints_tail_then_wipes_old_wal() -> Result<(), OpCode> {
     opt.checkpoint_nudge_ms = 0;
     opt.data_file_size = 1 << 30;
     let mace = Mace::new(opt.validate()?)?;
-    let db = mace.get_bucket("x")?;
+    let db = mace.open_bucket("x")?;
 
     // the switch open recovered the uncheckpointed tail, force-checkpointed it
     // (full fsync) and then wiped the old wal: the tail's data must be
@@ -237,8 +222,7 @@ fn route_switch_checkpoints_tail_then_wipes_old_wal() -> Result<(), OpCode> {
     tx.commit()?;
     db.checkpoint();
     for _ in 0..8 {
-        mace.start_gc();
-        std::thread::sleep(Duration::from_millis(10));
+        common::gc_round(&mace, Duration::from_secs(10));
     }
     Ok(())
 }
@@ -275,22 +259,60 @@ fn shared_stream_abort_clean_walks_interleaved_chain_without_range_escape() -> R
     drop(tx_a);
 
     // gc must walk a's prev chain strictly backward through the interleaved
-    // shared stream and retire the task
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while testing::fact_present(&db, 0, txid_a_abort) && Instant::now() < deadline {
-        // repeated gc rounds advance the epoch so the quiescence callback can
-        // fire and the task can retire
-        mace.start_gc();
-        let guard = crossbeam_epoch::pin();
-        guard.flush();
-        drop(guard);
-        std::thread::yield_now();
+    // shared stream and retire the task. phase 1 drives the synchronous walk:
+    // each round fully processes pending tasks, so a small round budget is
+    // structural, not a scheduling bet. the final retirement step is
+    // different -- it rides an EBR defer whose callback is ordered after the
+    // process-wide epoch grace period, and concurrent participants pin that
+    // epoch across long operations (a checkpoint publish holds a guard over
+    // its wait-zero window), so its completion is genuinely asynchronous
+    // phase 2 therefore waits on the engine's AfterQuiesceCallback signal
+    // instead of guessing rounds, then runs the one protocol-fixed drain
+    // round before asserting
+    let (quiesce_tx, quiesce_rx) = std::sync::mpsc::channel();
+    // hold hooks_lock across registration and removal per the testing
+    // contract; the span between them cannot hold it because gc_round takes
+    // the same lock internally, and this binary has no other hook user to
+    // race against
+    {
+        let _hooks = mace::testing::hooks_lock();
+        testing::set_abort_clean_hook(Some(std::sync::Arc::new(move |point, txid| {
+            if txid == txid_a_abort && point == AbortCleanSyncPoint::AfterQuiesceCallback {
+                let _ = quiesce_tx.send(());
+            }
+        })));
+    }
+    let gone = || !testing::fact_present(&db, 0, txid_a_abort);
+    let mut retired = gone();
+    let mut rewritten = false;
+    for _ in 0..4 {
+        if retired {
+            break;
+        }
+        common::gc_round(&mace, Duration::from_secs(30));
+        retired = gone();
+        rewritten = matches!(
+            testing::abort_clean_task_stage(&db, txid_a_abort),
+            Some(AbortCleanStage::WaitingQuiesce)
+        );
+    }
+    let mut quiesce_signal = retired;
+    if !retired && rewritten {
+        // rewrite half is durable; only the epoch grace period remains
+        // before the retire event lands
+        quiesce_signal = quiesce_rx.recv_timeout(Duration::from_secs(30)).is_ok();
+        retired = common::gc_rounds_until(&mace, 3, gone);
+    }
+    {
+        let _hooks = mace::testing::hooks_lock();
+        testing::clear_abort_clean_hook();
     }
     assert!(
-        !testing::fact_present(&db, 0, txid_a_abort),
-        "interleaved abort-clean chain must be fully walked and retired"
+        retired,
+        "interleaved abort-clean chain must be fully walked and retired; \
+         stage={:?} quiesce_signal={quiesce_signal}",
+        testing::abort_clean_task_stage(&db, txid_a_abort)
     );
-
     let view = db.view()?;
     for key in ["a1", "a2", "a3"] {
         assert!(
@@ -343,19 +365,11 @@ fn unused_logical_groups_do_not_pin_the_shared_wal_stream() -> Result<(), OpCode
         initial
     );
 
-    db.checkpoint();
+    db.checkpoint_and_wait();
 
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut recycled = false;
-    while Instant::now() < deadline {
-        mace.start_gc();
-        let ids = group_wal_file_ids(&log_root);
-        if ids.len() < initial.len() {
-            recycled = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let recycled = common::gc_rounds_until(&mace, 8, || {
+        group_wal_file_ids(&log_root).len() < initial.len()
+    });
     assert!(
         recycled,
         "unused logical groups must not pin the shared stream: {} files stayed ({:?})",
@@ -388,11 +402,9 @@ fn all_inactive_groups_recycle_unmodified_transaction_wal() -> Result<(), OpCode
         "unmodified transactions must rotate the shared wal: {initial:?}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while group_wal_file_ids(&log_root).len() >= initial.len() && Instant::now() < deadline {
-        mace.start_gc();
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    common::gc_rounds_until(&mace, 8, || {
+        group_wal_file_ids(&log_root).len() < initial.len()
+    });
     let retained = group_wal_file_ids(&log_root);
     assert!(
         retained.len() < initial.len(),
@@ -434,10 +446,11 @@ fn crash_child_empty_bucket() {
     // the checkpoint publish is asynchronous; wait until group 0's floor
     // advanced past the era start so the empty bucket is created with a
     // finite creation-time floor
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while testing::shared_checkpoint_floor(&db, 0).0 <= 1 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    db.checkpoint_and_wait();
+    assert!(
+        testing::shared_checkpoint_floor(&db, 0).0 > 1,
+        "scenario precondition: group 0 floor must advance past the era start"
+    );
     // create a bucket that is never written and never flushed: its durable
     // frontier stays at the create-time value in the manifest
     let _empty = mace
@@ -469,7 +482,7 @@ fn empty_bucket_does_not_pin_shared_stream_at_reopen() -> Result<(), OpCode> {
     reopen.checkpoint_nudge_ms = 0;
     reopen.data_file_size = 1 << 30;
     let mace = Mace::new(reopen.validate()?)?;
-    let db = mace.get_bucket("main")?;
+    let db = mace.open_bucket("main")?;
     let floor_at_open = testing::shared_checkpoint_floor(&db, 0);
     assert!(
         floor_at_open.0 > 0,

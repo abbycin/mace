@@ -376,8 +376,7 @@ fn no_g2() {
 
 // item anti-dependency cycles
 #[test]
-#[should_panic]
-fn write_skew() {
+fn write_skew_is_allowed_under_snapshot_isolation() {
     let (mut s1, mut s2, e) = prelude!(1, 2);
 
     s1.begin();
@@ -413,10 +412,15 @@ fn write_skew() {
 
     assert_eq!(r1, s1_r2);
     assert_eq!(r2, s2_r1);
-    // serializable schedule would set "1" and "2" to same value, either "10" or "20", depending on
-    // the order of s1 and s2
-    // SI can't prevent write skew, expect panic
-    assert_eq!(r1, r2);
+    // a serializable schedule would leave "1" and "2" at the same value
+    // ("10" or "20", depending on the order of s1 and s2); snapshot
+    // isolation permits the skew, so both pre-snapshot values survive and
+    // the pair ends inconsistent. pin that outcome explicitly — a bare
+    // should_panic would also accept an unrelated engine panic as "skew"
+    assert_ne!(
+        r1, r2,
+        "snapshot isolation permits write skew; the pair must end inconsistent"
+    );
 }
 
 #[test]
@@ -522,7 +526,7 @@ impl Executor {
 
     fn session(&self, worker: usize) -> Session {
         let (cond, _) = self.map.get(&worker).expect("invalid core");
-        let db = Arc::new(self.db.get_bucket("xx").unwrap());
+        let db = Arc::new(self.db.open_bucket("xx").unwrap());
         Session {
             kv: None,
             db,

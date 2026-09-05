@@ -34,7 +34,7 @@ fn intact_meta() {
 
     saved.tmp_store = true;
     let mace = Mace::new(saved.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view().unwrap();
     for (i, (k, v)) in pair.iter().enumerate() {
         if i % 2 == 0 {
@@ -68,7 +68,7 @@ fn bad_meta() {
 
     save.tmp_store = true;
     let mace = Mace::new(save.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view().unwrap();
     let x = view.get("114514").expect("not found");
     assert_eq!(x.slice(), "1919810".as_bytes());
@@ -96,7 +96,7 @@ fn crash_again() {
 
     {
         let mace = Mace::new(save.clone().validate().unwrap()).unwrap();
-        let db = mace.get_bucket("x").unwrap();
+        let db = mace.open_bucket("x").unwrap();
 
         let kv = db.begin().unwrap();
         let x = kv.get("foo").expect("not found");
@@ -111,7 +111,7 @@ fn crash_again() {
     {
         save.tmp_store = true;
         let mace = Mace::new(save.validate().unwrap()).unwrap();
-        let db = mace.get_bucket("x").unwrap();
+        let db = mace.open_bucket("x").unwrap();
 
         let view = db.view().unwrap();
         let r = view.get("foo").expect("not found");
@@ -148,7 +148,7 @@ fn recover_after_insert() {
 
     save.tmp_store = true;
     let mace = Mace::new(save.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view().unwrap();
     for (k, v) in &pairs {
         let r = view.get(k).unwrap();
@@ -197,7 +197,7 @@ fn recover_after_update() {
 
     save.tmp_store = true;
     let mace = Mace::new(save.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
 
     let view = db.view().unwrap();
     for (k, v) in &new_pairs {
@@ -236,7 +236,7 @@ fn recover_after_remove() {
 
     save.tmp_store = true;
     let mace = Mace::new(save.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view().unwrap();
     for (k, _) in &pairs {
         let r = view.get(k);
@@ -276,7 +276,7 @@ fn ckpt_wal(keys: usize, wal_len: u32) {
 
     save.tmp_store = true;
     let mace = Mace::new(save.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view().unwrap();
     for (k, v) in &data {
         let r = view.get(k).expect("not found");
@@ -340,7 +340,7 @@ fn long_txn_impl(before: bool) {
 
     save.tmp_store = true;
     let mace = Mace::new(save.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
     let view = db.view().unwrap();
     for (k, v) in &pair {
         let r = view.get(k).expect("not found");

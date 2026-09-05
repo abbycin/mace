@@ -30,6 +30,7 @@ impl SnapshotStamp {
     }
 }
 
+#[inline]
 pub(crate) fn is_visible_to(
     ctx: &Context,
     snapshot: SnapshotStamp,

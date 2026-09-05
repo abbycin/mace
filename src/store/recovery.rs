@@ -20,11 +20,13 @@ use crate::types::data::{Key, Record, Ver};
 use crate::utils::block::Block;
 use crate::utils::data::Position;
 use crate::utils::lru::Lru;
+#[cfg(feature = "metrics")]
 use crate::utils::observe::{CounterMetric, EventKind, GaugeMetric, HistogramMetric, ObserveEvent};
 use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, MutRef, NULL_CMD, NULL_ORACLE, OpCode, ROOT_PID};
 use crate::{Options, Store, static_assert};
 use crossbeam_epoch::Guard;
+#[cfg(feature = "metrics")]
 use std::time::Instant;
 
 /// there are some cases can't recover:
@@ -214,7 +216,9 @@ impl Recovery {
         wal_boot: &[GroupBoot],
         store: MutRef<Store>,
     ) -> Result<(), OpCode> {
+        #[cfg(feature = "metrics")]
         let phase2_started = Instant::now();
+        #[cfg(feature = "metrics")]
         self.opt.observer.event(ObserveEvent {
             kind: EventKind::RecoveryPhase2Begin,
             bucket_id: 0,
@@ -232,6 +236,7 @@ impl Recovery {
             }
             // redo correctness depends on rebuilding transaction outcomes and pending abort-clean chains
             // from all retained WAL files, not just latest checkpoint window
+            #[cfg(feature = "metrics")]
             let analyze_started = Instant::now();
             let cur_oracle = self.analyze(
                 boot.physical_wal_id,
@@ -241,6 +246,7 @@ impl Recovery {
                 &mut block,
                 store.clone(),
             )?;
+            #[cfg(feature = "metrics")]
             self.opt.observer.histogram(
                 HistogramMetric::RecoveryAnalyzeMicros,
                 analyze_started.elapsed().as_micros() as u64,
@@ -259,23 +265,32 @@ impl Recovery {
         self.dirty_table
             .retain(|ver, _| self.committed_txns.contains(&ver.txid));
 
+        #[cfg(feature = "metrics")]
         let recovered =
             !self.dirty_table.is_empty() || !store.context.abort_clean_tasks().is_empty();
-        self.opt.observer.gauge(
-            GaugeMetric::RecoveryDirtyEntries,
-            self.dirty_table.len() as i64,
-        );
-        self.opt.observer.gauge(GaugeMetric::RecoveryUndoEntries, 0);
-        if !self.dirty_table.is_empty() {
-            let redo_started = Instant::now();
-            let count = self.redo(&mut block, store.clone())?;
-            self.opt
-                .observer
-                .counter(CounterMetric::RecoveryRedoRecord, count);
-            self.opt.observer.histogram(
-                HistogramMetric::RecoveryRedoMicros,
-                redo_started.elapsed().as_micros() as u64,
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.gauge(
+                GaugeMetric::RecoveryDirtyEntries,
+                self.dirty_table.len() as i64,
             );
+            self.opt.observer.gauge(GaugeMetric::RecoveryUndoEntries, 0);
+        }
+        if !self.dirty_table.is_empty() {
+            #[cfg(feature = "metrics")]
+            let redo_started = Instant::now();
+            #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
+            let count = self.redo(&mut block, store.clone())?;
+            #[cfg(feature = "metrics")]
+            {
+                self.opt
+                    .observer
+                    .counter(CounterMetric::RecoveryRedoRecord, count);
+                self.opt.observer.histogram(
+                    HistogramMetric::RecoveryRedoMicros,
+                    redo_started.elapsed().as_micros() as u64,
+                );
+            }
         }
         if !store.context.abort_clean_tasks().is_empty() {
             drain_abort_clean_during_recovery(
@@ -335,17 +350,20 @@ impl Recovery {
         // runtime roots may use append positions only after recovery finishes
         debug_assert!(context.recovering());
         context.init_safe_exclusive(oracle);
-        self.opt.observer.histogram(
-            HistogramMetric::RecoveryPhase2Micros,
-            phase2_started.elapsed().as_micros() as u64,
-        );
-        self.opt.observer.event(ObserveEvent {
-            kind: EventKind::RecoveryPhase2End,
-            bucket_id: 0,
-            txid: oracle,
-            file_id: 0,
-            value: recovered as u64,
-        });
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.histogram(
+                HistogramMetric::RecoveryPhase2Micros,
+                phase2_started.elapsed().as_micros() as u64,
+            );
+            self.opt.observer.event(ObserveEvent {
+                kind: EventKind::RecoveryPhase2End,
+                bucket_id: 0,
+                txid: oracle,
+                file_id: 0,
+                value: recovered as u64,
+            });
+        }
         Ok(())
     }
 
@@ -635,6 +653,7 @@ impl Recovery {
                 // truncate the WAL if it's incomplete
                 log::trace!("truncate {path:?} from {end} to {pos}");
                 f.truncate(pos)?;
+                #[cfg(feature = "metrics")]
                 self.opt
                     .observer
                     .counter(CounterMetric::RecoveryWalTruncate, 1);
@@ -707,21 +726,31 @@ impl Recovery {
             let Some(target_tree) = target_tree else {
                 continue;
             };
+            let wal_group = c.group_id;
+            let wal_pos = pos;
 
             let apply_res = match c.sub_type() {
                 PayloadType::Insert => {
                     let i = c.put();
                     let val = Record::normal(c.group_id, i.val());
-                    target_tree.put(&g, key, val)
+                    target_tree.put(&g, key, val, wal_group, wal_pos)
                 }
                 PayloadType::Update => {
                     let u = c.update();
                     let val = Record::normal(c.group_id, u.new_val());
-                    target_tree.put(&g, key, val)
+                    target_tree.put(&g, key, val, wal_group, wal_pos)
                 }
                 PayloadType::Delete => {
                     let val = Record::remove(c.group_id);
-                    target_tree.put(&g, key, val)
+                    target_tree.put(&g, key, val, wal_group, wal_pos)
+                }
+                PayloadType::Merge => {
+                    // redo inserts the raw operand verbatim; interpretation is deferred to
+                    // read/compact paths and never requires a runtime operator here
+                    target_tree.bucket.mark_merge();
+                    let m = c.put();
+                    let val = Record::merge(c.group_id, m.val());
+                    target_tree.put(&g, key, val, wal_group, wal_pos)
                 }
             };
             apply_res?;
@@ -1080,7 +1109,16 @@ impl Recovery {
                         if !c.is_intact() {
                             break;
                         }
-                        latest = Some(c.checkpoint);
+                        // a checkpoint record whose position is Position::MAX
+                        // carries no real floor (a fresh bucket with no
+                        // committed writes seeds the logical checkpoint floor
+                        // to MAX); treating it as the latest checkpoint would
+                        // make the recovery scan start at file u64::MAX and
+                        // fail the scan_start <= latest_id gate
+                        let ckpt = { c.checkpoint };
+                        if ckpt != Position::MAX {
+                            latest = Some(ckpt);
+                        }
                     }
                     EntryType::Update => {
                         if PayloadType::try_from(block.slice::<u8>(1, 1)[0]).is_err() {
@@ -1717,5 +1755,647 @@ mod tests {
         assert!(!removable.exists());
         assert!(boundary.exists());
         assert!(other_stream.exists());
+    }
+    fn seed_merge_txn(
+        path: &std::path::Path,
+        txid: u64,
+        bucket_id: u64,
+        key: &[u8],
+        operand: &[u8],
+        terminal: EntryType,
+    ) {
+        assert!(matches!(terminal, EntryType::Commit | EntryType::Abort));
+        let mut begin = crate::cc::wal::WalBegin {
+            wal_type: EntryType::Begin,
+            txid,
+            checksum: 0,
+        };
+        begin.checksum = begin.calc_checksum();
+
+        // payload covers key + length prefix + operand
+        let payload_len = key.len() + size_of::<crate::cc::wal::WalMerge>() + operand.len();
+        let mut update = WalUpdate {
+            wal_type: EntryType::Update,
+            sub_type: PayloadType::Merge,
+            bucket_id,
+            group_id: 0,
+            size: payload_len as u32,
+            cmd_id: 0,
+            klen: key.len() as u32,
+            txid,
+            prev_id: 0,
+            prev_off: 0,
+            checksum: 0,
+        };
+        let mut record = vec![0u8; WalUpdate::size() + payload_len];
+        record[..WalUpdate::size()].copy_from_slice(update.to_slice());
+        record[WalUpdate::size()..WalUpdate::size() + key.len()].copy_from_slice(key);
+        let voff = WalUpdate::size() + key.len();
+        record[voff..voff + size_of::<u32>()]
+            .copy_from_slice(&(operand.len() as u32).to_le_bytes());
+        record[voff + size_of::<u32>()..].copy_from_slice(operand);
+        let stored = crate::cc::wal::ptr_to::<WalUpdate>(record.as_ptr());
+        update.checksum = stored.calc_checksum();
+        record[..WalUpdate::size()].copy_from_slice(update.to_slice());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(begin.to_slice());
+        out.extend_from_slice(&record);
+        if terminal == EntryType::Commit {
+            let mut commit = crate::cc::wal::WalCommit {
+                wal_type: EntryType::Commit,
+                txid,
+                checksum: 0,
+            };
+            commit.checksum = commit.calc_checksum();
+            out.extend_from_slice(commit.to_slice());
+        } else {
+            let mut abort = crate::cc::wal::WalAbort {
+                wal_type: EntryType::Abort,
+                txid,
+                checksum: 0,
+            };
+            abort.checksum = abort.calc_checksum();
+            out.extend_from_slice(abort.to_slice());
+        }
+        std::fs::write(path, out).expect("merge wal seed write must succeed");
+    }
+
+    /// appends many committed merge transactions to one wal file (test seed helper)
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    fn seed_committed_merges(path: &std::path::Path, bucket_id: u64, txns: &[(u64, &[u8], &[u8])]) {
+        let mut out = Vec::new();
+        for (txid, key, operand) in txns {
+            let mut begin = crate::cc::wal::WalBegin {
+                wal_type: EntryType::Begin,
+                txid: *txid,
+                checksum: 0,
+            };
+            begin.checksum = begin.calc_checksum();
+            out.extend_from_slice(begin.to_slice());
+
+            let payload_len = key.len() + size_of::<crate::cc::wal::WalMerge>() + operand.len();
+            let mut update = WalUpdate {
+                wal_type: EntryType::Update,
+                sub_type: PayloadType::Merge,
+                bucket_id,
+                group_id: 0,
+                size: payload_len as u32,
+                cmd_id: 0,
+                klen: key.len() as u32,
+                txid: *txid,
+                prev_id: 0,
+                prev_off: 0,
+                checksum: 0,
+            };
+            let mut record = vec![0u8; WalUpdate::size() + payload_len];
+            record[..WalUpdate::size()].copy_from_slice(update.to_slice());
+            record[WalUpdate::size()..WalUpdate::size() + key.len()].copy_from_slice(key);
+            let voff = WalUpdate::size() + key.len();
+            record[voff..voff + size_of::<u32>()]
+                .copy_from_slice(&(operand.len() as u32).to_le_bytes());
+            record[voff + size_of::<u32>()..].copy_from_slice(operand);
+            let stored = crate::cc::wal::ptr_to::<WalUpdate>(record.as_ptr());
+            update.checksum = stored.calc_checksum();
+            record[..WalUpdate::size()].copy_from_slice(update.to_slice());
+            out.extend_from_slice(&record);
+
+            let mut commit = crate::cc::wal::WalCommit {
+                wal_type: EntryType::Commit,
+                txid: *txid,
+                checksum: 0,
+            };
+            commit.checksum = commit.calc_checksum();
+            out.extend_from_slice(commit.to_slice());
+        }
+        std::fs::write(path, out).expect("batch merge wal seed must succeed");
+    }
+
+    #[test]
+    fn committed_merge_redo_replays_raw_operand_without_operator() {
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.sync_on_write = false;
+        options.concurrent_write = 1;
+        let mace = Mace::new(
+            options
+                .clone()
+                .validate()
+                .expect("initial open must validate"),
+        )
+        .expect("initial open must succeed");
+        let bucket_id = mace
+            .new_bucket("bucket", BucketOptions::default())
+            .expect("create bucket must succeed")
+            .id();
+        drop(mace);
+
+        let parsed = options
+            .clone()
+            .validate()
+            .expect("recovery options must validate");
+        seed_merge_txn(
+            &parsed.wal_file(0, 0),
+            1_000_001,
+            bucket_id,
+            b"mk",
+            b"+7",
+            EntryType::Commit,
+        );
+
+        let reopened = Mace::new(parsed).expect("reopen must succeed");
+        let db = reopened.open_bucket("bucket").expect("bucket must exist");
+        // user-visible read reports Invalid: phase a has no fold resolver, and the
+        // head is a merge operand, not a plain value
+        let view = db.view().expect("view must open");
+        assert!(matches!(view.get("mk"), Err(OpCode::Invalid)));
+        drop(view);
+
+        // physical proof: the redo inserted the raw merge-tagged operand verbatim
+        let g = crossbeam_epoch::pin();
+        let key = crate::types::data::Key::new(
+            "mk".as_bytes(),
+            crate::types::data::Ver::new(u64::MAX, u32::MAX),
+        );
+        let (k, val) = db.tree.get(&g, key).expect("replayed key must exist");
+        assert_eq!(k.txid, 1_000_001);
+        assert!(val.is_merge());
+        assert_eq!(val.slice(), b"+7");
+        assert_eq!(val.group_id(), 0);
+    }
+
+    #[test]
+    fn reopen_after_abort_only_wal_activity_with_max_checkpoint_floor() {
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        // durable mode (shared stream): the fresh bucket's frontier seeds the
+        // shared logical checkpoint floor; with no committed writes the floor
+        // stays Position::MAX and the checkpoint record carries it
+        options.sync_on_write = true;
+        options.concurrent_write = 1;
+        options.data_file_size = 32 << 10;
+        options.wal_file_size = 16 << 10;
+        options.max_ckpt_per_txn = 64;
+        let mace = Mace::new(
+            options
+                .clone()
+                .validate()
+                .expect("initial open must validate"),
+        )
+        .expect("initial open must succeed");
+        let db = mace
+            .new_bucket("bucket", BucketOptions::default())
+            .expect("create bucket must succeed");
+
+        // the only WAL activity is an unmodified abort (Begin + Abort records)
+        let kv = db.begin().expect("begin txn");
+        match kv.del("k") {
+            Ok(_) => panic!("del of an absent key must report NotFound"),
+            Err(OpCode::NotFound) => {}
+            Err(e) => panic!("del failed: {e:?}"),
+        }
+        drop(kv);
+
+        db.checkpoint();
+        drop(db);
+        drop(mace);
+
+        let reopened = Mace::new(options.clone().validate().expect("reopen options"))
+            .expect("reopen must succeed");
+        let db = reopened
+            .open_bucket("bucket")
+            .expect("bucket must exist after reopen");
+        let view = db.view().expect("view must open");
+        let mut iter = view.seek("k");
+        assert!(iter.next().is_none(), "no committed writes means no keys");
+    }
+
+    #[test]
+    fn aborted_merge_redo_stays_invisible_before_abort_clean() {
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.sync_on_write = false;
+        options.concurrent_write = 1;
+        let mace = Mace::new(
+            options
+                .clone()
+                .validate()
+                .expect("initial open must validate"),
+        )
+        .expect("initial open must succeed");
+        let bucket_id = mace
+            .new_bucket("bucket", BucketOptions::default())
+            .expect("create bucket must succeed")
+            .id();
+        drop(mace);
+
+        let parsed = options
+            .clone()
+            .validate()
+            .expect("recovery options must validate");
+        seed_merge_txn(
+            &parsed.wal_file(0, 0),
+            1_000_002,
+            bucket_id,
+            b"mk",
+            b"+9",
+            EntryType::Abort,
+        );
+
+        let reopened = Mace::new(parsed).expect("reopen must succeed");
+        let db = reopened.open_bucket("bucket").expect("bucket must exist");
+        let view = db.view().expect("view must open");
+        // NotFound (not Invalid): the aborted operand was never surfaced as a visible head
+        assert!(matches!(view.get("mk"), Err(OpCode::NotFound)));
+    }
+
+    #[test]
+    fn malformed_merge_wal_is_rejected_as_corruption() {
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.sync_on_write = false;
+        options.concurrent_write = 1;
+        options.truncate_corrupted_wal = false;
+        let mace = Mace::new(
+            options
+                .clone()
+                .validate()
+                .expect("initial open must validate"),
+        )
+        .expect("initial open must succeed");
+        let bucket_id = mace
+            .new_bucket("bucket", BucketOptions::default())
+            .expect("create bucket must succeed")
+            .id();
+        drop(mace);
+
+        let parsed = options
+            .clone()
+            .validate()
+            .expect("recovery options must validate");
+        let path = parsed.wal_file(0, 0);
+        // empty merge operand fails payload validation
+        seed_merge_txn(&path, 5, bucket_id, b"mk", b"", EntryType::Commit);
+        let err = match Mace::new(parsed) {
+            Ok(_) => panic!("empty operand must be corruption"),
+            Err(e) => e,
+        };
+        assert_eq!(err, OpCode::Corruption);
+    }
+
+    #[cfg(feature = "metrics")]
+    fn counter_of(
+        snap: &crate::utils::observe::ObserveSnapshot,
+        m: crate::utils::observe::CounterMetric,
+    ) -> u64 {
+        snap.counters
+            .iter()
+            .find(|(k, _)| *k == m)
+            .map(|(_, v)| *v)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn redo_never_splits_or_consolidates_until_recovery_completes() {
+        use crate::utils::observe::{CounterMetric, InMemoryObserver};
+        use std::sync::Arc;
+
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.sync_on_write = false;
+        options.concurrent_write = 1;
+        let observer = Arc::new(InMemoryObserver::new(16));
+        options.observer = observer.clone();
+
+        let mace = Mace::new(options.clone().validate().expect("initial open")).expect("open");
+        let bucket_id = mace
+            .new_bucket(
+                "b",
+                BucketOptions {
+                    split_elems: 64,
+                    consolidate_threshold: 16,
+                    ..BucketOptions::default()
+                },
+            )
+            .expect("create bucket")
+            .id();
+        // a compact single-leaf baseline well under the split bound
+        let db = mace.open_bucket("b").expect("bucket must exist");
+        let kv = db.begin().expect("begin");
+        for i in 0..30 {
+            kv.put(format!("k{i:04}"), vec![b'v'; 8]).unwrap();
+        }
+        kv.commit().unwrap();
+        db.checkpoint_and_wait();
+        // baseline after all pre-recovery activity so the assertions below measure
+        // strictly what happens during the recovery reopen
+        let baseline = observer.snapshot();
+        drop(mace);
+
+        // redo payload big enough to exceed both thresholds on that leaf
+        let parsed = options.clone().validate().expect("recovery options");
+        let mut txns: Vec<(u64, &[u8], &[u8])> = Vec::new();
+        for i in 0..40u64 {
+            txns.push((1_000_000 + i, b"hot", b"+1"));
+        }
+        seed_committed_merges(&parsed.wal_file(0, 0), bucket_id, &txns);
+
+        let reopened = Mace::new(parsed).expect("reopen must succeed");
+        let counters = observer.snapshot();
+        let splits = counter_of(&counters, CounterMetric::TreeNodeSplit)
+            - counter_of(&baseline, CounterMetric::TreeNodeSplit);
+        let consolidates = counter_of(&counters, CounterMetric::TreeNodeConsolidate)
+            - counter_of(&baseline, CounterMetric::TreeNodeConsolidate);
+        assert_eq!(splits, 0, "recovery must not split pages");
+        assert_eq!(
+            consolidates, 0,
+            "recovery must not consolidate delta chains"
+        );
+
+        // data written by redo is reachable
+        let db = reopened.open_bucket("b").unwrap();
+        let view = db.view().unwrap();
+        assert!(view.get("k0000").is_ok());
+        drop(view);
+
+        // structural maintenance resumes only after recovery completes
+        let kv = db.begin().unwrap();
+        for i in 0..80 {
+            kv.put(format!("z{i:04}"), vec![b'w'; 8]).unwrap();
+        }
+        kv.commit().unwrap();
+        let db2 = reopened.open_bucket("b").unwrap();
+        db2.checkpoint_and_wait();
+        let counters = observer.snapshot();
+        let resumed = (counter_of(&counters, CounterMetric::TreeNodeSplit)
+            - counter_of(&baseline, CounterMetric::TreeNodeSplit))
+            + (counter_of(&counters, CounterMetric::TreeNodeConsolidate)
+                - counter_of(&baseline, CounterMetric::TreeNodeConsolidate));
+        assert!(
+            resumed > 0,
+            "structural maintenance must resume post-recovery"
+        );
+    }
+
+    #[derive(Default)]
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    struct TestAddOp;
+
+    impl crate::MergeOperator for TestAddOp {
+        fn combine_operands(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Vec<u8> {
+            let decode = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
+            (decode(left) + decode(right)).to_le_bytes().to_vec()
+        }
+
+        fn apply(&self, _key: &[u8], base: Option<&[u8]>, operand: &[u8]) -> Option<Vec<u8>> {
+            let decode = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
+            let o = decode(operand);
+            let v = match base {
+                None => o,
+                Some(b) => decode(b) + o,
+            };
+            Some(v.to_le_bytes().to_vec())
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn raw_preserving_maintenance_keeps_merge_chain_readable() {
+        use crate::utils::observe::{CounterMetric, InMemoryObserver};
+        use std::sync::Arc;
+
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.sync_on_write = false;
+        options.concurrent_write = 1;
+        let observer = Arc::new(InMemoryObserver::new(16));
+        options.observer = observer.clone();
+
+        // operator-less first open: recovery must not interpret operands
+        let mace = Mace::new(options.clone().validate().expect("initial open")).expect("open");
+        let bucket_id = mace
+            .new_bucket(
+                "b",
+                BucketOptions {
+                    split_elems: 64,
+                    consolidate_threshold: 16,
+                    ..BucketOptions::default()
+                },
+            )
+            .expect("create bucket")
+            .id();
+        drop(mace);
+
+        // committed four-version chain on "c050": operands 8,4,2,1 fold to 15.
+        // the key lives inside the c-series so every maintained leaf carries a real
+        // common prefix (prefix_len > 0), exercising the prescan suffix handling
+        let parsed = options.clone().validate().expect("recovery options");
+        let merge_key: Vec<u8> = b"c050".to_vec();
+        let operands: Vec<[u8; 8]> = vec![
+            8u64.to_le_bytes(),
+            4u64.to_le_bytes(),
+            2u64.to_le_bytes(),
+            1u64.to_le_bytes(),
+        ];
+        let mut txns: Vec<(u64, &[u8], &[u8])> = Vec::new();
+        for (i, operand) in operands.iter().enumerate() {
+            txns.push((100 + i as u64, &merge_key, operand.as_slice()));
+        }
+        seed_committed_merges(&parsed.wal_file(0, 0), bucket_id, &txns);
+        let reopened = Mace::new(parsed).expect("reopen must succeed");
+
+        // load without an operator first: folding remains unavailable for this context
+        let db = reopened.open_bucket("b").unwrap();
+        db.checkpoint_and_wait(); // settle redo tail before asserting
+        // without an operator the chain cannot be interpreted: reads surface Invalid
+        assert!(matches!(
+            db.view().unwrap().get(&merge_key),
+            Err(OpCode::Invalid)
+        ));
+
+        // maintenance may run before the runtime merge operator is registered;
+        // this path must preserve the complete merge chain verbatim
+        let before_operator_maintenance = observer.snapshot();
+        let kv = db.begin().unwrap();
+        for i in 0..100 {
+            if i == 50 {
+                continue;
+            }
+            kv.put(format!("c{i:03}"), vec![b'x'; 8]).unwrap();
+        }
+        kv.commit().unwrap();
+        db.checkpoint_and_wait();
+        let after_operatorless_maintenance = observer.snapshot();
+        assert!(
+            counter_of(
+                &after_operatorless_maintenance,
+                CounterMetric::TreeNodeConsolidate
+            ) > counter_of(
+                &before_operator_maintenance,
+                CounterMetric::TreeNodeConsolidate
+            ),
+            "operator-less maintenance must consolidate the recovered leaf"
+        );
+
+        let mut with_op = BucketOptions {
+            split_elems: 64,
+            consolidate_threshold: 16,
+            ..BucketOptions::default()
+        };
+        with_op.merge_operator = Some(Arc::new(TestAddOp));
+        assert!(matches!(
+            reopened.open_bucket_with_options("b", with_op.clone()),
+            Err(OpCode::Invalid)
+        ));
+        drop(db);
+        reopened.drop_bucket("b").unwrap();
+        let db = reopened.open_bucket_with_options("b", with_op).unwrap();
+
+        let folded = |db: &crate::store::store::Bucket| -> u64 {
+            let v = db.view().unwrap().get(&merge_key).unwrap();
+            u64::from_le_bytes(v.slice().try_into().unwrap())
+        };
+        assert_eq!(folded(&db), 15, "chain must fold to the design value");
+
+        // long-lived view pins the snapshot across maintenance
+        let view_old = db.view().unwrap();
+
+        // phase 1: force another threshold consolidation after reloading with an operator
+        let baseline = observer.snapshot();
+        let kv = db.begin().unwrap();
+        for i in 0..100 {
+            kv.put(format!("d{i:03}"), vec![b'x'; 8]).unwrap();
+        }
+        kv.commit().unwrap();
+
+        let counters = observer.snapshot();
+        let consolidates = counter_of(&counters, CounterMetric::TreeNodeConsolidate)
+            - counter_of(&baseline, CounterMetric::TreeNodeConsolidate);
+        assert_eq!(folded(&db), 15, "chain survives consolidation");
+        assert_eq!(
+            view_old.get(&merge_key).unwrap().slice(),
+            15u64.to_le_bytes()
+        );
+
+        // phase 2: same-prefix writes force a second consolidation on a page that
+        // already carries prefix_len > 0 — the state where double prefix-stripping
+        // in the prescan would corrupt the exempt set
+        let kv = db.begin().unwrap();
+        for i in 0..100 {
+            kv.put(format!("e{i:03}"), vec![b'y'; 8]).unwrap();
+        }
+        kv.commit().unwrap();
+
+        let counters = observer.snapshot();
+        let splits = counter_of(&counters, CounterMetric::TreeNodeSplit)
+            - counter_of(&baseline, CounterMetric::TreeNodeSplit);
+        assert!(splits + consolidates > 0, "maintenance must have run");
+        assert_eq!(folded(&db), 15, "chain survives split");
+        assert_eq!(
+            view_old.get(&merge_key).unwrap().slice(),
+            15u64.to_le_bytes()
+        );
+
+        // every written key is still reachable across the maintained leaves
+        let view = db.view().unwrap();
+        for i in 0..20 {
+            assert!(view.get(format!("c{i:03}")).is_ok());
+        }
+        for i in 0..100 {
+            if i == 50 {
+                continue;
+            }
+            assert!(view.get(format!("c{i:03}")).is_ok());
+        }
+        for i in 0..100 {
+            assert!(view.get(format!("d{i:03}")).is_ok());
+        }
+        for i in 0..100 {
+            assert!(view.get(format!("e{i:03}")).is_ok());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn prefixed_leaf_raw_preserving_survives_consolidation() {
+        use crate::utils::observe::{CounterMetric, InMemoryObserver};
+        use std::sync::Arc;
+
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.sync_on_write = false;
+        options.concurrent_write = 1;
+        let observer = Arc::new(InMemoryObserver::new(16));
+        options.observer = observer.clone();
+
+        // every key shares the "user_" prefix so any leaf holding them carries
+        // prefix_len > 0 after compression — exactly the shape where double
+        // prefix-stripping in the prescan breaks raw preservation
+        let mace = Mace::new(options.clone().validate().expect("initial open")).expect("open");
+        let bucket_id = mace
+            .new_bucket(
+                "p",
+                BucketOptions {
+                    consolidate_threshold: 16,
+                    ..BucketOptions::default()
+                },
+            )
+            .expect("create bucket")
+            .id();
+        drop(mace);
+
+        let parsed = options.clone().validate().expect("recovery options");
+        // one key, four committed operands (8,4,2,1 -> fold 15): versions three and
+        // four land below the safe boundary where unguarded trimming would drop them
+        let chain_key = b"user_0007".to_vec();
+        let operands: Vec<[u8; 8]> = vec![
+            8u64.to_le_bytes(),
+            4u64.to_le_bytes(),
+            2u64.to_le_bytes(),
+            1u64.to_le_bytes(),
+        ];
+        let mut txns: Vec<(u64, &[u8], &[u8])> = Vec::new();
+        for (i, operand) in operands.iter().enumerate() {
+            txns.push((100 + i as u64, &chain_key, operand));
+        }
+        seed_committed_merges(&parsed.wal_file(0, 0), bucket_id, &txns);
+        let reopened = Mace::new(parsed).expect("reopen must succeed");
+
+        let db = reopened.open_bucket("p").unwrap();
+        db.checkpoint_and_wait();
+
+        let with_op = BucketOptions {
+            merge_operator: Some(Arc::new(TestAddOp)),
+            ..BucketOptions::default()
+        };
+        drop(db);
+        reopened.drop_bucket("p").unwrap();
+        let db = reopened.open_bucket_with_options("p", with_op).unwrap();
+
+        let folded = |db: &crate::store::store::Bucket, key: &str| -> u64 {
+            let v = db.view().unwrap().get(key).unwrap();
+            u64::from_le_bytes(v.slice().try_into().unwrap())
+        };
+
+        let baseline = observer.snapshot();
+        let kv = db.begin().unwrap();
+        // writes overlap the chain-key range so the consolidated leaf is the one
+        // holding the merge rows — the exact page whose prescan must exempt them
+        for i in 0..56u64 {
+            kv.put(format!("user_{:04}", 9 + i), vec![b'z'; 8]).unwrap();
+        }
+        kv.commit().unwrap();
+
+        let counters = observer.snapshot();
+        let consolidates = counter_of(&counters, CounterMetric::TreeNodeConsolidate)
+            - counter_of(&baseline, CounterMetric::TreeNodeConsolidate);
+        assert!(consolidates > 0, "consolidation must have run");
+
+        assert_eq!(
+            folded(&db, std::str::from_utf8(&chain_key).unwrap()),
+            15,
+            "the full four-operand chain on a prefixed leaf must survive consolidation"
+        );
     }
 }

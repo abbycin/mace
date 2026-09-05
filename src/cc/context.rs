@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::OpCode;
 use crate::utils::data::Position;
+use crate::utils::instance_local::LocalSlot;
+#[cfg(feature = "metrics")]
 use crate::utils::observe::{
     HistogramMetric, LATENCY_SAMPLE_SHIFT, observe_elapsed, sampled_instant,
 };
@@ -16,10 +18,10 @@ use crate::utils::seqlock::SeqLock;
 use crate::utils::{CachePad, Handle, NULL_ORACLE};
 
 use super::group::{RegistrationTs, TxnFact, WriterGroup};
-use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
+use std::sync::{Arc, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -76,6 +78,7 @@ fn two_choices(ticket: usize, nr: usize) -> (usize, usize) {
     // advance the offset after each full home round so every home visits every other choice
     let round = ticket / nr;
     let offset = 1 + round % (nr - 1);
+
     let second = home + offset;
     (home, if second >= nr { second - nr } else { second })
 }
@@ -197,7 +200,7 @@ impl Context {
             }
         }
 
-        let pool = Arc::new(CCPool::new());
+        let pool = CCPool::new();
         let groups = Arc::new(groups);
         let safe_exclusive = Arc::new(AtomicU64::new(sequences.oracle.load(Acquire)));
         let (tx, rx) = channel();
@@ -268,6 +271,10 @@ impl Context {
         self.pool.free(pin);
     }
 
+    /// test-determinism wakeup (extra_check): nudges the collector so a test
+    /// can drive safe_exclusive advancement synchronously instead of waiting
+    /// for the background duty-cycle. production keeps the pure polling
+    /// cadence — delayed reclamation is a designed tradeoff, not a leak.
     #[cfg(feature = "extra_check")]
     pub(crate) fn request_collect(&self) {
         let _ = self.tx.send(CollectorSignal::Wake);
@@ -340,6 +347,7 @@ impl Context {
         self.safe_exclusive.load(Acquire)
     }
 
+    #[inline(always)]
     pub(crate) fn recovering(&self) -> bool {
         self.recovering.load(Acquire)
     }
@@ -592,16 +600,20 @@ impl Context {
 
     /// lock a logical group's WAL logger
     #[inline]
+    #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
     pub(crate) fn lock_wal_logging(&self, gid: usize, seed: u64) -> MutexGuard<'_, Logging> {
         let logging = &self.groups[gid].logging;
         if self.opt.sync_on_write {
-            let started = sampled_instant(seed, LATENCY_SAMPLE_SHIFT);
             let guard = logging.lock();
-            observe_elapsed(
-                self.opt.observer.as_ref(),
-                HistogramMetric::WalLockWaitMicros,
-                started,
-            );
+            #[cfg(feature = "metrics")]
+            {
+                let started = sampled_instant(seed, LATENCY_SAMPLE_SHIFT);
+                observe_elapsed(
+                    self.opt.observer.as_ref(),
+                    HistogramMetric::WalLockWaitMicros,
+                    started,
+                );
+            }
             guard
         } else {
             logging.lock()
@@ -609,17 +621,21 @@ impl Context {
     }
 
     #[inline]
+    #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
     pub(crate) fn lock_shared_logging(&self, seed: u64) -> MutexGuard<'_, Logging> {
         let shared = self
             .shared_logging()
             .expect("durable mode must construct the shared logging");
-        let started = sampled_instant(seed, LATENCY_SAMPLE_SHIFT);
         let guard = shared.lock();
-        observe_elapsed(
-            self.opt.observer.as_ref(),
-            HistogramMetric::WalLockWaitMicros,
-            started,
-        );
+        #[cfg(feature = "metrics")]
+        {
+            let started = sampled_instant(seed, LATENCY_SAMPLE_SHIFT);
+            observe_elapsed(
+                self.opt.observer.as_ref(),
+                HistogramMetric::WalLockWaitMicros,
+                started,
+            );
+        }
         guard
     }
 
@@ -628,6 +644,7 @@ impl Context {
         if ticket.is_completed() {
             return Ok(());
         }
+        #[cfg(feature = "metrics")]
         let wait_started = sampled_instant(
             ticket.target().file_id ^ ticket.target().offset,
             LATENCY_SAMPLE_SHIFT,
@@ -646,6 +663,7 @@ impl Context {
         } else {
             ticket.wait();
         }
+        #[cfg(feature = "metrics")]
         observe_elapsed(
             self.opt.observer.as_ref(),
             HistogramMetric::WalGenerationWaitMicros,
@@ -693,6 +711,10 @@ fn collect_thread(
     safe_exclusive: Arc<AtomicU64>,
     pool: Arc<CCPool>,
 ) -> JoinHandle<()> {
+    // one collector per mace instance; the token distinguishes this
+    // instance's collector from every other instance's in the process
+    #[cfg(feature = "extra_check")]
+    let collector_token = Arc::as_ptr(&sequences) as usize;
     std::thread::Builder::new()
         .name("collector".into())
         .spawn(move || {
@@ -709,6 +731,8 @@ fn collect_thread(
                     &pool,
                     &mut committed,
                     &mut registry_nodes,
+                    #[cfg(feature = "extra_check")]
+                    collector_token,
                 );
                 idle_delay = collector_idle_delay(cost);
                 if drain_pending_wakes(&reader) {
@@ -731,6 +755,7 @@ fn run_collect_cycle(
     pool: &CCPool,
     committed: &mut Vec<(usize, u64, u64)>,
     registry_nodes: &mut Vec<*mut CCNode>,
+    #[cfg(feature = "extra_check")] collector_token: usize,
 ) -> Duration {
     let proof_scan_started = Instant::now();
     // `SeqCst` linearizes this cut with writer/view registration and timestamp sampling (`oracle`,
@@ -820,6 +845,8 @@ fn run_collect_cycle(
         );
         prune_committed_facts(groups, committed, published_safe, deadline);
     }
+    #[cfg(feature = "extra_check")]
+    crate::testing::fire_collector_completed(collector_token);
     if Instant::now() < deadline {
         pool.maybe_shrink_until(deadline);
     }
@@ -949,30 +976,89 @@ impl CCNode {
     }
 }
 
+/// bound on idle pins a thread keeps out of the shared shards: enough to
+/// absorb short-view churn reuse, small enough that thread exits strand at
+/// most this many nodes for the pool-drop registry reclaim
+const LOCAL_PINS_MAX: usize = 2;
+
+/// per-thread idle-pin cache for one CCPool. holds only non-owning Handle
+/// copies of nodes that are Idle and still owned by the core registry. the
+/// Weak back-reference lets the drop return them to their shard while the
+/// pool is still alive.
+struct LocalPins {
+    nodes: Vec<Handle<CCNode>>,
+    core: Weak<CCPool>,
+}
+
+impl LocalPins {
+    fn new(core: Weak<CCPool>) -> Self {
+        Self {
+            nodes: Vec::with_capacity(LOCAL_PINS_MAX),
+            core,
+        }
+    }
+}
+
+impl Drop for LocalPins {
+    fn drop(&mut self) {
+        // runs OUTSIDE the registry threads lock on both teardown paths
+        // (ThreadTable::drop drops entries after releasing the lock;
+        // LocalSlot::drain drops retired values outside its lock scope), so
+        // dropping an upgraded Arc here cannot re-enter the threads lock
+        let Some(core) = self.core.upgrade() else {
+            // pool core is already dropping: nodes stay registered and
+            // CCPool::drop's registry walk reclaims them exactly once
+            return;
+        };
+        for node in self.nodes.drain(..) {
+            core.push_shard(node.shard_index, node);
+        }
+        // dropping `core` may run CCPool::drop if this was the last strong
+        // reference; safe because we hold no registry lock here
+    }
+}
+
 struct CCPool {
     shards: [Mutex<Vec<Handle<CCNode>>>; CCPOOL_SHARD],
     shard_index: CachePad<AtomicUsize>,
     // TODO: maybe change to seqlock ?
     registry: RwLock<Vec<Handle<CCNode>>>,
     registry_len: CachePad<AtomicUsize>,
+    /// per-thread idle-pin cache: each thread keeps up to LOCAL_PINS_MAX
+    /// idle nodes out of the shard mutexes
+    pins: LocalSlot<LocalPins>,
+    /// weak handle to this pool, so a LocalPins drop on thread exit can reach
+    /// the shards only while the pool is alive (armed once at construction)
+    self_weak: OnceLock<Weak<CCPool>>,
 }
 
 impl CCPool {
-    fn new() -> Self {
-        let mut registry = Vec::with_capacity(CCPOOL_SHARD);
-        let mut shards = std::array::from_fn(|_| Mutex::new(Vec::new()));
-        for shard in shards.iter_mut() {
-            let mut h = Handle::new(CCNode::new());
-            h.registry_index = registry.len();
-            registry.push(h);
-            shard.get_mut().push(h);
-        }
-        Self {
-            shards,
+    /// builds the pool behind an Arc: the self weak back-reference used by the
+    /// thread-exit idle-pin return is armed right after allocation
+    fn new() -> Arc<Self> {
+        let pool = Arc::new(Self {
+            shards: std::array::from_fn(|_| Mutex::new(Vec::new())),
             shard_index: CachePad::default(),
-            registry: RwLock::new(registry),
-            registry_len: CachePad::from(AtomicUsize::new(CCPOOL_SHARD)),
+            registry: RwLock::new(Vec::new()),
+            registry_len: CachePad::from(AtomicUsize::new(0)),
+            pins: LocalSlot::new(),
+            self_weak: OnceLock::new(),
+        });
+        // prime the initial shard population (one node per shard)
+        {
+            let mut registry = pool.registry.write();
+            for shard in pool.shards.iter() {
+                let mut h = Handle::new(CCNode::new());
+                h.registry_index = registry.len();
+                registry.push(h);
+                shard.lock().push(h);
+            }
+            pool.registry_len.store(registry.len(), Release);
         }
+        pool.self_weak
+            .set(Arc::downgrade(&pool))
+            .expect("self weak armed once");
+        pool
     }
 
     fn next_ticket(&self) -> usize {
@@ -990,6 +1076,9 @@ impl CCPool {
     }
 
     fn alloc(&self) -> Handle<CCNode> {
+        if let Some(pin) = self.pop_local_pin() {
+            return pin;
+        }
         let ticket = self.next_ticket();
         let (shard, second) = two_choices(ticket, CCPOOL_SHARD);
 
@@ -1009,7 +1098,38 @@ impl CCPool {
     }
 
     fn free(&self, cc: Handle<CCNode>) {
+        if self.cache_local_pin(cc) {
+            return;
+        }
         self.push_shard(cc.shard_index, cc);
+    }
+
+    /// pop one idle node from this thread's local cache, if it has one
+    fn pop_local_pin(&self) -> Option<Handle<CCNode>> {
+        self.pins.with(
+            || LocalPins::new(self.self_weak.get().cloned().expect("pool self weak armed")),
+            |local| local.nodes.pop(),
+        )
+    }
+
+    /// cache an idle node on this thread (up to LOCAL_PINS_MAX); returns true
+    /// when cached, false when the local list is full and the caller must
+    /// spill it to the shared shard
+    fn cache_local_pin(&self, cc: Handle<CCNode>) -> bool {
+        let spill = self.pins.with(
+            // init must NOT push: with() runs f on the init-created value too,
+            // so a push here would insert the node twice into one list
+            || LocalPins::new(self.self_weak.get().cloned().expect("pool self weak armed")),
+            |local| {
+                if local.nodes.len() < LOCAL_PINS_MAX {
+                    local.nodes.push(cc);
+                    None
+                } else {
+                    Some(cc)
+                }
+            },
+        );
+        spill.is_none()
     }
 
     fn maybe_shrink_one(&self, start: usize, guard: &Guard) -> bool {
@@ -1075,6 +1195,10 @@ impl CCPool {
 
 impl Drop for CCPool {
     fn drop(&mut self) {
+        // last Arc drop is the quiescent point: remove every thread's LocalPins
+        // cell before reclaiming registry allocations, so no thread-exit drop
+        // can observe a half-torn pool (idempotent: slot Drop after this no-ops)
+        self.pins.drain();
         let mut r = self.registry.write();
         while let Some(x) = r.pop() {
             x.reclaim();
@@ -1089,6 +1213,7 @@ mod tests {
         DUTY_CYCLE_SLEEP_MULTIPLIER, collector_idle_delay, drain_pending_wakes, two_choices,
     };
     use crate::cc::context::ViewState;
+    #[cfg(feature = "metrics")]
     use crate::utils::observe::InMemoryObserver;
     use crate::{Options, RandomPath, meta::Sequences};
     use std::sync::Arc;
@@ -1097,18 +1222,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn new_context_with_groups(groups: u8) -> (RandomPath, Context) {
-        let observer = Arc::new(InMemoryObserver::default());
-        new_context_with_groups_and_observer(groups, observer)
-    }
-
-    fn new_context_with_groups_and_observer(
-        groups: u8,
-        observer: Arc<InMemoryObserver>,
-    ) -> (RandomPath, Context) {
         let root = RandomPath::tmp();
         let mut opt = Options::new(&*root);
         opt.concurrent_write = groups;
-        opt.observer = observer;
+        #[cfg(feature = "metrics")]
+        {
+            opt.observer = Arc::new(InMemoryObserver::default());
+        }
         let ctx = Context::new(
             Arc::new(opt.validate().expect("context options must validate")),
             Arc::new(Sequences::default()),
@@ -1160,6 +1280,167 @@ mod tests {
         assert_eq!(h2.start_ts(), 11);
         h2.clear_idle();
         pool.free(h2);
+    }
+
+    #[test]
+    fn ccpool_local_path_reuses_same_node_on_same_thread() {
+        let _alloc = crate::utils::instance_local::alloc_test_guard();
+        let pool = CCPool::new();
+        let h = pool.alloc();
+        let inner = h.inner();
+        h.begin_reg();
+        h.activate(10);
+        h.clear_idle();
+        pool.free(h); // enters this thread's local cache
+
+        // the instance-local path must hand the just-freed node back without
+        // touching a shard; the legacy path could return a different node
+        let h2 = pool.alloc();
+        assert_eq!(h2.inner(), inner, "local cache must reuse the freed node");
+        h2.clear_idle();
+        pool.free(h2);
+        drop(pool);
+    }
+
+    #[test]
+    fn ccpool_local_alloc_free_keeps_registry_bounded() {
+        let _alloc = crate::utils::instance_local::alloc_test_guard();
+        let pool = CCPool::new();
+        let base_len = pool.registry_len.load(Relaxed);
+        for i in 0..64u64 {
+            let h = pool.alloc();
+            h.begin_reg();
+            h.activate(i + 1);
+            h.clear_idle();
+            pool.free(h);
+        }
+        // steady alloc/free on one thread never grows the registry: nodes cycle
+        // through the local cache and spill back to shards
+        assert_eq!(pool.registry_len.load(Relaxed), base_len);
+        drop(pool);
+    }
+
+    #[test]
+    fn ccpool_thread_exit_returns_local_pins_to_shard() {
+        let _alloc = crate::utils::instance_local::alloc_test_guard();
+        let pool = CCPool::new();
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, usize)>();
+        let worker_pool = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let h = worker_pool.alloc();
+            h.begin_reg();
+            h.activate(1);
+            h.clear_idle();
+            let shard = h.shard_index;
+            let inner = h.inner() as usize;
+            worker_pool.free(h); // enters the worker thread's local cache
+            tx.send((inner, shard)).expect("parent is waiting");
+            // worker exits: the exit hook must push the cached node back to its shard
+        })
+        .join()
+        .expect("worker completed");
+
+        let (inner, shard) = rx.recv().expect("worker result");
+        let back = pool.shards[shard]
+            .lock()
+            .iter()
+            .any(|n| n.inner() as usize == inner);
+        assert!(
+            back,
+            "exit hook must return the idle node to its original shard"
+        );
+    }
+
+    #[test]
+    fn ccpool_local_never_hands_one_node_to_two_live_views() {
+        // regression for the init-path double-push: the duplicate could enter
+        // the local list only when cache_local_pin's init closure runs, i.e. on
+        // a thread whose FIRST slot operation is a free. so a fresh worker
+        // frees a node (init path), then allocates twice and keeps both live
+        let _alloc = crate::utils::instance_local::alloc_test_guard();
+        let pool = CCPool::new();
+        for round in 0..3u64 {
+            let h = pool.alloc();
+            h.begin_reg();
+            h.activate(round * 3 + 1);
+            h.clear_idle();
+            let worker_pool = Arc::clone(&pool);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                // first slot op on this thread is a free: exercises the init path
+                worker_pool.free(h);
+                let a = worker_pool.alloc();
+                a.begin_reg();
+                a.activate(round * 3 + 2);
+                let b = worker_pool.alloc();
+                b.begin_reg();
+                b.activate(round * 3 + 3);
+                assert_ne!(
+                    a.inner() as usize,
+                    b.inner() as usize,
+                    "two live views must hold distinct CCNodes (round {round})"
+                );
+                a.clear_idle();
+                b.clear_idle();
+                worker_pool.free(a);
+                worker_pool.free(b);
+                done_tx.send(()).expect("parent is waiting");
+            });
+            done_rx.recv().expect("worker finished");
+            worker.join().expect("worker completed");
+        }
+        drop(pool);
+    }
+
+    #[test]
+    fn ccpool_local_pool_drop_concurrent_with_live_foreign_cell_does_not_deadlock() {
+        // ordering smoke test: the shard return must never run CCPool::drop while
+        // holding the registry threads lock. here a worker holds a LocalPins cell
+        // (node cached) while the last external Arc is dropped on the main
+        // thread; CCPool::drop drains the foreign cell (upgrade-failure branch)
+        // and the worker then exits with its cell already gone. the structural
+        // guarantee (LocalPins::drop runs only at drop(retired)/drop(entries),
+        // both outside the lock) is verified by the review; this test pins the
+        // drain-foreign-cell ordering and post-drop thread exit end to end
+        let _alloc = crate::utils::instance_local::alloc_test_guard();
+        let pool = CCPool::new();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_pool = Arc::clone(&pool);
+        let worker = std::thread::spawn(move || {
+            let h = worker_pool.alloc();
+            h.begin_reg();
+            h.activate(1);
+            h.clear_idle();
+            worker_pool.free(h); // cached in the worker's LocalPins
+            drop(worker_pool); // worker still holds its cell; only main ref left
+            ready_tx.send(()).expect("parent is waiting");
+            release_rx.recv().expect("parent releases worker");
+        });
+
+        ready_rx.recv().expect("worker cached a pin");
+        drop(pool); // last external Arc; CCPool::drop drains the worker's cell
+        release_tx.send(()).expect("worker is alive");
+        worker.join().expect("worker completed");
+    }
+
+    #[test]
+    fn ccpool_local_pins_drop_with_pool_reclaims_once() {
+        let _alloc = crate::utils::instance_local::alloc_test_guard();
+        // worker allocates and frees (node cached in worker local), exits (hook
+        // returns it); then the pool drops and reclaims the registry exactly once
+        let pool = CCPool::new();
+        let worker_pool = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let h = worker_pool.alloc();
+            h.begin_reg();
+            h.activate(1);
+            h.clear_idle();
+            worker_pool.free(h);
+        })
+        .join()
+        .expect("worker completed");
+        drop(pool); // must not panic; registry reclaim runs once
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::{
-    Options,
+    OpCode, Options,
     cc::context::Context,
     map::{
         IDataReader, JunksMap, Loader, PagesMap, RetiredChain, SharedState, SparseFrontier,
@@ -27,12 +27,13 @@ use crate::{
         data::{GroupPositions, Position},
         interval::IntervalMap,
         lru::ShardPriorityLru,
+        merge_operator::MergeOperator,
         options::{BucketOptions, ParsedOptions},
     },
 };
 use crate::{types::refbox::BoxView, utils::data::init_group_pos};
 use crossbeam_epoch::Guard;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 use super::flow::{FlowController, ForegroundWritePermit};
 use super::flush::{Checkpoint, CheckpointObserver};
@@ -742,11 +743,15 @@ pub(crate) struct BucketContext {
     pub(crate) table: MutRef<PageMap>,
     pub(crate) state: MutRef<BucketState>,
     pub(crate) opt: Arc<BucketOptions>,
+    pub(crate) has_merge: AtomicBool,
     pub(crate) data_intervals: RwLock<IntervalMap>,
     pub(crate) blob_intervals: RwLock<IntervalMap>,
     pub(crate) lru: Handle<ShardPriorityLru<BoxRef>>,
     pub(crate) bucket_id: u64,
     pub(crate) reader: Arc<dyn IDataReader>,
+    /// exact keys whose merge chain produced a contract violation
+    /// runtime-only and cleared when the bucket is unloaded
+    pub(crate) merge_blocked_keys: DashSet<Vec<u8>>,
     ctx: Handle<Context>,
     cache: NodeCache,
     candidates: CandidateRing,
@@ -787,12 +792,14 @@ impl BucketContext {
             pool,
             table,
             state,
+            has_merge: AtomicBool::new(opt.merge_operator.is_some()),
             opt,
             data_intervals: RwLock::new(IntervalMap::new()),
             blob_intervals: RwLock::new(IntervalMap::new()),
             lru,
             bucket_id,
             reader,
+            merge_blocked_keys: DashSet::new(),
             ctx,
             cache: NodeCache::new(),
             candidates: CandidateRing::new(CANDIDATE_RING_SIZE),
@@ -802,6 +809,36 @@ impl BucketContext {
             final_checkpointed: AtomicBool::new(false),
             reclaimed: AtomicBool::new(false),
         }
+    }
+
+    /// validates a runtime operator against the one fixed when this context was loaded
+    pub(crate) fn validate_merge_operator(
+        &self,
+        op: Option<&Arc<dyn MergeOperator>>,
+    ) -> Result<(), OpCode> {
+        let Some(op) = op else {
+            return Ok(());
+        };
+        if let Some(existing) = self.opt.merge_operator.as_ref()
+            && Arc::ptr_eq(existing, op)
+        {
+            return Ok(());
+        }
+        Err(OpCode::Invalid)
+    }
+
+    #[inline(always)]
+    pub(crate) fn merge_operator(&self) -> Option<&dyn MergeOperator> {
+        self.opt.merge_operator.as_deref()
+    }
+
+    #[inline]
+    pub(crate) fn mark_merge(&self) {
+        self.has_merge.store(true, Release);
+    }
+
+    pub(crate) fn context(&self) -> Handle<Context> {
+        self.ctx
     }
 
     pub(crate) fn before_foreground_write(&self, bytes: u64) -> ForegroundWritePermit {

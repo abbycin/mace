@@ -103,7 +103,7 @@ impl Sst<IntlKey<'_>> {
 
         while lo < hi {
             let mid = lo + ((hi - lo) >> 1);
-            match self.raw_key_at(mid).cmp(rk) {
+            match crate::types::data::cmp_raw_bytes(self.raw_key_at(mid), rk) {
                 Ordering::Equal => return Some((mid, self.pid_at(mid))),
                 Ordering::Greater => hi = mid,
                 Ordering::Less => lo = mid + 1,
@@ -145,7 +145,7 @@ impl Sst<Key<'_>> {
 
         while lo < hi {
             let mid = lo + ((hi - lo) >> 1);
-            match self.raw_key_at(mid).cmp(rk) {
+            match crate::types::data::cmp_raw_bytes(self.raw_key_at(mid), rk) {
                 Ordering::Equal => return Some(self.ver_val_at(mid)),
                 Ordering::Greater => hi = mid,
                 Ordering::Less => lo = mid + 1,

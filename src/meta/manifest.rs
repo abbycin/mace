@@ -13,6 +13,8 @@ use std::{
     },
 };
 
+#[cfg(feature = "metrics")]
+use crate::utils::observe::{CounterMetric, EventKind, GaugeMetric, ObserveEvent};
 use crate::{
     Options,
     cc::context::Context,
@@ -32,8 +34,7 @@ use crate::{
         Handle, INIT_ADDR, MutRef, OpCode,
         compress::CompressorPool,
         data::{GroupPositions, LenSeq, Position, init_group_pos},
-        observe::{CounterMetric, EventKind, GaugeMetric, ObserveEvent},
-        options::{BucketOptions, ParsedOptions, PersistedOptions},
+        options::{BucketOptions, ParsedOptions, PersistedBucketOptions, PersistedOptions},
     },
 };
 
@@ -273,6 +274,7 @@ impl Manifest {
     }
 
     fn observe_retired_stat_keys(&self) {
+        #[cfg(feature = "metrics")]
         self.opt.observer.gauge(
             GaugeMetric::RetiredStatKeysCurrent,
             self.retired_stat_keys.len() as i64,
@@ -371,6 +373,23 @@ impl Manifest {
         Ok(meta)
     }
 
+    /// reads only the persisted bucket options from metadata; unlike
+    /// [`Self::load_bucket_meta`] this never touches the bucket runtime
+    /// (no BucketRuntime, no page table, no context)
+    pub(crate) fn load_bucket_options(
+        &self,
+        name: &str,
+    ) -> Result<Option<PersistedBucketOptions>, OpCode> {
+        let mut options = None;
+        let _ = self.btree.view(BUCKET_METAS, |txn| {
+            if let Ok(v) = txn.get(name.as_bytes()) {
+                options = Some(BucketMeta::decode(&v).options);
+            }
+            Ok(())
+        });
+        Ok(options)
+    }
+
     pub(crate) fn load_bucket_meta(&self, name: &str) -> Result<Arc<BucketMeta>, OpCode> {
         if let Some(meta) = self.bucket_metas.get(name) {
             return Ok(meta.clone());
@@ -402,7 +421,7 @@ impl Manifest {
 
         let meta = Arc::new(BucketMeta {
             id: bucket_id,
-            options: opt,
+            options: PersistedBucketOptions::from(&opt),
         });
         for btree_bucket in [
             super::page_table_name(bucket_id),
@@ -416,7 +435,7 @@ impl Manifest {
         self.bucket_metas_by_id.insert(bucket_id, meta.clone());
 
         // ensure state and pagemap are initialized
-        let bucket_ctx = self.load_bucket_context_locked(bucket_id);
+        let bucket_ctx = self.load_bucket_context_locked(bucket_id, Some(&opt))?;
         // inactive floors are not durable positions
         let mut frontier = self.current_group_checkpoints();
         for slot in frontier.iter_mut() {
@@ -445,7 +464,10 @@ impl Manifest {
         Ok((meta, bucket_ctx))
     }
 
-    fn bucket_option_conflicts(old: BucketOptions, new: BucketOptions) -> Vec<&'static str> {
+    fn bucket_option_conflicts(
+        old: &PersistedBucketOptions,
+        new: &PersistedBucketOptions,
+    ) -> Vec<&'static str> {
         let mut conflicts = Vec::new();
         if old.inline_size != new.inline_size {
             conflicts.push("inline_size");
@@ -475,11 +497,13 @@ impl Manifest {
             return Err(OpCode::Again);
         }
 
-        if meta.options == opt {
+        let old_persisted = meta.options;
+        let new_persisted = PersistedBucketOptions::from(&opt);
+        if old_persisted == new_persisted {
             return Ok(());
         }
 
-        let conflicts = Self::bucket_option_conflicts(meta.options, opt);
+        let conflicts = Self::bucket_option_conflicts(&old_persisted, &new_persisted);
         if !conflicts.is_empty() {
             log::error!(
                 "bucket {}({}) option update conflicts on [{}], old: {:?}, new: {:?}",
@@ -494,7 +518,7 @@ impl Manifest {
 
         let new_meta = Arc::new(BucketMeta {
             id: bucket_id,
-            options: opt,
+            options: new_persisted,
         });
         let mut buf = vec![0u8; new_meta.as_ref().packed_size()];
         new_meta.as_ref().encode(&mut buf);
@@ -512,18 +536,24 @@ impl Manifest {
     }
 
     pub(crate) fn load_bucket_context(&self, bucket_id: u64) -> Result<Arc<BucketContext>, OpCode> {
+        self.load_bucket_context_with_options(bucket_id, None)
+    }
+
+    pub(crate) fn load_bucket_context_with_options(
+        &self,
+        bucket_id: u64,
+        runtime_opt: Option<&BucketOptions>,
+    ) -> Result<Arc<BucketContext>, OpCode> {
         if let Some(ctx) = self.buckets.buckets.get(&bucket_id) {
+            ctx.validate_merge_operator(runtime_opt.and_then(|opt| opt.merge_operator.as_ref()))?;
             return Ok(ctx.value().clone());
         }
 
         let _lock = self.structural_lock.lock();
-        if let Some(ctx) = self.buckets.buckets.get(&bucket_id) {
-            return Ok(ctx.value().clone());
-        }
         if !self.bucket_metas_by_id.contains_key(&bucket_id) {
             return Err(OpCode::NotFound);
         }
-        Ok(self.load_bucket_context_locked(bucket_id))
+        self.load_bucket_context_locked(bucket_id, runtime_opt)
     }
 
     pub(crate) fn try_acquire_rewrite(&self, bucket_id: u64) -> Option<BucketRewritePermit> {
@@ -541,10 +571,15 @@ impl Manifest {
         })
     }
 
-    fn load_bucket_context_locked(&self, bucket_id: u64) -> Arc<BucketContext> {
+    fn load_bucket_context_locked(
+        &self,
+        bucket_id: u64,
+        runtime_opt: Option<&BucketOptions>,
+    ) -> Result<Arc<BucketContext>, OpCode> {
         // double check
         if let Some(ctx) = self.buckets.buckets.get(&bucket_id) {
-            return ctx.value().clone();
+            ctx.validate_merge_operator(runtime_opt.and_then(|opt| opt.merge_operator.as_ref()))?;
+            return Ok(ctx.value().clone());
         }
 
         if !self.bucket_metas_by_id.contains_key(&bucket_id) {
@@ -570,10 +605,14 @@ impl Manifest {
             "bucket meta must exist"
         )
         .clone();
+        let mut opt = meta.options.to_runtime();
+        if let Some(runtime_opt) = runtime_opt {
+            opt.merge_operator.clone_from(&runtime_opt.merge_operator);
+        }
         let ctx = Arc::new(BucketContext::new(
             self.buckets.ctx,
             &self.opt,
-            Arc::new(meta.options),
+            Arc::new(opt),
             state,
             bucket_id,
             table,
@@ -587,7 +626,7 @@ impl Manifest {
         self.recover_intervals(bucket_id, &ctx);
 
         self.buckets.buckets.insert(bucket_id, ctx.clone());
-        ctx
+        Ok(ctx)
     }
 
     fn begin_bucket_remove_locked(
@@ -775,14 +814,17 @@ impl Manifest {
 
     pub(crate) fn stage_orphan_file(&self, kind: FileKind, file_id: u64) {
         self.stage_orphan_marker(self.orphan_marker_key(kind, file_id), kind, file_id);
-        self.opt.observer.counter(self.orphan_stage_metric(kind), 1);
-        self.opt.observer.event(ObserveEvent {
-            kind: self.orphan_stage_event(kind),
-            bucket_id: 0,
-            txid: 0,
-            file_id,
-            value: 0,
-        });
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.counter(self.orphan_stage_metric(kind), 1);
+            self.opt.observer.event(ObserveEvent {
+                kind: self.orphan_stage_event(kind),
+                bucket_id: 0,
+                txid: 0,
+                file_id,
+                value: 0,
+            });
+        }
     }
 
     pub(crate) fn clear_orphan_file(&self, kind: FileKind, txn: &mut Txn<'_>, file_id: u64) {
@@ -790,14 +832,17 @@ impl Manifest {
             .entry(BUCKET_MISC.to_string())
             .or_default()
             .push(MetaOp::Del(self.orphan_marker_key(kind, file_id)));
-        self.opt.observer.counter(self.orphan_clear_metric(kind), 1);
-        self.opt.observer.event(ObserveEvent {
-            kind: self.orphan_clear_event(kind),
-            bucket_id: 0,
-            txid: 0,
-            file_id,
-            value: 0,
-        });
+        #[cfg(feature = "metrics")]
+        {
+            self.opt.observer.counter(self.orphan_clear_metric(kind), 1);
+            self.opt.observer.event(ObserveEvent {
+                kind: self.orphan_clear_event(kind),
+                bucket_id: 0,
+                txid: 0,
+                file_id,
+                value: 0,
+            });
+        }
     }
 
     pub(crate) fn stage_unsynced_file(&self, kind: FileKind, file_id: u64) {
@@ -908,6 +953,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn orphan_stage_metric(&self, kind: FileKind) -> CounterMetric {
         match kind {
             FileKind::Data => CounterMetric::FlushOrphanDataStaged,
@@ -915,6 +961,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn orphan_clear_metric(&self, kind: FileKind) -> CounterMetric {
         match kind {
             FileKind::Data => CounterMetric::FlushOrphanDataCleared,
@@ -922,6 +969,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn orphan_stage_event(&self, kind: FileKind) -> EventKind {
         match kind {
             FileKind::Data => EventKind::FlushOrphanDataStaged,
@@ -929,6 +977,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(feature = "metrics")]
     fn orphan_clear_event(&self, kind: FileKind) -> EventKind {
         match kind {
             FileKind::Data => EventKind::FlushOrphanDataCleared,
@@ -1090,6 +1139,7 @@ impl Manifest {
         self.stat_ctx(kind)
             .apply_junks(tick, junks, &ctx, &self.btree, |file_id| {
                 let retired = self.is_retired_stat(kind, bucket_id, file_id);
+                #[cfg(feature = "metrics")]
                 if retired {
                     self.opt.observer.counter(self.skip_retired_metric(kind), 1);
                 }
@@ -1097,6 +1147,7 @@ impl Manifest {
             })
     }
 
+    #[cfg(feature = "metrics")]
     fn skip_retired_metric(&self, kind: FileKind) -> CounterMetric {
         match kind {
             FileKind::Data => CounterMetric::FlushSkipRetiredDataStat,
@@ -1189,6 +1240,7 @@ impl RetiredStatKeys {
         removed
     }
 
+    #[cfg(feature = "metrics")]
     pub(crate) fn len(&self) -> usize {
         self.keys.len()
     }

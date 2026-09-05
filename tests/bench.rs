@@ -41,12 +41,19 @@ fn bench() {
 
     let e2 = b.elapsed();
 
+    let b = Instant::now();
+    let view = db.view().unwrap();
+    let scanned = view.seek("0").count();
+    assert_eq!(scanned, cap);
+    drop(view);
+    let e_scan = b.elapsed();
+
     drop(db);
     drop(mace);
 
     copy.tmp_store = true;
     let mace = Mace::new(copy.validate().unwrap()).unwrap();
-    let db = mace.get_bucket("x").unwrap();
+    let db = mace.open_bucket("x").unwrap();
 
     let b = Instant::now();
     for k in &pair {
@@ -56,11 +63,13 @@ fn bench() {
 
     let e3 = b.elapsed();
     println!(
-        "{:<10}{}ms\n{:<10}{}ms\n{:<10}{}ms",
+        "{:<10}{}ms\n{:<10}{}ms\n{:<10}{}ms\n{:<10}{}ms",
         "put",
         e1.as_millis(),
         "hot get",
         e2.as_millis(),
+        "scan",
+        e_scan.as_millis(),
         "cold get",
         e3.as_millis()
     );

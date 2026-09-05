@@ -47,12 +47,13 @@ pub(crate) enum PayloadType {
     Insert,
     Update,
     Delete,
+    Merge,
 }
 
 impl TryFrom<u8> for PayloadType {
     type Error = OpCode;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        if value <= PayloadType::Delete as u8 {
+        if value <= PayloadType::Merge as u8 {
             unsafe { Ok(std::mem::transmute::<u8, PayloadType>(value)) }
         } else {
             Err(OpCode::Corruption)
@@ -219,6 +220,28 @@ impl WalUpdate {
                     Err(OpCode::Corruption)
                 }
             }
+            PayloadType::Merge => {
+                if value.len() < size_of::<u32>() {
+                    return Err(OpCode::Corruption);
+                }
+                let operand_len = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                // an empty operand is not encodable as a page record: empty data means tombstone
+                if operand_len == 0 {
+                    return Err(OpCode::Corruption);
+                }
+                let expected = size_of::<u32>()
+                    .checked_add(usize::try_from(operand_len).map_err(|_| OpCode::Corruption)?)
+                    .ok_or(OpCode::Corruption)?;
+                if value.len() == expected
+                    && key_len
+                        .checked_add(usize::try_from(operand_len).map_err(|_| OpCode::Corruption)?)
+                        .is_some_and(|len| len <= Options::MAX_KV_SIZE)
+                {
+                    Ok(())
+                } else {
+                    Err(OpCode::Corruption)
+                }
+            }
             _ => Err(OpCode::Corruption),
         }
     }
@@ -364,6 +387,21 @@ impl WalDel {
 
 impl_codec!(WalDel);
 
+/// length-prefixed merge operand, byte layout identical to [`WalPut`]
+#[repr(C, packed(1))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WalMerge {
+    vlen: u32,
+}
+
+impl WalMerge {
+    pub(crate) fn new(vlen: usize) -> Self {
+        Self { vlen: vlen as u32 }
+    }
+}
+
+impl_codec!(WalMerge);
+
 impl IWalPayload for WalPut {
     fn sub_type(&self) -> PayloadType {
         PayloadType::Insert
@@ -379,6 +417,12 @@ impl IWalPayload for WalReplace {
 impl IWalPayload for WalDel {
     fn sub_type(&self) -> PayloadType {
         PayloadType::Delete
+    }
+}
+
+impl IWalPayload for WalMerge {
+    fn sub_type(&self) -> PayloadType {
+        PayloadType::Merge
     }
 }
 
@@ -595,5 +639,127 @@ mod test {
 
         assert_eq!(raw[0], EntryType::Begin as u8);
         assert_eq!(&raw[1..1 + size_of::<u64>()], &txid.to_le_bytes());
+    }
+
+    #[test]
+    fn merge_record_validation_accepts_len_prefixed_operand() {
+        let header_len = WalUpdate::size();
+        let operand = b"+41";
+        // payload covers key + length prefix + operand
+        let payload_len = 1 + size_of::<u32>() + operand.len();
+        let mut update = WalUpdate {
+            wal_type: EntryType::Update,
+            sub_type: PayloadType::Merge,
+            bucket_id: 0,
+            group_id: 2,
+            size: payload_len as u32,
+            cmd_id: 0,
+            klen: 1,
+            txid: 9,
+            prev_id: 0,
+            prev_off: 0,
+            checksum: 0,
+        };
+        let mut record = vec![0; header_len + payload_len];
+        record[..header_len].copy_from_slice(update.to_slice());
+        record[header_len..header_len + 1].copy_from_slice(b"k");
+        record[header_len + 1..header_len + 1 + size_of::<u32>()]
+            .copy_from_slice(&(operand.len() as u32).to_le_bytes());
+        record[header_len + 1 + size_of::<u32>()..].copy_from_slice(operand);
+        let stored = ptr_to::<WalUpdate>(record.as_ptr());
+        update.checksum = stored.calc_checksum();
+        record[..header_len].copy_from_slice(update.to_slice());
+
+        let stored = ptr_to::<WalUpdate>(record.as_ptr());
+        assert!(stored.is_intact());
+        assert_eq!(stored.validate_record(&record), Ok(()));
+        assert_eq!(stored.sub_type(), PayloadType::Merge);
+    }
+
+    #[test]
+    fn merge_record_validation_rejects_malformed_payloads() {
+        let header_len = WalUpdate::size();
+        let build = |vlen: u32, body: &[u8]| {
+            let payload_len = size_of::<u32>() + body.len();
+            let mut update = WalUpdate {
+                wal_type: EntryType::Update,
+                sub_type: PayloadType::Merge,
+                bucket_id: 0,
+                group_id: 0,
+                size: payload_len as u32,
+                cmd_id: 0,
+                klen: 0,
+                txid: 1,
+                prev_id: 0,
+                prev_off: 0,
+                checksum: 0,
+            };
+            let mut record = vec![0; header_len + size_of::<u32>() + body.len()];
+            record[..header_len].copy_from_slice(update.to_slice());
+            record[header_len..header_len + size_of::<u32>()].copy_from_slice(&vlen.to_le_bytes());
+            record[header_len + size_of::<u32>()..].copy_from_slice(body);
+            let stored = ptr_to::<WalUpdate>(record.as_ptr());
+            update.checksum = stored.calc_checksum();
+            record[..header_len].copy_from_slice(update.to_slice());
+            record
+        };
+
+        // empty operand is not encodable as a page record
+        let record = build(0, &[]);
+        assert_eq!(
+            ptr_to::<WalUpdate>(record.as_ptr()).validate_record(&record),
+            Err(OpCode::Corruption)
+        );
+
+        // declared length longer than the actual body
+        let record = build(8, b"abc");
+        assert_eq!(
+            ptr_to::<WalUpdate>(record.as_ptr()).validate_record(&record),
+            Err(OpCode::Corruption)
+        );
+
+        // checksum mismatch
+        let mut record = build(3, b"abc");
+        let last = record.len() - 1;
+        record[last] ^= 0xff;
+        let stored = ptr_to::<WalUpdate>(record.as_ptr());
+        assert!(!stored.is_intact());
+
+        // oversized operand beyond MAX_KV_SIZE (klen == 0)
+        let big_len = Options::MAX_KV_SIZE + 1;
+        let payload_len = size_of::<u32>().saturating_add(big_len);
+        if payload_len <= WalUpdate::checked_payload_len(payload_len as u32).unwrap_or(usize::MAX) {
+            // only meaningful when the framing itself allows it; otherwise checked_payload_len
+            // already rejects it before validate_record runs
+            let mut update = WalUpdate {
+                wal_type: EntryType::Update,
+                sub_type: PayloadType::Merge,
+                bucket_id: 0,
+                group_id: 0,
+                size: payload_len as u32,
+                cmd_id: 0,
+                klen: 0,
+                txid: 1,
+                prev_id: 0,
+                prev_off: 0,
+                checksum: 0,
+            };
+            let mut record = vec![0; header_len + payload_len];
+            record[..header_len].copy_from_slice(update.to_slice());
+            record[header_len..header_len + size_of::<u32>()]
+                .copy_from_slice(&(big_len as u32).to_le_bytes());
+            let stored = ptr_to::<WalUpdate>(record.as_ptr());
+            update.checksum = stored.calc_checksum();
+            record[..header_len].copy_from_slice(update.to_slice());
+            assert_eq!(
+                ptr_to::<WalUpdate>(record.as_ptr()).validate_record(&record),
+                Err(OpCode::Corruption)
+            );
+        } else {
+            assert_eq!(
+                WalUpdate::checked_payload_len(u32::try_from(big_len + size_of::<u32>()).unwrap()),
+                Err(OpCode::Corruption)
+            );
+        }
     }
 }

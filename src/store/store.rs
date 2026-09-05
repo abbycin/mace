@@ -12,7 +12,9 @@ use crate::utils::MutRef;
 pub use crate::utils::OpCode;
 use crate::utils::ROOT_PID;
 pub use crate::utils::options::Options;
-use crate::utils::options::{BucketOptions, ParsedOptions, PersistedOptions};
+use crate::utils::options::{
+    BucketOptions, ParsedOptions, PersistedBucketOptions, PersistedOptions,
+};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::mpsc::channel;
@@ -82,12 +84,47 @@ impl Inner {
         })
     }
 
-    fn get_bucket(this: &Arc<Inner>, name: &str) -> Result<Bucket, OpCode> {
+    fn open_bucket(this: &Arc<Inner>, name: &str) -> Result<Bucket, OpCode> {
         if name.len() >= Self::MAX_BUCKET_NAME_LEN {
             return Err(OpCode::TooLarge);
         }
         let meta = this.store.manifest.load_bucket_meta(name)?;
         let bucket_ctx = this.store.manifest.load_bucket_context(meta.id)?;
+
+        Ok(Bucket {
+            tree: Tree::new(this.store.clone(), ROOT_PID, bucket_ctx),
+            _holder: meta,
+            inner: this.clone(),
+        })
+    }
+
+    /// reads the persisted bucket options from metadata only: no bucket
+    /// runtime, page table, or context is loaded
+    fn get_bucket_options(this: &Arc<Inner>, name: &str) -> Result<Option<BucketOptions>, OpCode> {
+        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
+            return Err(OpCode::TooLarge);
+        }
+        Ok(this
+            .store
+            .manifest
+            .load_bucket_options(name)?
+            .map(PersistedBucketOptions::to_runtime))
+    }
+
+    fn open_bucket_with_options(
+        this: &Arc<Inner>,
+        name: &str,
+        opt: BucketOptions,
+    ) -> Result<Bucket, OpCode> {
+        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
+            return Err(OpCode::TooLarge);
+        }
+        let meta = this.store.manifest.load_bucket_meta(name)?;
+        // persisted fields always come from BucketMeta; runtime fields are fixed at context load
+        let bucket_ctx = this
+            .store
+            .manifest
+            .load_bucket_context_with_options(meta.id, Some(&opt))?;
 
         Ok(Bucket {
             tree: Tree::new(this.store.clone(), ROOT_PID, bucket_ctx),
@@ -266,12 +303,56 @@ impl Mace {
     }
 
     /// Gets an existing bucket with the given name.
+    ///
+    /// If the bucket is not loaded, this fixes its runtime merge operator to `None`
+    /// until the context is unloaded.
     /// NOTE: name must be less than 32 bytes.
-    pub fn get_bucket<S: AsRef<str>>(&self, name: S) -> Result<Bucket, OpCode> {
-        Inner::get_bucket(&self.inner, name.as_ref())
+    pub fn open_bucket<S: AsRef<str>>(&self, name: S) -> Result<Bucket, OpCode> {
+        Inner::open_bucket(&self.inner, name.as_ref())
+    }
+
+    /// Reads the persisted options of a bucket from its metadata without
+    /// loading the bucket context (no page table or runtime state is touched).
+    ///
+    /// Returns `None` when the bucket does not exist. The returned
+    /// [`BucketOptions`] carries the persisted subset only: the runtime merge
+    /// operator is never persisted and is always `None` here — use
+    /// [`Mace::open_bucket_with_options`] to adopt a runtime operator.
+    ///
+    /// NOTE: name must be less than 32 bytes.
+    pub fn get_bucket_options<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<Option<BucketOptions>, OpCode> {
+        Inner::get_bucket_options(&self.inner, name.as_ref())
+    }
+
+    /// Gets an existing bucket and uses only the runtime fields of `options`
+    /// (currently the [`crate::MergeOperator`]). Persisted bucket fields always come from
+    /// the stored bucket metadata.
+    ///
+    /// The merge operator is fixed before a newly loaded bucket context is published.
+    /// Re-opening a loaded context with a different operator, or providing one after the
+    /// context was loaded without one, returns [`OpCode::Invalid`]. After
+    /// [`Mace::drop_bucket`] unloads the context, the next load chooses the operator again.
+    /// Providing an operator does not guarantee it matches the one that wrote existing
+    /// merge operands; that semantic contract belongs to the caller.
+    ///
+    /// NOTE: name must be less than 32 bytes.
+    pub fn open_bucket_with_options<S: AsRef<str>>(
+        &self,
+        name: S,
+        opt: BucketOptions,
+    ) -> Result<Bucket, OpCode> {
+        Inner::open_bucket_with_options(&self.inner, name.as_ref(), opt.validate())
     }
 
     /// Updates the persisted bucket-scoped options of an existing bucket
+    ///
+    /// Runtime-only fields of the passed options (currently the merge operator)
+    /// are ignored: they are never persisted. For an existing bucket the
+    /// operator is adopted through [`Mace::open_bucket_with_options`]; a new
+    /// bucket adopts it at creation via [`Mace::new_bucket`].
     ///
     /// Returns [`OpCode::Again`] if the bucket is currently loaded
     ///

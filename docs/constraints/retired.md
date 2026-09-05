@@ -25,3 +25,11 @@ Notes:
 - reason: visibility no longer has a group-local resolved-prefix proof, so there is no terminal queue or prefix boundary that can cross an active hole
 - replacement: exact `TxnFact` lookup in `src/cc/mod.rs`; active-hole visibility remains covered by the live safe and exact-outcome constraints
 - evidence: `src/cc/group.rs` removes `ResolvedPrefix` and terminal queue state; `tests/si.rs` retains same-group active-hole and late-commit schedules without prefix forcing
+
+## `protocol.wal_format_upgrade_requires_wal_independent_exit`
+
+- retired_on: 2026-09-01
+- previous_status: active
+- reason: the identifier described a WAL-independent graceful-exit invariant as a data-format upgrade, but the current data/blob format is V1-only and has no format-upgrade protocol
+- replacement: `protocol.graceful_exit_wal_independent_visibility` in `registry.yaml`
+- evidence: `docs/design.md` section 15.1 defines V1-only writers/readers and an explicit future migration boundary; `tests/exit_flush.rs` verifies the retained graceful-exit WAL-independent visibility invariant

@@ -4,7 +4,6 @@ use mace::observe::{CounterMetric, InMemoryObserver};
 use mace::testing::{self, WalRecordKind, WalUpdateProbe};
 use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use std::sync::Arc;
-use std::time::Duration;
 
 #[test]
 fn durable_route_sends_all_logical_groups_through_group_wal() -> Result<(), OpCode> {
@@ -192,7 +191,7 @@ fn durable_large_record_across_rotation_survives_reopen() -> Result<(), OpCode> 
     reopen.wal_buffer_size = 8 << 10;
     reopen.wal_file_size = 4 << 10;
     let mace = Mace::new(reopen.validate()?)?;
-    let db = mace.get_bucket("x").expect("bucket must reopen");
+    let db = mace.open_bucket("x").expect("bucket must reopen");
     let view = db.view()?;
     let got = view.get("big")?;
     assert_eq!(got.slice(), payload.as_slice());
@@ -231,9 +230,8 @@ fn durable_mode_shares_one_logging_with_per_group_checkpoint_floors() -> Result<
     // samples the bucket frontier only while flush data is pending); drive a
     // few rounds so both logical groups' floors separate
     for _ in 0..8 {
-        db.checkpoint();
+        db.checkpoint_and_wait();
         mace.start_gc();
-        std::thread::sleep(Duration::from_millis(10));
     }
     // the shared logger must hold one floor slot per logical group, not a
     // single scalar shared by every group

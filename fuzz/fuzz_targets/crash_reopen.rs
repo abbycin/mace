@@ -14,6 +14,7 @@
 //!      die before the commit record exists, window 2 commits fully), so any
 //!      in-flight write surfacing after reopen is an engine regression and
 //!      must fail the target -- there is no tolerated override state.
+//!
 //! four crash windows are scripted per transaction tag: right after begin
 //! (nothing durable), after upsert before commit (no commit record exists),
 //! after a full commit (must be durable), and after an abort (must stay
@@ -24,7 +25,6 @@
 //! streamed back over stdout (`C\t<i>` lines); the parent replays the input to
 //! rebuild the expected key/value model.
 
-#[allow(dead_code)]
 mod common;
 
 use common::{FuzzDbRoot, get_or_create_bucket, key_name, open_engine, value_bytes};
