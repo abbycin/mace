@@ -17,7 +17,7 @@ fn load_persisted_bucket_options(opt: &Options, name: &str) -> PersistedBucketOp
     let tree = BTree::open(opt.manifest()).unwrap();
     let mut raw = None;
     tree.view("bucket_metas", |txn| {
-        raw = Some(txn.get(name.as_bytes())?.to_vec());
+        raw = Some(txn.get(name.as_bytes())?);
         Ok(())
     })
     .unwrap();
@@ -30,7 +30,7 @@ fn load_persisted_global_options(opt: &Options) -> Value {
     let tree = BTree::open(opt.manifest()).unwrap();
     let mut raw = None;
     tree.view("misc", |txn| {
-        raw = Some(txn.get("options")?.to_vec());
+        raw = Some(txn.get("options")?);
         Ok(())
     })
     .unwrap();
@@ -182,18 +182,156 @@ fn global_options_bad_json_is_corruption() {
     assert_eq!(err, OpCode::Corruption);
 }
 
+/// file ids of one per-group WAL stream, ascending
+fn wal_file_ids(log_root: &std::path::Path, physical: u8) -> Vec<u64> {
+    let prefix = format!("wal_{physical}_");
+    let mut ids: Vec<u64> = std::fs::read_dir(log_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().into_owned();
+            name.strip_prefix(&prefix)
+                .and_then(|id| id.parse::<u64>().ok())
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// file ids of the shared durable WAL stream, ascending
+fn group_wal_file_ids(log_root: &std::path::Path) -> Vec<u64> {
+    let prefix = "group_wal_";
+    let mut ids: Vec<u64> = std::fs::read_dir(log_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().into_owned();
+            name.strip_prefix(prefix)
+                .and_then(|id| id.parse::<u64>().ok())
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
 #[test]
-fn global_options_concurrent_write_conflict_is_invalid() {
+fn global_options_resize_migrates_the_epoch_and_writes_options_back() -> Result<(), OpCode> {
     let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
+    common::deterministic_gc(&mut opt);
     opt.concurrent_write = 8;
-    let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+    opt.sync_on_write = false;
+    let log_root = opt.log_root();
+    let mace = Mace::new(opt.validate()?)?;
+    let bucket = mace.new_bucket("resize", BucketOptions::default())?;
+    // one transaction per key spreads versions across all eight writer groups, so the later
+    // shrink leaves record groups beyond the runtime width for the settled-history path
+    for i in 0..64u32 {
+        let tx = bucket.begin()?;
+        tx.put(format!("k{i}"), format!("v{i}"))?;
+        tx.commit()?;
+    }
+    drop(bucket);
     drop(mace);
 
-    let mut reopen = Options::new(&*path);
-    reopen.concurrent_write = 16;
-    let err = Mace::new(reopen.validate().unwrap()).err().unwrap();
-    assert_eq!(err, OpCode::Invalid);
+    let all_stream_ids = |log_root: &std::path::Path| -> Vec<u64> {
+        (0..8u8)
+            .flat_map(|physical| wal_file_ids(log_root, physical))
+            .chain(group_wal_file_ids(log_root))
+            .collect()
+    };
+    let first_era_max = *all_stream_ids(&log_root)
+        .iter()
+        .max()
+        .expect("the first open must own WAL files");
+
+    // shrink across a route switch: the reopen scans the persisted width, retires every
+    // pre-migration stream and hands a two-group durable runtime Context, which must answer for
+    // record groups the old writers owned
+    let mut shrink = Options::new(&*path);
+    common::deterministic_gc(&mut shrink);
+    shrink.concurrent_write = 2;
+    shrink.sync_on_write = true;
+    let mace = Mace::new(shrink.clone().validate()?)?;
+    assert_eq!(mace.options().concurrent_write, 2);
+    let bucket = mace.open_bucket("resize")?;
+    let view = bucket.view()?;
+    for i in 0..64u32 {
+        assert_eq!(
+            view.get(format!("k{i}"))?.slice(),
+            format!("v{i}").as_bytes()
+        );
+    }
+    drop(view);
+    let tx = bucket.begin()?;
+    tx.put("after_shrink", b"x")?;
+    tx.commit()?;
+    drop(bucket);
+    drop(mace);
+
+    for id in all_stream_ids(&log_root) {
+        assert!(
+            id > first_era_max,
+            "file id {id} survives the wipe: the migration must retire every pre-migration stream"
+        );
+    }
+    assert!(
+        !group_wal_file_ids(&log_root).is_empty(),
+        "a durable target must own a shared era file"
+    );
+    let value = load_persisted_global_options(&shrink);
+    assert_eq!(
+        value["concurrent_write"], 2,
+        "a completed migration records the target width"
+    );
+
+    // grow across the route switch back: every target-only stream starts a fresh era above the
+    // retired namespace instead of reusing an old file id
+    let second_era_max = *all_stream_ids(&log_root)
+        .iter()
+        .max()
+        .expect("the shrink must leave era files");
+    let mut grow = Options::new(&*path);
+    common::deterministic_gc(&mut grow);
+    grow.concurrent_write = 8;
+    grow.sync_on_write = false;
+    let mace = Mace::new(grow.clone().validate()?)?;
+    assert_eq!(mace.options().concurrent_write, 8);
+    let bucket = mace.open_bucket("resize")?;
+    let view = bucket.view()?;
+    for i in 0..64u32 {
+        assert_eq!(
+            view.get(format!("k{i}"))?.slice(),
+            format!("v{i}").as_bytes()
+        );
+    }
+    assert_eq!(view.get("after_shrink")?.slice(), b"x");
+    drop(view);
+    let tx = bucket.begin()?;
+    tx.put("after_grow", b"x")?;
+    tx.commit()?;
+    drop(bucket);
+    drop(mace);
+
+    for id in all_stream_ids(&log_root) {
+        assert!(
+            id > second_era_max,
+            "file id {id} must start above the retired namespace"
+        );
+    }
+    for physical in 0..8u8 {
+        assert!(
+            !wal_file_ids(&log_root, physical).is_empty(),
+            "a relaxed target must give stream {physical} its own era file"
+        );
+    }
+    let value = load_persisted_global_options(&grow);
+    assert_eq!(value["concurrent_write"], 8);
+    Ok(())
 }
 
 #[test]
@@ -347,7 +485,7 @@ fn get_bucket_options_reads_persisted_subset_without_loading() -> Result<(), OpC
     let bucket_opt = BucketOptions {
         split_elems: 128,
         consolidate_threshold: 16,
-        inline_size: 8192,
+        inline_size: 2048,
         ..BucketOptions::default()
     };
     let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
@@ -358,7 +496,7 @@ fn get_bucket_options_reads_persisted_subset_without_loading() -> Result<(), OpC
     let read = mace.get_bucket_options("x")?.expect("bucket must exist");
     assert_eq!(read.split_elems, 128);
     assert_eq!(read.consolidate_threshold, 16);
-    assert_eq!(read.inline_size, 8192);
+    assert_eq!(read.inline_size, 2048);
     assert!(
         read.merge_operator.is_none(),
         "the runtime operator is never persisted"
@@ -373,7 +511,7 @@ fn bucket_update_opt_persists_compatible_changes() -> Result<(), OpCode> {
     let bucket_opt = BucketOptions {
         split_elems: 128,
         consolidate_threshold: 16,
-        inline_size: 8192,
+        inline_size: 2048,
         checkpoint_size: 64 << 10,
         pool_capacity: 128 << 10,
         cache_capacity: 256 << 10,
@@ -417,6 +555,11 @@ fn bucket_update_opt_persists_compatible_changes() -> Result<(), OpCode> {
             ..updated.clone()
         };
         assert_eq!(mace.update_bucket_opt("x", conflict), Err(OpCode::Invalid));
+        let increase = BucketOptions {
+            inline_size: updated.inline_size + 1,
+            ..updated.clone()
+        };
+        assert_eq!(mace.update_bucket_opt("x", increase), Err(OpCode::Invalid));
         mace.update_bucket_opt("x", bucket_opt.clone())?;
     }
 
@@ -434,6 +577,147 @@ fn bucket_update_opt_persists_compatible_changes() -> Result<(), OpCode> {
         assert_eq!(mace.update_bucket_opt("x", conflict), Err(OpCode::Invalid));
     }
 
+    Ok(())
+}
+
+#[test]
+fn bucket_update_opt_persists_inline_size_change() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let bucket_opt = BucketOptions {
+        inline_size: 4096,
+        checkpoint_size: 64 << 10,
+        pool_capacity: 128 << 10,
+        ..BucketOptions::default()
+    };
+    // an explicit in-window change persists; a default-constructed request
+    // (inline_size = 1024 = the new default) is an equally explicit change
+    // when the stored threshold differs, and must not be treated as a no-op
+    // or rejected as a conflict
+    let changed = BucketOptions {
+        inline_size: 2048,
+        ..bucket_opt.clone()
+    };
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let bucket = mace.new_bucket("x", bucket_opt.clone())?;
+        drop(bucket);
+        mace.drop_bucket("x")?;
+        mace.update_bucket_opt("x", changed.clone())?;
+        let read = mace.get_bucket_options("x")?.expect("bucket must exist");
+        assert_eq!(read.inline_size, 2048);
+        assert_eq!(read.pool_capacity, 128 << 10);
+        // and again down to the current default
+        mace.update_bucket_opt(
+            "x",
+            BucketOptions {
+                inline_size: BucketOptions::MIN_INLINE_SIZE,
+                ..changed.clone()
+            },
+        )?;
+        let read = mace.get_bucket_options("x")?.expect("bucket must exist");
+        assert_eq!(read.inline_size, BucketOptions::MIN_INLINE_SIZE);
+    }
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let read = mace.get_bucket_options("x")?.expect("bucket must exist");
+        assert_eq!(read.inline_size, BucketOptions::MIN_INLINE_SIZE);
+        mace.open_bucket("x")?; // loads with the persisted threshold
+    }
+    Ok(())
+}
+
+#[test]
+fn bucket_update_inline_size_keeps_existing_data_readable() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let bucket_opt = BucketOptions {
+        inline_size: 4096,
+        split_elems: 32,
+        checkpoint_size: 64 << 10,
+        pool_capacity: 128 << 10,
+        ..BucketOptions::default()
+    };
+    let small = vec![b's'; 500]; // inline before and after
+    let mid = vec![b'm'; 3000]; // inline at 4096, blob-sized at 1024
+    let big = vec![b'z'; 6000]; // blob before and after
+    let n = 48usize;
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let db = mace.new_bucket("x", bucket_opt.clone())?;
+        let kv = db.begin()?;
+        for i in 0..n {
+            let k = format!("k{i:04}");
+            kv.put(k.as_bytes(), &mid)?;
+            kv.put(format!("{k}.s").as_bytes(), &small)?;
+        }
+        kv.put("big".as_bytes(), &big)?;
+        kv.commit()?;
+        db.checkpoint();
+        // lower the threshold on the unloaded bucket
+        drop(db);
+        while let Err(e) = mace.drop_bucket("x") {
+            assert_eq!(e, OpCode::Again);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        mace.update_bucket_opt(
+            "x",
+            BucketOptions {
+                inline_size: BucketOptions::MIN_INLINE_SIZE,
+                ..bucket_opt.clone()
+            },
+        )?;
+    }
+    // reopen and rewrite: gc must re-encode every live record under the new
+    // threshold (the 3000B inline values become blob-backed) without losing
+    // or corrupting data
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let db = mace.open_bucket("x")?;
+        let kv = db.begin()?;
+        for i in 0..n {
+            let k = format!("k{i:04}");
+            kv.update(k.as_bytes(), &mid)?;
+            kv.update(format!("{k}.s").as_bytes(), &small)?;
+        }
+        kv.commit()?;
+        db.checkpoint();
+        let before = mace.data_gc_count();
+        let ran = common::gc_rounds_until_with_settle(
+            &mace,
+            40,
+            std::time::Duration::from_millis(120),
+            || mace.data_gc_count() > before,
+        );
+        assert!(ran, "expected a data gc rewrite round");
+        let view = db.view()?;
+        for i in 0..n {
+            let k = format!("k{i:04}");
+            assert_eq!(view.get(&k).unwrap().slice(), mid.as_slice());
+            assert_eq!(
+                view.get(format!("{k}.s").as_bytes()).unwrap().slice(),
+                small.as_slice()
+            );
+        }
+        assert_eq!(view.get("big".as_bytes()).unwrap().slice(), big.as_slice());
+    }
+    // reopen once more: the split-converted leaves and their materialized
+    // blob boxes were flushed by checkpoints; everything must read back from
+    // files through the interval maps
+    {
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let db = mace.open_bucket("x")?;
+        let view = db.view()?;
+        for i in 0..n {
+            let k = format!("k{i:04}");
+            assert_eq!(view.get(&k).unwrap().slice(), mid.as_slice());
+            assert_eq!(
+                view.get(format!("{k}.s").as_bytes()).unwrap().slice(),
+                small.as_slice()
+            );
+        }
+        assert_eq!(view.get("big".as_bytes()).unwrap().slice(), big.as_slice());
+    }
     Ok(())
 }
 

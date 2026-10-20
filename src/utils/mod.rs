@@ -75,6 +75,23 @@ impl From<std::io::Error> for OpCode {
     }
 }
 
+/// open failures are recoverable for the caller: another instance holding the lock, or a
+/// live instance of this path in this process, is retryable, and a file this build cannot
+/// read is a corruption the caller must see rather than a fatal invariant failure
+impl From<btree_store::OpenError> for OpCode {
+    fn from(err: btree_store::OpenError) -> Self {
+        match err {
+            btree_store::OpenError::DatabaseBusy { .. } => OpCode::Again,
+            // the backend raises `InvalidOptions` only for a live instance of this path
+            // that was opened with different options, which is contention too
+            btree_store::OpenError::InvalidOptions(_) => OpCode::Again,
+            btree_store::OpenError::Corruption(_) => OpCode::Corruption,
+            btree_store::OpenError::Io(_) => OpCode::IoError,
+            btree_store::OpenError::ReadOnly => OpCode::Invalid,
+        }
+    }
+}
+
 impl From<btree_store::Error> for OpCode {
     fn from(err: btree_store::Error) -> Self {
         match err {
@@ -86,7 +103,8 @@ impl From<btree_store::Error> for OpCode {
             | btree_store::Error::InvalidBucket(btree_store::BucketError::TooLarge { .. })
             | btree_store::Error::ValueTooLarge { .. } => OpCode::TooLarge,
             btree_store::Error::InvalidKey(btree_store::KeyError::Empty)
-            | btree_store::Error::InvalidBucket(btree_store::BucketError::Empty) => OpCode::Invalid,
+            | btree_store::Error::InvalidBucket(btree_store::BucketError::Empty)
+            | btree_store::Error::ReadOnly => OpCode::Invalid,
         }
     }
 }
@@ -173,6 +191,10 @@ impl Default for RandomPath {
 impl RandomPath {
     const PREFIX: &'static str = "mace_tmp_";
 
+    /// base-directory override for [`RandomPath::tmp`]; a parent process sets it so it owns the
+    /// temp tree of a child that aborts before `Drop`
+    pub(crate) const TMP_ROOT_ENV: &'static str = "MACE_TMP_ROOT";
+
     fn gen_path(root: &PathBuf) -> PathBuf {
         static TID: AtomicI64 = AtomicI64::new(0);
         let path = Path::new(&root);
@@ -192,9 +214,16 @@ impl RandomPath {
     }
 
     /// Creates a new temporary path that will be deleted on drop.
+    ///
+    /// [`Self::TMP_ROOT_ENV`] overrides the base directory. A parent process uses it to own the
+    /// tree of a child that aborts: an abort skips `Drop`, so only a directory the parent
+    /// removes is still cleaned up.
     pub fn tmp() -> Self {
+        let root = std::env::var_os(Self::TMP_ROOT_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
         Self {
-            path: Self::gen_path(&std::env::temp_dir()),
+            path: Self::gen_path(&root),
             del: true,
         }
     }

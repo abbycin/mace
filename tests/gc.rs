@@ -226,12 +226,15 @@ fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<()
     opt.gc_timeout = 60_000;
     opt.gc_eager = false;
     opt.data_garbage_ratio = 100;
+    opt.blob_garbage_ratio = 100;
     opt.data_file_size = 256 << 10;
+    opt.blob_file_size = 256 << 10;
     let mace = Mace::new(opt.validate()?)?;
     mace.disable_gc();
     let bucket = mace.new_bucket(
         "rewrite_junk_handoff",
         BucketOptions {
+            inline_size: 1024,
             split_elems: 64,
             consolidate_threshold: 8,
             checkpoint_size: 256 << 10,
@@ -243,9 +246,10 @@ fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<()
     let keys = (0..256)
         .map(|idx| format!("key_{idx:04}"))
         .collect::<Vec<_>>();
-    let initial = vec![b'a'; 256];
-    let middle = vec![b'b'; 256];
-    let latest = vec![b'c'; 256];
+    let value_len = 256;
+    let initial = vec![b'a'; value_len];
+    let middle = vec![b'b'; value_len];
+    let latest = vec![b'c'; value_len];
 
     let txn = bucket.begin()?;
     for key in &keys {
@@ -259,6 +263,7 @@ fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<()
         txn.update(key, &middle)?;
     }
     txn.commit()?;
+    testing::checkpoint_and_wait(&bucket);
     drop(bucket);
     drop(mace);
 
@@ -268,29 +273,51 @@ fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<()
     rewrite.gc_timeout = 60_000;
     rewrite.gc_eager = true;
     rewrite.data_garbage_ratio = 1;
+    rewrite.blob_garbage_ratio = 100;
     rewrite.data_file_size = 16 << 10;
+    rewrite.blob_file_size = 16 << 10;
+    let observer = Arc::new(InMemoryObserver::default());
+    rewrite.observer = observer.clone();
     let mace = Mace::new(rewrite.validate()?)?;
     let bucket = mace.open_bucket("rewrite_junk_handoff")?;
 
-    let (ready_tx, ready_rx) = channel();
-    let (release_tx, release_rx) = channel();
-    let release_rx = Arc::new(Mutex::new(release_rx));
-    let fired = Arc::new(AtomicBool::new(false));
+    let (collecting_ready_tx, collecting_ready_rx) = channel();
+    let (collecting_release_tx, collecting_release_rx) = channel();
+    let collecting_release_rx = Arc::new(Mutex::new(collecting_release_rx));
+    let (mask_ready_tx, mask_ready_rx) = channel();
+    let (mask_release_tx, mask_release_rx) = channel();
+    let mask_release_rx = Arc::new(Mutex::new(mask_release_rx));
+    let collecting_fired = Arc::new(AtomicBool::new(false));
+    let mask_fired = Arc::new(AtomicBool::new(false));
     let bucket_id = bucket.id();
     let db_root = path.to_path_buf();
-    testing::set_gc_rewrite_hook(Some(Arc::new({
-        let fired = fired.clone();
-        let release_rx = release_rx.clone();
+    testing::set_gc_stat_hook(Some(Arc::new({
+        let collecting_fired = collecting_fired.clone();
+        let mask_fired = mask_fired.clone();
+        let collecting_release_rx = collecting_release_rx.clone();
+        let mask_release_rx = mask_release_rx.clone();
         move |point, observed_bucket_id, observed_db_root| {
-            if point == testing::GcRewriteSyncPoint::BeforeDataPublish
-                && observed_bucket_id == bucket_id
-                && observed_db_root == db_root
-                && !fired.swap(true, Ordering::SeqCst)
+            if observed_bucket_id != bucket_id || observed_db_root != db_root {
+                return;
+            }
+            if point == testing::GcStatSyncPoint::DataRewriteCollecting
+                && !collecting_fired.swap(true, Ordering::SeqCst)
             {
-                ready_tx.send(()).expect("signal rewrite publish cut");
-                let _ = release_rx
+                collecting_ready_tx
+                    .send(())
+                    .expect("signal rewrite collecting");
+                let _ = collecting_release_rx
                     .lock()
-                    .expect("lock rewrite release receiver")
+                    .expect("lock rewrite collecting receiver")
+                    .recv_timeout(Duration::from_secs(10));
+            }
+            if point == testing::GcStatSyncPoint::DataCheckpointRewriteMaskLoad
+                && !mask_fired.swap(true, Ordering::SeqCst)
+            {
+                mask_ready_tx.send(()).expect("signal checkpoint mask load");
+                let _ = mask_release_rx
+                    .lock()
+                    .expect("lock checkpoint mask receiver")
                     .recv_timeout(Duration::from_secs(10));
             }
         }
@@ -299,25 +326,44 @@ fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<()
     let before = mace.data_gc_count();
     let gc_mace = mace.clone();
     let gc_thread = std::thread::spawn(move || gc_mace.start_gc());
-    ready_rx
+    collecting_ready_rx
         .recv_timeout(Duration::from_secs(10))
-        .expect("data rewrite must reach publish cut");
+        .expect("rewrite must register collecting victims");
 
     let txn = bucket.begin()?;
-    for key in &keys {
+    for key in keys.iter().step_by(4) {
         txn.update(key, &latest)?;
     }
     txn.commit()?;
-    testing::checkpoint_and_wait(&bucket);
-    release_tx.send(()).expect("release data rewrite");
-    gc_thread.join().expect("data rewrite thread must finish");
-    assert!(mace.data_gc_count() > before, "data rewrite did not finish");
+    let checkpoint_bucket = bucket.clone();
+    let checkpoint_thread =
+        std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
+    mask_ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("checkpoint must hold the final-victim mask load");
+    collecting_release_tx
+        .send(())
+        .expect("release rewrite scan");
+    mask_release_tx
+        .send(())
+        .expect("release checkpoint mask load");
+    checkpoint_thread
+        .join()
+        .expect("checkpoint must enqueue rewrite junk before publication");
+    gc_thread.join().expect("rewrite gc thread must finish");
+    let after = mace.data_gc_count();
+    assert!(after > before, "gc did not finish");
     testing::checkpoint_and_wait(&bucket);
     testing::assert_persisted_gc_stats(&mace);
 
     let view = bucket.view()?;
-    for key in &keys {
-        assert_eq!(view.get(key)?.slice(), latest.as_slice());
+    for (idx, key) in keys.iter().enumerate() {
+        let expected = match idx % 4 {
+            0 => latest.as_slice(),
+            2 => middle.as_slice(),
+            _ => initial.as_slice(),
+        };
+        assert_eq!(view.get(key)?.slice(), expected);
     }
     drop(view);
     drop(bucket);
@@ -329,21 +375,228 @@ fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<()
     reopen.gc_timeout = 60_000;
     reopen.gc_eager = true;
     reopen.data_garbage_ratio = 1;
+    reopen.blob_garbage_ratio = 100;
     reopen.data_file_size = 16 << 10;
+    reopen.blob_file_size = 16 << 10;
     // teardown-only flag: wipes db_root when this final instance drops
     reopen.tmp_store = true;
     let mace = Mace::new(reopen.validate()?)?;
     testing::assert_persisted_gc_stats(&mace);
     let bucket = mace.open_bucket("rewrite_junk_handoff")?;
     let view = bucket.view()?;
-    for key in &keys {
-        assert_eq!(view.get(key)?.slice(), latest.as_slice());
+    for (idx, key) in keys.iter().enumerate() {
+        let expected = match idx % 4 {
+            0 => latest.as_slice(),
+            2 => middle.as_slice(),
+            _ => initial.as_slice(),
+        };
+        assert_eq!(view.get(key)?.slice(), expected);
     }
     Ok(())
 }
 
 #[cfg(feature = "extra_check")]
-#[derive(Clone, Copy, Debug)]
+#[test]
+fn rewrite_handoff_to_ordinary_fully_obsolete_candidate_during_collect() -> Result<(), OpCode> {
+    run_rewrite_obsolete_candidate_handoff()
+}
+
+#[cfg(feature = "extra_check")]
+fn seed_handoff_bucket(mace: &Mace, name: &str, prefix: &str) -> Result<mace::Bucket, OpCode> {
+    let bucket = mace.new_bucket(
+        name,
+        BucketOptions {
+            inline_size: 1024,
+            split_elems: 64,
+            consolidate_threshold: 8,
+            checkpoint_size: 256 << 10,
+            pool_capacity: 512 << 10,
+            enable_backpressure: false,
+            ..BucketOptions::default()
+        },
+    )?;
+    let keys = (0..256)
+        .map(|idx| format!("{prefix}_{idx:04}"))
+        .collect::<Vec<_>>();
+    let initial = vec![b'a'; 256];
+    let middle = vec![b'b'; 256];
+
+    let txn = bucket.begin()?;
+    for key in &keys {
+        txn.put(key, &initial)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+
+    // keep each seed file a rewrite candidate
+    let txn = bucket.begin()?;
+    for key in keys.iter().step_by(2) {
+        txn.update(key, &middle)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+    Ok(bucket)
+}
+
+#[cfg(feature = "extra_check")]
+fn run_rewrite_obsolete_candidate_handoff() -> Result<(), OpCode> {
+    let _hook_lock = testing::checkpoint_test_lock();
+    let _hook_reset = HookReset;
+    let path = RandomPath::new();
+    let mut opt = Options::new(&*path);
+    opt.concurrent_write = 1;
+    opt.sync_on_write = true;
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = false;
+    opt.data_garbage_ratio = 100;
+    opt.blob_garbage_ratio = 100;
+    opt.data_file_size = 256 << 10;
+    opt.blob_file_size = 256 << 10;
+    let mace = Mace::new(opt.validate()?)?;
+    mace.disable_gc();
+    // one collecting candidate becomes ordinary while the other still publishes
+    let bucket_a = seed_handoff_bucket(&mace, "handoff_a", "a_key")?;
+    let bucket_b = seed_handoff_bucket(&mace, "handoff_b", "b_key")?;
+    let keys_a = (0..256)
+        .map(|idx| format!("a_key_{idx:04}"))
+        .collect::<Vec<_>>();
+    let keys_b = (0..256)
+        .map(|idx| format!("b_key_{idx:04}"))
+        .collect::<Vec<_>>();
+    drop(bucket_a);
+    drop(bucket_b);
+    drop(mace);
+
+    let mut rewrite = Options::new(&*path);
+    rewrite.concurrent_write = 1;
+    rewrite.sync_on_write = true;
+    rewrite.gc_timeout = 60_000;
+    rewrite.gc_eager = true;
+    rewrite.data_garbage_ratio = 1;
+    rewrite.blob_garbage_ratio = 100;
+    rewrite.data_file_size = 16 << 10;
+    rewrite.blob_file_size = 16 << 10;
+    let mace = Mace::new(rewrite.validate()?)?;
+    let bucket_a = mace.open_bucket("handoff_a")?;
+    let bucket_b = mace.open_bucket("handoff_b")?;
+    let bucket_id_a = bucket_a.id();
+
+    let (collecting_ready_tx, collecting_ready_rx) = channel();
+    let (collecting_bucket_tx, collecting_bucket_rx) = channel();
+    let (collecting_release_tx, collecting_release_rx) = channel();
+    let collecting_release_rx = Arc::new(Mutex::new(collecting_release_rx));
+    let collecting_fired = Arc::new(AtomicBool::new(false));
+    let db_root = path.to_path_buf();
+    testing::set_gc_stat_hook(Some(Arc::new({
+        let collecting_fired = collecting_fired.clone();
+        let collecting_release_rx = collecting_release_rx.clone();
+        move |point, observed_bucket_id, observed_db_root| {
+            if observed_db_root != db_root {
+                return;
+            }
+            if point == testing::GcStatSyncPoint::DataRewriteCollecting
+                && !collecting_fired.swap(true, Ordering::SeqCst)
+            {
+                let _ = collecting_bucket_tx.send(observed_bucket_id);
+                collecting_ready_tx
+                    .send(())
+                    .expect("signal rewrite collecting");
+                let _ = collecting_release_rx
+                    .lock()
+                    .expect("lock rewrite collecting receiver")
+                    .recv_timeout(Duration::from_secs(10));
+            }
+        }
+    })));
+
+    let before = mace.data_gc_count();
+    let gc_mace = mace.clone();
+    let gc_thread = std::thread::spawn(move || gc_mace.start_gc());
+    collecting_ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("rewrite must register collecting victims");
+    let registering_bucket = collecting_bucket_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("hook must identify the registering bucket");
+
+    // make the collecting candidate fully obsolete before its victim scan
+    let registered_a = registering_bucket == bucket_id_a;
+    let (registering_bucket, registering_keys, surviving_bucket, surviving_keys) = if registered_a {
+        (bucket_a, &keys_a, bucket_b, &keys_b)
+    } else {
+        (bucket_b, &keys_b, bucket_a, &keys_a)
+    };
+    let initial = vec![b'a'; 256];
+    let middle = vec![b'b'; 256];
+    let latest = vec![b'c'; 256];
+    let txn = registering_bucket.begin()?;
+    for key in registering_keys {
+        txn.update(key, &latest)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&registering_bucket);
+
+    collecting_release_tx
+        .send(())
+        .expect("release rewrite scan");
+    gc_thread.join().expect("rewrite gc thread must finish");
+    let after = mace.data_gc_count();
+    // the other candidate must still complete the rewrite
+    assert!(after > before, "rewrite did not finish");
+    testing::assert_persisted_gc_stats(&mace);
+
+    // the handed-off bucket keeps the collect-phase value
+    let view = registering_bucket.view()?;
+    for key in registering_keys {
+        assert_eq!(view.get(key)?.slice(), latest.as_slice());
+    }
+    drop(view);
+    // the surviving bucket preserves its values
+    let view = surviving_bucket.view()?;
+    for (idx, key) in surviving_keys.iter().enumerate() {
+        let expected = if idx % 2 == 0 { &middle } else { &initial };
+        assert_eq!(view.get(key)?.slice(), expected.as_slice());
+    }
+    drop(view);
+
+    drop(registering_bucket);
+    drop(surviving_bucket);
+    drop(mace);
+    let mut reopen = Options::new(&*path);
+    reopen.concurrent_write = 1;
+    reopen.sync_on_write = true;
+    reopen.gc_timeout = 60_000;
+    reopen.gc_eager = true;
+    reopen.data_garbage_ratio = 1;
+    reopen.blob_garbage_ratio = 100;
+    reopen.data_file_size = 16 << 10;
+    reopen.blob_file_size = 16 << 10;
+    // teardown-only flag: wipes db_root when this final instance drops
+    reopen.tmp_store = true;
+    let mace = Mace::new(reopen.validate()?)?;
+    testing::assert_persisted_gc_stats(&mace);
+    let bucket_a = mace.open_bucket("handoff_a")?;
+    let bucket_b = mace.open_bucket("handoff_b")?;
+    let (latest_bucket, latest_keys, surviving_bucket, surviving_keys) = if registered_a {
+        (bucket_a, &keys_a, bucket_b, &keys_b)
+    } else {
+        (bucket_b, &keys_b, bucket_a, &keys_a)
+    };
+    let view = latest_bucket.view()?;
+    for key in latest_keys {
+        assert_eq!(view.get(key)?.slice(), latest.as_slice());
+    }
+    drop(view);
+    let view = surviving_bucket.view()?;
+    for (idx, key) in surviving_keys.iter().enumerate() {
+        let expected = if idx % 2 == 0 { &middle } else { &initial };
+        assert_eq!(view.get(key)?.slice(), expected.as_slice());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestFileKind {
     Data,
     Blob,
@@ -371,57 +624,25 @@ fn retire_sync_point(kind: TestFileKind, cut: RetireCut) -> testing::GcStatSyncP
 }
 
 #[cfg(feature = "extra_check")]
-#[cfg(feature = "metrics")]
-fn conditional_stat_miss_metric(kind: TestFileKind) -> CounterMetric {
-    match kind {
-        TestFileKind::Data => CounterMetric::FlushConditionalDataStatPutMiss,
-        TestFileKind::Blob => CounterMetric::FlushConditionalBlobStatPutMiss,
-    }
-}
-
-#[cfg(feature = "extra_check")]
-#[derive(Clone, Copy, Debug)]
-enum CheckpointSchedule {
-    BeforeGc,
-    AfterGcCut,
-}
-
-#[cfg(feature = "extra_check")]
 #[test]
 #[cfg(feature = "metrics")]
 fn lagging_checkpoint_cannot_resurrect_retired_stats_at_any_reclaim_cut() -> Result<(), OpCode> {
     let _hook_lock = testing::checkpoint_test_lock();
     let _hook_reset = HookReset;
     for kind in [TestFileKind::Data, TestFileKind::Blob] {
-        let schedules = match kind {
-            TestFileKind::Data => [true, true],
-            TestFileKind::Blob => [false, true],
-        };
-        for (schedule, enabled) in [
-            (CheckpointSchedule::BeforeGc, schedules[0]),
-            (CheckpointSchedule::AfterGcCut, schedules[1]),
+        for cut in [
+            RetireCut::MetaCommit,
+            RetireCut::RetiredMark,
+            RetireCut::RuntimeRemove,
         ] {
-            if !enabled {
-                continue;
-            }
-            for cut in [
-                RetireCut::MetaCommit,
-                RetireCut::RetiredMark,
-                RetireCut::RuntimeRemove,
-            ] {
-                run_lagging_checkpoint_retire_cut(kind, cut, schedule)?;
-            }
+            run_lagging_checkpoint_retire_cut(kind, cut)?;
         }
     }
     Ok(())
 }
 
 #[cfg(feature = "extra_check")]
-fn run_lagging_checkpoint_retire_cut(
-    kind: TestFileKind,
-    cut: RetireCut,
-    schedule: CheckpointSchedule,
-) -> Result<(), OpCode> {
+fn run_lagging_checkpoint_retire_cut(kind: TestFileKind, cut: RetireCut) -> Result<(), OpCode> {
     testing::clear_hooks();
     let path = RandomPath::new();
     let observer = Arc::new(InMemoryObserver::new(1024));
@@ -474,11 +695,8 @@ fn run_lagging_checkpoint_retire_cut(
         testing::checkpoint_and_wait(&bucket);
     }
 
-    let initial_checkpoint =
-        !(matches!(kind, TestFileKind::Blob) && matches!(schedule, CheckpointSchedule::AfterGcCut));
-
     if matches!(kind, TestFileKind::Blob) {
-        for seed in [b'c', b'd'] {
+        for seed in *b"cd" {
             let replacement = vec![seed; value_len];
             let txn = bucket.begin()?;
             for key in &keys {
@@ -494,9 +712,7 @@ fn run_lagging_checkpoint_retire_cut(
         txn.del(key)?;
     }
     txn.commit()?;
-    if !initial_checkpoint {
-        testing::checkpoint_and_wait(&bucket);
-    }
+    testing::checkpoint_and_wait(&bucket);
 
     // determinism (extra_check): production publishes the safe waterline on
     // the collector's own polling cadence; drive cycles until the deleted
@@ -508,6 +724,7 @@ fn run_lagging_checkpoint_retire_cut(
     );
 
     let (checkpoint_ready_tx, checkpoint_ready_rx) = channel();
+    let (checkpoint_result_sync_tx, checkpoint_result_sync_rx) = channel();
 
     let (checkpoint_release_tx, checkpoint_release_rx) = channel();
     let checkpoint_release_rx = Arc::new(Mutex::new(checkpoint_release_rx));
@@ -548,18 +765,16 @@ fn run_lagging_checkpoint_retire_cut(
             }
         }
     })));
-
-    let miss_before = counter_value(&observer, conditional_stat_miss_metric(kind));
-    let checkpoint_thread = if initial_checkpoint {
-        let checkpoint_bucket = bucket.clone();
-        let thread = std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
-        checkpoint_ready_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("checkpoint must prepare the old stat update");
-        Some(thread)
-    } else {
-        None
-    };
+    testing::set_checkpoint_hook(Some(Arc::new({
+        let checkpoint_result_sync_tx = checkpoint_result_sync_tx.clone();
+        move |point, observed_bucket_id| {
+            if observed_bucket_id == bucket_id
+                && point == testing::CheckpointSyncPoint::AfterResultSync
+            {
+                let _ = checkpoint_result_sync_tx.send(());
+            }
+        }
+    })));
 
     let gc_mace = mace.clone();
     let gc_loop_fired = gc_fired.clone();
@@ -597,54 +812,36 @@ fn run_lagging_checkpoint_retire_cut(
             );
         });
 
-    match schedule {
-        CheckpointSchedule::BeforeGc => {
-            checkpoint_release_tx
-                .send(())
-                .expect("release lagging checkpoint");
-            checkpoint_thread
-                .expect("pre-cut checkpoint thread must exist")
-                .join()
-                .expect("lagging checkpoint must finish");
-            assert!(
-                counter_value(&observer, conditional_stat_miss_metric(kind)) > miss_before,
-                "old stat update must miss after reclaim delete commits first"
-            );
-        }
-        CheckpointSchedule::AfterGcCut => {
-            if let Some(checkpoint_thread) = checkpoint_thread {
-                checkpoint_release_tx
-                    .send(())
-                    .expect("release pre-cut checkpoint");
-                checkpoint_thread
-                    .join()
-                    .expect("pre-cut checkpoint must finish");
-            }
-
-            let late_key = "late_checkpoint_key";
-            let late_value = vec![b'b'; value_len];
-            let txn = bucket.begin()?;
-            txn.upsert(late_key, &late_value)?;
-            txn.commit()?;
-            checkpoint_fired.store(false, Ordering::SeqCst);
-            let checkpoint_bucket = bucket.clone();
-            let checkpoint_thread =
-                std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
-            checkpoint_ready_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("post-cut checkpoint must reach manifest commit");
-            checkpoint_release_tx
-                .send(())
-                .expect("release post-cut checkpoint");
-            checkpoint_thread
-                .join()
-                .expect("post-cut checkpoint must finish");
-        }
+    {
+        let late_key = "late_checkpoint_key";
+        let late_value = vec![b'b'; value_len];
+        let txn = bucket.begin()?;
+        txn.upsert(late_key, &late_value)?;
+        txn.commit()?;
+        checkpoint_fired.store(false, Ordering::SeqCst);
+        let checkpoint_bucket = bucket.clone();
+        let checkpoint_thread =
+            std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
+        checkpoint_result_sync_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("post-cut checkpoint must finish result sync before reclaim release");
+        gc_release_tx
+            .send(())
+            .expect("release ordinary reclaim before checkpoint commit");
+        checkpoint_ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("post-cut checkpoint must reach manifest commit");
+        checkpoint_release_tx
+            .send(())
+            .expect("release post-cut checkpoint");
+        checkpoint_thread
+            .join()
+            .expect("post-cut checkpoint must finish");
     }
 
-    gc_release_tx.send(()).expect("release ordinary reclaim");
     gc_thread.join().expect("ordinary reclaim must finish");
     testing::clear_gc_stat_hook();
+    testing::clear_checkpoint_hook();
 
     testing::checkpoint_and_wait(&bucket);
     mace.start_gc();
@@ -653,15 +850,13 @@ fn run_lagging_checkpoint_retire_cut(
     for key in &keys {
         assert!(
             matches!(view.get(key), Err(OpCode::NotFound)),
-            "{kind:?} {schedule:?} key {key} must be deleted"
+            "{kind:?} key {key} must be deleted"
         );
     }
-    if matches!(schedule, CheckpointSchedule::AfterGcCut) {
-        assert_eq!(
-            view.get("late_checkpoint_key")?.slice(),
-            vec![b'b'; value_len]
-        );
-    }
+    assert_eq!(
+        view.get("late_checkpoint_key")?.slice(),
+        vec![b'b'; value_len]
+    );
     drop(view);
     drop(bucket);
     drop(mace);
@@ -801,6 +996,8 @@ fn run_publishing_checkpoint_reresolves_owner(
     let (release_tx, release_rx) = channel();
     let release_rx = Arc::new(Mutex::new(release_rx));
     let (wait_tx, wait_rx) = channel();
+    let (gate_release_tx, gate_release_rx) = channel();
+    let (commit_tx, commit_rx) = channel();
     let publishing_fired = Arc::new(AtomicBool::new(false));
     let wait_fired = Arc::new(AtomicBool::new(false));
     let output_count = Arc::new(AtomicUsize::new(0));
@@ -811,6 +1008,7 @@ fn run_publishing_checkpoint_reresolves_owner(
         let wait_fired = wait_fired.clone();
         let output_count = output_count.clone();
         let release_rx = release_rx.clone();
+        let gate_release_rx = Arc::new(Mutex::new(gate_release_rx));
         move |point, observed_bucket_id, observed_db_root| {
             if observed_bucket_id != bucket_id || observed_db_root != db_root {
                 return;
@@ -841,14 +1039,22 @@ fn run_publishing_checkpoint_reresolves_owner(
                 (kind, point),
                 (
                     TestFileKind::Data,
-                    testing::GcStatSyncPoint::DataCheckpointPublishingWait
+                    testing::GcStatSyncPoint::DataRewriteGateClosed
                 ) | (
                     TestFileKind::Blob,
-                    testing::GcStatSyncPoint::BlobCheckpointPublishingWait
+                    testing::GcStatSyncPoint::BlobRewriteGateClosed
                 )
             );
             if is_wait && !wait_fired.swap(true, Ordering::SeqCst) {
                 wait_tx.send(()).expect("signal checkpoint publishing wait");
+                gate_release_rx
+                    .lock()
+                    .expect("lock gate release receiver")
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release publishing gate");
+            }
+            if point == testing::GcStatSyncPoint::CheckpointBeforeManifestCommit {
+                commit_tx.send(()).expect("signal checkpoint commit");
             }
         }
     })));
@@ -859,13 +1065,9 @@ fn run_publishing_checkpoint_reresolves_owner(
     };
     let gc_mace = mace.clone();
     let gc_thread = std::thread::spawn(move || gc_mace.start_gc());
-    publishing_rx
+    wait_rx
         .recv_timeout(Duration::from_secs(10))
-        .expect("rewrite must enter publishing");
-    assert!(
-        output_count.load(Ordering::Acquire) > 1,
-        "integration workload must produce multiple rewrite outputs"
-    );
+        .expect("gc must close the publishing gate");
 
     let txn = bucket.begin()?;
     for key in &keys {
@@ -875,11 +1077,23 @@ fn run_publishing_checkpoint_reresolves_owner(
     let checkpoint_bucket = bucket.clone();
     let checkpoint_thread =
         std::thread::spawn(move || testing::checkpoint_and_wait(&checkpoint_bucket));
-    wait_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("checkpoint must wait on publishing ownership");
 
+    assert!(
+        commit_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "checkpoint must not commit while the publishing gate is closed"
+    );
+    gate_release_tx.send(()).expect("release publishing gate");
+    publishing_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("rewrite must enter publishing");
+    assert!(
+        output_count.load(Ordering::Acquire) > 1,
+        "integration workload must produce multiple rewrite outputs"
+    );
     release_tx.send(()).expect("release rewrite publishing");
+    commit_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("checkpoint must commit after the publishing gate reopens");
     gc_thread.join().expect("rewrite gc must finish");
     checkpoint_thread
         .join()
@@ -940,6 +1154,16 @@ fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
     };
     let alpha = mace.new_bucket("alpha", bucket_options.clone())?;
     let beta = mace.new_bucket("beta", bucket_options)?;
+    let doomed = mace.new_bucket(
+        "doomed",
+        BucketOptions {
+            inline_size: 1024,
+            checkpoint_size: 64 << 10,
+            pool_capacity: 128 << 10,
+            enable_backpressure: false,
+            ..BucketOptions::default()
+        },
+    )?;
     let data_v1 = vec![b'a'; 512];
     let data_v2 = vec![b'b'; 512];
     let blob_v1 = vec![b'x'; 8 << 10];
@@ -954,6 +1178,25 @@ fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
         tx.commit()?;
         testing::checkpoint_and_wait(bucket);
     }
+    let tx = doomed.begin()?;
+    for idx in 0..96 {
+        tx.put(format!("data_{idx:03}"), &data_v1)?;
+        tx.put(format!("blob_{idx:03}"), &blob_v1)?;
+    }
+    tx.commit()?;
+    testing::checkpoint_and_wait(&doomed);
+    let tx = doomed.begin()?;
+    let doomed_delete_ts = testing::txn_start_ts(&tx);
+    for idx in 0..96 {
+        tx.del(format!("data_{idx:03}"))?;
+        tx.del(format!("blob_{idx:03}"))?;
+    }
+    tx.commit()?;
+    testing::checkpoint_and_wait(&doomed);
+    assert!(common::collector_rounds_until(&doomed, 8, || {
+        testing::safe_exclusive(&doomed) > doomed_delete_ts
+    }));
+    drop(doomed);
     for bucket in [&alpha, &beta] {
         let tx = bucket.begin()?;
         for idx in (0..96).step_by(2) {
@@ -997,6 +1240,10 @@ fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
         assert_eq!(view.get("blob_000")?.slice(), blob_v2.as_slice());
         assert_eq!(view.get("blob_001")?.slice(), blob_v1.as_slice());
     }
+    let doomed = mace.open_bucket("doomed")?;
+    let doomed_view = doomed.view()?;
+    assert!(matches!(doomed_view.get("data_000"), Err(OpCode::NotFound)));
+    assert!(matches!(doomed_view.get("blob_000"), Err(OpCode::NotFound)));
     common::gc_round(&mace, Duration::from_secs(30));
     testing::assert_persisted_gc_stats(&mace);
     Ok(())
@@ -1948,7 +2195,7 @@ fn abort_clean_blocks_drop_until_task_is_fully_removed() -> Result<(), OpCode> {
 #[test]
 fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
     use mace::testing::{self, AbortCleanStage};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
 
     let _hook_lock = testing::checkpoint_test_lock();
 
@@ -1981,13 +2228,13 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
         txid
     ));
 
-    let callback_seen = Arc::new(AtomicBool::new(false));
+    let (callback_tx, callback_rx) = channel();
     testing::set_abort_clean_hook(Some(Arc::new({
-        let callback_seen = callback_seen.clone();
+        let callback_tx = callback_tx.clone();
         move |point, callback_txid| {
             if point == testing::AbortCleanSyncPoint::AfterQuiesceCallback && callback_txid == txid
             {
-                callback_seen.store(true, Ordering::Release);
+                let _ = callback_tx.send(());
             }
         }
     })));
@@ -2011,14 +2258,21 @@ fn abort_clean_lifecycle_closes_state_and_protections() -> Result<(), OpCode> {
     assert_eq!(mace.drop_bucket("x"), Err(OpCode::Again));
 
     drop(callback_blocker);
-    let callback_deadline = Instant::now() + Duration::from_secs(5);
-    while !callback_seen.load(Ordering::Acquire) && Instant::now() < callback_deadline {
+    // the deferred callback only runs once some thread advances the epoch, so keep flushing it
+    // while waiting: blocking on the channel alone waits for background cadence that parallel test
+    // load can starve. no extra gc round is driven here, because the task must still be parked at
+    // `WaitingQuiesce` when the assertion below reads it
+    let callback_deadline = Instant::now() + Duration::from_secs(30);
+    while callback_rx.try_recv().is_err() {
+        assert!(
+            Instant::now() < callback_deadline,
+            "abort-clean quiesce callback must run after the blocker is released"
+        );
         let guard = crossbeam_epoch::pin();
         guard.flush();
         drop(guard);
         std::thread::yield_now();
     }
-    assert!(callback_seen.load(Ordering::Acquire));
     let bucket = mace.open_bucket("x")?;
     assert_eq!(
         testing::abort_clean_task_stage(&bucket, txid),
@@ -2369,4 +2623,129 @@ fn zero_gc_timeout_only_runs_on_explicit_start() {
         counter_value(&relaxed_observer, CounterMetric::GcRun),
         relaxed_baseline + 1
     );
+}
+
+/// the fully-obsolete reclaim and the bucket delete path both retire a bucket's
+/// files, so either may find a stat key the other already deleted. the second
+/// delete must commit as a miss instead of failing the whole metadata
+/// transaction, and the surviving bucket's committed values must stay readable
+#[cfg(feature = "extra_check")]
+#[test]
+fn bucket_delete_racing_obsolete_reclaim_keeps_committed_values() -> Result<(), OpCode> {
+    // the gc stat hook is process-global: take the same lock every other hook-using test in this
+    // binary takes, or a concurrently running test clobbers this one's hook mid-run
+    let _hook_lock = testing::checkpoint_test_lock();
+    let _reset = HookReset;
+    // `tmp()` unlinks the root on drop; `new()` keeps it, so every run of this test would leave
+    // a database root behind in the temporary directory
+    let path = RandomPath::tmp();
+    let observer = Arc::new(InMemoryObserver::default());
+    let mut opt = Options::new(&*path);
+    opt.concurrent_write = 1;
+    opt.sync_on_write = true;
+    opt.data_file_size = 16 << 10;
+    opt.wal_buffer_size = 1 << 20;
+    opt.wal_file_size = 1 << 20;
+    opt.gc_eager = false;
+    opt.data_garbage_ratio = 100;
+    opt.blob_garbage_ratio = 100;
+    opt.observer = observer.clone();
+    common::deterministic_gc(&mut opt);
+    let mace = Mace::new(opt.validate()?)?;
+
+    let bucket_opt = || BucketOptions {
+        inline_size: 8192,
+        cache_evict_pct: 10,
+        checkpoint_size: 32 << 10,
+        pool_capacity: 64 << 10,
+        enable_backpressure: false,
+        ..BucketOptions::default()
+    };
+    let doomed = mace.new_bucket("doomed", bucket_opt())?;
+    let keeper = mace.new_bucket("keeper", bucket_opt())?;
+
+    let payload = vec![b'd'; 1024];
+    let txn = doomed.begin()?;
+    for idx in 0..192 {
+        txn.put(format!("dok_{idx:04}"), &payload)?;
+    }
+    txn.commit()?;
+    let txn = keeper.begin()?;
+    txn.put("survivor", b"kept")?;
+    txn.commit()?;
+    testing::checkpoint_and_wait(&doomed);
+    testing::checkpoint_and_wait(&keeper);
+
+    // every record of the doomed bucket's files becomes junk, so the next
+    // reclaim round retires those files as fully obsolete
+    let txn = doomed.begin()?;
+    for idx in 0..192 {
+        txn.del(format!("dok_{idx:04}"))?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&doomed);
+
+    let bucket_id = doomed.id();
+    let db_root = path.as_path().to_path_buf();
+    drop(doomed);
+
+    let (fired_tx, fired_rx) = channel();
+    let (release_tx, release_rx) = channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let fired = Arc::new(AtomicBool::new(false));
+    testing::set_gc_stat_hook(Some(Arc::new({
+        let fired = fired.clone();
+        let release_rx = release_rx.clone();
+        move |point, observed_bucket, observed_root| {
+            if observed_bucket != bucket_id || observed_root != db_root {
+                return;
+            }
+            // park the reclaim right after its durable stat deletion, with the
+            // in-memory stat list still naming the victim file
+            if point == testing::GcStatSyncPoint::DataObsoleteAfterMetaCommit
+                && !fired.swap(true, Ordering::SeqCst)
+            {
+                fired_tx.send(()).expect("signal reclaim cut");
+                let _ = release_rx
+                    .lock()
+                    .expect("lock reclaim release receiver")
+                    .recv_timeout(Duration::from_secs(20));
+            }
+        }
+    })));
+
+    let gc_mace = mace.clone();
+    let gc = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            gc_mace.start_gc();
+            if fired.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    fired_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("reclaim must reach its obsolete meta commit");
+    mace.del_bucket("doomed")?;
+    release_tx.send(()).expect("release reclaim");
+    gc.join().expect("gc thread must finish");
+
+    assert!(
+        counter_value(&observer, CounterMetric::FlushConditionalDataDelMiss) >= 1,
+        "the overlapping delete must be recorded as a conditional miss"
+    );
+    assert!(
+        mace.open_bucket("doomed").is_err(),
+        "the deleted bucket must be gone"
+    );
+    let view = keeper.view()?;
+    assert_eq!(
+        view.get("survivor")?.slice(),
+        b"kept",
+        "the untouched bucket must keep its committed value"
+    );
+    Ok(())
 }

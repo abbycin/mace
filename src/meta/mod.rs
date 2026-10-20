@@ -1,13 +1,15 @@
 pub(crate) mod builder;
 mod entry;
+pub(crate) mod guard;
 mod manifest;
 mod stat;
 mod txn;
 
+pub(crate) use guard::DeletionGuard;
+
 use crate::map::buffer::BucketContext;
 use crate::utils::interval::IntervalMap;
 use crate::utils::options::ParsedOptions;
-#[cfg(feature = "extra_check")]
 pub(crate) use entry::IMetaCodec;
 pub use entry::{
     BucketDurableFrontier, BucketMeta, DelInterval, Delete, FileKind, IntervalPair, MemStat,
@@ -15,7 +17,7 @@ pub use entry::{
 };
 pub(crate) use manifest::Manifest;
 use parking_lot::RwLock;
-pub(crate) use stat::{FileReader, new_reader};
+pub(crate) use stat::{FileReader, JunkPermit, new_reader, try_new_reader};
 use std::path::PathBuf;
 pub(crate) use txn::Txn;
 

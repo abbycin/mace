@@ -1,4 +1,4 @@
-use crate::cc::{SnapshotStamp, is_visible_to};
+use crate::cc::{SnapshotStamp, is_retained_abort, is_visible_to};
 use crate::map::buffer::BucketContext;
 use crate::map::publish::AllocGuard;
 use crate::map::{Loader, Node, Page};
@@ -92,7 +92,7 @@ impl ValRef {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    /// Converts the reference into a owned Vec<u8>.
+    /// Converts the reference into an owned `Vec<u8>`.
     pub fn to_vec(self) -> Vec<u8> {
         if self.is_folded() {
             let ptr = self.ptr;
@@ -1056,12 +1056,7 @@ impl Tree {
         if head_ver.txid != aborted_txid {
             return Ok(false);
         }
-        if !self
-            .store
-            .context
-            .group(head_val.group_id() as usize)
-            .is_retained_abort(aborted_txid)
-        {
+        if !is_retained_abort(&self.store.context, head_val.group_id(), aborted_txid) {
             return Ok(false);
         }
 

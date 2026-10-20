@@ -23,8 +23,9 @@ fn compatible_update(seed: u8) -> BucketOptions {
 }
 
 fn incompatible_update(seed: u8) -> BucketOptions {
+    // inline_size may only be lowered; raising it is rejected (existing values carry their own inline/remote
+    // form), so only split_elems remains a rejection-worthy conflict
     BucketOptions {
-        inline_size: if seed & 1 == 0 { 4096 } else { 8192 },
         split_elems: if seed & 2 == 0 { 128 } else { 256 },
         ..compatible_update(seed)
     }

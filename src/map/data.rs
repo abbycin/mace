@@ -1113,41 +1113,45 @@ impl ParsedFooter {
 
 impl MetaReader {
     pub(crate) fn new<P: AsRef<Path>>(fs: &dyn FileSystem, path: P) -> Self {
-        let file = must_ok!(
-            File::options().read(true).trunc(false).open(fs, &path),
-            "can't open {:?}",
-            path.as_ref()
-        );
-        let end = must_ok!(file.size(), "can't get file size");
-        if end < size_of::<FileFooter>() as u64 {
-            must_ok!(
-                Result::<(), OpCode>::Err(OpCode::Invalid),
-                "incomplete trailer"
-            );
-        }
-        let footer = Self::read_tail::<FileFooter>(&file, end - size_of::<FileFooter>() as u64);
-        let version_raw = footer.version;
-        let version = must_ok!(
-            FileVersion::from_raw(version_raw).ok_or(OpCode::BadVersion),
-            "unsupported file version {}",
-            version_raw
-        );
-        must_true!(
-            footer.is_supported_version(version),
-            "unsupported file trailer fields for version {}",
-            version.raw()
-        );
-        let footer = ParsedFooter::from_footer(version, footer);
-        let interval_len = must_exist!((footer.nr_intervals as usize).checked_mul(Interval::LEN));
-        let reloc_len = must_exist!((footer.nr_reloc as usize).checked_mul(AddrPair::LEN));
-        let meta_len = must_exist!(
-            interval_len
-                .checked_add(reloc_len)
-                .and_then(|x| x.checked_add(size_of::<FileFooter>()))
-        );
-        must_true!(end >= meta_len as u64, "file trailer exceeds file size");
+        must_ok!(Self::try_new(fs, path), "can't open payload metadata")
+    }
 
-        Self { file, footer, end }
+    /// fallible variant of [`Self::new`], for readers that must report damage
+    /// instead of aborting (the offline checker)
+    pub(crate) fn try_new<P: AsRef<Path>>(fs: &dyn FileSystem, path: P) -> Result<Self, OpCode> {
+        let path = path.as_ref();
+        let file = File::options()
+            .read(true)
+            .trunc(false)
+            .open(fs, path)
+            .map_err(OpCode::from)?;
+        let end = file.size().map_err(OpCode::from)?;
+        if end < size_of::<FileFooter>() as u64 {
+            return Err(OpCode::Corruption);
+        }
+        let footer =
+            Self::try_read_tail::<FileFooter>(&file, end - size_of::<FileFooter>() as u64)?;
+        let version_raw = footer.version;
+        let version = FileVersion::from_raw(version_raw).ok_or(OpCode::BadVersion)?;
+        if !footer.is_supported_version(version) {
+            return Err(OpCode::BadVersion);
+        }
+        let footer = ParsedFooter::from_footer(version, footer);
+        let interval_len = (footer.nr_intervals as usize)
+            .checked_mul(Interval::LEN)
+            .ok_or(OpCode::Corruption)?;
+        let reloc_len = (footer.nr_reloc as usize)
+            .checked_mul(AddrPair::LEN)
+            .ok_or(OpCode::Corruption)?;
+        let meta_len = interval_len
+            .checked_add(reloc_len)
+            .and_then(|x| x.checked_add(size_of::<FileFooter>()))
+            .ok_or(OpCode::Corruption)?;
+        if end < meta_len as u64 {
+            return Err(OpCode::Corruption);
+        }
+
+        Ok(Self { file, footer, end })
     }
 
     pub(crate) fn version(&self) -> FileVersion {
@@ -1155,8 +1159,13 @@ impl MetaReader {
     }
 
     pub(crate) fn get_reloc(&mut self) -> Box<[AddrPair]> {
+        must_ok!(self.try_get_reloc(), "can't read relocations")
+    }
+
+    /// fallible variant of [`Self::get_reloc`]
+    pub(crate) fn try_get_reloc(&mut self) -> Result<Box<[AddrPair]>, OpCode> {
         let len = self.footer.nr_reloc as usize * AddrPair::LEN;
-        self.read_meta(
+        self.try_read_meta(
             self.end - (len + size_of::<FileFooter>()) as u64,
             self.footer.nr_reloc as usize,
             self.footer.reloc_crc,
@@ -1164,8 +1173,13 @@ impl MetaReader {
     }
 
     pub(crate) fn get_interval(&mut self) -> Box<[Interval]> {
+        must_ok!(self.try_get_interval(), "can't read intervals")
+    }
+
+    /// fallible variant of [`Self::get_interval`]
+    pub(crate) fn try_get_interval(&mut self) -> Result<Box<[Interval]>, OpCode> {
         let len = self.footer.nr_intervals as usize * Interval::LEN;
-        self.read_meta(
+        self.try_read_meta(
             self.end
                 - (len + self.footer.nr_reloc as usize * AddrPair::LEN + size_of::<FileFooter>())
                     as u64,
@@ -1174,46 +1188,38 @@ impl MetaReader {
         )
     }
 
-    fn read_meta<U>(&self, off: u64, count: usize, crc: u32) -> Box<[U]> {
-        let len = must_exist!(size_of::<U>().checked_mul(count));
+    fn try_read_meta<U>(&self, off: u64, count: usize, crc: u32) -> Result<Box<[U]>, OpCode> {
+        let len = size_of::<U>()
+            .checked_mul(count)
+            .ok_or(OpCode::Corruption)?;
         let mut data = Box::<[MaybeUninit<U>]>::new_uninit_slice(count);
         let dst = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), len) };
-        Self::read_exact(&self.file, dst, off);
+        Self::try_read_exact(&self.file, dst, off)?;
         let mut h = Crc32cHasher::default();
         h.write(dst);
-        let actual_crc = h.finish() as u32;
-        if actual_crc != crc {
-            must_ok!(
-                Result::<(), OpCode>::Err(OpCode::Corruption),
-                "checksum mismatch, expect {} get {}",
-                crc,
-                actual_crc
-            );
+        if h.finish() as u32 != crc {
+            return Err(OpCode::Corruption);
         }
         let p = Box::into_raw(data) as *mut [U];
-        unsafe { Box::from_raw(p) }
+        unsafe { Ok(Box::from_raw(p)) }
     }
 
-    fn read_tail<T: Default>(file: &File, off: u64) -> T {
+    fn try_read_tail<T: Default>(file: &File, off: u64) -> Result<T, OpCode> {
         let mut footer = T::default();
         let dst = unsafe {
             let p = addr_of_mut!(footer);
             std::slice::from_raw_parts_mut(p.cast::<u8>(), size_of::<T>())
         };
-        Self::read_exact(file, dst, off);
-        footer
+        Self::try_read_exact(file, dst, off)?;
+        Ok(footer)
     }
 
-    fn read_exact(file: &File, buf: &mut [u8], off: u64) {
-        let got = must_ok!(file.read(buf, off), "must read metadata");
+    fn try_read_exact(file: &File, buf: &mut [u8], off: u64) -> Result<(), OpCode> {
+        let got = file.read(buf, off).map_err(OpCode::from)?;
         if got != buf.len() {
-            must_ok!(
-                Result::<(), OpCode>::Err(OpCode::Corruption),
-                "incomplete metadata read: expect {} get {}",
-                buf.len(),
-                got
-            );
+            return Err(OpCode::Corruption);
         }
+        Ok(())
     }
 
     pub(crate) fn take(self) -> File {

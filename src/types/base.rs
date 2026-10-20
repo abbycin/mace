@@ -87,7 +87,10 @@ impl BaseView {
             }
 
             let k = ks.remove_prefix(prefix_len);
-            if cv.is_remote() {
+            // rows whose record reaches the inline boundary end up as remote
+            // envelopes in the rebuilt leaf; that includes stored inline rows
+            // above a lowered bucket threshold, which materialize in pass 2
+            if cv.is_remote() || cv.data_size() >= inline_size {
                 remote_hint_cnt += 1;
             }
             let vsz = cv.data_size();
@@ -166,10 +169,7 @@ impl BaseView {
             // any large-value write (lsn/group aligned for GC retirement)
             let (r, remote) = match v.materialize_blob(a, group, lsn) {
                 Some(x) => x,
-                None => {
-                    let (r, _) = v.get_record(l);
-                    (r, v.get_remote())
-                }
+                None => v.record_with_remote(a, l, group, lsn),
             };
             if remote != NULL_ADDR {
                 remote_hint_addrs.push(remote);
@@ -360,10 +360,7 @@ impl BaseView {
                 // dangling address for them
                 let (r, remote) = match v.materialize_blob(a, group, lsn) {
                     Some(x) => x,
-                    None => {
-                        let (r, _) = v.get_record(l);
-                        (r, v.get_remote())
-                    }
+                    None => v.record_with_remote(a, l, group, lsn),
                 };
                 if remote != NULL_ADDR {
                     remote_hint_addrs.push(remote);

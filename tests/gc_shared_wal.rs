@@ -119,6 +119,9 @@ fn durable_shared_gc_respects_group1_active_pin() -> Result<(), OpCode> {
     let saved = opt.clone();
     let mace = Mace::new(opt.validate()?)?;
     let db = mace.new_bucket("x", BucketOptions::default())?;
+    // checkpoint completion queues wal gc independently of the gc timer, so retain
+    // the old-file witness until its identity and the active pin have been captured
+    let retain_wal = testing::suspend_deletions(&mace);
 
     // 501 sequential commits consume tickets 0..=500, so ticket 501 lands in group 1
     for i in 0..501 {
@@ -132,7 +135,7 @@ fn durable_shared_gc_respects_group1_active_pin() -> Result<(), OpCode> {
     assert_eq!(testing::txn_group(&db, pin_txid), Some(1));
     pin.put("pin", b"v")?;
 
-    db.checkpoint();
+    db.checkpoint_and_wait();
 
     let probes = testing::wal_record_probes(&log_root, 2);
     let begin = probes
@@ -146,13 +149,19 @@ fn durable_shared_gc_respects_group1_active_pin() -> Result<(), OpCode> {
         .min()
         .expect("probes must exist");
     let first_file = saved.group_wal_file(first_file_id);
+    drop(retain_wal);
     // GC can only recycle before the group 1 pin after group 0's checkpoint
     // publication has crossed the earliest WAL file.  Wait for that async
     // publication explicitly instead of racing it with the GC assertion.
     db.checkpoint_and_wait();
     assert!(
         testing::shared_checkpoint_floor(&db, 0).0 > first_file_id,
-        "scenario precondition: group 0 checkpoint must pass the earliest WAL file before gc"
+        "scenario precondition: group 0 checkpoint must pass the earliest WAL file before gc; first={first_file_id} floor0={:?} floor1={:?} frontier0={:?} frontier1={:?} {}",
+        testing::shared_checkpoint_floor(&db, 0),
+        testing::shared_checkpoint_floor(&db, 1),
+        testing::durable_frontier(&db, 0),
+        testing::durable_frontier(&db, 1),
+        testing::debug_snapshot(&mace)
     );
     let recycled_earlier = common::gc_rounds_until(&mace, 8, || !first_file.exists());
     assert!(

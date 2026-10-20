@@ -53,11 +53,7 @@ macro_rules! impl_varint {
                         return (<$e>::from(x)).checked_shl(shift).map(|x| (n | x, (i+1) as usize));
                     }
                     // extract lower 7 bits
-                    if let Some(x) = ((<$e>::from(x)) & 127).checked_shl(shift) {
-                        n |= x;
-                    } else {
-                        return None;
-                    }
+                    n |= ((<$e>::from(x)) & 127).checked_shl(shift)?;
                     shift += 7;
                 }
                 None

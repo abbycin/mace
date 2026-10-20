@@ -21,7 +21,7 @@ use crate::{
     map::{
         IDataReader, SharedState,
         buffer::{BucketContext, BucketMgr},
-        flush::CheckpointObserver,
+        flush::{Checkpoint, CheckpointObserver},
         table::{BucketState, PageMap},
     },
     meta::{
@@ -40,11 +40,11 @@ use crate::{
 
 use super::{
     BUCKET_FRONTIER, BUCKET_METAS, BUCKET_MISC, BUCKET_PENDING_DEL, BUCKET_VERSION,
-    BucketDurableFrontier, BucketMeta, CURRENT_VERSION, Delete, FileKind, IntervalPair,
-    MAX_BUCKETS, MemStat, MetaKind, OPTIONS_KEY, PersistStat, VERSION_KEY, WalRecycleIntent,
-    WalRecycleState, delete_done_meta_kind, delete_meta_kind, interval_bucket_name,
-    orphan_blob_marker_key, orphan_data_marker_key, stat::StatCtx, stat_file_path, stat_intervals,
-    txn::Txn, wal_recycle_key,
+    BucketDurableFrontier, BucketMeta, CURRENT_VERSION, Delete, DeletionGuard, FileKind,
+    IntervalPair, MAX_BUCKETS, MemStat, MetaKind, OPTIONS_KEY, PersistStat, VERSION_KEY,
+    WalRecycleIntent, WalRecycleState, delete_done_meta_kind, delete_meta_kind,
+    interval_bucket_name, orphan_blob_marker_key, orphan_data_marker_key, stat::StatCtx,
+    stat_file_path, stat_intervals, txn::Txn, wal_recycle_key,
 };
 
 pub(crate) struct Manifest {
@@ -61,6 +61,8 @@ pub(crate) struct Manifest {
     retired_stat_keys: RetiredStatKeys,
     pub(crate) opt: Arc<ParsedOptions>,
     pub(crate) btree: BTree,
+    /// suspends runtime file deletions while a checkpoint copies them
+    pub(crate) deletions: Arc<DeletionGuard>,
 }
 
 enum BucketRemoveMode {
@@ -83,9 +85,16 @@ impl Manifest {
         }
     }
 
-    pub(crate) fn new(opt: Arc<ParsedOptions>, tx: Sender<SharedState>, rx: Receiver<()>) -> Self {
+    pub(crate) fn new(
+        opt: Arc<ParsedOptions>,
+        tx: Sender<SharedState>,
+        rx: Receiver<()>,
+    ) -> Result<Self, OpCode> {
         let path = opt.manifest();
-        let btree = must_ok!(BTree::open(path), "can't open btree-store");
+        // an open failure is recoverable for the caller: another instance holding the
+        // lock maps to `OpCode::Again` and a file this build cannot read to
+        // `OpCode::Corruption`, so opening must not abort the process
+        let btree = BTree::open(path).map_err(OpCode::from)?;
         let buckets_to_ensure = [
             BUCKET_MISC,
             BUCKET_DATA_STAT,
@@ -102,7 +111,7 @@ impl Manifest {
             Self::ensure_btree_bucket(&btree, name);
         }
 
-        Self {
+        Ok(Self {
             sequences: Arc::new(Sequences::default()),
             files: [
                 FileState::new(opt.clone(), FileKind::Data),
@@ -123,7 +132,8 @@ impl Manifest {
             nr_buckets: AtomicU64::new(0),
             opt,
             btree,
-        }
+            deletions: DeletionGuard::new(),
+        })
     }
 
     pub(crate) fn load_persisted_options_if_present(
@@ -167,21 +177,45 @@ impl Manifest {
         ctx: Handle<Context>,
         reader: Arc<dyn IDataReader>,
         observer: Arc<dyn CheckpointObserver>,
-    ) {
+    ) -> Result<(), OpCode> {
         unsafe {
             let mgr = &mut *self.buckets.inner();
-            mgr.start(ctx, reader, observer);
+            mgr.start(ctx, reader, observer)
         }
+    }
+
+    /// restart the recovery checkpoint flusher on the recovered Context.
+    ///
+    /// a same-width rebuild stops the flusher before it detaches the recovery
+    /// writers, so this entry must find no running flusher: replacing a live one
+    /// would leave its thread and its tasks behind (`Checkpoint` has no `Drop`).
+    /// `BucketMgr::start` enforces that rule at the site that replaces the flusher
+    /// and returns the violation as an error
+    pub(crate) fn restart_checkpoint_flusher(
+        &mut self,
+        ctx: Handle<Context>,
+        reader: Arc<dyn IDataReader>,
+        observer: Arc<dyn CheckpointObserver>,
+    ) -> Result<(), OpCode> {
+        self.set_context(ctx, reader, observer)
     }
 
     pub(crate) fn abort(&mut self) {
         self.buckets.abort();
     }
 
+    /// detach the bucket checkpoint flusher.
+    ///
+    /// `BucketMgr::start` refuses to publish a second flusher and `Checkpoint` has no `Drop`,
+    /// so a Context rebind must stop the running flusher explicitly instead of dropping it
+    pub(crate) fn take_checkpoint_flusher(&mut self) -> Option<Checkpoint> {
+        self.buckets.flush.take()
+    }
+
     fn bucket_is_empty(&self, bucket: &str) -> Result<bool, OpCode> {
         self.btree
             .view(bucket, |txn| {
-                let mut iter = txn.iter_uncached();
+                let mut iter = txn.iter();
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 Ok(!iter.next_ref(&mut k, &mut v))
@@ -283,6 +317,21 @@ impl Manifest {
 
     pub(crate) fn stat_ctx(&self, kind: FileKind) -> &StatCtx {
         &self.file_state(kind).stat
+    }
+
+    pub(crate) fn try_acquire_junk_permit(
+        &self,
+        kind: FileKind,
+    ) -> Option<crate::meta::stat::JunkPermit<'_>> {
+        self.stat_ctx(kind).try_acquire_junk_permit()
+    }
+
+    pub(crate) fn close_junk_gate(&self, kind: FileKind) -> crate::meta::stat::JunkGate<'_> {
+        self.stat_ctx(kind).close_junk_gate()
+    }
+
+    pub(crate) fn wait_junk_gate_open(&self, kind: FileKind) {
+        self.stat_ctx(kind).wait_junk_gate_open()
     }
 
     pub(crate) fn durable_frontier_lsn(&self, bucket_id: u64, group: u8) -> Position {
@@ -469,9 +518,13 @@ impl Manifest {
         new: &PersistedBucketOptions,
     ) -> Vec<&'static str> {
         let mut conflicts = Vec::new();
-        if old.inline_size != new.inline_size {
+        // inline_size may only move downward. Lowering the threshold is handled
+        // by rebuild materialization; raising it would require converting
+        // existing remote rows back to inline rows and retiring their blobs.
+        if new.inline_size > old.inline_size {
             conflicts.push("inline_size");
         }
+        // split_elems shapes persisted tree topology and stays immutable.
         if old.split_elems != new.split_elems {
             conflicts.push("split_elems");
         }
@@ -781,7 +834,7 @@ impl Manifest {
             self.save_obsolete_files(kind, ids);
         }
         self.bucket_frontier.remove(&bucket_id);
-        self.delete_files();
+        must_ok!(self.delete_files());
 
         Ok(())
     }
@@ -796,7 +849,7 @@ impl Manifest {
         for kind in FileKind::ALL {
             let interval_table = interval_bucket_name(kind, bucket_id);
             let _ = self.btree.view(&interval_table, |txn| {
-                let mut iter = txn.iter_uncached();
+                let mut iter = txn.iter();
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 let mut map = stat_intervals(kind, ctx).write();
@@ -985,7 +1038,7 @@ impl Manifest {
         }
     }
 
-    fn unsynced_set(&self, kind: FileKind) -> &parking_lot::RwLock<std::collections::HashSet<u64>> {
+    fn unsynced_set(&self, kind: FileKind) -> &RwLock<HashSet<u64>> {
         &self.file_state(kind).unsync
     }
 
@@ -1026,7 +1079,18 @@ impl Manifest {
         }
     }
 
-    pub(crate) fn delete_files(&self) {
+    /// remove the obsolete files recorded in the manifest.
+    ///
+    /// the open path propagates a failed directory sync (the caller can still fail the open);
+    /// runtime callers keep their fail-stop by wrapping the result
+    pub(crate) fn delete_files(&self) -> Result<(), OpCode> {
+        // a running checkpoint suspends deletions: skip the whole phase so that no
+        // file is unlinked and no `*DeleteDone` record advances. the obsolete ids stay
+        // in memory (and their durable `Delete` records stay in the manifest), so the
+        // next call retries exactly this batch.
+        let Some(_work) = self.deletions.begin() else {
+            return Ok(());
+        };
         let mut deleted = [Vec::new(), Vec::new()];
         for kind in FileKind::ALL {
             let mut lk = self.file_state(kind).obsolete.lock();
@@ -1049,7 +1113,7 @@ impl Manifest {
             .iter()
             .any(|&kind| !deleted[kind.slot()].is_empty())
         {
-            self.opt.sync_data_dir();
+            self.opt.try_sync_data_dir()?;
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_delete_files_after_dir_sync_before_meta_commit");
 
@@ -1066,6 +1130,7 @@ impl Manifest {
             }
             txn.commit();
         }
+        Ok(())
     }
 
     pub(crate) fn add_stat(&self, kind: FileKind, stat: MemStat, ivl: IntervalPair) {
@@ -1128,6 +1193,7 @@ impl Manifest {
     pub(crate) fn apply_junks(
         &self,
         kind: FileKind,
+        permit: &crate::meta::stat::JunkPermit<'_>,
         bucket_id: u64,
         tick: u64,
         junks: &[u64],
@@ -1137,7 +1203,7 @@ impl Manifest {
         }
         let ctx = self.get_bucket_context_must_exist(bucket_id);
         self.stat_ctx(kind)
-            .apply_junks(tick, junks, &ctx, &self.btree, |file_id| {
+            .apply_junks(permit, tick, junks, &ctx, &self.btree, |file_id| {
                 let retired = self.is_retired_stat(kind, bucket_id, file_id);
                 #[cfg(feature = "metrics")]
                 if retired {

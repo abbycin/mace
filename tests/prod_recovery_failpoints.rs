@@ -161,7 +161,7 @@ fn manifest_bucket_exists(manifest: &BTree, bucket: &str) -> bool {
 
 fn manifest_bucket_keys(manifest: &BTree, bucket: &str) -> Option<Vec<Vec<u8>>> {
     match manifest.view(bucket, |txn| {
-        let mut iter = txn.iter_uncached();
+        let mut iter = txn.iter();
         let mut out = Vec::new();
         let mut k = Vec::new();
         let mut v = Vec::new();
@@ -616,6 +616,27 @@ fn assert_bucket_readable(db_root: &Path) {
         let key = format!("k_{idx}");
         let _ = view.get(&key);
     }
+}
+
+fn assert_multi_bucket_readable(db_root: &Path) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = true;
+    });
+    for name in ["prod_a", "prod_b"] {
+        let bucket = mace
+            .open_bucket(name)
+            .expect("multi-bucket bucket should exist after reopen");
+        let view = bucket.view().expect("open multi-bucket view after reopen");
+        for idx in 0..192 {
+            assert!(matches!(
+                view.get(format!("dok_{idx:04}")),
+                Err(OpCode::NotFound)
+            ));
+        }
+    }
+    #[cfg(feature = "extra_check")]
+    testing::assert_persisted_gc_stats(&mace);
 }
 
 fn assert_bucket_exists_after_reopen(db_root: &Path, name: &str) {
@@ -1084,6 +1105,69 @@ fn child_case_data_obsolete_reclaim(db_root: &Path) -> ! {
     panic!("data obsolete failpoint did not fire")
 }
 
+fn child_case_data_obsolete_reclaim_multi_bucket(db_root: &Path, inject_stat_failure: bool) -> ! {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 16 << 10;
+        opt.wal_buffer_size = 1 << 20;
+        opt.wal_file_size = 1 << 20;
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = false;
+        opt.data_garbage_ratio = 100;
+        opt.blob_garbage_ratio = 100;
+    });
+    let mut buckets = Vec::new();
+    for name in ["prod_a", "prod_b"] {
+        let bucket = match mace.open_bucket(name) {
+            Ok(bucket) => bucket,
+            Err(OpCode::NotFound) => mace
+                .new_bucket(
+                    name,
+                    BucketOptions {
+                        inline_size: 8192,
+                        cache_evict_pct: 10,
+                        checkpoint_size: 32 << 10,
+                        pool_capacity: 64 << 10,
+                        enable_backpressure: false,
+                        ..BucketOptions::default()
+                    },
+                )
+                .expect("create multi-bucket prod bucket failed"),
+            Err(err) => panic!("open multi-bucket prod bucket failed: {err:?}"),
+        };
+        let payload = vec![b'd'; 1024];
+        let seed = bucket.begin().expect("begin multi-bucket seed failed");
+        for idx in 0..192 {
+            seed.put(format!("dok_{idx:04}"), &payload)
+                .expect("seed multi-bucket key failed");
+        }
+        seed.commit().expect("commit multi-bucket seed failed");
+        bucket.checkpoint();
+        let delete = bucket.begin().expect("begin multi-bucket delete failed");
+        for idx in 0..192 {
+            delete
+                .del(format!("dok_{idx:04}"))
+                .expect("delete multi-bucket key failed");
+        }
+        delete.commit().expect("commit multi-bucket delete failed");
+        bucket.checkpoint();
+        buckets.push(bucket);
+    }
+    if inject_stat_failure {
+        testing::arm_failpoint_rule("mace_stat_load_persisted_inner=io");
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        for bucket in &buckets {
+            bucket.checkpoint();
+        }
+        mace.start_gc();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("multi-bucket data obsolete failpoint did not fire")
+}
+
 fn child_case_blob_obsolete_reclaim(db_root: &Path) -> ! {
     #[cfg(feature = "metrics")]
     let observer = Arc::new(InMemoryObserver::new(64));
@@ -1543,6 +1627,12 @@ fn failpoint_child() {
         }
         "stat_mask_before_load" => child_case_stat_mask_before_load(&db_root),
         "data_obsolete_reclaim" => child_case_data_obsolete_reclaim(&db_root),
+        "data_obsolete_reclaim_multi_bucket" => {
+            child_case_data_obsolete_reclaim_multi_bucket(&db_root, false)
+        }
+        "data_obsolete_stat_failure_multi_bucket" => {
+            child_case_data_obsolete_reclaim_multi_bucket(&db_root, true)
+        }
         "blob_obsolete_reclaim" => child_case_blob_obsolete_reclaim(&db_root),
         "wal_after_checkpoint_write" => child_case_wal_after_checkpoint_write(&db_root),
         "manifest_before_multi_commit" => child_case_manifest_before_multi_commit(&db_root),
@@ -1593,6 +1683,18 @@ fn failpoint_child() {
             child_case_txn_commit_abort_window(&db_root)
         }
         "evictor_before_evict_once" => child_case_evictor_before_evict_once(&db_root),
+        "abort_clean_hint_window_same_file" => {
+            child_case_abort_clean_hint_window_same_file(&db_root)
+        }
+        "abort_clean_hint_window_multi_file" => {
+            child_case_abort_clean_hint_window_multi_file(&db_root)
+        }
+        "abort_clean_hint_control_after_hint" => {
+            child_case_abort_clean_hint_control_after_hint(&db_root)
+        }
+        "abort_clean_crash_after_abort_sync" => {
+            child_case_abort_clean_crash_after_abort_sync(&db_root)
+        }
         _ => panic!("unknown failpoint case: {case}"),
     }
 }
@@ -1600,7 +1702,7 @@ fn failpoint_child() {
 #[test]
 #[ignore]
 fn chaos_failpoint_flush_after_data_sync() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_after_data_sync",
         &path,
@@ -1624,7 +1726,7 @@ fn chaos_failpoint_flush_after_data_sync() {
 #[test]
 #[ignore]
 fn chaos_failpoint_flush_after_data_dir_sync() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_after_data_dir_sync",
         &path,
@@ -1651,7 +1753,7 @@ fn chaos_failpoint_flush_after_data_dir_sync() {
 #[test]
 #[ignore]
 fn chaos_failpoint_flush_before_manifest_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_before_manifest_commit",
         &path,
@@ -1675,7 +1777,7 @@ fn chaos_failpoint_flush_before_manifest_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_flush_after_manifest_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_after_manifest_commit",
         &path,
@@ -1697,7 +1799,7 @@ fn chaos_failpoint_flush_after_manifest_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_flush_after_manifest_commit_with_retire() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_after_manifest_commit_with_retire",
         &path,
@@ -1713,7 +1815,7 @@ fn chaos_failpoint_flush_after_manifest_commit_with_retire() {
 #[test]
 #[ignore]
 fn chaos_failpoint_flush_after_data_sync_with_retire() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_after_manifest_commit_with_retire",
         &path,
@@ -1729,7 +1831,7 @@ fn chaos_failpoint_flush_after_data_sync_with_retire() {
 #[test]
 #[ignore]
 fn chaos_failpoint_flush_before_manifest_commit_with_retire() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_after_manifest_commit_with_retire",
         &path,
@@ -1745,7 +1847,7 @@ fn chaos_failpoint_flush_before_manifest_commit_with_retire() {
 #[test]
 #[ignore]
 fn chaos_failpoint_flush_after_manifest_commit_with_retire_multi_bucket() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_after_manifest_commit_with_retire_multi_bucket",
         &path,
@@ -1761,7 +1863,7 @@ fn chaos_failpoint_flush_after_manifest_commit_with_retire_multi_bucket() {
 #[test]
 #[ignore]
 fn chaos_failpoint_flush_after_old_stat_delta() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_after_old_stat_delta",
         &path,
@@ -1774,7 +1876,7 @@ fn chaos_failpoint_flush_after_old_stat_delta() {
 #[test]
 #[ignore]
 fn chaos_failpoint_stat_mask_before_load() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "stat_mask_before_load",
         &path,
@@ -1787,7 +1889,7 @@ fn chaos_failpoint_stat_mask_before_load() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_data_obsolete_after_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "data_obsolete_reclaim",
         &path,
@@ -1800,7 +1902,7 @@ fn chaos_failpoint_gc_data_obsolete_after_meta_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_data_obsolete_after_retired_mark() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "data_obsolete_reclaim",
         &path,
@@ -1816,7 +1918,7 @@ fn chaos_failpoint_gc_data_obsolete_after_retired_mark() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_data_obsolete_after_remove_stat() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "data_obsolete_reclaim",
         &path,
@@ -1828,8 +1930,35 @@ fn chaos_failpoint_gc_data_obsolete_after_remove_stat() {
 
 #[test]
 #[ignore]
+fn chaos_failpoint_gc_data_obsolete_multi_bucket_after_each_window() {
+    for failpoint in [
+        "mace_gc_data_obsolete_after_meta_commit=abort@1",
+        "mace_gc_data_obsolete_after_retired_mark=abort@1",
+        "mace_gc_data_obsolete_after_remove_stat=abort@1",
+    ] {
+        let path = RandomPath::tmp();
+        let status = spawn_child("data_obsolete_reclaim_multi_bucket", &path, failpoint);
+        assert_child_aborted(status, "multi-bucket obsolete child should abort");
+        assert_multi_bucket_readable(&path);
+    }
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_gc_data_obsolete_multi_bucket_stat_read_failure() {
+    let path = RandomPath::tmp();
+    let status = spawn_child("data_obsolete_stat_failure_multi_bucket", &path, "off");
+    assert_child_aborted(
+        status,
+        "multi-bucket durable-stat failure child should abort",
+    );
+    assert_multi_bucket_readable(&path);
+}
+
+#[test]
+#[ignore]
 fn chaos_failpoint_gc_blob_obsolete_after_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "blob_obsolete_reclaim",
         &path,
@@ -1842,7 +1971,7 @@ fn chaos_failpoint_gc_blob_obsolete_after_meta_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_blob_obsolete_after_retired_mark() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "blob_obsolete_reclaim",
         &path,
@@ -1858,7 +1987,7 @@ fn chaos_failpoint_gc_blob_obsolete_after_retired_mark() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_blob_obsolete_after_remove_stat() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "blob_obsolete_reclaim",
         &path,
@@ -1871,7 +2000,7 @@ fn chaos_failpoint_gc_blob_obsolete_after_remove_stat() {
 #[test]
 #[ignore]
 fn chaos_failpoint_wal_after_checkpoint_write() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "wal_after_checkpoint_write",
         &path,
@@ -1884,7 +2013,7 @@ fn chaos_failpoint_wal_after_checkpoint_write() {
 #[test]
 #[ignore]
 fn chaos_failpoint_manifest_before_multi_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "manifest_before_multi_commit",
         &path,
@@ -1897,7 +2026,7 @@ fn chaos_failpoint_manifest_before_multi_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_wal_recycle_before_intent_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "wal_recycle_before_intent_commit",
         &path,
@@ -1918,7 +2047,7 @@ fn chaos_failpoint_wal_recycle_before_intent_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_wal_recycle_after_remove_before_dir_sync() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "wal_recycle_after_remove_before_dir_sync",
         &path,
@@ -1939,7 +2068,7 @@ fn chaos_failpoint_wal_recycle_after_remove_before_dir_sync() {
 #[test]
 #[ignore]
 fn chaos_failpoint_wal_recycle_after_dir_sync_before_done_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "wal_recycle_done_windows",
         &path,
@@ -1960,7 +2089,7 @@ fn chaos_failpoint_wal_recycle_after_dir_sync_before_done_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_wal_recycle_after_done_commit_before_publish() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "wal_recycle_done_windows",
         &path,
@@ -2015,7 +2144,7 @@ fn seed_wal_recycle_intent_after_first_remove(db_root: &Path) {
 #[test]
 #[ignore]
 fn chaos_failpoint_recovery_wal_recycle_after_dir_sync_before_done_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     seed_wal_recycle_intent_after_dir_sync(&path);
 
     let status = spawn_child(
@@ -2044,7 +2173,7 @@ fn chaos_failpoint_recovery_wal_recycle_after_dir_sync_before_done_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_recovery_wal_recycle_after_done_commit_before_publish() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     seed_wal_recycle_intent_after_dir_sync(&path);
 
     let status = spawn_child(
@@ -2073,7 +2202,7 @@ fn chaos_failpoint_recovery_wal_recycle_after_done_commit_before_publish() {
 #[test]
 #[ignore]
 fn chaos_failpoint_recovery_fs_remove_file_io() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     seed_wal_recycle_intent_after_first_remove(&path);
 
     let status = spawn_child(
@@ -2095,7 +2224,7 @@ fn chaos_failpoint_recovery_fs_remove_file_io() {
 #[test]
 #[ignore]
 fn chaos_failpoint_txn_commit_after_wal_file_sync_before_dir_sync() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "txn_commit_after_wal_file_sync_before_dir_sync",
         &path,
@@ -2111,7 +2240,7 @@ fn chaos_failpoint_txn_commit_after_wal_file_sync_before_dir_sync() {
 #[test]
 #[ignore]
 fn chaos_failpoint_txn_commit_after_record_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "txn_commit_after_record_commit",
         &path,
@@ -2127,7 +2256,7 @@ fn chaos_failpoint_txn_commit_after_record_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_txn_commit_after_wal_sync() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "txn_commit_after_wal_sync",
         &path,
@@ -2140,7 +2269,7 @@ fn chaos_failpoint_txn_commit_after_wal_sync() {
 #[test]
 #[ignore]
 fn chaos_failpoint_bucket_create_before_manifest_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "bucket_create",
         &path,
@@ -2154,7 +2283,7 @@ fn chaos_failpoint_bucket_create_before_manifest_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_bucket_create_after_manifest_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "bucket_create",
         &path,
@@ -2168,7 +2297,7 @@ fn chaos_failpoint_bucket_create_after_manifest_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_bucket_delete_before_manifest_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let bucket_id = seed_bucket_delete_target(&path);
     let status = spawn_child(
         "bucket_delete",
@@ -2184,7 +2313,7 @@ fn chaos_failpoint_bucket_delete_before_manifest_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_bucket_delete_after_manifest_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let bucket_id = seed_bucket_delete_target(&path);
     let status = spawn_child(
         "bucket_delete",
@@ -2200,7 +2329,7 @@ fn chaos_failpoint_bucket_delete_after_manifest_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_pending_bucket_reap_after_batch_before_finalize() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let bucket_id = seed_pending_bucket_reap_target(&path);
     let status = spawn_child(
         "pending_bucket_reap",
@@ -2217,7 +2346,7 @@ fn chaos_failpoint_pending_bucket_reap_after_batch_before_finalize() {
 #[test]
 #[ignore]
 fn chaos_failpoint_pending_bucket_reap_after_finalize_before_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let bucket_id = seed_pending_bucket_reap_target(&path);
     let status = spawn_child(
         "pending_bucket_reap",
@@ -2240,7 +2369,7 @@ fn chaos_failpoint_pending_bucket_reap_after_finalize_before_meta_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_pending_bucket_reap_after_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let bucket_id = seed_pending_bucket_reap_target(&path);
     let status = spawn_child(
         "pending_bucket_reap",
@@ -2258,7 +2387,7 @@ fn chaos_failpoint_pending_bucket_reap_after_meta_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_data_rewrite_before_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_data_rewrite_before_meta_commit",
         &path,
@@ -2271,7 +2400,7 @@ fn chaos_failpoint_gc_data_rewrite_before_meta_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_data_rewrite_after_stage_marker() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_data_rewrite_after_stage_marker",
         &path,
@@ -2284,7 +2413,7 @@ fn chaos_failpoint_gc_data_rewrite_after_stage_marker() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_data_rewrite_after_data_dir_sync() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_data_rewrite_after_data_dir_sync",
         &path,
@@ -2300,7 +2429,7 @@ fn chaos_failpoint_gc_data_rewrite_after_data_dir_sync() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_data_rewrite_after_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_data_rewrite_after_meta_commit",
         &path,
@@ -2337,7 +2466,7 @@ fn assert_collecting_junk_after_reopen(db_root: &Path) {
 #[ignore]
 #[cfg(feature = "extra_check")]
 fn chaos_failpoint_gc_data_rewrite_collecting_junk_before_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_data_rewrite_collecting_junk_before_meta_commit",
         &path,
@@ -2351,7 +2480,7 @@ fn chaos_failpoint_gc_data_rewrite_collecting_junk_before_meta_commit() {
 #[ignore]
 #[cfg(feature = "extra_check")]
 fn chaos_failpoint_gc_data_rewrite_collecting_junk_after_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_data_rewrite_collecting_junk_after_meta_commit",
         &path,
@@ -2364,7 +2493,7 @@ fn chaos_failpoint_gc_data_rewrite_collecting_junk_after_meta_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_blob_rewrite_before_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_blob_rewrite_before_meta_commit",
         &path,
@@ -2377,7 +2506,7 @@ fn chaos_failpoint_gc_blob_rewrite_before_meta_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_blob_rewrite_after_stage_marker() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_blob_rewrite_after_stage_marker",
         &path,
@@ -2390,7 +2519,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_stage_marker() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_blob_rewrite_after_data_dir_sync() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_blob_rewrite_after_data_dir_sync",
         &path,
@@ -2406,7 +2535,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_data_dir_sync() {
 #[test]
 #[ignore]
 fn chaos_failpoint_gc_blob_rewrite_after_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "gc_blob_rewrite_after_meta_commit",
         &path,
@@ -2419,7 +2548,7 @@ fn chaos_failpoint_gc_blob_rewrite_after_meta_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_delete_files_after_dir_sync_before_meta_commit() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "delete_files_after_dir_sync_before_meta_commit",
         &path,
@@ -2435,7 +2564,7 @@ fn chaos_failpoint_delete_files_after_dir_sync_before_meta_commit() {
 #[test]
 #[ignore]
 fn chaos_failpoint_recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "flush_before_manifest_commit",
         &path,
@@ -2470,7 +2599,7 @@ fn chaos_failpoint_recovery_orphan_cleanup_after_data_dir_sync_before_marker_cle
 #[test]
 #[ignore]
 fn chaos_failpoint_recovery_abort_clean_after_drain_before_start() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child("recovery_abort_clean_seed", &path, "");
     assert!(status.success(), "seed child should finish normally");
 
@@ -2502,7 +2631,7 @@ fn chaos_failpoint_recovery_abort_clean_after_drain_before_start() {
 #[test]
 #[ignore]
 fn chaos_failpoint_recovery_abort_clean_does_not_recycle_wal_before_runtime_checkpoint() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child("recovery_abort_clean_seed", &path, "");
     assert!(status.success(), "seed child should finish normally");
 
@@ -2547,7 +2676,7 @@ fn chaos_failpoint_recovery_abort_clean_does_not_recycle_wal_before_runtime_chec
 
 #[test]
 fn recovery_rejects_sparse_wal_gap_after_checkpoint() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     {
         let mace = open_with_tune(&path, |opt| {
             opt.concurrent_write = 1;
@@ -2614,7 +2743,7 @@ fn recovery_rejects_sparse_wal_gap_after_checkpoint() {
 #[test]
 #[ignore]
 fn wal_recycle_done_reopen_is_idempotent() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "wal_recycle_done_windows",
         &path,
@@ -2642,7 +2771,7 @@ fn wal_recycle_done_reopen_is_idempotent() {
 #[test]
 #[ignore]
 fn wal_recycle_done_does_not_weaken_gap_detection_after_frontier() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "wal_recycle_done_windows",
         &path,
@@ -2710,7 +2839,7 @@ fn wal_recycle_done_does_not_weaken_gap_detection_after_frontier() {
 #[test]
 #[ignore]
 fn chaos_failpoint_evictor_before_evict_once() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let status = spawn_child(
         "evictor_before_evict_once",
         &path,
@@ -2718,4 +2847,263 @@ fn chaos_failpoint_evictor_before_evict_once() {
     );
     assert_child_aborted(status, "evictor failpoint child should abort");
     assert_bucket_readable(&path);
+}
+
+// F2 acceptance.
+//
+// recovery starts wal record analysis at the durable checkpoint hint, and everything
+// before it is assumed to be folded into durable pages. that holds for redo (gated by
+// the bucket frontier) but not for transaction outcomes: an aborted transaction's only
+// durable trace is its Abort record, so a hint past it would skip the abort, leave the
+// aborted versions looking committed and drop the abort-clean task.
+//
+// every case below blocks the gc round that would drain abort-clean, forces a later
+// checkpoint to write the hint, crashes, and then checks the reopened database shows the
+// committed model and that recovery reconstructed and drained the task.
+
+const ABORT_CLEAN_GHOST_KEY: &str = "k";
+const ABORT_CLEAN_FILLER_LEN: usize = 1024;
+
+fn abort_clean_bucket_options() -> BucketOptions {
+    BucketOptions {
+        inline_size: 8192,
+        cache_evict_pct: 10,
+        checkpoint_size: 32 << 10,
+        pool_capacity: 64 << 10,
+        enable_backpressure: false,
+        ..BucketOptions::default()
+    }
+}
+
+fn abort_clean_open(db_root: &Path, wal_file_size: u32) -> (Mace, Bucket) {
+    let mace = open_with_tune(db_root, |opt| {
+        opt.concurrent_write = 1;
+        opt.sync_on_write = true;
+        opt.data_file_size = 32 << 10;
+        opt.blob_file_size = 32 << 10;
+        opt.wal_buffer_size = 1 << 20;
+        opt.wal_file_size = wal_file_size;
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = false;
+        opt.data_garbage_ratio = 100;
+        opt.blob_garbage_ratio = 100;
+    });
+    // the crash must leave the abort-clean task unsettled, so no gc round may run
+    mace.disable_gc();
+    let bucket = match mace.open_bucket("prod") {
+        Ok(bucket) => bucket,
+        Err(OpCode::NotFound) => mace
+            .new_bucket("prod", abort_clean_bucket_options())
+            .expect("create prod bucket failed"),
+        Err(err) => panic!("open prod bucket failed: {err:?}"),
+    };
+    (mace, bucket)
+}
+
+fn abort_clean_seed(bucket: &Bucket) {
+    let txn = bucket.begin().expect("begin seed failed");
+    txn.put(ABORT_CLEAN_GHOST_KEY, "committed")
+        .expect("seed put failed");
+    txn.commit().expect("seed commit failed");
+}
+
+/// the aborted write of the seeded key, plus enough committed-size records to make the
+/// aborted transaction's own chain span wal files when `fillers` is large
+///
+/// returns the durable wal position before the transaction started and after its abort
+/// record was synced, so a caller can assert where the abort record landed
+fn abort_clean_abort_write(bucket: &Bucket, fillers: usize) -> ((u64, u64), (u64, u64)) {
+    let begin = testing::wal_durable_pos(bucket, 0);
+    let txn = bucket.begin().expect("begin aborted write failed");
+    txn.upsert(ABORT_CLEAN_GHOST_KEY, "ghost")
+        .expect("aborted upsert failed");
+    let filler = vec![b'g'; ABORT_CLEAN_FILLER_LEN];
+    for idx in 0..fillers {
+        txn.put(format!("ghost_filler_{idx:04}"), &filler)
+            .expect("aborted filler put failed");
+    }
+    drop(txn);
+    (begin, testing::wal_durable_pos(bucket, 0))
+}
+
+/// later committed writes plus checkpoints raise the group floor, and therefore the wal
+/// hint, without settling the aborted versions
+fn abort_clean_raise_floor(mace: &Mace, bucket: &Bucket) {
+    let filler = vec![b'x'; ABORT_CLEAN_FILLER_LEN];
+    for idx in 0..96 {
+        let txn = bucket.begin().expect("begin committed filler failed");
+        txn.put(format!("committed_filler_{idx:04}"), &filler)
+            .expect("committed filler put failed");
+        txn.commit().expect("committed filler commit failed");
+    }
+    for _ in 0..3 {
+        testing::checkpoint_and_wait(bucket);
+    }
+    // the hint record itself must be durable before the crash
+    mace.sync().expect("sync failed");
+}
+
+/// the window exists when the checkpoint folded a position past the abort record, and the
+/// fix holds when the hint written from that checkpoint stayed behind it
+fn assert_hint_cannot_pass_abort(bucket: &Bucket, abort_end: (u64, u64)) {
+    let folded = testing::durable_frontier(bucket, 0);
+    let floor = testing::shared_checkpoint_floor(bucket, 0);
+    assert!(
+        folded > abort_end,
+        "the checkpoint must fold a position past the abort record: folded={folded:?} abort_end={abort_end:?}"
+    );
+    assert!(
+        floor <= abort_end,
+        "the hint must stay behind the unsettled abort record: floor={floor:?} abort_end={abort_end:?}"
+    );
+}
+
+/// reopen with an observer and require the committed model plus a drained task
+fn assert_abort_clean_reopen(db_root: &Path) {
+    let observer = Arc::new(InMemoryObserver::new(64));
+    let mace = open_with_tune(db_root, |opt| {
+        opt.observer = observer.clone();
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = true;
+    });
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
+    let view = bucket.view().expect("open verify view failed");
+    let val = view
+        .get(ABORT_CLEAN_GHOST_KEY)
+        .expect("seeded key must resolve after reopen");
+    assert_eq!(
+        val.slice(),
+        b"committed",
+        "an aborted write must stay invisible after reopen"
+    );
+    let walked = counter_value(&observer, CounterMetric::GcAbortCleanWalFileOpen)
+        + counter_value(&observer, CounterMetric::GcAbortCleanCheckpointBucket);
+    assert!(
+        walked >= 1,
+        "recovery must reconstruct and drain the pending abort-clean task"
+    );
+}
+
+/// the abort record and the hint share one wal file: the hint moves past the abort
+/// record by offset, which is the shape a file-granularity clamp must still cover
+#[test]
+#[ignore]
+fn abort_clean_hint_window_same_file() {
+    let path = RandomPath::tmp();
+    let status = spawn_child("abort_clean_hint_window_same_file", &path, "");
+    assert_child_aborted(status, "same-file window child must abort");
+    assert_abort_clean_reopen(&path);
+}
+
+/// the aborted transaction's own records span several wal files, so the task's chain
+/// crosses a file boundary and the hint lands in a later file than the abort record
+#[test]
+#[ignore]
+fn abort_clean_hint_window_multi_file() {
+    let path = RandomPath::tmp();
+    let status = spawn_child("abort_clean_hint_window_multi_file", &path, "");
+    assert_child_aborted(status, "multi-file window child must abort");
+    assert_abort_clean_reopen(&path);
+}
+
+/// control: the same workload with the abort after the hint keeps the committed value,
+/// which isolates the hint as the cause of the ghost window
+#[test]
+#[ignore]
+fn abort_clean_hint_control_after_hint() {
+    let path = RandomPath::tmp();
+    let status = spawn_child("abort_clean_hint_control_after_hint", &path, "");
+    assert_child_aborted(status, "control child must abort");
+    assert_abort_clean_reopen(&path);
+}
+
+/// the abort record is durable but its in-memory abort-clean task was never registered,
+/// while concurrent checkpoints keep advancing the floor: recovery must rebuild the task
+/// from the wal alone
+#[test]
+#[ignore]
+fn abort_clean_crash_after_abort_sync_before_task_registration() {
+    let path = RandomPath::tmp();
+    let status = spawn_child(
+        "abort_clean_crash_after_abort_sync",
+        &path,
+        "mace_txn_abort_after_wal_sync=abort@1",
+    );
+    assert_child_aborted(
+        status,
+        "abort-after-wal-sync child must abort before registering its task",
+    );
+    assert_abort_clean_reopen(&path);
+}
+
+fn child_case_abort_clean_hint_window_same_file(db_root: &Path) -> ! {
+    let (mace, bucket) = abort_clean_open(db_root, 1 << 20);
+    abort_clean_seed(&bucket);
+    let (begin, abort_end) = abort_clean_abort_write(&bucket, 0);
+    abort_clean_raise_floor(&mace, &bucket);
+    assert!(
+        begin.0 == abort_end.0,
+        "this shape wants the abort record in the seeded file: begin={begin:?} abort_end={abort_end:?}"
+    );
+    assert!(
+        wal_files(db_root, Options::SHARED_ID).len() == 1,
+        "the same-file shape must keep one wal file"
+    );
+    assert_hint_cannot_pass_abort(&bucket, abort_end);
+    std::process::abort();
+}
+
+fn child_case_abort_clean_hint_window_multi_file(db_root: &Path) -> ! {
+    let (mace, bucket) = abort_clean_open(db_root, 8 << 10);
+    abort_clean_seed(&bucket);
+    let (begin, abort_end) = abort_clean_abort_write(&bucket, 24);
+    abort_clean_raise_floor(&mace, &bucket);
+    assert!(
+        begin.0 < abort_end.0,
+        "this shape wants the abort chain to span wal files: begin={begin:?} abort_end={abort_end:?}"
+    );
+    assert!(
+        wal_files(db_root, Options::SHARED_ID).len() >= 2,
+        "the multi-file shape must leave several wal files"
+    );
+    assert_hint_cannot_pass_abort(&bucket, abort_end);
+    std::process::abort();
+}
+
+fn child_case_abort_clean_hint_control_after_hint(db_root: &Path) -> ! {
+    let (mace, bucket) = abort_clean_open(db_root, 1 << 20);
+    abort_clean_seed(&bucket);
+    // the hint is written and made durable first, so it precedes the abort record
+    abort_clean_raise_floor(&mace, &bucket);
+    let floor = testing::shared_checkpoint_floor(&bucket, 0);
+    let (_, abort_end) = abort_clean_abort_write(&bucket, 0);
+    assert!(
+        floor < abort_end,
+        "the control requires the hint before the abort record: floor={floor:?} abort_end={abort_end:?}"
+    );
+    mace.sync().expect("sync failed");
+    std::process::abort();
+}
+
+fn child_case_abort_clean_crash_after_abort_sync(db_root: &Path) -> ! {
+    let (mace, bucket) = abort_clean_open(db_root, 1 << 20);
+    abort_clean_seed(&bucket);
+    testing::checkpoint_and_wait(&bucket);
+    // keep advancing the floor from another thread while the aborting transaction
+    // publishes its abort record, so the unregistered window is exercised under
+    // concurrent checkpoints
+    let floor_mace = mace.clone();
+    let floor_bucket = bucket.clone();
+    let _floor = std::thread::spawn(move || {
+        for _ in 0..64 {
+            testing::checkpoint_and_wait(&floor_bucket);
+            floor_mace.sync().expect("floor sync failed");
+        }
+    });
+    // the armed failpoint aborts inside this drop, after the abort record is synced
+    let txn = bucket.begin().expect("begin aborted write failed");
+    txn.upsert(ABORT_CLEAN_GHOST_KEY, "ghost")
+        .expect("aborted upsert failed");
+    drop(txn);
+    panic!("the abort-after-wal-sync failpoint did not fire")
 }

@@ -54,7 +54,15 @@ pub enum CounterMetric {
     FlushSkipRetiredBlobStat,
     FlushConditionalDataStatPutMiss,
     FlushConditionalBlobStatPutMiss,
+    FlushConditionalDataDelMiss,
+    FlushConditionalBlobDelMiss,
     FlowFgAdmissionWait,
+    CheckpointStart,
+    CheckpointComplete,
+    CheckpointFailure,
+    CheckpointCopiedBytes,
+    CheckpointWalCut,
+    CheckpointFrontier,
     WalGeneration,
     WalGenerationLeader,
     WalGenerationFollower,
@@ -63,7 +71,7 @@ pub enum CounterMetric {
 }
 
 impl CounterMetric {
-    pub const COUNT: usize = 38;
+    pub const COUNT: usize = 46;
     pub const ALL: [CounterMetric; Self::COUNT] = [
         CounterMetric::TxnBegin,
         CounterMetric::TxnCommit,
@@ -97,7 +105,15 @@ impl CounterMetric {
         CounterMetric::FlushSkipRetiredBlobStat,
         CounterMetric::FlushConditionalDataStatPutMiss,
         CounterMetric::FlushConditionalBlobStatPutMiss,
+        CounterMetric::FlushConditionalDataDelMiss,
+        CounterMetric::FlushConditionalBlobDelMiss,
         CounterMetric::FlowFgAdmissionWait,
+        CounterMetric::CheckpointStart,
+        CounterMetric::CheckpointComplete,
+        CounterMetric::CheckpointFailure,
+        CounterMetric::CheckpointCopiedBytes,
+        CounterMetric::CheckpointWalCut,
+        CounterMetric::CheckpointFrontier,
         CounterMetric::WalGeneration,
         CounterMetric::WalGenerationLeader,
         CounterMetric::WalGenerationFollower,
@@ -151,13 +167,14 @@ pub enum HistogramMetric {
     GcDataRewriteVictimFiles,
     GcBlobRewriteVictimFiles,
     FlowFgAdmissionWaitMicros,
+    CheckpointGuardHoldMicros,
     WalGenerationBatch,
     WalGenerationWaitMicros,
     WalLockWaitMicros,
 }
 
 impl HistogramMetric {
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 19;
     pub const ALL: [HistogramMetric; Self::COUNT] = [
         HistogramMetric::TxnCommitMicros,
         HistogramMetric::TxnRollbackMicros,
@@ -174,6 +191,7 @@ impl HistogramMetric {
         HistogramMetric::GcDataRewriteVictimFiles,
         HistogramMetric::GcBlobRewriteVictimFiles,
         HistogramMetric::FlowFgAdmissionWaitMicros,
+        HistogramMetric::CheckpointGuardHoldMicros,
         HistogramMetric::WalGenerationBatch,
         HistogramMetric::WalGenerationWaitMicros,
         HistogramMetric::WalLockWaitMicros,

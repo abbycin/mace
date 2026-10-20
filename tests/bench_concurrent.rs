@@ -10,7 +10,7 @@ use mace::{BucketOptions, Mace, Options, RandomPath};
 /// concurrent workload bench: stresses the shared atomics and pool locks that
 /// the instance-local default-on path removes contention from.
 fn setup() -> (RandomPath, Options) {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(path.deref());
     opt.sync_on_write = false;
     (path, opt)

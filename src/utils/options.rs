@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::io;
+use crate::must_ok;
 use crate::utils::merge_operator::MergeOperator;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::{NoopObserver, Observer};
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::OpCode;
 
-fn dir_parent_for_sync(path: &Path) -> Option<&Path> {
+pub(crate) fn dir_parent_for_sync(path: &Path) -> Option<&Path> {
     match path.parent() {
         Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
         Some(parent) => Some(parent),
@@ -49,14 +50,27 @@ fn create_dir_all_and_sync(fs: &dyn io::FileSystem, path: &Path) -> std::io::Res
 /// Configuration options for the Mace storage engine.
 #[derive(Clone)]
 pub struct Options {
-    /// Force-sync data to disk for every wal/data write.
+    /// WAL durability route. The default value is `true`.
     ///
-    /// The default value is `true` (use fsync or else use fdatasync). Turning it off may result in
-    /// data loss, while turning it on may reduce performance.
+    /// Enabled, every logical group appends to one durable shared stream: concurrent terminal
+    /// records and explicit barriers join a caller-led sync generation, and a commit returns only
+    /// after its durability target completes. Disabled, each logical group appends to its own
+    /// stream and a commit only reaches the page cache, so a crash can lose recently committed
+    /// transactions.
+    ///
+    /// The route is persisted with the database. A reopen that requests a different value starts a
+    /// route transition on the same rebuild path a width change uses, so the requested route takes
+    /// effect once that transition completes.
     pub sync_on_write: bool,
-    /// Writer group count. Default is [`Self::CONCURRENT_WRITE`] and it must be in the range `[1, 128]`
+    /// Writer group count. Default is [`Self::CONCURRENT_WRITE`]; validation clamps the value to
+    /// `[1, Self::MAX_CONCURRENT_WRITE]` and rounds it up to a power of two.
     ///
-    /// **Once set, it cannot be modified**
+    /// The width is persisted with the database. A reopen that requests a different width migrates
+    /// the WAL epoch instead of being rejected: recovery keeps reading at the persisted (source)
+    /// width, the wipe and recycle bound cover both widths plus the shared stream, and the
+    /// requested width takes effect for the runtime that follows the migration. The persisted value
+    /// is replaced once that migration completes, so a crash before then leaves the source width in
+    /// charge of the next open.
     pub concurrent_write: u8,
     /// Garbage collection cycle interval (milliseconds).
     ///
@@ -104,17 +118,20 @@ pub struct Options {
     pub data_handle_cache_capacity: usize,
     /// Maximum number of open blob-file handles cached concurrently, used for loading blob pages.
     pub blob_handle_cache_capacity: usize,
-    /// Size limit of a data file. Minimum is [`Self::DATA_FILE_SIZE`]
+    /// Size limit of a data file. Zero selects the default [`Self::DATA_FILE_SIZE`]
     pub data_file_size: usize,
-    /// WAL ring buffer size. Must be greater than the page size and a power of two.
+    /// WAL ring buffer size. Must be a power of two and large enough for the largest record the
+    /// engine appends: a record is staged in the ring before it is written out.
     pub wal_buffer_size: usize,
     /// Number of checkpoints a transaction can span (i.e., transaction length limit).
     ///
     /// If a transaction exceeds this limit, it is forcibly aborted.
     pub max_ckpt_per_txn: usize,
-    /// WAL file size limit that triggers switching to a new WAL file, up to 2GB.
+    /// WAL file size limit that triggers switching to a new WAL file.
     pub wal_file_size: u32,
-    /// If true, corrupted WAL is truncated during recovery; otherwise recovery panics.
+    /// If true, a malformed or incomplete WAL tail is truncated at the first bad record during
+    /// recovery and the remaining files of that stream are ignored; otherwise startup fails with a
+    /// corruption error instead of truncating.
     ///
     /// Default is true.
     pub truncate_corrupted_wal: bool,
@@ -137,15 +154,21 @@ pub struct PersistedBucketOptions {
     pub cache_capacity: usize,
     /// Percentage of items evicted per round. Range is `[10, 80]`, default is `20%`
     pub cache_evict_pct: usize,
-    /// Per-bucket pool target bytes. Default is [`Self::POOL_CAP`]
+    /// Per-bucket pool target bytes. Default is [`BucketOptions::POOL_CAP`]
+    /// Dirty memory (hot + sealed) gate: admission may add a bounded
+    /// drain burst (<= pool/8, <= checkpoint_size) while a checkpoint is
+    /// in flight, so projected dirty is capped at pool_capacity + burst
+    /// (actual dirty can overshoot between snapshots via per-op estimate
+    /// gaps and unadmitted eviction growth)
     pub pool_capacity: usize,
-    /// Maximum bytes a single checkpoint round should emit. Default is [`Self::CHECKPOINT_SIZE`]
+    /// Maximum bytes a single checkpoint round should emit. Default is [`BucketOptions::CHECKPOINT_SIZE`]
     pub checkpoint_size: usize,
     /// For branch nodes, keys and indexes are always inlined. For leaf nodes, only values smaller
     /// than `inline_size` are inlined; values whose size is equal to or greater than `inline_size`
-    /// are stored as blobs. Default is [`Self::MIN_INLINE_SIZE`]
+    /// are stored as blobs. For existing buckets, `update_bucket_opt` only permits lowering this
+    /// threshold. Default is [`BucketOptions::INLINE_SIZE`]
     pub inline_size: usize,
-    /// Maximum number of elements in an SST (B+Tree node). Default is [`Self::MAX_SPLIT_ELEMS`]
+    /// Maximum number of elements in an SST (B+Tree node). Default is [`BucketOptions::MAX_SPLIT_ELEMS`]
     pub split_elems: u16,
     /// Threshold for consolidating delta chains. Range is `[16, Self::split_elems / 2]`
     pub consolidate_threshold: u16,
@@ -200,12 +223,18 @@ pub struct BucketOptions {
     /// Percentage of items evicted per round. Range is `[10, 80]`, default is `20%`
     pub cache_evict_pct: usize,
     /// Per-bucket pool target bytes. Default is [`Self::POOL_CAP`]
+    /// Dirty memory (hot + sealed) gate: admission may add a bounded
+    /// drain burst (<= pool/8, <= checkpoint_size) while a checkpoint is
+    /// in flight, so projected dirty is capped at pool_capacity + burst
+    /// (actual dirty can overshoot between snapshots via per-op estimate
+    /// gaps and unadmitted eviction growth)
     pub pool_capacity: usize,
     /// Maximum bytes a single checkpoint round should emit. Default is [`Self::CHECKPOINT_SIZE`]
     pub checkpoint_size: usize,
     /// For branch nodes, keys and indexes are always inlined. For leaf nodes, only values smaller
     /// than `inline_size` are inlined; values whose size is equal to or greater than `inline_size`
-    /// are stored as blobs. Default is [`Self::MIN_INLINE_SIZE`]
+    /// are stored as blobs. For existing buckets, `update_bucket_opt` only permits lowering this
+    /// threshold. Default is [`Self::INLINE_SIZE`]
     pub inline_size: usize,
     /// Maximum number of elements in an SST (B+Tree node). Default is [`Self::MAX_SPLIT_ELEMS`]
     pub split_elems: u16,
@@ -248,8 +277,9 @@ impl BucketOptions {
     pub const CACHE_CAP: usize = 1 << 30; // 1GB
     pub const POOL_CAP: usize = 1 << 30; // 1GB
     pub const CHECKPOINT_SIZE: usize = 256 << 20; // 256MB
-    pub const MIN_INLINE_SIZE: usize = 4096;
-    pub const MAX_INLINE_SIZE: usize = 16384;
+    pub const MIN_INLINE_SIZE: usize = 256;
+    pub const INLINE_SIZE: usize = 1024;
+    pub const MAX_INLINE_SIZE: usize = 4096;
 
     pub fn new() -> Self {
         Self {
@@ -258,7 +288,7 @@ impl BucketOptions {
             pool_capacity: Self::POOL_CAP,
             checkpoint_size: Self::CHECKPOINT_SIZE,
             consolidate_threshold: Self::MAX_SPLIT_ELEMS / 2,
-            inline_size: Self::MIN_INLINE_SIZE,
+            inline_size: Self::INLINE_SIZE,
             split_elems: Self::MAX_SPLIT_ELEMS,
             enable_compression: false,
             enable_backpressure: true,
@@ -456,17 +486,59 @@ impl Options {
     }
 
     pub(crate) fn sync_data_dir(&self) {
+        must_ok!(
+            self.try_sync_data_dir(),
+            "can't sync the data directory {:?}",
+            self.data_root()
+        );
+    }
+
+    /// fallible variant for the open path: orphan cleanup and obsolete-file deletion run before
+    /// recovery, where a failed directory sync can still fail the open with an error instead of
+    /// killing the process. the runtime publish path keeps the fatal form
+    pub(crate) fn try_sync_data_dir(&self) -> Result<(), OpCode> {
         self.fs
             .as_ref()
             .sync_dir(&self.data_root())
-            .unwrap_or_else(|e| panic!("can't fail, {:?}", e));
+            .map_err(OpCode::from)
     }
 
     pub(crate) fn sync_log_dir(&self) {
+        must_ok!(
+            self.try_sync_log_dir(),
+            "can't sync the log directory {:?}",
+            self.log_root()
+        );
+    }
+
+    /// fallible variant for the recovery-open sequence: the epoch handoff must return an error
+    /// through the open's cleanup instead of unwinding mid-handoff, because a panic there runs
+    /// destructors on a half-migrated namespace
+    pub(crate) fn try_sync_log_dir(&self) -> Result<(), OpCode> {
         self.fs
             .as_ref()
             .sync_dir(&self.log_root())
-            .unwrap_or_else(|e| panic!("can't fail, {:?}", e));
+            .map_err(OpCode::from)
+    }
+
+    /// whether the log directory already holds legacy per-group `wal_<group>_<seq>` files.
+    ///
+    /// the durable steady state never writes that namespace, so a durable open that finds it
+    /// must migrate the layout before continuing.
+    pub(crate) fn has_legacy_per_group_wal(&self) -> Result<bool, OpCode> {
+        let prefix = format!("{}{}", Self::WAL_PREFIX, Self::SEP);
+        for entry in self.fs.read_dir(&self.log_root())? {
+            let Some(name) = entry.file_name() else {
+                continue;
+            };
+            let Some(raw) = name.to_str() else {
+                continue;
+            };
+            if raw.starts_with(&prefix) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -546,13 +618,6 @@ impl PersistedOptions {
     pub(crate) fn to_json(&self) -> Result<Vec<u8>, OpCode> {
         serde_json::to_vec(self).map_err(|_| OpCode::Corruption)
     }
-
-    pub(crate) fn check_compatible(&self, opt: &Options) -> Result<(), OpCode> {
-        if self.concurrent_write != opt.concurrent_write {
-            return Err(OpCode::Invalid);
-        }
-        Ok(())
-    }
 }
 
 impl Drop for ParsedOptions {
@@ -588,6 +653,32 @@ mod tests {
         opt.fs = fs;
         let err = opt.validate().err().expect("validate must fail");
         assert_eq!(err, OpCode::IoError);
+    }
+
+    #[test]
+    fn try_sync_data_dir_propagates_a_directory_sync_failure() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        let fs = Arc::new(InjectedFileSystem::new());
+        opt.fs = fs.clone();
+        let parsed = opt.validate().expect("options must validate");
+        // arm the rule after validation so only the call under test can consume it
+        fs.fail_once(
+            InjectOp::SyncDir,
+            parsed.data_root(),
+            ErrorKind::PermissionDenied,
+        );
+
+        assert_eq!(
+            parsed.try_sync_data_dir(),
+            Err(OpCode::IoError),
+            "the open path must see a failed data-directory sync as an error"
+        );
+        assert_eq!(
+            parsed.try_sync_log_dir(),
+            Ok(()),
+            "the failure must be the data directory's, not a device-wide one"
+        );
     }
 
     #[test]
@@ -629,17 +720,16 @@ mod tests {
     }
 
     #[test]
-    fn persisted_options_reject_concurrent_write_conflicts() {
+    fn persisted_options_keep_a_foreign_concurrent_write() {
+        // the width is no longer an immutable gate: a mismatching persisted value decodes
+        // as-is and the open plan decides whether a migration is required
         let root = RandomPath::tmp();
         let mut opt = Options::new(&*root);
         opt.concurrent_write = 8;
         let persisted = PersistedOptions::from_options(&opt.validate().unwrap());
 
-        let reopen_root = RandomPath::tmp();
-        let mut reopen = Options::new(&*reopen_root);
-        reopen.concurrent_write = 16;
-        let reopen = reopen.validate().unwrap();
-
-        assert_eq!(persisted.check_compatible(&reopen), Err(OpCode::Invalid));
+        let json = persisted.to_json().expect("encode persisted options");
+        let decoded = PersistedOptions::from_json(&json).expect("decode persisted options");
+        assert_eq!(decoded.concurrent_write, 8);
     }
 }

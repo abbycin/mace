@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    cc::context::Context,
+    cc::{context::Context, is_retained_abort},
     must_exist,
     types::{
         base::{BaseIter, BaseRevIter},
@@ -20,7 +20,9 @@ use crate::{
         },
         header::{BoxHeader, NodeType, RemoteHeader},
         refbox::{BaseView, BoxView, DeltaView, RemoteView},
-        traits::{IAsBoxRef, IBoxHeader, IDecode, IFrameAlloc, IHeader, IKey, ILoader, IVal},
+        traits::{
+            IAsBoxRef, IBoxHeader, ICodec, IDecode, IFrameAlloc, IHeader, IKey, ILoader, IVal,
+        },
     },
     utils::{
         Handle, INIT_ORACLE, NULL_ADDR, NULL_CMD, NULL_ORACLE, NULL_PID, OpCode,
@@ -1558,6 +1560,36 @@ impl<'a> CompactVal<'a> {
             _ => None,
         }
     }
+
+    /// second pass for page-backed rows: returns (record, remote addr). a
+    /// stored inline row whose record now sits at or above the inline
+    /// boundary materializes a real remote box here, because a bucket
+    /// threshold can be lowered on an existing bucket and rebuilding the row
+    /// otherwise encodes a remote envelope with a null address (the box is
+    /// what `builder.add_leaf` needs when `vsz >= limit`)
+    pub(crate) fn record_with_remote<A: IFrameAlloc, L: ILoader>(
+        &self,
+        a: &mut A,
+        l: &L,
+        group: u8,
+        lsn: Position,
+    ) -> (Record, u64) {
+        let (r, _) = self.get_record(l);
+        let mut remote = self.get_remote();
+        if remote == NULL_ADDR && r.packed_size() >= a.inline_size() {
+            let mut b = a.alloc((r.packed_size() + size_of::<RemoteHeader>()) as u32);
+            let h = b.header_mut();
+            h.kind = TagKind::Remote;
+            h.node_type = NodeType::Leaf;
+            h.lsn = lsn;
+            h.group = group;
+            let mut view = b.view().as_remote();
+            view.header_mut().size = r.packed_size();
+            r.encode_to(view.raw_mut());
+            remote = b.header().addr;
+        }
+        (r, remote)
+    }
 }
 
 /// adapts a plain page-backed version stream; folding never triggers for these callers
@@ -2017,7 +2049,7 @@ impl<'a> PlainLeafFilter<'a> {
         if k.txid() <= self.txid
             && self
                 .abort_ctx
-                .is_some_and(|ctx| ctx.group(v.group_id() as usize).is_retained_abort(k.txid()))
+                .is_some_and(|ctx| is_retained_abort(&ctx, v.group_id(), k.txid()))
         {
             self.collect(v);
             return false;
@@ -2170,7 +2202,7 @@ impl<'a, L: ILoader> LeafFilter<'a, L> {
 
         while i < versions.len() {
             let (k, v) = versions[i];
-            if self.is_retained_abort(&k, &v) {
+            if self.drops_retained_abort(&k, &v) {
                 self.collect(&v);
                 i += 1;
                 continue;
@@ -2289,11 +2321,11 @@ impl<'a, L: ILoader> LeafFilter<'a, L> {
     }
 
     #[inline(always)]
-    fn is_retained_abort(&self, k: &LeafSeg<'a>, v: &Val<'a>) -> bool {
+    fn drops_retained_abort(&self, k: &LeafSeg<'a>, v: &Val<'a>) -> bool {
         k.txid() <= self.txid
             && self
                 .abort_ctx
-                .is_some_and(|ctx| ctx.group(v.group_id() as usize).is_retained_abort(k.txid()))
+                .is_some_and(|ctx| is_retained_abort(&ctx, v.group_id(), k.txid()))
     }
 
     fn collect_remaining(&mut self, versions: &[(LeafSeg<'a>, Val<'a>)], start: usize) {
@@ -2305,12 +2337,12 @@ impl<'a, L: ILoader> LeafFilter<'a, L> {
     /// outcome for the operator-free streaming path
     fn check_out(&mut self, k: &LeafSeg<'a>, v: &Val<'a>) -> FilterOut {
         if let Some(ctx) = self.drop_aborted_ctx
-            && ctx.group(v.group_id() as usize).is_retained_abort(k.txid())
+            && is_retained_abort(&ctx, v.group_id(), k.txid())
         {
             self.removed = true;
             return FilterOut::Drop;
         }
-        if self.is_retained_abort(k, v) {
+        if self.drops_retained_abort(k, v) {
             return FilterOut::Drop;
         }
         if self.operator.is_none() {
@@ -2489,6 +2521,7 @@ mod test {
         map: Mutex<HashMap<u64, BoxRef>>,
         off: AtomicU64,
         remote_loads: AtomicUsize,
+        inline: AtomicUsize,
     }
 
     #[derive(Clone)]
@@ -2503,8 +2536,15 @@ mod test {
                     map: Mutex::new(HashMap::new()),
                     off: AtomicU64::new(0),
                     remote_loads: AtomicUsize::new(0),
+                    inline: AtomicUsize::new(BucketOptions::MIN_INLINE_SIZE),
                 }),
             }
+        }
+
+        /// test-only: change the inline boundary a rebuild is classified under,
+        /// to model a persisted bucket threshold change on an existing tree
+        fn set_inline(&self, inline: usize) {
+            self.inner.inline.store(inline, Relaxed);
         }
 
         fn load(&self, addr: u64) -> BoxRef {
@@ -2526,7 +2566,7 @@ mod test {
         }
 
         fn inline_size(&self) -> usize {
-            BucketOptions::MIN_INLINE_SIZE
+            self.inner.inline.load(Relaxed)
         }
     }
 
@@ -3513,6 +3553,74 @@ mod test {
             folded.2
         );
         assert_eq!(folded.3, 4500, "folded value survives the blob round trip");
+    }
+
+    /// a raw chain written inline under a wide threshold re-encodes into
+    /// blob-backed rows when the threshold drops and consolidation regions
+    /// the chain again: every rebuilt row (main payload and history sibling)
+    /// must carry a materialized remote address, never a null envelope
+    #[test]
+    fn inline_history_rows_materialize_remotes_after_threshold_drop() {
+        fn push_version(a: &mut A, node: &Node<A>, txid: u64, gid: u8, data: &[u8], merge: bool) {
+            let key = Key::new("k".as_bytes(), Ver::new(txid, 1));
+            let rec = if merge {
+                Record::merge(gid, data)
+            } else {
+                Record::normal(gid, data)
+            };
+            let (delta, remote) = DeltaView::from_key_val(a, &key, &rec, 0, Position::MIN);
+            node.insert_inplace(
+                delta.view().as_delta(),
+                remote
+                    .as_ref()
+                    .map(|x| x.header().total_size as usize)
+                    .unwrap_or(0),
+            );
+            node.save_delta(delta);
+        }
+
+        let base = vec![b'a'; 3000];
+        let operand = vec![b'b'; 3000];
+        let mut a = A::new();
+        let l = a.clone();
+        // build the chain under a wide threshold: both 3000B rows are inline
+        a.set_inline(4096);
+        let node = Node::new_leaf(&mut a, l.clone(), 0, Position::MIN);
+        push_version(&mut a, &node, 10, 0, &base, false);
+        push_version(&mut a, &node, 15, 1, &operand, true);
+        // raw-preserving consolidation regions the chain while the wide
+        // threshold still applies (rows stay inline in the history pages)
+        let (node, _) = node.compact(&mut a, 25, None, &mut |_| {}, None);
+        // lower the threshold (a persisted bucket option change) and rebuild
+        // again: the page-backed chain rows now classify past the boundary
+        // and must materialize real blob boxes in the main pass and in the
+        // history-sibling pass
+        a.set_inline(BucketOptions::MIN_INLINE_SIZE);
+        let (node, _) = node.compact(&mut a, 25, None, &mut |_| {}, None);
+
+        let mut junk = Junk::new();
+        let mut iter = node.leaf_iter(&mut junk, 25, BucketOptions::MIN_INLINE_SIZE, None, None);
+        let mut scratch: Vec<u8> = Vec::new();
+        use crate::types::node::LeafCompactSource;
+        let mut rows = Vec::new();
+        while let Some((seg, cv)) = iter.next_compact(&mut scratch) {
+            let (rec, _) = cv.get_record(&l);
+            rows.push((
+                seg.ver.txid,
+                cv.is_merge(),
+                cv.get_remote(),
+                rec.data().len(),
+            ));
+        }
+        assert_eq!(rows.len(), 2, "raw chain survives both consolidations");
+        for (_, is_merge, remote, len) in rows {
+            assert!(
+                remote != NULL_ADDR,
+                "rebuilt row must carry a real remote address after the threshold drop"
+            );
+            assert_eq!(len, 3000, "row data survives the blob round trip");
+            let _ = is_merge;
+        }
     }
 
     /// the shared folded-size classification pins the inline/blob/too-large

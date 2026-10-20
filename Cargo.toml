@@ -1,36 +1,37 @@
 [package]
 name = "mace-kv"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
 readme = "README.md"
 homepage = "https://github.com/abbycin/mace"
 repository = "https://github.com/abbycin/mace"
-description = "A fast, cross-platform embedded key-value database with ACID, MVCC, and flash-optimized storage"
+description = "A pure-Rust lightweight alternative to RocksDB (in most cases)"
 license = "MIT"
 categories = ["database-implementations", "database"]
-keywords = ["database", "lmdb", "sled", "rocksdb", "mace"]
+keywords = ["database", "key-value", "rocksdb", "leveldb", "sled"]
 
 [lib]
 name = "mace"
 
 [dependencies]
 backtrace = "0.3.76"
+clap = { version = "=4.6.7", features = ["derive"] }
 crc32c = "0.6.8"
 dashmap = "6.2.1"
-rand = "0.10.2"
+rand = "0.10.3"
 log = "0.4.34"
-crossbeam-epoch = "0.9.20"
+crossbeam-epoch = "0.9.21"
 parking_lot = "0.12.5"
-btree-store = "1.1.1"
+btree-store = "2.1.0"
 rustc-hash = "2.1.3"
-zstd = "0.14.0"
+zstd = "0.14.3"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 
 [target.'cfg(not(windows))'.dependencies]
-libc = "0.2.189"
+libc = "0.2.191"
 
 [dev-dependencies]
 logger = { path = "deps/logger" }
@@ -43,7 +44,6 @@ failpoints = ["extra_check"]
 [profile.release]
 opt-level = 3
 lto = true
-debug = true
 panic = "abort"
 
 [[example]]

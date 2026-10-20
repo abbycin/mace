@@ -28,6 +28,7 @@ chaos_retry="${CHAOS_RETRY:-3}"
 failures=()
 
 fast_targets=(
+  cli
   prod_bucket
   prod_concurrency
   prod_evictor
@@ -35,6 +36,7 @@ fast_targets=(
   prod_workload
   prod_recovery
   prod_recovery_failpoints
+  concurrent_write_migration
 )
 
 gc_space_accounting_cases=(
@@ -64,6 +66,8 @@ gc_space_accounting_cases=(
   "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_after_meta_commit:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_after_retired_mark:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_after_remove_stat:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_multi_bucket_after_each_window:crash"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_multi_bucket_stat_read_failure:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_blob_obsolete_after_meta_commit:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_blob_obsolete_after_retired_mark:crash"
   "prod_recovery_failpoints:chaos_failpoint_gc_blob_obsolete_after_remove_stat:crash"
@@ -100,6 +104,8 @@ chaos_cases=(
   "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_after_meta_commit"
   "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_after_retired_mark"
   "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_after_remove_stat"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_multi_bucket_after_each_window"
+  "prod_recovery_failpoints:chaos_failpoint_gc_data_obsolete_multi_bucket_stat_read_failure"
   "prod_recovery_failpoints:chaos_failpoint_gc_blob_obsolete_after_meta_commit"
   "prod_recovery_failpoints:chaos_failpoint_gc_blob_obsolete_after_retired_mark"
   "prod_recovery_failpoints:chaos_failpoint_gc_blob_obsolete_after_remove_stat"
@@ -137,6 +143,10 @@ chaos_cases=(
   "prod_recovery_failpoints:chaos_failpoint_recovery_abort_clean_after_drain_before_start"
   "prod_recovery_failpoints:chaos_failpoint_recovery_abort_clean_does_not_recycle_wal_before_runtime_checkpoint"
   "prod_recovery_failpoints:chaos_failpoint_evictor_before_evict_once"
+  "prod_recovery_failpoints:abort_clean_hint_window_same_file"
+  "prod_recovery_failpoints:abort_clean_hint_window_multi_file"
+  "prod_recovery_failpoints:abort_clean_hint_control_after_hint"
+  "prod_recovery_failpoints:abort_clean_crash_after_abort_sync_before_task_registration"
 )
 
 run_cmd() {
@@ -247,6 +257,34 @@ run_fast() {
   if ! run_cmd "fast:prod_generation_failpoints" "$fast_timeout" \
     cargo test --features "$gen_features" --test "$gen_target" -- --nocapture --test-threads="$test_threads"; then
     failures+=("fast:prod_generation_failpoints")
+  fi
+
+  # the concurrent-write migration matrix is extra_check-gated too, so a feature gate
+  # drift would turn its fast_targets entry into a passing "0 tests"; probe the count
+  local cw_features="extra_check"
+  local cw_target="concurrent_write_migration"
+  local cw_list
+  local cw_list_code=0
+  set +e
+  cw_list="$(timeout "$fast_timeout" cargo test --features "$cw_features" --test "$cw_target" -- --list 2>/dev/null)"
+  cw_list_code=$?
+  set -e
+  if [[ "$cw_list_code" -ne 0 ]]; then
+    if [[ "$cw_list_code" -eq 124 ]]; then
+      echo "==> [fast:concurrent_write_migration:list] timeout"
+    else
+      echo "==> [fast:concurrent_write_migration:list] failed with exit code ${cw_list_code}"
+    fi
+    failures+=("fast:concurrent_write_migration:list")
+    return 0
+  fi
+  local cw_count
+  cw_count="$(printf '%s\n' "$cw_list" | grep -c ': test$' || true)"
+  echo "==> [fast:concurrent_write_migration] feature-gated tests found: ${cw_count}"
+  if [[ -z "${cw_count}" || "${cw_count}" -le 0 ]]; then
+    echo "==> [fast:concurrent_write_migration] FAILED: zero tests with --features ${cw_features} (feature gate drift?)"
+    failures+=("fast:concurrent_write_migration")
+    return 0
   fi
 
   # gc space accounting needs the physical payload oracle, which is intentionally

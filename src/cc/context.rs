@@ -89,6 +89,10 @@ pub struct Context {
     safe_exclusive: Arc<AtomicU64>,
     /// recovery roots use `Position::MIN` until phase2 completes
     recovering: AtomicBool,
+    /// a rebuild open detached its loggers and has not installed the full new era
+    /// yet: the runtime WAL barrier is meaningless in this window, so `quit` and
+    /// `sync` must not run and every error leaves through the recovery-open abort
+    recovery_abort_only: AtomicBool,
     /// shared durable WAL logger
     shared_logging: Option<Arc<Mutex<Logging>>>,
     pool: Arc<CCPool>,
@@ -115,26 +119,28 @@ impl Context {
 
     pub fn new(
         opt: Arc<ParsedOptions>,
+        groups: u8,
         sequences: Arc<Sequences>,
         group_boot: &[GroupBoot],
     ) -> Self {
-        let cores = opt.concurrent_write as usize;
+        // the group count is not always `opt.concurrent_write`: recovery builds its Context with
+        // the persisted (source) width while sharing the target options allocation, and only the
+        // runtime Context uses the target width
+        // the route is always the requested one, never the persisted era's: the retained scan
+        // enumerates physical boots at the source width (shared streams included), while the
+        // loggers lay out the new era, so a route-only switch carries this Context over as the
+        // runtime one and never hands off
+        let cores = groups as usize;
+        // the boot list must describe exactly this Context's width: a caller that cannot produce a
+        // boot for every slot must fix its plan instead of relying on a silent default slot
+        assert!(
+            group_boot.len() == cores + 1,
+            "boot slice must hold one boot per logical group plus the shared boot, got {} for {} groups",
+            group_boot.len(),
+            cores
+        );
         // per-group boots followed by the shared-stream boot
-        let default_boot = |physical_wal_id: u8| GroupBoot {
-            oldest_id: 0,
-            latest_id: 0,
-            scan_start: Position::MIN,
-            has_files: false,
-            start_id: 0,
-            checkpoint_floor: Position::MIN,
-            physical_wal_id,
-        };
-        let per_group_boot = |i: usize| {
-            group_boot
-                .get(i)
-                .copied()
-                .unwrap_or_else(|| default_boot(i as u8))
-        };
+        let per_group_boot = |i: usize| group_boot[i];
 
         let ckpt_cnts: Vec<Arc<AtomicUsize>> =
             (0..cores).map(|_| Arc::new(AtomicUsize::new(0))).collect();
@@ -143,12 +149,10 @@ impl Context {
         let mut shared_logging = None;
         if opt.sync_on_write {
             // durable mode shares one logger across all logical groups
-            let shared_boot = group_boot
-                .get(cores)
-                .copied()
-                .unwrap_or_else(|| default_boot(Options::SHARED_ID));
+            let shared_boot = group_boot[cores];
             let shared = Arc::new(Mutex::new(Logging::new(
                 Options::SHARED_ID,
+                cores,
                 shared_boot.start_id,
                 shared_boot.oldest_id,
                 Position::MIN,
@@ -165,6 +169,7 @@ impl Context {
                 let boot = per_group_boot(i);
                 groups_logging.push(Arc::new(Mutex::new(Logging::new(
                     i as u8,
+                    cores,
                     boot.start_id,
                     boot.oldest_id,
                     Position::MIN,
@@ -210,6 +215,7 @@ impl Context {
             sequences,
             safe_exclusive,
             recovering: AtomicBool::new(true),
+            recovery_abort_only: AtomicBool::new(false),
             shared_logging,
             pool,
             groups,
@@ -295,7 +301,31 @@ impl Context {
     /// publish shared-stream floors before runtime checkpointing or GC
     pub(crate) fn publish_shared_logical_checkpoint_floors(&self, floors: &[Position]) {
         if let Some(shared) = &self.shared_logging {
-            shared.lock().set_logical_checkpoint_floors(floors);
+            // recovery drains every reconstructed abort-clean task before this point, so the
+            // pin is normally absent here; clamp anyway so a task that somehow outlived the
+            // drain can never let recovery's own floors skip its records
+            let pin = self.min_abort_clean_file_id(Options::SHARED_ID);
+            let clamped: Vec<Position> = floors
+                .iter()
+                .enumerate()
+                .map(|(slot, pos)| match pin {
+                    Some(pin) => {
+                        let pin_pos = Position::new(pin, 0);
+                        if *pos > pin_pos {
+                            log::warn!(
+                                "abort-clean pin clamped shared floor[{:?}] from {:?} to {:?} (pin={:?})",
+                                slot,
+                                pos,
+                                pin_pos,
+                                pin
+                            );
+                        }
+                        (*pos).min(pin_pos)
+                    }
+                    None => *pos,
+                })
+                .collect();
+            shared.lock().set_logical_checkpoint_floors(&clamped);
         }
     }
 
@@ -319,6 +349,90 @@ impl Context {
 
     pub fn groups(&self) -> &Vec<WriterGroup> {
         &self.groups
+    }
+
+    /// the loggers this context writes through: one shared logger in durable mode,
+    /// one per logical group in relaxed mode. every one of them owns a physical
+    /// stream the era wipe covers
+    fn writer_loggings(&self) -> Vec<Arc<Mutex<Logging>>> {
+        match &self.shared_logging {
+            Some(shared) => vec![shared.clone()],
+            None => self
+                .groups
+                .iter()
+                .map(|group| group.logging.clone())
+                .collect(),
+        }
+    }
+
+    /// a rebuild open is between detaching its recovery writers and installing the
+    /// full new era: neither the runtime barrier nor a foreground sync is defined
+    pub(crate) fn recovery_abort_only(&self) -> bool {
+        self.recovery_abort_only.load(Acquire)
+    }
+
+    /// witness for the era handoff's order: the wipe removes the old era's files, so it may
+    /// only run once control of them has left every logger
+    #[cfg(feature = "extra_check")]
+    pub(crate) fn assert_writers_detached(&self) {
+        for logging in self.writer_loggings() {
+            must_true!(
+                logging.lock().writer.is_none(),
+                "the era wipe must not run while a recovery writer is still open"
+            );
+        }
+    }
+
+    /// close every recovery writer before the era wipe.
+    ///
+    /// the precheck runs over every logger first: a relaxed route must not close
+    /// some streams' files and then discover another logger is not detachable
+    pub(crate) fn detach_recovery_writers(&self, epoch_start: u64) -> Result<(), OpCode> {
+        // a foreground writer exists only after `init_safe_exclusive`, so the recovery
+        // window is what makes "no append in flight" true rather than merely likely
+        if !self.recovering() {
+            log::error!("refusing to detach recovery writers outside the recovery window");
+            return Err(OpCode::IoError);
+        }
+        let loggings = self.writer_loggings();
+        for logging in loggings.iter() {
+            logging.lock().check_detachable(epoch_start)?;
+        }
+        self.recovery_abort_only.store(true, Release);
+        for logging in loggings.iter() {
+            logging.lock().detach_writer(epoch_start)?;
+        }
+        Ok(())
+    }
+
+    /// publish the new era's writer into every logger of a same-width rebuild.
+    ///
+    /// the whole install must succeed before the context may serve the runtime, so
+    /// a partial install leaves `recovery_abort_only` set for the caller's abort
+    pub(crate) fn install_epoch_writers(&self, epoch_start: u64) -> Result<(), OpCode> {
+        must_true!(
+            self.recovery_abort_only(),
+            "epoch writers install outside a rebuild's abort window"
+        );
+        for logging in self.writer_loggings() {
+            logging.lock().install_epoch_writer(epoch_start)?;
+        }
+        self.recovery_abort_only.store(false, Release);
+        Ok(())
+    }
+
+    /// recovery-open abort cleanup: close a partially built context without the
+    /// runtime WAL barrier.
+    ///
+    /// the barrier assumes installed era writers and admitted foreground writers;
+    /// a failed rebuild open can have detached loggers or a partially installed
+    /// era, and it has no foreground write whose durability the barrier would
+    /// establish
+    pub(crate) fn abort_recovery_open(&self) {
+        let _ = self.tx.send(CollectorSignal::Quit);
+        if let Some(handle) = self.collector.lock().take() {
+            let _ = handle.join();
+        }
     }
 
     pub(crate) fn next_group_id(&self) -> usize {
@@ -509,6 +623,27 @@ impl Context {
         min_id
     }
 
+    /// keep a durable checkpoint floor (and the wal analysis hint written from it)
+    /// behind every pending abort-clean task of that physical stream
+    ///
+    /// the hint tells recovery where record analysis may start, and everything before it is
+    /// assumed to be folded into durable pages. that is true for redo, which is gated by the
+    /// bucket frontier, but not for transaction outcomes: an aborted transaction's only durable
+    /// trace is its `Abort` record, so a hint past it would skip the abort, leave the aborted
+    /// versions looking committed and drop the abort-clean task. a task's pin is the earliest
+    /// record it still needs, so the floor may not pass it
+    pub(crate) fn clamp_floor_to_abort_clean(
+        &self,
+        pos: Position,
+        physical_wal_id: u8,
+    ) -> Position {
+        match self.min_abort_clean_file_id(physical_wal_id) {
+            // whole-file granularity is enough: recovery scans from the hint file onwards
+            Some(pin) => pos.min(Position::new(pin, 0)),
+            None => pos,
+        }
+    }
+
     #[inline]
     pub(crate) fn has_pending_abort_clean_bucket(&self, bucket_id: u64) -> bool {
         let shard = Self::shard_of(bucket_id);
@@ -558,6 +693,14 @@ impl Context {
     }
 
     pub(crate) fn quit(&self) {
+        // a rebuild open installs the full new era before it may serve the runtime;
+        // reaching a barrier with detached or partially installed loggers means the
+        // open published a context it never finished, and a barrier would either
+        // abort on the missing writer or make a half-installed era look durable
+        must_true!(
+            !self.recovery_abort_only(),
+            "quit on a recovery-open context whose era writers are not installed"
+        );
         self.drain_inflight();
         if self.opt.sync_on_write {
             let ticket = {
@@ -688,6 +831,12 @@ impl Context {
     }
 
     pub fn sync(&self) -> Result<(), OpCode> {
+        // same window as `quit`: no runtime sync exists before the new era is fully
+        // installed
+        must_true!(
+            !self.recovery_abort_only(),
+            "sync on a recovery-open context whose era writers are not installed"
+        );
         if self.opt.sync_on_write {
             let ticket = {
                 let mut log = self.lock_shared_logging(0);
@@ -1210,9 +1359,11 @@ impl Drop for CCPool {
 mod tests {
     use super::{
         CCNode, CCPOOL_SHARD, CCPool, COLLECTOR_MIN_SLEEP, CollectorSignal, Context,
-        DUTY_CYCLE_SLEEP_MULTIPLIER, collector_idle_delay, drain_pending_wakes, two_choices,
+        DUTY_CYCLE_SLEEP_MULTIPLIER, GroupBoot, collector_idle_delay, drain_pending_wakes,
+        two_choices,
     };
     use crate::cc::context::ViewState;
+    use crate::utils::data::Position;
     #[cfg(feature = "metrics")]
     use crate::utils::observe::InMemoryObserver;
     use crate::{Options, RandomPath, meta::Sequences};
@@ -1229,12 +1380,68 @@ mod tests {
         {
             opt.observer = Arc::new(InMemoryObserver::default());
         }
+        let mut boots: Vec<GroupBoot> = (0..groups).map(test_boot).collect();
+        boots.push(test_boot(Options::SHARED_ID));
         let ctx = Context::new(
             Arc::new(opt.validate().expect("context options must validate")),
+            groups,
             Arc::new(Sequences::default()),
-            &[],
+            &boots,
         );
         (root, ctx)
+    }
+
+    /// an empty, file-less boot for the given physical stream
+    fn test_boot(physical_wal_id: u8) -> GroupBoot {
+        GroupBoot {
+            physical_wal_id,
+            oldest_id: 0,
+            latest_id: 0,
+            scan_start: Position::MIN,
+            has_files: false,
+            start_id: 0,
+            checkpoint_floor: Position::MIN,
+        }
+    }
+
+    #[test]
+    fn context_takes_its_width_from_the_explicit_group_count() {
+        // the target options width and the Context's width differ during a width migration:
+        // recovery builds a source-width Context on the target options allocation, so a boot
+        // slice shaped for the explicit group count must be accepted
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 4;
+        let boots: Vec<GroupBoot> = (0..2)
+            .map(test_boot)
+            .chain([test_boot(Options::SHARED_ID)])
+            .collect();
+        let _ = Context::new(
+            Arc::new(opt.validate().expect("context options must validate")),
+            2,
+            Arc::new(Sequences::default()),
+            &boots,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "boot slice must hold one boot per logical group")]
+    fn context_rejects_a_boot_slice_that_does_not_match_its_width() {
+        // a slice shaped for the options width instead of the Context's own width is rejected
+        // rather than silently filling the missing slots with a default boot
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 4;
+        let boots: Vec<GroupBoot> = (0..4)
+            .map(test_boot)
+            .chain([test_boot(Options::SHARED_ID)])
+            .collect();
+        let _ = Context::new(
+            Arc::new(opt.validate().expect("context options must validate")),
+            2,
+            Arc::new(Sequences::default()),
+            &boots,
+        );
     }
 
     #[test]
@@ -1580,5 +1787,36 @@ mod tests {
         tx.send(CollectorSignal::Wake).unwrap();
         tx.send(CollectorSignal::Quit).unwrap();
         assert!(drain_pending_wakes(&reader));
+    }
+
+    /// the same-width rebuild walks this context through its abort window and back:
+    /// detaching arms it, a full install disarms it, and every stream owns the era
+    #[test]
+    fn rebuild_handoff_arms_and_disarms_the_abort_window() {
+        let (_root, ctx) = new_context_with_groups(2);
+        assert!(
+            !ctx.recovery_abort_only(),
+            "a fresh recovery context is not abort-only"
+        );
+        ctx.detach_recovery_writers(0)
+            .expect("a quiescent context must detach its streams");
+        assert!(
+            ctx.recovery_abort_only(),
+            "detaching a writer must arm the abort window"
+        );
+
+        ctx.install_epoch_writers(9)
+            .expect("install must publish every era writer");
+        assert!(
+            !ctx.recovery_abort_only(),
+            "a full install must disarm the abort window"
+        );
+        for group in ctx.groups().iter() {
+            let logging = group.logging.lock();
+            assert_eq!(logging.current_pos(), Position::new(9, 0));
+            assert_eq!(logging.oldest_wal_id(), 9);
+        }
+        ctx.sync()
+            .expect("the runtime sync must work once every era writer exists");
     }
 }

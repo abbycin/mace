@@ -276,6 +276,7 @@ mod tests {
         let ckpt_cnt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let logging = Arc::new(Mutex::new(Logging::new(
             0,
+            1,
             0,
             0,
             Position::MIN,

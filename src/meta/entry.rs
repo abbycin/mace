@@ -120,26 +120,63 @@ impl PersistStat {
         }
     }
 
+    /// offset of the `StatInner` payload inside a persisted stat record, for tests that
+    /// build a damaged record
+    #[cfg(test)]
+    pub(crate) const fn stat_inner_offset() -> usize {
+        size_of::<StatHdr>()
+    }
+
     pub(crate) fn decode_inner_only(src: &[u8]) -> StatInner {
-        let hdr = StatHdr::from_slice(src);
-        StatInner::from_slice(&src[hdr.len()..])
+        crate::must_ok!(
+            Self::try_decode_inner_only(src),
+            "can't decode the stat record"
+        )
+    }
+
+    /// fallible variant of [`Self::decode_inner_only`], for readers that must report
+    /// damage instead of aborting (the offline checker): the record must at least hold
+    /// its fixed header and body before the body is read
+    pub(crate) fn try_decode_inner_only(src: &[u8]) -> Result<StatInner, OpCode> {
+        if src.len() < size_of::<StatHdr>() + size_of::<StatInner>() {
+            return Err(OpCode::Corruption);
+        }
+        Ok(StatInner::from_slice(&src[size_of::<StatHdr>()..]))
     }
 
     pub(crate) fn decode_mask_only(src: &[u8], total_elems: u32) -> BitMap {
+        crate::must_ok!(
+            Self::try_decode_mask_only(src, total_elems),
+            "can't decode the inactive bitmap"
+        )
+    }
+
+    /// fallible variant of [`Self::decode_mask_only`], for readers that must report
+    /// damage instead of aborting (the offline checker). every count that indexes the
+    /// record is validated against the record length, and every inactive sequence is
+    /// range-checked against `total_elems` before use, because the unchecked version
+    /// would read past the record and index the bitmap out of bounds on a corrupt
+    /// header. `total_elems` itself sizes the bitmap and is a legal record field, so it
+    /// is not bounded here: a file may hold millions of elements
+    pub(crate) fn try_decode_mask_only(src: &[u8], total_elems: u32) -> Result<BitMap, OpCode> {
         let hdr = StatHdr::from_slice(src);
-        let mut mask = BitMap::new(total_elems);
-        let seq = unsafe {
-            src.as_ptr()
-                .add(hdr.len() + size_of::<StatInner>())
-                .cast::<u32>()
-        };
-        for i in 0..hdr.elems as usize {
-            unsafe {
-                let x = seq.add(i).read_unaligned();
-                mask.set(x);
-            }
+        let body = size_of::<StatHdr>() + size_of::<StatInner>();
+        let mask_len = (hdr.elems as usize)
+            .checked_mul(size_of::<u32>())
+            .ok_or(OpCode::Corruption)?;
+        if src.len() < body + mask_len {
+            return Err(OpCode::Corruption);
         }
-        mask
+        let mut mask = BitMap::new(total_elems);
+        let seq = unsafe { src.as_ptr().add(body).cast::<u32>() };
+        for i in 0..hdr.elems as usize {
+            let x = unsafe { seq.add(i).read_unaligned() };
+            if x >= total_elems {
+                return Err(OpCode::Corruption);
+            }
+            mask.set(x);
+        }
+        Ok(mask)
     }
 
     fn len(&self) -> usize {
@@ -672,18 +709,24 @@ impl IMetaCodec for BucketMeta {
 
 impl IAsSlice for BucketMeta {}
 
-/// which conditional stat-update kind missed, so retried commits can count
-/// the miss under the right metric when metrics are enabled
+/// which conditional metadata operation missed: a stat update that found no record
+/// (`Data`/`Blob`) or an idempotent delete that found the key already gone
+/// (`DataDel`/`BlobDel`), so a commit can count the miss under the right metric
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StatMissKind {
     Data,
     Blob,
+    DataDel,
+    BlobDel,
 }
 
 pub enum MetaOp {
     Put(Vec<u8>, Vec<u8>),
     Update(Vec<u8>, Vec<u8>, StatMissKind),
     Del(Vec<u8>),
+    /// delete that tolerates an already-absent key, for stat keys two producers
+    /// may retire: the gc fully-obsolete reclaim and the bucket delete path
+    DelIfExists(Vec<u8>, StatMissKind),
 }
 
 pub(crate) trait IMetaCodec {
@@ -765,30 +808,48 @@ impl MetaRecord for Delete {
     fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
         match kind {
             MetaKind::DataDelete | MetaKind::BlobDelete => {
-                let (obs_bucket, stat_bucket) = if kind == MetaKind::DataDelete {
-                    (BUCKET_OBSOLETE_DATA, BUCKET_DATA_STAT)
+                let (obs_bucket, stat_bucket, miss_kind) = if kind == MetaKind::DataDelete {
+                    (
+                        BUCKET_OBSOLETE_DATA,
+                        BUCKET_DATA_STAT,
+                        StatMissKind::DataDel,
+                    )
                 } else {
-                    (BUCKET_OBSOLETE_BLOB, BUCKET_BLOB_STAT)
+                    (
+                        BUCKET_OBSOLETE_BLOB,
+                        BUCKET_BLOB_STAT,
+                        StatMissKind::BlobDel,
+                    )
                 };
                 for &id in self.iter() {
                     let key = id.to_le_bytes().to_vec();
                     ops.entry(obs_bucket.to_string())
                         .or_default()
                         .push(MetaOp::Put(key.clone(), vec![]));
+                    // the stat key may already be gone: the fully-obsolete reclaim
+                    // and the bucket delete path both retire a bucket's files, and
+                    // an earlier producer's delete is a miss here, not a fault
                     ops.entry(stat_bucket.to_string())
                         .or_default()
-                        .push(MetaOp::Del(key));
+                        .push(MetaOp::DelIfExists(key, miss_kind));
                 }
             }
             MetaKind::DataDeleteDone | MetaKind::BlobDeleteDone => {
-                let bucket = if kind == MetaKind::DataDeleteDone {
-                    BUCKET_OBSOLETE_DATA
+                let (bucket, miss_kind) = if kind == MetaKind::DataDeleteDone {
+                    (BUCKET_OBSOLETE_DATA, StatMissKind::DataDel)
                 } else {
-                    BUCKET_OBSOLETE_BLOB
+                    (BUCKET_OBSOLETE_BLOB, StatMissKind::BlobDel)
                 };
                 let bucket_ops = ops.entry(bucket.to_string()).or_default();
+                // one marker key is cleared once per record, and a clear that finds
+                // no marker is the completion of an already-cleared file: the reclaim
+                // path and the bucket delete path can both queue the same id, so the
+                // second round's clear must be a miss, not a fault
+                let mut dedup = BTreeSet::new();
                 for &id in self.iter() {
-                    bucket_ops.push(MetaOp::Del(id.to_le_bytes().to_vec()));
+                    if dedup.insert(id) {
+                        bucket_ops.push(MetaOp::DelIfExists(id.to_le_bytes().to_vec(), miss_kind));
+                    }
                 }
             }
             _ => unreachable!(),
@@ -810,5 +871,55 @@ impl MetaRecord for DelInterval {
                 bucket_ops.push(MetaOp::Del(lo.to_le_bytes().to_vec()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a record whose declared sequence count runs past its own bytes is rejected
+    #[test]
+    fn a_declared_sequence_count_beyond_the_record_is_a_corruption() {
+        let body = size_of::<StatHdr>() + size_of::<StatInner>();
+        let mut buf = vec![0u8; body];
+        // the header claims one sequence, the record carries no sequence bytes
+        buf[..4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            PersistStat::try_decode_mask_only(&buf, 16).err(),
+            Some(OpCode::Corruption)
+        );
+    }
+
+    /// an inactive sequence beyond the declared element count is rejected instead of
+    /// indexing the bitmap out of bounds
+    #[test]
+    fn an_out_of_range_inactive_sequence_is_a_corruption() {
+        let body = size_of::<StatHdr>() + size_of::<StatInner>();
+        let mut buf = vec![0u8; body + size_of::<u32>()];
+        buf[..4].copy_from_slice(&1u32.to_le_bytes());
+        buf[body..].copy_from_slice(&99u32.to_le_bytes());
+        assert_eq!(
+            PersistStat::try_decode_mask_only(&buf, 16).err(),
+            Some(OpCode::Corruption)
+        );
+    }
+
+    /// a legal record may carry far more elements than any fixed reader-side cap: a
+    /// compressed payload file holds millions of records, so the bitmap is sized from
+    /// `total_elems` and only the counts that index the record are bounded
+    #[test]
+    fn a_large_element_count_is_not_a_corruption() {
+        let body = size_of::<StatHdr>() + size_of::<StatInner>();
+        let buf = vec![0u8; body];
+        let total_elems = 1 << 21;
+        let mut mask = PersistStat::try_decode_mask_only(&buf, total_elems)
+            .expect("a legal record with a large element count must decode");
+        let last = total_elems - 1;
+        mask.set(last);
+        assert!(
+            mask.set_bits(total_elems).contains(&last),
+            "the bitmap must be sized from the record's element count"
+        );
     }
 }

@@ -398,7 +398,7 @@ impl GarbageCollector {
             self.process_files(kind);
         }
         self.process_pending_buckets();
-        self.store.manifest.delete_files();
+        must_ok!(self.store.manifest.delete_files());
         #[cfg(feature = "metrics")]
         self.store.opt.observer.histogram(
             HistogramMetric::GcRunMicros,
@@ -413,6 +413,12 @@ impl GarbageCollector {
     }
 
     fn process_wal_clean_with_manifest(&mut self, manifest: Handle<Manifest>) {
+        // suspended deletions skip the whole recycle phase, including the durable
+        // intent commit: a committed intent whose files were not deleted can only be
+        // completed at the next startup, so the phase must not start at all.
+        let Some(_work) = manifest.deletions.begin() else {
+            return;
+        };
         let ctx = self.ctx;
         if ctx.opt.sync_on_write {
             self.process_shared_wal_clean(ctx, manifest);
@@ -446,6 +452,9 @@ impl GarbageCollector {
     }
 
     fn process_shared_wal_clean(&mut self, ctx: Handle<Context>, manifest: Handle<Manifest>) {
+        let Some(_work) = manifest.deletions.begin() else {
+            return;
+        };
         let shared = ctx
             .shared_logging()
             .expect("durable mode has a shared logging");
@@ -973,7 +982,7 @@ impl GarbageCollector {
     fn process_pending_buckets(&mut self) {
         let mut bucket_id = None;
         let _ = self.store.manifest.btree.view(BUCKET_PENDING_DEL, |txn| {
-            let mut iter = txn.iter_uncached();
+            let mut iter = txn.iter();
             let mut k = Vec::new();
             let mut v = Vec::new();
             if iter.next_ref(&mut k, &mut v) {
@@ -1053,7 +1062,7 @@ impl GarbageCollector {
     fn delete_bucket_batch(&self, bucket: &str) -> usize {
         let mut keys = Vec::with_capacity(Self::MAX_ELEMS);
         let _ = self.store.manifest.btree.view(bucket, |txn| {
-            let mut iter = txn.iter_uncached();
+            let mut iter = txn.iter();
             let mut k = Vec::new();
             let mut v = Vec::new();
             while iter.next_ref(&mut k, &mut v) && keys.len() < Self::MAX_ELEMS {
@@ -1232,37 +1241,77 @@ impl GarbageCollector {
     }
 
     fn process_obsoleted_files(&self, kind: FileKind, obsoleted: &[u64], bucket_id: u64) {
-        if obsoleted.is_empty() {
+        let mut grouped = HashMap::new();
+        grouped.insert(bucket_id, obsoleted.to_vec());
+        self.process_obsoleted_batches(kind, &grouped);
+    }
+
+    fn process_obsoleted_batches(&self, kind: FileKind, grouped: &HashMap<u64, Vec<u64>>) {
+        if grouped.values().all(Vec::is_empty) {
             return;
         }
-
-        let mut unlinked = Delete::default();
-        let mut del_intervals = DelInterval {
-            lo: Vec::new(),
-            bucket_id,
-        };
-        obsoleted
-            .iter()
-            .filter(|x| !self.store.manifest.is_unsynced_file(kind, **x))
-            .for_each(|&x| {
+        let mut file_intervals = Vec::new();
+        for (&bucket_id, obsoleted) in grouped {
+            for &file_id in obsoleted {
+                if self.store.manifest.is_unsynced_file(kind, file_id) {
+                    continue;
+                }
                 let path = match kind {
-                    FileKind::Data => self.store.opt.data_file(x),
-                    FileKind::Blob => self.store.opt.blob_file(x),
+                    FileKind::Data => self.store.opt.data_file(file_id),
+                    FileKind::Blob => self.store.opt.blob_file(file_id),
                 };
                 let mut loader = MetaReader::new(self.store.opt.fs.as_ref(), path);
                 let ivls = loader.get_interval();
+                let mut lows = Vec::new();
                 for i in ivls {
                     if kind == FileKind::Data || i.lo <= i.hi {
                         // keep deleting old sentinel keys from earlier empty data files
-                        del_intervals.push(i.lo);
+                        lows.push(i.lo);
                     }
                 }
-                unlinked.push(x);
-            });
+                file_intervals.push((bucket_id, file_id, lows));
+            }
+        }
+        if file_intervals.is_empty() {
+            return;
+        }
 
+        let gate = self.store.manifest.close_junk_gate(kind);
+        gate.drain();
+        let mut kept = HashMap::<u64, (Delete, Vec<u64>)>::new();
+        for &(bucket_id, file_id, ref lows) in &file_intervals {
+            match self
+                .store
+                .manifest
+                .stat_ctx(kind)
+                .load_persisted_stat_inner(file_id, &self.store.manifest.btree)
+            {
+                Ok(stat) => {
+                    must_true!(
+                        stat.active_elems == 0 && stat.active_size == 0,
+                        "reclaim candidate still active in durable stats"
+                    );
+                    let entry = kept
+                        .entry(bucket_id)
+                        .or_insert_with(|| (Delete::default(), Vec::new()));
+                    entry.0.push(file_id);
+                    entry.1.extend(lows);
+                }
+                Err(OpCode::NotFound) => {}
+                Err(err) => must_ok!(Result::<(), OpCode>::Err(err)),
+            }
+        }
         let mut txn = self.store.manifest.begin();
-        txn.record(Self::delete_meta_kind(kind), &unlinked);
-        txn.record(Self::delete_interval_meta_kind(kind), &del_intervals);
+        for (&bucket_id, (unlinked, lows)) in &kept {
+            txn.record(Self::delete_meta_kind(kind), unlinked);
+            txn.record(
+                Self::delete_interval_meta_kind(kind),
+                &DelInterval {
+                    lo: lows.clone(),
+                    bucket_id,
+                },
+            );
+        }
         txn.commit();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::obsolete_after_meta_commit_failpoint(kind));
@@ -1272,30 +1321,29 @@ impl GarbageCollector {
                 FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterMetaCommit,
                 FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterMetaCommit,
             },
-            bucket_id,
+            file_intervals[0].0,
             &self.store.opt.db_root,
         );
-
-        self.store
-            .manifest
-            .mark_retired_stats(kind, bucket_id, &unlinked);
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash(Self::obsolete_after_retired_mark_failpoint(kind));
-        #[cfg(feature = "extra_check")]
-        crate::testing::fire_gc_stat_sync_point(
-            match kind {
-                FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterRetiredMark,
-                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterRetiredMark,
-            },
-            bucket_id,
-            &self.store.opt.db_root,
-        );
-        self.store.manifest.remove_retired_stat_intervals(
-            kind,
-            bucket_id,
-            &unlinked,
-            &del_intervals.lo,
-        );
+        for (&bucket_id, (unlinked, lows)) in &kept {
+            self.store
+                .manifest
+                .mark_retired_stats(kind, bucket_id, unlinked);
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash(Self::obsolete_after_retired_mark_failpoint(kind));
+            #[cfg(feature = "extra_check")]
+            crate::testing::fire_gc_stat_sync_point(
+                match kind {
+                    FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterRetiredMark,
+                    FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterRetiredMark,
+                },
+                bucket_id,
+                &self.store.opt.db_root,
+            );
+            self.store
+                .manifest
+                .remove_retired_stat_intervals(kind, bucket_id, unlinked, lows);
+        }
+        drop(gate);
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(Self::obsolete_after_remove_stat_failpoint(kind));
         #[cfg(feature = "extra_check")]
@@ -1304,16 +1352,24 @@ impl GarbageCollector {
                 FileKind::Data => crate::testing::GcStatSyncPoint::DataObsoleteAfterRuntimeRemove,
                 FileKind::Blob => crate::testing::GcStatSyncPoint::BlobObsoleteAfterRuntimeRemove,
             },
-            bucket_id,
+            file_intervals[0].0,
             &self.store.opt.db_root,
         );
-        self.store.manifest.save_obsolete_files(kind, &unlinked);
-        self.store.manifest.delete_files();
+        #[cfg(feature = "metrics")]
+        let mut total = 0;
+        for (_, (unlinked, _)) in kept {
+            #[cfg(feature = "metrics")]
+            {
+                total += unlinked.len();
+            }
+            self.store.manifest.save_obsolete_files(kind, &unlinked);
+            must_ok!(self.store.manifest.delete_files());
+        }
         #[cfg(feature = "metrics")]
         self.store
             .opt
             .observer
-            .counter(Self::obsolete_counter(kind), unlinked.len() as u64);
+            .counter(Self::obsolete_counter(kind), total as u64);
         self.file_runs(kind).fetch_add(1, Relaxed);
     }
 
@@ -1323,9 +1379,7 @@ impl GarbageCollector {
         let eager = self.store.opt.gc_eager;
         let (obsoleted, bucket_usage, candidates) = self.collect_candidates(kind);
 
-        for (bucket_id, files) in obsoleted {
-            self.process_obsoleted_files(kind, &files, bucket_id);
-        }
+        self.process_obsoleted_batches(kind, &obsoleted);
 
         let ranked = Self::rank_candidates(candidates, |bucket_id| self.next_tick(bucket_id, kind));
         if ranked.is_empty() {
@@ -1513,10 +1567,23 @@ impl GarbageCollector {
         let mut obsoleted = Vec::new();
 
         let collect_ids: Vec<u64> = candidate.iter().map(|x| x.id).collect();
-        self.store
-            .manifest
-            .stat_ctx(kind)
-            .start_collect_junks(&collect_ids);
+        {
+            let gate = self.store.manifest.close_junk_gate(kind);
+            gate.drain();
+            self.store
+                .manifest
+                .stat_ctx(kind)
+                .start_collect_junks(&collect_ids);
+        }
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataRewriteCollecting,
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobRewriteCollecting,
+            },
+            bucket_id,
+            &self.store.opt.db_root,
+        );
         let victims: Vec<u64> = candidate
             .iter()
             .filter_map(|x| {
@@ -1533,11 +1600,25 @@ impl GarbageCollector {
                     .filter(|ivl| ivl.lo <= ivl.hi)
                     .collect();
                 let mut im = InactiveMap::new(&ivls);
+                let persisted = match self
+                    .store
+                    .manifest
+                    .stat_ctx(kind)
+                    .load_persisted_stat_inner(x.id, &self.store.manifest.btree)
+                {
+                    Ok(stat) => stat,
+                    Err(OpCode::NotFound)
+                        if self.store.manifest.is_retired_stat(kind, bucket_id, x.id) =>
+                    {
+                        return None;
+                    }
+                    Err(err) => must_ok!(Result::<StatInner, OpCode>::Err(err)),
+                };
                 let bitmap = self
                     .store
                     .manifest
                     .stat_ctx(kind)
-                    .load_mask_clone(x.id, &self.store.manifest.btree)
+                    .load_mask_from_btree(x.id, persisted.total_elems, &self.store.manifest.btree)
                     .expect("must exist");
 
                 let active: Vec<Entry> = relocs
@@ -1570,7 +1651,15 @@ impl GarbageCollector {
         let victim_count = victims.len() as u64;
 
         // it's possible that another thread deactivated all live items while we were processing
+        self.store
+            .manifest
+            .stat_ctx(kind)
+            .handoff_collect_junks_to_ordinary(&obsoleted);
         self.process_obsoleted_files(kind, &obsoleted, bucket_id);
+        self.store
+            .manifest
+            .stat_ctx(kind)
+            .clear_ordinary_collect_junks(&obsoleted);
 
         let target = self.target_file_size(kind).max(1);
         let chunks = split_rewrite_items(items, target, permit.enable_compression);
@@ -1636,6 +1725,17 @@ impl GarbageCollector {
             &opt.db_root,
         );
 
+        let gate = self.store.manifest.close_junk_gate(kind);
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_gc_stat_sync_point(
+            match kind {
+                FileKind::Data => crate::testing::GcStatSyncPoint::DataRewriteGateClosed,
+                FileKind::Blob => crate::testing::GcStatSyncPoint::BlobRewriteGateClosed,
+            },
+            bucket_id,
+            &self.store.opt.db_root,
+        );
+        gate.drain();
         let mut txn = self.store.manifest.begin();
         txn.record(MetaKind::Sequences, self.store.manifest.sequences.deref());
 
@@ -1687,9 +1787,10 @@ impl GarbageCollector {
             &del_intervals,
             &remap_intervals,
         );
+        drop(gate);
 
         self.store.manifest.save_obsolete_files(kind, &tmp);
-        self.store.manifest.delete_files();
+        must_ok!(self.store.manifest.delete_files());
         self.file_runs(kind).fetch_add(1, AcqRel);
         #[cfg(feature = "metrics")]
         {

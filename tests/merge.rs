@@ -1,6 +1,5 @@
-//! Focused checks for the merge design:
-//! per-bucket runtime operator binding, persistence boundary, and
-//! read-surface gating of recovered merge records.
+//! Merge operator acceptance tests: per-bucket runtime operator binding, persistence
+//! boundary, and read-surface gating of recovered merge records.
 mod common;
 
 use common::TestEnv;
@@ -748,10 +747,9 @@ fn force_consolidation(db: &mace::Bucket) {
     kv.commit().unwrap();
 }
 
-/// Phase C crash-safety core: a materializing compact absorbs operand LSNs into
-/// the compacted page lineage, so recovery's bucket-frontier gate must skip them.
-/// a missing frontier entry would redo the operands on top of the folded base
-/// (double-add); a non-durable folded base would lose the increments (no-add).
+/// a materializing compact absorbs operand LSNs into the compacted page lineage, so recovery's
+/// bucket-frontier gate must skip them: a missing frontier entry would redo the operands on top of
+/// the folded base (double-add), while a non-durable folded base would lose the increments (no-add).
 #[test]
 fn materializing_compact_survives_reopen_without_double_add() {
     let env = TestEnv::default();
@@ -980,7 +978,6 @@ fn materialized_blob_fold_survives_reopen() {
 /// a folded value past MAX_KV_SIZE is a contract violation on every reliable read
 /// path; the key becomes merge-blocked until a committed del/reset_merge clears
 /// it, while the raw chain stays valid and does not block other keys' maintenance
-/// (solve.md)
 #[test]
 fn oversized_fold_blocks_merge_until_committed_delete() {
     use std::sync::Arc;
@@ -1065,7 +1062,7 @@ fn oversized_fold_blocks_merge_until_committed_delete() {
     // a committed del and reset_merge both succeed (their commit-gated unblock
     // is a best-effort reset: a background reader pinned before the del may
     // still re-block the key from the old chain, which is designed behavior —
-    // any observation of the violation re-blocks, solve.md point 3)
+    // any observation of the violation re-blocks)
     let kv = db.begin().unwrap();
     kv.del("bad").unwrap();
     kv.commit().unwrap();

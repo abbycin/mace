@@ -1,3 +1,7 @@
+//! crash and fault injection points
+//!
+//! every consultation is counted, so a test can assert that the code under test actually
+//! reached a point instead of passing because the point did not exist or never ran.
 use crate::OpCode;
 use std::{
     collections::HashMap,
@@ -17,10 +21,15 @@ pub(crate) enum FailAction {
 pub(crate) enum FsOp {
     Open,
     TryExists,
+    CreateDir,
     CreateDirAll,
     ReadDir,
     RemoveFile,
+    RemoveDirAll,
     SyncDir,
+    Rename,
+    HardLink,
+    CopyFile,
 }
 
 impl FsOp {
@@ -28,10 +37,15 @@ impl FsOp {
         match name {
             "open" => Some(Self::Open),
             "try_exists" => Some(Self::TryExists),
+            "create_dir" => Some(Self::CreateDir),
             "create_dir_all" => Some(Self::CreateDirAll),
             "read_dir" => Some(Self::ReadDir),
             "remove_file" => Some(Self::RemoveFile),
+            "remove_dir_all" => Some(Self::RemoveDirAll),
             "sync_dir" => Some(Self::SyncDir),
+            "rename" => Some(Self::Rename),
+            "hard_link" => Some(Self::HardLink),
+            "copy_file" => Some(Self::CopyFile),
             _ => None,
         }
     }
@@ -40,10 +54,15 @@ impl FsOp {
         match self {
             Self::Open => "mace_fs_open",
             Self::TryExists => "mace_fs_try_exists",
+            Self::CreateDir => "mace_fs_create_dir",
             Self::CreateDirAll => "mace_fs_create_dir_all",
             Self::ReadDir => "mace_fs_read_dir",
             Self::RemoveFile => "mace_fs_remove_file",
+            Self::RemoveDirAll => "mace_fs_remove_dir_all",
             Self::SyncDir => "mace_fs_sync_dir",
+            Self::Rename => "mace_fs_rename",
+            Self::HardLink => "mace_fs_hard_link",
+            Self::CopyFile => "mace_fs_copy_file",
         }
     }
 }

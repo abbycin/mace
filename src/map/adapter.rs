@@ -10,6 +10,7 @@ use crate::must_ok;
 use crate::types::refbox::{BoxRef, BoxView};
 use crate::utils::Handle;
 use crate::utils::data::init_group_pos;
+use crate::utils::options::Options;
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -107,7 +108,12 @@ impl ManifestCheckpointObserver {
         }
     }
 
-    fn update_stat_interval(&self, txn: &mut Txn, result: &mut FlushResult) -> FlushStatDelta {
+    fn update_stat_interval(
+        &self,
+        txn: &mut Txn,
+        result: &mut FlushResult,
+        junk_permits: &[Option<crate::meta::JunkPermit<'_>>; 2],
+    ) -> FlushStatDelta {
         let bucket_id = result.bucket_id;
         let mut delta = FlushStatDelta {
             kinds: [FlushStatDeltaKind::default(), FlushStatDeltaKind::default()],
@@ -126,11 +132,17 @@ impl ManifestCheckpointObserver {
                 })
                 .unwrap_or_else(|| self.next_tick(bucket_id, kind));
             let mut by_file = BTreeMap::<u64, PersistStat>::new();
-            let stats =
-                must_ok!(
-                    self.manifest
-                        .apply_junks(kind, bucket_id, tick, &result.kind(kind).junk)
-                );
+            let stats = if result.kind(kind).junk.is_empty() {
+                Vec::new()
+            } else {
+                must_ok!(self.manifest.apply_junks(
+                    kind,
+                    junk_permits[kind.slot()].as_ref().expect("junk permit"),
+                    bucket_id,
+                    tick,
+                    &result.kind(kind).junk,
+                ))
+            };
             for stat in stats {
                 by_file.insert(stat.file_id, stat);
             }
@@ -200,15 +212,47 @@ impl ManifestCheckpointObserver {
         }
 
         result.sync();
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_checkpoint_sync_point(
+            crate::testing::CheckpointSyncPoint::AfterResultSync,
+            bucket_id,
+        );
         if has_new_files {
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_flush_after_data_dir_sync");
+        }
+        let needed: Vec<FileKind> = FileKind::ALL
+            .into_iter()
+            .filter(|&kind| !result.kind(kind).junk.is_empty())
+            .collect();
+        let mut junk_permits = [None, None];
+        while !needed
+            .iter()
+            .all(|kind| junk_permits[kind.slot()].is_some())
+        {
+            for &kind in &needed {
+                if junk_permits[kind.slot()].is_none() {
+                    junk_permits[kind.slot()] = self.manifest.try_acquire_junk_permit(kind);
+                }
+            }
+            if !needed
+                .iter()
+                .all(|kind| junk_permits[kind.slot()].is_some())
+            {
+                let wait_kind = needed
+                    .iter()
+                    .copied()
+                    .find(|kind| junk_permits[kind.slot()].is_none())
+                    .expect("missing junk kind");
+                junk_permits = [None, None];
+                self.manifest.wait_junk_gate_open(wait_kind);
+            }
         }
         let bucket_frontier = self
             .manifest
             .merge_bucket_frontier(bucket_id, &frontier_delta);
         let mut txn = self.manifest.begin();
-        let stat_delta = self.update_stat_interval(&mut txn, &mut result);
+        let stat_delta = self.update_stat_interval(&mut txn, &mut result, &junk_permits);
 
         for kind in FileKind::ALL {
             for ivl in &result.kind(kind).ivls {
@@ -246,6 +290,7 @@ impl ManifestCheckpointObserver {
         for kind in FileKind::ALL {
             self.manifest.clear_synced_files(kind);
         }
+        drop(junk_permits);
 
         #[cfg(feature = "failpoints")]
         if let Err(e) = crate::utils::failpoint::check("mace_flush_after_manifest_commit") {
@@ -261,6 +306,7 @@ impl ManifestCheckpointObserver {
                 if let Some(min) = g.min_active_lsn(&mut lk) {
                     pos = pos.min(min);
                 }
+                pos = self.ctx.clamp_floor_to_abort_clean(pos, Options::SHARED_ID);
                 lk.update_checkpoint_for(pos, i);
             }
             // durable checkpoints only flush the hint
@@ -274,6 +320,7 @@ impl ManifestCheckpointObserver {
                 {
                     pos = min;
                 }
+                pos = self.ctx.clamp_floor_to_abort_clean(pos, g.id as u8);
                 lk.update_checkpoint_for(pos, i);
             }
         }

@@ -288,3 +288,81 @@ fn group_wal_gap_rejected_on_reopen() -> Result<(), OpCode> {
     assert_eq!(err, OpCode::Corruption);
     Ok(())
 }
+
+#[test]
+fn route_switch_on_a_wal_free_database_keeps_the_namespace_contiguous() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+
+    {
+        let mut opt = Options::new(&*path);
+        opt.sync_on_write = false;
+        opt.concurrent_write = 2;
+        opt.gc_timeout = 60_000;
+        let _mace = Mace::new(opt.validate()?)?;
+    }
+    let log_root = Options::new(&*path).log_root();
+    for entry in fs::read_dir(&log_root)?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("wal_") || name.starts_with("group_wal_") {
+            fs::remove_file(entry.path())?;
+        }
+    }
+
+    {
+        let mut opt = Options::new(&*path);
+        opt.sync_on_write = true;
+        opt.concurrent_write = 2;
+        opt.gc_timeout = 60_000;
+        let mace = Mace::new(opt.validate()?)?;
+        let db = mace.new_bucket("x", BucketOptions::default())?;
+        let tx = db.begin()?;
+        tx.put("k", b"v")?;
+        tx.commit()?;
+        #[cfg(feature = "extra_check")]
+        assert_eq!(
+            testing::logger_oldest_wal_id(&db, 0),
+            0,
+            "a rebuild with no history starts its era at zero"
+        );
+    }
+
+    let shared = group_wal_file_ids(&log_root);
+    assert!(
+        !shared.is_empty() && shared[0] == 0,
+        "the migrated era must own the shared stream from file zero: {shared:?}"
+    );
+    assert_eq!(
+        shared,
+        (shared[0]..=shared[shared.len() - 1]).collect::<Vec<u64>>(),
+        "the shared stream must have no gap after the switch: {shared:?}"
+    );
+
+    let mut opt = Options::new(&*path);
+    opt.sync_on_write = true;
+    opt.concurrent_write = 2;
+    opt.gc_timeout = 60_000;
+    let mace = Mace::new(opt.validate()?)?;
+    let db = mace.open_bucket("x")?;
+    {
+        let view = db.view()?;
+        assert_eq!(view.get("k")?.slice(), b"v");
+    }
+    let tx = db.begin()?;
+    tx.put("k2", b"v2")?;
+    tx.commit()?;
+    drop(db);
+    drop(mace);
+
+    let reopened = group_wal_file_ids(&log_root);
+    assert!(
+        !reopened.is_empty(),
+        "the reopened database must keep its shared era file: {reopened:?}"
+    );
+    assert_eq!(
+        reopened,
+        (reopened[0]..=reopened[reopened.len() - 1]).collect::<Vec<u64>>(),
+        "the reopened shared stream must stay contiguous: {reopened:?}"
+    );
+    Ok(())
+}

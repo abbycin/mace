@@ -125,6 +125,7 @@ pub enum TreeUpdateSyncPoint {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckpointSyncPoint {
+    AfterResultSync,
     AfterRetiredPageDeferred(u64),
     BeforeSnapshotWaitZero,
     AfterRetiredPageFallbackRead(u64),
@@ -155,6 +156,10 @@ pub enum GcRewriteSyncPoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GcStatSyncPoint {
     CheckpointBeforeManifestCommit,
+    DataRewriteCollecting,
+    DataCheckpointRewriteMaskLoad,
+    BlobRewriteCollecting,
+    BlobCheckpointRewriteMaskLoad,
     DataObsoleteAfterMetaCommit,
     DataObsoleteAfterRetiredMark,
     DataObsoleteAfterRuntimeRemove,
@@ -163,8 +168,8 @@ pub enum GcStatSyncPoint {
     BlobObsoleteAfterRuntimeRemove,
     DataRewritePublishing { output_count: usize },
     BlobRewritePublishing { output_count: usize },
-    DataCheckpointPublishingWait,
-    BlobCheckpointPublishingWait,
+    DataRewriteGateClosed,
+    BlobRewriteGateClosed,
 }
 
 pub struct CheckpointRootRestore {
@@ -256,6 +261,34 @@ pub fn checkpoint_and_wait(bucket: &Bucket) {
     bucket.tree.bucket.checkpoint_and_wait(false);
 }
 
+/// suspends instance-level file deletions until the returned guard is dropped
+///
+/// waits for the deletion phase that is already running, exactly like a checkpoint
+/// does before it takes its cut. The checkpoint tests need a suspension window that is
+/// held open without running a checkpoint, which the public API cannot express, so this
+/// hook stays as a permanent extra_check-only test surface.
+pub fn suspend_deletions(mace: &crate::Mace) -> DeletionSuspension {
+    let deletions = &mace.inner.store.manifest.deletions;
+    let token = deletions.suspend();
+    deletions.wait_quiescent();
+    DeletionSuspension { _token: token }
+}
+
+/// RAII deletion suspension held by a test
+pub struct DeletionSuspension {
+    _token: crate::meta::guard::DeletionToken,
+}
+
+/// durable per-bucket, per-group frontier position as `(file_id, offset)`
+pub fn durable_frontier(bucket: &Bucket, group: u8) -> (u64, u64) {
+    let pos = bucket
+        .inner
+        .store
+        .manifest
+        .durable_frontier_lsn(bucket.id(), group);
+    (pos.file_id, pos.offset)
+}
+
 pub fn data_rewrite_collected_junk_count(bucket: &Bucket) -> usize {
     bucket
         .inner
@@ -286,7 +319,7 @@ fn assert_persisted_gc_stats_for_kind(mace: &crate::Mace, kind: FileKind) {
     manifest
         .btree
         .view(stat_bucket, |txn| {
-            let mut iter = txn.iter_uncached();
+            let mut iter = txn.iter();
             let mut key = Vec::new();
             let mut value = Vec::new();
             while iter.next_ref(&mut key, &mut value) {
@@ -325,7 +358,7 @@ fn assert_persisted_gc_stats_for_kind(mace: &crate::Mace, kind: FileKind) {
     manifest
         .btree
         .view(obsolete_bucket, |txn| {
-            let mut iter = txn.iter_uncached();
+            let mut iter = txn.iter();
             let mut key = Vec::new();
             let mut value = Vec::new();
             while iter.next_ref(&mut key, &mut value) {
@@ -354,7 +387,7 @@ fn assert_persisted_gc_stats_for_kind(mace: &crate::Mace, kind: FileKind) {
         manifest
             .btree
             .view(&bucket, |txn| {
-                let mut iter = txn.iter_uncached();
+                let mut iter = txn.iter();
                 let mut key = Vec::new();
                 let mut value = Vec::new();
                 while iter.next_ref(&mut key, &mut value) {
@@ -502,7 +535,7 @@ fn assert_persisted_gc_stats_for_kind(mace: &crate::Mace, kind: FileKind) {
     manifest
         .btree
         .view(BUCKET_MISC, |txn| {
-            let mut iter = txn.iter_uncached();
+            let mut iter = txn.iter();
             let mut key = Vec::new();
             let mut value = Vec::new();
             while iter.next_ref(&mut key, &mut value) {
@@ -585,7 +618,7 @@ fn assert_persisted_reachability(
         manifest
             .btree
             .view(&page_table_name(bucket_id), |txn| {
-                let mut iter = txn.iter_uncached();
+                let mut iter = txn.iter();
                 let mut key = Vec::new();
                 let mut value = Vec::new();
                 while iter.next_ref(&mut key, &mut value) {
@@ -705,7 +738,7 @@ fn load_persisted_stats(mace: &crate::Mace, kind: FileKind) -> BTreeMap<u64, Per
         .manifest
         .btree
         .view(bucket, |txn| {
-            let mut iter = txn.iter_uncached();
+            let mut iter = txn.iter();
             let mut key = Vec::new();
             let mut value = Vec::new();
             while iter.next_ref(&mut key, &mut value) {
@@ -1181,6 +1214,20 @@ pub fn wal_recycle_boundary(bucket: &Bucket, physical_group_id: u8) -> u64 {
         .oldest_id()
 }
 
+/// raw durable recycle slot of a physical stream as `(from_file_id, to_file_id, done)`.
+///
+/// `wal_recycle_boundary` collapses the slot to `oldest_id()`, which hides both the stage
+/// and the intent's `to_file_id`; a check that must reject a `u64::MAX` boundary or a
+/// `STAGE_NONE`/`STAGE_INTENT` residue needs the uncollapsed record
+pub fn wal_recycle_state(bucket: &Bucket, physical_group_id: u8) -> (u64, u64, bool) {
+    let state = bucket
+        .inner
+        .store
+        .manifest
+        .load_wal_recycle_state(physical_group_id);
+    (state.from_file_id, state.to_file_id, state.is_done())
+}
+
 /// durable mode: every writer group shares one logging Arc; relaxed mode:
 /// every group owns its own
 pub fn loggings_shared_across_groups(bucket: &Bucket) -> bool {
@@ -1196,6 +1243,30 @@ pub fn shared_checkpoint_floor(bucket: &Bucket, logical_group: usize) -> (u64, u
         .expect("durable mode has a shared logging");
     let pos = shared.lock().logical_checkpoint_at(logical_group);
     (pos.file_id, pos.offset)
+}
+
+/// relaxed mode: the group-local logging's own checkpoint floor slot
+pub fn group_checkpoint_floor(bucket: &Bucket, group: usize, logical_group: usize) -> (u64, u64) {
+    let pos = bucket
+        .inner
+        .store
+        .context
+        .group(group)
+        .logging
+        .lock()
+        .logical_checkpoint_at(logical_group);
+    (pos.file_id, pos.offset)
+}
+
+/// oldest wal file id the live runtime logger serving `logical_group` will still read.
+///
+/// durable mode shares one logger, so every logical group reports the shared stream's id
+pub fn logger_oldest_wal_id(bucket: &Bucket, logical_group: usize) -> u64 {
+    let ctx = &bucket.inner.store.context;
+    if let Some(shared) = ctx.shared_logging() {
+        return shared.lock().oldest_wal_id();
+    }
+    ctx.group(logical_group).logging.lock().oldest_wal_id()
 }
 
 pub fn group_checkpoint_count(bucket: &Bucket, logical_group: usize) -> usize {
@@ -1215,9 +1286,9 @@ pub fn rewrite_persisted_sync_on_write(
     let parsed = Arc::new(options.validate()?);
     let (tx, _rx) = channel();
     let (_ack_tx, ack_rx) = channel();
-    let mut builder = ManifestBuilder::new_with_channels(parsed, tx, ack_rx);
+    let mut builder = ManifestBuilder::new_with_channels(parsed, tx, ack_rx)?;
     builder.load()?;
-    let manifest = Handle::new(builder.finish());
+    let manifest = Handle::new(builder.finish()?);
     let result = (|| {
         let mut persisted = manifest
             .load_persisted_options_if_present()?

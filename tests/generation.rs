@@ -1,7 +1,7 @@
 #![cfg(feature = "extra_check")]
 
-//! phase b focused checks: caller-led sync generations on the shared durable
-//! wal stream (new_sync_final.md §2/§3)
+//! caller-led sync generation checks on the shared durable wal stream: sealing,
+//! follower joining, and the leader's error broadcast
 
 use mace::observe::{CounterMetric, HistogramMetric, InMemoryObserver};
 use mace::testing::{self, WalRecordKind, WalSyncPoint};

@@ -3,6 +3,7 @@ use crate::map::data::{CheckpointTask, FileBuilder, MapBuilder};
 use crate::meta::{FileKind, IntervalPair, MemStat, PageTable, PersistStat};
 #[cfg(feature = "extra_check")]
 use crate::utils::NULL_ADDR;
+use crate::utils::OpCode;
 use crate::utils::countblock::Countblock;
 use crate::utils::data::{GatherWriter, GroupPositions, Interval};
 use crate::utils::options::ParsedOptions;
@@ -243,7 +244,7 @@ fn checkpoint_thread(
     ctx: Handle<Context>,
     observer: Arc<dyn CheckpointObserver>,
     sync: Arc<Notifier>,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>, OpCode> {
     std::thread::Builder::new()
         .name("checkpointer".into())
         .spawn(move || {
@@ -262,7 +263,10 @@ fn checkpoint_thread(
             sync.notify_done();
             log::info!("checkpoint thread exit");
         })
-        .expect("can't build checkpoint thread")
+        // a thread-creation failure must reach the caller: the open can still abort
+        // and return, and a fatal invariant abort here would take the process down
+        // with a half-installed flusher behind it
+        .map_err(|_| OpCode::IoError)
 }
 
 struct Notifier {
@@ -302,11 +306,16 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    pub fn new(ctx: Handle<Context>, observer: Arc<dyn CheckpointObserver>) -> Self {
+    pub fn new(
+        ctx: Handle<Context>,
+        observer: Arc<dyn CheckpointObserver>,
+    ) -> Result<Self, OpCode> {
         let (tx, rx) = channel();
         let sync = Arc::new(Notifier::new());
-        checkpoint_thread(rx, ctx, observer, sync.clone());
-        Self { tx, sync }
+        // the flusher is published only after its thread exists: a failed spawn must
+        // leave the caller with no flusher instead of a sender nobody reads
+        checkpoint_thread(rx, ctx, observer, sync.clone())?;
+        Ok(Self { tx, sync })
     }
 
     pub fn quit(&self) {

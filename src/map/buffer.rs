@@ -203,7 +203,12 @@ impl Pool {
         Self {
             // trigger checkpoint by hot generation size; sealed generation may coexist while flushing
             max_hot_size: opt.checkpoint_size,
-            // total dirty memory hard cap (hot + sealed) as a safety net
+            // total dirty memory gate (hot + sealed): pool_capacity is the
+            // durable gate; foreground admission may add a bounded drain burst
+            // (<= pool/8, <= flush_unit) while a checkpoint is in flight, so
+            // projected dirty is capped at pool_capacity + credit_burst
+            // (actual dirty can overshoot between snapshots via per-op
+            // estimate gaps and unadmitted eviction growth)
             max_mem_size: opt.pool_capacity,
             enable_compression: opt.enable_compression,
             compressors,
@@ -1066,9 +1071,20 @@ impl BucketMgr {
         ctx: Handle<Context>,
         reader: Arc<dyn IDataReader>,
         observer: Arc<dyn CheckpointObserver>,
-    ) {
+    ) -> Result<(), OpCode> {
+        // this is the only site that replaces the flusher, so the rule that a live one must
+        // be stopped first belongs here: an overwritten `Checkpoint` has no `Drop`, so its
+        // thread and its tasks would outlive the rebind
+        if self.flush.is_some() {
+            log::error!("refusing to start a checkpoint flusher while one is running");
+            return Err(OpCode::IoError);
+        }
+        // build the flusher before rebinding: a failed spawn must leave the manager on its
+        // previous context instead of pointing at a context the caller is about to drop
+        let flush = Checkpoint::new(ctx, observer)?;
         self.set_context(ctx, reader);
-        self.flush = Some(Checkpoint::new(ctx, observer));
+        self.flush = Some(flush);
+        Ok(())
     }
 
     fn reclaim_lru(&mut self) {

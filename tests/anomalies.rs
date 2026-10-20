@@ -537,7 +537,7 @@ impl Executor {
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        for (_, (cond, quit)) in self.map.iter() {
+        for (cond, quit) in self.map.values() {
             quit.store(true, Release);
             cond.producer().wake();
         }

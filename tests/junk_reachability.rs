@@ -236,6 +236,7 @@ fn checkpoint_snapshot_holds_ebr_guard_before_wait_zero() -> Result<(), OpCode> 
                 return;
             }
             match point {
+                CheckpointSyncPoint::AfterResultSync => {}
                 CheckpointSyncPoint::AfterRetiredPageDeferred(addr) => {
                     let _ = deferred_tx.send(addr);
                     release_writer.wait();

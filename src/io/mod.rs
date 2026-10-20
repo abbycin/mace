@@ -40,13 +40,28 @@ pub(crate) trait FileSystem: Send + Sync {
 
     fn try_exists(&self, path: &Path) -> Result<bool, io::Error>;
 
+    /// creates one directory and fails with `AlreadyExists` when it is present
+    fn create_dir(&self, path: &Path) -> Result<(), io::Error>;
+
     fn create_dir_all(&self, path: &Path) -> Result<(), io::Error>;
 
     fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, io::Error>;
 
     fn remove_file(&self, path: &Path) -> Result<(), io::Error>;
 
+    /// removes `path` and everything under it
+    fn remove_dir_all(&self, path: &Path) -> Result<(), io::Error>;
+
     fn sync_dir(&self, path: &Path) -> Result<(), io::Error>;
+
+    /// renames `from` onto `to`, replacing `to` when it exists
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), io::Error>;
+
+    /// creates a hard link at `to` pointing at `from`
+    fn hard_link(&self, from: &Path, to: &Path) -> Result<(), io::Error>;
+
+    /// copies the whole file at `from` onto `to`, truncating `to`
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), io::Error>;
 
     fn remove_file_if_exists(&self, path: &Path) -> Result<(), io::Error> {
         if !self.try_exists(path)? {
@@ -144,6 +159,12 @@ impl FileSystem for OsFileSystem {
         path.try_exists()
     }
 
+    fn create_dir(&self, path: &Path) -> Result<(), io::Error> {
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check_fs(FsOp::CreateDir, path)?;
+        std::fs::create_dir(path)
+    }
+
     fn create_dir_all(&self, path: &Path) -> Result<(), io::Error> {
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check_fs(FsOp::CreateDirAll, path)?;
@@ -164,11 +185,43 @@ impl FileSystem for OsFileSystem {
         std::fs::remove_file(path)
     }
 
+    fn remove_dir_all(&self, path: &Path) -> Result<(), io::Error> {
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check_fs(FsOp::RemoveDirAll, path)?;
+        std::fs::remove_dir_all(path)
+    }
+
     fn sync_dir(&self, path: &Path) -> Result<(), io::Error> {
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::check_fs(FsOp::SyncDir, path)?;
         sync_dir(path)
     }
+
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), io::Error> {
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check_fs(FsOp::Rename, from)?;
+        std::fs::rename(from, to)
+    }
+
+    fn hard_link(&self, from: &Path, to: &Path) -> Result<(), io::Error> {
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check_fs(FsOp::HardLink, from)?;
+        std::fs::hard_link(from, to)
+    }
+
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), io::Error> {
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::check_fs(FsOp::CopyFile, from)?;
+        copy_file(from, to)
+    }
+}
+
+/// whole-file copy used when a payload cannot be hard linked
+fn copy_file(from: &Path, to: &Path) -> Result<(), io::Error> {
+    let mut reader = std::fs::File::open(from)?;
+    let mut writer = std::fs::File::create(to)?;
+    io::copy(&mut reader, &mut writer)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -185,10 +238,15 @@ pub(crate) mod testfs {
     pub(crate) enum InjectOp {
         Open,
         TryExists,
+        CreateDir,
         CreateDirAll,
         ReadDir,
         RemoveFile,
+        RemoveDirAll,
         SyncDir,
+        Rename,
+        HardLink,
+        CopyFile,
     }
 
     #[derive(Clone, Debug)]
@@ -282,6 +340,11 @@ pub(crate) mod testfs {
             self.os.try_exists(path)
         }
 
+        fn create_dir(&self, path: &Path) -> Result<(), io::Error> {
+            self.check(InjectOp::CreateDir, path)?;
+            self.os.create_dir(path)
+        }
+
         fn create_dir_all(&self, path: &Path) -> Result<(), io::Error> {
             self.check(InjectOp::CreateDirAll, path)?;
             self.os.create_dir_all(path)
@@ -297,9 +360,29 @@ pub(crate) mod testfs {
             self.os.remove_file(path)
         }
 
+        fn remove_dir_all(&self, path: &Path) -> Result<(), io::Error> {
+            self.check(InjectOp::RemoveDirAll, path)?;
+            self.os.remove_dir_all(path)
+        }
+
         fn sync_dir(&self, path: &Path) -> Result<(), io::Error> {
             self.check(InjectOp::SyncDir, path)?;
             self.os.sync_dir(path)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> Result<(), io::Error> {
+            self.check(InjectOp::Rename, from)?;
+            self.os.rename(from, to)
+        }
+
+        fn hard_link(&self, from: &Path, to: &Path) -> Result<(), io::Error> {
+            self.check(InjectOp::HardLink, from)?;
+            self.os.hard_link(from, to)
+        }
+
+        fn copy_file(&self, from: &Path, to: &Path) -> Result<(), io::Error> {
+            self.check(InjectOp::CopyFile, from)?;
+            self.os.copy_file(from, to)
         }
     }
 }
@@ -347,5 +430,102 @@ mod tests {
         assert_eq!(calls[0].0, InjectOp::TryExists);
         assert_eq!(calls[1].0, InjectOp::TryExists);
         let _ = std::fs::remove_file(path);
+    }
+
+    fn scratch_dir() -> RandomPath {
+        let dir = RandomPath::tmp();
+        std::fs::create_dir_all(&*dir).expect("scratch dir must be created");
+        dir
+    }
+
+    #[test]
+    fn rename_replaces_the_destination_with_the_source_bytes() {
+        let dir = scratch_dir();
+        let from = dir.join("from");
+        let to = dir.join("to");
+        std::fs::write(&from, b"moved").expect("source must be written");
+        std::fs::write(&to, b"stale").expect("destination must be written");
+
+        super::FileSystem::rename(&super::OsFileSystem, &from, &to).expect("rename must succeed");
+
+        assert!(!from.exists(), "rename must remove the source name");
+        assert_eq!(
+            std::fs::read(&to).expect("destination must be readable"),
+            b"moved"
+        );
+    }
+
+    #[test]
+    fn hard_link_shares_the_source_content() {
+        let dir = scratch_dir();
+        let from = dir.join("from");
+        let to = dir.join("to");
+        std::fs::write(&from, b"aa").expect("source must be written");
+
+        super::FileSystem::hard_link(&super::OsFileSystem, &from, &to).expect("link must succeed");
+        std::fs::write(&from, b"bbbb").expect("source rewrite must succeed");
+
+        assert_eq!(
+            std::fs::read(&to).expect("link must be readable"),
+            b"bbbb",
+            "a hard link must observe writes made through the source name"
+        );
+    }
+
+    #[test]
+    fn copy_file_leaves_the_destination_independent() {
+        let dir = scratch_dir();
+        let from = dir.join("from");
+        let to = dir.join("to");
+        std::fs::write(&from, b"original").expect("source must be written");
+
+        super::FileSystem::copy_file(&super::OsFileSystem, &from, &to).expect("copy must succeed");
+        // checked before the source rewrite below, otherwise a rename-based copy would
+        // be re-created by that write and still pass
+        assert!(
+            from.exists(),
+            "a copy must leave the source name in place (a rename would not)"
+        );
+        std::fs::write(&from, b"changed").expect("source rewrite must succeed");
+
+        assert_eq!(
+            std::fs::read(&to).expect("copy must be readable"),
+            b"original",
+            "a copy must not follow later source writes"
+        );
+    }
+
+    #[test]
+    fn injected_fs_injects_and_records_namespace_primitives() {
+        let dir = scratch_dir();
+        let from = dir.join("from");
+        let to = dir.join("to");
+        std::fs::write(&from, b"seed").expect("source must be written");
+        let fs = InjectedFileSystem::new();
+        fs.fail_once(InjectOp::Rename, &from, ErrorKind::PermissionDenied);
+
+        let err =
+            super::FileSystem::rename(&fs, &from, &to).expect_err("injected rename must fail");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(
+            from.exists(),
+            "a failed rename must leave the source intact"
+        );
+        assert!(!to.exists(), "a failed rename must not create the target");
+
+        super::FileSystem::rename(&fs, &from, &to).expect("second rename must pass");
+        super::FileSystem::hard_link(&fs, &to, &dir.join("linked")).expect("link must pass");
+        super::FileSystem::copy_file(&fs, &to, &dir.join("copied")).expect("copy must pass");
+
+        let ops: Vec<InjectOp> = fs.calls().iter().map(|(op, _)| *op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                InjectOp::Rename,
+                InjectOp::Rename,
+                InjectOp::HardLink,
+                InjectOp::CopyFile
+            ]
+        );
     }
 }

@@ -35,6 +35,9 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
+      - name: Build maintenance CLI
+        run: cargo build --verbose --bin mace-kv
+
       - name: Run Tests
         run: cargo test --features extra_check --verbose -- --nocapture
 

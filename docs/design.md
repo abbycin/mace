@@ -7,6 +7,28 @@ The live correctness constraints, their evidence, and their verifier coverage ar
 `docs/constraints/registry.yaml`. This document does not duplicate that ledger and does not serve
 as a source-code tour.
 
+## 0. Upstream contracts Mace relies on
+
+`btree-store` owns the metadata store. Four of its contracts are load-bearing, and a
+checker or a reviewer should be able to find them here rather than in a test index:
+
+- **conditional update.** `exec`/`update` on an existing key changes it and reports success;
+  on an absent key it changes nothing and reports a miss. Mace treats that miss as
+  "someone deleted this stat first" and never recreates the record.
+- **conditional delete.** `del` on an existing key removes it and reports success; on an absent
+  key it removes nothing and reports a miss. Mace tolerates that miss only for idempotent reclaim
+  and cleanup deletes: a stat record, an obsolete-file marker, and an orphan marker cleared during
+  open cleanup. Every other metadata delete treats a miss as an invariant failure.
+- **one-generation publication.** `exec_multi` publishes every bucket-root change of one
+  manifest transaction in a single generation. On failure it restores the previous bucket roots;
+  consumed metadata high-water state may still be published as a rollback generation. Mace relies
+  on the bucket-root property to publish map, frontier, stats and sequences as one step.
+- **fatal page damage.** Corruption that only a page read reaches terminates the process:
+  `btree-store` prints a `BTREE_FATAL_*` line and aborts. The I/O variant names the file and
+  offset; the corruption variant names the fault, generation and page identity instead. A
+  read-only consumer of a database directory (the offline checker) inherits that termination
+  instead of reporting a partial picture.
+
 ## 1. System Overview
 
 Mace is an embedded key-value engine built around:
@@ -51,11 +73,12 @@ The runtime has three main domains:
 
 - foreground transactions and read-only views
 - bucket runtimes containing index, cache, dirty generations, and checkpoint state
-- background services for checkpoint completion, recovery, abort-clean, WAL recycling, payload GC,
-  and bucket cleanup
+- background services for checkpoint completion, abort-clean, WAL recycling, payload GC, bucket
+  cleanup, visibility collection, and eviction
 
 Bucket runtimes are loaded lazily. Opening a database reconstructs global durable state and WAL
-state without eagerly loading every bucket index.
+state without eagerly loading every bucket index; recovery itself runs synchronously before
+foreground admission begins.
 
 ## 2. Metadata And Addressing
 
@@ -66,7 +89,8 @@ The main identities are:
 - bucket ID: durable identity of a named bucket
 - page ID: logical identity of an index page inside a bucket
 - logical address: durable identity of a persisted record inside a bucket address space
-- file ID: identity of a data, blob, or WAL file
+- file ID: identity of a data or blob file; a WAL file is identified by its physical stream id
+  together with its per-stream sequence number
 
 A persisted page is resolved in three steps:
 
@@ -79,7 +103,7 @@ history references therefore remain stable across file rewrite.
 
 ### 2.1 Metadata groups
 
-The metadata store contains separate logical groups for:
+The metadata store organizes state into:
 
 - global sequences and persisted options
 - bucket names, IDs, options, and lifecycle state
@@ -87,7 +111,8 @@ The metadata store contains separate logical groups for:
 - per-bucket data and blob interval maps
 - per-file data and blob statistics
 - per-bucket durable WAL frontiers
-- orphan, obsolete-file, pending-delete, and WAL-recycle records
+- orphan and WAL-recycle records as prefixed keys in the miscellaneous group, plus separate
+  obsolete-file and pending-delete records
 
 Changes that form one durable checkpoint closure are committed in one metadata transaction. This
 includes the page map, address intervals, file statistics, bucket frontier, and related global
@@ -109,10 +134,13 @@ persisted accounting as logical addresses become unreachable or move to replacem
 
 ### 3.1 Creation
 
-Creating a bucket allocates a durable bucket ID, stores the bucket options, initializes its durable
-frontier, and increments global bucket accounting in one metadata publication.
+Creating a bucket allocates a durable bucket ID, stores the bucket options, and initializes its
+durable frontier in one metadata publication. Global bucket accounting is runtime state: it is
+incremented with the creation and recomputed from the catalog plus pending deletes on open.
 
-The bucket becomes visible after that publication. Its runtime index is then created on demand.
+The name enters the in-memory catalog before that transaction commits, so a concurrent reader can
+observe the bucket during creation. The new bucket's runtime context and root leaf are initialized
+as part of creation; other buckets stay lazy.
 
 ### 3.2 Loading
 
@@ -121,27 +149,34 @@ Loading a bucket reconstructs its runtime from:
 - bucket options
 - page table entries
 - data and blob interval maps
-- durable frontier and file-accounting state
+
+The durable frontier and per-file accounting are manifest-global state. Checkpoint publication
+reads them; recovery compares bucket frontiers with WAL positions. They are not per-bucket load
+inputs.
 
 The loaded runtime owns the bucket cache, dirty generations, address allocator, checkpoint state,
 and flow-control state.
 
 ### 3.3 Unloading
 
-Unloading removes only the cached bucket runtime. Durable metadata and payload files remain
-unchanged.
+Unloading removes the cached bucket runtime. A live bucket is final-checkpointed before its
+runtime is dropped, so dirty pages, its page table, frontier and statistics are published first;
+delete instead discards the sealed batch and removes the bucket. The active WAL route is
+synchronized before unload.
 
-Before unload, the active WAL route is synchronized. A bucket with pending abort-clean work remains
-loaded until that work has completed its page rewrite, durable checkpoint, and reader-quiescence
-phase.
+An unload or delete attempt while abort-clean work is pending is refused with `Again`, so the
+bucket remains loaded until that task has completed its page rewrite, durable checkpoint, and
+reader-quiescence phase.
 
 ### 3.4 Deletion
 
 Deletion has two phases:
 
-1. logical deletion removes the bucket from the visible catalog and records a pending-delete entry
-2. background cleanup removes page-table state, interval metadata, file accounting, obsolete files,
-   and the remaining bucket metadata in bounded batches
+1. logical deletion removes the bucket from the visible catalog, records a pending-delete entry,
+   records the bucket's file deletions (which also delete their stat records), and removes its
+   obsolete files once the commit succeeds, or on a later retry if deletion is suspended
+2. background cleanup drains the page-table and interval btrees and the pending-delete record in
+   bounded batches
 
 Global bucket accounting includes pending-delete buckets. It is decremented when physical cleanup
 finishes.
@@ -153,10 +188,12 @@ maintenance policy: the inline-value boundary, node split cardinality, cache and
 checkpoint sizing, eviction and consolidation thresholds, compression, and backpressure. The merge
 operator is runtime-only and never reaches manifest metadata, WAL records, or pages.
 
-The inline-value boundary and node split cardinality define persisted page interpretation and cannot
-be changed after bucket creation. Other persisted bucket options are runtime or output policies and
-may be updated while the bucket is unloaded and no rewrite is active. The updated values take effect
-on the next load.
+The inline-value boundary and node split cardinality define persisted page interpretation. Node split
+cardinality cannot change after bucket creation, and the inline-value boundary may only be lowered:
+rebuild materialization moves the affected values into large-value records, while raising it would
+have to convert stored large values back into inline rows and retire their blob payloads. Other
+persisted bucket options are runtime or output policies and may be updated while the bucket is
+unloaded and no rewrite is active. The updated values take effect on the next load.
 
 A bucket runtime chooses either one merge operator or no operator before it becomes visible to
 foreground operations. That choice is immutable for the lifetime of the runtime. Re-opening an
@@ -176,10 +213,11 @@ boundary: a contiguous run older than that boundary folds into one plain base ro
 boundary version identity, while newer versions remain verbatim. The replacement retains the
 lineage of every absorbed WAL position, so recovery neither redoes nor skips an operand. Retained
 aborted versions are invisible to snapshots and never participate in a fold or serve as its barrier:
-below-safe aborted versions are removed only by abort-clean, while above-safe aborted versions remain
-verbatim until then. This prevents both leaking aborted bytes into a synthesized row and dropping a
-row whose boundary version is still needed by abort-clean. Folded values use the normal inline or
-large-value persistence rules.
+below-safe aborted versions may be dropped as junk by ordinary consolidation, while abort-clean owns
+the retained-abort fact and WAL pin that make the abort state retire; above-safe aborted versions
+remain verbatim until then. This prevents both leaking aborted bytes into a synthesized row and
+dropping a row whose boundary version is still needed by abort-clean. Folded values use the normal
+inline or large-value persistence rules.
 
 When no operator is selected, compaction remains raw-preserving. Reads that encounter a visible
 merge operand return an invalid-operation result rather than interpreting its bytes. If folding
@@ -204,9 +242,12 @@ existing raw and compressed records remain readable in the same bucket.
 An initialized metadata store contains a persisted subset of global engine options. Opening the
 database validates the persisted record before recovery.
 
-Writer-group cardinality defines persistent transaction ownership and is fixed for an initialized
-database. Runtime and maintenance policies are refreshed from the current open options. The
-persisted WAL route records the last route whose startup transition completed.
+Writer-group cardinality defines persistent transaction ownership. It is fixed for an ordinary
+reopen: a reopen that requests a different `concurrent_write` starts an epoch migration instead of
+being rejected. The transition recovers at the persisted (source) width, rebuilds the WAL epoch,
+brings its runtime state up at the requested width, and only then records the new width in the
+persisted options. Runtime and maintenance policies are refreshed from the current open options.
+The persisted WAL route records the last route whose startup transition completed.
 
 Process-local objects, such as the observer and filesystem instance, are not persisted.
 
@@ -215,9 +256,10 @@ Process-local objects, such as the observer and filesystem instance, are not per
 Each bucket uses a Bw-Tree style ordered index with immutable page images and delta-based updates.
 Tree mutation publishes replacement pages rather than modifying durable pages in place.
 
-Leaf records contain versioned key/value state. Values below the bucket inline boundary remain in
-the leaf representation. Larger values are stored as blob records and referenced by logical
-address.
+Leaf records contain versioned key/value state. The split is on the packed value record, including
+its group byte: a record whose packed size is strictly below the bucket inline boundary remains in
+the leaf representation; a record at or above the boundary is stored as a blob record and referenced
+by logical address.
 
 Page consolidation, split, merge, and eviction can produce replacement page images. These images
 enter the normal dirty-generation and checkpoint flow; there is no separate whole-bucket vacuum
@@ -237,8 +279,9 @@ region. History-page retirement and blob-payload retirement are accounted indepe
 Point lookup and range iteration evaluate all candidate versions for a raw key against one fixed
 snapshot. Forward and reverse iteration use the same visibility model as point lookup.
 
-The snapshot remains pinned for the lifetime of a transaction or read-only view and for the
-lifetime of iterators and borrowed values derived from it.
+The snapshot remains pinned for the lifetime of a transaction or read-only view. An iterator
+borrows that transaction or view, so the pin covers iteration; a returned `ValRef` holds its own
+page-image reference and keeps the bytes alive without extending the snapshot pin.
 
 ## 5. Transactions And Snapshot Isolation
 
@@ -251,7 +294,13 @@ A transaction records:
 - a start timestamp
 - logical writer-group ownership
 - a WAL begin position
-- an exact outcome: active, committed with commit timestamp, or aborted
+
+A modified transaction also records an exact outcome: active, committed with commit timestamp, or
+aborted.
+
+Every writer publishes an active fact at start. A transaction that performs no write keeps that
+active fact until commit or abort removes it; it allocates no commit timestamp and publishes no
+committed or aborted fact.
 
 A read-only view has a snapshot timestamp but no writer-group ownership.
 
@@ -262,9 +311,11 @@ timestamp, appends the WAL begin record, publishes the active outcome, and final
 registration stable. The visibility collector treats an in-progress registration as an unfinished
 scan source and does not publish a new safe boundary from that scan.
 
-Commit records the terminal WAL entry, completes the selected WAL durability policy, allocates the
-commit timestamp, and publishes the committed outcome. Abort publishes the aborted outcome and,
-for a modified transaction, transfers WAL retention to an abort-clean task.
+For a modified transaction, commit records the terminal WAL entry, completes the selected WAL
+durability policy, allocates the commit timestamp, and publishes the committed outcome. Abort
+publishes the aborted outcome and transfers WAL retention to an abort-clean task. For an unmodified
+transaction, commit records the terminal entry and removes its active fact without a commit
+timestamp; abort removes it without publishing an aborted fact.
 
 ### 5.2 Visibility
 
@@ -272,14 +323,25 @@ Visibility is evaluated in this order:
 
 1. a transaction sees its own versions
 2. versions whose writer started at or after the snapshot are excluded
-3. versions below the published safe boundary use the positive visibility path
-4. retained abort state is checked before a positive result is accepted
-5. versions outside the safe boundary use their exact transaction outcome
-6. if an exact committed outcome has already been pruned, a newer safe-boundary publication may
+3. records whose logical group id is at or above the current runtime width use the settled-history
+   class described below; this test runs before any group-table access, so a retired group index is
+   never dereferenced
+4. versions below the published safe boundary use the positive visibility path
+5. retained abort state is checked before a positive result is accepted
+6. versions outside the safe boundary use their exact transaction outcome
+7. if an exact committed outcome has already been pruned, a newer safe-boundary publication may
    provide the result
 
 An exact commit is visible only when its commit timestamp precedes the snapshot. Active and aborted
 versions are not visible.
+
+Once a width-change epoch migration has completed, retained records whose logical group id is at or
+above the current runtime width are answered from the settled-history class: they predate the
+current epoch, so their transactions were resolved and their aborted versions physically removed
+while the migration still ran at the persisted (source) width. They are accepted without consulting
+a live transaction fact or the retained-abort state, and they never index the runtime group table.
+The class covers every record-derived decision, not only point reads: compaction and merge folding
+treat such a record as committed history, and abort-clean never claims it as a retained abort.
 
 ### 5.3 Safe-boundary collection
 
@@ -298,9 +360,10 @@ boundary.
 
 ### 5.4 Write conflicts
 
-Same-key writers use first-writer-wins conflict handling. Every retry or page-replacement path checks
-the latest key head again before publishing a mutation, so an earlier successful writer cannot be
-silently overwritten by a stale retry.
+Same-key writers use first-writer-wins conflict handling. Concurrent merge operands on one key are
+the exception: when the bucket has a runtime operator, merge/merge writers may stack operands.
+Every retry or page-replacement path checks the latest key head again before publishing a mutation,
+so an earlier successful writer cannot be silently overwritten by a stale retry.
 
 ## 6. Dirty State And Checkpoint
 
@@ -331,8 +394,10 @@ Structural links, retired lineage, and compaction-produced junk remain associate
 generation that still owns their reachability. The checkpoint separates addresses that can retire
 with the current closure from addresses that still belong to a live or newer page image.
 
-When a bucket is leaving the loaded set, its sealed batch is discarded instead of being published;
-the unload/delete path has already excluded new mutations and retains the previous durable state.
+When a bucket is being deleted, its sealed batch is discarded instead of being published; the
+delete path has already excluded new mutations and removes the bucket. A live bucket that is only
+unloaded is final-checkpointed before its runtime is dropped, so its dirty state is published
+rather than discarded.
 
 ### 6.2 Bucket durable frontier
 
@@ -347,10 +412,14 @@ whether a WAL update is already represented in durable pages.
 
 After metadata publication:
 
-- the sealed generation is released
-- still-live state is carried into the current hot generation
-- retired page images move to deferred reclamation
-- WAL checkpoint floors are advanced for logical groups that participated in the closure
+- the sealed generation is released and its containers are recycled
+- still-live state above the snapshot boundary was carried into the hot generation when the cut was
+  taken, not after publication
+- retired page images were already handed to deferred reclamation when their page was replaced or
+  evicted
+- WAL checkpoint floors are advanced for every configured group with an active floor; inactive
+  shared-stream slots stay inactive. The per-group checkpoint counter advances only for groups with
+  WAL activity since the previous publication
 - checkpoint progress updates bucket flow control
 
 ## 7. Data And Blob Publication
@@ -362,9 +431,11 @@ For each output file, the flow is:
 1. persist an orphan marker
 2. build the file
 3. synchronize the file and required directory state
-4. commit intervals, relocations, statistics, map/frontier updates, and orphan-marker removal in
-   metadata
-5. publish the new runtime interval and accounting state
+4. commit intervals, statistics, map/frontier updates, sequences, and orphan-marker removal in
+   metadata; relocations are already in the payload file's relocation region, covered by the
+   footer and by step 3's synchronization
+5. make the runtime interval and accounting view reflect the output (a checkpoint updates it during
+   file construction; a rewrite publishes it after the metadata commit)
 
 Before metadata commit, the output is an orphan and is not reachable through durable metadata.
 After metadata commit, the output is the authoritative owner of its published logical-address
@@ -404,20 +475,24 @@ are not compressed by the bucket data/blob compression policy.
 ## 8. WAL Design
 
 The WAL is redo-only. It contains begin, update, commit, abort, and checkpoint-hint records.
-Insert and update records carry the new value image; delete records carry the tombstone operation.
+Update records carry an insert/update value image, a tombstone, or a merge operand; merge operands
+are replayed as merge records, not folded during recovery.
 
-Every WAL record has two ownership dimensions:
+WAL records have two ownership dimensions:
 
 - logical group: transaction facts, visibility, frontier, and checkpoint-age ownership
 - physical stream: WAL file namespace used for append, recovery, and abort-chain traversal
 
-The logical group is encoded in the record and is not inferred from its physical stream.
+An update record encodes its logical group. Begin, commit, abort, and checkpoint-hint records carry
+transaction or position identity instead; recovery resolves terminal facts by transaction id and
+takes an abort's logical group from its update chain.
 
 ### 8.1 Relaxed route
 
-With `sync_on_write` disabled, each logical group writes its own physical WAL stream. Commit flushes
-the WAL bytes to the file/page cache and publishes the outcome without a WAL fsync generation or a
-durability wait.
+With `sync_on_write` disabled, each logical group writes its own physical WAL stream. A modified
+commit flushes the WAL bytes to the file/page cache and publishes the outcome without a WAL fsync
+generation or a durability wait; an unmodified commit records its terminal entry and removes its
+active fact without a flush or durability wait.
 
 Each group maintains its own checkpoint counter and retained WAL floor.
 
@@ -476,15 +551,16 @@ The startup flow is:
 
 1. load and validate metadata version and persisted options
 2. complete orphan-file cleanup from durable markers
-3. complete pending bucket and WAL recycle work needed for bootstrap
+3. complete WAL recycle work needed for bootstrap; pending bucket reaping is counted here but runs
+   in the GC service after recovery
 4. discover retained WAL streams and their durable lower boundaries
 5. validate and analyze WAL records to reconstruct transaction outcomes and abort-clean tasks
 6. redo committed updates not covered by each bucket frontier
 7. drain reconstructed abort-clean work
 8. checkpoint recovery-produced pages when the startup transition requires durable closure
-9. finish any WAL route or layout transition
-10. publish runtime checkpoint floors and safe visibility state
-11. unload bucket runtimes loaded only for recovery
+9. unload bucket runtimes loaded only for recovery
+10. finish any WAL route or layout transition
+11. publish runtime checkpoint floors and safe visibility state
 12. start the normal collector, checkpoint, and GC services
 
 ### 9.1 WAL discovery
@@ -492,28 +568,71 @@ The startup flow is:
 Recovery scans every retained physical stream, independent of the route requested for the new open.
 This allows it to discover history from both per-group and shared namespaces.
 
+A reopen that requests a different `concurrent_write` keeps the retained record scan at the
+persisted (source) width. Recycle completion and the epoch high-water cover the fixed slot space of
+`MAX_CONCURRENT_WRITE` writer-group slots unioned with every WAL namespace present on disk and with
+the shared stream, so a recycle intent left behind by a wider interrupted attempt is completed even
+when the current open requests a narrower width. The era wipe sweeps the `max(source, target)` bound
+unioned with every WAL namespace present on disk, so streams that only the target width owns are
+cleaned and given a durable recycle boundary as well. The redo scan and group-id validation stay
+at the source width until the wipe has completed; the target width takes over only after the wipe,
+once the runtime state has been rebuilt at that width.
+
 The durable recycle boundary defines the first file that can still exist. A validated checkpoint
 hint may move record analysis forward, while the bucket frontier remains the redo decision boundary.
 
 ### 9.2 WAL validation and tail handling
 
-Records are validated in physical-stream order. Header, length, payload layout, checksum, logical
-group, and chain fields are checked before a record is consumed.
+Records are validated in physical-stream order. Header, length, payload layout, checksum, and the
+update's logical group are checked before a record is consumed; chain positions are validated by
+abort-clean when it traverses a retained chain.
 
 The first incomplete or malformed record ends that stream scan at the record start. With WAL tail
 truncation enabled, recovery truncates there and ignores later files in the same stream. Otherwise
 startup returns corruption. Runtime append positions are rebased to the truncated end before any
-new append or checkpoint work begins.
+new WAL append or WAL checkpoint record; reconstructed abort-clean may already have checkpointed
+pages before that point.
 
 ### 9.3 Route and layout transition
 
 The persisted `sync_on_write` value identifies the last WAL route whose transition completed. A
-different requested value starts a route transition. Opening the durable route while legacy
-per-group durable-layout files still exist starts the same rebuild process.
+different requested value starts a route transition. A width change starts the same rebuild; the
+rebuild completes before the requested options are recorded, and a crash before that writeback is
+retried with the persisted width. Opening the durable route while legacy per-group durable-layout
+files still exist starts the same rebuild process.
 
 The rebuild computes a file-ID high-water mark from WAL files, bucket frontiers, and recycle state.
 It closes recovery-produced state durably, removes the old WAL era through the normal recycle
-protocol, and starts the new era above that high-water mark.
+protocol, and starts the new era above that high-water mark. The wipe sweeps every physical stream
+in `[0, max(source, target))`, every WAL namespace present on disk, and the shared stream —
+including streams that only the target width owns, which can only hold era files left by an earlier
+interrupted attempt — and advances each swept stream's durable recycle boundary to the new era
+start.
+
+The recovery scan itself is per stream: every retained physical stream is read at that stream's own
+boot position, and only the global epoch start crosses over to the runtime era. A rebuild therefore
+ends the recovery scan positions before it removes the old era:
+
+- it stops the recovery checkpoint flusher, then detaches and closes every logger's writer, so the
+  wipe never rides on a filesystem that tolerates removing an open file;
+- it wipes the swept streams and advances each one's durable recycle boundary to the new era start,
+  leaving a stream already at or above that start untouched;
+- it installs the new era's writer at `epoch_start` with the new era's checkpoint floors. A
+  same-width rebuild requires an empty epoch file and rejects non-empty content; a width-change
+  context opens the target file with append at its current end;
+- it syncs the log directory, then restarts the checkpoint flusher on that context for a same-width
+  rebuild, because the flusher was stopped above and every later bucket load requires one;
+- only then does the options writeback record the transition.
+
+The new era starts at `epoch_start`, the file-ID high-water mark plus one. If no WAL file, bucket
+frontier or recycle state anywhere has history, `epoch_start` is zero; otherwise every swept stream
+below the global start receives a durable recycle boundary, including an empty stream.
+
+Until the install completes, a foreground writer does not exist and the runtime WAL barrier is
+undefined: an error in that window leaves through a recovery-open cleanup that closes the context
+without a barrier. Because every stream keeps its own scan position, no step of this sequence can
+leave a hole inside a retained range, so a crash at any point is either continued by the next open
+or migrated again.
 
 The route option is written back after the transition completes. If startup stops earlier, the next
 open sees the old persisted route or remaining legacy files and repeats the transition.
@@ -537,7 +656,7 @@ A modified abort retains:
 
 - the aborted transaction outcome
 - the physical WAL stream and chain range
-- the set of buckets touched by cleanup
+- the bucket that owns the aborted updates
 
 Abort-clean follows the transaction update chain backward. Chain positions are interpreted in the
 physical stream's file-and-offset order, while logical group ownership selects the retained abort
@@ -558,15 +677,17 @@ An abort-clean task moves through two conceptual phases:
   - readers that could still hold old page images are allowed to drain
   - the task, WAL pin, and retained abort outcome are then removed
 
-An unloaded bucket is not reloaded solely for steady-state abort-clean. Its task remains pending and
-blocks unload/delete completion. Recovery may load a bucket to finish reconstructed cleanup, then
-unloads that recovery-only runtime before open returns.
+Steady-state abort-clean does not reload a bucket that is not loaded. A bucket with pending
+abort-clean work is not unloaded in the first place: unload and delete are refused with `Again`
+until the task's page rewrite, durable checkpoint, and reader-quiescence phase complete. Recovery
+may load a bucket to finish reconstructed cleanup, then unloads that recovery-only runtime before
+open returns.
 
 Aborted versions remain invisible throughout both phases.
 
 ## 11. Garbage Collection And Rewrite
 
-Background GC performs four kinds of maintenance:
+Background GC runs abort-clean first, then four payload/maintenance kinds:
 
 - reclaim fully obsolete data/blob files
 - rewrite partially live data/blob files
@@ -604,13 +725,33 @@ Only one rewrite runs for a bucket at a time.
 
 ### 11.3 Concurrent junk accounting
 
-Rewrite registers its selected victim files before reading their inactive-record state. While output
-is being built, newly retired logical addresses are collected with the rewrite ownership state.
+Rewrite closes the file-kind producer gate before registering its selected victim files. The gate,
+active producer permits, collector phase, and collected addresses share one collector mutex per file
+kind; waits use a condition variable. Closing it for one bucket's rewrite therefore holds off junk
+permits for other buckets of the same kind while it is closed. A checkpoint acquires a permit for
+every kind with junk before merging the bucket frontier or opening its metadata transaction, and
+releases it only after the transaction and immediate runtime bookkeeping complete. A producer waits
+with no manifest or stat lock held.
+
+After the initial drain, rewrite reopens the gate before reading durable inactive masks and scanning
+victim records. When replacement files are synchronized, it closes the gate again, drains permits,
+and enters the publishing cut only while the gate is closed and the permit count is zero. It then
+transfers collected addresses and publishes replacement statistics, intervals, remaps, victim
+deletion, and orphan cleanup in one metadata transaction. Physical deletion remains outside the
+gate. The publishing phase has no producer retry or wait path.
+
+The collector separates final rewrite victims from fully-obsolete candidates. For a final victim,
+checkpoint rechecks its owner, loads the inactive bitmap, resolves relocation, updates the old stat,
+and queues the address under the collector mutex. A fully-obsolete candidate becomes runtime-only
+`Ordinary` under that mutex, is reclaimed without it, and is cleared before publish. Stale
+`Ordinary` snapshots follow ordinary reclassification; a missing final-victim stat is fatal.
 
 When replacement relocations are complete, collected addresses that were copied are transferred to
-the corresponding replacement-file accounting. A checkpoint that reaches the ownership switch
-waits for rewrite publication, resolves the logical address again, and applies the retirement to its
-new file owner.
+the corresponding replacement-file accounting. A checkpoint that enters after the gate reopens
+resolves the logical address again and applies the retirement to its current owner. Fully obsolete
+reclaim closes the same gate and rechecks durable statistics before deleting; a missing durable
+stat means that GC already retired the candidate, while an active durable stat is an invariant
+failure.
 
 The ownership state returns to idle after durable metadata and runtime interval/accounting state both
 refer to the replacement files. A rewrite with no replacement output cancels the ownership transfer.
@@ -624,29 +765,34 @@ images through the same dirty-generation flow as foreground tree changes. Evicti
 separate durability path.
 
 When bucket backpressure is enabled, a writer reserves dirty-memory budget before entering tree
-mutation. Admission is based on current dirty bytes, checkpoint progress, and a short burst allowance.
-Checkpoint completion releases pressure and wakes waiting writers in batches.
+mutation. Admission compares dirty bytes plus outstanding reservations and the new write against the
+pool capacity; when dirty is already at capacity and a checkpoint round is draining, a bounded
+credit of `min(checkpoint_size, pool_capacity / 8)` raises that ceiling. Checkpoint progress paces
+batched waiter wake-ups, never admission headroom; completion wakes all remaining waiters.
 
 Buckets with backpressure disabled enter mutation directly.
 
 ## 13. Startup And Shutdown Lifecycle
 
 Database startup completes metadata loading, recovery, route transition, and recovery-only cleanup
-before background services and foreground admission begin.
+before foreground admission begins. The bucket checkpoint flusher starts earlier so recovery
+checkpoints can run; the visibility collector, GC, and evictor start after recovery.
 
 Shutdown begins when the final database or bucket handle is dropped. The runtime then:
 
 1. stops background GC admission
 2. waits for admitted transactions to publish terminal outcomes
 3. drains pending abort-clean work
-4. checkpoints every loaded bucket
-5. fully synchronizes files written by the final checkpoint
-6. completes a WAL barrier on the active route
+4. stops the evictor
+5. final-checkpoints every loaded bucket with full file synchronization and joins the checkpoint
+   flusher
+6. completes the active route's WAL durability step (a shared barrier on the durable route,
+   per-logger flush on the relaxed route)
 7. stops the visibility collector and releases metadata state
 
 The final checkpoint runs with full file synchronization even when relaxed WAL commit mode was used
-during normal operation. After a successful graceful shutdown, persisted pages represent the
-committed model without relying on retained WAL files.
+during normal operation. Persisted pages carry the committed model, but recovery may still analyze
+retained WAL to rebuild transaction outcomes for folded versions.
 
 ## 14. Filesystem Boundary
 
@@ -656,6 +802,7 @@ Mace uses an internal filesystem boundary for:
 - path existence checks
 - directory enumeration and creation
 - rename and removal
+- hard links and whole-file copies used by checkpoint export
 - directory synchronization
 
 Opened-file read/write behavior remains part of the data, blob, WAL, and metadata components rather
@@ -689,11 +836,14 @@ an explicit migration boundary before it can coexist with the current format.
 
 ### 15.2 Metadata format
 
-The metadata store has one current Mace metadata version. Startup validates it before loading
-database state.
+Two version axes gate the metadata store. `btree-store` owns the manifest file format (currently
+version 2), validated when the store is opened. Mace owns a `current_version` metadata record
+(currently 1), validated before database state loads.
 
-An incompatible metadata organization change uses a new metadata version and an offline metadata
-migration. Runtime startup does not rewrite an unsupported metadata organization in place.
+A change to either axis uses an offline migration; runtime startup does not rewrite an unsupported
+format in place. The 0.1.2 -> 0.2.0 hop moves the `btree-store` manifest format from 1 to 2; Mace's
+`current_version` stays 1. The migrations, the format versions they move between, and the procedure
+are in [docs/migration.md](./migration.md).
 
 ### 15.3 WAL format
 
@@ -701,7 +851,7 @@ The current route split changes physical stream placement but not WAL record enc
 use the same WAL record format and recovery decoder.
 
 WAL format evolution under the current release model is one-way: only newer binaries open a
-directory after merge-capable payloads are written, so additive record kinds (such as the merge
+directory after merge-capable payloads are written, so additive payload types (such as the merge
 operand payload) require no migration barrier and no old-binary compatibility window. Deploying a
 binary that writes new WAL payload kinds therefore commits that directory to binaries of at least
 that capability level; downgrades are unsupported. This boundary applies to additive payload types
@@ -711,11 +861,13 @@ durable state.
 
 ## 16. Observability
 
-Mace exposes fixed-cardinality counters, gauges, histograms, and events.
+With the non-default `metrics` feature enabled, Mace exposes fixed-cardinality counters, gauges,
+histograms, and events; without it the observer and every observation call are compiled out.
 
-High-frequency latency observations may be sampled. Lifecycle, recovery, checkpoint, GC, and
-durability events are emitted directly. Metric identities remain bounded and do not include
-unbounded bucket, key, or transaction labels.
+High-frequency latency observations may be sampled. Recovery, GC, orphan, transaction-conflict and
+merge-contract activity is reported through counters, gauges, histograms where appropriate, and a
+small fixed set of events. Metric identities remain bounded and do not include unbounded bucket,
+key, or transaction labels.
 
 ## References
 

@@ -15,9 +15,68 @@ use crate::{
         BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_METAS, BUCKET_MISC, BUCKET_OBSOLETE_BLOB,
         BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, Manifest, entry::Sequences,
     },
-    utils::options::{ParsedOptions, PersistedOptions},
+    utils::options::{Options, ParsedOptions, PersistedOptions},
 };
 use std::sync::mpsc::{Receiver, Sender};
+
+/// the single source/target decision point for an open.
+///
+/// `source_*` describes the configuration the on-disk state was written with; `target_*`
+/// describes the configuration this open was asked for. Everything downstream (recovery
+/// scan width, recycle/wipe stream bound, target boot construction, runtime width) reads
+/// its width from here instead of re-deriving it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OpenPlan {
+    pub source_groups: u8,
+    pub target_groups: u8,
+    pub group_resize: bool,
+    pub route_switch: bool,
+    pub layout_migration: bool,
+}
+
+impl OpenPlan {
+    /// derive the open plan from the persisted configuration (absent on a pristine database).
+    ///
+    /// `durable_legacy_per_group_wal` is "a durable open already sees legacy per-group WAL
+    /// files in the log directory"; a relaxed target never migrates that layout.
+    pub(crate) fn derive(
+        persisted: Option<(u8, bool)>,
+        requested: &Options,
+        durable_legacy_per_group_wal: bool,
+    ) -> Self {
+        let (source_groups, source_route) =
+            persisted.unwrap_or((requested.concurrent_write, requested.sync_on_write));
+        Self {
+            source_groups,
+            target_groups: requested.concurrent_write,
+            group_resize: source_groups != requested.concurrent_write,
+            route_switch: source_route != requested.sync_on_write,
+            layout_migration: durable_legacy_per_group_wal,
+        }
+    }
+
+    /// physical WAL stream bound for the era wipe. recycle completion and the epoch high-water
+    /// cannot use it: a durable recycle slot outlives the width that staged its intent, so they
+    /// cover the whole durable slot space instead.
+    ///
+    /// target-only streams (id >= `source_groups`) may hold era files left by an interrupted
+    /// attempt, so the wipe must reach them as well.
+    pub(crate) fn stream_bound(&self) -> u8 {
+        self.source_groups.max(self.target_groups)
+    }
+
+    /// whether recovery must rebuild the WAL epoch
+    pub(crate) fn rebuild_epoch(&self) -> bool {
+        self.group_resize || self.route_switch || self.layout_migration
+    }
+}
+
+/// what `ManifestBuilder::load` hands back to the open path
+pub(crate) struct LoadOutcome {
+    pub plan: OpenPlan,
+    /// `Some(current)` when the persisted subset must be rewritten after the open completes
+    pub writeback: Option<PersistedOptions>,
+}
 
 pub(crate) struct ManifestBuilder {
     inner: Manifest,
@@ -30,22 +89,25 @@ pub(crate) struct ManifestBuilder {
 }
 
 impl ManifestBuilder {
+    /// opening the metadata store can fail recoverably (another instance holds the
+    /// lock, or this build cannot read the file's format), so the builder is fallible
+    /// too and the caller sees a typed `OpCode` instead of a failed invariant
     pub(crate) fn new_with_channels(
         opt: Arc<ParsedOptions>,
         tx: Sender<SharedState>,
         rx: Receiver<()>,
-    ) -> Self {
-        Self {
-            inner: Manifest::new(opt, tx, rx),
+    ) -> Result<Self, OpCode> {
+        Ok(Self {
+            inner: Manifest::new(opt, tx, rx)?,
             max_file_id: 0,
             data_active_size: 0,
             data_total_size: 0,
             blob_active_size: 0,
             blob_total_size: 0,
-        }
+        })
     }
 
-    pub(crate) fn load(&mut self) -> Result<Option<PersistedOptions>, OpCode> {
+    pub(crate) fn load(&mut self) -> Result<LoadOutcome, OpCode> {
         let sequences_ref = &self.inner.sequences;
         let current = PersistedOptions::from_options(self.inner.opt.as_ref());
 
@@ -64,9 +126,10 @@ impl ManifestBuilder {
         }
 
         // 1. load persisted global options
+        let mut persisted_source: Option<(u8, bool)> = None;
         let persisted = match self.inner.load_persisted_options_if_present()? {
             Some(persisted) => {
-                persisted.check_compatible(self.inner.opt.as_ref())?;
+                persisted_source = Some((persisted.concurrent_write, persisted.sync_on_write));
                 persisted
             }
             None if !has_version && self.inner.is_pristine_uninitialized()? => {
@@ -77,6 +140,14 @@ impl ManifestBuilder {
             None => return Err(OpCode::Corruption),
         };
         let needs_writeback = persisted != current;
+        // the open plan is the single place that decides source/target widths and routes
+        let durable_legacy_per_group_wal =
+            self.inner.opt.sync_on_write && self.inner.opt.has_legacy_per_group_wal()?;
+        let plan = OpenPlan::derive(
+            persisted_source,
+            self.inner.opt.as_ref(),
+            durable_legacy_per_group_wal,
+        );
 
         // 2. load sequences
         if let Ok(val) = self
@@ -109,7 +180,7 @@ impl ManifestBuilder {
         self.inner
             .btree
             .view(BUCKET_METAS, |txn| {
-                let mut iter = txn.iter_uncached();
+                let mut iter = txn.iter();
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 while iter.next_ref(&mut k, &mut v) {
@@ -131,7 +202,7 @@ impl ManifestBuilder {
         // 2.1 count pending buckets
         let mut nr_buckets = self.inner.bucket_metas.len() as u64;
         let _ = self.inner.btree.view(BUCKET_PENDING_DEL, |txn| {
-            let mut iter = txn.iter_uncached();
+            let mut iter = txn.iter();
             let mut k = Vec::new();
             let mut v = Vec::new();
             while iter.next_ref(&mut k, &mut v) {
@@ -145,7 +216,7 @@ impl ManifestBuilder {
         self.inner
             .btree
             .view(BUCKET_FRONTIER, |txn| {
-                let mut iter = txn.iter_uncached();
+                let mut iter = txn.iter();
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 while iter.next_ref(&mut k, &mut v) {
@@ -167,7 +238,7 @@ impl ManifestBuilder {
                         FileKind::Blob => BUCKET_BLOB_STAT,
                     },
                     |txn| {
-                        let mut iter = txn.iter_uncached();
+                        let mut iter = txn.iter();
                         let mut k = Vec::new();
                         let mut v = Vec::new();
                         while iter.next_ref(&mut k, &mut v) {
@@ -194,7 +265,7 @@ impl ManifestBuilder {
                         FileKind::Blob => BUCKET_OBSOLETE_BLOB,
                     },
                     |txn| {
-                        let mut iter = txn.iter_uncached();
+                        let mut iter = txn.iter();
                         let mut k = Vec::new();
                         let mut v = Vec::new();
                         let mut obs = self.inner.file_state(kind).obsolete.lock();
@@ -219,17 +290,24 @@ impl ManifestBuilder {
                 .map_err(|_| OpCode::IoError)?;
         }
 
-        Ok(needs_writeback.then_some(current))
+        Ok(LoadOutcome {
+            plan,
+            writeback: needs_writeback.then_some(current),
+        })
     }
 
-    pub(crate) fn finish(mut self) -> Manifest {
-        self.clean_orphans();
-        self.inner.delete_files();
+    pub(crate) fn finish(mut self) -> Result<Manifest, OpCode> {
+        // both cleanups sync the data directory, and this runs before recovery: a failed sync
+        // must fail the open with an error, which the caller reports as a failed open
+        self.clean_orphans()?;
+        self.inner.delete_files()?;
 
+        #[cfg(feature = "extra_check")]
         self.inner
             .stat_ctx(FileKind::Data)
             .update_size(self.data_active_size, self.data_total_size);
 
+        #[cfg(feature = "extra_check")]
         self.inner
             .stat_ctx(FileKind::Blob)
             .update_size(self.blob_active_size, self.blob_total_size);
@@ -239,7 +317,7 @@ impl ManifestBuilder {
             .next_file_id
             .store(self.max_file_id + 1, Relaxed);
 
-        self.inner
+        Ok(self.inner)
     }
 
     fn set_loaded_sizes(&mut self, kind: FileKind, active_size: u64, total_size: u64) {
@@ -255,13 +333,13 @@ impl ManifestBuilder {
         }
     }
 
-    fn clean_orphans(&mut self) {
+    fn clean_orphans(&mut self) -> Result<(), OpCode> {
         let mut markers: [Vec<(u64, Vec<u8>)>; 2] = [Vec::new(), Vec::new()];
 
         let _ = self.inner.btree.view(BUCKET_MISC, |txn| {
             // file ids can be sparse because some ids are reserved before any file is flushed
             // rely on explicit per-file markers instead of max_id tail probing or directory scan
-            let mut iter = txn.iter_uncached();
+            let mut iter = txn.iter();
             let mut k = Vec::new();
             let mut v = Vec::new();
             while iter.next_ref(&mut k, &mut v) {
@@ -287,6 +365,11 @@ impl ManifestBuilder {
                     FileKind::Data => self.inner.opt.data_file(id),
                     FileKind::Blob => self.inner.opt.blob_file(id),
                 };
+                // this unlink runs only from `Store::new` while opening the instance, so
+                // it can never overlap a checkpoint (which requires an already-open
+                // instance) and does not claim a `DeletionGuard` slot. moving orphan
+                // cleanup to a runtime path requires claiming a slot via
+                // `DeletionGuard::begin` first
                 must_ok!(
                     self.inner.opt.fs.remove_file_if_exists(&path),
                     "path {:?}",
@@ -300,26 +383,29 @@ impl ManifestBuilder {
             .iter()
             .all(|&kind| cleaned_marker_keys[kind.slot()].is_empty())
         {
-            return;
+            return Ok(());
         }
 
-        self.inner.opt.sync_data_dir();
+        self.inner.opt.try_sync_data_dir()?;
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash(
             "mace_recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear",
         );
 
-        must_ok!(
-            self.inner.btree.exec(BUCKET_MISC, |txn| {
+        self.inner
+            .btree
+            .exec(BUCKET_MISC, |txn| {
                 for kind in FileKind::ALL {
                     for key in &cleaned_marker_keys[kind.slot()] {
-                        let _ = txn.del(key);
+                        // a marker already cleared by an earlier attempt deletes
+                        // nothing; every other failure must still surface
+                        let _ = txn.del(key)?;
                     }
                 }
                 Ok(())
-            }),
-            "orphan marker update failed"
-        );
+            })
+            .map_err(OpCode::from)?;
+        Ok(())
     }
 
     fn observe_orphan_id(&mut self, id: u64) {
@@ -333,5 +419,111 @@ impl ManifestBuilder {
         }
         let raw_id = std::str::from_utf8(&raw[prefix.len()..]).ok()?;
         raw_id.parse::<u64>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenPlan;
+    use crate::Options;
+
+    fn requested(groups: u8, durable: bool) -> Options {
+        let mut opt = Options::new("/tmp/mace-open-plan-test");
+        opt.concurrent_write = groups;
+        opt.sync_on_write = durable;
+        opt
+    }
+
+    /// the builder's orphan cleanup syncs the data directory before clearing its markers; an open
+    /// that fails there must fail with an error instead of killing the process
+    #[test]
+    fn finish_propagates_a_failed_data_directory_sync() {
+        use std::io::ErrorKind;
+        use std::sync::Arc;
+        use std::sync::mpsc::channel;
+
+        use crate::RandomPath;
+        use crate::io::testfs::{InjectOp, InjectedFileSystem};
+        use crate::meta::{BUCKET_MISC, orphan_data_marker_key};
+
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        let fs = Arc::new(InjectedFileSystem::new());
+        opt.fs = fs.clone();
+        let parsed = Arc::new(opt.validate().expect("options must validate"));
+        let (tx, _rx) = channel();
+        let (_ack_tx, ack_rx) = channel();
+        let mut builder = super::ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx)
+            .expect("builder must open");
+        builder.load().expect("manifest load must work");
+        // an orphan marker is what makes the open path sync the data directory
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_MISC, |txn| txn.put(orphan_data_marker_key(7), []))
+            .expect("marker must be staged");
+        // arm the rule after the marker, so only the cleanup's sync can consume it
+        fs.fail_once(
+            InjectOp::SyncDir,
+            parsed.data_root(),
+            ErrorKind::PermissionDenied,
+        );
+
+        assert_eq!(
+            builder.finish().err(),
+            Some(crate::OpCode::IoError),
+            "a failed data-directory sync during orphan cleanup must fail the open"
+        );
+    }
+
+    #[test]
+    fn open_plan_detects_group_resize_and_rebuilds_the_epoch() {
+        let opt = requested(2, true);
+        let plan = OpenPlan::derive(Some((4, true)), &opt, false);
+        assert_eq!(plan.source_groups, 4);
+        assert_eq!(plan.target_groups, 2);
+        assert!(plan.group_resize);
+        assert!(!plan.route_switch);
+        assert!(!plan.layout_migration);
+        assert!(plan.rebuild_epoch());
+    }
+
+    #[test]
+    fn open_plan_keeps_the_scan_at_source_width_and_the_wipe_at_stream_bound() {
+        // grow: the retained scan stays on the persisted width, the physical bound follows it
+        let plan = OpenPlan::derive(Some((2, true)), &requested(4, true), false);
+        assert_eq!(plan.source_groups, 2);
+        assert_eq!(plan.target_groups, 4);
+        assert_eq!(plan.stream_bound(), 4);
+        assert!(plan.group_resize);
+        assert!(plan.rebuild_epoch());
+    }
+
+    #[test]
+    fn open_plan_pristine_database_has_no_migration() {
+        let plan = OpenPlan::derive(None, &requested(4, true), false);
+        assert_eq!(plan.source_groups, 4);
+        assert_eq!(plan.target_groups, 4);
+        assert_eq!(plan.stream_bound(), 4);
+        assert!(!plan.rebuild_epoch());
+    }
+
+    #[test]
+    fn open_plan_route_switch_rebuilds_without_resizing() {
+        let plan = OpenPlan::derive(Some((4, false)), &requested(4, true), false);
+        assert!(plan.route_switch);
+        assert!(!plan.group_resize);
+        assert!(plan.rebuild_epoch());
+    }
+
+    #[test]
+    fn open_plan_migrates_legacy_layout_only_for_a_durable_open() {
+        let durable = OpenPlan::derive(Some((2, true)), &requested(2, true), true);
+        assert!(durable.layout_migration);
+        assert!(durable.rebuild_epoch());
+
+        let relaxed = OpenPlan::derive(Some((2, false)), &requested(2, false), false);
+        assert!(!relaxed.layout_migration);
+        assert!(!relaxed.rebuild_epoch());
     }
 }

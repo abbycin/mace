@@ -1,3 +1,8 @@
+//! instance-scoped storage for per-thread state
+//!
+//! a `LocalSlot<T>` holds one value per thread that registered for it, and the values are
+//! isolated: a thread only ever observes its own. `drain` requires every owner to be
+//! quiescent, destroys each value exactly once, and only then may an owner id be reused.
 use parking_lot::{Mutex, MutexGuard};
 use std::{
     cell::UnsafeCell,

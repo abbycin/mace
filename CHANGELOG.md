@@ -1,3 +1,27 @@
+## [0.2.0] 2026-10-20
+### New Features
+- Added `Mace::create_checkpoint`, a durable standalone copy of a database into a new directory, reported as `CheckpointInfo` with the frontier the copy was cut at
+- Added `check_database`, an offline read-only consistency checker that reports every finding with a stable category and location
+- The offline checker now reports unresolved page-record chain references as `bad_page_chain`
+- `CheckCategory` gains a public `BadPageChain` variant; downstream exhaustive matches must handle it
+- Added the `mace-kv check <db-dir>` CLI on top of it: exit `0` clean, `1` damaged, `2` usage error, and it never writes
+- A reopen that requests a different `concurrent_write` now migrates the database instead of being rejected, so every crash window is retryable at either width
+
+### Changes
+- **Breaking: databases written by 0.1.2 and earlier must be rebuilt with `btree-store migrate <source> --output <destination> --to 2`**; opening one returns `OpCode::Corruption`, which `mace-kv check` reports as `unsupported_metadata_format`
+- A fatal invariant failure prints a structured report (check, caller, message, captured arguments, error, backtrace) and then aborts
+- `concurrent_write` is rounded up to a power of two by validation
+- A page record whose group id belongs to a width this open no longer uses reads as settled history
+- Foreground admission may add a bounded drain burst (`pool_capacity / 8`, `checkpoint_size`) while a checkpoint is in flight
+- Lowered the inline-size range/default, made existing-bucket updates decrease-only, and rebuilds materialize the affected values as blobs
+- Reworked the internal constraint ledger to five concerns: data loss, crash safety, space leak, visibility, and data race/deadlock/livelock
+
+### Bug Fixes
+- Fixed a GC rewrite/checkpoint race in which a fully-obsolete rewrite candidate could strand unreachable payload space or resurrect a retired stat
+- Fixed a WAL epoch migration leaving a gap in a relaxed route's per-stream WAL, which made the next open refuse the database as corrupt
+- Fixed a durable checkpoint hint advancing past an aborted transaction with pending abort-clean work, which could reopen with the aborted version visible and drop the cleanup task
+- Fixed a bucket delete racing a file's fully-obsolete reclaim, where the duplicate Delete aborted the process or stopped reclamation; the reclaim-path deletion now treats an already-absent key as a counted miss
+
 ## [0.1.2] 2026-09-05
 ### New Features
 - Added optional per-bucket merge operators with durable merge operands and the default `U64AddOperator`

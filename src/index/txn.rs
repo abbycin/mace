@@ -10,7 +10,7 @@ use crate::{
         SnapshotStamp,
         context::{CCNode, Context},
         group::{TxnState, WriterGroup},
-        is_visible_to,
+        is_retained_abort, is_visible_to,
         wal::{WalDel, WalMerge, WalPut, WalReplace},
     },
     index::tree::{Iter, Tree},
@@ -208,6 +208,11 @@ impl<'a> TxnKV<'a> {
         self.ctx.opt.observer.event(event);
     }
 
+    /// Takes the foreground admission permit before a mutation enters the tree.
+    ///
+    /// The permit is what bounds dirty memory: a writer that would exceed the ceiling
+    /// waits here instead of inside `tree.update`, so a blocked writer never holds a
+    /// partial mutation.
     #[inline]
     fn before_write_budget(&self, estimated_bytes: usize) -> ForegroundWritePermit {
         self.tree
@@ -262,11 +267,7 @@ impl<'a> TxnKV<'a> {
         if self.is_visible_for_write(snapshot, rv.ver.txid, rv.group_id) {
             return Ok(Some(*rv));
         }
-        if self
-            .ctx
-            .group(rv.group_id as usize)
-            .is_retained_abort(rv.ver.txid)
-        {
+        if is_retained_abort(self.ctx, rv.group_id, rv.ver.txid) {
             return Err(FailCause::Aborted);
         }
         Err(FailCause::Conflict)
@@ -287,11 +288,7 @@ impl<'a> TxnKV<'a> {
         if self.is_visible_for_write(snapshot, rv.ver.txid, rv.group_id) {
             return Ok(Some(*rv));
         }
-        if self
-            .ctx
-            .group(rv.group_id as usize)
-            .is_retained_abort(rv.ver.txid)
-        {
+        if is_retained_abort(self.ctx, rv.group_id, rv.ver.txid) {
             return Err(FailCause::Aborted);
         }
         // merge/merge coexists under the same runtime operator; every other concurrent
@@ -393,11 +390,7 @@ impl<'a> TxnKV<'a> {
         let Some(m) = latest else {
             return Ok(false);
         };
-        if !self
-            .ctx
-            .group(m.group_id as usize)
-            .is_retained_abort(m.ver.txid)
-        {
+        if !is_retained_abort(self.ctx, m.group_id, m.ver.txid) {
             return Ok(false);
         }
 
@@ -740,7 +733,7 @@ impl<'a> TxnKV<'a> {
     ///
     /// Returns [`OpCode::Invalid`] when the bucket has no runtime merge operator, when the
     /// operand is empty, or when the operator output would be rejected. Returns
-    /// [`OpCode::TooLarge`] when key plus operand exceed [`Options::MAX_KV_SIZE`]. Operands
+    /// [`OpCode::TooLarge`] when key plus operand exceed the maximum key/value size. Operands
     /// larger than the bucket inline boundary use the normal remote/blob storage path.
     /// Concurrent merge/merge writes may coexist; other overlapping writes use first-writer-wins.
     ///

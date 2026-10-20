@@ -1936,8 +1936,8 @@ fn exact_miss_rereads_safe_after_prune() -> Result<(), OpCode> {
         let prune_armed = prune_armed.clone();
         move |point, safe| {
             if point != CollectorSyncPoint::AfterSafePublishBeforeCommittedFactPrune
-                || !prune_armed.swap(false, Ordering::SeqCst)
                 || safe <= committed_txid
+                || !prune_armed.swap(false, Ordering::SeqCst)
             {
                 return;
             }

@@ -112,7 +112,7 @@ impl PageMap {
         if let Some(btree) = btree {
             let bucket_table = crate::meta::page_table_name(bucket_id);
             let e = btree.view(&bucket_table, |txn| {
-                let mut iter = txn.iter_uncached();
+                let mut iter = txn.iter();
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 while iter.next_ref(&mut k, &mut v) {
@@ -342,11 +342,11 @@ impl BucketState {
 
 #[cfg(test)]
 mod test {
+    use crate::error::test_support::{assert_aborted, is_abort_child, run_child_test};
     use crate::{
         map::table::{L1_FANOUT, L2_FANOUT, L3_FANOUT, PageMap},
         utils::NULL_ADDR,
     };
-    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn addr(a: u64) -> u64 {
         a * 2
@@ -384,12 +384,29 @@ mod test {
         assert_eq!(pids.len(), mapped_pid.len());
     }
 
+    /// recycling a mapped pid is an invariant failure, so the process aborts with the
+    /// report instead of unwinding and leaving the map in a state the caller may reuse
     #[test]
     fn recycle_pid_requires_null_mapping() {
+        let output = run_child_test("map::table::test::recycle_pid_requires_null_mapping_child");
+        assert_aborted(
+            &output,
+            &[
+                "fatal invariant failure",
+                "check=must_true",
+                "must be unmapped",
+            ],
+        );
+    }
+
+    /// the aborting side of the test above: it runs only in the child process
+    #[test]
+    fn recycle_pid_requires_null_mapping_child() {
+        if !is_abort_child() {
+            return;
+        }
         let table = PageMap::default();
         let pid = table.map(addr(13));
-        let panic = catch_unwind(AssertUnwindSafe(|| table.recycle_pid(pid)));
-        assert!(panic.is_err(), "recycling a mapped pid must panic");
-        assert_eq!(table.get(pid), addr(13));
+        table.recycle_pid(pid);
     }
 }

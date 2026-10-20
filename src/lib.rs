@@ -1,5 +1,7 @@
 pub use index::txn::{TxnKV, TxnView};
 pub use store::VacuumStats;
+pub use store::checker::{CheckCategory, CheckReport, Diagnostic, check_database};
+pub use store::checkpoint::{BucketFrontier, CheckpointInfo, GroupPosition};
 pub(crate) use store::store::Store;
 pub use store::store::{Bucket, Mace};
 #[cfg(feature = "metrics")]

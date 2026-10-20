@@ -3,7 +3,7 @@ use crate::{OpCode, Options, must_ok};
 
 use crate::io::{self, FileSystem, GatherIO, IoVec};
 use std::fmt::Debug;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
 pub struct LenSeq {
@@ -153,23 +153,24 @@ impl GatherWriter {
     pub(crate) const MAX_IOVCNT: usize = 1024;
     pub(crate) const DEFAULT_IOVCNT: usize = 64;
 
-    fn open(fs: &dyn FileSystem, path: &PathBuf, trunc: bool) -> io::File {
-        must_ok!(
-            io::File::options()
-                .write(true)
-                .append(true)
-                .trunc(trunc)
-                .create(true)
-                .open(fs, path),
-            "can't open {:?}",
-            path
-        )
+    fn try_open(fs: &dyn FileSystem, path: &PathBuf, trunc: bool) -> Result<io::File, OpCode> {
+        io::File::options()
+            .write(true)
+            .append(true)
+            .trunc(trunc)
+            .create(true)
+            .open(fs, path)
+            .map_err(OpCode::from)
     }
 
-    fn create(fs: &dyn FileSystem, path: &PathBuf, max_iovcnt: usize, trunc: bool) -> Self {
+    fn open(fs: &dyn FileSystem, path: &PathBuf, trunc: bool) -> io::File {
+        must_ok!(Self::try_open(fs, path, trunc), "can't open {:?}", path)
+    }
+
+    fn with_file(path: &Path, file: io::File, max_iovcnt: usize) -> Self {
         Self {
-            path: path.clone(),
-            file: Self::open(fs, path, trunc),
+            path: path.to_path_buf(),
+            file,
             queue: Vec::with_capacity(max_iovcnt),
             owned: Vec::new(),
             queued_len: 0,
@@ -181,12 +182,31 @@ impl GatherWriter {
         }
     }
 
+    fn create(fs: &dyn FileSystem, path: &PathBuf, max_iovcnt: usize, trunc: bool) -> Self {
+        Self::with_file(path, Self::open(fs, path, trunc), max_iovcnt)
+    }
+
     pub fn trunc(fs: &dyn FileSystem, path: &PathBuf, max_iovcnt: usize) -> Self {
         Self::create(fs, path, max_iovcnt, true)
     }
 
     pub fn append(fs: &dyn FileSystem, path: &PathBuf, max_iovcnt: usize) -> Self {
         Self::create(fs, path, max_iovcnt, false)
+    }
+
+    /// fallible append open for the epoch handoff: the opening path can still clean
+    /// up and report the failure, so a failed open must not turn into a fatal
+    /// invariant abort with a half-installed epoch writer behind it
+    pub fn try_append(
+        fs: &dyn FileSystem,
+        path: &PathBuf,
+        max_iovcnt: usize,
+    ) -> Result<Self, OpCode> {
+        Ok(Self::with_file(
+            path,
+            Self::try_open(fs, path, false)?,
+            max_iovcnt,
+        ))
     }
 
     pub fn queue(&mut self, data: &[u8]) {
@@ -218,6 +238,12 @@ impl GatherWriter {
 
     pub fn pos(&self) -> u64 {
         must_ok!(self.file.size(), "path: {:?}", self.path)
+    }
+
+    /// fallible size probe for the epoch handoff: the era-file check must return an error
+    /// through the recovery-open cleanup instead of aborting the process
+    pub(crate) fn try_pos(&self) -> Result<u64, OpCode> {
+        self.file.size().map_err(OpCode::from)
     }
 
     pub fn write(&mut self, data: &[u8]) {

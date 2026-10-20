@@ -14,6 +14,7 @@ use crate::cc::wal::{
     ptr_to, wal_record_sz,
 };
 use crate::index::tree::Tree;
+use crate::meta::builder::OpenPlan;
 use crate::meta::{Manifest, Sequences, WalRecycleIntent};
 use crate::store::gc::drain_abort_clean_during_recovery;
 use crate::types::data::{Key, Record, Ver};
@@ -29,6 +30,17 @@ use crossbeam_epoch::Guard;
 #[cfg(feature = "metrics")]
 use std::time::Instant;
 
+/// the target-width inputs a runtime Context is constructed from after the era wipe.
+///
+/// the boot list describes exactly `target_groups` logical streams plus the shared stream at index
+/// `target_groups`, and every slot's `start_id`/`oldest_id` must already point at the new era.
+/// `checkpoint_floor` carries the post-wipe floor seed `Context::new` publishes: the durable route
+/// leaves every logical slot inactive (`Position::MAX`, consumed by the shared GC guard), the
+/// relaxed route seeds each logger's own slot with a real position at the era start
+pub(crate) struct TargetPlan {
+    pub(crate) boots: Vec<GroupBoot>,
+}
+
 /// there are some cases can't recover:
 /// 1. manifest file missing or corrupted
 /// 2. data file lost
@@ -37,10 +49,13 @@ use std::time::Instant;
 /// perform necessary redo/undo to bring data back to consistent, and this only apply to the lost of latest data file
 pub(crate) struct Recovery {
     opt: Arc<ParsedOptions>,
-    /// route switches and legacy durable layouts rebuild the WAL epoch
-    rebuild_epoch: bool,
-    /// epoch start consumed after recovery flushes and eviction
-    pending_switch: Option<u64>,
+    /// the single source/target decision record for this open: the retained WAL scan uses the
+    /// source width, recycle completion and the high-water cover the durable slot space, and the
+    /// era wipe uses `stream_bound()`
+    plan: OpenPlan,
+    /// epoch start of the era this open rebuilds: read by the era wipe and by the post-wipe target
+    /// boot list. A non-rebuild open keeps 0 and never wipes
+    epoch_start: u64,
     dirty_table: BTreeMap<Ver, Location>,
     committed_txns: HashSet<u64>,
     in_progress_txns: HashSet<u64>,
@@ -57,11 +72,11 @@ impl Recovery {
     const INIT_BLOCK_SIZE: usize = 1 << 20;
     const BUCKET_CACHE_CAP: usize = 16;
 
-    pub(crate) fn new(opt: Arc<ParsedOptions>, rebuild_epoch: bool) -> Self {
+    pub(crate) fn new(opt: Arc<ParsedOptions>, plan: OpenPlan) -> Self {
         Self {
             opt,
-            rebuild_epoch,
-            pending_switch: None,
+            plan,
+            epoch_start: 0,
             dirty_table: BTreeMap::new(),
             committed_txns: HashSet::new(),
             in_progress_txns: HashSet::new(),
@@ -143,7 +158,7 @@ impl Recovery {
     }
 
     fn evict_bucket(&self, bucket_id: u64, store: MutRef<Store>) {
-        if self.pending_switch.is_some() {
+        if self.plan.rebuild_epoch() {
             // on a switch open the wipe deletes the wal that still
             // guards the recovery-redone tail, so every eviction flush (not
             // only the forced checkpoint over still-loaded buckets) must be
@@ -172,33 +187,45 @@ impl Recovery {
         self.evict_all(store);
     }
 
+    /// epoch start this open consumes for its era wipe and for the post-wipe target boot list
+    pub(crate) fn epoch_start(&self) -> u64 {
+        self.epoch_start
+    }
+
     pub(crate) fn phase1(
         &mut self,
         manifest: Handle<Manifest>,
         sequences: Arc<Sequences>,
     ) -> Result<(Vec<GroupBoot>, Handle<Context>), OpCode> {
-        self.finish_pending_wal_recycle(manifest)?;
+        // one namespace snapshot for both phase1 consumers: the recycle sweep may delete files
+        // before the high-water reads the namespace, and such a slot can only carry a `none` or a
+        // `done` state whose boundary is at or below the era start the sweep recorded
+        let present = self.present_wal_streams()?;
+        self.finish_pending_wal_recycle(manifest, &present)?;
         let mut wal_boot = self.load_wal_boot(manifest)?;
         // seed per-logical-group checkpoint floors from the manifest on
         // EVERY open (independent of the epoch skip) so a same-route reopen
         // does not freeze the shared-stream recycle boundary
         self.seed_checkpoint_floors(manifest, &mut wal_boot);
-        if self.rebuild_epoch {
-            // compute the global epoch start; the old wal is
-            // wiped in phase2 (after the forced checkpoint of the redone tail)
-            // and the new era begins at start
-            let (high_water, has_history) = self.epoch_high_water(manifest)?;
-            let start = if has_history {
+        if self.plan.rebuild_epoch() {
+            // only the epoch start is global. every retained stream keeps its own boot
+            // position for the scan: overwriting them with `start` makes a logger open
+            // `wal_<id>_<start>` while the stream's retained range still ends lower,
+            // and the next open has to read that as a gap inside a retained range.
+            // the runtime era writer is installed at `epoch_start` after the wipe
+            let (high_water, has_history) = self.epoch_high_water(manifest, &present)?;
+            self.epoch_start = if has_history {
                 high_water.checked_add(1).ok_or(OpCode::Corruption)?
             } else {
                 0
             };
-            for boot in wal_boot.iter_mut() {
-                boot.start_id = start;
-            }
-            self.pending_switch = Some(start);
         }
-        let ctx = Handle::new(Context::new(self.opt.clone(), sequences, &wal_boot));
+        let ctx = Handle::new(Context::new(
+            self.opt.clone(),
+            self.plan.source_groups,
+            sequences,
+            &wal_boot,
+        ));
         Ok((wal_boot, ctx))
     }
 
@@ -296,7 +323,7 @@ impl Recovery {
             drain_abort_clean_during_recovery(
                 store.clone(),
                 store.context,
-                self.pending_switch.is_some(),
+                self.plan.rebuild_epoch(),
             )?;
         }
         // analyze may truncate a writer opened during phase1
@@ -306,7 +333,7 @@ impl Recovery {
         log::trace!("oracle {oracle}");
         store.manifest.sequences.oracle.store(oracle, Relaxed);
         // a rebuild must durable-flush every redone bucket before wiping its WAL
-        if self.pending_switch.is_some() {
+        if self.plan.rebuild_epoch() {
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_switch_before_forced_checkpoint");
             for bucket_id in self.loaded_buckets.borrow().iter() {
@@ -314,17 +341,29 @@ impl Recovery {
                     tree.bucket.checkpoint_before_reclaim(true);
                 }
             }
+            // the redone tail is durable and the old era is still intact: a crash here must
+            // still retry into the same era start and finish the wipe
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_switch_after_forced_checkpoint_before_wipe");
         }
-        let manifest = store.manifest;
+        let mut manifest = store.manifest;
         let context = store.context;
         self.evict_all(store);
-        let switching = self.pending_switch.is_some();
+        let switching = self.plan.rebuild_epoch();
         // wipe the old era only after every redone tail is durable
         if switching {
-            let start = self
-                .pending_switch
-                .take()
-                .expect("pending switch start must exist");
+            // the recovery flusher must be gone before any writer is detached: its
+            // tasks outlive a `take` (`Checkpoint` has no `Drop`) and a checkpoint
+            // record written after the wipe would land in the new era
+            if let Some(flush) = manifest.take_checkpoint_flusher() {
+                flush.quit();
+            }
+            let start = self.epoch_start;
+            // close the old era's files before removing them: the wipe must not depend
+            // on the filesystem accepting the removal of an open file
+            context.detach_recovery_writers(start)?;
+            #[cfg(feature = "extra_check")]
+            context.assert_writers_detached();
             self.wipe_old_wal(manifest, wal_boot, start)?;
             // keep the runtime recycle cache aligned with the durable done
             // boundary before the collector can build its first intent
@@ -337,11 +376,27 @@ impl Recovery {
             }
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_switch_after_wipe_before_writeback");
+            if !self.plan.group_resize {
+                // a same-width rebuild hands this Context to the runtime, so it owns
+                // the new era from here on: install its epoch writers and floors, then
+                // make the new files' directory entries durable before the options
+                // writeback records the migration
+                context.install_epoch_writers(start)?;
+                // data-first: the era files' directory entries must be durable before the
+                // options writeback records the migration, and a failed sync must leave
+                // through the open's cleanup rather than panic mid-handoff
+                self.opt.try_sync_log_dir()?;
+            }
         }
         // publish shared-stream floors before runtime checkpointing or GC
         if self.opt.sync_on_write {
             if switching {
-                context.reset_shared_logical_checkpoint_floors();
+                // a same-width rebuild seeded the new era's floors through
+                // `install_epoch_writers`; a width change retires this Context, so
+                // only its shared logger's stale floors are cleared here
+                if self.plan.group_resize {
+                    context.reset_shared_logical_checkpoint_floors();
+                }
             } else {
                 let floors = self.recovery_logical_checkpoint_floors(manifest);
                 context.publish_shared_logical_checkpoint_floors(&floors);
@@ -373,7 +428,7 @@ impl Recovery {
     }
 
     fn validate_update_group(&self, u: &WalUpdate) -> Result<(), OpCode> {
-        if u.group_id >= self.opt.concurrent_write {
+        if u.group_id >= self.plan.source_groups {
             return Err(OpCode::Corruption);
         }
         Ok(())
@@ -712,7 +767,7 @@ impl Recovery {
             if !c.is_intact() || c.validate_record(block.slice(0, len as usize)).is_err() {
                 return Err(OpCode::Corruption);
             }
-            if c.group_id >= self.opt.concurrent_write {
+            if c.group_id >= self.plan.source_groups {
                 return Err(OpCode::Corruption);
             }
             let txid = { c.txid };
@@ -797,8 +852,8 @@ impl Recovery {
     }
 
     fn load_wal_boot(&self, manifest: Handle<Manifest>) -> Result<Vec<GroupBoot>, OpCode> {
-        let mut out = Vec::with_capacity(self.opt.concurrent_write as usize + 1);
-        for physical in 0..self.opt.concurrent_write {
+        let mut out = Vec::with_capacity(self.plan.source_groups as usize + 1);
+        for physical in 0..self.plan.source_groups {
             let boot = self.load_physical_stream_boot(manifest, physical)?;
             out.push(boot);
         }
@@ -875,14 +930,130 @@ impl Recovery {
         }
     }
 
-    /// wipe old physical WAL streams after recovery data is durable
+    /// build the target-width boot list and floor seeds from the post-wipe physical state.
+    ///
+    /// this is the boot-only path the design requires after the wipe: it never reuses the source
+    /// boot list and never invents a missing slot. A slot that still reports a pre-era boundary
+    /// means the wipe did not cover that stream, which is corruption for this open.
+    pub(crate) fn target_plan(
+        &self,
+        manifest: Handle<Manifest>,
+        era_start: u64,
+    ) -> Result<TargetPlan, OpCode> {
+        let target = self.plan.target_groups;
+        let mut boots: Vec<GroupBoot> = Vec::with_capacity(target as usize + 1);
+        for id in 0..target {
+            boots.push(self.load_physical_stream_boot(manifest, id)?);
+        }
+        boots.push(self.load_physical_stream_boot(manifest, Options::SHARED_ID)?);
+        for (slot, boot) in boots.iter().enumerate() {
+            let expected = if slot == target as usize {
+                Options::SHARED_ID
+            } else {
+                slot as u8
+            };
+            if boot.physical_wal_id != expected
+                || boot.start_id < era_start
+                || boot.oldest_id < era_start
+            {
+                return Err(OpCode::Corruption);
+            }
+        }
+        // the post-wipe floor seed: the durable route's shared logger consumes a MAX sentinel for
+        // every inactive slot, while the relaxed route needs a real own-slot position (a MAX own
+        // floor would build a recycle intent with `to_file_id = u64::MAX`)
+        let seed = if self.opt.sync_on_write {
+            Position::MAX
+        } else {
+            Position::new(era_start, 0)
+        };
+        for boot in boots.iter_mut() {
+            boot.checkpoint_floor = seed;
+        }
+        Ok(TargetPlan { boots })
+    }
+
+    /// every physical WAL stream id present in the log namespace (per-group and shared).
+    ///
+    /// the era wipe must sweep what exists, not only what the current plan can name: a failed
+    /// open to a wider target can leave namespace entries above the current bound.
+    fn present_wal_streams(&self) -> Result<BTreeSet<u8>, OpCode> {
+        let shared_prefix = format!("{}{}", Options::GROUP_WAL_PREFIX, Options::SEP);
+        let group_prefix = format!("{}{}", Options::WAL_PREFIX, Options::SEP);
+        let mut streams = BTreeSet::new();
+        for entry in self.opt.fs.read_dir(&self.opt.log_root())? {
+            let Some(raw) = entry.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if raw.starts_with(&shared_prefix) {
+                streams.insert(Options::SHARED_ID);
+                continue;
+            }
+            let Some(rest) = raw.strip_prefix(&group_prefix) else {
+                continue;
+            };
+            let Some((group, _seq)) = rest.split_once(Options::SEP) else {
+                continue;
+            };
+            if let Ok(group) = group.parse::<u8>() {
+                streams.insert(group);
+            }
+        }
+        Ok(streams)
+    }
+
+    /// durable recycle slots may outlive the width that triggered their intent: `[0,
+    /// MAX_CONCURRENT_WRITE)` is the whole writable slot space (`Options::validate` clamps the
+    /// width to it, the shared stream is `SHARED_ID`, and any other id can only come from a file
+    /// name that `present_wal_streams` reports), so a narrower open still completes the intents a
+    /// wider, interrupted attempt left behind
+    fn durable_recycle_streams(present: &BTreeSet<u8>) -> Vec<u8> {
+        let mut streams: Vec<u8> = (0..Options::MAX_CONCURRENT_WRITE).collect();
+        streams.extend(present.iter().copied());
+        streams.push(Options::SHARED_ID);
+        streams.sort_unstable();
+        streams.dedup();
+        streams
+    }
+
+    /// wipe old physical WAL streams after recovery data is durable.
+    ///
+    /// the stream bound is `OpenPlan::stream_bound()`, not the retained scan width: an
+    /// interrupted attempt may have left era files for streams only the target width owns, and
+    /// those streams need the same durable `done` boundary before the new era starts. Such
+    /// files can never carry pre-migration data (every earlier width change wiped all streams
+    /// of the then-persisted width), so recycling them is safe.
     fn wipe_old_wal(
         &self,
         manifest: Handle<Manifest>,
         wal_boot: &[GroupBoot],
         start: u64,
     ) -> Result<(), OpCode> {
-        let mut ordered: Vec<&GroupBoot> = wal_boot.iter().collect();
+        // sweep the union of the OpenPlan stream bound and every stream namespace present on disk: an
+        // interrupted attempt may have written era files for a stream id above the current bound
+        // (for example an aborted 4 -> 8 grow retried at 4 -> 2), and those files must not be
+        // left behind. They carry no pre-migration data (every earlier width change wiped all
+        // streams of the then-persisted width), so recycling them is safe.
+        let synth = |physical_wal_id: u8| GroupBoot {
+            physical_wal_id,
+            oldest_id: 0,
+            latest_id: 0,
+            scan_start: Position::MIN,
+            has_files: false,
+            start_id: start,
+            checkpoint_floor: Position::MIN,
+        };
+        let mut streams: BTreeSet<u8> = (0..self.plan.stream_bound()).collect();
+        streams.extend(self.present_wal_streams()?);
+        streams.extend(wal_boot.iter().map(|boot| boot.physical_wal_id));
+        let mut ordered: Vec<GroupBoot> = Vec::with_capacity(streams.len());
+        for id in streams {
+            match wal_boot.iter().find(|boot| boot.physical_wal_id == id) {
+                Some(boot) => ordered.push(*boot),
+                // target-only stream: the retained scan produced no boot for it
+                None => ordered.push(synth(id)),
+            }
+        }
         ordered.sort_by_key(|boot| {
             (
                 boot.physical_wal_id != Options::SHARED_ID,
@@ -904,7 +1075,7 @@ impl Recovery {
                 continue;
             };
             Self::remove_wal_prefix(&self.opt, intent)?;
-            self.opt.sync_log_dir();
+            self.opt.try_sync_log_dir()?;
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
             assert!(
@@ -919,7 +1090,7 @@ impl Recovery {
 
     /// per-group lower bound over persisted bucket frontiers
     fn manifest_checkpoint_floors(&self, manifest: Handle<Manifest>) -> Vec<Position> {
-        let n = self.opt.concurrent_write as usize;
+        let n = self.plan.source_groups as usize;
         let mut floors = vec![Position::MAX; n];
         let mut seen = [false; Options::MAX_CONCURRENT_WRITE as usize];
         for frontier in manifest.bucket_frontier.iter() {
@@ -938,7 +1109,7 @@ impl Recovery {
 
     /// shared-stream floors, with inactive groups set to `Position::MAX`
     fn recovery_logical_checkpoint_floors(&self, manifest: Handle<Manifest>) -> Vec<Position> {
-        let n = self.opt.concurrent_write as usize;
+        let n = self.plan.source_groups as usize;
         let manifest_floors = self.manifest_checkpoint_floors(manifest);
         let mut floors = vec![Position::MAX; n];
         for (i, floor) in manifest_floors.iter().enumerate().take(n) {
@@ -949,7 +1120,11 @@ impl Recovery {
         floors
     }
 
-    fn epoch_high_water(&self, manifest: Handle<Manifest>) -> Result<(u64, bool), OpCode> {
+    fn epoch_high_water(
+        &self,
+        manifest: Handle<Manifest>,
+        present: &BTreeSet<u8>,
+    ) -> Result<(u64, bool), OpCode> {
         let mut high_water = 0u64;
         let mut has_history = false;
         for entry in self.opt.fs.read_dir(&self.opt.log_root())? {
@@ -975,10 +1150,7 @@ impl Recovery {
                 has_history = true;
             }
         }
-        // per-group recycle slots plus the reserved shared-stream slot
-        let mut physical_streams: Vec<u8> = (0..self.opt.concurrent_write).collect();
-        physical_streams.push(Options::SHARED_ID);
-        for group in physical_streams {
+        for group in Self::durable_recycle_streams(present) {
             let state = manifest.load_wal_recycle_state(group);
             if !state.is_none() {
                 high_water = high_water.max(state.from_file_id).max(state.to_file_id);
@@ -988,11 +1160,14 @@ impl Recovery {
         Ok((high_water, has_history))
     }
 
-    fn finish_pending_wal_recycle(&self, manifest: Handle<Manifest>) -> Result<(), OpCode> {
-        // per-group recycle slots plus the reserved shared-stream slot
-        let mut physical_streams: Vec<u8> = (0..self.opt.concurrent_write).collect();
-        physical_streams.push(Options::SHARED_ID);
-        for group_id in physical_streams {
+    fn finish_pending_wal_recycle(
+        &self,
+        manifest: Handle<Manifest>,
+        present: &BTreeSet<u8>,
+    ) -> Result<(), OpCode> {
+        // this sweep runs on every open, not only on a rebuild, and each drained intent consumes a
+        // hit of both crash hooks below: an `abort@N` targeting a later wipe slot must count them
+        for group_id in Self::durable_recycle_streams(present) {
             let state = manifest.load_wal_recycle_state(group_id);
             if state.is_none() || state.is_done() {
                 continue;
@@ -1003,7 +1178,7 @@ impl Recovery {
                 to_file_id: state.to_file_id,
             };
             Self::remove_wal_prefix(&self.opt, intent)?;
-            self.opt.sync_log_dir();
+            self.opt.try_sync_log_dir()?;
             #[cfg(feature = "failpoints")]
             crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
             assert!(
@@ -1017,6 +1192,11 @@ impl Recovery {
     }
 
     fn remove_wal_prefix(opt: &ParsedOptions, intent: WalRecycleIntent) -> Result<(), OpCode> {
+        // reached only from the recovery open path (`Recovery::phase1` via
+        // `finish_pending_wal_recycle`, `Recovery::phase2` via `wipe_old_wal`), so it can
+        // never overlap a checkpoint (which requires an already-open instance) and does
+        // not claim a `DeletionGuard` slot. moving era wiping to a runtime path requires
+        // claiming a slot via `DeletionGuard::begin` first
         let prefix = if intent.group_id == Options::SHARED_ID {
             format!("{}{}", Options::GROUP_WAL_PREFIX, Options::SEP)
         } else {
@@ -1191,8 +1371,13 @@ mod tests {
         },
     };
 
-    use super::Recovery;
+    use super::{OpenPlan, Recovery};
     use crate::utils::options::{Options, ParsedOptions};
+
+    /// a no-migration plan: the retained scan and the target runtime use the same width
+    fn plan_for(opt: &ParsedOptions) -> OpenPlan {
+        OpenPlan::derive(None, opt, false)
+    }
 
     fn new_opt() -> (RandomPath, Arc<InjectedFileSystem>, Arc<ParsedOptions>) {
         let root = RandomPath::tmp();
@@ -1212,7 +1397,7 @@ mod tests {
             opt.log_root(),
             ErrorKind::PermissionDenied,
         );
-        let recovery = Recovery::new(opt, false);
+        let recovery = Recovery::new(opt.clone(), plan_for(&opt));
         let err = recovery
             .wal_file_range(0)
             .expect_err("wal_file_range must fail");
@@ -1236,7 +1421,7 @@ mod tests {
     #[test]
     fn recovery_rejects_invalid_update_group() {
         let (_root, _fs, opt) = new_opt();
-        let recovery = Recovery::new(opt, false);
+        let recovery = Recovery::new(opt.clone(), plan_for(&opt));
         let mut update = WalUpdate {
             wal_type: EntryType::Update,
             sub_type: PayloadType::Delete,
@@ -1305,7 +1490,7 @@ mod tests {
         wal.extend_from_slice(checkpoint.to_slice());
         std::fs::write(path, wal).expect("wal seed write must succeed");
 
-        let recovery = Recovery::new(opt, false);
+        let recovery = Recovery::new(opt.clone(), plan_for(&opt));
         assert_eq!(
             recovery
                 .find_latest_checkpoint(0, 0, 0)
@@ -1508,10 +1693,11 @@ mod tests {
         let opt = Arc::new(opt.validate().expect("recovery options must validate"));
         let (tx, _erx) = channel();
         let (_etx, rx) = channel();
-        let mut builder = ManifestBuilder::new_with_channels(opt.clone(), tx, rx);
-        let persisted = builder.load().expect("manifest load must succeed");
-        let manifest = Handle::new(builder.finish());
-        if let Some(persisted) = persisted {
+        let mut builder = ManifestBuilder::new_with_channels(opt.clone(), tx, rx)
+            .expect("manifest builder must open");
+        let load = builder.load().expect("manifest load must succeed");
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
+        if let Some(persisted) = load.writeback {
             manifest
                 .store_persisted_options(&persisted)
                 .expect("options writeback must succeed");
@@ -1522,13 +1708,15 @@ mod tests {
             .get("bucket")
             .expect("bucket meta must exist")
             .id;
-        let mut recovery = Recovery::new(opt.clone(), false);
+        let mut recovery = Recovery::new(opt.clone(), plan_for(&opt));
         let (_wal_boot, ctx) = recovery
             .phase1(manifest, manifest.sequences.clone())
             .expect("phase1 must succeed");
         let observer = Arc::new(ManifestCheckpointObserver::new(manifest, ctx));
         let reader = Arc::new(ManifestDataReader::new(manifest));
-        manifest.set_context(ctx, reader, observer);
+        manifest
+            .set_context(ctx, reader, observer)
+            .expect("recovery flusher must start");
         let store = MutRef::new(Store::new(opt, manifest, ctx));
 
         assert!(
@@ -1567,15 +1755,22 @@ mod tests {
 
         let (tx, _rx) = channel::<SharedState>();
         let (_ack_tx, ack_rx) = channel::<()>();
-        let mut builder = ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx);
+        let mut builder = ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx)
+            .expect("manifest builder must open");
         let _ = builder.load().expect("manifest must load");
-        let manifest = Handle::new(builder.finish());
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
 
         // each component must be load-bearing: files alone, then the frontier,
         // then the recycle state
-        let recovery = Recovery::new(parsed.clone(), false);
+        let recovery = Recovery::new(parsed.clone(), plan_for(&parsed));
+        let present = recovery
+            .present_wal_streams()
+            .expect("namespace snapshot must read");
         assert_eq!(
-            recovery.epoch_high_water(manifest).expect("high water").0,
+            recovery
+                .epoch_high_water(manifest, &present)
+                .expect("high water")
+                .0,
             5,
             "the wal file scan alone must set the high water"
         );
@@ -1584,7 +1779,10 @@ mod tests {
         frontier[0] = Position::new(50, 100);
         manifest.merge_bucket_frontier(0, &frontier);
         assert_eq!(
-            recovery.epoch_high_water(manifest).expect("high water").0,
+            recovery
+                .epoch_high_water(manifest, &present)
+                .expect("high water")
+                .0,
             50,
             "the bucket frontier file id must raise the high water"
         );
@@ -1599,7 +1797,7 @@ mod tests {
                 .is_some()
         );
         let (high, has_history) = recovery
-            .epoch_high_water(manifest)
+            .epoch_high_water(manifest, &present)
             .expect("high water must compute");
         assert!(has_history, "seeded files must count as history");
         assert_eq!(
@@ -1620,9 +1818,10 @@ mod tests {
         let parsed = Arc::new(opt.validate().expect("options must validate"));
         let (tx, _rx) = channel::<SharedState>();
         let (_ack_tx, ack_rx) = channel::<()>();
-        let mut builder = ManifestBuilder::new_with_channels(parsed, tx, ack_rx);
+        let mut builder = ManifestBuilder::new_with_channels(parsed, tx, ack_rx)
+            .expect("manifest builder must open");
         let _ = builder.load().expect("manifest must load");
-        let manifest = Handle::new(builder.finish());
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
 
         let intent = manifest
             .commit_wal_recycle_intent(WalRecycleIntent {
@@ -1654,9 +1853,10 @@ mod tests {
         let parsed = Arc::new(opt.validate().expect("options must validate"));
         let (tx, _rx) = channel::<SharedState>();
         let (_ack_tx, ack_rx) = channel::<()>();
-        let mut builder = ManifestBuilder::new_with_channels(parsed, tx, ack_rx);
+        let mut builder = ManifestBuilder::new_with_channels(parsed, tx, ack_rx)
+            .expect("manifest builder must open");
         let _ = builder.load().expect("manifest must load");
-        let manifest = Handle::new(builder.finish());
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
 
         let first = manifest
             .commit_wal_recycle_intent(WalRecycleIntent {
@@ -1697,19 +1897,269 @@ mod tests {
         let parsed = Arc::new(opt.validate().expect("options must validate"));
         let (tx, _rx) = channel::<SharedState>();
         let (_ack_tx, ack_rx) = channel::<()>();
-        let mut builder = ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx);
+        let mut builder = ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx)
+            .expect("manifest builder must open");
         let _ = builder.load().expect("manifest must load");
-        let manifest = Handle::new(builder.finish());
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
 
         let mut frontier = init_group_pos();
         frontier[0] = Position::new(u64::MAX, 0);
         manifest.merge_bucket_frontier(0, &frontier);
 
-        let recovery = Recovery::new(parsed, false);
+        let recovery = Recovery::new(parsed.clone(), plan_for(&parsed));
         assert!(matches!(
             recovery.load_physical_stream_boot(manifest, Options::SHARED_ID),
             Err(OpCode::Corruption)
         ));
+
+        manifest.reclaim();
+    }
+
+    #[test]
+    fn era_wipe_advances_done_for_target_only_streams() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 2;
+        let parsed = Arc::new(opt.validate().expect("options must validate"));
+        // a leftover era file for a stream only the target width owns
+        std::fs::write(parsed.wal_file(1, 3), b"").expect("seed target-only era file");
+        // and a stray namespace entry above the OpenPlan bound, as an aborted wider attempt leaves
+        std::fs::write(parsed.wal_file(5, 7), b"").expect("seed stream above the bound");
+
+        let (tx, _rx) = channel::<SharedState>();
+        let (_ack_tx, ack_rx) = channel::<()>();
+        let mut builder = ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx)
+            .expect("manifest builder must open");
+        let _ = builder.load().expect("manifest must load");
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
+
+        // persisted width 1, requested width 2: stream 1 is target-only
+        let plan = OpenPlan::derive(Some((1, parsed.sync_on_write)), &parsed, false);
+        assert_eq!(plan.stream_bound(), 2);
+        let recovery = Recovery::new(parsed.clone(), plan);
+        let wal_boot = recovery.load_wal_boot(manifest).expect("source boot list");
+        assert_eq!(
+            wal_boot.len(),
+            2,
+            "the retained scan stays at the source width"
+        );
+
+        let start = 9;
+        recovery
+            .wipe_old_wal(manifest, &wal_boot, start)
+            .expect("era wipe must succeed");
+
+        let state = manifest.load_wal_recycle_state(1);
+        assert!(
+            state.is_done(),
+            "target-only stream must get a done boundary"
+        );
+        assert_eq!(state.oldest_id(), start);
+        assert!(
+            !parsed.wal_file(1, 3).exists(),
+            "the leftover era file must be recycled"
+        );
+        assert!(
+            !parsed.wal_file(5, 7).exists(),
+            "namespace entries above the OpenPlan bound must be swept too"
+        );
+        assert!(manifest.load_wal_recycle_state(5).is_done());
+
+        manifest.reclaim();
+    }
+
+    #[test]
+    fn pending_recycle_intent_for_a_target_only_stream_is_completed() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 1;
+        let parsed = Arc::new(opt.validate().expect("options must validate"));
+        std::fs::write(parsed.wal_file(1, 0), b"").expect("seed target-only era file");
+
+        // the open asks for a wider target than the options the Recovery shares, so stream 1 is
+        // reachable only through the OpenPlan stream bound
+        let mut requested = Options::new(&*root);
+        requested.concurrent_write = 2;
+        let requested = requested
+            .validate()
+            .expect("requested options must validate");
+
+        let (tx, _rx) = channel::<SharedState>();
+        let (_ack_tx, ack_rx) = channel::<()>();
+        let mut builder = ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx)
+            .expect("manifest builder must open");
+        let _ = builder.load().expect("manifest must load");
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
+
+        // an interrupted attempt left a durable intent on the target-only stream
+        assert!(
+            manifest
+                .commit_wal_recycle_intent(WalRecycleIntent {
+                    group_id: 1,
+                    from_file_id: 0,
+                    to_file_id: 5,
+                })
+                .is_some(),
+            "the interrupted intent must be durable"
+        );
+
+        let plan = OpenPlan::derive(Some((1, parsed.sync_on_write)), &requested, false);
+        assert_eq!(plan.stream_bound(), 2);
+        assert!(plan.stream_bound() > parsed.concurrent_write);
+        let recovery = Recovery::new(parsed.clone(), plan);
+        let present = recovery
+            .present_wal_streams()
+            .expect("namespace snapshot must read");
+        recovery
+            .finish_pending_wal_recycle(manifest, &present)
+            .expect("recycle completion must succeed");
+
+        assert!(
+            manifest.load_wal_recycle_state(1).is_done(),
+            "the target-only stream's pending intent must be completed before the scan"
+        );
+
+        manifest.reclaim();
+    }
+
+    #[test]
+    fn target_plan_covers_target_width_after_the_wipe() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 2;
+        opt.sync_on_write = false;
+        let parsed = Arc::new(opt.validate().expect("options must validate"));
+        std::fs::write(parsed.wal_file(1, 3), b"").expect("seed target-only era file");
+
+        let (tx, _rx) = channel::<SharedState>();
+        let (_ack_tx, ack_rx) = channel::<()>();
+        let mut builder = ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx)
+            .expect("manifest builder must open");
+        let _ = builder.load().expect("manifest must load");
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
+
+        // persisted width 1, requested width 2: the target plan must cover both streams
+        let plan = OpenPlan::derive(Some((1, parsed.sync_on_write)), &parsed, false);
+        let recovery = Recovery::new(parsed.clone(), plan);
+        let wal_boot = recovery.load_wal_boot(manifest).expect("source boot list");
+        let era_start = 9;
+        recovery
+            .wipe_old_wal(manifest, &wal_boot, era_start)
+            .expect("era wipe must succeed");
+
+        let target = recovery
+            .target_plan(manifest, era_start)
+            .expect("target plan must build after the wipe");
+        assert_eq!(
+            target.boots.len(),
+            3,
+            "two logical streams plus the shared slot"
+        );
+        for (slot, boot) in target.boots.iter().enumerate() {
+            let expected = if slot == 2 {
+                Options::SHARED_ID
+            } else {
+                slot as u8
+            };
+            assert_eq!(boot.physical_wal_id, expected, "slot {slot} stream id");
+            assert!(
+                boot.start_id >= era_start,
+                "slot {slot} start_id must point into the new era"
+            );
+            assert!(
+                boot.oldest_id >= era_start,
+                "slot {slot} oldest_id must point into the new era"
+            );
+        }
+        for boot in target.boots.iter().take(2) {
+            assert_eq!(
+                boot.checkpoint_floor,
+                Position::new(era_start, 0),
+                "a relaxed target seeds a real own-slot floor instead of Position::MAX"
+            );
+        }
+
+        manifest.reclaim();
+    }
+
+    #[test]
+    fn target_plan_rejects_a_state_the_wipe_has_not_covered() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 2;
+        opt.sync_on_write = false;
+        let parsed = Arc::new(opt.validate().expect("options must validate"));
+        std::fs::write(parsed.wal_file(1, 3), b"").expect("seed target-only era file");
+
+        let (tx, _rx) = channel::<SharedState>();
+        let (_ack_tx, ack_rx) = channel::<()>();
+        let mut builder = ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx)
+            .expect("manifest builder must open");
+        let _ = builder.load().expect("manifest must load");
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
+
+        // make the source-width slots pass on their own, so only the target-only stream can be
+        // the reason the plan is rejected
+        let era_start = 9;
+        for group_id in [0u8, Options::SHARED_ID] {
+            let intent = WalRecycleIntent {
+                group_id,
+                from_file_id: 0,
+                to_file_id: era_start,
+            };
+            let intent = manifest
+                .commit_wal_recycle_intent(intent)
+                .expect("the boundary intent must be durable");
+            assert!(manifest.commit_wal_recycle_done(intent));
+        }
+
+        let plan = OpenPlan::derive(Some((1, parsed.sync_on_write)), &parsed, false);
+        let recovery = Recovery::new(parsed.clone(), plan);
+
+        // the target-only stream still reports a pre-era boundary, which the plan must reject
+        assert!(matches!(
+            recovery.target_plan(manifest, era_start),
+            Err(OpCode::Corruption)
+        ));
+
+        manifest.reclaim();
+    }
+
+    #[test]
+    fn target_plan_follows_the_target_route_on_a_route_switch() {
+        let root = RandomPath::tmp();
+        let mut opt = Options::new(&*root);
+        opt.concurrent_write = 2;
+        opt.sync_on_write = true;
+        let parsed = Arc::new(opt.validate().expect("options must validate"));
+
+        let (tx, _rx) = channel::<SharedState>();
+        let (_ack_tx, ack_rx) = channel::<()>();
+        let mut builder = ManifestBuilder::new_with_channels(parsed.clone(), tx, ack_rx)
+            .expect("manifest builder must open");
+        let _ = builder.load().expect("manifest must load");
+        let manifest = Handle::new(builder.finish().expect("manifest finish must succeed"));
+
+        // persisted relaxed route, requested durable route: the floors must follow the target
+        let plan = OpenPlan::derive(Some((1, false)), &parsed, false);
+        assert!(plan.route_switch);
+        let recovery = Recovery::new(parsed.clone(), plan);
+        let wal_boot = recovery.load_wal_boot(manifest).expect("source boot list");
+        let era_start = 4;
+        recovery
+            .wipe_old_wal(manifest, &wal_boot, era_start)
+            .expect("era wipe must succeed");
+
+        let target = recovery
+            .target_plan(manifest, era_start)
+            .expect("target plan must build after the wipe");
+        for boot in target.boots.iter() {
+            assert_eq!(
+                boot.checkpoint_floor,
+                Position::MAX,
+                "the shared logger consumes a MAX sentinel, not a per-stream own slot"
+            );
+        }
 
         manifest.reclaim();
     }
@@ -1905,7 +2355,7 @@ mod tests {
 
         let reopened = Mace::new(parsed).expect("reopen must succeed");
         let db = reopened.open_bucket("bucket").expect("bucket must exist");
-        // user-visible read reports Invalid: phase a has no fold resolver, and the
+        // user-visible read reports Invalid: there is no fold resolver for this read, and the
         // head is a merge operand, not a plain value
         let view = db.view().expect("view must open");
         assert!(matches!(view.get("mk"), Err(OpCode::Invalid)));
