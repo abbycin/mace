@@ -1084,7 +1084,7 @@ impl FileBuilder {
     }
 }
 
-pub(crate) struct MetaReader {
+pub struct MetaReader {
     file: File,
     footer: ParsedFooter,
     end: u64,
@@ -1118,7 +1118,7 @@ impl MetaReader {
 
     /// fallible variant of [`Self::new`], for readers that must report damage
     /// instead of aborting (the offline checker)
-    pub(crate) fn try_new<P: AsRef<Path>>(fs: &dyn FileSystem, path: P) -> Result<Self, OpCode> {
+    pub fn try_new<P: AsRef<Path>>(fs: &dyn FileSystem, path: P) -> Result<Self, OpCode> {
         let path = path.as_ref();
         let file = File::options()
             .read(true)
@@ -1163,7 +1163,7 @@ impl MetaReader {
     }
 
     /// fallible variant of [`Self::get_reloc`]
-    pub(crate) fn try_get_reloc(&mut self) -> Result<Box<[AddrPair]>, OpCode> {
+    pub fn try_get_reloc(&mut self) -> Result<Box<[AddrPair]>, OpCode> {
         let len = self.footer.nr_reloc as usize * AddrPair::LEN;
         self.try_read_meta(
             self.end - (len + size_of::<FileFooter>()) as u64,
@@ -1177,7 +1177,7 @@ impl MetaReader {
     }
 
     /// fallible variant of [`Self::get_interval`]
-    pub(crate) fn try_get_interval(&mut self) -> Result<Box<[Interval]>, OpCode> {
+    pub fn try_get_interval(&mut self) -> Result<Box<[Interval]>, OpCode> {
         let len = self.footer.nr_intervals as usize * Interval::LEN;
         self.try_read_meta(
             self.end

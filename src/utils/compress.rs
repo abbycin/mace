@@ -382,7 +382,7 @@ impl RecordDecompressor {
     }
 }
 
-pub(crate) struct DecompressorPool {
+pub struct DecompressorPool {
     /// bounded overflow buffer (see CompressorPool.pool)
     pool: Mutex<Vec<RecordDecompressor>>,
     /// per-thread decoder cache
@@ -390,7 +390,7 @@ pub(crate) struct DecompressorPool {
 }
 
 impl DecompressorPool {
-    pub(crate) fn new() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
             pool: Mutex::new(Vec::new()),
             local: LocalSlot::new(),

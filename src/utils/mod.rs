@@ -109,10 +109,10 @@ impl From<btree_store::Error> for OpCode {
     }
 }
 
-pub(crate) const NULL_PID: u64 = 0;
+pub const NULL_PID: u64 = 0;
 /// it's same to DEFAULT_BUCKET_ID
 pub(crate) const ROOT_PID: u64 = 1;
-pub(crate) const NULL_ADDR: u64 = 0;
+pub const NULL_ADDR: u64 = 0;
 /// starts from 1 make sure remapped addr will always greater than NULL_ADDR
 pub(crate) const INIT_ADDR: u64 = 1;
 pub const ADDR_LEN: usize = size_of::<u64>();

@@ -2,6 +2,7 @@
 name = "logger"
 version = "0.1.1"
 edition = "2024"
+publish = false
 authors = ["abbytsing@gmail.com"]
 
 [target.'cfg(target_os = "linux")'.dependencies]

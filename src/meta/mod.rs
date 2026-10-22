@@ -10,35 +10,38 @@ pub(crate) use guard::DeletionGuard;
 use crate::map::buffer::BucketContext;
 use crate::utils::interval::IntervalMap;
 use crate::utils::options::ParsedOptions;
-pub(crate) use entry::IMetaCodec;
+pub use entry::IMetaCodec;
 pub use entry::{
     BucketDurableFrontier, BucketMeta, DelInterval, Delete, FileKind, IntervalPair, MemStat,
     MetaKind, MetaOp, PageTable, PersistStat, Sequences, StatInner, WalRecycleState,
 };
 pub(crate) use manifest::Manifest;
 use parking_lot::RwLock;
-pub(crate) use stat::{FileReader, JunkPermit, new_reader, try_new_reader};
+pub use stat::FileReader;
+#[cfg(feature = "maintenance")]
+pub use stat::try_new_reader;
+pub(crate) use stat::{JunkPermit, new_reader};
 use std::path::PathBuf;
 pub(crate) use txn::Txn;
 
-pub(crate) const BUCKET_MISC: &str = "misc";
+pub const BUCKET_MISC: &str = "misc";
 pub(crate) const SEQUENCES_KEY: &str = "sequences";
-pub(crate) const BUCKET_DATA_STAT: &str = "data_stat";
-pub(crate) const BUCKET_BLOB_STAT: &str = "blob_stat";
-pub(crate) const BUCKET_OBSOLETE_DATA: &str = "obsolete_data";
-pub(crate) const BUCKET_OBSOLETE_BLOB: &str = "obsolete_blob";
-pub(crate) const BUCKET_METAS: &str = "bucket_metas";
-pub(crate) const BUCKET_PENDING_DEL: &str = "pending_del";
-pub(crate) const BUCKET_FRONTIER: &str = "bucket_frontier";
-pub(crate) const BUCKET_VERSION: &str = "version";
+pub const BUCKET_DATA_STAT: &str = "data_stat";
+pub const BUCKET_BLOB_STAT: &str = "blob_stat";
+pub const BUCKET_OBSOLETE_DATA: &str = "obsolete_data";
+pub const BUCKET_OBSOLETE_BLOB: &str = "obsolete_blob";
+pub const BUCKET_METAS: &str = "bucket_metas";
+pub const BUCKET_PENDING_DEL: &str = "pending_del";
+pub const BUCKET_FRONTIER: &str = "bucket_frontier";
+pub const BUCKET_VERSION: &str = "version";
 pub(crate) const MAX_BUCKETS: u64 = 1024;
-pub(crate) const VERSION_KEY: &str = "current_version";
-pub(crate) const OPTIONS_KEY: &str = "options";
-pub(crate) const ORPHAN_DATA_MARKER_PREFIX: &str = "odf_";
-pub(crate) const ORPHAN_BLOB_MARKER_PREFIX: &str = "obf_";
-pub(crate) const WAL_RECYCLE_PREFIX: &str = "wrc_";
+pub const VERSION_KEY: &str = "current_version";
+pub const OPTIONS_KEY: &str = "options";
+pub const ORPHAN_DATA_MARKER_PREFIX: &str = "odf_";
+pub const ORPHAN_BLOB_MARKER_PREFIX: &str = "obf_";
+pub const WAL_RECYCLE_PREFIX: &str = "wrc_";
 /// storage format version
-pub(crate) const CURRENT_VERSION: u64 = 1;
+pub const CURRENT_VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalRecycleIntent {
@@ -48,11 +51,11 @@ pub(crate) struct WalRecycleIntent {
     pub(crate) to_file_id: u64,
 }
 
-pub(crate) fn page_table_name(bucket_id: u64) -> String {
+pub fn page_table_name(bucket_id: u64) -> String {
     format!("page_table_{}", bucket_id)
 }
 
-pub(crate) fn data_interval_name(bucket_id: u64) -> String {
+pub fn data_interval_name(bucket_id: u64) -> String {
     format!("data_interval_{}", bucket_id)
 }
 
@@ -60,15 +63,15 @@ pub(crate) fn blob_interval_name(bucket_id: u64) -> String {
     format!("blob_interval_{}", bucket_id)
 }
 
-pub(crate) fn orphan_data_marker_key(file_id: u64) -> Vec<u8> {
+pub fn orphan_data_marker_key(file_id: u64) -> Vec<u8> {
     format!("{}{}", ORPHAN_DATA_MARKER_PREFIX, file_id).into_bytes()
 }
 
-pub(crate) fn orphan_blob_marker_key(file_id: u64) -> Vec<u8> {
+pub fn orphan_blob_marker_key(file_id: u64) -> Vec<u8> {
     format!("{}{}", ORPHAN_BLOB_MARKER_PREFIX, file_id).into_bytes()
 }
 
-pub(crate) fn wal_recycle_key(group_id: u8) -> Vec<u8> {
+pub fn wal_recycle_key(group_id: u8) -> Vec<u8> {
     format!("{}{}", WAL_RECYCLE_PREFIX, group_id).into_bytes()
 }
 
@@ -100,7 +103,7 @@ pub(crate) fn stat_file_path(opt: &ParsedOptions, kind: FileKind, file_id: u64) 
     }
 }
 
-pub(crate) fn interval_bucket_name(kind: FileKind, bucket_id: u64) -> String {
+pub fn interval_bucket_name(kind: FileKind, bucket_id: u64) -> String {
     match kind {
         FileKind::Data => data_interval_name(bucket_id),
         FileKind::Blob => blob_interval_name(bucket_id),

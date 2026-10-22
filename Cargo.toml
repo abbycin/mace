@@ -1,6 +1,6 @@
 [package]
 name = "mace-kv"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.95"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
@@ -12,12 +12,16 @@ license = "MIT"
 categories = ["database-implementations", "database"]
 keywords = ["database", "key-value", "rocksdb", "leveldb", "sled"]
 
+[workspace]
+members = ["cli"]
+exclude = ["fuzz", "deps/logger"]
+resolver = "3"
+
 [lib]
 name = "mace"
 
 [dependencies]
 backtrace = "0.3.76"
-clap = { version = "=4.6.7", features = ["derive"] }
 crc32c = "0.6.8"
 dashmap = "6.2.1"
 rand = "0.10.3"
@@ -40,11 +44,18 @@ logger = { path = "deps/logger" }
 metrics = []
 extra_check = ["metrics"]
 failpoints = ["extra_check"]
+# internal on-disk inspection surface for the exact-pinned maintenance CLI;
+# not part of the stable public API
+maintenance = []
 
 [profile.release]
 opt-level = 3
 lto = true
 panic = "abort"
+
+[profile.dev]
+debug = 1
+incremental = false
 
 [[example]]
 name = "observer"

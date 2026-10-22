@@ -27,11 +27,11 @@ unsafe impl Sync for BoxRef {}
 pub struct BoxView(*mut BoxHeader);
 
 #[derive(Clone, Copy)]
-pub(crate) struct DeltaView(pub(super) *mut DeltaHeader);
+pub struct DeltaView(pub(super) *mut DeltaHeader);
 
 /// both base node and sibling share same layout
 #[derive(Clone, Copy)]
-pub(crate) struct BaseView(pub(super) *mut BaseHeader);
+pub struct BaseView(pub(super) *mut BaseHeader);
 
 /// used for large key-val
 #[derive(Clone, Copy)]
@@ -69,14 +69,14 @@ impl BoxView {
         unsafe { self.0.add(1).cast::<T>() }
     }
 
-    pub(crate) fn as_delta(&self) -> DeltaView {
+    pub fn as_delta(&self) -> DeltaView {
         match self.header().kind {
             TagKind::Delta => DeltaView(self.cast_to::<_>()),
             _ => unreachable!("invalid kind {:?}", self.header()),
         }
     }
 
-    pub(crate) fn as_base(&self) -> BaseView {
+    pub fn as_base(&self) -> BaseView {
         match self.header().kind {
             TagKind::Base => BaseView(self.cast_to::<_>()),
             _ => unreachable!("invalid kind {:?}", self.header()),
@@ -93,7 +93,7 @@ impl BoxView {
 
 impl BoxRef {
     pub(crate) const HDR_LEN: usize = size_of::<BoxHeader>();
-    pub(crate) const DUMP_HDR_LEN: usize = size_of::<BoxHeader>() - size_of::<AtomicU32>();
+    pub const DUMP_HDR_LEN: usize = size_of::<BoxHeader>() - size_of::<AtomicU32>();
     pub(crate) const MAX_PERSISTED_HEAD_LEN: usize = Self::DUMP_HDR_LEN + size_of::<BaseHeader>();
 
     pub(crate) const fn real_size(size: u32) -> u32 {
@@ -411,7 +411,7 @@ impl BoxRef {
     }
 
     /// NOTE: for T is not u8, the caller **MUST** make sure T is aligned to pointer size
-    pub(crate) fn data_slice<'a, T>(&self) -> &'a [T] {
+    pub fn data_slice<T>(&self) -> &[T] {
         let h = self.header();
         let len = h.total_size as usize - Self::HDR_LEN;
         unsafe { std::slice::from_raw_parts(self.0.add(1).cast::<_>(), len / size_of::<T>()) }
@@ -425,7 +425,7 @@ impl BoxRef {
         unsafe { std::slice::from_raw_parts_mut(self.0.add(1).cast::<_>(), len / size_of::<T>()) }
     }
 
-    pub(crate) fn view(&self) -> BoxView {
+    pub fn view(&self) -> BoxView {
         BoxView(self.0)
     }
 }

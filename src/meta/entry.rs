@@ -50,7 +50,7 @@ pub enum FileKind {
 }
 
 impl FileKind {
-    pub(crate) const ALL: [Self; 2] = [Self::Data, Self::Blob];
+    pub const ALL: [Self; 2] = [Self::Data, Self::Blob];
 
     pub(crate) const fn slot(self) -> usize {
         match self {
@@ -122,12 +122,12 @@ impl PersistStat {
 
     /// offset of the `StatInner` payload inside a persisted stat record, for tests that
     /// build a damaged record
-    #[cfg(test)]
-    pub(crate) const fn stat_inner_offset() -> usize {
+    #[cfg(feature = "maintenance")]
+    pub const fn stat_inner_offset() -> usize {
         size_of::<StatHdr>()
     }
 
-    pub(crate) fn decode_inner_only(src: &[u8]) -> StatInner {
+    pub fn decode_inner_only(src: &[u8]) -> StatInner {
         crate::must_ok!(
             Self::try_decode_inner_only(src),
             "can't decode the stat record"
@@ -137,7 +137,7 @@ impl PersistStat {
     /// fallible variant of [`Self::decode_inner_only`], for readers that must report
     /// damage instead of aborting (the offline checker): the record must at least hold
     /// its fixed header and body before the body is read
-    pub(crate) fn try_decode_inner_only(src: &[u8]) -> Result<StatInner, OpCode> {
+    pub fn try_decode_inner_only(src: &[u8]) -> Result<StatInner, OpCode> {
         if src.len() < size_of::<StatHdr>() + size_of::<StatInner>() {
             return Err(OpCode::Corruption);
         }
@@ -158,7 +158,7 @@ impl PersistStat {
     /// would read past the record and index the bitmap out of bounds on a corrupt
     /// header. `total_elems` itself sizes the bitmap and is a legal record field, so it
     /// is not bounded here: a file may hold millions of elements
-    pub(crate) fn try_decode_mask_only(src: &[u8], total_elems: u32) -> Result<BitMap, OpCode> {
+    pub fn try_decode_mask_only(src: &[u8], total_elems: u32) -> Result<BitMap, OpCode> {
         let hdr = StatHdr::from_slice(src);
         let body = size_of::<StatHdr>() + size_of::<StatInner>();
         let mask_len = (hdr.elems as usize)
@@ -729,7 +729,7 @@ pub enum MetaOp {
     DelIfExists(Vec<u8>, StatMissKind),
 }
 
-pub(crate) trait IMetaCodec {
+pub trait IMetaCodec {
     fn packed_size(&self) -> usize;
 
     fn encode(&self, to: &mut [u8]);

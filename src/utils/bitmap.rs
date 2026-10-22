@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Formatter};
 
 #[derive(Clone)]
-pub(crate) struct BitMap {
+pub struct BitMap {
     cap: u32,
     data: Vec<u64>,
 }
@@ -12,7 +12,7 @@ const MASK: u32 = BITS - 1;
 
 impl BitMap {
     /// cap is the target count
-    pub(crate) fn new(cap: u32) -> Self {
+    pub fn new(cap: u32) -> Self {
         let cap = match cap % BITS {
             0 => cap / BITS,
             _ => cap / BITS + 1,
@@ -24,7 +24,7 @@ impl BitMap {
         }
     }
 
-    pub(crate) fn set(&mut self, bit: u32) {
+    pub fn set(&mut self, bit: u32) {
         self.data[(bit >> POWER) as usize] |= 1 << (bit & MASK);
     }
 
@@ -33,11 +33,11 @@ impl BitMap {
         self.data[(bit >> POWER) as usize] &= !(1 << (bit & MASK));
     }
 
-    pub(crate) fn test(&self, bit: u32) -> bool {
+    pub fn test(&self, bit: u32) -> bool {
         self.data[(bit >> POWER) as usize] & (1 << (bit & MASK)) != 0
     }
 
-    pub(crate) fn set_bits(&self, limit: u32) -> Vec<u32> {
+    pub fn set_bits(&self, limit: u32) -> Vec<u32> {
         let mut out = Vec::new();
         for (word_idx, &word) in self.data.iter().enumerate() {
             let mut remaining = word;

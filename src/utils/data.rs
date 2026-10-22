@@ -34,15 +34,15 @@ impl LenSeq {
 #[repr(C, packed(1))]
 pub struct Reloc {
     /// frame offset in page file
-    pub(crate) off: usize,
+    pub off: usize,
     /// decoded record length
-    pub(crate) raw_len: u32,
+    pub raw_len: u32,
     /// stored compressed length, 0 means raw
-    pub(crate) compressed_len: u32,
+    pub compressed_len: u32,
     /// index in relocation table
-    pub(crate) seq: u32,
+    pub seq: u32,
     /// checksum of page
-    pub(crate) crc: u32,
+    pub crc: u32,
 }
 
 impl Reloc {
@@ -74,9 +74,9 @@ impl Reloc {
 #[repr(C, packed(1))]
 pub struct AddrPair {
     /// logical address
-    pub(crate) key: u64,
+    pub key: u64,
     /// relocated address
-    pub(crate) val: Reloc,
+    pub val: Reloc,
 }
 
 impl AddrPair {

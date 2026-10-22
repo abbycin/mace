@@ -71,6 +71,7 @@ pub trait IVal: ICodec + Clone {
     fn is_tombstone(&self) -> bool;
 }
 
+#[allow(clippy::len_without_is_empty)]
 pub trait IAsSlice: Sized {
     fn as_slice(&self) -> &[u8] {
         let p = self as *const Self;

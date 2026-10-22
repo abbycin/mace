@@ -3,7 +3,8 @@
 mod common;
 
 use btree_store::BTree;
-use mace::{CheckCategory, Mace, OpCode, Options, RandomPath, check_database};
+use mace::{Mace, OpCode, Options, RandomPath};
+use mace_kv_cli::{CheckCategory, check_database};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

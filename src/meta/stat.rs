@@ -923,7 +923,7 @@ impl Deref for StatCtx {
     }
 }
 
-pub(crate) struct FileReader {
+pub struct FileReader {
     file: File,
     version: FileVersion,
     relocs: Box<[AddrPair]>,
@@ -956,7 +956,8 @@ pub(crate) fn new_reader(
     })
 }
 
-pub(crate) fn try_new_reader(
+#[cfg(feature = "maintenance")]
+pub fn try_new_reader(
     path: PathBuf,
     decoders: Arc<DecompressorPool>,
     fs: Arc<dyn FileSystem>,
@@ -1007,7 +1008,7 @@ impl FileReader {
         must_ok!(self.try_read_at(pos), "must read payload record")
     }
 
-    pub(crate) fn try_read_at(&self, pos: u64) -> Result<BoxRef, OpCode> {
+    pub fn try_read_at(&self, pos: u64) -> Result<BoxRef, OpCode> {
         let m = self.find_reloc(pos).ok_or(OpCode::NotFound)?;
         let raw_len = m.raw_len() as usize;
         if raw_len < BoxRef::DUMP_HDR_LEN {

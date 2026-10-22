@@ -1,3 +1,10 @@
+## [0.2.1] 2026-10-22
+### Changes
+- Split the maintenance CLI into the `mace-kv-cli` package (binary `mace-kv`); the library remains `mace-kv` and is imported as `mace`. Install the tool with `cargo install mace-kv-cli`.
+- Moved the offline checker out of the library into the `mace-kv-cli` library target. `CheckCategory`, `CheckReport`, `Diagnostic` and `check_database` are no longer exported by `mace`; they live in `mace_kv_cli`. The engine now exposes a non-default, internal `maintenance` feature (not part of the stable API) for the on-disk format primitives the checker reads.
+- The CLI package pins the library version exactly, so a CLI-only fix no longer requires a library version bump; `clap` is no longer a direct dependency of the library.
+- Publish `mace-kv` 0.2.1 first: it carries the `maintenance` feature, and removing the checker exports from `mace` is a breaking API change. `mace-kv-cli` pins that exact version, so `cargo package`/`cargo publish --dry-run` for the CLI only resolves after the library release is on crates.io.
+
 ## [0.2.0] 2026-10-20
 ### New Features
 - Added `Mace::create_checkpoint`, a durable standalone copy of a database into a new directory, reported as `CheckpointInfo` with the frontier the copy was cut at

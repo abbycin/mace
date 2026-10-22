@@ -1,6 +1,6 @@
 //! Read-only consistency checking of a mace database directory.
 //!
-//! The checker never constructs a [`crate::Mace`] instance: opening one runs
+//! The checker never constructs a [`mace::Mace`] instance: opening one runs
 //! writeback recovery (orphan cleanup, persisted-option writeback, epoch wipe) and
 //! starts the background services, none of which a checker may do. It reads the
 //! metadata store and the payload/WAL files directly and reports what it finds.
@@ -70,7 +70,7 @@ impl PayloadChecks {
             FileKind::Data => opt.data_file(file_id),
             FileKind::Blob => opt.blob_file(file_id),
         };
-        let reader = try_new_reader(path, decoders, opt.fs.clone());
+        let reader = try_new_reader(path, decoders, opt.fs_arc());
         self.readers.insert((kind, file_id), reader.clone());
         reader
     }
@@ -118,32 +118,17 @@ impl PayloadChecks {
 
 use std::sync::Arc;
 
-use crate::cc::wal::{
-    EntryType, PayloadType, WalAbort, WalCheckpoint, WalUpdate, ptr_to, wal_record_sz,
-};
-use crate::io::{File, GatherIO};
-use crate::map::data::MetaReader;
-use crate::meta::{
-    BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BUCKET_METAS, BUCKET_MISC,
-    BUCKET_OBSOLETE_BLOB, BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, BUCKET_VERSION, BucketMeta,
-    CURRENT_VERSION, FileKind, FileReader, IMetaCodec, IntervalPair, OPTIONS_KEY,
-    ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, PersistStat, VERSION_KEY,
-    WAL_RECYCLE_PREFIX, WalRecycleState, interval_bucket_name, page_table_name, try_new_reader,
-};
-use crate::types::header::DeltaHeader;
-use crate::types::refbox::BoxRef;
-use crate::types::{
-    header::{BaseHeader, NodeType, TagFlag, TagKind},
-    traits::IHeader,
-};
-use crate::utils::data::{AddrPair, Interval};
-use crate::utils::{
-    NULL_ADDR, NULL_PID, OpCode,
-    compress::DecompressorPool,
-    options::{Options, PersistedOptions},
-    varint::Varint32,
-};
 use btree_store::{BTree, Error as BTreeError, OpenError};
+use mace::maintenance::{
+    AddrPair, BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BUCKET_METAS, BUCKET_MISC,
+    BUCKET_OBSOLETE_BLOB, BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, BUCKET_VERSION, BaseHeader,
+    BoxRef, BucketMeta, CURRENT_VERSION, DecompressorPool, DeltaHeader, EntryType, File, FileKind,
+    FileReader, GatherIO, IHeader, IMetaCodec, Interval, IntervalPair, MetaReader, NULL_ADDR,
+    NULL_PID, NodeType, OPTIONS_KEY, ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, OpCode,
+    Options, PayloadType, PersistStat, PersistedOptions, TagFlag, TagKind, VERSION_KEY, Varint32,
+    WAL_RECYCLE_PREFIX, WalAbort, WalCheckpoint, WalRecycleState, WalUpdate, interval_bucket_name,
+    page_table_name, ptr_to, try_new_reader, wal_record_sz,
+};
 
 /// stable diagnostic categories reported by the checker
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -336,7 +321,7 @@ pub fn check_database(opt: &Options) -> CheckReport {
 /// resolves to a relocation in the same file
 fn check_payload_files(opt: &Options, checks: &mut PayloadChecks, report: &mut CheckReport) {
     let data_root = opt.data_root();
-    let entries = match opt.fs.read_dir(&data_root) {
+    let entries = match opt.fs().read_dir(&data_root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(err) => {
@@ -562,7 +547,7 @@ fn check_lifecycle(
 
     // the durable recycle boundary of a stream with segments must equal its oldest one
     let mut oldest: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
-    if let Ok(entries) = opt.fs.read_dir(&opt.log_root()) {
+    if let Ok(entries) = opt.fs().read_dir(&opt.log_root()) {
         for path in entries {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
@@ -1228,7 +1213,7 @@ fn read_stats(opt: &Options, btree: &BTree, kind: FileKind) -> (StatView, Vec<Di
                 });
                 continue;
             };
-            if MetaReader::try_new(opt.fs.as_ref(), &path).is_err() {
+            if MetaReader::try_new(opt.fs(), &path).is_err() {
                 records.push(StatRecord {
                     file_id: inner.file_id,
                     bucket_id: inner.bucket_id,
@@ -1372,7 +1357,7 @@ fn reloc_keys(
         FileKind::Data => opt.data_file(file_id),
         FileKind::Blob => opt.blob_file(file_id),
     };
-    let outcome = MetaReader::try_new(opt.fs.as_ref(), &path).and_then(|mut reader| {
+    let outcome = MetaReader::try_new(opt.fs(), &path).and_then(|mut reader| {
         reader.try_get_reloc().map(|relocs| {
             let mut keys = relocs.iter().map(|reloc| reloc.key).collect::<Vec<u64>>();
             // the lookups below binary search this vector, so it is sorted here rather than
@@ -1524,7 +1509,7 @@ fn check_stats_against_files(
 /// is damage an operator must see.
 fn check_wal(opt: &Options, tolerate_tail: bool, report: &mut CheckReport) {
     let log_root = opt.log_root();
-    let entries = match opt.fs.read_dir(&log_root) {
+    let entries = match opt.fs().read_dir(&log_root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(err) => {
@@ -1708,7 +1693,7 @@ fn wal_record_len(data: &[u8], offset: usize) -> Result<usize, &'static str> {
 }
 
 fn read_segment(opt: &Options, path: &std::path::Path) -> Result<Vec<u8>, std::io::Error> {
-    let file = File::options().read(true).open(opt.fs.as_ref(), path)?;
+    let file = File::options().read(true).open(opt.fs(), path)?;
     let len = file.size()? as usize;
     let mut data = vec![0u8; len];
     let mut read = 0usize;
@@ -1750,7 +1735,7 @@ fn check_payload_file(
     checks: &mut PayloadChecks,
     report: &mut CheckReport,
 ) {
-    let mut reader = match MetaReader::try_new(opt.fs.as_ref(), path) {
+    let mut reader = match MetaReader::try_new(opt.fs(), path) {
         Ok(reader) => reader,
         Err(err) => {
             // shared with the metadata phases, so one unreadable file is reported once
@@ -1813,7 +1798,7 @@ fn check_payload_file(
 }
 
 fn payload_file_len(opt: &Options, path: &std::path::Path) -> Result<u64, std::io::Error> {
-    let file = File::options().read(true).open(opt.fs.as_ref(), path)?;
+    let file = File::options().read(true).open(opt.fs(), path)?;
     file.size()
 }
 
@@ -2023,7 +2008,7 @@ fn classify_open_error(err: &OpenError) -> Option<OpenErrorClass> {
 /// `open_read_only`, so absence and an unusable file surface as typed `OpenError`s
 /// that this function classifies; a page read on a damaged store still aborts inside
 /// btree-store after logging `BTREE_FATAL_*`, which is pinned by
-/// `tests/checker.rs::metadata_page_damage_aborts_by_design`.
+/// `cli/tests/checker.rs::metadata_page_damage_aborts_by_design`.
 fn open_metadata_read_only(opt: &Options, report: &mut CheckReport) -> Option<BTree> {
     let path = opt.manifest();
     match BTree::open_read_only(&path) {
@@ -2183,10 +2168,12 @@ fn check_bucket_catalog(btree: &BTree, report: &mut CheckReport) {
 #[cfg(test)]
 mod tests {
     use super::{CheckCategory, check_database, classify_open_error};
-    use crate::RandomPath;
-    use crate::io::testfs::{InjectOp, InjectedFileSystem};
-    use crate::meta::IMetaCodec;
-    use crate::utils::options::Options;
+    use mace::Options;
+    use mace::RandomPath;
+    use mace::maintenance::IMetaCodec;
+    #[cfg(feature = "extra_check")]
+    use mace::testing::testfs::{InjectOp, InjectedFileSystem};
+    #[cfg(feature = "extra_check")]
     use std::sync::Arc;
 
     /// every category keeps its published name: the CLI prints these strings
@@ -2241,8 +2228,8 @@ mod tests {
         seed(&root);
         let opt = Options::new(&*root);
         let mut checks = super::PayloadChecks::default();
-        let first = super::reloc_keys(&opt, crate::meta::FileKind::Data, 4096, &mut checks);
-        let second = super::reloc_keys(&opt, crate::meta::FileKind::Data, 4096, &mut checks);
+        let first = super::reloc_keys(&opt, mace::maintenance::FileKind::Data, 4096, &mut checks);
+        let second = super::reloc_keys(&opt, mace::maintenance::FileKind::Data, 4096, &mut checks);
 
         let (super::FileRelocs::Unreadable(first), super::FileRelocs::Unreadable(second)) =
             (first, second)
@@ -2280,8 +2267,18 @@ mod tests {
         let file_id = *ids.first().expect("the seed checkpoint writes a data file");
 
         let mut checks = super::PayloadChecks::default();
-        let first = super::reloc_keys(&opt, crate::meta::FileKind::Data, file_id, &mut checks);
-        let second = super::reloc_keys(&opt, crate::meta::FileKind::Data, file_id, &mut checks);
+        let first = super::reloc_keys(
+            &opt,
+            mace::maintenance::FileKind::Data,
+            file_id,
+            &mut checks,
+        );
+        let second = super::reloc_keys(
+            &opt,
+            mace::maintenance::FileKind::Data,
+            file_id,
+            &mut checks,
+        );
 
         let (super::FileRelocs::Keys(first), super::FileRelocs::Keys(second)) = (first, second)
         else {
@@ -2307,8 +2304,8 @@ mod tests {
         let opt = Options::new(&*root);
         let btree = btree_store::BTree::open(opt.manifest()).expect("open manifest");
         btree
-            .exec(crate::meta::BUCKET_MISC, |txn| {
-                txn.put(crate::meta::wal_recycle_key(3), [0u8; 4])
+            .exec(mace::maintenance::BUCKET_MISC, |txn| {
+                txn.put(mace::maintenance::wal_recycle_key(3), [0u8; 4])
             })
             .expect("short recycle row");
         drop(btree);
@@ -2333,7 +2330,9 @@ mod tests {
         let opt = Options::new(&*root);
         let btree = btree_store::BTree::open(opt.manifest()).expect("open manifest");
         btree
-            .exec(crate::meta::BUCKET_METAS, |txn| txn.put("short", [0u8; 4]))
+            .exec(mace::maintenance::BUCKET_METAS, |txn| {
+                txn.put("short", [0u8; 4])
+            })
             .expect("short record");
         drop(btree);
 
@@ -2416,7 +2415,7 @@ mod tests {
     #[test]
     fn a_corrupted_payload_file_is_reported_once_per_category() {
         use crate::Diagnostic;
-        use crate::meta::{BUCKET_DATA_STAT, PersistStat};
+        use mace::maintenance::{BUCKET_DATA_STAT, PersistStat};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -2495,7 +2494,7 @@ mod tests {
     #[test]
     fn a_short_interval_row_does_not_cascade_into_page_table_findings() {
         use crate::Diagnostic;
-        use crate::meta::{BUCKET_METAS, BucketMeta, data_interval_name};
+        use mace::maintenance::{BUCKET_METAS, BucketMeta, data_interval_name};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -2622,7 +2621,7 @@ mod tests {
     #[test]
     fn an_undecodable_stat_record_is_reported_once() {
         use crate::Diagnostic;
-        use crate::meta::{BUCKET_DATA_STAT, PersistStat};
+        use mace::maintenance::{BUCKET_DATA_STAT, PersistStat};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -2672,7 +2671,7 @@ mod tests {
     #[test]
     fn a_truncated_payload_file_is_reported_once() {
         use crate::Diagnostic;
-        use crate::meta::{BUCKET_DATA_STAT, PersistStat};
+        use mace::maintenance::{BUCKET_DATA_STAT, PersistStat};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -2714,7 +2713,7 @@ mod tests {
     /// a page table entry that no interval covers is reported as a page-table defect
     #[test]
     fn a_page_table_entry_without_an_interval_is_reported() {
-        use crate::meta::{BUCKET_METAS, BucketMeta, page_table_name};
+        use mace::maintenance::{BUCKET_METAS, BucketMeta, page_table_name};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -2776,7 +2775,7 @@ mod tests {
     #[test]
     fn an_unreadable_payload_file_is_reported_once() {
         use crate::Diagnostic;
-        use crate::meta::{BUCKET_DATA_STAT, PersistStat};
+        use mace::maintenance::{BUCKET_DATA_STAT, PersistStat};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -2829,11 +2828,11 @@ mod tests {
     /// lifecycle records that contradict the metadata they belong to are reported
     #[test]
     fn lifecycle_contradictions_are_reported() {
-        use crate::meta::{
+        use mace::maintenance::IAsSlice;
+        use mace::maintenance::{
             BUCKET_FRONTIER, BUCKET_MISC, BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, BucketMeta,
             WalRecycleState, orphan_data_marker_key, wal_recycle_key,
         };
-        use crate::types::traits::IAsSlice;
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -2843,7 +2842,7 @@ mod tests {
         let bucket_id = {
             let mut id = None;
             btree
-                .view(crate::meta::BUCKET_METAS, |txn| {
+                .view(mace::maintenance::BUCKET_METAS, |txn| {
                     let mut iter = txn.iter();
                     let (mut key, mut value) = (Vec::new(), Vec::new());
                     while iter.next_ref(&mut key, &mut value) {
@@ -2857,11 +2856,12 @@ mod tests {
         let file_id = {
             let mut id = None;
             btree
-                .view(crate::meta::BUCKET_DATA_STAT, |txn| {
+                .view(mace::maintenance::BUCKET_DATA_STAT, |txn| {
                     let mut iter = txn.iter();
                     let (mut key, mut value) = (Vec::new(), Vec::new());
                     while iter.next_ref(&mut key, &mut value) {
-                        id = Some(crate::meta::PersistStat::decode_inner_only(&value).file_id);
+                        id =
+                            Some(mace::maintenance::PersistStat::decode_inner_only(&value).file_id);
                     }
                     Ok(())
                 })
@@ -2954,7 +2954,7 @@ mod tests {
     /// checksum is intact
     #[test]
     fn a_wal_record_with_an_invalid_payload_layout_is_reported() {
-        use crate::cc::wal::{IWalCodec, PayloadType, WalUpdate, ptr_to};
+        use mace::maintenance::{IWalCodec, PayloadType, WalUpdate, ptr_to};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -2976,7 +2976,7 @@ mod tests {
             };
             write(
                 std::mem::offset_of!(WalUpdate, wal_type),
-                &[crate::cc::wal::EntryType::Update as u8],
+                &[mace::maintenance::EntryType::Update as u8],
             );
             write(
                 std::mem::offset_of!(WalUpdate, sub_type),
@@ -3026,7 +3026,7 @@ mod tests {
     /// tail rule must not hide)
     #[test]
     fn a_wal_checksum_mismatch_is_reported() {
-        use crate::cc::wal::{EntryType, WalUpdate, ptr_to, wal_record_sz};
+        use mace::maintenance::{EntryType, WalUpdate, ptr_to, wal_record_sz};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -3146,12 +3146,12 @@ mod tests {
         let bucket_id = {
             let mut id = None;
             btree
-                .view(crate::meta::BUCKET_METAS, |txn| {
+                .view(mace::maintenance::BUCKET_METAS, |txn| {
                     let mut iter = txn.iter();
                     let mut key = Vec::new();
                     let mut value = Vec::new();
                     while iter.next_ref(&mut key, &mut value) {
-                        id = Some(crate::meta::BucketMeta::decode(&value).id);
+                        id = Some(mace::maintenance::BucketMeta::decode(&value).id);
                     }
                     Ok(())
                 })
@@ -3159,7 +3159,7 @@ mod tests {
             id.expect("fixture must hold a bucket")
         };
         let interval_bucket =
-            crate::meta::interval_bucket_name(crate::meta::FileKind::Data, bucket_id);
+            mace::maintenance::interval_bucket_name(mace::maintenance::FileKind::Data, bucket_id);
         let (key, mut interval) = {
             let mut found = None;
             btree
@@ -3168,7 +3168,8 @@ mod tests {
                     let mut key = Vec::new();
                     let mut value = Vec::new();
                     while iter.next_ref(&mut key, &mut value) {
-                        found = Some((key.clone(), crate::meta::IntervalPair::decode(&value)));
+                        found =
+                            Some((key.clone(), mace::maintenance::IntervalPair::decode(&value)));
                     }
                     Ok(())
                 })
@@ -3176,8 +3177,8 @@ mod tests {
             found.expect("fixture must publish an interval")
         };
         interval.file_id = 999_999;
-        let mut encoded = vec![0u8; size_of::<crate::meta::IntervalPair>()];
-        crate::meta::IMetaCodec::encode(&interval, &mut encoded);
+        let mut encoded = vec![0u8; size_of::<mace::maintenance::IntervalPair>()];
+        mace::maintenance::IMetaCodec::encode(&interval, &mut encoded);
         btree
             .exec(&interval_bucket, |txn| txn.put(&key, &encoded))
             .expect("rewrite interval");
@@ -3205,7 +3206,7 @@ mod tests {
         let (key, mut value) = {
             let mut found = None;
             btree
-                .view(crate::meta::BUCKET_DATA_STAT, |txn| {
+                .view(mace::maintenance::BUCKET_DATA_STAT, |txn| {
                     let mut iter = txn.iter();
                     let mut key = Vec::new();
                     let mut value = Vec::new();
@@ -3218,11 +3219,14 @@ mod tests {
             found.expect("fixture must publish a stat record")
         };
         // the element counts live in `StatInner`, right after the fixed header
-        let inner_offset = crate::meta::PersistStat::stat_inner_offset();
-        let total_offset = inner_offset + std::mem::offset_of!(crate::meta::StatInner, total_elems);
+        let inner_offset = mace::maintenance::PersistStat::stat_inner_offset();
+        let total_offset =
+            inner_offset + std::mem::offset_of!(mace::maintenance::StatInner, total_elems);
         value[total_offset] = value[total_offset].wrapping_add(7);
         btree
-            .exec(crate::meta::BUCKET_DATA_STAT, |txn| txn.put(&key, &value))
+            .exec(mace::maintenance::BUCKET_DATA_STAT, |txn| {
+                txn.put(&key, &value)
+            })
             .expect("rewrite stat");
         drop(btree);
 
@@ -3247,11 +3251,13 @@ mod tests {
         let opt = Options::new(&*root);
         let btree = btree_store::BTree::open(opt.manifest()).expect("open manifest");
         let encoded = btree
-            .view(crate::meta::BUCKET_METAS, |txn| txn.get("x"))
+            .view(mace::maintenance::BUCKET_METAS, |txn| txn.get("x"))
             .expect("seeded bucket record");
-        let expected_id = crate::meta::BucketMeta::decode(&encoded).id;
+        let expected_id = mace::maintenance::BucketMeta::decode(&encoded).id;
         btree
-            .exec(crate::meta::BUCKET_METAS, |txn| txn.put("dup", &encoded))
+            .exec(mace::maintenance::BUCKET_METAS, |txn| {
+                txn.put("dup", &encoded)
+            })
             .expect("duplicate record");
         drop(btree);
 
@@ -3279,7 +3285,7 @@ mod tests {
     fn seed_with_data(root: &std::path::Path) {
         let mut opt = Options::new(root);
         opt.sync_on_write = true;
-        let mace = crate::Mace::new(opt.validate().expect("seed options")).expect("seed open");
+        let mace = mace::Mace::new(opt.validate().expect("seed options")).expect("seed open");
         let db = mace
             .new_bucket("x", Default::default())
             .expect("seed bucket");
@@ -3298,7 +3304,7 @@ mod tests {
         let mut opt = Options::new(root);
         opt.sync_on_write = true;
         opt.truncate_corrupted_wal = false;
-        let mace = crate::Mace::new(opt.validate().expect("seed options")).expect("seed open");
+        let mace = mace::Mace::new(opt.validate().expect("seed options")).expect("seed open");
         let db = mace
             .new_bucket("x", Default::default())
             .expect("seed bucket");
@@ -3314,7 +3320,7 @@ mod tests {
     fn seed(root: &std::path::Path) {
         let mut opt = Options::new(root);
         opt.sync_on_write = true;
-        let mace = crate::Mace::new(opt.validate().expect("seed options")).expect("seed open");
+        let mace = mace::Mace::new(opt.validate().expect("seed options")).expect("seed open");
         let _ = mace
             .new_bucket("x", Default::default())
             .expect("seed bucket");
@@ -3339,6 +3345,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "extra_check")]
     #[test]
     fn a_check_on_an_absent_root_creates_nothing() {
         let scratch = RandomPath::tmp();
@@ -3348,7 +3355,7 @@ mod tests {
         let root = scratch.join("absent");
         let fs = Arc::new(InjectedFileSystem::new());
         let mut opt = Options::new(&root);
-        opt.fs = fs.clone();
+        opt.set_fs(fs.clone());
 
         let report = check_database(&opt);
 
@@ -3370,6 +3377,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "extra_check")]
     #[test]
     fn the_checker_opens_the_metadata_store_read_only() {
         let root = RandomPath::tmp();
@@ -3378,7 +3386,7 @@ mod tests {
         {
             let mut seed = Options::new(&*root);
             seed.sync_on_write = true;
-            let mace = crate::Mace::new(seed.validate().expect("seed options")).expect("seed open");
+            let mace = mace::Mace::new(seed.validate().expect("seed options")).expect("seed open");
             let _ = mace
                 .new_bucket("x", Default::default())
                 .expect("seed bucket");
@@ -3386,7 +3394,7 @@ mod tests {
 
         let fs = Arc::new(InjectedFileSystem::new());
         let mut opt = Options::new(&*root);
-        opt.fs = fs.clone();
+        opt.set_fs(fs.clone());
         let report = check_database(&opt);
         assert!(
             report.is_ok(),

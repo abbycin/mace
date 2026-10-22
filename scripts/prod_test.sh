@@ -28,7 +28,6 @@ chaos_retry="${CHAOS_RETRY:-3}"
 failures=()
 
 fast_targets=(
-  cli
   prod_bucket
   prod_concurrency
   prod_evictor
@@ -219,6 +218,14 @@ run_fast() {
 
   if ! run_cmd "fast" "$fast_timeout" cargo "${args[@]}"; then
     failures+=("fast")
+  fi
+
+  # the maintenance CLI is its own package now, so the multi-target invocation
+  # above cannot reach it; keep its acceptance tests in the same fast gate
+  if ! run_cmd "fast:cli" "$fast_timeout" \
+    cargo test -p mace-kv-cli --features "$features" --test cli --test checker \
+      -- --nocapture --test-threads="$test_threads"; then
+    failures+=("fast:cli")
   fi
 
   # the shared-durable-wal generation/route-switch crash windows require BOTH

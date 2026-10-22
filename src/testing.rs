@@ -4,6 +4,7 @@ use crate::cc::{
     context::AbortCleanState,
     wal::{EntryType, IWalCodec, WalAbort, WalCheckpoint, WalUpdate, ptr_to, wal_record_sz},
 };
+pub use crate::io::testfs;
 use crate::map::buffer::Pool;
 use crate::map::data::MetaReader;
 use crate::meta::builder::ManifestBuilder;

@@ -542,9 +542,30 @@ impl Options {
     }
 }
 
+#[cfg(feature = "maintenance")]
+impl Options {
+    /// the filesystem hook the offline maintenance checker must use
+    #[doc(hidden)]
+    pub fn fs(&self) -> &dyn crate::io::FileSystem {
+        self.fs.as_ref()
+    }
+
+    /// shared handle to the filesystem hook, for readers that outlive the call
+    #[doc(hidden)]
+    pub fn fs_arc(&self) -> std::sync::Arc<dyn crate::io::FileSystem> {
+        self.fs.clone()
+    }
+
+    /// inject a filesystem for the maintenance checker's own tests
+    #[doc(hidden)]
+    pub fn set_fs(&mut self, fs: std::sync::Arc<dyn crate::io::FileSystem>) {
+        self.fs = fs;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub(crate) struct PersistedOptions {
+pub struct PersistedOptions {
     pub concurrent_write: u8,
     pub sync_on_write: bool,
     pub gc_timeout: u64,
@@ -611,7 +632,7 @@ impl PersistedOptions {
         }
     }
 
-    pub(crate) fn from_json(buf: &[u8]) -> Result<Self, OpCode> {
+    pub fn from_json(buf: &[u8]) -> Result<Self, OpCode> {
         serde_json::from_slice(buf).map_err(|_| OpCode::Corruption)
     }
 

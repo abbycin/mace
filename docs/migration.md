@@ -43,9 +43,12 @@ read it (`... is format <n> ...`), which selects the next hop.
 
 ## Tools
 
-- `mace-kv`, the maintenance CLI (added in 0.2.0; 0.1.2 shipped no CLI): `cargo install mace-kv`, the
-  binary is `mace-kv`. `mace-kv check` exits `0` on a clean check, `1` when it reports a finding
-  (including a format this build cannot read), and `2` on a usage error.
+- `mace-kv`, the maintenance CLI (added in 0.2.0; the package is `mace-kv-cli` since 0.2.1):
+  `cargo install mace-kv-cli`, the binary is `mace-kv`. If the binary was installed from the
+  `mace-kv` package (0.2.0 or earlier), run `cargo uninstall mace-kv` first or pass `--force`; cargo
+  refuses to overwrite a binary owned by another package. `mace-kv check` exits `0` on a clean check,
+  `1` when it reports a finding (including a format this build cannot read), and `2` on a usage
+  error.
 - the `btree-store` CLI: `cargo install btree-store`. `btree-store --help` must list `migrate`, and
   `btree-store migrate --help` prints
   `Usage: btree-store migrate --output <destination> --to <version> <source>`.
@@ -121,7 +124,7 @@ is a version bump in `Cargo.toml`:
 
 ```toml
 [dependencies]
-mace-kv = "0.2.0" # the release you are upgrading to
+mace-kv = "0.2.1" # the current release; 0.2.1 is a patch over 0.2.0 with no format change
 ```
 
 ```rust

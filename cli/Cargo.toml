@@ -1,0 +1,34 @@
+[package]
+name = "mace-kv-cli"
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.95"
+authors = ["AbbyCin <abbytsing@gmail.com>"]
+homepage = "https://github.com/abbycin/mace"
+repository = "https://github.com/abbycin/mace"
+description = "Maintenance CLI for the mace key-value engine"
+license = "MIT"
+categories = ["command-line-utilities", "database"]
+keywords = ["database", "key-value", "maintenance", "cli"]
+
+[[bin]]
+name = "mace-kv"
+path = "src/main.rs"
+
+[lib]
+name = "mace_kv_cli"
+path = "src/lib.rs"
+
+[dependencies]
+mace = { package = "mace-kv", path = "..", version = "=0.2.1", features = ["maintenance"] }
+btree-store = "2.1.0"
+clap = { version = "=4.6.7", features = ["derive"] }
+
+[features]
+# the checker tests use the engine's test-only corruption hooks; keep the feature
+# graph explicit instead of enabling it for every build of the tool
+extra_check = ["mace/extra_check"]
+failpoints = ["extra_check", "mace/failpoints"]
+
+[dev-dependencies]
+crc32c = "0.6.8"

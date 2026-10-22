@@ -7,7 +7,7 @@ use crate::{
     utils::{OpCode, data::Position, options::Options},
 };
 
-pub(crate) trait IWalCodec {
+pub trait IWalCodec {
     fn encoded_len(&self) -> usize;
 
     fn size() -> usize;
@@ -21,7 +21,7 @@ pub(crate) trait IWalPayload {
 
 #[repr(u8)]
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub(crate) enum EntryType {
+pub enum EntryType {
     Update,
     Begin,
     Commit,
@@ -43,7 +43,7 @@ impl TryFrom<u8> for EntryType {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PayloadType {
+pub enum PayloadType {
     Insert,
     Update,
     Delete,
@@ -62,19 +62,19 @@ impl TryFrom<u8> for PayloadType {
 }
 
 #[repr(C, packed(1))]
-pub(crate) struct WalUpdate {
-    pub(crate) wal_type: EntryType,
-    pub(crate) sub_type: PayloadType,
-    pub(crate) bucket_id: u64,
-    pub(crate) group_id: u8,
+pub struct WalUpdate {
+    pub wal_type: EntryType,
+    pub sub_type: PayloadType,
+    pub bucket_id: u64,
+    pub group_id: u8,
     /// payload size
-    pub(crate) size: u32,
-    pub(crate) cmd_id: u32,
-    pub(crate) klen: u32,
-    pub(crate) txid: u64,
-    pub(crate) prev_id: u64,
-    pub(crate) prev_off: u64,
-    pub(crate) checksum: u32,
+    pub size: u32,
+    pub cmd_id: u32,
+    pub klen: u32,
+    pub txid: u64,
+    pub prev_id: u64,
+    pub prev_off: u64,
+    pub checksum: u32,
 }
 
 impl Debug for WalUpdate {
@@ -105,10 +105,10 @@ pub(crate) struct WalBegin {
 
 #[repr(C, packed(1))]
 #[derive(Debug)]
-pub(crate) struct WalAbort {
-    pub(crate) wal_type: EntryType,
-    pub(crate) txid: u64,
-    pub(crate) checksum: u32,
+pub struct WalAbort {
+    pub wal_type: EntryType,
+    pub txid: u64,
+    pub checksum: u32,
 }
 
 #[repr(C, packed(1))]
@@ -127,10 +127,10 @@ static_assert!(size_of::<WalCommit>() == size_of::<WalBegin>());
 // it does not imply that all transactions are committed; active transactions may exist
 #[repr(C, packed(1))]
 #[derive(Debug)]
-pub(crate) struct WalCheckpoint {
-    pub(crate) wal_type: EntryType,
-    pub(crate) checkpoint: Position,
-    pub(crate) checksum: u32,
+pub struct WalCheckpoint {
+    pub wal_type: EntryType,
+    pub checkpoint: Position,
+    pub checksum: u32,
 }
 
 macro_rules! impl_checksum {
@@ -149,7 +149,7 @@ macro_rules! impl_checksum {
                 h.finish() as u32
             }
 
-            pub(crate) fn is_intact(&self) -> bool {
+            pub fn is_intact(&self) -> bool {
                 self.checksum == self.calc_checksum()
             }
         }
@@ -162,7 +162,7 @@ impl_checksum!(WalAbort);
 impl_checksum!(WalCheckpoint);
 
 impl WalUpdate {
-    pub(crate) fn checked_payload_len(payload_size: u32) -> Result<usize, OpCode> {
+    pub fn checked_payload_len(payload_size: u32) -> Result<usize, OpCode> {
         let payload_len = usize::try_from(payload_size).map_err(|_| OpCode::Corruption)?;
         let max_payload = Options::MAX_KV_SIZE
             .checked_add(size_of::<WalReplace>())
@@ -174,13 +174,13 @@ impl WalUpdate {
         }
     }
 
-    pub(crate) fn checked_encoded_len(payload_len: usize) -> Result<usize, OpCode> {
+    pub fn checked_encoded_len(payload_len: usize) -> Result<usize, OpCode> {
         Self::size()
             .checked_add(payload_len)
             .ok_or(OpCode::Corruption)
     }
 
-    pub(crate) fn validate_record(&self, record: &[u8]) -> Result<(), OpCode> {
+    pub fn validate_record(&self, record: &[u8]) -> Result<(), OpCode> {
         let header_len = Self::size();
         if record.len() < header_len || record[0] != EntryType::Update as u8 {
             return Err(OpCode::Corruption);
@@ -272,7 +272,7 @@ impl WalUpdate {
         self.cast_to::<WalReplace>()
     }
 
-    pub(crate) fn calc_checksum(&self) -> u32 {
+    pub fn calc_checksum(&self) -> u32 {
         let ptr = self as *const Self as *const u8;
         let header_size = self.encoded_len();
         let checksum_offset = header_size - size_of_val(&{ self.checksum });
@@ -289,7 +289,7 @@ impl WalUpdate {
         h.finish() as u32
     }
 
-    pub(crate) fn is_intact(&self) -> bool {
+    pub fn is_intact(&self) -> bool {
         let expected = { self.checksum };
         let actual = self.calc_checksum();
         expected == actual
@@ -440,7 +440,7 @@ impl IWalCodec for &[u8] {
     }
 }
 
-pub(crate) fn wal_record_sz(e: EntryType) -> Result<usize, OpCode> {
+pub fn wal_record_sz(e: EntryType) -> Result<usize, OpCode> {
     match e {
         EntryType::Abort | EntryType::Begin | EntryType::Commit => Ok(WalAbort::size()),
         EntryType::Update => Ok(WalUpdate::size()),
@@ -460,7 +460,7 @@ pub(crate) struct Location {
     pub(crate) pos: Position,
 }
 
-pub(crate) fn ptr_to<T>(x: *const u8) -> &'static T {
+pub fn ptr_to<T>(x: *const u8) -> &'static T {
     unsafe { &*x.cast::<T>() }
 }
 

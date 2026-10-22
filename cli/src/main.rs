@@ -24,7 +24,8 @@
 //! offset and generation.
 
 use clap::{Parser, Subcommand};
-use mace::{CheckReport, Diagnostic, Options, check_database};
+use mace::Options;
+use mace_kv_cli::{CheckReport, Diagnostic, check_database};
 use std::path::Path;
 use std::process::ExitCode;
 
