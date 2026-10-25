@@ -6,4 +6,10 @@
 
 pub mod checker;
 
-pub use checker::{CheckCategory, CheckReport, Diagnostic, check_database};
+pub use checker::{
+    CheckCategory, CheckReport, Diagnostic, LeakReport, RepairRecord, check_database,
+    leak_check_database,
+};
+
+#[cfg(feature = "extra_check")]
+pub use checker::leak_check_reachable_for_test;

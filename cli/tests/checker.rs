@@ -331,6 +331,24 @@ fn missing_child_page_mapping_is_reported() -> Result<(), OpCode> {
             .any(|diagnostic| diagnostic.category == CheckCategory::BadPageChain),
         "a deleted child mapping must be reported: {report:?}"
     );
+    let before = fingerprint(&root);
+    let result = mace_kv_cli::leak_check_database(&Options::new(&root), true);
+    assert!(result.repairs.is_empty());
+    assert!(
+        result
+            .report
+            .diagnostics
+            .iter()
+            .any(|d| d.category == CheckCategory::LeakUndecidable)
+    );
+    assert!(
+        !result
+            .report
+            .diagnostics
+            .iter()
+            .any(|d| d.category == CheckCategory::JunkLeak)
+    );
+    assert_eq!(before, fingerprint(&root));
     Ok(())
 }
 
@@ -897,4 +915,1018 @@ fn a_pending_delete_window_checks_clean() -> Result<(), OpCode> {
         "a store after the pending reap must check clean: {report:?}"
     );
     Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+mod leaks {
+    use super::*;
+    use mace::maintenance::{
+        BUCKET_BLOB_STAT, BUCKET_DATA_STAT, FileKind, IHeader, IMetaCodec, MetaReader, PersistStat,
+        ROOT_PID, page_table_name,
+    };
+    use mace::testing::{
+        add_inactive_mark_for_leak_test, drop_one_inactive_mark_for_leak_test,
+        persisted_reachable_for_test,
+    };
+    use mace_kv_cli::{leak_check_database, leak_check_reachable_for_test};
+
+    fn stats(opt: &Options, kind: FileKind) -> Vec<PersistStat> {
+        let tree = BTree::open_read_only(opt.manifest()).unwrap();
+        let mut out = Vec::new();
+        tree.view(
+            match kind {
+                FileKind::Data => BUCKET_DATA_STAT,
+                FileKind::Blob => BUCKET_BLOB_STAT,
+            },
+            |tx| {
+                let mut it = tx.iter();
+                let (mut k, mut v) = (Vec::new(), Vec::new());
+                while it.next_ref(&mut k, &mut v) {
+                    out.push(PersistStat::decode(&v));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        out
+    }
+
+    fn seed_junk(root: &Path) -> (Options, u64) {
+        let mut opt = Options::new(root);
+        opt.gc_timeout = 0;
+        opt.sync_on_write = true;
+        let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+        let db = mace
+            .new_bucket(
+                "leaks",
+                mace::BucketOptions {
+                    inline_size: 32,
+                    consolidate_threshold: 2,
+                    split_elems: 8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for round in 0..12u8 {
+            let tx = db.begin().unwrap();
+            for key in 0..128 {
+                if round == 0 || key >= 64 {
+                    tx.upsert(format!("key_{key:03}"), vec![round; 512])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            db.checkpoint_and_wait();
+        }
+        let tx = db.begin().unwrap();
+        tx.upsert("key_127", vec![11; 512]).unwrap();
+        tx.commit().unwrap();
+        db.checkpoint_and_wait();
+        let id = db.id();
+        drop(db);
+        drop(mace);
+        (opt, id)
+    }
+
+    fn assert_closed_closures(opt: &Options, id: u64) {
+        let before = fingerprint(&opt.db_root());
+        let typed = persisted_reachable_for_test(opt, id);
+        let raw = leak_check_reachable_for_test(opt, id);
+        assert!(!typed.0.is_empty());
+        assert_eq!(typed, raw);
+        assert_eq!(before, fingerprint(&opt.db_root()));
+    }
+
+    #[test]
+    fn fixed_root_collectors_agree_on_closed_history_and_cross_file_chains() -> Result<(), OpCode> {
+        let scratch = RandomPath::tmp();
+        let first = scratch.join("history");
+        let id = seed_sibling_pages(&first)?;
+        assert!(count_sibling_pages(&first, id) > 0);
+        let history_opt = Options::new(&first);
+        assert_closed_closures(&history_opt, id);
+        let history_closure = leak_check_reachable_for_test(&history_opt, id);
+        let (mut sibling, mut branch) = (None, None);
+        for stat in stats(&history_opt, FileKind::Data) {
+            let reader = mace::maintenance::try_new_reader(
+                history_opt.data_file(stat.file_id),
+                mace::maintenance::DecompressorPool::new(),
+                history_opt.fs_arc(),
+            )
+            .unwrap();
+            for reloc in MetaReader::try_new(history_opt.fs(), history_opt.data_file(stat.file_id))
+                .unwrap()
+                .try_get_reloc()
+                .unwrap()
+                .iter()
+            {
+                let addr = reloc.key;
+                let page = reader.try_read_at(addr).unwrap();
+                if page.header().flag == mace::maintenance::TagFlag::Sibling {
+                    sibling = Some(addr);
+                }
+                if page.header().node_type == mace::maintenance::NodeType::Intl {
+                    branch = Some(addr);
+                }
+            }
+        }
+        assert!(
+            history_closure
+                .0
+                .contains(&sibling.expect("concrete history sibling"))
+        );
+        assert!(
+            history_closure
+                .0
+                .contains(&branch.expect("concrete branch"))
+        );
+        let r = leak_check_database(&Options::new(&first), false);
+        assert!(r.report.is_ok(), "{r:?}");
+        let (opt, id) = seed_cross_file_chain(&scratch.join("chain"))?;
+        assert_closed_closures(&opt, id);
+        let closure = leak_check_reachable_for_test(&opt, id);
+        let mut owners = std::collections::BTreeMap::new();
+        for stat in stats(&opt, FileKind::Data) {
+            for reloc in MetaReader::try_new(opt.fs(), opt.data_file(stat.file_id))
+                .unwrap()
+                .try_get_reloc()
+                .unwrap()
+                .iter()
+            {
+                owners.insert(reloc.key, stat.file_id);
+            }
+        }
+        let mut cross_link = false;
+        for (&addr, &file) in &owners {
+            if !closure.0.contains(&addr) {
+                continue;
+            }
+            let reader = mace::maintenance::try_new_reader(
+                opt.data_file(file),
+                mace::maintenance::DecompressorPool::new(),
+                opt.fs_arc(),
+            )
+            .unwrap();
+            let page = reader.try_read_at(addr).unwrap();
+            let link = page.header().link;
+            if link != 0 && owners[&link] != file {
+                assert!(closure.0.contains(&link));
+                assert_eq!(page.header().kind, mace::maintenance::TagKind::Delta);
+                cross_link = true;
+            }
+        }
+        assert!(
+            cross_link,
+            "fixture must retain a concrete cross-file page link"
+        );
+        assert!(leak_check_database(&opt, false).report.is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_marks_are_detected_repaired_and_idempotent_for_both_kinds() {
+        for kind in FileKind::ALL {
+            let root = RandomPath::tmp();
+            let (opt, id) = seed_junk(&root);
+            assert_closed_closures(&opt, id);
+            assert!(!persisted_reachable_for_test(&opt, id).1.is_empty());
+            let clean = leak_check_database(&opt, false);
+            assert!(clean.report.is_ok(), "{clean:?}");
+            let stat = stats(&opt, kind)
+                .into_iter()
+                .find(|s| !s.inactive_elems.is_empty())
+                .expect("inactive fixture");
+            let (addr, _) = drop_one_inactive_mark_for_leak_test(&opt, kind, stat.file_id);
+            assert!(check_database(&opt).is_ok());
+            let before = fingerprint(&root);
+            let detection = leak_check_database(&opt, false);
+            assert_eq!(before, fingerprint(&root));
+            let leaks: Vec<_> = detection
+                .report
+                .diagnostics
+                .iter()
+                .filter(|d| d.category == CheckCategory::JunkLeak)
+                .collect();
+            assert_eq!(leaks.len(), 1, "{detection:?}");
+            assert_eq!(leaks[0].address, Some(addr));
+            assert_eq!(leaks[0].bucket_id, Some(id));
+            assert_eq!(leaks[0].file_id, Some(stat.file_id));
+            let fixed = leak_check_database(&opt, true);
+            assert!(fixed.report.is_ok(), "{fixed:?}");
+            assert!(fixed.fault.is_none());
+            assert_eq!(fixed.repairs.len(), 1);
+            assert_eq!(fixed.repairs[0].added_inactive, 1);
+            assert_eq!(fixed.repairs[0].bucket_id, id);
+            assert_eq!(fixed.repairs[0].file_id, stat.file_id);
+            assert_eq!(
+                fixed.repairs[0].kind,
+                match kind {
+                    FileKind::Data => "data",
+                    FileKind::Blob => "blob",
+                }
+            );
+            let restored = stats(&opt, kind)
+                .into_iter()
+                .find(|s| s.file_id == stat.file_id)
+                .unwrap();
+            assert_eq!((restored.up1, restored.up2), (stat.up1, stat.up2));
+            assert_eq!(restored.inactive_elems, stat.inactive_elems);
+            assert_eq!(
+                (
+                    restored.active_elems,
+                    restored.total_elems,
+                    restored.active_size,
+                    restored.total_size
+                ),
+                (
+                    stat.active_elems,
+                    stat.total_elems,
+                    stat.active_size,
+                    stat.total_size
+                )
+            );
+            let before = fingerprint(&root);
+            let again = leak_check_database(&opt, true);
+            assert!(again.report.is_ok());
+            assert!(again.repairs.is_empty());
+            assert_eq!(before, fingerprint(&root));
+            let mace = Mace::new(opt.validate().unwrap()).unwrap();
+            let db = mace.open_bucket("leaks").unwrap();
+            let tx = db.begin().unwrap();
+            for key in 0..128 {
+                assert_eq!(
+                    tx.get(format!("key_{key:03}")).unwrap().slice(),
+                    &[if key < 64 { 0 } else { 11 }; 512]
+                );
+            }
+            drop(tx);
+            drop(db);
+            mace.start_gc();
+            mace::testing::assert_persisted_gc_stats(&mace);
+            if stat.active_elems == 0 {
+                let path = if kind == FileKind::Data {
+                    mace::Options::new(&*root).data_file(stat.file_id)
+                } else {
+                    mace::Options::new(&*root).blob_file(stat.file_id)
+                };
+                assert!(!path.exists(), "fully inactive victim was not reclaimed");
+            }
+        }
+    }
+
+    fn encoded_stat(opt: &Options, kind: FileKind, file: u64) -> Vec<u8> {
+        let stat = stats(opt, kind)
+            .into_iter()
+            .find(|s| s.file_id == file)
+            .unwrap();
+        let mut bytes = vec![0; stat.packed_size()];
+        stat.encode(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn overmarked_files_are_never_repaired_even_with_missing_marks() {
+        for kind in FileKind::ALL {
+            let root = RandomPath::tmp();
+            let (opt, id) = seed_junk(&root);
+            let live = persisted_reachable_for_test(&opt, id);
+            let set = if kind == FileKind::Data {
+                live.0
+            } else {
+                live.1
+            };
+            let stat = stats(&opt, kind)
+                .into_iter()
+                .find(|s| s.active_elems > 0 && !s.inactive_elems.is_empty());
+            let Some(stat) = stat else {
+                panic!(
+                    "mixed live/junk fixture required: {kind:?} {:?}",
+                    stats(&opt, kind)
+                        .iter()
+                        .map(|s| (s.file_id, s.active_elems, s.total_elems))
+                        .collect::<Vec<_>>()
+                )
+            };
+            let path = if kind == FileKind::Data {
+                opt.data_file(stat.file_id)
+            } else {
+                opt.blob_file(stat.file_id)
+            };
+            let mut reader = MetaReader::try_new(opt.fs(), &path).unwrap();
+            let addr = reader
+                .try_get_reloc()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    let addr = r.key;
+                    set.contains(&addr)
+                })
+                .unwrap()
+                .key;
+            add_inactive_mark_for_leak_test(&opt, kind, stat.file_id, addr);
+            let pure_before = encoded_stat(&opt, kind, stat.file_id);
+            let pure = leak_check_database(&opt, true);
+            assert!(pure.repairs.is_empty(), "{pure:?}");
+            assert_eq!(pure_before, encoded_stat(&opt, kind, stat.file_id));
+            assert!(
+                pure.report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.category == CheckCategory::BadStatAccounting)
+            );
+            let tree = BTree::open(opt.manifest()).unwrap();
+            let mut encoded = vec![0; stat.packed_size()];
+            stat.encode(&mut encoded);
+            tree.exec(
+                match kind {
+                    FileKind::Data => BUCKET_DATA_STAT,
+                    FileKind::Blob => BUCKET_BLOB_STAT,
+                },
+                |tx| tx.put(stat.file_id.to_le_bytes(), encoded.clone()),
+            )
+            .unwrap();
+            drop(tree);
+            drop_one_inactive_mark_for_leak_test(&opt, kind, stat.file_id);
+            add_inactive_mark_for_leak_test(&opt, kind, stat.file_id, addr);
+            let other = stats(&opt, kind)
+                .into_iter()
+                .find(|s| s.file_id != stat.file_id && !s.inactive_elems.is_empty())
+                .unwrap();
+            drop_one_inactive_mark_for_leak_test(&opt, kind, other.file_id);
+            let before = encoded_stat(&opt, kind, stat.file_id);
+            let result = leak_check_database(&opt, true);
+            assert!(
+                result.repairs.iter().any(|r| r.file_id == other.file_id),
+                "{result:?}"
+            );
+            assert!(
+                result
+                    .report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.category == CheckCategory::JunkLeak
+                        && d.file_id == Some(stat.file_id)),
+                "{result:?}"
+            );
+            assert!(result.repairs.iter().all(|r| r.file_id != stat.file_id));
+            assert_eq!(before, encoded_stat(&opt, kind, stat.file_id));
+        }
+    }
+
+    #[test]
+    fn absent_or_null_fixed_root_refuses_all_repairs() {
+        for null in [false, true] {
+            let root = RandomPath::tmp();
+            let (opt, id) = seed_junk(&root);
+            let tree = BTree::open(opt.manifest()).unwrap();
+            tree.exec(&page_table_name(id), |tx| {
+                if null {
+                    tx.put(ROOT_PID.to_le_bytes(), 0u64.to_le_bytes())
+                } else {
+                    tx.del(ROOT_PID.to_le_bytes()).map(|_| ())
+                }
+            })
+            .unwrap();
+            drop(tree);
+            let before = fingerprint(&root);
+            let result = leak_check_database(&opt, true);
+            assert!(result.repairs.is_empty());
+            assert!(
+                result
+                    .report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.category == CheckCategory::LeakUndecidable),
+                "{result:?}"
+            );
+            assert!(
+                !result
+                    .report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.category == CheckCategory::JunkLeak)
+            );
+            assert_eq!(before, fingerprint(&root));
+        }
+    }
+    #[test]
+    fn disconnected_mapping_and_its_exclusive_blob_are_not_roots() {
+        let root = RandomPath::tmp();
+        let (opt, id) = seed_junk(&root);
+        let original = persisted_reachable_for_test(&opt, id);
+        let tree = BTree::open(opt.manifest()).unwrap();
+        let mut rows = Vec::new();
+        tree.view(&page_table_name(id), |tx| {
+            let mut it = tx.iter();
+            let (mut k, mut v) = (Vec::new(), Vec::new());
+            while it.next_ref(&mut k, &mut v) {
+                rows.push((
+                    u64::from_le_bytes(k.as_slice().try_into().unwrap()),
+                    u64::from_le_bytes(v.as_slice().try_into().unwrap()),
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+        let old_root = rows.iter().find(|(pid, _)| *pid == ROOT_PID).unwrap().1;
+        drop(tree);
+        let mut candidates = Vec::new();
+        for stat in stats(&opt, FileKind::Data) {
+            for reloc in MetaReader::try_new(opt.fs(), opt.data_file(stat.file_id))
+                .unwrap()
+                .try_get_reloc()
+                .unwrap()
+                .iter()
+            {
+                let addr = reloc.key;
+                if !original.0.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
+        }
+        let (orphan_page, orphan_blob) = candidates
+            .into_iter()
+            .find_map(|addr| {
+                let tree = BTree::open(opt.manifest()).unwrap();
+                tree.exec(&page_table_name(id), |tx| {
+                    tx.put(ROOT_PID.to_le_bytes(), addr.to_le_bytes())
+                })
+                .unwrap();
+                drop(tree);
+                let closure = leak_check_reachable_for_test(&opt, id);
+                let tree = BTree::open(opt.manifest()).unwrap();
+                tree.exec(&page_table_name(id), |tx| {
+                    tx.put(ROOT_PID.to_le_bytes(), old_root.to_le_bytes())
+                })
+                .unwrap();
+                closure
+                    .1
+                    .difference(&original.1)
+                    .next()
+                    .copied()
+                    .map(|blob| (addr, blob))
+            })
+            .expect("fixture must retain an unreachable page with an exclusive blob");
+        let orphan_pid = rows.iter().map(|(pid, _)| *pid).max().unwrap() + 1;
+        let tree = BTree::open(opt.manifest()).unwrap();
+        tree.exec(&page_table_name(id), |tx| {
+            tx.put(orphan_pid.to_le_bytes(), orphan_page.to_le_bytes())
+        })
+        .unwrap();
+        drop(tree);
+        let typed = persisted_reachable_for_test(&opt, id);
+        let raw = leak_check_reachable_for_test(&opt, id);
+        assert_eq!(typed, raw);
+        assert!(!typed.0.contains(&orphan_page));
+        assert!(!raw.0.contains(&orphan_page));
+        assert!(!typed.1.contains(&orphan_blob));
+        assert!(!raw.1.contains(&orphan_blob));
+        assert_ne!(orphan_pid, ROOT_PID);
+        let before = fingerprint(&root);
+        let result = leak_check_database(&opt, true);
+        assert!(result.repairs.is_empty());
+        assert!(
+            !result
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.category == CheckCategory::JunkLeak)
+        );
+        assert!(
+            result
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.category == CheckCategory::LeakUndecidable
+                    && d.detail.contains(&format!("PID {orphan_pid}"))),
+            "{result:?}"
+        );
+        assert_eq!(before, fingerprint(&root));
+    }
+
+    fn write_stat(opt: &Options, kind: FileKind, stat: &PersistStat) {
+        let mut bytes = vec![0; stat.packed_size()];
+        stat.encode(&mut bytes);
+        let tree = BTree::open(opt.manifest()).unwrap();
+        tree.exec(
+            match kind {
+                FileKind::Data => BUCKET_DATA_STAT,
+                FileKind::Blob => BUCKET_BLOB_STAT,
+            },
+            |tx| tx.put(stat.file_id.to_le_bytes(), bytes.clone()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn invalid_mask_and_count_exclude_only_the_file_and_keep_its_blob_edges() {
+        for damage in ["mask", "count", "duplicate"] {
+            let root = RandomPath::tmp();
+            let (opt, id) = seed_junk(&root);
+            let closure = persisted_reachable_for_test(&opt, id);
+            let all = stats(&opt, FileKind::Data);
+            let mut bad = all.iter().find(|s| s.active_elems > 0).unwrap().clone();
+            let good = all
+                .iter()
+                .find(|s| s.file_id != bad.file_id && !s.inactive_elems.is_empty())
+                .unwrap();
+            drop_one_inactive_mark_for_leak_test(&opt, FileKind::Data, good.file_id);
+            match damage {
+                "mask" => bad.inactive_elems.push(bad.total_elems),
+                "count" => bad.total_elems += 1,
+                _ => {
+                    let seq = *bad.inactive_elems.first().expect("mixed file");
+                    bad.inactive_elems.push(seq);
+                }
+            }
+            write_stat(&opt, FileKind::Data, &bad);
+            assert_eq!(closure, leak_check_reachable_for_test(&opt, id));
+            let result = leak_check_database(&opt, true);
+            assert!(result.fault.is_none(), "{result:?}");
+            assert!(
+                result
+                    .report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.category == CheckCategory::BadStatAccounting
+                        && d.file_id == Some(bad.file_id)),
+                "{result:?}"
+            );
+            assert!(
+                !result.report.diagnostics.iter().any(|d| matches!(
+                    d.category,
+                    CheckCategory::JunkLeak | CheckCategory::LeakUndecidable
+                )),
+                "{result:?}"
+            );
+            assert_eq!(result.repairs.len(), 1, "{result:?}");
+            assert_eq!(result.repairs[0].file_id, good.file_id);
+        }
+    }
+
+    #[test]
+    fn unknown_stat_ownership_blocks_all_buckets_and_missing_payload_blocks_the_group() {
+        for damage in ["header", "payload"] {
+            let root = RandomPath::tmp();
+            let (opt, _) = seed_junk(&root);
+            let all = stats(&opt, FileKind::Data);
+            let stat = &all[0];
+            if damage == "header" {
+                let tree = BTree::open(opt.manifest()).unwrap();
+                tree.exec(BUCKET_DATA_STAT, |tx| {
+                    tx.put(stat.file_id.to_le_bytes(), vec![0; 3])
+                })
+                .unwrap();
+            } else {
+                std::fs::remove_file(opt.data_file(stat.file_id)).unwrap();
+            }
+            let before = fingerprint(&root);
+            let result = leak_check_database(&opt, true);
+            assert!(result.repairs.is_empty(), "{result:?}");
+            assert!(
+                result
+                    .report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.category == CheckCategory::LeakUndecidable)
+            );
+            assert!(
+                !result
+                    .report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.category == CheckCategory::JunkLeak)
+            );
+            assert_eq!(before, fingerprint(&root));
+        }
+    }
+
+    #[test]
+    fn crash_frontier_child() {
+        let Ok(root) = std::env::var("MACE_LEAK_CRASH_ROOT") else {
+            return;
+        };
+        let covered = std::env::var("MACE_LEAK_COVERED").unwrap() == "true";
+        let mut opt = Options::new(root);
+        opt.sync_on_write = true;
+        opt.gc_timeout = 0;
+        let mace = Mace::new(opt.validate().unwrap()).unwrap();
+        let db = mace.open_bucket("leaks").unwrap();
+        let _old = db.view().unwrap();
+        let tx = db.begin().unwrap();
+        tx.upsert("crash_key", vec![99; 512]).unwrap();
+        tx.commit().unwrap();
+        if covered {
+            db.checkpoint_and_wait();
+        }
+        std::process::abort();
+    }
+
+    #[test]
+    fn redo_beyond_frontier_is_rejected_but_covered_crash_is_decidable() {
+        for covered in [false, true] {
+            let root = RandomPath::tmp();
+            let (opt, _) = seed_junk(&root);
+            let status = common::child_test_command(&std::env::current_exe().unwrap())
+                .args(["--exact", "leaks::crash_frontier_child", "--nocapture"])
+                .env("MACE_LEAK_CRASH_ROOT", root.to_string_lossy().as_ref())
+                .env("MACE_LEAK_COVERED", covered.to_string())
+                .status()
+                .unwrap();
+            assert!(!status.success());
+            let before = fingerprint(&root);
+            let result = leak_check_database(&opt, true);
+            assert!(result.repairs.is_empty(), "{result:?}");
+            assert_eq!(before, fingerprint(&root));
+            if covered {
+                assert!(result.report.is_ok(), "{result:?}");
+            } else {
+                assert!(
+                    result
+                        .report
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.category == CheckCategory::LeakUndecidable
+                            && d.detail.contains("frontier")),
+                    "{result:?}"
+                );
+            }
+            if covered {
+                let stat = stats(&opt, FileKind::Data)
+                    .into_iter()
+                    .find(|s| !s.inactive_elems.is_empty())
+                    .unwrap();
+                drop_one_inactive_mark_for_leak_test(&opt, FileKind::Data, stat.file_id);
+                let repaired = leak_check_database(&opt, true);
+                assert!(repaired.report.is_ok(), "{repaired:?}");
+                assert_eq!(repaired.repairs.len(), 1);
+            }
+            let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+            let db = mace.open_bucket("leaks").unwrap();
+            let tx = db.begin().unwrap();
+            for key in 0..128 {
+                let round = if key < 64 { 0 } else { 11 };
+                assert_eq!(
+                    tx.get(format!("key_{key:03}")).unwrap().slice(),
+                    &[round; 512]
+                );
+            }
+            assert_eq!(tx.get("crash_key").unwrap().slice(), &[99; 512]);
+            drop(tx);
+            drop(db);
+            drop(mace);
+            assert!(leak_check_database(&opt, false).report.is_ok());
+        }
+    }
+
+    fn edit_relocations(path: &Path, edit: impl FnOnce(&mut [u8], usize, usize)) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let footer = bytes.len() - 24;
+        let count = u32::from_le_bytes(bytes[footer + 8..footer + 12].try_into().unwrap()) as usize;
+        let table = footer - count * 32;
+        edit(&mut bytes, table, count);
+        let crc = crc32c::crc32c(&bytes[table..footer]);
+        bytes[footer + 16..footer + 20].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn invalid_sequences_exclude_one_file_but_duplicate_addresses_block_the_group() {
+        for damage in [
+            "seq_duplicate",
+            "seq_range",
+            "addr_duplicate",
+            "missing_ref",
+        ] {
+            let root = RandomPath::tmp();
+            let (opt, _) = seed_junk(&root);
+            let all = stats(&opt, FileKind::Data);
+            let bad = all
+                .iter()
+                .find(|s| s.active_elems > 0 && s.total_elems > 1)
+                .unwrap();
+            let good = all
+                .iter()
+                .find(|s| s.file_id != bad.file_id && !s.inactive_elems.is_empty())
+                .unwrap();
+            drop_one_inactive_mark_for_leak_test(&opt, FileKind::Data, good.file_id);
+            edit_relocations(&opt.data_file(bad.file_id), |bytes, table, count| {
+                assert!(count > 1);
+                if damage == "seq_duplicate" {
+                    let seq = bytes[table + 24..table + 28].to_vec();
+                    bytes[table + 56..table + 60].copy_from_slice(&seq);
+                } else if damage == "seq_range" {
+                    bytes[table + 24..table + 28].copy_from_slice(&(count as u32).to_le_bytes());
+                } else if damage == "addr_duplicate" {
+                    let addr = bytes[table..table + 8].to_vec();
+                    bytes[table + 32..table + 40].copy_from_slice(&addr);
+                } else {
+                    for i in 0..count {
+                        bytes[table + i * 32..table + i * 32 + 8]
+                            .copy_from_slice(&(u64::MAX - i as u64).to_le_bytes());
+                    }
+                }
+            });
+            let result = leak_check_database(&opt, true);
+            if damage.starts_with("seq") {
+                assert_eq!(result.repairs.len(), 1, "{result:?}");
+                assert_eq!(result.repairs[0].file_id, good.file_id);
+                assert!(
+                    result
+                        .report
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.category == CheckCategory::BadStatAccounting
+                            && d.file_id == Some(bad.file_id))
+                );
+            } else {
+                assert!(result.repairs.is_empty(), "{result:?}");
+                assert!(
+                    result
+                        .report
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.category == CheckCategory::LeakUndecidable)
+                );
+                assert!(
+                    !result
+                        .report
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.category == CheckCategory::JunkLeak)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recycle_boundary_mismatch_blocks_leak_repairs() {
+        use mace::maintenance::{BUCKET_MISC, IAsSlice, WalRecycleState, wal_recycle_key};
+
+        let root = RandomPath::tmp();
+        let (opt, bucket_id) = seed_junk(&root);
+        let stat = stats(&opt, FileKind::Data)
+            .into_iter()
+            .find(|stat| !stat.inactive_elems.is_empty())
+            .expect("inactive fixture");
+        drop_one_inactive_mark_for_leak_test(&opt, FileKind::Data, stat.file_id);
+
+        let segment_ids: Vec<_> = std::fs::read_dir(opt.log_root())
+            .expect("log root")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let path = entry.path();
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("group_wal_"))
+                    .and_then(|raw| raw.parse::<u64>().ok())
+                    .map(|id| (id, path))
+            })
+            .collect();
+        let (oldest, oldest_path) = segment_ids
+            .iter()
+            .min_by_key(|(id, _)| id)
+            .expect("fixture must write a shared segment");
+        let newest = segment_ids.iter().map(|(id, _)| id).max().unwrap();
+        let tree = BTree::open(opt.manifest()).unwrap();
+        tree.exec(BUCKET_MISC, |tx| {
+            tx.put(
+                wal_recycle_key(Options::SHARED_ID),
+                WalRecycleState::done(Options::SHARED_ID, *oldest, *oldest).as_slice(),
+            )
+        })
+        .unwrap();
+        drop(tree);
+        std::fs::remove_file(oldest_path).expect("remove oldest segment");
+        std::fs::write(opt.group_wal_file(*newest + 1), []).expect("leave a later empty segment");
+
+        let before = fingerprint(&root);
+        let result = leak_check_database(&opt, true);
+        assert!(result.repairs.is_empty(), "{result:?}");
+        assert!(
+            result.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.category == CheckCategory::LeakUndecidable
+                    && diagnostic.detail.contains("lifecycle or WAL inventory")
+                    && diagnostic.bucket_id == Some(bucket_id)
+            }),
+            "{result:?}"
+        );
+        assert_eq!(before, fingerprint(&root));
+    }
+
+    #[test]
+    fn collectors_follow_sibling_and_merging_pids_without_branch_edges() {
+        for field in [8usize, 16] {
+            let root = RandomPath::tmp();
+            let (opt, id) = seed_junk(&root);
+            let tree = BTree::open(opt.manifest()).unwrap();
+            let mut rows = Vec::new();
+            tree.view(&page_table_name(id), |tx| {
+                let mut it = tx.iter();
+                let (mut k, mut v) = (Vec::new(), Vec::new());
+                while it.next_ref(&mut k, &mut v) {
+                    rows.push((
+                        u64::from_le_bytes(k.as_slice().try_into().unwrap()),
+                        u64::from_le_bytes(v.as_slice().try_into().unwrap()),
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap();
+            drop(tree);
+            let mut leaves = Vec::new();
+            for stat in stats(&opt, FileKind::Data) {
+                let path = opt.data_file(stat.file_id);
+                let bytes = std::fs::read(&path).unwrap();
+                let relocs = MetaReader::try_new(opt.fs(), &path)
+                    .unwrap()
+                    .try_get_reloc()
+                    .unwrap();
+                for row in rows.iter().filter(|(pid, _)| *pid != ROOT_PID) {
+                    if let Some(r) = relocs.iter().find(|r| r.key == row.1) {
+                        assert!(!r.val.is_compressed());
+                        if bytes[r.val.off] == 2 && bytes[r.val.off + 1] == 1 {
+                            leaves.push((*row, stat.file_id, r.val.off));
+                        }
+                    }
+                }
+            }
+            assert!(leaves.len() >= 2, "two mapped base leaves required");
+            let ((_, from), _, _) = leaves[0];
+            let ((pid, to), _, _) = leaves[1];
+            for (source, item) in [leaves[0], leaves[1]].into_iter().enumerate() {
+                let ((_, addr), file, off) = item;
+                edit_relocations(&opt.data_file(file), |bytes, table, count| {
+                    bytes[off + 36..off + 44].fill(0);
+                    let base = off + mace::maintenance::BoxRef::DUMP_HDR_LEN;
+                    bytes[base + 8..base + 24].fill(0);
+                    if source == 0 {
+                        bytes[base + field..base + field + 8].copy_from_slice(&pid.to_le_bytes());
+                    }
+                    for i in 0..count {
+                        let r = table + i * 32;
+                        if u64::from_le_bytes(bytes[r..r + 8].try_into().unwrap()) == addr {
+                            let len = u32::from_le_bytes(bytes[r + 16..r + 20].try_into().unwrap())
+                                as usize;
+                            let crc = crc32c::crc32c(&bytes[off..off + len]);
+                            bytes[r + 28..r + 32].copy_from_slice(&crc.to_le_bytes());
+                        }
+                    }
+                });
+            }
+            let tree = BTree::open(opt.manifest()).unwrap();
+            tree.exec(&page_table_name(id), |tx| {
+                for (other, _) in &rows {
+                    if *other != ROOT_PID && *other != pid {
+                        tx.del(other.to_le_bytes())?;
+                    }
+                }
+                tx.put(ROOT_PID.to_le_bytes(), from.to_le_bytes())
+            })
+            .unwrap();
+            drop(tree);
+            let before = fingerprint(&root);
+            let raw = leak_check_reachable_for_test(&opt, id);
+            let typed = persisted_reachable_for_test(&opt, id);
+            assert_eq!(raw, typed);
+            assert!(raw.0.contains(&from));
+            assert!(raw.0.contains(&to));
+            assert!(!raw.1.is_empty());
+            assert_eq!(before, fingerprint(&root));
+            let fixed = leak_check_database(&opt, true);
+            assert!(fixed.report.is_ok(), "{fixed:?}");
+        }
+    }
+
+    #[test]
+    fn repaired_partial_live_files_are_rewritten_without_losing_fixed_views() {
+        for kind in FileKind::ALL {
+            let root = RandomPath::tmp();
+            let (mut opt, _) = seed_junk(&root);
+            let target = stats(&opt, kind)
+                .into_iter()
+                .find(|s| s.active_elems > 0 && !s.inactive_elems.is_empty())
+                .expect("partial live victim");
+            let source_path = if kind == FileKind::Data {
+                opt.data_file(target.file_id)
+            } else {
+                opt.blob_file(target.file_id)
+            };
+            let survivors: std::collections::BTreeSet<_> =
+                MetaReader::try_new(opt.fs(), source_path)
+                    .unwrap()
+                    .try_get_reloc()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| {
+                        let seq = r.val.seq;
+                        !target.inactive_elems.contains(&seq)
+                    })
+                    .map(|r| r.key)
+                    .collect();
+            let (leaked, _) = drop_one_inactive_mark_for_leak_test(&opt, kind, target.file_id);
+            let fixed = leak_check_database(&opt, true);
+            assert!(fixed.report.is_ok(), "{fixed:?}");
+            assert!(fixed.repairs[0].active_elems.1 > 0);
+            opt.gc_eager = true;
+            opt.data_garbage_ratio = 1;
+            opt.blob_garbage_ratio = 1;
+            if kind == FileKind::Data {
+                opt.data_file_size = target.active_size;
+            } else {
+                opt.blob_file_size = target.active_size;
+            }
+            let mace = Mace::new(opt.clone().validate().unwrap()).unwrap();
+            let db = mace.open_bucket("leaks").unwrap();
+            let old = db.view().unwrap();
+            assert_eq!(old.get("key_000").unwrap().slice(), &[0; 512]);
+            let tx = db.begin().unwrap();
+            tx.upsert("key_127", vec![42; 512]).unwrap();
+            tx.commit().unwrap();
+            db.checkpoint_and_wait();
+            mace.start_gc();
+            assert_eq!(old.get("key_127").unwrap().slice(), &[11; 512]);
+            let tx = db.begin().unwrap();
+            assert_eq!(tx.get("key_127").unwrap().slice(), &[42; 512]);
+            drop(tx);
+            drop(old);
+            db.checkpoint_and_wait();
+            mace.start_gc();
+            mace::testing::assert_persisted_gc_stats(&mace);
+            drop(db);
+            drop(mace);
+            let path = if kind == FileKind::Data {
+                opt.data_file(target.file_id)
+            } else {
+                opt.blob_file(target.file_id)
+            };
+            assert!(
+                !path.exists(),
+                "target victim was not physically collected: {}",
+                path.display()
+            );
+            let mut copied_survivors = std::collections::BTreeSet::new();
+            for stat in stats(&opt, kind) {
+                let path = if kind == FileKind::Data {
+                    opt.data_file(stat.file_id)
+                } else {
+                    opt.blob_file(stat.file_id)
+                };
+                let relocs = MetaReader::try_new(opt.fs(), path)
+                    .unwrap()
+                    .try_get_reloc()
+                    .unwrap();
+                copied_survivors.extend(
+                    relocs
+                        .iter()
+                        .map(|r| r.key)
+                        .filter(|addr| survivors.contains(addr)),
+                );
+                assert!(
+                    relocs.iter().all(|r| r.key != leaked),
+                    "replacement copied leaked address"
+                );
+            }
+            assert!(
+                survivors.is_subset(&copied_survivors),
+                "replacement lost target survivors: missing {:?}",
+                survivors.difference(&copied_survivors).collect::<Vec<_>>()
+            );
+            assert!(leak_check_database(&opt, false).report.is_ok());
+        }
+    }
+    #[test]
+    fn unsupported_engine_version_prevents_repair_of_real_missing_marks() {
+        let root = RandomPath::tmp();
+        let (opt, _) = seed_junk(&root);
+        let stat = stats(&opt, FileKind::Data)
+            .into_iter()
+            .find(|s| !s.inactive_elems.is_empty())
+            .unwrap();
+        drop_one_inactive_mark_for_leak_test(&opt, FileKind::Data, stat.file_id);
+        let tree = BTree::open(opt.manifest()).unwrap();
+        tree.exec(mace::maintenance::BUCKET_VERSION, |tx| {
+            tx.put(mace::maintenance::VERSION_KEY, 0u64.to_le_bytes())
+        })
+        .unwrap();
+        drop(tree);
+        let before = fingerprint(&root);
+        let report = leak_check_database(&opt, true);
+        assert!(report.repairs.is_empty());
+        assert!(
+            report
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.category == CheckCategory::BadVersion)
+        );
+        assert!(
+            !report
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.category == CheckCategory::JunkLeak)
+        );
+        assert_eq!(before, fingerprint(&root));
+    }
 }

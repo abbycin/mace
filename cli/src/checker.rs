@@ -1,11 +1,18 @@
-//! Read-only consistency checking of a mace database directory.
+//! Offline consistency and fixed-root leak checking of a mace database directory.
 //!
 //! The checker never constructs a [`mace::Mace`] instance: opening one runs
 //! writeback recovery (orphan cleanup, persisted-option writeback, epoch wipe) and
 //! starts the background services, none of which a checker may do. It reads the
 //! metadata store and the payload/WAL files directly and reports what it finds.
 //!
-//! Scope: a read-only metadata access path, manifest-level validation (version, global
+//! `check` and detection-only `leak-check` use read-only metadata access. Leak repair
+//! holds the exclusive metadata lock and only appends inactive marks to stat records,
+//! rebuilding their counts in one atomic transaction before a complete recheck. It
+//! requires a readable fixed-root closure and no updates beyond durable frontiers;
+//! unknown ownership or root-external mappings prevent classification and repair.
+//! Payloads, page tables, lifecycle metadata and WAL are never repaired.
+//!
+//! Scope: manifest-level validation (version, global
 //! options, bucket catalog), the cross-record consistency checks (intervals, stats, page
 //! tables, lifecycle records), the payload file checks and the WAL framing checks.
 //!
@@ -39,6 +46,7 @@ struct IntervalView {
 struct StatView {
     records: Vec<StatRecord>,
     undecodable: std::collections::HashSet<u64>,
+    unattributed: bool,
 }
 
 /// per-run state shared by the payload cross-checks: decoded relocation tables and the
@@ -116,18 +124,20 @@ impl PayloadChecks {
     }
 }
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use btree_store::{BTree, Error as BTreeError, OpenError};
 use mace::maintenance::{
     AddrPair, BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BUCKET_METAS, BUCKET_MISC,
     BUCKET_OBSOLETE_BLOB, BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, BUCKET_VERSION, BaseHeader,
-    BoxRef, BucketMeta, CURRENT_VERSION, DecompressorPool, DeltaHeader, EntryType, File, FileKind,
-    FileReader, GatherIO, IHeader, IMetaCodec, Interval, IntervalPair, MetaReader, NULL_ADDR,
-    NULL_PID, NodeType, OPTIONS_KEY, ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, OpCode,
-    Options, PayloadType, PersistStat, PersistedOptions, TagFlag, TagKind, VERSION_KEY, Varint32,
-    WAL_RECYCLE_PREFIX, WalAbort, WalCheckpoint, WalRecycleState, WalUpdate, interval_bucket_name,
-    page_table_name, ptr_to, try_new_reader, wal_record_sz,
+    BitMap, BoxRef, BucketDurableFrontier, BucketMeta, CURRENT_VERSION, DecompressorPool,
+    DeltaHeader, EntryType, File, FileKind, FileReader, GatherIO, IHeader, IMetaCodec, Interval,
+    IntervalPair, MetaReader, NULL_ADDR, NULL_PID, NodeType, OPTIONS_KEY,
+    ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, OpCode, Options, PayloadType,
+    PersistStat, PersistedOptions, Position, ROOT_PID, StatInner, TagFlag, TagKind, VERSION_KEY,
+    Varint32, WAL_RECYCLE_PREFIX, WalAbort, WalCheckpoint, WalRecycleState, WalUpdate,
+    interval_bucket_name, page_table_name, ptr_to, try_new_reader, wal_record_sz,
 };
 
 /// stable diagnostic categories reported by the checker
@@ -163,6 +173,10 @@ pub enum CheckCategory {
     BadPageTable,
     /// a readable page record points at an address no interval or relocation resolves
     BadPageChain,
+    /// unreachable retained records are missing from the inactive ledger
+    JunkLeak,
+    /// the persisted reference closure cannot be established safely
+    LeakUndecidable,
 }
 
 impl CheckCategory {
@@ -183,6 +197,8 @@ impl CheckCategory {
             Self::BadLifecycleState => "bad_lifecycle_state",
             Self::BadPageTable => "bad_page_table",
             Self::BadPageChain => "bad_page_chain",
+            Self::JunkLeak => "junk_leak",
+            Self::LeakUndecidable => "leak_undecidable",
         }
     }
 }
@@ -228,6 +244,31 @@ impl Diagnostic {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CheckReport {
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// one stat record changed by a successful leak repair
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairRecord {
+    pub bucket_id: u64,
+    pub file_id: u64,
+    pub kind: &'static str,
+    pub added_inactive: usize,
+    pub active_elems: (u32, u32),
+    pub active_size: (usize, usize),
+}
+
+/// final check result and any successfully committed leak repairs
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeakReport {
+    pub report: CheckReport,
+    pub repairs: Vec<RepairRecord>,
+    pub fault: Option<String>,
+}
+
+struct RepairPlan {
+    kind: FileKind,
+    stat: PersistStat,
+    record: RepairRecord,
 }
 
 impl CheckReport {
@@ -292,7 +333,12 @@ pub fn check_database(opt: &Options) -> CheckReport {
         report.sort();
         return report;
     };
-    if metadata_is_uninitialized(&btree) {
+    run_checks(opt, &btree, false).0
+}
+
+fn run_checks(opt: &Options, btree: &BTree, leak: bool) -> (CheckReport, Vec<RepairPlan>) {
+    let mut report = CheckReport::default();
+    if metadata_is_uninitialized(btree) {
         // btree-store creates the manifest file on open and the runtime treats the absence
         // of every metadata bucket as the bootstrap state
         // the metadata is uninitialized, so report this state once
@@ -302,18 +348,617 @@ pub fn check_database(opt: &Options) -> CheckReport {
             "the metadata store carries no version, options or bucket catalog yet".to_string(),
         );
         report.sort();
-        return report;
+        return (report, Vec::new());
     }
-    check_version(&btree, &mut report);
-    let tolerate_tail = check_options(&btree, &mut report);
-    check_bucket_catalog(&btree, &mut report);
+    check_version(btree, &mut report);
+    let version_readable = report.is_ok();
+    let tolerate_tail = check_options(btree, &mut report);
+    check_bucket_catalog(btree, &mut report);
     let mut checks = PayloadChecks::default();
-    check_bucket_metadata(opt, &btree, &mut checks, &mut report);
-    check_lifecycle(opt, &btree, &mut checks, &mut report);
+    check_bucket_metadata(opt, btree, &mut checks, &mut report);
+    let mut lifecycle = check_lifecycle(opt, btree, &mut checks, &mut report);
+    lifecycle.healthy &= version_readable;
     check_payload_files(opt, &mut checks, &mut report);
-    check_wal(opt, tolerate_tail, &mut report);
+    let wal = check_wal(opt, tolerate_tail, &lifecycle.frontiers, &mut report);
+    let repairs = if leak {
+        classify_database_leaks(opt, btree, &lifecycle, &wal, &mut checks, &mut report)
+    } else {
+        Vec::new()
+    };
     report.sort();
-    report
+    (report, repairs)
+}
+
+/// checks the fixed-root closure of a closed database, optionally repairing its stat ledger
+pub fn leak_check_database(opt: &Options, fix: bool) -> LeakReport {
+    let mut report = CheckReport::default();
+    let btree = if fix {
+        let path = opt.manifest();
+        match opt.fs().try_exists(&path) {
+            Ok(false) => {
+                report.push(
+                    CheckCategory::MissingMetadata,
+                    format!("metadata store {} is absent", path.display()),
+                );
+                report.sort();
+                return LeakReport {
+                    report,
+                    ..LeakReport::default()
+                };
+            }
+            Err(err) => {
+                report.push(
+                    CheckCategory::UnreadableMetadata,
+                    format!("cannot inspect {}: {err}", path.display()),
+                );
+                report.sort();
+                return LeakReport {
+                    report,
+                    ..LeakReport::default()
+                };
+            }
+            Ok(true) => {}
+        }
+        match BTree::open(path.clone()) {
+            Ok(btree) => btree,
+            Err(err) => {
+                if let Some(class) = classify_open_error(&err) {
+                    report.push_diagnostic((class.detail)(&err, &path));
+                } else {
+                    report.push(
+                        CheckCategory::UnreadableMetadata,
+                        format!("cannot open {}: {err:?}", path.display()),
+                    );
+                }
+                report.sort();
+                return LeakReport {
+                    report,
+                    ..LeakReport::default()
+                };
+            }
+        }
+    } else {
+        let Some(btree) = open_metadata_read_only(opt, &mut report) else {
+            report.sort();
+            return LeakReport {
+                report,
+                ..LeakReport::default()
+            };
+        };
+        btree
+    };
+    let (report, plans) = run_checks(opt, &btree, true);
+    if !fix || plans.is_empty() {
+        return LeakReport {
+            report,
+            ..LeakReport::default()
+        };
+    }
+    let prepared = match prepare_repairs(plans) {
+        Ok(prepared) => prepared,
+        Err(fault) => {
+            return LeakReport {
+                report,
+                fault: Some(fault),
+                ..LeakReport::default()
+            };
+        }
+    };
+    match write_repairs(&btree, &prepared) {
+        Ok(()) => {
+            let report = run_checks(opt, &btree, true).0;
+            let repairs = prepared
+                .into_iter()
+                .map(|(_, _, _, record)| record)
+                .collect();
+            LeakReport {
+                report,
+                repairs,
+                fault: None,
+            }
+        }
+        Err(fault) => LeakReport {
+            report,
+            fault: Some(fault),
+            ..LeakReport::default()
+        },
+    }
+}
+
+type PreparedRepair = (String, [u8; 8], Vec<u8>, RepairRecord);
+
+fn prepare_repairs(plans: Vec<RepairPlan>) -> Result<Vec<PreparedRepair>, String> {
+    let mut prepared = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let len = plan.stat.packed_size();
+        if len > btree_store::MAX_VAL_LEN {
+            return Err(format!(
+                "stat repair value is {len} bytes, exceeding btree-store's {} byte limit",
+                btree_store::MAX_VAL_LEN
+            ));
+        }
+        let mut encoded = vec![0; len];
+        plan.stat.encode(&mut encoded);
+        prepared.push((
+            stat_bucket(plan.kind).to_string(),
+            plan.stat.file_id.to_le_bytes(),
+            encoded,
+            plan.record,
+        ));
+    }
+    Ok(prepared)
+}
+
+fn write_repairs(btree: &BTree, prepared: &[PreparedRepair]) -> Result<(), String> {
+    if prepared.is_empty() {
+        return Ok(());
+    }
+    btree
+        .exec_multi(|multi| {
+            for (bucket, key, value, _) in prepared {
+                multi.exec(bucket, |txn| txn.put(key, value.clone()))?;
+            }
+            Ok(())
+        })
+        .map_err(|err| format!("repair transaction failed: {err:?}"))
+}
+
+fn stat_bucket(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Data => BUCKET_DATA_STAT,
+        FileKind::Blob => BUCKET_BLOB_STAT,
+    }
+}
+
+#[derive(Default)]
+struct LifecycleFacts {
+    catalog: Vec<u64>,
+    pending: HashSet<u64>,
+    blocked_files: HashSet<(FileKind, u64)>,
+    frontiers: HashMap<u64, BucketDurableFrontier>,
+    inventory_complete: bool,
+    healthy: bool,
+}
+
+#[derive(Default)]
+struct BucketReachable {
+    seen: BTreeSet<u64>,
+    blob_roots: BTreeSet<u64>,
+    outside: Vec<(u64, u64)>,
+}
+
+fn undecidable(bucket: u64, kind: FileKind, reason: impl std::fmt::Display) -> Diagnostic {
+    Diagnostic::new(
+        CheckCategory::LeakUndecidable,
+        format!("{kind:?}: {reason}"),
+    )
+    .with_bucket(bucket)
+}
+
+fn derive_bucket(
+    opt: &Options,
+    btree: &BTree,
+    bucket: u64,
+    kind: FileKind,
+    stats: &StatView,
+    checks: &mut PayloadChecks,
+    seeds: Option<&BTreeSet<u64>>,
+) -> Result<BucketReachable, Diagnostic> {
+    let mut index = HashMap::new();
+    for stat in stats.records.iter().filter(|stat| stat.bucket_id == bucket) {
+        let keys = match reloc_keys(opt, kind, stat.file_id, checks) {
+            FileRelocs::Keys(keys) => keys,
+            FileRelocs::Unreadable(reason) => {
+                return Err(undecidable(bucket, kind, reason).with_file(stat.file_id));
+            }
+        };
+        for &(addr, seq) in keys.iter() {
+            if index.insert(addr, (stat.file_id, seq)).is_some() {
+                return Err(undecidable(bucket, kind, "duplicate relocation address")
+                    .with_file(stat.file_id)
+                    .with_address(addr));
+            }
+        }
+    }
+    let mut mapping = BTreeMap::new();
+    let mut queue = Vec::new();
+    let mut pids = Vec::new();
+    if let Some(seeds) = seeds {
+        queue.extend(seeds);
+    } else {
+        let mut malformed = None;
+        btree
+            .view(&page_table_name(bucket), |txn| {
+                let mut iter = txn.iter();
+                let (mut key, mut value) = (Vec::new(), Vec::new());
+                while iter.next_ref(&mut key, &mut value) {
+                    let (Ok(key), Ok(value)) =
+                        (key.as_slice().try_into(), value.as_slice().try_into())
+                    else {
+                        malformed = Some("invalid page table row");
+                        continue;
+                    };
+                    mapping.insert(u64::from_le_bytes(key), u64::from_le_bytes(value));
+                }
+                Ok(())
+            })
+            .map_err(|err| undecidable(bucket, kind, format!("page table: {err:?}")))?;
+        if let Some(reason) = malformed {
+            return Err(undecidable(bucket, kind, reason));
+        }
+        pids.push(ROOT_PID);
+    }
+    let mut reached_pids = HashSet::new();
+    let mut result = BucketReachable::default();
+    loop {
+        for pid in pids.drain(..) {
+            let addr = mapping
+                .get(&pid)
+                .copied()
+                .filter(|addr| *addr != NULL_ADDR)
+                .ok_or_else(|| {
+                    undecidable(bucket, kind, format!("PID {pid} is missing or NULL"))
+                })?;
+            if reached_pids.insert(pid) {
+                queue.push(addr);
+            }
+        }
+        let Some(addr) = queue.pop() else { break };
+        if result.seen.contains(&addr) {
+            continue;
+        }
+        let &(file_id, _) = index.get(&addr).ok_or_else(|| {
+            undecidable(bucket, kind, "reference has no relocation").with_address(addr)
+        })?;
+        let reader = checks.reader(opt, kind, file_id).map_err(|err| {
+            undecidable(bucket, kind, format!("reader: {err:?}"))
+                .with_file(file_id)
+                .with_address(addr)
+        })?;
+        let page = reader.try_read_at(addr).map_err(|err| {
+            undecidable(bucket, kind, format!("page: {err:?}"))
+                .with_file(file_id)
+                .with_address(addr)
+        })?;
+        if page.header().link != NULL_ADDR {
+            queue.push(page.header().link);
+        }
+        if kind == FileKind::Data {
+            if !matches!(page.header().kind, TagKind::Base | TagKind::Delta) {
+                return Err(undecidable(bucket, kind, "invalid data page kind")
+                    .with_file(file_id)
+                    .with_address(addr));
+            }
+            for edge in page_edges(&page).map_err(|err| {
+                undecidable(bucket, kind, err)
+                    .with_file(file_id)
+                    .with_address(addr)
+            })? {
+                match edge {
+                    PageEdge::Child(pid) => pids.push(pid),
+                    PageEdge::Address(FileKind::Data, target) => queue.push(target),
+                    PageEdge::Address(FileKind::Blob, target) => {
+                        result.blob_roots.insert(target);
+                    }
+                }
+            }
+        } else if page.header().kind != TagKind::Remote {
+            return Err(undecidable(bucket, kind, "invalid blob page kind")
+                .with_file(file_id)
+                .with_address(addr));
+        }
+        result.seen.insert(addr);
+    }
+    result.outside = mapping
+        .into_iter()
+        .filter(|(pid, addr)| *addr != NULL_ADDR && !reached_pids.contains(pid))
+        .collect();
+    Ok(result)
+}
+
+fn classify_database_leaks(
+    opt: &Options,
+    btree: &BTree,
+    lifecycle: &LifecycleFacts,
+    wal: &WalFacts,
+    checks: &mut PayloadChecks,
+    report: &mut CheckReport,
+) -> Vec<RepairPlan> {
+    let stats = FileKind::ALL.map(|kind| read_stats(opt, btree, kind).0);
+    let mut repairs = Vec::new();
+    if lifecycle.inventory_complete {
+        for (kind, view) in FileKind::ALL.into_iter().zip(&stats) {
+            for stat in &view.records {
+                if !lifecycle.catalog.contains(&stat.bucket_id)
+                    && !lifecycle.pending.contains(&stat.bucket_id)
+                {
+                    report.push_diagnostic(
+                        Diagnostic::new(
+                            CheckCategory::BadLifecycleState,
+                            format!("{kind:?} stat has no catalog or pending-delete owner"),
+                        )
+                        .with_bucket(stat.bucket_id)
+                        .with_file(stat.file_id),
+                    );
+                }
+            }
+        }
+    }
+    for &bucket in &lifecycle.catalog {
+        if lifecycle.pending.contains(&bucket)
+            || (!stats.iter().any(|view| view.unattributed)
+                && !stats
+                    .iter()
+                    .any(|view| view.records.iter().any(|stat| stat.bucket_id == bucket)))
+        {
+            continue;
+        }
+        let mut data_complete = true;
+        let mut blob_roots = BTreeSet::new();
+        for (kind, view) in FileKind::ALL.into_iter().zip(&stats) {
+            let reason = if !lifecycle.healthy || !wal.healthy {
+                Some("lifecycle or WAL inventory is incomplete")
+            } else if !lifecycle.frontiers.contains_key(&bucket) {
+                Some("bucket frontier is missing")
+            } else if wal.pending_redo.contains(&bucket) {
+                Some("bucket has updates beyond its durable frontier")
+            } else if view.unattributed {
+                Some("stat ownership is incomplete")
+            } else if kind == FileKind::Blob && !data_complete {
+                Some("data closure is undecidable")
+            } else {
+                None
+            };
+            let derived = if let Some(reason) = reason {
+                Err(undecidable(bucket, kind, reason))
+            } else {
+                derive_bucket(
+                    opt,
+                    btree,
+                    bucket,
+                    kind,
+                    view,
+                    checks,
+                    (kind == FileKind::Blob).then_some(&blob_roots),
+                )
+            };
+            let closure = match derived {
+                Ok(closure) => closure,
+                Err(diagnostic) => {
+                    report.push_diagnostic(diagnostic);
+                    if kind == FileKind::Data {
+                        data_complete = false;
+                    }
+                    continue;
+                }
+            };
+            if let Some(&(pid, addr)) = closure.outside.first() {
+                report.push_diagnostic(
+                    undecidable(
+                        bucket,
+                        kind,
+                        format!("PID {pid} maps outside the fixed-root closure"),
+                    )
+                    .with_address(addr),
+                );
+                data_complete = false;
+                continue;
+            }
+            if kind == FileKind::Data {
+                blob_roots.clone_from(&closure.blob_roots);
+            }
+            match classify_leaks(
+                opt,
+                bucket,
+                kind,
+                view,
+                &closure.seen,
+                &lifecycle.blocked_files,
+                report,
+            ) {
+                Ok(plans) => repairs.extend(plans),
+                Err(diagnostic) => {
+                    report.push_diagnostic(diagnostic);
+                    if kind == FileKind::Data {
+                        data_complete = false;
+                    }
+                }
+            }
+        }
+    }
+    repairs
+}
+
+fn classify_leaks(
+    opt: &Options,
+    bucket: u64,
+    kind: FileKind,
+    stats: &StatView,
+    reachable: &BTreeSet<u64>,
+    blocked: &HashSet<(FileKind, u64)>,
+    report: &mut CheckReport,
+) -> Result<Vec<RepairPlan>, Diagnostic> {
+    let mut files = Vec::new();
+    for stat in stats.records.iter().filter(|stat| stat.bucket_id == bucket) {
+        let path = payload_path(opt, kind, stat.file_id);
+        let relocs = MetaReader::try_new(opt.fs(), &path)
+            .and_then(|mut reader| reader.try_get_reloc())
+            .map_err(|err| {
+                undecidable(bucket, kind, format!("relocation inventory: {err:?}"))
+                    .with_file(stat.file_id)
+            })?;
+        files.push((stat, relocs));
+    }
+    files.sort_by_key(|(stat, _)| stat.file_id);
+    let mut plans = Vec::new();
+    for (stat, relocs) in files {
+        let Some(mask) = &stat.mask else { continue };
+        let mut sequences = HashSet::new();
+        let mut accounting_valid = stat.total_elems as usize == relocs.len();
+        for entry in &relocs {
+            accounting_valid &=
+                entry.val.seq < relocs.len() as u32 && sequences.insert(entry.val.seq);
+        }
+        let original = PersistStat::decode(&stat.raw);
+        accounting_valid &= original.inactive_elems.len() == stat.inactive;
+        if !accounting_valid {
+            leak_bad_stat(
+                report,
+                bucket,
+                kind,
+                stat.file_id,
+                format!("{kind:?} sequence/mask/count does not match the relocation domain"),
+            );
+            continue;
+        }
+        let total_size: usize = relocs.iter().map(|e| e.val.active_len() as usize).sum();
+        let active_size: usize = relocs
+            .iter()
+            .filter(|e| !mask.test(e.val.seq))
+            .map(|e| e.val.active_len() as usize)
+            .sum();
+        if total_size != stat.total_size || active_size != stat.active_size {
+            leak_bad_stat(
+                report,
+                bucket,
+                kind,
+                stat.file_id,
+                format!(
+                    "{kind:?} byte totals disagree with relocations: total {} != {total_size}, active {} != {active_size}",
+                    stat.total_size, stat.active_size
+                ),
+            );
+        }
+        let mut leaked = Vec::new();
+        let mut overmarked = false;
+        let mut leak_bytes = 0usize;
+        let mut first_addr = None;
+        for entry in &relocs {
+            let addr = entry.key;
+            let seq = entry.val.seq;
+            match (reachable.contains(&addr), mask.test(seq)) {
+                (true, true) => {
+                    overmarked = true;
+                }
+                (false, false) => {
+                    leaked.push(seq);
+                    leak_bytes += entry.val.active_len() as usize;
+                    first_addr = Some(first_addr.map_or(addr, |old: u64| old.min(addr)));
+                }
+                _ => {}
+            }
+        }
+        if overmarked {
+            leak_bad_stat(
+                report,
+                bucket,
+                kind,
+                stat.file_id,
+                format!(
+                    "{kind:?} reachable relocation is marked inactive; file is excluded from repair"
+                ),
+            );
+        }
+        if let Some(addr) = first_addr {
+            report.push_diagnostic(
+                Diagnostic::new(
+                    CheckCategory::JunkLeak,
+                    format!(
+                        "{kind:?}: {} unreachable unmarked record(s), {leak_bytes} bytes",
+                        leaked.len()
+                    ),
+                )
+                .with_bucket(bucket)
+                .with_file(stat.file_id)
+                .with_address(addr),
+            );
+        }
+        if leaked.is_empty() || overmarked || blocked.contains(&(kind, stat.file_id)) {
+            continue;
+        }
+        let added_inactive = leaked.len();
+        let before = (stat.active_elems, stat.active_size);
+        let mut updated = original;
+        updated.inactive_elems.extend(leaked);
+        updated.inactive_elems.sort_unstable();
+        updated.inactive_elems.dedup();
+        let mut inactive = mask.clone();
+        for &seq in &updated.inactive_elems {
+            inactive.set(seq);
+        }
+        updated.active_elems = relocs.len() as u32 - updated.inactive_elems.len() as u32;
+        updated.active_size = relocs
+            .iter()
+            .filter(|e| !inactive.test(e.val.seq))
+            .map(|e| e.val.active_len() as usize)
+            .sum();
+        updated.total_elems = relocs.len() as u32;
+        updated.total_size = total_size;
+        plans.push(RepairPlan {
+            kind,
+            record: RepairRecord {
+                bucket_id: bucket,
+                file_id: stat.file_id,
+                kind: if kind == FileKind::Data {
+                    "data"
+                } else {
+                    "blob"
+                },
+                added_inactive,
+                active_elems: (before.0, updated.active_elems),
+                active_size: (before.1, updated.active_size),
+            },
+            stat: updated,
+        });
+    }
+    Ok(plans)
+}
+
+fn leak_bad_stat(report: &mut CheckReport, bucket: u64, kind: FileKind, file: u64, detail: String) {
+    let kind_prefix = format!("{kind:?}:");
+    if !report.diagnostics.iter().any(|d| {
+        d.category == CheckCategory::BadStatAccounting
+            && d.bucket_id == Some(bucket)
+            && d.file_id == Some(file)
+            && d.detail.starts_with(&kind_prefix)
+    }) {
+        report.push_diagnostic(
+            Diagnostic::new(CheckCategory::BadStatAccounting, detail)
+                .with_bucket(bucket)
+                .with_file(file),
+        );
+    }
+}
+
+/// returns the actual raw fixed-root closure, independently of the engine's typed oracle
+#[cfg(feature = "extra_check")]
+pub fn leak_check_reachable_for_test(
+    opt: &Options,
+    bucket_id: u64,
+) -> (BTreeSet<u64>, BTreeSet<u64>) {
+    let btree = BTree::open_read_only(opt.manifest()).expect("read-only manifest");
+    let mut checks = PayloadChecks::default();
+    let data = derive_bucket(
+        opt,
+        &btree,
+        bucket_id,
+        FileKind::Data,
+        &read_stats(opt, &btree, FileKind::Data).0,
+        &mut checks,
+        None,
+    )
+    .expect("data closure");
+    let blob = derive_bucket(
+        opt,
+        &btree,
+        bucket_id,
+        FileKind::Blob,
+        &read_stats(opt, &btree, FileKind::Blob).0,
+        &mut checks,
+        Some(&data.blob_roots),
+    )
+    .expect("blob closure");
+    (data.seen, blob.seen)
 }
 
 /// validates every data/blob file on its own terms: footer and table framing, table
@@ -368,7 +1013,11 @@ fn check_lifecycle(
     btree: &BTree,
     checks: &mut PayloadChecks,
     report: &mut CheckReport,
-) {
+) -> LifecycleFacts {
+    let mut facts = LifecycleFacts {
+        healthy: true,
+        ..LifecycleFacts::default()
+    };
     let mut catalog = Vec::new();
     let mut pending = Vec::new();
     let mut frontiers = Vec::new();
@@ -388,7 +1037,22 @@ fn check_lifecycle(
                 let (mut key, mut value) = (Vec::new(), Vec::new());
                 while iter.next_ref(&mut key, &mut value) {
                     if let Ok(bytes) = <[u8; 8]>::try_from(&key[..]) {
-                        out.push(u64::from_le_bytes(bytes));
+                        let id = u64::from_le_bytes(bytes);
+                        out.push(id);
+                        if bucket == BUCKET_FRONTIER {
+                            if value.len() >= size_of::<BucketDurableFrontier>() {
+                                let frontier = BucketDurableFrontier::decode(&value);
+                                if frontier.bucket_id == id {
+                                    facts.frontiers.insert(id, frontier);
+                                } else {
+                                    facts.healthy = false;
+                                }
+                            } else {
+                                facts.healthy = false;
+                            }
+                        }
+                    } else {
+                        facts.healthy = false;
                     }
                 }
                 Ok(())
@@ -451,9 +1115,12 @@ fn check_lifecycle(
             CheckCategory::UnreadableMetadata,
             format!("cannot scan the lifecycle records: {err:?}"),
         );
-        return;
+        facts.healthy = false;
+        return facts;
     }
+    facts.inventory_complete = true;
     for key in &undecodable_recycle {
+        facts.healthy = false;
         report.push(
             CheckCategory::UnreadableMetadata,
             format!(
@@ -471,16 +1138,11 @@ fn check_lifecycle(
 
     // the stat scan diagnostics were already reported by `check_bucket_metadata`, which
     // runs first; this phase only needs the identities
-    let stats: Vec<(FileKind, u64)> = FileKind::ALL
-        .iter()
-        .flat_map(|kind| {
-            read_stats(opt, btree, *kind)
-                .0
-                .records
-                .into_iter()
-                .map(move |stat| (*kind, stat.file_id))
-        })
-        .collect();
+    let mut stats = Vec::new();
+    for kind in FileKind::ALL {
+        let view = read_stats(opt, btree, kind).0;
+        stats.extend(view.records.into_iter().map(|stat| (kind, stat.file_id)));
+    }
 
     for (kind, file_id) in &orphans {
         checks.mark_referenced(*kind, *file_id);
@@ -565,6 +1227,7 @@ fn check_lifecycle(
             && let Some(first) = oldest.get(&state.group_id)
             && *first != state.to_file_id
         {
+            facts.healthy = false;
             report.push_diagnostic(
                 Diagnostic::new(
                     CheckCategory::BadLifecycleState,
@@ -577,6 +1240,11 @@ fn check_lifecycle(
             );
         }
     }
+    facts.catalog = catalog;
+    facts.pending.extend(pending);
+    facts.blocked_files.extend(orphans);
+    facts.blocked_files.extend(obsolete);
+    facts
 }
 
 /// validates the page table of one bucket: every mapped logical address must be covered
@@ -653,7 +1321,10 @@ fn check_page_table(
         // the covering interval names the file; the address must be relocated there
         match reloc_keys(opt, FileKind::Data, interval.file_id, checks) {
             FileRelocs::Keys(keys) => {
-                if keys.binary_search(&address).is_err() {
+                if keys
+                    .binary_search_by_key(&address, |entry| entry.0)
+                    .is_err()
+                {
                     report.push_diagnostic(
                         Diagnostic::new(
                             CheckCategory::BadPageTable,
@@ -858,9 +1529,10 @@ fn value_edges(raw: &[u8]) -> Result<Vec<(FileKind, u64)>, &'static str> {
     let mut edges = Vec::new();
     if has_hist {
         let addr = u64::from_le_bytes(raw[6..14].try_into().map_err(|_| "history address")?);
-        if addr != NULL_ADDR {
-            edges.push((FileKind::Data, addr));
+        if addr == NULL_ADDR {
+            return Err("history reference has a NULL address");
         }
+        edges.push((FileKind::Data, addr));
     }
     if remote {
         if data_off + 8 > raw.len() {
@@ -871,9 +1543,10 @@ fn value_edges(raw: &[u8]) -> Result<Vec<(FileKind, u64)>, &'static str> {
                 .try_into()
                 .map_err(|_| "remote address")?,
         );
-        if addr != NULL_ADDR {
-            edges.push((FileKind::Blob, addr));
+        if addr == NULL_ADDR {
+            return Err("remote reference has a NULL address");
         }
+        edges.push((FileKind::Blob, addr));
     } else if data_off
         .checked_add(data_len)
         .is_none_or(|end| end > raw.len())
@@ -1059,11 +1732,18 @@ fn page_edges(page: &BoxRef) -> Result<Vec<PageEdge>, &'static str> {
 
 /// one persisted per-file stat record, decoded for the cross-record checks
 struct StatRecord {
-    file_id: u64,
-    bucket_id: u64,
-    total_elems: u32,
-    active_elems: u32,
+    inner: StatInner,
+    raw: Vec<u8>,
+    mask: Option<BitMap>,
     inactive: usize,
+}
+
+impl std::ops::Deref for StatRecord {
+    type Target = StatInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 /// validates the per-bucket cross-record chain:
@@ -1104,12 +1784,20 @@ fn check_bucket_metadata(
         for bucket_id in &bucket_ids {
             let intervals = read_intervals(btree, kind, *bucket_id, report);
             bucket_intervals.insert((kind, *bucket_id), intervals);
+            // the traversal budget must not depend on the stat mask: a damaged mask still
+            // leaves a readable relocation table whose length is a safe page-count bound
             let budget = stats
                 .records
                 .iter()
                 .filter(|stat| stat.bucket_id == *bucket_id)
-                .map(|stat| stat.total_elems as usize)
-                .sum::<usize>();
+                .filter_map(|stat| match reloc_keys(opt, kind, stat.file_id, checks) {
+                    FileRelocs::Keys(keys) => Some(keys.len()),
+                    FileRelocs::Unreadable(_) if !stats.undecodable.contains(&stat.file_id) => {
+                        Some(stat.total_elems as usize)
+                    }
+                    FileRelocs::Unreadable(_) => None,
+                })
+                .fold(0usize, usize::saturating_add);
             *bucket_budget.entry(*bucket_id).or_insert(0) += budget;
             let intervals = bucket_intervals.get(&(kind, *bucket_id)).unwrap();
             check_intervals_against_stats(opt, kind, *bucket_id, intervals, &stats, checks, report);
@@ -1117,7 +1805,7 @@ fn check_bucket_metadata(
                 check_page_table(opt, btree, *bucket_id, intervals, checks, report);
             }
         }
-        check_stats_against_files(opt, kind, &stats.records, checks, report);
+        check_stats_against_files(opt, kind, &stats, checks, report);
     }
     for bucket_id in bucket_ids {
         let empty_data = IntervalView::default();
@@ -1175,6 +1863,7 @@ fn read_stats(opt: &Options, btree: &BTree, kind: FileKind) -> (StatView, Vec<Di
         FileKind::Blob => BUCKET_BLOB_STAT,
     };
     let mut records = Vec::new();
+    let mut unattributed = false;
     let outcome = btree.view(bucket, |txn| {
         let mut iter = txn.iter();
         let mut key = Vec::new();
@@ -1183,6 +1872,7 @@ fn read_stats(opt: &Options, btree: &BTree, kind: FileKind) -> (StatView, Vec<Di
             let inner = match PersistStat::try_decode_inner_only(&value) {
                 Ok(inner) => inner,
                 Err(err) => {
+                    unattributed = true;
                     // the record is undecodable, so locate it by its key instead
                     let mut diagnostic = Diagnostic::new(
                         CheckCategory::BadStatAccounting,
@@ -1198,6 +1888,10 @@ fn read_stats(opt: &Options, btree: &BTree, kind: FileKind) -> (StatView, Vec<Di
                     continue;
                 }
             };
+            match <[u8; 8]>::try_from(&key[..]) {
+                Ok(bytes) if u64::from_le_bytes(bytes) == inner.file_id => {}
+                _ => unattributed = true,
+            }
             // a payload file that cannot be opened is reported by the payload phase, and
             // its record's mask cannot be bounded by the file, so the mask is not decoded
             // here: the stat record is kept for the identity checks and the mask-derived
@@ -1205,20 +1899,18 @@ fn read_stats(opt: &Options, btree: &BTree, kind: FileKind) -> (StatView, Vec<Di
             let path = payload_path(opt, kind, inner.file_id);
             let Ok(file_len) = payload_file_len(opt, &path) else {
                 records.push(StatRecord {
-                    file_id: inner.file_id,
-                    bucket_id: inner.bucket_id,
-                    total_elems: inner.total_elems,
-                    active_elems: inner.active_elems,
+                    inner,
+                    raw: value.clone(),
+                    mask: None,
                     inactive: 0,
                 });
                 continue;
             };
             if MetaReader::try_new(opt.fs(), &path).is_err() {
                 records.push(StatRecord {
-                    file_id: inner.file_id,
-                    bucket_id: inner.bucket_id,
-                    total_elems: inner.total_elems,
-                    active_elems: inner.active_elems,
+                    inner,
+                    raw: value.clone(),
+                    mask: None,
                     inactive: 0,
                 });
                 continue;
@@ -1240,6 +1932,12 @@ fn read_stats(opt: &Options, btree: &BTree, kind: FileKind) -> (StatView, Vec<Di
                     .with_bucket(inner.bucket_id)
                     .with_file(inner.file_id),
                 );
+                records.push(StatRecord {
+                    inner,
+                    raw: value.clone(),
+                    mask: None,
+                    inactive: 0,
+                });
                 continue;
             }
             let mask = match PersistStat::try_decode_mask_only(&value, inner.total_elems) {
@@ -1254,20 +1952,26 @@ fn read_stats(opt: &Options, btree: &BTree, kind: FileKind) -> (StatView, Vec<Di
                         .with_bucket(inner.bucket_id)
                         .with_file(inner.file_id),
                     );
+                    records.push(StatRecord {
+                        inner,
+                        raw: value.clone(),
+                        mask: None,
+                        inactive: 0,
+                    });
                     continue;
                 }
             };
             records.push(StatRecord {
-                file_id: inner.file_id,
-                bucket_id: inner.bucket_id,
-                total_elems: inner.total_elems,
-                active_elems: inner.active_elems,
+                inner,
+                raw: value.clone(),
                 inactive: mask.set_bits(inner.total_elems).len(),
+                mask: Some(mask),
             });
         }
         Ok(())
     });
     if let Err(err) = outcome {
+        unattributed = true;
         diagnostics.push(Diagnostic::new(
             CheckCategory::UnreadableMetadata,
             format!("cannot scan {bucket}: {err:?}"),
@@ -1277,6 +1981,7 @@ fn read_stats(opt: &Options, btree: &BTree, kind: FileKind) -> (StatView, Vec<Di
         StatView {
             records,
             undecodable,
+            unattributed,
         },
         diagnostics,
     )
@@ -1337,7 +2042,7 @@ enum FileRelocs {
     /// the table decoded, sorted by key so the lookups can binary search it. the cache hands out
     /// a shared handle: a page-table row or interval check resolves one of these per item, and
     /// copying the vector each time costs O(entries) per row
-    Keys(Arc<[u64]>),
+    Keys(Arc<[(u64, u32)]>),
     /// the file could not be read at all, with the reason
     Unreadable(Arc<str>),
 }
@@ -1359,7 +2064,10 @@ fn reloc_keys(
     };
     let outcome = MetaReader::try_new(opt.fs(), &path).and_then(|mut reader| {
         reader.try_get_reloc().map(|relocs| {
-            let mut keys = relocs.iter().map(|reloc| reloc.key).collect::<Vec<u64>>();
+            let mut keys = relocs
+                .iter()
+                .map(|reloc| (reloc.key, reloc.val.seq))
+                .collect::<Vec<_>>();
             // the lookups below binary search this vector, so it is sorted here rather than
             // trusted: a damaged table can be out of order, and that damage is reported on its
             // own by `check_relocations`, which reads the table in file order
@@ -1429,7 +2137,10 @@ fn check_intervals_against_stats(
         }
         match reloc_keys(opt, kind, file_id, checks) {
             FileRelocs::Keys(keys) => {
-                if keys.binary_search(&interval.lo_addr).is_err() {
+                if keys
+                    .binary_search_by_key(&interval.lo_addr, |entry| entry.0)
+                    .is_err()
+                {
                     report.push_diagnostic(
                         Diagnostic::new(
                             CheckCategory::BadInterval,
@@ -1451,11 +2162,15 @@ fn check_intervals_against_stats(
 fn check_stats_against_files(
     opt: &Options,
     kind: FileKind,
-    stats: &[StatRecord],
+    stats: &StatView,
     checks: &mut PayloadChecks,
     report: &mut CheckReport,
 ) {
-    for stat in stats {
+    for stat in stats
+        .records
+        .iter()
+        .filter(|stat| !stats.undecodable.contains(&stat.file_id))
+    {
         let keys = match reloc_keys(opt, kind, stat.file_id, checks) {
             FileRelocs::Keys(keys) => keys,
             FileRelocs::Unreadable(reason) => {
@@ -1507,17 +2222,33 @@ fn check_stats_against_files(
 /// non-last segment: recovery truncates there and silently drops the rest of the stream,
 /// while the checker reports `BadWal`, because a hole in the middle of a retained stream
 /// is damage an operator must see.
-fn check_wal(opt: &Options, tolerate_tail: bool, report: &mut CheckReport) {
+#[derive(Default)]
+struct WalFacts {
+    pending_redo: HashSet<u64>,
+    healthy: bool,
+}
+
+fn check_wal(
+    opt: &Options,
+    tolerate_tail: bool,
+    frontiers: &HashMap<u64, BucketDurableFrontier>,
+    report: &mut CheckReport,
+) -> WalFacts {
+    let mut facts = WalFacts {
+        healthy: true,
+        ..WalFacts::default()
+    };
     let log_root = opt.log_root();
     let entries = match opt.fs().read_dir(&log_root) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return facts,
         Err(err) => {
             report.push(
                 CheckCategory::UnreadableMetadata,
                 format!("cannot list {}: {err}", log_root.display()),
             );
-            return;
+            facts.healthy = false;
+            return facts;
         }
     };
     let mut segments: Vec<(u8, u64, std::path::PathBuf)> = Vec::new();
@@ -1537,6 +2268,7 @@ fn check_wal(opt: &Options, tolerate_tail: bool, report: &mut CheckReport) {
             && previous_physical == *physical_id
             && *file_id != previous_id + 1
         {
+            facts.healthy = false;
             report.push_diagnostic(
                 Diagnostic::new(
                     CheckCategory::BadWal,
@@ -1556,16 +2288,18 @@ fn check_wal(opt: &Options, tolerate_tail: bool, report: &mut CheckReport) {
             .map(|(_, id, _)| *id)
             .max()
             == Some(*file_id);
-        check_wal_segment(
+        let segment = check_wal_segment(
             opt,
             path,
-            *physical_id,
-            *file_id,
-            is_last,
+            (*physical_id, *file_id, is_last),
             tolerate_tail,
+            frontiers,
             report,
         );
+        facts.healthy &= segment.healthy;
+        facts.pending_redo.extend(segment.pending_redo);
     }
+    facts
 }
 
 /// parses `wal_<group>_<seq>` / `group_wal_<seq>` into `(physical stream, file id)`
@@ -1587,12 +2321,16 @@ fn wal_segment_name(name: &str) -> Option<(u8, u64)> {
 fn check_wal_segment(
     opt: &Options,
     path: &std::path::Path,
-    physical_id: u8,
-    file_id: u64,
-    is_last: bool,
+    segment: (u8, u64, bool),
     tolerate_tail: bool,
+    frontiers: &HashMap<u64, BucketDurableFrontier>,
     report: &mut CheckReport,
-) {
+) -> WalFacts {
+    let (physical_id, file_id, is_last) = segment;
+    let mut facts = WalFacts {
+        healthy: true,
+        ..WalFacts::default()
+    };
     let data = match read_segment(opt, path) {
         Ok(data) => data,
         Err(err) => {
@@ -1603,13 +2341,40 @@ fn check_wal_segment(
                 )
                 .with_file(file_id),
             );
-            return;
+            facts.healthy = false;
+            return facts;
         }
     };
     let mut offset = 0usize;
     while offset < data.len() {
         let reason = match wal_record_len(&data, offset) {
             Ok(len) => {
+                if EntryType::try_from(data[offset]) == Ok(EntryType::Update) {
+                    let update = ptr_to::<WalUpdate>(unsafe { data.as_ptr().add(offset) });
+                    let bucket_id = update.bucket_id;
+                    let group = update.group_id as usize;
+                    if group >= Options::MAX_CONCURRENT_WRITE as usize {
+                        facts.healthy = false;
+                        report.push_diagnostic(
+                            Diagnostic::new(
+                                CheckCategory::BadWal,
+                                format!(
+                                    "stream {physical_id} segment {file_id} has out-of-range group id {group}"
+                                ),
+                            )
+                            .with_file(file_id)
+                            .with_address(offset as u64),
+                        );
+                    } else {
+                        let frontier = frontiers
+                            .get(&bucket_id)
+                            .map(|f| f.lsn[group])
+                            .unwrap_or(Position::MIN);
+                        if Position::new(file_id, offset as u64) > frontier {
+                            facts.pending_redo.insert(bucket_id);
+                        }
+                    }
+                }
                 offset += len;
                 continue;
             }
@@ -1619,6 +2384,7 @@ fn check_wal_segment(
         // a finding when the stream continues after it, or when truncation is disabled
         let tolerated = is_last && tolerate_tail;
         if !tolerated {
+            facts.healthy = false;
             report.push_diagnostic(
                 Diagnostic::new(
                     CheckCategory::BadWal,
@@ -1630,8 +2396,9 @@ fn check_wal_segment(
                 .with_address(offset as u64),
             );
         }
-        return;
+        return facts;
     }
+    facts
 }
 
 /// length of the record starting at `offset`, or the reason it does not frame/checksum
@@ -2176,6 +2943,77 @@ mod tests {
     #[cfg(feature = "extra_check")]
     use std::sync::Arc;
 
+    #[test]
+    fn one_overmarked_live_record_and_one_unmarked_dead_record_cannot_become_obsolete() {
+        use super::*;
+        use mace::maintenance::IAsSlice;
+        for kind in FileKind::ALL {
+            let root = RandomPath::tmp();
+            let opt = Options::new(&*root);
+            let path = payload_path(&opt, kind, 1);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut bytes = Vec::new();
+            for (seq, addr) in [10, 20].into_iter().enumerate() {
+                bytes.extend_from_slice(AddrPair::new(addr, 0, 1, 0, seq as u32, 0).as_slice());
+            }
+            let mut footer = [0u8; 24];
+            footer[..2].copy_from_slice(&1u16.to_le_bytes());
+            footer[8..12].copy_from_slice(&2u32.to_le_bytes());
+            footer[16..20].copy_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
+            bytes.extend_from_slice(&footer);
+            std::fs::write(path, bytes).unwrap();
+            let stat = PersistStat {
+                inner: StatInner {
+                    file_id: 1,
+                    bucket_id: 1,
+                    up1: 5,
+                    up2: 7,
+                    total_elems: 2,
+                    active_elems: 1,
+                    total_size: 2,
+                    active_size: 1,
+                },
+                inactive_elems: vec![0],
+            };
+            let mut raw = vec![0; stat.packed_size()];
+            stat.encode(&mut raw);
+            let mask = PersistStat::try_decode_mask_only(&raw, 2).unwrap();
+            let view = StatView {
+                records: vec![StatRecord {
+                    inner: stat.inner,
+                    raw,
+                    mask: Some(mask),
+                    inactive: 1,
+                }],
+                ..Default::default()
+            };
+            let mut report = CheckReport::default();
+            let plans = classify_leaks(
+                &opt,
+                1,
+                kind,
+                &view,
+                &BTreeSet::from([10]),
+                &HashSet::new(),
+                &mut report,
+            )
+            .unwrap();
+            assert!(plans.is_empty());
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.category == CheckCategory::JunkLeak)
+            );
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.category == CheckCategory::BadStatAccounting)
+            );
+        }
+    }
+
     /// every category keeps its published name: the CLI prints these strings
     #[test]
     fn category_names_are_stable() {
@@ -2194,6 +3032,8 @@ mod tests {
             CheckCategory::BadLifecycleState,
             CheckCategory::BadPageTable,
             CheckCategory::BadPageChain,
+            CheckCategory::JunkLeak,
+            CheckCategory::LeakUndecidable,
         ]
         .iter()
         .map(|category| category.name())
@@ -2214,8 +3054,27 @@ mod tests {
                 "bad_stat_accounting",
                 "bad_lifecycle_state",
                 "bad_page_table",
-                "bad_page_chain"
+                "bad_page_chain",
+                "junk_leak",
+                "leak_undecidable"
             ]
+        );
+    }
+
+    #[test]
+    fn flagged_null_value_references_are_rejected() {
+        let mut history = vec![0; 20];
+        history[0] = 0x80;
+        assert_eq!(
+            super::value_edges(&history),
+            Err("history reference has a NULL address")
+        );
+
+        let mut remote = vec![0; 14];
+        remote[0] = 0x10;
+        assert_eq!(
+            super::value_edges(&remote),
+            Err("remote reference has a NULL address")
         );
     }
 
@@ -2225,7 +3084,7 @@ mod tests {
     fn relocation_cache_hands_out_shared_handles() {
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
-        seed(&root);
+        seed_with_data(&root);
         let opt = Options::new(&*root);
         let mut checks = super::PayloadChecks::default();
         let first = super::reloc_keys(&opt, mace::maintenance::FileKind::Data, 4096, &mut checks);
@@ -3022,6 +3881,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_checksum_valid_out_of_range_group_id_is_reported() {
+        use mace::maintenance::{EntryType, WalUpdate, ptr_to, wal_record_sz};
+
+        let root = RandomPath::tmp();
+        std::fs::create_dir_all(&*root).expect("scratch dir");
+        seed_with_data_strict_wal(&root);
+        let opt = Options::new(&*root);
+        let segment = std::fs::read_dir(opt.log_root())
+            .expect("log root")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("group_wal_"))
+            })
+            .expect("fixture must write a shared wal segment");
+        let mut data = std::fs::read(&segment).expect("read segment");
+        let mut offset = 0usize;
+        let mut changed = false;
+        while offset < data.len() {
+            let kind = EntryType::try_from(data[offset]).expect("valid WAL kind");
+            let header_len = wal_record_sz(kind).expect("known WAL size");
+            if offset + header_len > data.len() {
+                break;
+            }
+            if kind == EntryType::Update {
+                let update = ptr_to::<WalUpdate>(unsafe { data.as_ptr().add(offset) });
+                let payload_len = WalUpdate::checked_payload_len(update.size).expect("payload");
+                let total_len = WalUpdate::checked_encoded_len(payload_len).expect("record");
+                if offset + total_len > data.len() {
+                    break;
+                }
+                let record = &mut data[offset..offset + total_len];
+                record[std::mem::offset_of!(WalUpdate, group_id)] = u8::MAX;
+                let update = ptr_to::<WalUpdate>(record.as_ptr());
+                let checksum = update.calc_checksum();
+                let checksum_offset = std::mem::offset_of!(WalUpdate, checksum);
+                unsafe {
+                    (record.as_mut_ptr().add(checksum_offset) as *mut u32)
+                        .write_unaligned(checksum);
+                }
+                changed = true;
+                break;
+            }
+            offset += header_len;
+        }
+        assert!(changed, "fixture must contain an update record");
+        std::fs::write(&segment, &data).expect("write crafted segment");
+
+        let mut strict = Options::new(&*root);
+        strict.truncate_corrupted_wal = false;
+        let report = check_database(&strict);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.category == CheckCategory::BadWal
+                    && diagnostic.detail.contains("out-of-range group id 255")
+                    && diagnostic.address.is_some()
+            }),
+            "an out-of-range group id must identify the WAL record: {report:?}"
+        );
+    }
+
+    #[test]
+    fn stat_diagnostics_are_deduplicated_per_file_kind() {
+        use super::*;
+
+        let mut report = CheckReport::default();
+        leak_bad_stat(&mut report, 1, FileKind::Data, 7, "Data: first".to_string());
+        leak_bad_stat(
+            &mut report,
+            1,
+            FileKind::Data,
+            7,
+            "Data: duplicate".to_string(),
+        );
+        leak_bad_stat(
+            &mut report,
+            1,
+            FileKind::Blob,
+            7,
+            "Blob: same file id".to_string(),
+        );
+        assert_eq!(report.diagnostics.len(), 2);
+        assert!(report.diagnostics.iter().any(|d| d.detail == "Data: first"));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.detail == "Blob: same file id")
+        );
+    }
+
     /// a checksum mismatch inside a well-framed record is reported (the damage the
     /// tail rule must not hide)
     #[test]
@@ -3242,6 +4195,54 @@ mod tests {
         );
     }
 
+    /// a damaged stat mask must not reduce the readable page-chain budget to zero
+    #[test]
+    fn a_damaged_stat_mask_does_not_exhaust_page_chain_budget() {
+        use mace::maintenance::{BUCKET_DATA_STAT, PersistStat};
+
+        let root = RandomPath::tmp();
+        std::fs::create_dir_all(&*root).expect("scratch dir");
+        seed_with_data(&root);
+        let opt = Options::new(&*root);
+        let btree = btree_store::BTree::open(opt.manifest()).expect("open manifest");
+        let (key, mut value) = btree
+            .view(BUCKET_DATA_STAT, |txn| {
+                let mut iter = txn.iter();
+                let (mut key, mut value) = (Vec::new(), Vec::new());
+                let found = iter.next_ref(&mut key, &mut value);
+                Ok(found.then_some((key, value)))
+            })
+            .expect("stat scan")
+            .expect("stat record");
+        assert!(
+            value.len() > PersistStat::stat_inner_offset(),
+            "fixture must carry a stat"
+        );
+        // make the encoded inactive sequence count exceed the available record body
+        value[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        btree
+            .exec(BUCKET_DATA_STAT, |txn| txn.put(&key, &value))
+            .expect("damage stat mask");
+        drop(btree);
+
+        let report = check_database(&opt);
+
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.category == CheckCategory::BadStatAccounting),
+            "the damaged mask must be reported: {report:?}"
+        );
+        assert!(
+            !report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.category == CheckCategory::BadPageChain
+                    && diagnostic.detail.contains("budget exhausted")
+            }),
+            "a readable relocation table must preserve the page-chain budget: {report:?}"
+        );
+    }
+
     /// a duplicated bucket id is located by bucket id and the report is ordered
     #[test]
     fn a_duplicated_bucket_id_is_located_and_ordered() {
@@ -3417,5 +4418,61 @@ mod tests {
             })
             .count();
         assert_eq!(writes, 0, "a check run must not perform namespace writes");
+    }
+    fn repair_record() -> super::RepairRecord {
+        super::RepairRecord {
+            bucket_id: 1,
+            file_id: 1,
+            kind: "data",
+            added_inactive: 1,
+            active_elems: (2, 1),
+            active_size: (2, 1),
+        }
+    }
+
+    #[test]
+    fn repair_transaction_rolls_back_earlier_records_on_returned_error() {
+        let root = RandomPath::tmp();
+        std::fs::create_dir_all(&*root).unwrap();
+        let tree = btree_store::BTree::open(root.join("manifest")).unwrap();
+        tree.new_bucket("present", false).unwrap();
+        let key = 1u64.to_le_bytes();
+        tree.exec("present", |tx| tx.put(key, b"old")).unwrap();
+        let prepared = vec![
+            ("present".to_string(), key, b"new".to_vec(), repair_record()),
+            ("missing".to_string(), key, b"new".to_vec(), repair_record()),
+        ];
+        let fault = super::write_repairs(&tree, &prepared);
+        assert!(fault.is_err());
+        tree.view("present", |tx| {
+            assert_eq!(tx.get(key)?, b"old");
+            Ok(())
+        })
+        .unwrap();
+        super::write_repairs(&tree, &[]).unwrap();
+    }
+
+    #[test]
+    fn oversized_repair_is_rejected_before_a_transaction() {
+        use mace::maintenance::{FileKind, PersistStat, StatInner};
+        let stat = PersistStat {
+            inner: StatInner {
+                file_id: 1,
+                bucket_id: 1,
+                up1: 0,
+                up2: 0,
+                active_elems: 1,
+                total_elems: 1,
+                active_size: 1,
+                total_size: 1,
+            },
+            inactive_elems: vec![0; btree_store::MAX_VAL_LEN / 4 + 1],
+        };
+        let result = super::prepare_repairs(vec![super::RepairPlan {
+            kind: FileKind::Data,
+            stat,
+            record: repair_record(),
+        }]);
+        assert!(result.is_err());
     }
 }

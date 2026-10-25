@@ -13,12 +13,12 @@ use crate::meta::{
     FileKind, IMetaCodec, IntervalPair, PersistStat, interval_bucket_name, page_table_name,
     stat_file_path, stat_intervals,
 };
-use crate::types::data::{Key, Val, Ver};
+use crate::types::data::{Index, IntlKey, Key, Val, Ver};
 use crate::types::header::{NodeType, RemoteHeader, TagFlag, TagKind};
 use crate::types::refbox::BoxRef;
-use crate::types::traits::IHeader;
+use crate::types::traits::{IDecode, IHeader};
 use crate::utils::compress::DecompressorPool;
-use crate::utils::{Handle, NULL_ADDR};
+use crate::utils::{Handle, NULL_ADDR, NULL_PID, ROOT_PID};
 use crate::{Bucket, OpCode, Options, TxnKV, TxnView};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -605,42 +605,93 @@ fn assert_persisted_reachability(
     let manifest = &mace.inner.store.manifest;
     let blob_stats = load_persisted_stats(mace, FileKind::Blob);
     let blob_relocs = load_reloc_index(mace, FileKind::Blob, &blob_stats);
-    let decoders = DecompressorPool::new();
-    let mut readers = BTreeMap::new();
-    let mut pending_data = Vec::new();
     let mut reachable_data = BTreeSet::new();
     let mut reachable_blob = BTreeSet::new();
-
     let bucket_ids = data_stats
         .values()
         .map(|stat| stat.bucket_id)
         .collect::<BTreeSet<_>>();
     for bucket_id in bucket_ids {
-        manifest
-            .btree
-            .view(&page_table_name(bucket_id), |txn| {
-                let mut iter = txn.iter();
-                let mut key = Vec::new();
-                let mut value = Vec::new();
-                while iter.next_ref(&mut key, &mut value) {
-                    let addr = u64::from_le_bytes(
-                        value
-                            .as_slice()
-                            .try_into()
-                            .expect("page table address must be a u64"),
-                    );
-                    if addr != NULL_ADDR {
-                        pending_data.push((bucket_id, addr));
-                    }
-                }
-                Ok(())
-            })
-            .expect("read persisted page table");
+        let closure = collect_persisted_bucket(
+            &mace.inner.store.opt,
+            &manifest.btree,
+            bucket_id,
+            data_relocs,
+            &blob_relocs,
+        );
+        assert!(
+            closure.unreachable_mappings.is_empty(),
+            "mapped pages outside bucket {bucket_id} root closure: {:?}",
+            closure.unreachable_mappings
+        );
+        reachable_data.extend(closure.data.into_iter().map(|addr| (bucket_id, addr)));
+        reachable_blob.extend(closure.blob.into_iter().map(|addr| (bucket_id, addr)));
     }
+    assert_reachability_matches_inactive(FileKind::Data, data_stats, data_relocs, &reachable_data);
+    assert_reachability_matches_inactive(
+        FileKind::Blob,
+        &blob_stats,
+        &blob_relocs,
+        &reachable_blob,
+    );
+}
 
+struct PersistedClosure {
+    data: BTreeSet<u64>,
+    blob: BTreeSet<u64>,
+    unreachable_mappings: Vec<(u64, u64)>,
+}
+
+fn collect_persisted_bucket(
+    opt: &Options,
+    btree: &btree_store::BTree,
+    bucket_id: u64,
+    data_relocs: &BTreeMap<(u64, u64), (u64, u32)>,
+    blob_relocs: &BTreeMap<(u64, u64), (u64, u32)>,
+) -> PersistedClosure {
+    let mut mapping = BTreeMap::new();
+    btree
+        .view(&page_table_name(bucket_id), |txn| {
+            let mut iter = txn.iter();
+            let mut key = Vec::new();
+            let mut value = Vec::new();
+            while iter.next_ref(&mut key, &mut value) {
+                let addr = u64::from_le_bytes(
+                    value
+                        .as_slice()
+                        .try_into()
+                        .expect("page table address must be a u64"),
+                );
+                let pid = u64::from_le_bytes(
+                    key.as_slice()
+                        .try_into()
+                        .expect("page table PID must be a u64"),
+                );
+                mapping.insert(pid, addr);
+            }
+            Ok(())
+        })
+        .expect("read persisted page table");
+    let decoders = DecompressorPool::new();
+    let mut readers = BTreeMap::new();
+    let mut reachable_data = BTreeSet::new();
+    let mut reachable_blob = BTreeSet::new();
+    let mut reached_pids = BTreeSet::new();
+    let mut pending_pids = vec![ROOT_PID];
+    let mut pending_data = Vec::new();
     let mut pending_blob = Vec::new();
-    while let Some((bucket_id, addr)) = pending_data.pop() {
-        if !reachable_data.insert((bucket_id, addr)) {
+    loop {
+        for pid in pending_pids.drain(..) {
+            let addr = *mapping.get(&pid).expect("referenced PID must be mapped");
+            assert_ne!(addr, NULL_ADDR, "referenced PID {pid} is NULL");
+            if reached_pids.insert(pid) {
+                pending_data.push(addr);
+            }
+        }
+        let Some(addr) = pending_data.pop() else {
+            break;
+        };
+        if !reachable_data.insert(addr) {
             continue;
         }
         let (file_id, _) = data_relocs
@@ -650,16 +701,20 @@ fn assert_persisted_reachability(
                 panic!("reachable data address {addr} in bucket {bucket_id} has no relocation")
             });
         let reader = readers.entry(file_id).or_insert_with(|| {
-            crate::meta::new_reader(
-                stat_file_path(&mace.inner.store.opt, FileKind::Data, file_id),
-                decoders.clone(),
-                mace.inner.store.opt.fs.clone(),
-            )
+            crate::meta::new_reader(opt.data_file(file_id), decoders.clone(), opt.fs.clone())
         });
         let page = reader.read_at(addr);
         let header = page.header();
         if header.link != NULL_ADDR {
-            pending_data.push((bucket_id, header.link));
+            pending_data.push(header.link);
+        }
+        if header.kind == TagKind::Base {
+            let base = page.view().as_base();
+            for pid in [base.header().right_sibling, base.header().merging_child] {
+                if pid != NULL_PID {
+                    pending_pids.push(pid);
+                }
+            }
         }
         match (header.kind, header.node_type) {
             (TagKind::Base, NodeType::Leaf) => {
@@ -673,22 +728,37 @@ fn assert_persisted_reachability(
                         val
                     };
                     if let Some(hist) = val.get_hist() {
-                        pending_data.push((bucket_id, hist.page_addr));
+                        pending_data.push(hist.page_addr);
                     }
                     let remote = val.get_remote();
                     if remote != NULL_ADDR {
-                        pending_blob.push((bucket_id, remote));
+                        pending_blob.push(remote);
                     }
                 }
             }
             (TagKind::Delta, NodeType::Leaf) => {
                 let val = page.view().as_delta().val();
                 if let Some(hist) = val.get_hist() {
-                    pending_data.push((bucket_id, hist.page_addr));
+                    pending_data.push(hist.page_addr);
                 }
                 let remote = val.get_remote();
                 if remote != NULL_ADDR {
-                    pending_blob.push((bucket_id, remote));
+                    pending_blob.push(remote);
+                }
+            }
+            (TagKind::Base, NodeType::Intl) => {
+                let base = page.view().as_base();
+                for idx in 0..base.header().elems as usize {
+                    let (_, child) = base.sst::<IntlKey>().kv_at::<Index>(idx);
+                    if child.pid != NULL_PID {
+                        pending_pids.push(child.pid);
+                    }
+                }
+            }
+            (TagKind::Delta, NodeType::Intl) => {
+                let child = Index::decode_from(page.view().as_delta().index()).pid;
+                if child != NULL_PID {
+                    pending_pids.push(child);
                 }
             }
             _ => {}
@@ -696,8 +766,8 @@ fn assert_persisted_reachability(
     }
 
     readers.clear();
-    while let Some((bucket_id, addr)) = pending_blob.pop() {
-        if !reachable_blob.insert((bucket_id, addr)) {
+    while let Some(addr) = pending_blob.pop() {
+        if !reachable_blob.insert(addr) {
             continue;
         }
         let (file_id, _) = blob_relocs
@@ -707,25 +777,149 @@ fn assert_persisted_reachability(
                 panic!("reachable blob address {addr} in bucket {bucket_id} has no relocation")
             });
         let reader = readers.entry(file_id).or_insert_with(|| {
-            crate::meta::new_reader(
-                stat_file_path(&mace.inner.store.opt, FileKind::Blob, file_id),
-                decoders.clone(),
-                mace.inner.store.opt.fs.clone(),
-            )
+            crate::meta::new_reader(opt.blob_file(file_id), decoders.clone(), opt.fs.clone())
         });
         let blob = reader.read_at(addr);
         if blob.header().link != NULL_ADDR {
-            pending_blob.push((bucket_id, blob.header().link));
+            pending_blob.push(blob.header().link);
         }
     }
 
-    assert_reachability_matches_inactive(FileKind::Data, data_stats, data_relocs, &reachable_data);
-    assert_reachability_matches_inactive(
-        FileKind::Blob,
-        &blob_stats,
-        &blob_relocs,
-        &reachable_blob,
-    );
+    PersistedClosure {
+        data: reachable_data,
+        blob: reachable_blob,
+        unreachable_mappings: mapping
+            .into_iter()
+            .filter(|(pid, addr)| *addr != NULL_ADDR && !reached_pids.contains(pid))
+            .collect(),
+    }
+}
+
+/// independently collects the physical fixed-root closure of a closed database
+pub fn persisted_reachable_for_test(
+    opt: &Options,
+    bucket_id: u64,
+) -> (BTreeSet<u64>, BTreeSet<u64>) {
+    let btree = btree_store::BTree::open_read_only(opt.manifest()).expect("read-only manifest");
+    let mut indices = Vec::new();
+    for kind in FileKind::ALL {
+        let mut index = BTreeMap::new();
+        let bucket = match kind {
+            FileKind::Data => BUCKET_DATA_STAT,
+            FileKind::Blob => BUCKET_BLOB_STAT,
+        };
+        btree
+            .view(bucket, |txn| {
+                let mut iter = txn.iter();
+                let (mut key, mut value) = (Vec::new(), Vec::new());
+                while iter.next_ref(&mut key, &mut value) {
+                    let inner = PersistStat::try_decode_inner_only(&value).expect("stat header");
+                    if inner.bucket_id != bucket_id {
+                        continue;
+                    }
+                    let path = match kind {
+                        FileKind::Data => opt.data_file(inner.file_id),
+                        FileKind::Blob => opt.blob_file(inner.file_id),
+                    };
+                    let mut reader = MetaReader::new(opt.fs.as_ref(), &path);
+                    for entry in reader.get_reloc().iter() {
+                        assert!(
+                            index
+                                .insert((bucket_id, entry.key), (inner.file_id, entry.val.seq))
+                                .is_none()
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .expect("read stats");
+        indices.push(index);
+    }
+    let closure = collect_persisted_bucket(opt, &btree, bucket_id, &indices[0], &indices[1]);
+    (closure.data, closure.blob)
+}
+
+/// removes one already-inactive sequence and keeps its derived counters consistent
+pub fn drop_one_inactive_mark_for_leak_test(
+    opt: &Options,
+    kind: FileKind,
+    file_id: u64,
+) -> (u64, u32) {
+    change_inactive_mark_for_leak_test(opt, kind, file_id, None)
+}
+
+/// marks a specified relocation inactive and keeps its derived counters consistent
+pub fn add_inactive_mark_for_leak_test(
+    opt: &Options,
+    kind: FileKind,
+    file_id: u64,
+    addr: u64,
+) -> u32 {
+    change_inactive_mark_for_leak_test(opt, kind, file_id, Some(addr)).1
+}
+
+fn change_inactive_mark_for_leak_test(
+    opt: &Options,
+    kind: FileKind,
+    file_id: u64,
+    add: Option<u64>,
+) -> (u64, u32) {
+    let btree = btree_store::BTree::open(opt.manifest()).expect("open manifest");
+    let bucket = match kind {
+        FileKind::Data => BUCKET_DATA_STAT,
+        FileKind::Blob => BUCKET_BLOB_STAT,
+    };
+    let path = match kind {
+        FileKind::Data => opt.data_file(file_id),
+        FileKind::Blob => opt.blob_file(file_id),
+    };
+    let mut reader = MetaReader::new(opt.fs.as_ref(), &path);
+    let relocs = reader.get_reloc();
+    let mut changed = None;
+    btree
+        .exec(bucket, |txn| {
+            let mut stat = PersistStat::decode(&txn.get(file_id.to_le_bytes())?);
+            let entry = if let Some(addr) = add {
+                let entry = relocs
+                    .iter()
+                    .find(|entry| entry.key == addr)
+                    .expect("relocation");
+                let seq = entry.val.seq;
+                assert!(!stat.inactive_elems.contains(&seq));
+                stat.inactive_elems.push(entry.val.seq);
+                entry
+            } else {
+                let seq = stat
+                    .inactive_elems
+                    .pop()
+                    .expect("fixture needs an inactive record");
+                relocs
+                    .iter()
+                    .find(|entry| entry.val.seq == seq)
+                    .expect("inactive relocation")
+            };
+            changed = Some((entry.key, entry.val.seq));
+            stat.inactive_elems.sort_unstable();
+            stat.total_elems = relocs.len() as u32;
+            stat.active_elems = stat.total_elems - stat.inactive_elems.len() as u32;
+            stat.total_size = relocs
+                .iter()
+                .map(|entry| entry.val.active_len() as usize)
+                .sum();
+            stat.active_size = relocs
+                .iter()
+                .filter(|entry| {
+                    let seq = entry.val.seq;
+                    !stat.inactive_elems.contains(&seq)
+                })
+                .map(|entry| entry.val.active_len() as usize)
+                .sum();
+            let mut encoded = vec![0; stat.packed_size()];
+            stat.encode(&mut encoded);
+            txn.put(file_id.to_le_bytes(), encoded)
+        })
+        .expect("update fixture stat");
+    changed.expect("changed relocation")
 }
 
 fn load_persisted_stats(mace: &crate::Mace, kind: FileKind) -> BTreeMap<u64, PersistStat> {

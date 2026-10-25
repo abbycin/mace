@@ -21,8 +21,10 @@ pub use crate::meta::{
 pub use crate::types::header::{BaseHeader, DeltaHeader, NodeType, TagFlag, TagKind};
 pub use crate::types::refbox::{BaseView, BoxRef, DeltaView};
 pub use crate::types::traits::{IAsSlice, IHeader};
-pub use crate::utils::data::{AddrPair, Interval};
+pub use crate::utils::data::{AddrPair, Interval, Position};
 pub use crate::utils::options::{Options, PersistedOptions};
 pub use crate::utils::{
     NULL_ADDR, NULL_PID, OpCode, bitmap::BitMap, compress::DecompressorPool, varint::Varint32,
 };
+
+pub const ROOT_PID: u64 = crate::utils::ROOT_PID;

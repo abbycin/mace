@@ -1,9 +1,9 @@
-## [0.2.1] 2026-10-22
+## [Unreleased]
+### New Features
+- Added offline `mace-kv leak-check <db-dir> [--fix]` to detect missing inactive marks from fixed-root reachability and safely repair eligible stat records before rechecking.
+
 ### Changes
-- Split the maintenance CLI into the `mace-kv-cli` package (binary `mace-kv`); the library remains `mace-kv` and is imported as `mace`. Install the tool with `cargo install mace-kv-cli`.
-- Moved the offline checker out of the library into the `mace-kv-cli` library target. `CheckCategory`, `CheckReport`, `Diagnostic` and `check_database` are no longer exported by `mace`; they live in `mace_kv_cli`. The engine now exposes a non-default, internal `maintenance` feature (not part of the stable API) for the on-disk format primitives the checker reads.
-- The CLI package pins the library version exactly, so a CLI-only fix no longer requires a library version bump; `clap` is no longer a direct dependency of the library.
-- Publish `mace-kv` 0.2.1 first: it carries the `maintenance` feature, and removing the checker exports from `mace` is a breaking API change. `mace-kv-cli` pins that exact version, so `cargo package`/`cargo publish --dry-run` for the CLI only resolves after the library release is on crates.io.
+- Split maintenance tooling into the `mace-kv-cli` package, moved checker APIs behind the engine's internal `maintenance` feature, and let the CLI depend on compatible `mace-kv` patch releases within the same minor version.
 
 ## [0.2.0] 2026-10-20
 ### New Features

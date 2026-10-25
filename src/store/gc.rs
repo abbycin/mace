@@ -2576,6 +2576,14 @@ mod tests {
 
     #[test]
     fn rewrite_batches_non_eager_wait_for_target() {
+        assert!(
+            super::GarbageCollector::select_rewrite_batches_for_bucket(
+                vec![test_score(1, 40), test_score(2, 40)],
+                100,
+                false,
+            )
+            .is_empty()
+        );
         let batches = super::GarbageCollector::select_rewrite_batches_for_bucket(
             vec![test_score(1, 40), test_score(2, 40), test_score(3, 40)],
             100,
