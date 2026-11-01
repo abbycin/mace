@@ -64,7 +64,8 @@ payload files that are not named by a stat record, orphan marker or obsolete ent
 
 The checker opens metadata read-only and does not modify the database. It is intended for a closed,
 stable database. Do not run it against a database being written by another process; direct external
-writes that bypass Mace's locking protocol also invalidate the stable-file assumption.
+writes that bypass Mace's locking protocol also invalidate the stable-file assumption. The byte
+layouts and the reader checks it applies are specified in [format.md](./format.md).
 
 ## `leak-check`
 

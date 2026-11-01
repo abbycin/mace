@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::meta::entry::{IMetaCodec, MetaOp, MetaRecord};
+use crate::meta::entry::{IMetaCodec, MetaOp, MetaRecord, encode_record};
 use crate::must_true;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::CounterMetric;
@@ -22,6 +22,25 @@ impl<'a> Txn<'a> {
         }
     }
 
+    pub(crate) fn put(&mut self, bucket: &str, key: Vec<u8>, value: Vec<u8>) {
+        self.ops
+            .entry(bucket.to_string())
+            .or_default()
+            .push(MetaOp::Put(key, value));
+    }
+
+    pub(crate) fn put_record<T: IMetaCodec>(&mut self, bucket: &str, key: Vec<u8>, record: &T) {
+        self.put(bucket, key, encode_record(record));
+    }
+
+    pub(crate) fn del(&mut self, bucket: &str, key: Vec<u8>) {
+        self.ops
+            .entry(bucket.to_string())
+            .or_default()
+            .push(MetaOp::Del(key));
+    }
+
+    #[cfg(test)]
     pub(crate) fn ops_mut(&mut self) -> &mut BTreeMap<String, Vec<MetaOp>> {
         &mut self.ops
     }
@@ -114,8 +133,7 @@ impl<'a> Txn<'a> {
     where
         T: IMetaCodec,
     {
-        let mut buf = vec![0u8; x.packed_size()];
-        x.encode(&mut buf);
+        let buf = encode_record(x);
         self.ops
             .entry(bucket.to_string())
             .or_default()
@@ -136,7 +154,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc::channel;
 
-    fn open_manifest() -> Handle<Manifest> {
+    fn open_manifest() -> (crate::RandomPath, Handle<Manifest>) {
         let root = crate::RandomPath::tmp();
         let opt = Arc::new(
             crate::Options::new(&*root)
@@ -148,7 +166,10 @@ mod tests {
         let mut builder =
             ManifestBuilder::new_with_channels(opt, tx, ack_rx).expect("manifest store must open");
         builder.load().expect("manifest load must work");
-        Handle::new(builder.finish().expect("manifest finish must succeed"))
+        (
+            root,
+            Handle::new(builder.finish().expect("manifest finish must succeed")),
+        )
     }
 
     fn record(manifest: &Manifest, op: MetaOp) {
@@ -164,7 +185,7 @@ mod tests {
     /// the tolerant variant commits whether the key was there or not
     #[test]
     fn del_if_exists_tolerates_an_absent_key() {
-        let manifest = open_manifest();
+        let (_root, manifest) = open_manifest();
         let key = b"tolerant".to_vec();
         record(&manifest, MetaOp::Put(key.clone(), b"v".to_vec()));
         record(
@@ -204,7 +225,7 @@ mod tests {
         if !is_abort_child() {
             return;
         }
-        let manifest = open_manifest();
+        let (_root, manifest) = open_manifest();
         record(&manifest, MetaOp::Del(b"absent".to_vec()));
     }
 }

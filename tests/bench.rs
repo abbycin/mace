@@ -4,7 +4,7 @@ use mace::{BucketOptions, Mace, Options, RandomPath};
 
 #[test]
 fn bench() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     println!("db_root {:?}", path.deref());
     let mut opt = Options::new(&*path);
     opt.sync_on_write = false;

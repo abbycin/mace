@@ -3,7 +3,7 @@ use rand::RngExt;
 
 #[test]
 fn upsert_delete() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     let mut saved = opt.clone();
     opt.tmp_store = false;
@@ -61,7 +61,7 @@ fn upsert_delete() {
 
 #[test]
 fn big_kv() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mut saved = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
@@ -101,7 +101,7 @@ fn big_kv() {
 
 #[test]
 fn big_kv2() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.wal_buffer_size = 1024;
     opt.data_file_size = 4096;
@@ -142,7 +142,7 @@ fn big_kv2() {
 
 #[test]
 fn big_kv3() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     // non-tmp store: this test reopens after graceful close (tmp_store would
     // wipe the whole db_root on exit, leaving nothing to reopen)

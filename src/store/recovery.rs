@@ -30,16 +30,11 @@ use crossbeam_epoch::Guard;
 #[cfg(feature = "metrics")]
 use std::time::Instant;
 
-/// the target-width inputs a runtime Context is constructed from after the era wipe.
-///
-/// the boot list describes exactly `target_groups` logical streams plus the shared stream at index
-/// `target_groups`, and every slot's `start_id`/`oldest_id` must already point at the new era.
-/// `checkpoint_floor` carries the post-wipe floor seed `Context::new` publishes: the durable route
-/// leaves every logical slot inactive (`Position::MAX`, consumed by the shared GC guard), the
-/// relaxed route seeds each logger's own slot with a real position at the era start
-pub(crate) struct TargetPlan {
-    pub(crate) boots: Vec<GroupBoot>,
-}
+mod redo;
+mod scan;
+mod transition;
+
+pub(crate) use transition::TargetPlan;
 
 /// there are some cases can't recover:
 /// 1. manifest file missing or corrupted
@@ -63,7 +58,6 @@ pub(crate) struct Recovery {
     pin_file: BTreeMap<u64, u64>,
     /// shared-stream groups with retained updates
     shared_update_groups: BTreeSet<usize>,
-    bucket_cache_cap: usize,
     trees: Lru<u64, Tree>,
     loaded_buckets: RefCell<HashSet<u64>>,
 }
@@ -83,104 +77,9 @@ impl Recovery {
             last_update: BTreeMap::new(),
             pin_file: BTreeMap::new(),
             shared_update_groups: BTreeSet::new(),
-            bucket_cache_cap: Self::BUCKET_CACHE_CAP,
             trees: Lru::new(),
             loaded_buckets: RefCell::new(HashSet::new()),
         }
-    }
-
-    fn mark_aborted(&mut self, store: &Store, txid: u64) {
-        let tail = self.last_update.remove(&txid);
-        self.in_progress_txns.remove(&txid);
-        self.committed_txns.remove(&txid);
-
-        if let Some(tail) = tail {
-            let pin_file_id = self
-                .pin_file
-                .remove(&txid)
-                .unwrap_or(tail.pos.file_id)
-                .min(tail.pos.file_id);
-            store
-                .context
-                .group(tail.logical_group_id as usize)
-                .recover_retained_abort(txid);
-            store.context.enqueue_abort_clean(
-                txid,
-                tail.bucket_id,
-                tail.logical_group_id as u8,
-                tail.physical_wal_id as u8,
-                tail.pos,
-                pin_file_id,
-            );
-        } else {
-            store.context.remove_abort_clean(txid);
-            self.pin_file.remove(&txid);
-        }
-    }
-
-    fn mark_committed(&mut self, store: &Store, txid: u64) {
-        self.in_progress_txns.remove(&txid);
-        self.committed_txns.insert(txid);
-        self.last_update.remove(&txid);
-        self.pin_file.remove(&txid);
-        store.context.remove_abort_clean(txid);
-    }
-
-    fn get_tree(&self, bucket_id: u64, store: MutRef<Store>) -> Option<Tree> {
-        if let Some(tree) = self.trees.get(&bucket_id) {
-            return Some(tree.clone());
-        }
-
-        // it's possible that bucket has been logically removed, we simply skip process wal entry in
-        // redo/undo for that bucket
-        if let Some(meta) = store
-            .manifest
-            .bucket_metas_by_id
-            .get(&bucket_id)
-            .map(|m| m.clone())
-        {
-            must_true!(eq meta.id, bucket_id);
-            let bucket_ctx = must_ok!(store.manifest.load_bucket_context(bucket_id), "must exist");
-            let tree = Tree::new(store.clone(), ROOT_PID, bucket_ctx);
-            if let Some((evicted_id, evicted_tree)) =
-                self.trees
-                    .add_with_evict(self.bucket_cache_cap, bucket_id, tree.clone())
-            {
-                drop(evicted_tree);
-                self.loaded_buckets.borrow_mut().remove(&evicted_id);
-                self.evict_bucket(evicted_id, store.clone());
-            }
-            self.loaded_buckets.borrow_mut().insert(bucket_id);
-            Some(tree)
-        } else {
-            None
-        }
-    }
-
-    fn evict_bucket(&self, bucket_id: u64, store: MutRef<Store>) {
-        if self.plan.rebuild_epoch() {
-            // on a switch open the wipe deletes the wal that still
-            // guards the recovery-redone tail, so every eviction flush (not
-            // only the forced checkpoint over still-loaded buckets) must be
-            // full-fsync. fdatasync-only leaves file-size metadata un-durable
-            // and the tail can truncate on power loss once the wal is gone.
-            store.manifest.buckets.del_bucket(bucket_id, true);
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_recovery_eviction_force_fsync");
-        } else {
-            store.manifest.buckets.del_bucket(bucket_id, false);
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_recovery_eviction_flush");
-        }
-    }
-
-    fn evict_all(&self, store: MutRef<Store>) {
-        let mut loaded = self.loaded_buckets.borrow_mut();
-        for bucket_id in loaded.drain() {
-            self.trees.del(&bucket_id);
-            self.evict_bucket(bucket_id, store.clone());
-        }
-        store.manifest.buckets.unload_all();
     }
 
     pub(crate) fn abort(&self, store: MutRef<Store>) {
@@ -237,26 +136,14 @@ impl Recovery {
         }
     }
 
-    /// we must perform phase2, in case crash happened before data flush and log checkpoint
-    pub(crate) fn phase2(
+    /// rebuild transaction outcomes and pending abort-clean chains from every retained stream
+    fn analyze_wal(
         &mut self,
         wal_boot: &[GroupBoot],
         store: MutRef<Store>,
-    ) -> Result<(), OpCode> {
-        #[cfg(feature = "metrics")]
-        let phase2_started = Instant::now();
-        #[cfg(feature = "metrics")]
-        self.opt.observer.event(ObserveEvent {
-            kind: EventKind::RecoveryPhase2Begin,
-            bucket_id: 0,
-            txid: 0,
-            file_id: 0,
-            value: wal_boot.len() as u64,
-        });
-
+        block: &mut Block,
+    ) -> Result<u64, OpCode> {
         let mut oracle = store.manifest.sequences.oracle.load(Relaxed);
-        let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
-
         for boot in wal_boot.iter() {
             if !boot.has_files {
                 continue;
@@ -270,7 +157,7 @@ impl Recovery {
                 boot.scan_start,
                 boot.oldest_id,
                 boot.latest_id,
-                &mut block,
+                block,
                 store.clone(),
             )?;
             #[cfg(feature = "metrics")]
@@ -283,10 +170,26 @@ impl Recovery {
                 oracle = max(oracle, cur_oracle.saturating_add(1));
             }
         }
+        Ok(oracle)
+    }
 
+    /// finish redo and abort-clean work before runtime checkpoint recording is valid
+    fn finish_recovery_writes(
+        &mut self,
+        wal_boot: &[GroupBoot],
+        mut block: Block,
+        store: MutRef<Store>,
+        oracle: u64,
+    ) -> Result<bool, OpCode> {
         let in_progress: Vec<u64> = self.in_progress_txns.iter().copied().collect();
         for txid in in_progress {
-            self.mark_aborted(&store, txid);
+            let oldest = self.last_update.get(&txid).and_then(|loc| {
+                wal_boot
+                    .iter()
+                    .find(|boot| boot.physical_wal_id as u32 == loc.physical_wal_id)
+                    .map(|boot| boot.oldest_id)
+            });
+            self.mark_aborted(&store, txid, oldest);
         }
 
         self.dirty_table
@@ -332,76 +235,135 @@ impl Recovery {
         crate::utils::failpoint::crash("mace_recovery_abort_clean_after_drain_before_start");
         log::trace!("oracle {oracle}");
         store.manifest.sequences.oracle.store(oracle, Relaxed);
-        // a rebuild must durable-flush every redone bucket before wiping its WAL
-        if self.plan.rebuild_epoch() {
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_switch_before_forced_checkpoint");
-            for bucket_id in self.loaded_buckets.borrow().iter() {
-                if let Some(tree) = self.trees.get(bucket_id) {
-                    tree.bucket.checkpoint_before_reclaim(true);
-                }
-            }
-            // the redone tail is durable and the old era is still intact: a crash here must
-            // still retry into the same era start and finish the wipe
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_switch_after_forced_checkpoint_before_wipe");
+        #[cfg(feature = "metrics")]
+        {
+            Ok(recovered)
         }
-        let mut manifest = store.manifest;
+        #[cfg(not(feature = "metrics"))]
+        {
+            Ok(false)
+        }
+    }
+
+    /// a rebuild must durable-flush every redone bucket before wiping its WAL
+    fn checkpoint_before_rebuild(&self) {
+        if !self.plan.rebuild_epoch() {
+            return;
+        }
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_switch_before_forced_checkpoint");
+        for bucket_id in self.loaded_buckets.borrow().iter() {
+            if let Some(tree) = self.trees.get(bucket_id) {
+                tree.bucket.checkpoint_before_reclaim(true);
+            }
+        }
+        // the redone tail is durable and the old era is still intact: a crash here must
+        // still retry into the same era start and finish the wipe
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_switch_after_forced_checkpoint_before_wipe");
+    }
+
+    /// wipe the old era and install the new one after every redone tail is durable
+    fn switch_epoch(
+        &mut self,
+        mut manifest: Handle<Manifest>,
+        context: Handle<Context>,
+        wal_boot: &[GroupBoot],
+        start: u64,
+    ) -> Result<(), OpCode> {
+        // the recovery flusher must be gone before any writer is detached: its
+        // tasks outlive a `take` (`Checkpoint` has no `Drop`) and a checkpoint
+        // record written after the wipe would land in the new era
+        if let Some(flush) = manifest.take_checkpoint_flusher() {
+            flush.quit();
+        }
+        // close the old era's files before removing them: the wipe must not depend
+        // on the filesystem accepting the removal of an open file
+        context.detach_recovery_writers(start)?;
+        #[cfg(feature = "extra_check")]
+        context.assert_writers_detached();
+        self.wipe_old_wal(manifest, wal_boot, start)?;
+        // keep the runtime recycle cache aligned with the durable done
+        // boundary before the collector can build its first intent
+        if let Some(shared) = context.shared_logging() {
+            shared.lock().advance_oldest_wal_id(start);
+        } else {
+            for group in context.groups() {
+                group.logging.lock().advance_oldest_wal_id(start);
+            }
+        }
+        #[cfg(feature = "failpoints")]
+        crate::utils::failpoint::crash("mace_switch_after_wipe_before_writeback");
+        if !self.plan.group_resize {
+            // a same-width rebuild hands this Context to the runtime, so it owns
+            // the new era from here on: install its epoch writers and floors, then
+            // make the new files' directory entries durable before the options
+            // writeback records the migration
+            context.install_epoch_writers(start)?;
+            // data-first: the era files' directory entries must be durable before the
+            // options writeback records the migration, and a failed sync must leave
+            // through the open's cleanup rather than panic mid-handoff
+            self.opt.try_sync_log_dir()?;
+        }
+        Ok(())
+    }
+
+    /// publish shared-stream floors before runtime checkpointing or GC
+    fn publish_recovery_floors(
+        &self,
+        manifest: Handle<Manifest>,
+        context: Handle<Context>,
+        switching: bool,
+    ) {
+        if !self.opt.sync_on_write {
+            return;
+        }
+        if switching {
+            // a same-width rebuild seeded the new era's floors through
+            // `install_epoch_writers`; a width change retires this Context, so
+            // only its shared logger's stale floors are cleared here
+            if self.plan.group_resize {
+                context.reset_shared_logical_checkpoint_floors();
+            }
+        } else {
+            let floors = self.recovery_logical_checkpoint_floors(manifest);
+            context.publish_shared_logical_checkpoint_floors(&floors);
+        }
+    }
+
+    /// we must perform phase2, in case crash happened before data flush and log checkpoint
+    pub(crate) fn phase2(
+        &mut self,
+        wal_boot: &[GroupBoot],
+        store: MutRef<Store>,
+    ) -> Result<(), OpCode> {
+        #[cfg(feature = "metrics")]
+        let phase2_started = Instant::now();
+        #[cfg(feature = "metrics")]
+        self.opt.observer.event(ObserveEvent {
+            kind: EventKind::RecoveryPhase2Begin,
+            bucket_id: 0,
+            txid: 0,
+            file_id: 0,
+            value: wal_boot.len() as u64,
+        });
+
+        let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
+        let oracle = self.analyze_wal(wal_boot, store.clone(), &mut block)?;
+        #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
+        let recovered = self.finish_recovery_writes(wal_boot, block, store.clone(), oracle)?;
+        self.checkpoint_before_rebuild();
+
+        let manifest = store.manifest;
         let context = store.context;
         self.evict_all(store);
         let switching = self.plan.rebuild_epoch();
         // wipe the old era only after every redone tail is durable
         if switching {
-            // the recovery flusher must be gone before any writer is detached: its
-            // tasks outlive a `take` (`Checkpoint` has no `Drop`) and a checkpoint
-            // record written after the wipe would land in the new era
-            if let Some(flush) = manifest.take_checkpoint_flusher() {
-                flush.quit();
-            }
-            let start = self.epoch_start;
-            // close the old era's files before removing them: the wipe must not depend
-            // on the filesystem accepting the removal of an open file
-            context.detach_recovery_writers(start)?;
-            #[cfg(feature = "extra_check")]
-            context.assert_writers_detached();
-            self.wipe_old_wal(manifest, wal_boot, start)?;
-            // keep the runtime recycle cache aligned with the durable done
-            // boundary before the collector can build its first intent
-            if let Some(shared) = context.shared_logging() {
-                shared.lock().advance_oldest_wal_id(start);
-            } else {
-                for group in context.groups() {
-                    group.logging.lock().advance_oldest_wal_id(start);
-                }
-            }
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_switch_after_wipe_before_writeback");
-            if !self.plan.group_resize {
-                // a same-width rebuild hands this Context to the runtime, so it owns
-                // the new era from here on: install its epoch writers and floors, then
-                // make the new files' directory entries durable before the options
-                // writeback records the migration
-                context.install_epoch_writers(start)?;
-                // data-first: the era files' directory entries must be durable before the
-                // options writeback records the migration, and a failed sync must leave
-                // through the open's cleanup rather than panic mid-handoff
-                self.opt.try_sync_log_dir()?;
-            }
+            self.switch_epoch(manifest, context, wal_boot, self.epoch_start)?;
         }
-        // publish shared-stream floors before runtime checkpointing or GC
-        if self.opt.sync_on_write {
-            if switching {
-                // a same-width rebuild seeded the new era's floors through
-                // `install_epoch_writers`; a width change retires this Context, so
-                // only its shared logger's stale floors are cleared here
-                if self.plan.group_resize {
-                    context.reset_shared_logical_checkpoint_floors();
-                }
-            } else {
-                let floors = self.recovery_logical_checkpoint_floors(manifest);
-                context.publish_shared_logical_checkpoint_floors(&floors);
-            }
-        }
+        self.publish_recovery_floors(manifest, context, switching);
+
         // runtime roots may use append positions only after recovery finishes
         debug_assert!(context.recovering());
         context.init_safe_exclusive(oracle);
@@ -421,926 +383,6 @@ impl Recovery {
         }
         Ok(())
     }
-
-    fn get_size(e: EntryType, len: usize) -> Result<Option<usize>, OpCode> {
-        let sz = wal_record_sz(e)?;
-        if len < sz { Ok(None) } else { Ok(Some(sz)) }
-    }
-
-    fn validate_update_group(&self, u: &WalUpdate) -> Result<(), OpCode> {
-        if u.group_id >= self.plan.source_groups {
-            return Err(OpCode::Corruption);
-        }
-        Ok(())
-    }
-
-    fn handle_update(
-        &mut self,
-        g: &Guard,
-        f: &mut File,
-        loc: &mut Location,
-        block: &mut Block,
-        store: MutRef<Store>,
-    ) -> Result<bool, OpCode> {
-        must_true!(
-            (loc.len as usize) <= block.len(),
-            "loc.len {}, block.len {}",
-            loc.len,
-            block.len()
-        );
-        f.read(block.mut_slice(0, loc.len as usize), loc.pos.offset)?;
-
-        if PayloadType::try_from(block.slice::<u8>(1, 1)[0]).is_err() {
-            return Ok(false);
-        }
-        let u = ptr_to::<WalUpdate>(block.data());
-
-        if !u.is_intact() || u.validate_record(block.slice(0, loc.len as usize)).is_err() {
-            return Ok(false);
-        }
-
-        let ver = Ver::new(u.txid, u.cmd_id);
-        self.validate_update_group(u)?;
-        if self.dirty_table.contains_key(&ver) {
-            return Err(OpCode::Corruption);
-        }
-
-        // correctness gate: if this WAL record is already covered by bucket durable frontier,
-        // it has been materialized in persisted page image and must not enter redo.
-        let durable_lsn = store.manifest.durable_frontier_lsn(u.bucket_id, u.group_id);
-        if loc.pos <= durable_lsn {
-            return Ok(true);
-        }
-
-        let raw = u.key();
-        let target_tree = self.get_tree(u.bucket_id, store);
-        if let Some(target_tree) = &target_tree {
-            let r = target_tree
-                .get(g, Key::new(raw, Ver::new(NULL_ORACLE, NULL_CMD)))
-                .map(|(k, _)| *k.ver());
-
-            // check whether the key exists in data or is latest
-            let lost = r.map(|v| v > ver).map_err(|_| true).unwrap_or_else(|x| x);
-            if lost {
-                self.dirty_table.insert(ver, *loc);
-            }
-        }
-        Ok(true)
-    }
-
-    fn analyze(
-        &mut self,
-        group_id: u8,
-        addr: Position,
-        oldest_file_id: u64,
-        latest_file_id: u64,
-        block: &mut Block,
-        store: MutRef<Store>,
-    ) -> Result<u64, OpCode> {
-        let Position { file_id, offset } = addr;
-        let mut pos;
-        let mut oracle = 0;
-        let mut loc = Location {
-            bucket_id: 0,
-            physical_wal_id: group_id as u32,
-            logical_group_id: 0,
-            pos: Position::MIN,
-            len: 0,
-        };
-        let g = crossbeam_epoch::pin();
-
-        for i in file_id..=latest_file_id {
-            let path = self.opt.physical_wal_path(group_id, i);
-            if !self.opt.fs.try_exists(&path)? {
-                log::error!(
-                    "wal gap detected after recycled prefix, group={group_id} file_id={i} oldest={oldest_file_id} latest={latest_file_id}"
-                );
-                return Err(OpCode::Corruption);
-            }
-            let mut f = File::options()
-                .read(true)
-                .write(true)
-                .open(self.opt.fs.as_ref(), &path)?;
-            let end = f.size()?;
-            if i == file_id && offset > end {
-                return Err(OpCode::Corruption);
-            }
-            if end == 0 {
-                continue;
-            }
-            static_assert!(size_of::<EntryType>() == 1);
-
-            loc.pos.file_id = i;
-            pos = if i == file_id { offset } else { 0 };
-
-            log::trace!("{path:?} pos {pos} end {end}");
-            while pos < end {
-                let start_pos = pos;
-                let hdr = {
-                    let hdr = block.mut_slice(0, 1);
-                    f.read(hdr, pos)?;
-                    hdr[0]
-                };
-                let et: EntryType = match hdr.try_into() {
-                    Ok(et) => et,
-                    // leave malformed tails to the common truncate path
-                    Err(_) => {
-                        pos = start_pos;
-                        break;
-                    }
-                };
-
-                let Some(sz) = Self::get_size(et, (end - pos) as usize)? else {
-                    pos = start_pos;
-                    break;
-                };
-                must_true!(sz < Self::INIT_BLOCK_SIZE);
-
-                log::trace!("pos {pos} sz {sz} {et:?}");
-                f.read(block.mut_slice(0, sz), pos)?;
-
-                pos += sz as u64;
-                let ptr = block.data();
-                match et {
-                    EntryType::Commit => {
-                        let a = ptr_to::<WalCommit>(ptr);
-                        if !a.is_intact() {
-                            pos = start_pos;
-                            break;
-                        }
-                        let txid = { a.txid };
-                        log::trace!("{a:?}");
-                        self.mark_committed(&store, txid);
-                        oracle = max(txid, oracle);
-                    }
-                    EntryType::Abort => {
-                        let a = ptr_to::<WalAbort>(ptr);
-                        if !a.is_intact() {
-                            pos = start_pos;
-                            break;
-                        }
-                        let txid = { a.txid };
-                        log::trace!("{a:?}");
-                        self.mark_aborted(&store, txid);
-                        oracle = max(txid, oracle);
-                    }
-                    EntryType::Begin => {
-                        let b = ptr_to::<WalBegin>(ptr);
-                        if !b.is_intact() {
-                            pos = start_pos;
-                            break;
-                        }
-                        let txid = { b.txid };
-                        log::trace!("{b:?}");
-                        self.in_progress_txns.insert(txid);
-                        self.committed_txns.remove(&txid);
-                        self.pin_file
-                            .entry(txid)
-                            .and_modify(|x| *x = (*x).min(i))
-                            .or_insert(i);
-                        oracle = max(txid, oracle);
-                    }
-                    EntryType::CheckPoint => {
-                        use crate::cc::wal::WalCheckpoint;
-                        let c = ptr_to::<WalCheckpoint>(ptr);
-                        if !c.is_intact() {
-                            pos = start_pos;
-                            break;
-                        }
-                    }
-                    EntryType::Update => {
-                        if PayloadType::try_from(block.slice::<u8>(1, 1)[0]).is_err() {
-                            pos = start_pos;
-                            break;
-                        }
-                        let u = ptr_to::<WalUpdate>(ptr);
-                        let payload_size = { u.size };
-                        let payload_len = match WalUpdate::checked_payload_len(payload_size) {
-                            Ok(len) => len,
-                            Err(_) => {
-                                pos = start_pos;
-                                break;
-                            }
-                        };
-                        let total = match WalUpdate::checked_encoded_len(payload_len) {
-                            Ok(total) => total,
-                            Err(_) => {
-                                pos = start_pos;
-                                break;
-                            }
-                        };
-                        let payload_len_u64 = match u64::try_from(payload_len) {
-                            Ok(len) => len,
-                            Err(_) => {
-                                pos = start_pos;
-                                break;
-                            }
-                        };
-                        let record_end = match pos.checked_add(payload_len_u64) {
-                            Some(end) => end,
-                            None => {
-                                pos = start_pos;
-                                break;
-                            }
-                        };
-                        if record_end > end {
-                            pos = start_pos;
-                            break;
-                        }
-                        // copy before possible realloc
-                        let bucket_id = u.bucket_id;
-                        let txid = u.txid;
-                        loc.logical_group_id = u.group_id as u32;
-                        loc.len = match u32::try_from(total) {
-                            Ok(len) => len,
-                            Err(_) => {
-                                pos = start_pos;
-                                break;
-                            }
-                        };
-                        loc.bucket_id = bucket_id;
-                        if block.len() < loc.len as usize {
-                            block.realloc(loc.len as usize);
-                        }
-                        log::trace!("{pos} => update txid={txid}");
-                        loc.pos.offset = pos - sz as u64;
-
-                        if !self.handle_update(&g, &mut f, &mut loc, block, store.clone())? {
-                            pos = start_pos;
-                            break;
-                        }
-                        if group_id == Options::SHARED_ID {
-                            self.shared_update_groups.insert(u.group_id as usize);
-                        }
-                        oracle = max(txid, oracle);
-                        self.last_update.insert(
-                            txid,
-                            Location {
-                                bucket_id,
-                                physical_wal_id: group_id as u32,
-                                logical_group_id: u.group_id as u32,
-                                pos: loc.pos,
-                                len: 0,
-                            },
-                        );
-                        self.pin_file
-                            .entry(txid)
-                            .and_modify(|x| *x = (*x).min(i))
-                            .or_insert(i);
-
-                        if !self.committed_txns.contains(&txid) {
-                            // txn may have begun before the last checkpoint and therefore has no begin record in this scan range
-                            let _ = self.in_progress_txns.insert(txid);
-                        }
-
-                        pos = record_end;
-                    }
-                    _ => {
-                        return Err(OpCode::Corruption);
-                    }
-                }
-            }
-
-            if pos < end {
-                if !self.opt.truncate_corrupted_wal {
-                    return Err(OpCode::Corruption);
-                }
-                // truncate the WAL if it's incomplete
-                log::trace!("truncate {path:?} from {end} to {pos}");
-                f.truncate(pos)?;
-                #[cfg(feature = "metrics")]
-                self.opt
-                    .observer
-                    .counter(CounterMetric::RecoveryWalTruncate, 1);
-                // if we truncated the file, we must stop here
-                break;
-            }
-        }
-
-        Ok(oracle)
-    }
-
-    fn get_file(
-        cache: &Lru<(u32, u64), Rc<File>>,
-        cap: usize,
-        opt: &Options,
-        physical_wal_id: u32,
-        seq: u64,
-    ) -> Result<Option<Rc<File>>, OpCode> {
-        let id = (physical_wal_id, seq);
-        if let Some(f) = cache.get(&id) {
-            Ok(Some(f.clone()))
-        } else {
-            let path = opt.physical_wal_path(physical_wal_id as u8, seq);
-            if !opt.fs.try_exists(&path)? {
-                return Ok(None);
-            }
-            let f = Rc::new(File::options().read(true).open(opt.fs.as_ref(), &path)?);
-            cache.add(cap, id, f.clone());
-            Ok(Some(f))
-        }
-    }
-
-    fn redo(&mut self, block: &mut Block, store: MutRef<Store>) -> Result<u64, OpCode> {
-        let cache = Lru::new();
-        let cap = 32;
-        let mut applied = 0u64;
-        let g = crossbeam_epoch::pin();
-
-        // NOTE: because the `Ver` is descending ordered by txid first, we call `rev` here to make
-        //  smaller txid to apply first
-        for (_, table) in self.dirty_table.iter().rev() {
-            let Location {
-                physical_wal_id,
-                pos,
-                len,
-                ..
-            } = *table;
-            let Some(f) = Self::get_file(&cache, cap, &self.opt, physical_wal_id, pos.file_id)?
-            else {
-                return Err(OpCode::Corruption);
-            };
-            must_true!(len as usize <= block.len());
-            f.read(block.mut_slice(0, len as usize), pos.offset)?;
-            PayloadType::try_from(block.slice::<u8>(1, 1)[0])?;
-            let c = ptr_to::<WalUpdate>(block.data());
-            if !c.is_intact() || c.validate_record(block.slice(0, len as usize)).is_err() {
-                return Err(OpCode::Corruption);
-            }
-            if c.group_id >= self.plan.source_groups {
-                return Err(OpCode::Corruption);
-            }
-            let txid = { c.txid };
-            if !self.committed_txns.contains(&txid) {
-                continue;
-            }
-            let ok = c.key();
-            let key = Key::new(ok, Ver::new(c.txid, c.cmd_id));
-
-            let target_tree = self.get_tree(c.bucket_id, store.clone());
-            let Some(target_tree) = target_tree else {
-                continue;
-            };
-            let wal_group = c.group_id;
-            let wal_pos = pos;
-
-            let apply_res = match c.sub_type() {
-                PayloadType::Insert => {
-                    let i = c.put();
-                    let val = Record::normal(c.group_id, i.val());
-                    target_tree.put(&g, key, val, wal_group, wal_pos)
-                }
-                PayloadType::Update => {
-                    let u = c.update();
-                    let val = Record::normal(c.group_id, u.new_val());
-                    target_tree.put(&g, key, val, wal_group, wal_pos)
-                }
-                PayloadType::Delete => {
-                    let val = Record::remove(c.group_id);
-                    target_tree.put(&g, key, val, wal_group, wal_pos)
-                }
-                PayloadType::Merge => {
-                    // redo inserts the raw operand verbatim; interpretation is deferred to
-                    // read/compact paths and never requires a runtime operator here
-                    target_tree.bucket.mark_merge();
-                    let m = c.put();
-                    let val = Record::merge(c.group_id, m.val());
-                    target_tree.put(&g, key, val, wal_group, wal_pos)
-                }
-            };
-            apply_res?;
-            applied += 1;
-        }
-        Ok(applied)
-    }
-
-    fn wal_file_range(&self, physical_wal_id: u8) -> Result<Option<(u64, u64)>, OpCode> {
-        let mut min_id = u64::MAX;
-        let mut max_id = 0;
-        let mut found = false;
-        let prefix = if physical_wal_id == Options::SHARED_ID {
-            format!("{}{}", Options::GROUP_WAL_PREFIX, Options::SEP)
-        } else {
-            format!(
-                "{}{}{}{}",
-                Options::WAL_PREFIX,
-                Options::SEP,
-                physical_wal_id,
-                Options::SEP
-            )
-        };
-
-        for entry in self.opt.fs.read_dir(&self.opt.log_root())? {
-            let Some(name) = entry.file_name() else {
-                continue;
-            };
-            let Some(raw) = name.to_str() else {
-                continue;
-            };
-            if !raw.starts_with(&prefix) {
-                continue;
-            }
-            let Ok(id) = raw[prefix.len()..].parse::<u64>() else {
-                continue;
-            };
-            found = true;
-            min_id = min_id.min(id);
-            max_id = max_id.max(id);
-        }
-
-        Ok(if found { Some((min_id, max_id)) } else { None })
-    }
-
-    fn load_wal_boot(&self, manifest: Handle<Manifest>) -> Result<Vec<GroupBoot>, OpCode> {
-        let mut out = Vec::with_capacity(self.plan.source_groups as usize + 1);
-        for physical in 0..self.plan.source_groups {
-            let boot = self.load_physical_stream_boot(manifest, physical)?;
-            out.push(boot);
-        }
-        // inspect the shared stream even on relaxed opens
-        let shared = self.load_physical_stream_boot(manifest, Options::SHARED_ID)?;
-        out.push(shared);
-        Ok(out)
-    }
-
-    fn load_physical_stream_boot(
-        &self,
-        manifest: Handle<Manifest>,
-        physical_wal_id: u8,
-    ) -> Result<GroupBoot, OpCode> {
-        let recycle_state = manifest.load_wal_recycle_state(physical_wal_id);
-        if let Some((min_id, max_id)) = self.wal_file_range(physical_wal_id)? {
-            // done state defines the contiguous prefix removed by recycle
-            let oldest_id = if recycle_state.is_done() {
-                recycle_state.oldest_id()
-            } else {
-                min_id
-            };
-            let latest_id = max_id.max(oldest_id);
-            let oldest_pos = Position {
-                file_id: oldest_id,
-                offset: 0,
-            };
-            let scan_start = self
-                .find_latest_checkpoint(physical_wal_id, oldest_id, max_id)?
-                .unwrap_or(oldest_pos)
-                .max(oldest_pos);
-            if scan_start.file_id > latest_id {
-                return Err(OpCode::Corruption);
-            }
-            Ok(GroupBoot {
-                physical_wal_id,
-                oldest_id,
-                latest_id,
-                scan_start,
-                has_files: true,
-                start_id: latest_id,
-                checkpoint_floor: Position::MIN,
-            })
-        } else {
-            let oldest_id = if recycle_state.is_done() {
-                recycle_state.oldest_id()
-            } else {
-                0
-            };
-            // start the new shared stream above every persisted frontier
-            let start_id = if physical_wal_id == Options::SHARED_ID {
-                let mut max_frontier = 0u64;
-                for frontier in manifest.bucket_frontier.iter() {
-                    for pos in frontier.value().iter() {
-                        max_frontier = max_frontier.max(pos.file_id);
-                    }
-                }
-                oldest_id.max(max_frontier.checked_add(1).ok_or(OpCode::Corruption)?)
-            } else {
-                oldest_id
-            };
-            Ok(GroupBoot {
-                physical_wal_id,
-                oldest_id,
-                latest_id: oldest_id,
-                scan_start: Position {
-                    file_id: oldest_id,
-                    offset: 0,
-                },
-                has_files: false,
-                start_id,
-                checkpoint_floor: Position::MIN,
-            })
-        }
-    }
-
-    /// build the target-width boot list and floor seeds from the post-wipe physical state.
-    ///
-    /// this is the boot-only path the design requires after the wipe: it never reuses the source
-    /// boot list and never invents a missing slot. A slot that still reports a pre-era boundary
-    /// means the wipe did not cover that stream, which is corruption for this open.
-    pub(crate) fn target_plan(
-        &self,
-        manifest: Handle<Manifest>,
-        era_start: u64,
-    ) -> Result<TargetPlan, OpCode> {
-        let target = self.plan.target_groups;
-        let mut boots: Vec<GroupBoot> = Vec::with_capacity(target as usize + 1);
-        for id in 0..target {
-            boots.push(self.load_physical_stream_boot(manifest, id)?);
-        }
-        boots.push(self.load_physical_stream_boot(manifest, Options::SHARED_ID)?);
-        for (slot, boot) in boots.iter().enumerate() {
-            let expected = if slot == target as usize {
-                Options::SHARED_ID
-            } else {
-                slot as u8
-            };
-            if boot.physical_wal_id != expected
-                || boot.start_id < era_start
-                || boot.oldest_id < era_start
-            {
-                return Err(OpCode::Corruption);
-            }
-        }
-        // the post-wipe floor seed: the durable route's shared logger consumes a MAX sentinel for
-        // every inactive slot, while the relaxed route needs a real own-slot position (a MAX own
-        // floor would build a recycle intent with `to_file_id = u64::MAX`)
-        let seed = if self.opt.sync_on_write {
-            Position::MAX
-        } else {
-            Position::new(era_start, 0)
-        };
-        for boot in boots.iter_mut() {
-            boot.checkpoint_floor = seed;
-        }
-        Ok(TargetPlan { boots })
-    }
-
-    /// every physical WAL stream id present in the log namespace (per-group and shared).
-    ///
-    /// the era wipe must sweep what exists, not only what the current plan can name: a failed
-    /// open to a wider target can leave namespace entries above the current bound.
-    fn present_wal_streams(&self) -> Result<BTreeSet<u8>, OpCode> {
-        let shared_prefix = format!("{}{}", Options::GROUP_WAL_PREFIX, Options::SEP);
-        let group_prefix = format!("{}{}", Options::WAL_PREFIX, Options::SEP);
-        let mut streams = BTreeSet::new();
-        for entry in self.opt.fs.read_dir(&self.opt.log_root())? {
-            let Some(raw) = entry.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if raw.starts_with(&shared_prefix) {
-                streams.insert(Options::SHARED_ID);
-                continue;
-            }
-            let Some(rest) = raw.strip_prefix(&group_prefix) else {
-                continue;
-            };
-            let Some((group, _seq)) = rest.split_once(Options::SEP) else {
-                continue;
-            };
-            if let Ok(group) = group.parse::<u8>() {
-                streams.insert(group);
-            }
-        }
-        Ok(streams)
-    }
-
-    /// durable recycle slots may outlive the width that triggered their intent: `[0,
-    /// MAX_CONCURRENT_WRITE)` is the whole writable slot space (`Options::validate` clamps the
-    /// width to it, the shared stream is `SHARED_ID`, and any other id can only come from a file
-    /// name that `present_wal_streams` reports), so a narrower open still completes the intents a
-    /// wider, interrupted attempt left behind
-    fn durable_recycle_streams(present: &BTreeSet<u8>) -> Vec<u8> {
-        let mut streams: Vec<u8> = (0..Options::MAX_CONCURRENT_WRITE).collect();
-        streams.extend(present.iter().copied());
-        streams.push(Options::SHARED_ID);
-        streams.sort_unstable();
-        streams.dedup();
-        streams
-    }
-
-    /// wipe old physical WAL streams after recovery data is durable.
-    ///
-    /// the stream bound is `OpenPlan::stream_bound()`, not the retained scan width: an
-    /// interrupted attempt may have left era files for streams only the target width owns, and
-    /// those streams need the same durable `done` boundary before the new era starts. Such
-    /// files can never carry pre-migration data (every earlier width change wiped all streams
-    /// of the then-persisted width), so recycling them is safe.
-    fn wipe_old_wal(
-        &self,
-        manifest: Handle<Manifest>,
-        wal_boot: &[GroupBoot],
-        start: u64,
-    ) -> Result<(), OpCode> {
-        // sweep the union of the OpenPlan stream bound and every stream namespace present on disk: an
-        // interrupted attempt may have written era files for a stream id above the current bound
-        // (for example an aborted 4 -> 8 grow retried at 4 -> 2), and those files must not be
-        // left behind. They carry no pre-migration data (every earlier width change wiped all
-        // streams of the then-persisted width), so recycling them is safe.
-        let synth = |physical_wal_id: u8| GroupBoot {
-            physical_wal_id,
-            oldest_id: 0,
-            latest_id: 0,
-            scan_start: Position::MIN,
-            has_files: false,
-            start_id: start,
-            checkpoint_floor: Position::MIN,
-        };
-        let mut streams: BTreeSet<u8> = (0..self.plan.stream_bound()).collect();
-        streams.extend(self.present_wal_streams()?);
-        streams.extend(wal_boot.iter().map(|boot| boot.physical_wal_id));
-        let mut ordered: Vec<GroupBoot> = Vec::with_capacity(streams.len());
-        for id in streams {
-            match wal_boot.iter().find(|boot| boot.physical_wal_id == id) {
-                Some(boot) => ordered.push(*boot),
-                // target-only stream: the retained scan produced no boot for it
-                None => ordered.push(synth(id)),
-            }
-        }
-        ordered.sort_by_key(|boot| {
-            (
-                boot.physical_wal_id != Options::SHARED_ID,
-                boot.physical_wal_id,
-            )
-        });
-        for boot in ordered {
-            if boot.oldest_id >= start {
-                continue;
-            }
-            let intent = WalRecycleIntent {
-                group_id: boot.physical_wal_id,
-                from_file_id: boot.oldest_id,
-                to_file_id: start,
-            };
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_before_intent_commit");
-            let Some(intent) = manifest.commit_wal_recycle_intent(intent) else {
-                continue;
-            };
-            Self::remove_wal_prefix(&self.opt, intent)?;
-            self.opt.try_sync_log_dir()?;
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
-            assert!(
-                manifest.commit_wal_recycle_done(intent),
-                "wal recycle owner must complete its matching intent"
-            );
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_done_commit_before_publish");
-        }
-        Ok(())
-    }
-
-    /// per-group lower bound over persisted bucket frontiers
-    fn manifest_checkpoint_floors(&self, manifest: Handle<Manifest>) -> Vec<Position> {
-        let n = self.plan.source_groups as usize;
-        let mut floors = vec![Position::MAX; n];
-        let mut seen = [false; Options::MAX_CONCURRENT_WRITE as usize];
-        for frontier in manifest.bucket_frontier.iter() {
-            for (i, pos) in frontier.value().iter().enumerate().take(n) {
-                floors[i] = floors[i].min(*pos);
-                seen[i] = true;
-            }
-        }
-        for i in 0..n {
-            if !seen[i] {
-                floors[i] = Position::MIN;
-            }
-        }
-        floors
-    }
-
-    /// shared-stream floors, with inactive groups set to `Position::MAX`
-    fn recovery_logical_checkpoint_floors(&self, manifest: Handle<Manifest>) -> Vec<Position> {
-        let n = self.plan.source_groups as usize;
-        let manifest_floors = self.manifest_checkpoint_floors(manifest);
-        let mut floors = vec![Position::MAX; n];
-        for (i, floor) in manifest_floors.iter().enumerate().take(n) {
-            if self.shared_update_groups.contains(&i) {
-                floors[i] = *floor;
-            }
-        }
-        floors
-    }
-
-    fn epoch_high_water(
-        &self,
-        manifest: Handle<Manifest>,
-        present: &BTreeSet<u8>,
-    ) -> Result<(u64, bool), OpCode> {
-        let mut high_water = 0u64;
-        let mut has_history = false;
-        for entry in self.opt.fs.read_dir(&self.opt.log_root())? {
-            let Some(name) = entry.file_name() else {
-                continue;
-            };
-            let Some(raw) = name.to_str() else {
-                continue;
-            };
-            let is_wal = raw.starts_with(&format!("{}_", Options::WAL_PREFIX))
-                || raw.starts_with(&format!("{}_", Options::GROUP_WAL_PREFIX));
-            if is_wal
-                && let Some((_, file_id)) = raw.rsplit_once('_')
-                && let Ok(file_id) = file_id.parse::<u64>()
-            {
-                high_water = high_water.max(file_id);
-                has_history = true;
-            }
-        }
-        for frontier in manifest.bucket_frontier.iter() {
-            for pos in frontier.value().iter() {
-                high_water = high_water.max(pos.file_id);
-                has_history = true;
-            }
-        }
-        for group in Self::durable_recycle_streams(present) {
-            let state = manifest.load_wal_recycle_state(group);
-            if !state.is_none() {
-                high_water = high_water.max(state.from_file_id).max(state.to_file_id);
-                has_history = true;
-            }
-        }
-        Ok((high_water, has_history))
-    }
-
-    fn finish_pending_wal_recycle(
-        &self,
-        manifest: Handle<Manifest>,
-        present: &BTreeSet<u8>,
-    ) -> Result<(), OpCode> {
-        // this sweep runs on every open, not only on a rebuild, and each drained intent consumes a
-        // hit of both crash hooks below: an `abort@N` targeting a later wipe slot must count them
-        for group_id in Self::durable_recycle_streams(present) {
-            let state = manifest.load_wal_recycle_state(group_id);
-            if state.is_none() || state.is_done() {
-                continue;
-            }
-            let intent = WalRecycleIntent {
-                group_id,
-                from_file_id: state.from_file_id,
-                to_file_id: state.to_file_id,
-            };
-            Self::remove_wal_prefix(&self.opt, intent)?;
-            self.opt.try_sync_log_dir()?;
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_dir_sync_before_done_commit");
-            assert!(
-                manifest.commit_wal_recycle_done(intent),
-                "wal recycle owner must complete its matching intent"
-            );
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_done_commit_before_publish");
-        }
-        Ok(())
-    }
-
-    fn remove_wal_prefix(opt: &ParsedOptions, intent: WalRecycleIntent) -> Result<(), OpCode> {
-        // reached only from the recovery open path (`Recovery::phase1` via
-        // `finish_pending_wal_recycle`, `Recovery::phase2` via `wipe_old_wal`), so it can
-        // never overlap a checkpoint (which requires an already-open instance) and does
-        // not claim a `DeletionGuard` slot. moving era wiping to a runtime path requires
-        // claiming a slot via `DeletionGuard::begin` first
-        let prefix = if intent.group_id == Options::SHARED_ID {
-            format!("{}{}", Options::GROUP_WAL_PREFIX, Options::SEP)
-        } else {
-            format!(
-                "{}{}{}{}",
-                Options::WAL_PREFIX,
-                Options::SEP,
-                intent.group_id,
-                Options::SEP
-            )
-        };
-        for path in opt.fs.read_dir(&opt.log_root())? {
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let Some(raw_id) = name.strip_prefix(&prefix) else {
-                continue;
-            };
-            let Ok(seq) = raw_id.parse::<u64>() else {
-                continue;
-            };
-            if seq < intent.from_file_id || seq >= intent.to_file_id {
-                continue;
-            }
-            opt.fs.remove_file_if_exists(&path)?;
-            #[cfg(feature = "failpoints")]
-            crate::utils::failpoint::crash("mace_wal_recycle_after_remove_before_dir_sync");
-        }
-        Ok(())
-    }
-
-    fn find_latest_checkpoint(
-        &self,
-        group_id: u8,
-        min_file: u64,
-        max_file: u64,
-    ) -> Result<Option<Position>, OpCode> {
-        let mut block = Block::alloc(Self::INIT_BLOCK_SIZE);
-        for file_id in (min_file..=max_file).rev() {
-            let path = self.opt.physical_wal_path(group_id, file_id);
-            if !self.opt.fs.try_exists(&path)? {
-                continue;
-            }
-            let file = File::options()
-                .read(true)
-                .write(true)
-                .open(self.opt.fs.as_ref(), &path)?;
-            let end = file.size()?;
-            if end == 0 {
-                continue;
-            }
-            let mut pos = 0;
-            let mut latest = None;
-            while pos < end {
-                let hdr = {
-                    let hdr = block.mut_slice(0, 1);
-                    file.read(hdr, pos)?;
-                    hdr[0]
-                };
-                let Ok(et) = EntryType::try_from(hdr) else {
-                    break;
-                };
-                let Some(sz) = Self::get_size(et, (end - pos) as usize)? else {
-                    break;
-                };
-                file.read(block.mut_slice(0, sz), pos)?;
-                pos += sz as u64;
-                let ptr = block.data();
-                match et {
-                    EntryType::Commit => {
-                        let c = ptr_to::<WalCommit>(ptr);
-                        if !c.is_intact() {
-                            break;
-                        }
-                    }
-                    EntryType::Abort => {
-                        let a = ptr_to::<WalAbort>(ptr);
-                        if !a.is_intact() {
-                            break;
-                        }
-                    }
-                    EntryType::Begin => {
-                        let b = ptr_to::<WalBegin>(ptr);
-                        if !b.is_intact() {
-                            break;
-                        }
-                    }
-                    EntryType::CheckPoint => {
-                        let c = ptr_to::<WalCheckpoint>(ptr);
-                        if !c.is_intact() {
-                            break;
-                        }
-                        // a checkpoint record whose position is Position::MAX
-                        // carries no real floor (a fresh bucket with no
-                        // committed writes seeds the logical checkpoint floor
-                        // to MAX); treating it as the latest checkpoint would
-                        // make the recovery scan start at file u64::MAX and
-                        // fail the scan_start <= latest_id gate
-                        let ckpt = { c.checkpoint };
-                        if ckpt != Position::MAX {
-                            latest = Some(ckpt);
-                        }
-                    }
-                    EntryType::Update => {
-                        if PayloadType::try_from(block.slice::<u8>(1, 1)[0]).is_err() {
-                            break;
-                        }
-                        let u = ptr_to::<WalUpdate>(ptr);
-                        let payload_size = { u.size };
-                        let payload_len = match WalUpdate::checked_payload_len(payload_size) {
-                            Ok(len) => len,
-                            Err(_) => break,
-                        };
-                        let total = match WalUpdate::checked_encoded_len(payload_len) {
-                            Ok(total) => total,
-                            Err(_) => break,
-                        };
-                        let payload_len_u64 = match u64::try_from(payload_len) {
-                            Ok(len) => len,
-                            Err(_) => break,
-                        };
-                        let record_end = match pos.checked_add(payload_len_u64) {
-                            Some(candidate) if candidate <= end => candidate,
-                            _ => break,
-                        };
-                        if block.len() < total {
-                            block.realloc(total);
-                        }
-                        file.read(block.mut_slice(sz, payload_len), pos)?;
-                        let u = ptr_to::<WalUpdate>(block.data());
-                        if !u.is_intact() || u.validate_record(block.slice(0, total)).is_err() {
-                            break;
-                        }
-                        pos = record_end;
-                    }
-                    _ => break,
-                }
-            }
-            if latest.is_some() {
-                return Ok(latest);
-            }
-        }
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
@@ -1353,22 +395,21 @@ mod tests {
 
     use crate::{
         BucketOptions, Mace, OpCode, RandomPath, Store,
-        cc::wal::{EntryType, IWalCodec, PayloadType, WalCheckpoint, WalUpdate},
+        cc::wal::{
+            EntryType, IWalCodec, Location, PayloadType, WalCheckpoint, WalCommit, WalUpdate,
+        },
         io::{
             File,
             testfs::{InjectOp, InjectedFileSystem},
         },
-        map::{
-            SharedState,
-            adapter::{ManifestCheckpointObserver, ManifestDataReader},
-        },
+        map::{SharedState, adapter::ManifestCheckpointObserver},
         meta::WalRecycleIntent,
         meta::builder::ManifestBuilder,
-        utils::lru::Lru,
         utils::{
             Handle, MutRef,
             data::{Position, init_group_pos},
         },
+        utils::{block::Block, lru::Lru},
     };
 
     use super::{OpenPlan, Recovery};
@@ -1459,6 +500,70 @@ mod tests {
         )
         .expect_err("remove_wal_prefix must fail");
         assert_eq!(err, OpCode::IoError);
+    }
+
+    #[test]
+    fn record_reader_stops_at_bad_update_before_a_later_record() {
+        let (_root, _fs, opt) = new_opt();
+        let path = opt.wal_file(0, 0);
+        let bad = WalUpdate {
+            wal_type: EntryType::Update,
+            sub_type: PayloadType::Delete,
+            bucket_id: 0,
+            group_id: 0,
+            size: 0,
+            cmd_id: 0,
+            klen: 0,
+            txid: 1,
+            prev_id: 0,
+            prev_off: 0,
+            checksum: 0xdead_beef,
+        };
+        let mut good = WalUpdate { checksum: 0, ..bad };
+        good.checksum = good.calc_checksum();
+        let commit = WalCommit {
+            wal_type: EntryType::Commit,
+            txid: 1,
+            checksum: 0,
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(bad.to_slice());
+        bytes.extend_from_slice(commit.to_slice());
+        std::fs::write(&path, &bytes).expect("wal seed write must succeed");
+
+        let mut f = File::options()
+            .read(true)
+            .open(opt.fs.as_ref(), &path)
+            .expect("wal seed open must succeed");
+        let mut block = Block::alloc(1024);
+        assert!(
+            Recovery::read_wal_record(&mut f, 0, bytes.len() as u64, &mut block)
+                .expect("record read must not fail")
+                .is_none(),
+            "a bad update checksum must stop before the later commit record"
+        );
+        let (et, total) = Recovery::read_wal_record(
+            &mut f,
+            bad.encoded_len() as u64,
+            bytes.len() as u64,
+            &mut block,
+        )
+        .expect("later record read must not fail")
+        .expect("later commit must parse");
+        assert_eq!(et, EntryType::Commit);
+        assert_eq!(total, commit.encoded_len());
+
+        std::fs::write(&path, good.to_slice()).expect("valid wal write must succeed");
+        let mut f = File::options()
+            .read(true)
+            .open(opt.fs.as_ref(), &path)
+            .expect("valid wal open must succeed");
+        let (et, total) =
+            Recovery::read_wal_record(&mut f, 0, good.encoded_len() as u64, &mut block)
+                .expect("valid record read must not fail")
+                .expect("valid record must parse");
+        assert_eq!(et, EntryType::Update);
+        assert_eq!(total, good.encoded_len());
     }
 
     #[test]
@@ -1704,18 +809,16 @@ mod tests {
         }
 
         let bucket_id = manifest
-            .bucket_metas
-            .get("bucket")
-            .expect("bucket meta must exist")
-            .id;
+            .catalog
+            .id("bucket")
+            .expect("bucket meta must exist");
         let mut recovery = Recovery::new(opt.clone(), plan_for(&opt));
         let (_wal_boot, ctx) = recovery
             .phase1(manifest, manifest.sequences.clone())
             .expect("phase1 must succeed");
         let observer = Arc::new(ManifestCheckpointObserver::new(manifest, ctx));
-        let reader = Arc::new(ManifestDataReader::new(manifest));
         manifest
-            .set_context(ctx, reader, observer)
+            .set_context(ctx, observer)
             .expect("recovery flusher must start");
         let store = MutRef::new(Store::new(opt, manifest, ctx));
 
@@ -1724,7 +827,7 @@ mod tests {
             "recovery must be able to load the persisted bucket"
         );
         assert!(
-            !store.manifest.buckets.buckets.is_empty(),
+            !store.manifest.buckets.contexts_is_empty(),
             "loading the tree must publish a bucket context"
         );
 
@@ -1734,7 +837,7 @@ mod tests {
             "recovery abort must clear the loaded bucket set"
         );
         assert!(
-            store.manifest.buckets.buckets.is_empty(),
+            store.manifest.buckets.contexts_is_empty(),
             "recovery abort must unload bucket contexts before store abort tears down flush/context"
         );
 
@@ -2206,12 +1309,13 @@ mod tests {
         assert!(boundary.exists());
         assert!(other_stream.exists());
     }
-    fn seed_merge_txn(
+    fn seed_update_txn(
         path: &std::path::Path,
         txid: u64,
         bucket_id: u64,
         key: &[u8],
-        operand: &[u8],
+        sub_type: PayloadType,
+        payload: &[u8],
         terminal: EntryType,
     ) {
         assert!(matches!(terminal, EntryType::Commit | EntryType::Abort));
@@ -2222,11 +1326,10 @@ mod tests {
         };
         begin.checksum = begin.calc_checksum();
 
-        // payload covers key + length prefix + operand
-        let payload_len = key.len() + size_of::<crate::cc::wal::WalMerge>() + operand.len();
+        let payload_len = key.len() + payload.len();
         let mut update = WalUpdate {
             wal_type: EntryType::Update,
-            sub_type: PayloadType::Merge,
+            sub_type,
             bucket_id,
             group_id: 0,
             size: payload_len as u32,
@@ -2240,10 +1343,7 @@ mod tests {
         let mut record = vec![0u8; WalUpdate::size() + payload_len];
         record[..WalUpdate::size()].copy_from_slice(update.to_slice());
         record[WalUpdate::size()..WalUpdate::size() + key.len()].copy_from_slice(key);
-        let voff = WalUpdate::size() + key.len();
-        record[voff..voff + size_of::<u32>()]
-            .copy_from_slice(&(operand.len() as u32).to_le_bytes());
-        record[voff + size_of::<u32>()..].copy_from_slice(operand);
+        record[WalUpdate::size() + key.len()..].copy_from_slice(payload);
         let stored = crate::cc::wal::ptr_to::<WalUpdate>(record.as_ptr());
         update.checksum = stored.calc_checksum();
         record[..WalUpdate::size()].copy_from_slice(update.to_slice());
@@ -2268,7 +1368,29 @@ mod tests {
             abort.checksum = abort.calc_checksum();
             out.extend_from_slice(abort.to_slice());
         }
-        std::fs::write(path, out).expect("merge wal seed write must succeed");
+        std::fs::write(path, out).expect("wal seed write must succeed");
+    }
+
+    fn seed_merge_txn(
+        path: &std::path::Path,
+        txid: u64,
+        bucket_id: u64,
+        key: &[u8],
+        operand: &[u8],
+        terminal: EntryType,
+    ) {
+        let mut payload = Vec::with_capacity(size_of::<u32>() + operand.len());
+        payload.extend_from_slice(&(operand.len() as u32).to_le_bytes());
+        payload.extend_from_slice(operand);
+        seed_update_txn(
+            path,
+            txid,
+            bucket_id,
+            key,
+            PayloadType::Merge,
+            &payload,
+            terminal,
+        );
     }
 
     /// appends many committed merge transactions to one wal file (test seed helper)
@@ -2372,6 +1494,112 @@ mod tests {
         assert!(val.is_merge());
         assert_eq!(val.slice(), b"+7");
         assert_eq!(val.group_id(), 0);
+    }
+
+    #[test]
+    fn large_shared_wal_update_is_replayed() {
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.sync_on_write = true;
+        options.concurrent_write = 1;
+        options.wal_file_size = 8 << 20;
+        let mace = Mace::new(
+            options
+                .clone()
+                .validate()
+                .expect("initial open must validate"),
+        )
+        .expect("initial open must succeed");
+        let bucket_id = mace
+            .new_bucket("bucket", BucketOptions::default())
+            .expect("create bucket must succeed")
+            .id();
+        drop(mace);
+
+        // a single update larger than the recovery block forces the scan to realloc;
+        // the record pointer must not be used after that move
+        let value = vec![0x5au8; 2 << 20];
+        let mut payload = Vec::with_capacity(size_of::<u32>() + value.len());
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&value);
+        let parsed = options.validate().expect("recovery options must validate");
+        let wal = std::fs::read_dir(parsed.log_root())
+            .expect("log dir")
+            .filter_map(|e| {
+                let path = e.ok()?.path();
+                let seq = path
+                    .file_name()?
+                    .to_str()?
+                    .strip_prefix("group_wal_")?
+                    .parse::<u64>()
+                    .ok()?;
+                Some((seq, path))
+            })
+            .max_by_key(|(seq, _)| *seq)
+            .expect("shared wal file")
+            .1;
+        seed_update_txn(
+            &wal,
+            1_000_002,
+            bucket_id,
+            b"big",
+            PayloadType::Insert,
+            &payload,
+            EntryType::Commit,
+        );
+
+        let reopened = Mace::new(parsed).expect("reopen must succeed");
+        let db = reopened.open_bucket("bucket").expect("bucket must exist");
+        let view = db.view().expect("view must open");
+        assert_eq!(
+            view.get(b"big").expect("replayed value").slice(),
+            &value[..]
+        );
+    }
+
+    #[test]
+    fn abort_clean_pin_covers_files_before_the_scan_window() {
+        let root = RandomPath::tmp();
+        let mut options = Options::new(&*root);
+        options.concurrent_write = 1;
+        let mace = Mace::new(
+            options
+                .clone()
+                .validate()
+                .expect("initial open must validate"),
+        )
+        .expect("initial open must succeed");
+        let db = mace
+            .new_bucket("bucket", BucketOptions::default())
+            .expect("create bucket must succeed");
+        let txid = 42;
+        let parsed = options.validate().expect("recovery options must validate");
+        let plan = plan_for(&parsed);
+        let mut recovery = Recovery::new(Arc::new(parsed), plan);
+        recovery.last_update.insert(
+            txid,
+            Location {
+                bucket_id: db.id(),
+                physical_wal_id: 0,
+                logical_group_id: 0,
+                pos: Position::new(7, 100),
+                len: 0,
+            },
+        );
+        recovery.pin_file.insert(txid, 6);
+
+        recovery.mark_aborted(&mace.inner.store, txid, Some(5));
+
+        let task = mace
+            .inner
+            .store
+            .context
+            .abort_clean_tasks()
+            .into_iter()
+            .find(|task| task.txid == txid)
+            .expect("abort clean task");
+        assert_eq!(task.pin_file_id, 5);
+        mace.inner.store.context.remove_abort_clean(txid);
     }
 
     #[test]
@@ -2702,7 +1930,7 @@ mod tests {
         reopened.drop_bucket("b").unwrap();
         let db = reopened.open_bucket_with_options("b", with_op).unwrap();
 
-        let folded = |db: &crate::store::store::Bucket| -> u64 {
+        let folded = |db: &crate::store::bucket::Bucket| -> u64 {
             let v = db.view().unwrap().get(&merge_key).unwrap();
             u64::from_le_bytes(v.slice().try_into().unwrap())
         };
@@ -2823,7 +2051,7 @@ mod tests {
         reopened.drop_bucket("p").unwrap();
         let db = reopened.open_bucket_with_options("p", with_op).unwrap();
 
-        let folded = |db: &crate::store::store::Bucket, key: &str| -> u64 {
+        let folded = |db: &crate::store::bucket::Bucket, key: &str| -> u64 {
             let v = db.view().unwrap().get(key).unwrap();
             u64::from_le_bytes(v.slice().try_into().unwrap())
         };

@@ -1,4 +1,4 @@
-use crate::{must_exist, must_true};
+use crate::{must_exist, must_true, static_assert};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
@@ -22,6 +22,26 @@ use crate::{
     },
 };
 
+macro_rules! impl_ias_slice {
+    ($($ty:ty),* $(,)?) => {
+        $(impl IAsSlice for $ty {})*
+    };
+}
+
+impl_ias_slice!(
+    MetaKind,
+    StatInner,
+    StatHdr,
+    PageTableHdr,
+    BucketDurableFrontier,
+    WalRecycleState,
+    Sequences,
+    DeleteHdr,
+    IntervalPair,
+    DelIntervalStartHdr,
+    BucketMeta,
+);
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum MetaKind {
@@ -40,8 +60,6 @@ pub enum MetaKind {
     BlobDelInterval,
     KindEnd,
 }
-
-impl IAsSlice for MetaKind {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FileKind {
@@ -85,8 +103,6 @@ pub struct StatInner {
     pub bucket_id: u64,
 }
 
-impl IAsSlice for StatInner {}
-
 #[derive(Clone)]
 pub struct PersistStat {
     pub inner: StatInner,
@@ -96,6 +112,7 @@ pub struct PersistStat {
 pub struct MemStat {
     pub inner: StatInner,
     pub mask: Option<BitMap>,
+    pub(crate) mask_pins: u32,
 }
 
 impl Deref for PersistStat {
@@ -200,7 +217,11 @@ impl DerefMut for MemStat {
 
 impl MemStat {
     pub(crate) fn from_parts(inner: StatInner, mask: Option<BitMap>) -> Self {
-        Self { inner, mask }
+        Self {
+            inner,
+            mask,
+            mask_pins: 0,
+        }
     }
 
     pub(super) fn update(&mut self, tick: u64, reloc: &Reloc) {
@@ -230,8 +251,6 @@ pub(crate) struct StatHdr {
     pub(crate) size: u32,
 }
 
-impl IAsSlice for StatHdr {}
-
 impl IMetaCodec for PersistStat {
     fn packed_size(&self) -> usize {
         size_of::<StatHdr>() + self.len()
@@ -257,20 +276,9 @@ impl IMetaCodec for PersistStat {
     fn decode(src: &[u8]) -> Self {
         let hdr = StatHdr::from_slice(src);
         let inner = StatInner::from_slice(&src[hdr.len()..]);
-        let mut stat = Self::from_parts(inner, Vec::with_capacity(hdr.elems as usize));
-        let seq = unsafe {
-            src.as_ptr()
-                .add(hdr.len() + size_of::<StatInner>())
-                .cast::<u32>()
-        };
-
-        for i in 0..hdr.elems as usize {
-            unsafe {
-                let x = seq.add(i).read_unaligned();
-                stat.inactive_elems.push(x);
-            }
-        }
-        stat
+        let inactive_elems: Vec<u32> =
+            decode_seq(src, hdr.len() + size_of::<StatInner>(), hdr.elems as usize).collect();
+        Self::from_parts(inner, inactive_elems)
     }
 }
 
@@ -332,8 +340,6 @@ pub(crate) struct PageTableHdr {
     pub(crate) size: usize,
 }
 
-impl IAsSlice for PageTableHdr {}
-
 impl IMetaCodec for PageTable {
     fn packed_size(&self) -> usize {
         size_of::<PageTableHdr>() + self.len()
@@ -352,10 +358,7 @@ impl IMetaCodec for PageTable {
     fn decode(src: &[u8]) -> Self {
         let hdr = PageTableHdr::from_slice(src);
         let mut table = PageTable::default();
-        let p = unsafe { src.as_ptr().add(hdr.len()).cast::<MapEntry>() };
-
-        for i in 0..hdr.elems as usize {
-            let m = unsafe { p.add(i).read_unaligned() };
+        for m in decode_seq::<MapEntry>(src, hdr.len(), hdr.elems as usize) {
             table.add(m.page_id, m.page_addr);
         }
 
@@ -376,7 +379,14 @@ impl BucketDurableFrontier {
     }
 }
 
-impl IAsSlice for BucketDurableFrontier {}
+impl BucketDurableFrontier {
+    pub(crate) fn try_decode(src: &[u8]) -> Result<Self, OpCode> {
+        if src.len() < size_of::<Self>() {
+            return Err(OpCode::Corruption);
+        }
+        Ok(unsafe { std::ptr::read_unaligned(src.as_ptr().cast::<Self>()) })
+    }
+}
 
 impl IMetaCodec for BucketDurableFrontier {
     fn packed_size(&self) -> usize {
@@ -389,7 +399,7 @@ impl IMetaCodec for BucketDurableFrontier {
     }
 
     fn decode(src: &[u8]) -> Self {
-        Self::from_slice(src)
+        crate::must_ok!(Self::try_decode(src), "bucket durable frontier decode")
     }
 }
 
@@ -462,23 +472,6 @@ impl WalRecycleState {
     }
 }
 
-impl IAsSlice for WalRecycleState {}
-
-impl IMetaCodec for WalRecycleState {
-    fn packed_size(&self) -> usize {
-        size_of::<Self>()
-    }
-
-    fn encode(&self, to: &mut [u8]) {
-        must_true!(eq to.len(), self.packed_size());
-        to.copy_from_slice(self.as_slice());
-    }
-
-    fn decode(src: &[u8]) -> Self {
-        Self::from_slice(src)
-    }
-}
-
 impl Default for Sequences {
     fn default() -> Self {
         Self {
@@ -496,23 +489,6 @@ impl Clone for Sequences {
         let dst = addr_of_mut!(tmp);
         unsafe { std::ptr::copy_nonoverlapping(self, dst, 1) };
         tmp
-    }
-}
-
-impl IAsSlice for Sequences {}
-
-impl IMetaCodec for Sequences {
-    fn packed_size(&self) -> usize {
-        size_of::<Self>()
-    }
-
-    fn encode(&self, to: &mut [u8]) {
-        must_true!(eq to.len(), self.packed_size());
-        to.copy_from_slice(self.as_slice());
-    }
-
-    fn decode(src: &[u8]) -> Self {
-        Sequences::from_slice(src)
     }
 }
 
@@ -545,8 +521,6 @@ pub(crate) struct DeleteHdr {
     nr_id: u32,
 }
 
-impl IAsSlice for DeleteHdr {}
-
 impl IMetaCodec for Delete {
     fn packed_size(&self) -> usize {
         self.id.len() * size_of::<u64>() + size_of::<DeleteHdr>()
@@ -567,17 +541,12 @@ impl IMetaCodec for Delete {
 
     fn decode(src: &[u8]) -> Self {
         let hdr = DeleteHdr::from_slice(src);
-        let p = unsafe { src.as_ptr().add(hdr.len()).cast::<u64>() };
-        let mut r = Delete::default();
-        for i in 0..hdr.nr_id as usize {
-            let id = unsafe { p.add(i).read_unaligned() };
-            r.push(id);
-        }
-        r
+        Delete::from(decode_seq::<u64>(src, hdr.len(), hdr.nr_id as usize).collect::<Vec<u64>>())
     }
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct IntervalPair {
     pub lo_addr: u64,
     pub hi_addr: u64,
@@ -602,23 +571,6 @@ impl Debug for IntervalPair {
             "bucket {} [{}, {}] => {}",
             self.bucket_id, self.lo_addr, self.hi_addr, self.file_id
         ))
-    }
-}
-
-impl IAsSlice for IntervalPair {}
-
-impl IMetaCodec for IntervalPair {
-    fn packed_size(&self) -> usize {
-        size_of::<Self>()
-    }
-
-    fn encode(&self, to: &mut [u8]) {
-        must_true!(eq to.len(), self.packed_size());
-        to.copy_from_slice(self.as_slice());
-    }
-
-    fn decode(src: &[u8]) -> Self {
-        Self::from_slice(src)
     }
 }
 
@@ -649,8 +601,6 @@ pub(crate) struct DelIntervalStartHdr {
     bucket_id: u64,
 }
 
-impl IAsSlice for DelIntervalStartHdr {}
-
 impl IMetaCodec for DelInterval {
     fn packed_size(&self) -> usize {
         self.lo.len() * size_of::<u64>() + size_of::<DelIntervalStartHdr>()
@@ -672,16 +622,10 @@ impl IMetaCodec for DelInterval {
 
     fn decode(src: &[u8]) -> Self {
         let hdr = DelIntervalStartHdr::from_slice(src);
-        let p = unsafe { src.as_ptr().add(hdr.len()).cast::<u64>() };
-        let mut r = DelInterval {
-            lo: Vec::new(),
+        DelInterval {
+            lo: decode_seq::<u64>(src, hdr.len(), hdr.nr_lo as usize).collect(),
             bucket_id: hdr.bucket_id,
-        };
-        for i in 0..hdr.nr_lo as usize {
-            let id = unsafe { p.add(i).read_unaligned() };
-            r.push(id);
         }
-        r
     }
 }
 
@@ -690,6 +634,15 @@ impl IMetaCodec for DelInterval {
 pub struct BucketMeta {
     pub id: u64,
     pub options: PersistedBucketOptions,
+}
+
+impl BucketMeta {
+    pub(crate) fn try_decode(src: &[u8]) -> Result<Self, OpCode> {
+        if src.len() < size_of::<Self>() {
+            return Err(OpCode::Corruption);
+        }
+        Ok(unsafe { std::ptr::read_unaligned(src.as_ptr().cast::<Self>()) })
+    }
 }
 
 impl IMetaCodec for BucketMeta {
@@ -703,11 +656,9 @@ impl IMetaCodec for BucketMeta {
     }
 
     fn decode(src: &[u8]) -> Self {
-        unsafe { std::ptr::read_unaligned(src.as_ptr().cast::<Self>()) }
+        crate::must_ok!(Self::try_decode(src), "bucket meta decode")
     }
 }
-
-impl IAsSlice for BucketMeta {}
 
 /// which conditional metadata operation missed: a stat update that found no record
 /// (`Data`/`Blob`) or an idempotent delete that found the key already gone
@@ -737,17 +688,64 @@ pub trait IMetaCodec {
     fn decode(src: &[u8]) -> Self;
 }
 
+/// allocates exactly the packed size and encodes into it
+pub(crate) fn encode_record<T: IMetaCodec>(record: &T) -> Vec<u8> {
+    let mut buf = vec![0u8; record.packed_size()];
+    record.encode(&mut buf);
+    buf
+}
+
+/// yields `count` packed `T` values starting `offset` bytes into `src`; record bodies
+/// are unaligned, so every value is read with `read_unaligned`
+fn decode_seq<T>(src: &[u8], offset: usize, count: usize) -> impl Iterator<Item = T> {
+    let ptr = src.as_ptr().wrapping_add(offset).cast::<T>();
+    (0..count).map(move |i| unsafe { ptr.add(i).read_unaligned() })
+}
+
+/// stages one encoded record as a put under `bucket`
+fn push_put<T: IMetaCodec>(
+    ops: &mut BTreeMap<String, Vec<MetaOp>>,
+    bucket: impl Into<String>,
+    key: Vec<u8>,
+    record: &T,
+) {
+    let value = encode_record(record);
+    ops.entry(bucket.into())
+        .or_default()
+        .push(MetaOp::Put(key, value));
+}
+
+/// fixed-size record codec: the encoded form is the record's own bytes
+macro_rules! impl_fixed_codec {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl IMetaCodec for $t {
+                fn packed_size(&self) -> usize {
+                    size_of::<Self>()
+                }
+
+                fn encode(&self, to: &mut [u8]) {
+                    must_true!(eq to.len(), self.packed_size());
+                    to.copy_from_slice(self.as_slice());
+                }
+
+                fn decode(src: &[u8]) -> Self {
+                    Self::from_slice(src)
+                }
+            }
+        )*
+    };
+}
+
+impl_fixed_codec!(WalRecycleState, Sequences, IntervalPair);
+
 pub(crate) trait MetaRecord: IMetaCodec {
     fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>);
 }
 
 impl MetaRecord for Sequences {
     fn record(&self, _kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
-        let mut buf = vec![0u8; self.packed_size()];
-        self.encode(&mut buf);
-        ops.entry(BUCKET_MISC.to_string())
-            .or_default()
-            .push(MetaOp::Put(SEQUENCES_KEY.as_bytes().to_vec(), buf));
+        push_put(ops, BUCKET_MISC, SEQUENCES_KEY.as_bytes().to_vec(), self);
     }
 }
 
@@ -766,41 +764,34 @@ impl MetaRecord for PageTable {
 
 impl MetaRecord for BucketDurableFrontier {
     fn record(&self, _kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
-        let mut buf = vec![0u8; self.packed_size()];
-        self.encode(&mut buf);
-        ops.entry(BUCKET_FRONTIER.to_string())
-            .or_default()
-            .push(MetaOp::Put(self.bucket_id.to_le_bytes().to_vec(), buf));
+        push_put(
+            ops,
+            BUCKET_FRONTIER,
+            self.bucket_id.to_le_bytes().to_vec(),
+            self,
+        );
     }
 }
 
 impl MetaRecord for PersistStat {
     fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
-        let mut buf = vec![0u8; self.packed_size()];
-        self.encode(&mut buf);
         let bucket = if kind == MetaKind::DataStat {
             BUCKET_DATA_STAT
         } else {
             BUCKET_BLOB_STAT
         };
-        ops.entry(bucket.to_string())
-            .or_default()
-            .push(MetaOp::Put(self.file_id.to_le_bytes().to_vec(), buf));
+        push_put(ops, bucket, self.file_id.to_le_bytes().to_vec(), self);
     }
 }
 
 impl MetaRecord for IntervalPair {
     fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
-        let mut buf = vec![0u8; self.packed_size()];
-        self.encode(&mut buf);
         let bucket = if kind == MetaKind::DataInterval {
             data_interval_name(self.bucket_id)
         } else {
             blob_interval_name(self.bucket_id)
         };
-        ops.entry(bucket)
-            .or_default()
-            .push(MetaOp::Put(self.lo_addr.to_le_bytes().to_vec(), buf));
+        push_put(ops, bucket, self.lo_addr.to_le_bytes().to_vec(), self);
     }
 }
 
@@ -874,6 +865,18 @@ impl MetaRecord for DelInterval {
     }
 }
 
+// the persisted metadata value sizes and the offsets `docs/format.md` indexes;
+// `Sequences` holds atomics, which have the same layout as the u64s it stores
+static_assert!(size_of::<StatHdr>() == 8);
+static_assert!(size_of::<StatInner>() == 56);
+static_assert!(std::mem::offset_of!(StatInner, bucket_id) == 48);
+static_assert!(size_of::<Sequences>() == 24);
+static_assert!(size_of::<WalRecycleState>() == 24);
+static_assert!(size_of::<BucketDurableFrontier>() == 2056);
+static_assert!(size_of::<BucketMeta>() == 56);
+static_assert!(std::mem::offset_of!(BucketMeta, options) == 8);
+static_assert!(size_of::<IntervalPair>() == 32);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,5 +924,19 @@ mod tests {
             mask.set_bits(total_elems).contains(&last),
             "the bitmap must be sized from the record's element count"
         );
+    }
+
+    #[test]
+    fn bucket_meta_decode_bounds_rejected() {
+        let short_meta = vec![0u8; size_of::<BucketMeta>() - 1];
+        assert!(matches!(
+            BucketMeta::try_decode(&short_meta),
+            Err(OpCode::Corruption)
+        ));
+        let short_frontier = vec![0u8; size_of::<BucketDurableFrontier>() - 1];
+        assert!(matches!(
+            BucketDurableFrontier::try_decode(&short_frontier),
+            Err(OpCode::Corruption)
+        ));
     }
 }

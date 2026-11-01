@@ -182,8 +182,7 @@ impl WriterGroup {
 
     pub fn abort_fact(&self, start_ts: u64) {
         let _guard = AbortSeqGuard::enter(self);
-        self.retained_aborts.insert(start_ts, ());
-        self.retained_abort_floor.fetch_min(start_ts, Release);
+        self.retain_abort(start_ts);
         #[cfg(feature = "extra_check")]
         crate::testing::fire_txn_abort_sync_point(
             crate::testing::TxnAbortSyncPoint::AfterAbortFloorBeforeAbortedFactPublish,
@@ -215,9 +214,14 @@ impl WriterGroup {
         self.retained_abort_floor.store(floor, Release);
     }
 
+    /// records `txid` as a retained abort and lowers the published floor
+    fn retain_abort(&self, txid: u64) {
+        self.retained_aborts.insert(txid, ());
+        self.retained_abort_floor.fetch_min(txid, Release);
+    }
+
     pub fn recover_retained_abort(&self, start_ts: u64) {
-        self.retained_aborts.insert(start_ts, ());
-        self.retained_abort_floor.fetch_min(start_ts, Release);
+        self.retain_abort(start_ts);
         self.facts.insert(start_ts, TxnFact::Aborted);
     }
 
@@ -225,16 +229,12 @@ impl WriterGroup {
         let _log = self.logging.lock();
         let _guard = AbortSeqGuard::enter(self);
         self.retained_aborts.remove(&txid);
-        let Some(fact) = self.facts.get(&txid) else {
-            self.recompute_retained_abort_floor();
-            return;
-        };
-        if !matches!(*fact, TxnFact::Aborted) {
-            self.recompute_retained_abort_floor();
-            return;
+        if let Some(fact) = self.facts.get(&txid)
+            && matches!(*fact, TxnFact::Aborted)
+        {
+            drop(fact);
+            self.facts.remove(&txid);
         }
-        drop(fact);
-        self.facts.remove(&txid);
         self.recompute_retained_abort_floor();
     }
 
@@ -268,7 +268,7 @@ mod tests {
     use crate::utils::options::Options;
     use std::sync::Arc;
 
-    fn new_group() -> WriterGroup {
+    fn new_group() -> (RandomPath, WriterGroup) {
         let root = RandomPath::tmp();
         let mut opt = Options::new(&*root);
         opt.concurrent_write = 1;
@@ -283,12 +283,12 @@ mod tests {
             opt,
             vec![ckpt_cnt.clone()],
         )));
-        WriterGroup::new(0, logging, ckpt_cnt)
+        (root, WriterGroup::new(0, logging, ckpt_cnt))
     }
 
     #[test]
     fn active_bounds_follow_live_facts_without_collector_publication() {
-        let group = new_group();
+        let (_root, group) = new_group();
         group.active_fact(10, Position::new(1, 9));
         group.active_fact(20, Position::new(3, 7));
         group.commit_fact(10, || 30);
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn live_bounds_clear_after_last_active_commits() {
-        let group = new_group();
+        let (_root, group) = new_group();
         group.active_fact(10, Position::new(1, 9));
         group.commit_fact(10, || 20);
 
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn begin_registration_blocks_collection_until_start_ts_is_published() {
-        let group = new_group();
+        let (_root, group) = new_group();
 
         group.start_reg();
         assert_eq!(group.stable_ts(), RegistrationTs::Pending);

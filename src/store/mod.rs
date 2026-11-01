@@ -1,3 +1,4 @@
+pub(crate) mod bucket;
 pub(crate) mod checkpoint;
 pub(crate) mod gc;
 pub(crate) mod recovery;

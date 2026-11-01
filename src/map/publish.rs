@@ -26,7 +26,7 @@ pub struct Publish<'a> {
 impl<'a> Publish<'a> {
     pub(crate) fn commit(mut self) {
         for (pid, addr) in self.dirty_roots {
-            self.epoch.dirty_roots.mark(pid, addr);
+            crate::map::data::mark_root(&self.epoch.dirty_roots, pid, addr);
         }
 
         for p in self.cache_pages.drain(..) {
@@ -129,12 +129,17 @@ impl<'a> Publish<'a> {
     }
 
     pub(crate) fn mark_unmap(&mut self, pid: u64, old: u64) {
-        must_ok!(
-            self.table.cas(pid, old, NULL_ADDR),
-            "unmapped pid must still be mapped before recycle"
-        );
-        self.epoch.unmap_pid.mark(pid);
+        unmap(self.table, &self.epoch, pid, old);
     }
+}
+
+/// retire one mapping into the epoch's unmap set after clearing the page table slot
+fn unmap(table: &PageMap, epoch: &WriteEpoch, pid: u64, old: u64) {
+    must_ok!(
+        table.cas(pid, old, NULL_ADDR),
+        "unmapped pid must still be mapped before recycle"
+    );
+    epoch.unmap_pid.insert(pid);
 }
 
 pub(crate) struct AllocGuard<'a> {
@@ -164,15 +169,11 @@ impl<'a> AllocGuard<'a> {
     }
 
     pub(crate) fn mark_dirty(&self, pid: u64, addr: u64) {
-        self.epoch.dirty_roots.mark(pid, addr);
+        crate::map::data::mark_root(&self.epoch.dirty_roots, pid, addr);
     }
 
     pub(crate) fn mark_unmap(&self, pid: u64, old: u64) {
-        must_ok!(
-            self.bucket.table.cas(pid, old, NULL_ADDR),
-            "unmapped pid must still be mapped before recycle"
-        );
-        self.epoch.unmap_pid.mark(pid);
+        unmap(&self.bucket.table, &self.epoch, pid, old);
     }
 
     pub(crate) fn collect_retired(&self, base_addr: u64, dst: &mut Vec<u64>) {

@@ -6,6 +6,7 @@ use std::{
 
 use crate::io;
 use crate::must_ok;
+use crate::static_assert;
 use crate::utils::merge_operator::MergeOperator;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::{NoopObserver, Observer};
@@ -115,8 +116,10 @@ pub struct Options {
     /// Bitmap-cache entry count for data and blob stats.
     pub stat_mask_cache_count: usize,
     /// Maximum number of open data-file handles cached concurrently, used for loading data pages.
+    /// Values below the shard count are rounded up to one handle per shard; zero disables the cache.
     pub data_handle_cache_capacity: usize,
     /// Maximum number of open blob-file handles cached concurrently, used for loading blob pages.
+    /// Values below the shard count are rounded up to one handle per shard; zero disables the cache.
     pub blob_handle_cache_capacity: usize,
     /// Size limit of a data file. Zero selects the default [`Self::DATA_FILE_SIZE`]
     pub data_file_size: usize,
@@ -178,6 +181,12 @@ pub struct PersistedBucketOptions {
     pub enable_backpressure: bool,
     pub _padding: [u8; 2],
 }
+
+// `docs/format.md` specifies this as the persisted bucket options block
+static_assert!(size_of::<PersistedBucketOptions>() == 48);
+static_assert!(std::mem::offset_of!(PersistedBucketOptions, inline_size) == 32);
+static_assert!(std::mem::offset_of!(PersistedBucketOptions, split_elems) == 40);
+static_assert!(std::mem::offset_of!(PersistedBucketOptions, enable_compression) == 44);
 
 impl From<&BucketOptions> for PersistedBucketOptions {
     fn from(opt: &BucketOptions) -> Self {
@@ -393,16 +402,10 @@ impl Options {
 
     /// Creates the directory structure for the database.
     pub fn create_dir(&self) -> std::io::Result<()> {
-        let (db_root, data_root, log_root) = (self.db_root(), self.data_root(), self.log_root());
-
-        if !self.fs.try_exists(&db_root)? {
-            create_dir_all_and_sync(self.fs.as_ref(), &db_root)?;
-        }
-        if !self.fs.try_exists(&data_root)? {
-            create_dir_all_and_sync(self.fs.as_ref(), &data_root)?;
-        }
-        if !self.fs.try_exists(&log_root)? {
-            create_dir_all_and_sync(self.fs.as_ref(), &log_root)?;
+        for dir in [self.db_root(), self.data_root(), self.log_root()] {
+            if !self.fs.try_exists(&dir)? {
+                create_dir_all_and_sync(self.fs.as_ref(), &dir)?;
+            }
         }
         Ok(())
     }
@@ -433,14 +436,16 @@ impl Options {
         self.db_root().join("data")
     }
 
+    fn file_with_id(root: PathBuf, prefix: &str, id: u64) -> PathBuf {
+        root.join(format!("{}{}{}", prefix, Self::SEP, id))
+    }
+
     pub fn data_file(&self, id: u64) -> PathBuf {
-        self.data_root()
-            .join(format!("{}{}{}", Self::DATA_PREFIX, Self::SEP, id))
+        Self::file_with_id(self.data_root(), Self::DATA_PREFIX, id)
     }
 
     pub fn blob_file(&self, id: u64) -> PathBuf {
-        self.data_root()
-            .join(format!("{}{}{}", Self::BLOB_PREFIX, Self::SEP, id))
+        Self::file_with_id(self.data_root(), Self::BLOB_PREFIX, id)
     }
 
     pub fn log_root(&self) -> PathBuf {
@@ -468,8 +473,7 @@ impl Options {
 
     /// durable shared stream file: `group_wal_<seq>`
     pub fn group_wal_file(&self, seq: u64) -> PathBuf {
-        self.log_root()
-            .join(format!("{}{}{}", Self::GROUP_WAL_PREFIX, Self::SEP, seq))
+        Self::file_with_id(self.log_root(), Self::GROUP_WAL_PREFIX, seq)
     }
 
     /// path for a physical WAL stream

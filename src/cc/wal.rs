@@ -133,6 +133,16 @@ pub struct WalCheckpoint {
     pub checksum: u32,
 }
 
+static_assert!(size_of::<WalUpdate>() == 51);
+static_assert!(std::mem::offset_of!(WalUpdate, bucket_id) == 2);
+static_assert!(std::mem::offset_of!(WalUpdate, size) == 11);
+static_assert!(std::mem::offset_of!(WalUpdate, checksum) == 47);
+static_assert!(size_of::<WalBegin>() == 13);
+static_assert!(size_of::<WalCommit>() == 13);
+static_assert!(size_of::<WalAbort>() == 13);
+static_assert!(size_of::<WalCheckpoint>() == 21);
+static_assert!(std::mem::offset_of!(WalCheckpoint, checkpoint) == 1);
+
 macro_rules! impl_checksum {
     ($t:ty) => {
         impl $t {

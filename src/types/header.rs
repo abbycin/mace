@@ -150,5 +150,17 @@ static_assert!(size_of::<DiskBaseHeader>() == size_of::<BaseHeader>());
 static_assert!(size_of::<DiskDeltaHeader>() == size_of::<DeltaHeader>());
 static_assert!(size_of::<DiskRemoteHeader>() == size_of::<RemoteHeader>());
 
+// these are the persisted sizes and the offsets `docs/format.md` indexes; the
+// mem and disk structs must not drift from the specified layout
+static_assert!(size_of::<DiskBoxHeader>() == 60);
+static_assert!(std::mem::offset_of!(DiskBoxHeader, pid) == 12);
+static_assert!(std::mem::offset_of!(DiskBoxHeader, lsn) == 44);
+static_assert!(size_of::<DiskBaseHeader>() == 40);
+static_assert!(std::mem::offset_of!(DiskBaseHeader, size) == 4);
+static_assert!(std::mem::offset_of!(DiskBaseHeader, lo_len) == 24);
+static_assert!(std::mem::offset_of!(DiskBaseHeader, prefix_len) == 32);
+static_assert!(size_of::<DiskDeltaHeader>() == 8);
+static_assert!(size_of::<DiskRemoteHeader>() == 8);
+
 pub(crate) type SlotType = u32;
 pub(crate) const SLOT_LEN: usize = size_of::<SlotType>();

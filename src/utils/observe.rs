@@ -19,187 +19,109 @@ pub fn sampled_instant(seed: u64, shift: u8) -> Option<Instant> {
     should_sample(seed, shift).then(Instant::now)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum CounterMetric {
-    TxnBegin,
-    TxnCommit,
-    TxnAbort,
-    TxnConflictAbort,
-    TxnRollback,
-    TxnRetryAgain,
-    TreeRetryAgain,
-    TreeNodeSplit,
-    TreeNodeMerge,
-    TreeNodeConsolidate,
-    WalAppend,
-    WalSync,
-    FlushOrphanDataStaged,
-    FlushOrphanBlobStaged,
-    FlushOrphanDataCleared,
-    FlushOrphanBlobCleared,
-    RecoveryRedoRecord,
-    RecoveryUndoTxn,
-    RecoveryWalTruncate,
-    GcRun,
-    GcWalRecycleFile,
-    GcPendingBucketClean,
-    GcDataRewrite,
-    GcBlobRewrite,
-    GcDataObsoleteFile,
-    GcBlobObsoleteFile,
-    GcAbortCleanCheckpointBucket,
-    GcAbortCleanWalFileOpen,
-    FlushSkipRetiredDataStat,
-    FlushSkipRetiredBlobStat,
-    FlushConditionalDataStatPutMiss,
-    FlushConditionalBlobStatPutMiss,
-    FlushConditionalDataDelMiss,
-    FlushConditionalBlobDelMiss,
-    FlowFgAdmissionWait,
-    CheckpointStart,
-    CheckpointComplete,
-    CheckpointFailure,
-    CheckpointCopiedBytes,
-    CheckpointWalCut,
-    CheckpointFrontier,
-    WalGeneration,
-    WalGenerationLeader,
-    WalGenerationFollower,
-    WalGenerationError,
-    MergeContractViolation,
+/// declares a fixed-cardinality metric enum with its COUNT/ALL/idx surface;
+/// only the array-backed counter/gauge/histogram sets use this, event kinds
+/// stay a bounded hand-written enum
+macro_rules! metric_set {
+    ($vis:vis enum $name:ident { $($variant:ident),* $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(u8)]
+        $vis enum $name {
+            $($variant),*
+        }
+
+        impl $name {
+            pub const COUNT: usize = [$($name::$variant),*].len();
+            pub const ALL: [$name; Self::COUNT] = [$($name::$variant),*];
+
+            #[inline]
+            pub const fn idx(self) -> usize {
+                self as usize
+            }
+        }
+    };
 }
 
-impl CounterMetric {
-    pub const COUNT: usize = 46;
-    pub const ALL: [CounterMetric; Self::COUNT] = [
-        CounterMetric::TxnBegin,
-        CounterMetric::TxnCommit,
-        CounterMetric::TxnAbort,
-        CounterMetric::TxnConflictAbort,
-        CounterMetric::TxnRollback,
-        CounterMetric::TxnRetryAgain,
-        CounterMetric::TreeRetryAgain,
-        CounterMetric::TreeNodeSplit,
-        CounterMetric::TreeNodeMerge,
-        CounterMetric::TreeNodeConsolidate,
-        CounterMetric::WalAppend,
-        CounterMetric::WalSync,
-        CounterMetric::FlushOrphanDataStaged,
-        CounterMetric::FlushOrphanBlobStaged,
-        CounterMetric::FlushOrphanDataCleared,
-        CounterMetric::FlushOrphanBlobCleared,
-        CounterMetric::RecoveryRedoRecord,
-        CounterMetric::RecoveryUndoTxn,
-        CounterMetric::RecoveryWalTruncate,
-        CounterMetric::GcRun,
-        CounterMetric::GcWalRecycleFile,
-        CounterMetric::GcPendingBucketClean,
-        CounterMetric::GcDataRewrite,
-        CounterMetric::GcBlobRewrite,
-        CounterMetric::GcDataObsoleteFile,
-        CounterMetric::GcBlobObsoleteFile,
-        CounterMetric::GcAbortCleanCheckpointBucket,
-        CounterMetric::GcAbortCleanWalFileOpen,
-        CounterMetric::FlushSkipRetiredDataStat,
-        CounterMetric::FlushSkipRetiredBlobStat,
-        CounterMetric::FlushConditionalDataStatPutMiss,
-        CounterMetric::FlushConditionalBlobStatPutMiss,
-        CounterMetric::FlushConditionalDataDelMiss,
-        CounterMetric::FlushConditionalBlobDelMiss,
-        CounterMetric::FlowFgAdmissionWait,
-        CounterMetric::CheckpointStart,
-        CounterMetric::CheckpointComplete,
-        CounterMetric::CheckpointFailure,
-        CounterMetric::CheckpointCopiedBytes,
-        CounterMetric::CheckpointWalCut,
-        CounterMetric::CheckpointFrontier,
-        CounterMetric::WalGeneration,
-        CounterMetric::WalGenerationLeader,
-        CounterMetric::WalGenerationFollower,
-        CounterMetric::WalGenerationError,
-        CounterMetric::MergeContractViolation,
-    ];
-
-    #[inline]
-    pub const fn idx(self) -> usize {
-        self as usize
+metric_set! {
+    pub enum CounterMetric {
+        TxnBegin,
+        TxnCommit,
+        TxnAbort,
+        TxnConflictAbort,
+        TxnRollback,
+        TxnRetryAgain,
+        TreeRetryAgain,
+        TreeNodeSplit,
+        TreeNodeMerge,
+        TreeNodeConsolidate,
+        WalAppend,
+        WalSync,
+        FlushOrphanDataStaged,
+        FlushOrphanBlobStaged,
+        FlushOrphanDataCleared,
+        FlushOrphanBlobCleared,
+        RecoveryRedoRecord,
+        RecoveryUndoTxn,
+        RecoveryWalTruncate,
+        GcRun,
+        GcWalRecycleFile,
+        GcPendingBucketClean,
+        GcDataRewrite,
+        GcBlobRewrite,
+        GcDataObsoleteFile,
+        GcBlobObsoleteFile,
+        GcAbortCleanCheckpointBucket,
+        GcAbortCleanWalFileOpen,
+        FlushSkipRetiredDataStat,
+        FlushSkipRetiredBlobStat,
+        FlushConditionalDataStatPutMiss,
+        FlushConditionalBlobStatPutMiss,
+        FlushConditionalDataDelMiss,
+        FlushConditionalBlobDelMiss,
+        FlowFgAdmissionWait,
+        CheckpointStart,
+        CheckpointComplete,
+        CheckpointFailure,
+        CheckpointCopiedBytes,
+        CheckpointWalCut,
+        CheckpointFrontier,
+        WalGeneration,
+        WalGenerationLeader,
+        WalGenerationFollower,
+        WalGenerationError,
+        MergeContractViolation,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum GaugeMetric {
-    RecoveryDirtyEntries,
-    RecoveryUndoEntries,
-    RetiredStatKeysCurrent,
-}
-
-impl GaugeMetric {
-    pub const COUNT: usize = 3;
-    pub const ALL: [GaugeMetric; Self::COUNT] = [
-        GaugeMetric::RecoveryDirtyEntries,
-        GaugeMetric::RecoveryUndoEntries,
-        GaugeMetric::RetiredStatKeysCurrent,
-    ];
-
-    #[inline]
-    pub const fn idx(self) -> usize {
-        self as usize
+metric_set! {
+    pub enum GaugeMetric {
+        RecoveryDirtyEntries,
+        RecoveryUndoEntries,
+        RetiredStatKeysCurrent,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum HistogramMetric {
-    TxnCommitMicros,
-    TxnRollbackMicros,
-    TreeLinkHoldMicros,
-    WalAppendBytes,
-    WalSyncMicros,
-    RecoveryPhase2Micros,
-    RecoveryAnalyzeMicros,
-    RecoveryRedoMicros,
-    RecoveryUndoMicros,
-    GcRunMicros,
-    GcDataRewriteMicros,
-    GcBlobRewriteMicros,
-    GcDataRewriteVictimFiles,
-    GcBlobRewriteVictimFiles,
-    FlowFgAdmissionWaitMicros,
-    CheckpointGuardHoldMicros,
-    WalGenerationBatch,
-    WalGenerationWaitMicros,
-    WalLockWaitMicros,
-}
-
-impl HistogramMetric {
-    pub const COUNT: usize = 19;
-    pub const ALL: [HistogramMetric; Self::COUNT] = [
-        HistogramMetric::TxnCommitMicros,
-        HistogramMetric::TxnRollbackMicros,
-        HistogramMetric::TreeLinkHoldMicros,
-        HistogramMetric::WalAppendBytes,
-        HistogramMetric::WalSyncMicros,
-        HistogramMetric::RecoveryPhase2Micros,
-        HistogramMetric::RecoveryAnalyzeMicros,
-        HistogramMetric::RecoveryRedoMicros,
-        HistogramMetric::RecoveryUndoMicros,
-        HistogramMetric::GcRunMicros,
-        HistogramMetric::GcDataRewriteMicros,
-        HistogramMetric::GcBlobRewriteMicros,
-        HistogramMetric::GcDataRewriteVictimFiles,
-        HistogramMetric::GcBlobRewriteVictimFiles,
-        HistogramMetric::FlowFgAdmissionWaitMicros,
-        HistogramMetric::CheckpointGuardHoldMicros,
-        HistogramMetric::WalGenerationBatch,
-        HistogramMetric::WalGenerationWaitMicros,
-        HistogramMetric::WalLockWaitMicros,
-    ];
-
-    #[inline]
-    pub const fn idx(self) -> usize {
-        self as usize
+metric_set! {
+    pub enum HistogramMetric {
+        TxnCommitMicros,
+        TxnRollbackMicros,
+        TreeLinkHoldMicros,
+        WalAppendBytes,
+        WalSyncMicros,
+        RecoveryPhase2Micros,
+        RecoveryAnalyzeMicros,
+        RecoveryRedoMicros,
+        RecoveryUndoMicros,
+        GcRunMicros,
+        GcDataRewriteMicros,
+        GcBlobRewriteMicros,
+        GcDataRewriteVictimFiles,
+        GcBlobRewriteVictimFiles,
+        FlowFgAdmissionWaitMicros,
+        CheckpointGuardHoldMicros,
+        WalGenerationBatch,
+        WalGenerationWaitMicros,
+        WalLockWaitMicros,
     }
 }
 

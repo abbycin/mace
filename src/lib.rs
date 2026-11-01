@@ -1,8 +1,9 @@
 pub use index::txn::{TxnKV, TxnView};
 pub use store::VacuumStats;
+pub use store::bucket::Bucket;
 pub use store::checkpoint::{BucketFrontier, CheckpointInfo, GroupPosition};
+pub use store::store::Mace;
 pub(crate) use store::store::Store;
-pub use store::store::{Bucket, Mace};
 #[cfg(feature = "metrics")]
 pub use utils::observe;
 pub use utils::{
@@ -15,6 +16,8 @@ mod cc;
 mod error;
 #[cfg(any(feature = "extra_check", feature = "failpoints"))]
 pub mod failpoint_testing;
+#[cfg(test)]
+mod format_fixture;
 mod index;
 mod io;
 mod map;

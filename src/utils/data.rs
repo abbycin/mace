@@ -1,5 +1,5 @@
 use crate::types::traits::IAsSlice;
-use crate::{OpCode, Options, must_ok};
+use crate::{OpCode, Options, must_ok, static_assert};
 
 use crate::io::{self, FileSystem, GatherIO, IoVec};
 use std::fmt::Debug;
@@ -103,6 +103,11 @@ impl AddrPair {
 }
 
 impl IAsSlice for AddrPair {}
+
+static_assert!(size_of::<Reloc>() == 24);
+static_assert!(size_of::<AddrPair>() == 32);
+static_assert!(size_of::<Interval>() == 16);
+static_assert!(size_of::<Position>() == 16);
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed(1))]
@@ -229,11 +234,6 @@ impl GatherWriter {
             .expect("owned payload must exist")
             .as_slice();
         self.queue.push(slice.into());
-    }
-
-    #[allow(unused)]
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
     }
 
     pub fn pos(&self) -> u64 {

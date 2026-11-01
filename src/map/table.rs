@@ -3,9 +3,9 @@ use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-use crate::utils::{INIT_ADDR, NULL_ADDR, ROOT_PID};
+use crate::utils::{NULL_ADDR, ROOT_PID};
 
 const SLOT_SIZE: u64 = 1u64 << 16;
 
@@ -172,10 +172,6 @@ impl PageMap {
     }
 }
 
-impl Drop for PageMap {
-    fn drop(&mut self) {}
-}
-
 struct Layer3([AtomicU64; SLOT_SIZE as usize]);
 
 impl Default for Layer3 {
@@ -277,66 +273,6 @@ impl Swip {
 
     pub(crate) fn tagged(x: u64) -> u64 {
         x | Self::TAG
-    }
-}
-
-pub(crate) struct BucketState {
-    pub(crate) txn_ref: AtomicUsize,
-    pub(crate) next_addr: AtomicU64,
-    pub(crate) is_deleting: AtomicBool,
-    pub(crate) is_drop: AtomicBool,
-}
-
-impl BucketState {
-    pub(crate) fn new() -> Self {
-        Self {
-            txn_ref: AtomicUsize::new(0),
-            is_deleting: AtomicBool::new(false),
-            is_drop: AtomicBool::new(false),
-            next_addr: AtomicU64::new(INIT_ADDR),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn inc_txn_ref(&self) {
-        self.txn_ref.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub(crate) fn dec_txn_ref(&self) {
-        self.txn_ref.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub(crate) fn set_deleting(&self) {
-        self.is_deleting.store(true, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub(crate) fn clear_deleting(&self) {
-        self.is_deleting.store(false, Ordering::Relaxed);
-    }
-
-    pub(crate) fn set_drop(&self) {
-        self.is_drop.store(true, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub(crate) fn clear_drop(&self) {
-        self.is_drop.store(false, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub(crate) fn is_deleting(&self) -> bool {
-        self.is_deleting.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn is_drop(&self) -> bool {
-        self.is_drop.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn is_busy(&self) -> bool {
-        self.txn_ref.load(Ordering::Relaxed) > 0
     }
 }
 

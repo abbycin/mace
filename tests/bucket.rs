@@ -48,6 +48,29 @@ fn assert_runtime_only_fields_absent(value: &Value) {
 }
 
 #[test]
+fn bucket_interval_recovery_error_fails_load() {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let bucket_id = mace
+        .new_bucket("broken", BucketOptions::default())
+        .unwrap()
+        .id();
+    drop(mace);
+
+    let tree = BTree::open(Options::new(&*path).manifest()).unwrap();
+    tree.del_bucket(format!("data_interval_{bucket_id}"))
+        .expect("interval btree bucket must be deletable");
+    drop(tree);
+
+    let reopened = Mace::new(Options::new(&*path).validate().unwrap()).unwrap();
+    assert!(
+        reopened.open_bucket("broken").is_err(),
+        "missing interval table must fail bucket load instead of loading partial state"
+    );
+}
+
+#[test]
 fn bucket_concurrency_non_blocking() {
     let path = RandomPath::tmp();
     let opt = Options::new(&*path);
@@ -352,7 +375,7 @@ fn bucket_limit_safety() {
 
     for i in 0..10 {
         let name = format!("limit_test_{}", i);
-        // explicitly drop the handle to ensure strong_count decreases
+        // explicitly drop the handles so every lease is released
         buckets.clear();
 
         loop {
@@ -911,7 +934,7 @@ fn test_drop_bucket_safety() -> Result<(), OpCode> {
     // 1. test: cannot drop while bucket handle is held
     {
         let bucket = db.new_bucket(bucket_name, BucketOptions::default())?;
-        // should fail because 'bucket' holds an Arc<BucketMeta>
+        // should fail because 'bucket' holds a lease
         let res = db.drop_bucket(bucket_name);
         assert_eq!(res.err(), Some(OpCode::Again));
         drop(bucket);
@@ -957,5 +980,238 @@ fn test_drop_bucket_persistence() -> Result<(), OpCode> {
     let view = bucket.view()?;
     assert_eq!(view.get("k")?.slice(), b"v");
 
+    Ok(())
+}
+
+#[test]
+fn bucket_active_names_survive_unload() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let mace = Mace::new(opt.validate()?)?;
+
+    let bucket = mace.new_bucket("kept", BucketOptions::default())?;
+    let txn = bucket.begin()?;
+    txn.put("k", b"v")?;
+    txn.commit()?;
+    drop(bucket);
+
+    // unload is runtime-only: the bucket stays an active name
+    mace.drop_bucket("kept")?;
+    assert!(
+        mace.active_buckets().iter().any(|name| name == "kept"),
+        "unloading a bucket must not remove its active name"
+    );
+
+    let reopened = mace.open_bucket("kept")?;
+    assert_eq!(reopened.view()?.get("k")?.slice(), b"v");
+    drop(reopened);
+
+    // the logical delete phase is what removes the name
+    mace.del_bucket("kept")?;
+    assert!(
+        !mace.active_buckets().iter().any(|name| name == "kept"),
+        "a logically deleted bucket must leave the active names"
+    );
+    Ok(())
+}
+
+#[test]
+fn bucket_lease_blocks_unload_and_delete() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let mace = Mace::new(opt.validate()?)?;
+
+    let bucket = mace.new_bucket("leased", BucketOptions::default())?;
+    assert_eq!(
+        mace.drop_bucket("leased"),
+        Err(OpCode::Again),
+        "an open handle must refuse an unload"
+    );
+    assert_eq!(
+        mace.del_bucket("leased"),
+        Err(OpCode::Again),
+        "an open handle must refuse a delete"
+    );
+
+    let cloned = bucket.clone();
+    drop(bucket);
+    assert_eq!(
+        mace.del_bucket("leased"),
+        Err(OpCode::Again),
+        "every handle clone holds its own lease"
+    );
+    drop(cloned);
+
+    mace.drop_bucket("leased")?;
+    assert!(
+        mace.active_buckets().iter().any(|name| name == "leased"),
+        "an unloaded bucket is still active"
+    );
+    mace.del_bucket("leased")?;
+    assert_eq!(mace.del_bucket("leased"), Err(OpCode::NotFound));
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn bucket_unload_rewrite_returns_again() -> Result<(), OpCode> {
+    use std::sync::Mutex;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    use mace::testing;
+
+    let path = RandomPath::tmp();
+    let mut seed = Options::new(&*path);
+    seed.concurrent_write = 1;
+    seed.sync_on_write = true;
+    seed.gc_timeout = 60_000;
+    seed.gc_eager = false;
+    seed.data_garbage_ratio = 100;
+    seed.data_file_size = 2 << 20;
+    let mace = Mace::new(seed.validate()?)?;
+    mace.disable_gc();
+
+    let rewrite_opt = BucketOptions {
+        inline_size: 1024,
+        split_elems: 64,
+        consolidate_threshold: 8,
+        checkpoint_size: 4 << 20,
+        pool_capacity: 8 << 20,
+        enable_backpressure: false,
+        enable_compression: false,
+        ..BucketOptions::default()
+    };
+    let victim = mace.new_bucket("victim", rewrite_opt.clone())?;
+    let keys = (0..512)
+        .map(|idx| format!("key_{idx:04}"))
+        .collect::<Vec<_>>();
+    let initial = vec![b'a'; 512];
+    let middle = vec![b'b'; 512];
+    let txn = victim.begin()?;
+    for key in &keys {
+        txn.put(key, &initial)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&victim);
+    let txn = victim.begin()?;
+    for key in keys.iter().step_by(2) {
+        txn.update(key, &middle)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&victim);
+    drop(victim);
+    drop(mace);
+
+    let mut rewrite = Options::new(&*path);
+    rewrite.concurrent_write = 1;
+    rewrite.sync_on_write = true;
+    rewrite.gc_timeout = 60_000;
+    rewrite.gc_eager = true;
+    rewrite.data_garbage_ratio = 1;
+    rewrite.data_file_size = 16 << 10;
+    let mace = Mace::new(rewrite.validate()?)?;
+    let victim_id = mace.open_bucket("victim")?.id();
+
+    let db_root = path.to_path_buf();
+    let (build_tx, build_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let fired = Arc::new(AtomicBool::new(false));
+    testing::set_gc_rewrite_hook(Some(Arc::new({
+        let fired = fired.clone();
+        move |point, observed_bucket_id, observed_db_root| {
+            if observed_db_root != db_root
+                || observed_bucket_id != victim_id
+                || point != testing::GcRewriteSyncPoint::DuringDataBuild
+            {
+                return;
+            }
+            if !fired.swap(true, Ordering::SeqCst) {
+                build_tx.send(()).expect("signal rewrite pause");
+                release_rx
+                    .lock()
+                    .expect("lock rewrite release receiver")
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release rewrite build");
+            }
+        }
+    })));
+
+    let gc_mace = mace.clone();
+    let gc_thread = std::thread::spawn(move || gc_mace.start_gc());
+    build_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a data rewrite must pause during its build");
+
+    assert_eq!(
+        mace.drop_bucket("victim"),
+        Err(OpCode::Again),
+        "an unload must refuse a bucket whose rewrite is still in flight"
+    );
+    assert_eq!(
+        mace.del_bucket("victim"),
+        Err(OpCode::Again),
+        "a delete must refuse a bucket whose rewrite is still in flight"
+    );
+
+    release_tx.send(()).expect("release rewrite build");
+    gc_thread.join().expect("rewrite gc must finish");
+    testing::clear_gc_rewrite_hook();
+
+    mace.drop_bucket("victim")?;
+    assert!(
+        mace.active_buckets().iter().any(|name| name == "victim"),
+        "a refused unload must leave the bucket active and unloadable afterwards"
+    );
+    Ok(())
+}
+
+#[test]
+fn bucket_update_during_create_returns_again() -> Result<(), OpCode> {
+    use std::time::{Duration, Instant};
+
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let mace = Mace::new(opt.validate()?)?;
+
+    let creator = mace.clone();
+    let handle = std::thread::spawn(move || creator.new_bucket("during", BucketOptions::default()));
+
+    // the name enters the catalog while the create holds the lifecycle lock, before the context
+    // and the metadata publish: an option update issued now must wait for that create and then
+    // observe a loaded bucket
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mace.active_buckets().iter().any(|name| name == "during") {
+        assert!(
+            Instant::now() < deadline,
+            "the create must publish its name"
+        );
+        std::thread::yield_now();
+    }
+    let updated = mace.update_bucket_opt(
+        "during",
+        BucketOptions {
+            cache_evict_pct: 30,
+            ..BucketOptions::default()
+        },
+    );
+    assert_eq!(
+        updated,
+        Err(OpCode::Again),
+        "an option update must not commit between creation's reservation and its publish"
+    );
+
+    let bucket = handle.join().expect("creator thread must finish")?;
+    drop(bucket);
+
+    let persisted = mace
+        .get_bucket_options("during")?
+        .expect("the created bucket must exist");
+    assert_eq!(
+        persisted.cache_evict_pct,
+        BucketOptions::default().cache_evict_pct,
+        "the refused update must not have been persisted"
+    );
     Ok(())
 }

@@ -132,6 +132,8 @@ pub enum CheckpointSyncPoint {
     AfterRetiredPageFallbackRead(u64),
     AfterRetiredPageGuardDropped,
     AfterSnapshotBuilt,
+    /// a queued task was popped and the checkpoint thread is about to resolve its directive
+    BeforeFlushDirective,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +154,8 @@ pub enum WalSyncPoint {
 pub enum GcRewriteSyncPoint {
     BeforeDataPublish,
     BeforeBlobPublish,
+    DuringDataBuild,
+    DuringBlobBuild,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +175,8 @@ pub enum GcStatSyncPoint {
     BlobRewritePublishing { output_count: usize },
     DataRewriteGateClosed,
     BlobRewriteGateClosed,
+    DataRewriteAfterPublish,
+    BlobRewriteAfterPublish,
 }
 
 pub struct CheckpointRootRestore {
@@ -215,9 +221,7 @@ pub fn spawn_checkpoint_retired_page_writer(
         tx.put("__checkpoint_retired_page", b"v")
             .expect("test writer put");
         tx.commit().expect("test writer commit");
-        let (_, root_addr) = epoch
-            .dirty_roots
-            .first_live()
+        let (_, root_addr) = crate::map::data::first_live(&epoch.dirty_roots)
             .expect("test writer requires a dirty root");
         let mut root = epoch
             .pages
@@ -295,8 +299,8 @@ pub fn data_rewrite_collected_junk_count(bucket: &Bucket) -> usize {
         .inner
         .store
         .manifest
-        .stat_ctx(FileKind::Data)
-        .collected_junk_count()
+        .junk()
+        .collected_count(FileKind::Data)
 }
 
 /// verifies that the stable persisted GC ledger exactly matches physical reachability
@@ -348,7 +352,7 @@ fn assert_persisted_gc_stats_for_kind(mace: &crate::Mace, kind: FileKind) {
         .values()
         .map(|stat| stat.total_size as u64)
         .sum::<u64>();
-    let (runtime_active, runtime_total) = manifest.stat_ctx(kind).sizes();
+    let (runtime_active, runtime_total) = manifest.file_state(kind).stat.sizes();
     assert_eq!(
         (runtime_active, runtime_total),
         (expected_active, expected_total),
@@ -409,14 +413,13 @@ fn assert_persisted_gc_stats_for_kind(mace: &crate::Mace, kind: FileKind) {
             .expect("read persisted interval metadata");
     }
 
-    for loaded in manifest.buckets.buckets.iter() {
-        let bucket_id = *loaded.key();
+    for (bucket_id, loaded) in manifest.buckets.contexts() {
         let expected = interval_meta
             .iter()
             .filter(|entry| entry.3 == bucket_id)
             .copied()
             .collect::<HashSet<_>>();
-        let actual = stat_intervals(kind, loaded.value())
+        let actual = stat_intervals(kind, &loaded)
             .read()
             .entries()
             .map(|(lo, hi, file_id)| (lo, hi, file_id, bucket_id))
@@ -427,7 +430,7 @@ fn assert_persisted_gc_stats_for_kind(mace: &crate::Mace, kind: FileKind) {
         );
         for (_, _, file_id, _) in actual {
             assert!(
-                manifest.stat_ctx(kind).contains_key(&file_id),
+                manifest.file_state(kind).stat.contains(file_id),
                 "runtime {kind:?} interval references missing stat file {file_id}"
             );
         }
@@ -701,7 +704,7 @@ fn collect_persisted_bucket(
                 panic!("reachable data address {addr} in bucket {bucket_id} has no relocation")
             });
         let reader = readers.entry(file_id).or_insert_with(|| {
-            crate::meta::new_reader(opt.data_file(file_id), decoders.clone(), opt.fs.clone())
+            crate::map::data::new_reader(opt.data_file(file_id), decoders.clone(), opt.fs.clone())
         });
         let page = reader.read_at(addr);
         let header = page.header();
@@ -777,7 +780,7 @@ fn collect_persisted_bucket(
                 panic!("reachable blob address {addr} in bucket {bucket_id} has no relocation")
             });
         let reader = readers.entry(file_id).or_insert_with(|| {
-            crate::meta::new_reader(opt.blob_file(file_id), decoders.clone(), opt.fs.clone())
+            crate::map::data::new_reader(opt.blob_file(file_id), decoders.clone(), opt.fs.clone())
         });
         let blob = reader.read_at(addr);
         if blob.header().link != NULL_ADDR {
@@ -1019,7 +1022,7 @@ mod tests {
 
     #[test]
     fn persisted_gc_stats_rejects_interval_without_stat() -> Result<(), OpCode> {
-        let path = crate::RandomPath::new();
+        let path = crate::RandomPath::tmp();
         let mut opt = crate::Options::new(&*path);
         opt.tmp_store = true;
         let mace = crate::Mace::new(opt.validate()?)?;

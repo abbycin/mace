@@ -18,7 +18,7 @@ use crate::map::{
 use crate::{
     map::{
         SharedState,
-        buffer::{BucketContext, BucketMgr},
+        buffer::{BucketContext, BucketManager},
         table::Swip,
     },
     utils::{Handle, options::ParsedOptions},
@@ -26,7 +26,7 @@ use crate::{
 
 pub(crate) struct Evictor {
     opt: Arc<ParsedOptions>,
-    buckets: Handle<BucketMgr>,
+    buckets: Handle<BucketManager>,
     rx: Receiver<SharedState>,
     tx: Sender<()>,
 }
@@ -36,7 +36,7 @@ unsafe impl Send for Evictor {}
 impl Evictor {
     pub(crate) fn new(
         opt: Arc<ParsedOptions>,
-        buckets: Handle<BucketMgr>,
+        buckets: Handle<BucketManager>,
         rx: Receiver<SharedState>,
         tx: Sender<()>,
     ) -> Self {
@@ -61,14 +61,7 @@ impl Evictor {
     }
 
     fn target_bucket(&self, bucket_id: u64) -> Option<Arc<BucketContext>> {
-        self.buckets.buckets.get(&bucket_id).and_then(|entry| {
-            let bucket = entry.value().clone();
-            if bucket.state.is_deleting() || bucket.state.is_drop() {
-                None
-            } else {
-                Some(bucket)
-            }
-        })
+        self.buckets.context_if_active(bucket_id)
     }
 
     fn evict_bucket(&mut self, g: &Guard, safe_txid: u64, bucket_ctx: Arc<BucketContext>) -> bool {
@@ -76,9 +69,8 @@ impl Evictor {
         crate::utils::failpoint::crash("mace_evictor_before_evict_once");
 
         let mut rng = rand::rng();
-        if !bucket_ctx.begin_eviction() && !bucket_ctx.almost_full() {
-            return false;
-        }
+        // consume the pending request flag; eviction still requires an over-threshold bucket
+        let _ = bucket_ctx.begin_eviction();
         if !bucket_ctx.almost_full() {
             return false;
         }

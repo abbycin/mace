@@ -286,10 +286,6 @@ impl<T> MutRefInner<T> {
     }
 }
 
-impl<T> Drop for MutRefInner<T> {
-    fn drop(&mut self) {}
-}
-
 pub struct MutRef<T> {
     inner: *mut MutRefInner<T>,
 }

@@ -350,7 +350,7 @@ fn fast_process_crash_window() {
         _ => {}
     }
 
-    let db_root = RandomPath::new();
+    let db_root = RandomPath::tmp();
     let db_root_text = db_root.to_string_lossy().to_string();
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
@@ -370,7 +370,7 @@ fn fast_process_crash_update_chain() {
         _ => {}
     }
 
-    let db_root = RandomPath::new();
+    let db_root = RandomPath::tmp();
     let db_root_text = db_root.to_string_lossy().to_string();
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
@@ -409,7 +409,7 @@ fn fast_process_crash_delete_chain() {
         _ => {}
     }
 
-    let db_root = RandomPath::new();
+    let db_root = RandomPath::tmp();
     let db_root_text = db_root.to_string_lossy().to_string();
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
@@ -444,7 +444,7 @@ fn stress_crash_reopen_loop() {
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
     for round in 0..rounds {
-        let db_root = RandomPath::new();
+        let db_root = RandomPath::tmp();
         let db_root_text = db_root.to_string_lossy().to_string();
 
         run_crash_verify_once(&current_exe, "fast_process_crash_window", &db_root_text);
@@ -460,7 +460,7 @@ fn stress_crash_reopen_loop() {
 #[test]
 #[ignore]
 fn chaos_failpoint_txn_commit_io() {
-    let db_root = RandomPath::new();
+    let db_root = RandomPath::tmp();
     let db_root_text = db_root.to_string_lossy().to_string();
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
@@ -489,7 +489,7 @@ fn chaos_failpoint_txn_commit_io() {
 #[test]
 #[ignore]
 fn chaos_failpoint_txn_commit_abort() {
-    let db_root = RandomPath::new();
+    let db_root = RandomPath::tmp();
     let db_root_text = db_root.to_string_lossy().to_string();
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
@@ -518,7 +518,7 @@ fn chaos_failpoint_txn_commit_abort() {
 #[test]
 #[ignore]
 fn chaos_failpoint_fs_create_dir_all_io() {
-    let db_root = RandomPath::new();
+    let db_root = RandomPath::tmp();
     let db_root_text = db_root.to_string_lossy().to_string();
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
@@ -541,7 +541,7 @@ fn chaos_failpoint_fs_create_dir_all_io() {
 #[test]
 #[ignore]
 fn chaos_failpoint_fs_sync_dir_io() {
-    let db_root = RandomPath::new();
+    let db_root = RandomPath::tmp();
     let db_root_text = db_root.to_string_lossy().to_string();
     let current_exe = std::env::current_exe().expect("load current exe failed");
 
@@ -564,7 +564,7 @@ fn chaos_failpoint_fs_sync_dir_io() {
 #[test]
 #[ignore]
 fn chaos_failpoint_fs_read_dir_io() {
-    let db_root = RandomPath::new();
+    let db_root = RandomPath::tmp();
     let db_root_text = db_root.to_string_lossy().to_string();
 
     {

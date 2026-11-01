@@ -248,8 +248,8 @@ impl BoxRef {
         }
     }
 
-    fn payload_header_len(&self) -> usize {
-        match self.header().kind {
+    const fn payload_header_len(kind: TagKind) -> usize {
+        match kind {
             TagKind::Base => size_of::<BaseHeader>(),
             TagKind::Delta => size_of::<DeltaHeader>(),
             TagKind::Remote => size_of::<RemoteHeader>(),
@@ -258,7 +258,7 @@ impl BoxRef {
 
     fn persisted_body(&self) -> &[u8] {
         let payload_len = self.persisted_payload_len();
-        let hdr_len = self.payload_header_len();
+        let hdr_len = Self::payload_header_len(self.header().kind);
         let payload = &self.data_slice::<u8>()[..payload_len];
         &payload[hdr_len..]
     }
@@ -308,34 +308,23 @@ impl BoxRef {
         }
 
         let payload = &raw[Self::DUMP_HDR_LEN..];
-        if payload.len() != box_hdr.payload_size as usize {
+        if payload.len() != box_hdr.payload_size as usize
+            || payload.len() < Self::payload_header_len(kind)
+        {
             return Err(OpCode::Corruption);
         }
 
         let payload_header = match kind {
             TagKind::Base => {
-                if payload.len() < size_of::<DiskBaseHeader>() {
-                    return Err(OpCode::Corruption);
-                }
                 let disk = DiskBaseHeader::from_slice(payload);
                 if disk.merging > 1 || disk.is_index > 1 || disk.has_multiple_versions > 1 {
                     return Err(OpCode::Corruption);
                 }
                 PersistedPayloadHeaderV1::Base(disk)
             }
-            TagKind::Delta => {
-                if payload.len() < size_of::<DiskDeltaHeader>() {
-                    return Err(OpCode::Corruption);
-                }
-                let disk = DiskDeltaHeader::from_slice(payload);
-                PersistedPayloadHeaderV1::Delta(disk)
-            }
+            TagKind::Delta => PersistedPayloadHeaderV1::Delta(DiskDeltaHeader::from_slice(payload)),
             TagKind::Remote => {
-                if payload.len() < size_of::<DiskRemoteHeader>() {
-                    return Err(OpCode::Corruption);
-                }
-                let disk = DiskRemoteHeader::from_slice(payload);
-                PersistedPayloadHeaderV1::Remote(disk)
+                PersistedPayloadHeaderV1::Remote(DiskRemoteHeader::from_slice(payload))
             }
         };
 
@@ -398,11 +387,7 @@ impl BoxRef {
             }
         }
 
-        let hdr_len = match payload_header {
-            PersistedPayloadHeaderV1::Base(_) => size_of::<BaseHeader>(),
-            PersistedPayloadHeaderV1::Delta(_) => size_of::<DeltaHeader>(),
-            PersistedPayloadHeaderV1::Remote(_) => size_of::<RemoteHeader>(),
-        };
+        let hdr_len = Self::payload_header_len(kind);
         let payload_len = box_hdr.payload_size as usize;
         if payload_len < hdr_len {
             return Err(OpCode::Corruption);

@@ -402,7 +402,8 @@ mod tests {
 
     #[test]
     fn remove_file_if_exists_propagates_non_not_found_error() {
-        let path = PathBuf::from(&*RandomPath::tmp());
+        let root = RandomPath::tmp();
+        let path = PathBuf::from(&*root);
         std::fs::write(&path, b"x").expect("seed file must be created");
         let fs = InjectedFileSystem::new();
         fs.fail_once(InjectOp::RemoveFile, &path, ErrorKind::PermissionDenied);
@@ -418,7 +419,8 @@ mod tests {
 
     #[test]
     fn injected_fs_supports_nth_call_and_records_calls() {
-        let path = PathBuf::from(&*RandomPath::tmp());
+        let root = RandomPath::tmp();
+        let path = PathBuf::from(&*root);
         std::fs::write(&path, b"x").expect("seed file must be created");
         let fs = InjectedFileSystem::new();
         fs.fail_nth_any(InjectOp::TryExists, 2, ErrorKind::PermissionDenied);

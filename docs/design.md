@@ -817,7 +817,9 @@ The filesystem object is process-local and is not part of persisted engine optio
 ## 15. Persistent Format And Upgrade Model
 
 Mace currently supports 64-bit little-endian platforms. Persisted scalar and packed-layout handling
-is defined under that platform boundary.
+is defined under that platform boundary. The byte-level specification, the fixed sizes and offsets,
+and the reader validation list are in [format.md](./format.md); this section only states which version
+axis owns which change.
 
 There are three format families:
 
@@ -832,7 +834,9 @@ payload frames do not carry a separate format version. Writers emit version 1, a
 unknown versions or unsupported footer fields.
 
 Checkpoint and GC rewrite emit version 1. A future format version must define its reader support and
-an explicit migration boundary before it can coexist with the current format.
+an explicit migration boundary before it can coexist with the current format. Because the version is
+per file, coexistence is per file as well: a bucket may hold files of different versions, each decoded
+by its own footer, and a `file_id` may be reused only when source and target versions are equal.
 
 ### 15.2 Metadata format
 
@@ -845,19 +849,33 @@ format in place. The 0.1.2 -> 0.2.0 hop moves the `btree-store` manifest format 
 `current_version` stays 1. The migrations, the format versions they move between, and the procedure
 are in [docs/migration.md](./migration.md).
 
+`misc/options` is a metadata record, so its JSON field set belongs to `current_version`. Adding,
+removing or retyping a field changes persisted bytes and must raise `current_version` and ship a
+migration; reader tolerance for unknown fields (`serde(default)`) must not be used to keep two
+versions reading the same bytes differently.
+
 ### 15.3 WAL format
 
 The current route split changes physical stream placement but not WAL record encoding. Both routes
 use the same WAL record format and recovery decoder.
 
-WAL format evolution under the current release model is one-way: only newer binaries open a
-directory after merge-capable payloads are written, so additive payload types (such as the merge
-operand payload) require no migration barrier and no old-binary compatibility window. Deploying a
-binary that writes new WAL payload kinds therefore commits that directory to binaries of at least
-that capability level; downgrades are unsupported. This boundary applies to additive payload types
-under an unchanged record envelope. Any change to the shared Update envelope itself, or any other
-non-additive encoding change, still requires a migration design that first reaches a WAL-independent
-durable state.
+The WAL makes no cross-version compatibility promise. It has no file header, no version field and no
+layout tag, so a WAL written by a different layout is indistinguishable from a damaged tail: it
+belongs to the binary that wrote it. Any WAL layout change is therefore allowed without a version
+axis and without a migration, under one mandatory prerequisite:
+
+- before replacing the binary, start the current binary against the database and close it normally.
+  Normal shutdown drains abort cleanup, performs a final checkpoint of every dirty bucket and syncs
+  the WAL.
+- then remove the `wal_*` and `group_wal_*` files (or confirm they were recycled) before running the
+  new binary.
+
+Crashing and then upgrading directly is unsupported. A WAL of a different layout has no recognizable
+marker, so the new binary treats it as a malformed tail: with the default
+`truncate_corrupted_wal = true` it truncates at the first bad record and loses the uncheckpointed
+committed writes, and with the option disabled the database does not open. That is a consequence of
+the no-compatibility rule rather than a defect. The byte-level layout, the record checks and the
+drain rule are in [format.md](./format.md).
 
 ## 16. Observability
 

@@ -8,19 +8,29 @@ mod txn;
 pub(crate) use guard::DeletionGuard;
 
 use crate::map::buffer::BucketContext;
+#[allow(unused_imports)]
+pub use crate::map::data::FileReader;
+#[allow(unused_imports)]
+pub(crate) use crate::map::data::new_reader;
+#[cfg(feature = "maintenance")]
+#[allow(unused_imports)]
+pub use crate::map::data::try_new_reader;
 use crate::utils::interval::IntervalMap;
 use crate::utils::options::ParsedOptions;
+#[allow(unused_imports)]
 pub use entry::IMetaCodec;
+// the byte fixtures call `PageTable::record`, which is a `MetaRecord` method
+#[cfg(test)]
+pub(crate) use entry::MetaOp;
+#[cfg(test)]
+pub(crate) use entry::MetaRecord;
 pub use entry::{
     BucketDurableFrontier, BucketMeta, DelInterval, Delete, FileKind, IntervalPair, MemStat,
-    MetaKind, MetaOp, PageTable, PersistStat, Sequences, StatInner, WalRecycleState,
+    MetaKind, PageTable, PersistStat, Sequences, StatInner, WalRecycleState,
 };
-pub(crate) use manifest::Manifest;
+pub(crate) use manifest::{BucketCatalog, Manifest, RetiredStatFlushSnapshot};
 use parking_lot::RwLock;
-pub use stat::FileReader;
-#[cfg(feature = "maintenance")]
-pub use stat::try_new_reader;
-pub(crate) use stat::{JunkPermit, new_reader};
+pub(crate) use stat::{JunkPermit, JunkPermits, JunkRegistry, RewriteRegistration};
 use std::path::PathBuf;
 pub(crate) use txn::Txn;
 

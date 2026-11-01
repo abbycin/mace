@@ -1,5 +1,7 @@
 mod common;
 
+#[cfg(feature = "extra_check")]
+use mace::Bucket;
 #[cfg(feature = "metrics")]
 use mace::observe::{CounterMetric, HistogramMetric, InMemoryObserver};
 #[cfg(feature = "extra_check")]
@@ -54,7 +56,7 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
     enable_compression: bool,
 ) -> Result<(), OpCode> {
     // no hooks installed here; gc_round serializes itself via hooks_lock
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.sync_on_write = true;
     common::deterministic_gc(&mut opt);
@@ -219,7 +221,7 @@ fn run_persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen(
 fn checkpoint_junk_crossing_rewrite_publish_moves_to_output_stats() -> Result<(), OpCode> {
     let _hook_lock = testing::checkpoint_test_lock();
     let _hook_reset = HookReset;
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.concurrent_write = 1;
     opt.sync_on_write = true;
@@ -442,7 +444,7 @@ fn seed_handoff_bucket(mace: &Mace, name: &str, prefix: &str) -> Result<mace::Bu
 fn run_rewrite_obsolete_candidate_handoff() -> Result<(), OpCode> {
     let _hook_lock = testing::checkpoint_test_lock();
     let _hook_reset = HookReset;
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.concurrent_write = 1;
     opt.sync_on_write = true;
@@ -644,7 +646,7 @@ fn lagging_checkpoint_cannot_resurrect_retired_stats_at_any_reclaim_cut() -> Res
 #[cfg(feature = "extra_check")]
 fn run_lagging_checkpoint_retire_cut(kind: TestFileKind, cut: RetireCut) -> Result<(), OpCode> {
     testing::clear_hooks();
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let observer = Arc::new(InMemoryObserver::new(1024));
     let mut opt = Options::new(&*path);
     opt.concurrent_write = 1;
@@ -896,7 +898,7 @@ fn run_publishing_checkpoint_reresolves_owner(
 ) -> Result<(), OpCode> {
     let _hook_lock = testing::checkpoint_test_lock();
     let _hook_reset = HookReset;
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.concurrent_write = 1;
     opt.sync_on_write = true;
@@ -1132,9 +1134,304 @@ fn run_publishing_checkpoint_reresolves_owner(
 }
 
 #[cfg(feature = "extra_check")]
+fn rewrite_kind_params(kind: TestFileKind) -> (usize, usize, usize) {
+    match kind {
+        // (keys, value length, churn rounds)
+        TestFileKind::Data => (512, 512, 1),
+        TestFileKind::Blob => (96, 8 << 10, 4),
+    }
+}
+
+#[cfg(feature = "extra_check")]
+fn rewrite_bucket_options() -> BucketOptions {
+    BucketOptions {
+        inline_size: 1024,
+        split_elems: 64,
+        consolidate_threshold: 8,
+        checkpoint_size: 4 << 20,
+        pool_capacity: 8 << 20,
+        enable_backpressure: false,
+        enable_compression: false,
+        ..BucketOptions::default()
+    }
+}
+
+/// build a durable victim with garbage, then reopen it with rewrite-friendly
+/// options. gc stays paused; callers drive exactly one explicit round.
+#[cfg(feature = "extra_check")]
+fn open_rewrite_fixture(kind: TestFileKind) -> Result<(RandomPath, Mace, Bucket), OpCode> {
+    let (key_count, value_len, churn_rounds) = rewrite_kind_params(kind);
+    let path = RandomPath::tmp();
+    let mut opt = Options::new(&*path);
+    opt.concurrent_write = 1;
+    opt.sync_on_write = true;
+    opt.gc_timeout = 60_000;
+    opt.gc_eager = false;
+    opt.data_garbage_ratio = 100;
+    opt.blob_garbage_ratio = 100;
+    opt.data_file_size = 2 << 20;
+    opt.blob_file_size = 4 << 20;
+    let mace = Mace::new(opt.validate()?)?;
+    mace.disable_gc();
+    let bucket = mace.new_bucket("victim", rewrite_bucket_options())?;
+    let keys = (0..key_count)
+        .map(|idx| format!("key_{idx:04}"))
+        .collect::<Vec<_>>();
+    let initial = vec![b'a'; value_len];
+    let middle = vec![b'b'; value_len];
+    let txn = bucket.begin()?;
+    for key in &keys {
+        txn.put(key, &initial)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+    for _ in 0..churn_rounds {
+        let txn = bucket.begin()?;
+        for key in keys.iter().step_by(2) {
+            txn.update(key, &middle)?;
+        }
+        txn.commit()?;
+        testing::checkpoint_and_wait(&bucket);
+    }
+    drop(bucket);
+    drop(mace);
+
+    let mut rewrite = Options::new(&*path);
+    rewrite.concurrent_write = 1;
+    rewrite.sync_on_write = true;
+    rewrite.gc_timeout = 60_000;
+    rewrite.gc_eager = true;
+    rewrite.data_garbage_ratio = match kind {
+        TestFileKind::Data => 1,
+        TestFileKind::Blob => 100,
+    };
+    rewrite.blob_garbage_ratio = match kind {
+        TestFileKind::Data => 100,
+        TestFileKind::Blob => 1,
+    };
+    rewrite.data_file_size = 16 << 10;
+    rewrite.blob_file_size = 16 << 10;
+    let mace = Mace::new(rewrite.validate()?)?;
+    mace.disable_gc();
+    let bucket = mace.open_bucket("victim")?;
+    Ok((path, mace, bucket))
+}
+
+/// a second bucket with durable files and a batch of updates ready to make its
+/// next checkpoint own junk for the rewrite's file kind.
+#[cfg(feature = "extra_check")]
+fn create_peer_checkpoint_source(
+    mace: &Mace,
+    kind: TestFileKind,
+    name: &str,
+) -> Result<(Bucket, Vec<String>, Vec<u8>), OpCode> {
+    let (key_count, value_len, _) = rewrite_kind_params(kind);
+    let bucket = mace.new_bucket(name, rewrite_bucket_options())?;
+    let keys = (0..key_count)
+        .map(|idx| format!("peer_{idx:04}"))
+        .collect::<Vec<_>>();
+    let initial = vec![b'p'; value_len];
+    let latest = vec![b'q'; value_len];
+    let txn = bucket.begin()?;
+    for key in &keys {
+        txn.put(key, &initial)?;
+    }
+    txn.commit()?;
+    testing::checkpoint_and_wait(&bucket);
+    Ok((bucket, keys, latest))
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn rewrite_build_does_not_block_other_bucket_checkpoint() -> Result<(), OpCode> {
+    let _hook_lock = testing::checkpoint_test_lock();
+    let _hook_reset = HookReset;
+    for kind in [TestFileKind::Data, TestFileKind::Blob] {
+        run_rewrite_build_does_not_block_other_bucket_checkpoint(kind)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+fn run_rewrite_build_does_not_block_other_bucket_checkpoint(
+    kind: TestFileKind,
+) -> Result<(), OpCode> {
+    let (path, mace, victim) = open_rewrite_fixture(kind)?;
+    let victim_id = victim.id();
+    let (peer, peer_keys, latest) = create_peer_checkpoint_source(&mace, kind, "build_peer")?;
+    let db_root = path.as_path().to_path_buf();
+
+    let (build_tx, build_rx) = channel();
+    let (build_release_tx, build_release_rx) = channel();
+    let build_release_rx = Arc::new(Mutex::new(build_release_rx));
+    let build_fired = Arc::new(AtomicBool::new(false));
+    testing::set_gc_rewrite_hook(Some(Arc::new({
+        let build_fired = build_fired.clone();
+        let build_release_rx = build_release_rx.clone();
+        let db_root = db_root.clone();
+        move |point, observed_bucket_id, observed_db_root| {
+            let expected = match kind {
+                TestFileKind::Data => testing::GcRewriteSyncPoint::DuringDataBuild,
+                TestFileKind::Blob => testing::GcRewriteSyncPoint::DuringBlobBuild,
+            };
+            if observed_db_root != db_root || observed_bucket_id != victim_id || point != expected {
+                return;
+            }
+            if !build_fired.swap(true, Ordering::SeqCst) {
+                build_tx.send(()).expect("signal rewrite build pause");
+                build_release_rx
+                    .lock()
+                    .expect("lock build release receiver")
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release rewrite build");
+            }
+        }
+    })));
+
+    let (checkpoint_done_tx, checkpoint_done_rx) = channel();
+    let before = match kind {
+        TestFileKind::Data => mace.data_gc_count(),
+        TestFileKind::Blob => mace.blob_gc_count(),
+    };
+    let gc_mace = mace.clone();
+    let gc_thread = std::thread::spawn(move || gc_mace.start_gc());
+    build_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("gc rewrite must pause after the first output chunk");
+
+    // the initial collector gate reopened at start_rewrite, so this checkpoint
+    // can acquire its junk permit and commit while the build is paused
+    let txn = peer.begin()?;
+    for key in &peer_keys {
+        txn.update(key, &latest)?;
+    }
+    txn.commit()?;
+    let checkpoint_peer = peer.clone();
+    let checkpoint_thread = std::thread::spawn(move || {
+        testing::checkpoint_and_wait(&checkpoint_peer);
+        checkpoint_done_tx.send(()).expect("signal peer checkpoint");
+    });
+    checkpoint_done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("peer checkpoint must finish while the rewrite build is paused");
+
+    build_release_tx.send(()).expect("release rewrite build");
+    gc_thread.join().expect("rewrite gc must finish");
+    checkpoint_thread
+        .join()
+        .expect("peer checkpoint must finish");
+    let after = match kind {
+        TestFileKind::Data => mace.data_gc_count(),
+        TestFileKind::Blob => mace.blob_gc_count(),
+    };
+    assert!(
+        after > before,
+        "{kind:?} rewrite must complete after the build pause is released"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn publish_cut_blocks_checkpoint_until_commit() -> Result<(), OpCode> {
+    run_publishing_checkpoint_reresolves_owner(TestFileKind::Data, false)?;
+    run_publishing_checkpoint_reresolves_owner(TestFileKind::Blob, true)
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn publish_cut_reopens_gate_before_physical_delete() -> Result<(), OpCode> {
+    let _hook_lock = testing::checkpoint_test_lock();
+    let _hook_reset = HookReset;
+    for kind in [TestFileKind::Data, TestFileKind::Blob] {
+        run_publish_cut_reopens_gate_before_physical_delete(kind)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+fn run_publish_cut_reopens_gate_before_physical_delete(kind: TestFileKind) -> Result<(), OpCode> {
+    let (path, mace, victim) = open_rewrite_fixture(kind)?;
+    let victim_id = victim.id();
+    let (peer, peer_keys, latest) = create_peer_checkpoint_source(&mace, kind, "publish_peer")?;
+    let db_root = path.as_path().to_path_buf();
+
+    let (published_tx, published_rx) = channel();
+    let (publish_release_tx, publish_release_rx) = channel();
+    let publish_release_rx = Arc::new(Mutex::new(publish_release_rx));
+    let publish_fired = Arc::new(AtomicBool::new(false));
+    testing::set_gc_stat_hook(Some(Arc::new({
+        let publish_fired = publish_fired.clone();
+        let publish_release_rx = publish_release_rx.clone();
+        let db_root = db_root.clone();
+        move |point, observed_bucket_id, observed_db_root| {
+            let expected = match kind {
+                TestFileKind::Data => testing::GcStatSyncPoint::DataRewriteAfterPublish,
+                TestFileKind::Blob => testing::GcStatSyncPoint::BlobRewriteAfterPublish,
+            };
+            if observed_db_root != db_root || observed_bucket_id != victim_id || point != expected {
+                return;
+            }
+            if !publish_fired.swap(true, Ordering::SeqCst) {
+                published_tx.send(()).expect("signal rewrite after publish");
+                publish_release_rx
+                    .lock()
+                    .expect("lock publish release receiver")
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release rewrite publish");
+            }
+        }
+    })));
+
+    let (checkpoint_done_tx, checkpoint_done_rx) = channel();
+    let before = match kind {
+        TestFileKind::Data => mace.data_gc_count(),
+        TestFileKind::Blob => mace.blob_gc_count(),
+    };
+    let gc_mace = mace.clone();
+    let gc_thread = std::thread::spawn(move || gc_mace.start_gc());
+    published_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("gc rewrite must finish publishing before physical deletion");
+
+    // finish_publish reopened the gate, so this checkpoint can commit even
+    // though the obsolete-file save/delete has not run yet
+    let txn = peer.begin()?;
+    for key in &peer_keys {
+        txn.update(key, &latest)?;
+    }
+    txn.commit()?;
+    let checkpoint_peer = peer.clone();
+    let checkpoint_thread = std::thread::spawn(move || {
+        testing::checkpoint_and_wait(&checkpoint_peer);
+        checkpoint_done_tx.send(()).expect("signal peer checkpoint");
+    });
+    checkpoint_done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("peer checkpoint must commit while physical deletion is pending");
+
+    publish_release_tx
+        .send(())
+        .expect("release rewrite publish");
+    gc_thread.join().expect("rewrite gc must finish");
+    checkpoint_thread
+        .join()
+        .expect("peer checkpoint must finish");
+    let after = match kind {
+        TestFileKind::Data => mace.data_gc_count(),
+        TestFileKind::Blob => mace.blob_gc_count(),
+    };
+    assert!(
+        after > before,
+        "{kind:?} rewrite must complete after the publish pause is released"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
 #[test]
 fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.sync_on_write = true;
     opt.gc_timeout = 60_000;
@@ -1251,7 +1548,7 @@ fn persisted_gc_stats_are_bucket_scoped() -> Result<(), OpCode> {
 
 #[test]
 fn gc_data() -> Result<(), OpCode> {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.tmp_store = false;
     opt.sync_on_write = false;
@@ -1354,7 +1651,7 @@ fn gc_data() -> Result<(), OpCode> {
 
 #[test]
 fn gc_blob() -> Result<(), OpCode> {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     #[cfg(not(target_os = "linux"))]
     {
@@ -1674,7 +1971,7 @@ fn gc_blob_single_gc_run_stays_deleted_after_reopen() -> Result<(), OpCode> {
 
 #[test]
 fn gc_blob_with_compression() -> Result<(), OpCode> {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.blob_garbage_ratio = 1;
     opt.blob_file_size = 256 << 10;

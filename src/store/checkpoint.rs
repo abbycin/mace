@@ -4,7 +4,7 @@ use crate::map::data::FileVersion;
 use crate::meta::guard::DeletionToken;
 use crate::meta::{
     BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BucketDurableFrontier, CURRENT_VERSION,
-    FileKind, IMetaCodec, PersistStat,
+    FileKind, PersistStat, stat_file_path,
 };
 use crate::store::store::Store;
 #[cfg(feature = "metrics")]
@@ -248,16 +248,20 @@ fn checkpoint_staging(opt: &ParsedOptions, target: &Path) -> Result<(PathBuf, Pa
     if opt.fs.try_exists(&target)? {
         return Err(OpCode::Exist);
     }
+    // normalize each storage root once; the target must not overlap any of them
+    let mut roots = Vec::with_capacity(3);
     for root in [opt.db_root(), opt.data_root(), opt.log_root()] {
-        if overlaps(&target, &absolute_normalized(&root)?) {
+        let root = absolute_normalized(&root)?;
+        if overlaps(&target, &root) {
             return Err(OpCode::Invalid);
         }
+        roots.push(root);
     }
     let mut staging = target.as_os_str().to_os_string();
     staging.push(STAGING_SUFFIX);
     let staging = PathBuf::from(staging);
-    for root in [opt.db_root(), opt.data_root(), opt.log_root()] {
-        if overlaps(&staging, &absolute_normalized(&root)?) {
+    for root in &roots {
+        if overlaps(&staging, root) {
             return Err(OpCode::Invalid);
         }
     }
@@ -341,12 +345,30 @@ fn read_copy_metadata(
     }
 
     let mut frontiers = Vec::new();
+    let mut frontier_error = None;
     copy.view(BUCKET_FRONTIER, |txn| {
         let mut iter = txn.iter();
         let mut key = Vec::new();
         let mut value = Vec::new();
         while iter.next_ref(&mut key, &mut value) {
-            let item = BucketDurableFrontier::decode(&value);
+            let key_id = match key.as_slice().try_into() {
+                Ok(bytes) => u64::from_le_bytes(bytes),
+                Err(_) => {
+                    frontier_error = Some(OpCode::Corruption);
+                    return Ok(());
+                }
+            };
+            let item = match BucketDurableFrontier::try_decode(&value) {
+                Ok(item) => item,
+                Err(err) => {
+                    frontier_error = Some(err);
+                    return Ok(());
+                }
+            };
+            if item.bucket_id != key_id {
+                frontier_error = Some(OpCode::Corruption);
+                return Ok(());
+            }
             frontiers.push(BucketFrontier {
                 bucket_id: item.bucket_id,
                 groups: group_positions(&item.lsn),
@@ -355,19 +377,15 @@ fn read_copy_metadata(
         Ok(())
     })
     .map_err(|_| OpCode::IoError)?;
+    if let Some(err) = frontier_error {
+        return Err(err);
+    }
     drop(copy);
     Ok((data_files, blob_files, frontiers))
 }
 
 fn group_positions(positions: &GroupPositions) -> Vec<GroupPosition> {
     positions.iter().copied().map(GroupPosition::from).collect()
-}
-
-fn payload_path(opt: &ParsedOptions, kind: FileKind, file_id: u64) -> PathBuf {
-    match kind {
-        FileKind::Data => opt.data_file(file_id),
-        FileKind::Blob => opt.blob_file(file_id),
-    }
 }
 
 fn copy_payloads(
@@ -378,7 +396,7 @@ fn copy_payloads(
 ) -> Result<(), OpCode> {
     let dir = staging.join("data");
     for file_id in file_ids {
-        let source = payload_path(opt, kind, *file_id);
+        let source = stat_file_path(opt, kind, *file_id);
         let file_name = source.file_name().ok_or(OpCode::Corruption)?;
         let destination = dir.join(file_name);
         // a published payload file is never written again, so a link is enough; the

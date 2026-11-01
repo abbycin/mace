@@ -1,6 +1,7 @@
 use crate::cc::context::Context;
+use crate::map::adapter::ManifestCheckpointObserver;
 use crate::map::data::{CheckpointTask, FileBuilder, MapBuilder};
-use crate::meta::{FileKind, IntervalPair, MemStat, PageTable, PersistStat};
+use crate::meta::{FileKind, IntervalPair, PageTable, PersistStat};
 #[cfg(feature = "extra_check")]
 use crate::utils::NULL_ADDR;
 use crate::utils::OpCode;
@@ -18,7 +19,7 @@ use std::{
         atomic::Ordering::Relaxed,
         mpsc::{Receiver, Sender, channel},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 pub enum FlushDirective {
@@ -94,17 +95,11 @@ impl FlushResult {
     }
 }
 
-pub trait CheckpointObserver: Send + Sync {
-    fn flush_directive(&self, bucket_id: u64) -> FlushDirective;
-    fn next_update_epoch(&self, bucket_id: u64, kind: FileKind) -> u64;
-    fn stage_unsynced_file(&self, kind: FileKind, file_id: u64);
-    fn stage_orphan_file(&self, kind: FileKind, file_id: u64);
-    fn update_mem_interval_stat(&self, kind: FileKind, ivl: IntervalPair, stat: MemStat);
-    fn on_checkpoint(&self, result: FlushResult);
-    fn finish_checkpoint(&self);
-}
-
-fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn CheckpointObserver) {
+fn checkpoint(
+    mut task: CheckpointTask,
+    ctx: Handle<Context>,
+    observer: &ManifestCheckpointObserver,
+) {
     let bucket_id = task.bucket_id;
     let mut snapshot = task.snapshot();
     let mut map_builder = MapBuilder::new(bucket_id, &snapshot.unmap_pid);
@@ -133,21 +128,6 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
         );
     }
 
-    if file_builder.is_empty() {
-        let mut result = FlushResult::new(
-            ctx.opt.clone(),
-            bucket_id,
-            mapping,
-            task.last_chkpt_lsn.clone(),
-            task.force_fsync,
-        );
-        result.kind_mut(FileKind::Data).junk = std::mem::take(&mut snapshot.data_junk);
-        result.kind_mut(FileKind::Blob).junk = std::mem::take(&mut snapshot.blob_junk);
-        observer.on_checkpoint(result);
-        task.done(snapshot);
-        return;
-    }
-
     let mut result = FlushResult::new(
         ctx.opt.clone(),
         bucket_id,
@@ -157,8 +137,12 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
     );
     result.kind_mut(FileKind::Data).junk = std::mem::take(&mut snapshot.data_junk);
     result.kind_mut(FileKind::Blob).junk = std::mem::take(&mut snapshot.blob_junk);
-    let actual_bytes = file_builder.io_bytes();
-    let io_started = Instant::now();
+
+    if file_builder.is_empty() {
+        observer.on_checkpoint(result);
+        task.done(snapshot);
+        return;
+    }
 
     for kind in FileKind::ALL {
         if !file_builder.has_kind(kind) {
@@ -209,7 +193,6 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
     #[cfg(feature = "failpoints")]
     crate::utils::failpoint::crash("mace_flush_after_data_sync");
 
-    task.mark_io_built(actual_bytes, io_started.elapsed());
     observer.on_checkpoint(result);
 
     task.done(snapshot);
@@ -218,16 +201,20 @@ fn checkpoint(mut task: CheckpointTask, ctx: Handle<Context>, observer: &dyn Che
 fn process_task(
     q: &mut VecDeque<CheckpointTask>,
     ctx: Handle<Context>,
-    observer: &dyn CheckpointObserver,
+    observer: &ManifestCheckpointObserver,
 ) {
     let mut processed_checkpoint = false;
     while let Some(task) = q.pop_front() {
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_checkpoint_sync_point(
+            crate::testing::CheckpointSyncPoint::BeforeFlushDirective,
+            task.bucket_id,
+        );
         let directive = observer.flush_directive(task.bucket_id);
         if let FlushDirective::Skip = directive {
-            // Skip is only used for unload/delete bucket
-            // in this lifecycle the bucket is being reclaimed, so persisting this sealed batch,
-            // reclaiming its generation resources, and settling flow-control accounting are all
-            // intentionally unnecessary
+            // Skip means the bucket was logically deleted: its sealed batch must not be
+            // published, so persisting it, reclaiming its generation resources, and settling
+            // flow-control accounting are all intentionally unnecessary
             task.force_done();
             continue;
         }
@@ -242,7 +229,7 @@ fn process_task(
 fn checkpoint_thread(
     rx: Receiver<CheckpointTask>,
     ctx: Handle<Context>,
-    observer: Arc<dyn CheckpointObserver>,
+    observer: Arc<ManifestCheckpointObserver>,
     sync: Arc<Notifier>,
 ) -> Result<JoinHandle<()>, OpCode> {
     std::thread::Builder::new()
@@ -308,7 +295,7 @@ pub struct Checkpoint {
 impl Checkpoint {
     pub fn new(
         ctx: Handle<Context>,
-        observer: Arc<dyn CheckpointObserver>,
+        observer: Arc<ManifestCheckpointObserver>,
     ) -> Result<Self, OpCode> {
         let (tx, rx) = channel();
         let sync = Arc::new(Notifier::new());

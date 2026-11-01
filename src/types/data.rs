@@ -15,6 +15,15 @@ use crate::{
     utils::{ADDR_LEN, Handle, NULL_ADDR, NULL_PID, to_str, varint::Varint32},
 };
 
+/// slices out the payload of a length-framed record; keeps the caller's exact
+/// fail-stop message so a truncated frame still reports the same context
+macro_rules! decode_framed {
+    ($src:expr, $fmt:literal) => {{
+        let (len, n) = must_exist!(Varint32::decode($src), $fmt, $src);
+        &$src[n..n + len as usize]
+    }};
+}
+
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
 pub struct IntlKey<'a> {
     pub raw: &'a [u8],
@@ -27,8 +36,7 @@ impl<'a> IntlKey<'a> {
 
     #[inline(always)]
     pub(crate) fn encoded_raw(src: &[u8]) -> &[u8] {
-        let (raw_len, n) = must_exist!(Varint32::decode(src), "invalid src: {:?}", src);
-        &src[n..n + raw_len as usize]
+        decode_framed!(src, "invalid src: {:?}")
     }
 }
 
@@ -74,10 +82,6 @@ impl IKey for IntlKey<'_> {
 
     fn txid(&self) -> u64 {
         unimplemented!("internal node has no txid");
-    }
-
-    fn to_string(&self) -> String {
-        format!("raw {}", to_str(self.raw))
     }
 }
 
@@ -125,8 +129,7 @@ impl<'a> Key<'a> {
 
     #[inline(always)]
     fn encoded_key(data: &[u8]) -> &[u8] {
-        let (len, n) = must_exist!(Varint32::decode(data), "invalid data: {:?}", data);
-        &data[n..n + len as usize]
+        decode_framed!(data, "invalid data: {:?}")
     }
 
     #[inline(always)]
@@ -218,16 +221,6 @@ impl IKey for Key<'_> {
     fn txid(&self) -> u64 {
         self.txid
     }
-
-    fn to_string(&self) -> String {
-        format!(
-            "<{} {}, {}-{}>",
-            self.raw.len(),
-            to_str(self.raw),
-            self.ver.txid,
-            self.ver.cmd
-        )
-    }
 }
 
 impl IKey for Ver {
@@ -240,10 +233,6 @@ impl IKey for Ver {
 
     fn txid(&self) -> u64 {
         unimplemented!("Ver has no txid");
-    }
-
-    fn to_string(&self) -> String {
-        format!("Ver {{ txid: {}, cmd: {} }}", self.txid, self.cmd)
     }
 }
 
@@ -284,6 +273,17 @@ pub(crate) struct IntlSeg<'a> {
     base: &'a [u8],
 }
 
+/// strips a page prefix from (prefix, base) and returns the remaining pair;
+/// when `prefix_len` passes the stored prefix, the base absorbs the excess
+#[inline]
+fn split_prefix<'a>(prefix: &'a [u8], base: &'a [u8], prefix_len: usize) -> (&'a [u8], &'a [u8]) {
+    if prefix_len >= prefix.len() {
+        (&[], &base[prefix_len - prefix.len()..])
+    } else {
+        (&prefix[prefix_len..], base)
+    }
+}
+
 impl<'a> IntlSeg<'a> {
     pub(crate) fn new(prefix: &'a [u8], base: &'a [u8]) -> Self {
         Self { prefix, base }
@@ -322,18 +322,8 @@ impl IDecode for IntlSeg<'_> {
 impl IKeyCodec for IntlSeg<'_> {
     fn remove_prefix(&self, prefix_len: usize) -> Self {
         hot_true!(self.len() >= prefix_len);
-        if prefix_len >= self.prefix.len() {
-            let rest = prefix_len - self.prefix.len();
-            Self {
-                prefix: &[],
-                base: &self.base[rest..],
-            }
-        } else {
-            Self {
-                prefix: &self.prefix[prefix_len..],
-                base: self.base,
-            }
-        }
+        let (prefix, base) = split_prefix(self.prefix, self.base, prefix_len);
+        Self { prefix, base }
     }
 }
 
@@ -374,6 +364,23 @@ fn full_raw_cmp(l_prefix: &[u8], l_raw: &[u8], r_prefix: &[u8], r_raw: &[u8]) ->
     }
 }
 
+/// compares two (prefix, base) raw keys from possibly different prefix domains;
+/// same-domain compares only the stripped tails and empty-prefix sides trim the
+/// other prefix before falling back to the full raw compare
+#[inline]
+fn prefixed_raw_cmp(l_prefix: &[u8], l_base: &[u8], r_prefix: &[u8], r_base: &[u8]) -> Ordering {
+    if l_prefix == r_prefix {
+        return l_base.cmp(r_base);
+    }
+    if l_prefix.is_empty() {
+        return cmp_raw_with_prefixed_tail(l_base, r_prefix, r_base);
+    }
+    if r_prefix.is_empty() {
+        return cmp_raw_with_prefixed_tail(r_base, l_prefix, l_base).reverse();
+    }
+    full_raw_cmp(l_prefix, l_base, r_prefix, r_base)
+}
+
 impl<'a> LeafSeg<'a> {
     pub(crate) fn new(prefix: &'a [u8], base: &'a [u8], ver: Ver) -> Self {
         Self { prefix, base, ver }
@@ -387,12 +394,7 @@ impl<'a> LeafSeg<'a> {
     }
 
     pub(crate) fn raw_cmp(&self, other: &Self) -> Ordering {
-        // merge can feed items from different prefix domains, only then use full key compare
-        if self.prefix == other.prefix {
-            self.base.cmp(other.base)
-        } else {
-            full_raw_cmp(self.prefix, self.base, other.prefix, other.base)
-        }
+        prefixed_raw_cmp(self.prefix, self.base, other.prefix, other.base)
     }
 
     pub(crate) fn raw(&self) -> &'a [u8] {
@@ -443,19 +445,11 @@ impl IDecode for LeafSeg<'_> {
 impl IKeyCodec for LeafSeg<'_> {
     fn remove_prefix(&self, prefix_len: usize) -> Self {
         hot_true!(self.len() - Ver::len() >= prefix_len);
-        if prefix_len >= self.prefix.len() {
-            let rest = prefix_len - self.prefix.len();
-            Self {
-                prefix: &[],
-                base: &self.base[rest..],
-                ver: self.ver,
-            }
-        } else {
-            Self {
-                prefix: &self.prefix[prefix_len..],
-                base: self.base,
-                ver: self.ver,
-            }
+        let (prefix, base) = split_prefix(self.prefix, self.base, prefix_len);
+        Self {
+            prefix,
+            base,
+            ver: self.ver,
         }
     }
 }
@@ -638,10 +632,12 @@ impl<'a> Val<'a> {
             }
     }
 
+    /// writes [flags][gid][len] plus the optional history block and returns the
+    /// payload offset; `flags` carries the remote bit for blob envelopes
     #[inline(always)]
-    pub fn encode_inline(dst: &mut [u8], hist: Option<HistRef>, v: &Record) {
+    fn encode_head(dst: &mut [u8], hist: Option<HistRef>, v: &Record, flags: u8) -> usize {
         let merge = v.is_merge();
-        dst[0] = v.is_tombstone() as u8 | (merge as u8) << 1;
+        dst[0] = v.is_tombstone() as u8 | (merge as u8) << 1 | flags;
         dst[1] = v.group_id();
         let mut off = Self::HDR_LEN + Self::GID_LEN;
         Self::write::<u32>(dst, off, v.packed_size() as u32);
@@ -655,27 +651,18 @@ impl<'a> Val<'a> {
             Self::write::<u32>(dst, off, hist.count);
             off += Self::HIST_COUNT_LEN;
         }
+        off
+    }
+
+    #[inline(always)]
+    pub fn encode_inline(dst: &mut [u8], hist: Option<HistRef>, v: &Record) {
+        let off = Self::encode_head(dst, hist, v, 0);
         v.encode_to(&mut dst[off..]);
     }
 
     #[inline(always)]
     pub fn encode_remote(dst: &mut [u8], hist: Option<HistRef>, remote: u64, v: &Record) {
-        let merge = v.is_merge();
-        dst[0] = v.is_tombstone() as u8 | (merge as u8) << 1;
-        dst[0] |= Self::REMOTE_BIT;
-        dst[1] = v.group_id();
-        let mut off = Self::HDR_LEN + Self::GID_LEN;
-        Self::write::<u32>(dst, off, v.packed_size() as u32);
-        off += Self::DATA_LEN;
-        if let Some(hist) = hist {
-            dst[0] |= Self::HIST_BIT;
-            Self::write::<u64>(dst, off, hist.page_addr);
-            off += ADDR_LEN;
-            Self::write::<u16>(dst, off, hist.slot);
-            off += Self::HIST_SLOT_LEN;
-            Self::write::<u32>(dst, off, hist.count);
-            off += Self::HIST_COUNT_LEN;
-        }
+        let off = Self::encode_head(dst, hist, v, Self::REMOTE_BIT);
         Self::write::<u64>(dst, off, remote);
     }
 
@@ -971,21 +958,7 @@ where
     }
 
     pub(crate) fn cmp(&self, other: &Self) -> Ordering {
-        // fast path: most scan compares happen within the same prefix domain
-        if self.prefix == other.prefix {
-            return self.base.cmp(other.base);
-        }
-
-        // keep one-side-empty path branch-local to avoid cmp_key + reverse overhead
-        if self.prefix.is_empty() {
-            return cmp_raw_with_prefixed_tail(self.base, other.prefix, other.base);
-        }
-        if other.prefix.is_empty() {
-            return cmp_raw_with_prefixed_tail(other.base, self.prefix, self.base).reverse();
-        }
-
-        // mixed non-empty prefixes need full-key compare for correctness
-        full_raw_cmp(self.prefix, self.base, other.prefix, other.base)
+        prefixed_raw_cmp(self.prefix, self.base, other.prefix, other.base)
     }
 
     pub(crate) fn txid(&self) -> u64 {

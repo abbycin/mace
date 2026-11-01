@@ -89,13 +89,18 @@ struct FsRule {
     hits: u64,
 }
 
+/// consume one consultation; a rule acts on its nth hit, or on every hit without nth
+fn hit(hits: &mut u64, nth: Option<u64>) -> bool {
+    *hits += 1;
+    match nth {
+        Some(nth) => *hits == nth,
+        None => true,
+    }
+}
+
 impl Rule {
     fn hit(&mut self) -> bool {
-        self.hits += 1;
-        match self.nth {
-            Some(nth) => self.hits == nth,
-            None => true,
-        }
+        hit(&mut self.hits, self.nth)
     }
 }
 
@@ -109,11 +114,7 @@ impl FsRule {
     }
 
     fn hit(&mut self) -> bool {
-        self.hits += 1;
-        match self.nth {
-            Some(nth) => self.hits == nth,
-            None => true,
-        }
+        hit(&mut self.hits, self.nth)
     }
 }
 

@@ -1,22 +1,16 @@
 use crate::cc::context::Context;
-use crate::index::tree::Tree;
-pub use crate::index::txn::{TxnKV, TxnView};
-use crate::map::adapter::{ManifestCheckpointObserver, ManifestDataReader};
+use crate::map::adapter::ManifestCheckpointObserver;
 use crate::map::evictor::Evictor;
+use crate::meta::Manifest;
 use crate::meta::builder::{ManifestBuilder, OpenPlan};
-use crate::meta::{BucketMeta, Manifest};
 use crate::store::checkpoint::CheckpointInfo;
 use crate::store::gc::{GCHandle, drain_abort_clean_at_exit, start_gc};
 use crate::store::recovery::{Recovery, TargetPlan};
 use crate::utils::Handle;
 use crate::utils::MutRef;
 pub use crate::utils::OpCode;
-use crate::utils::ROOT_PID;
 pub use crate::utils::options::Options;
-use crate::utils::options::{
-    BucketOptions, ParsedOptions, PersistedBucketOptions, PersistedOptions,
-};
-use std::ops::Deref;
+use crate::utils::options::{ParsedOptions, PersistedOptions};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::mpsc::channel;
@@ -77,95 +71,6 @@ pub struct Inner {
     pub(crate) gc: GCHandle,
 }
 
-impl Inner {
-    const MAX_BUCKET_NAME_LEN: usize = 32;
-
-    fn new_bucket(this: &Arc<Inner>, name: &str, opt: BucketOptions) -> Result<Bucket, OpCode> {
-        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
-            return Err(OpCode::TooLarge);
-        }
-        let (meta, bucket_ctx) = this.store.manifest.create_bucket(name, opt)?;
-
-        Ok(Bucket {
-            tree: Tree::new(this.store.clone(), ROOT_PID, bucket_ctx),
-            _holder: meta,
-            inner: this.clone(),
-        })
-    }
-
-    fn open_bucket(this: &Arc<Inner>, name: &str) -> Result<Bucket, OpCode> {
-        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
-            return Err(OpCode::TooLarge);
-        }
-        let meta = this.store.manifest.load_bucket_meta(name)?;
-        let bucket_ctx = this.store.manifest.load_bucket_context(meta.id)?;
-
-        Ok(Bucket {
-            tree: Tree::new(this.store.clone(), ROOT_PID, bucket_ctx),
-            _holder: meta,
-            inner: this.clone(),
-        })
-    }
-
-    /// reads the persisted bucket options from metadata only: no bucket
-    /// runtime, page table, or context is loaded
-    fn get_bucket_options(this: &Arc<Inner>, name: &str) -> Result<Option<BucketOptions>, OpCode> {
-        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
-            return Err(OpCode::TooLarge);
-        }
-        Ok(this
-            .store
-            .manifest
-            .load_bucket_options(name)?
-            .map(PersistedBucketOptions::to_runtime))
-    }
-
-    fn open_bucket_with_options(
-        this: &Arc<Inner>,
-        name: &str,
-        opt: BucketOptions,
-    ) -> Result<Bucket, OpCode> {
-        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
-            return Err(OpCode::TooLarge);
-        }
-        let meta = this.store.manifest.load_bucket_meta(name)?;
-        // persisted fields always come from BucketMeta; runtime fields are fixed at context load
-        let bucket_ctx = this
-            .store
-            .manifest
-            .load_bucket_context_with_options(meta.id, Some(&opt))?;
-
-        Ok(Bucket {
-            tree: Tree::new(this.store.clone(), ROOT_PID, bucket_ctx),
-            _holder: meta,
-            inner: this.clone(),
-        })
-    }
-
-    fn update_bucket_opt(this: &Arc<Inner>, name: &str, opt: BucketOptions) -> Result<(), OpCode> {
-        if name.len() >= Self::MAX_BUCKET_NAME_LEN {
-            return Err(OpCode::TooLarge);
-        }
-        this.store.manifest.update_bucket_options(name, opt)
-    }
-
-    /// manually unload bucket to release memory
-    fn drop_bucket(self: &Inner, name: &str) -> Result<(), OpCode> {
-        self.store.context.sync()?;
-        self.store.manifest.unload_bucket(name)
-    }
-
-    fn del_bucket(self: &Inner, name: &str) -> Result<(), OpCode> {
-        self.store.manifest.delete_bucket(name)
-    }
-
-    fn checkpoint(&self, bucket_id: u64) {
-        if let Ok(ctx) = self.store.manifest.load_bucket_context(bucket_id) {
-            ctx.checkpoint();
-        }
-    }
-}
-
 impl Drop for Inner {
     fn drop(&mut self) {
         // stop GC before draining abort-clean tasks
@@ -178,54 +83,6 @@ impl Drop for Inner {
     }
 }
 
-/// A bucket is a named collection of key-value pairs.
-#[derive(Clone)]
-pub struct Bucket {
-    pub(crate) tree: Tree,
-    pub(crate) _holder: Arc<BucketMeta>,
-    pub(crate) inner: Arc<Inner>,
-}
-
-impl Bucket {
-    /// Begins a new read-write transaction.
-    pub fn begin(&'_ self) -> Result<TxnKV<'_>, OpCode> {
-        TxnKV::new(&self.inner.store.context, &self.tree)
-    }
-
-    /// Begins a new read-only transaction (view).
-    pub fn view(&'_ self) -> Result<TxnView<'_>, OpCode> {
-        TxnView::new(&self.inner.store.context, &self.tree)
-    }
-
-    /// Starts a manual checkpoint which will flush dirty pages to disk and may trigger WAL gc
-    pub fn checkpoint(&self) {
-        self.inner.checkpoint(self.id());
-    }
-
-    /// Flushes dirty pages in a fresh checkpoint and waits for it to finish
-    pub fn checkpoint_and_wait(&self) {
-        self.tree.bucket.checkpoint_and_wait(false);
-    }
-
-    /// Returns the unique identifier of this bucket.
-    pub fn id(&self) -> u64 {
-        self.tree.bucket_id()
-    }
-
-    /// Returns the options used by this bucket.
-    pub fn options(&self) -> &Options {
-        &self.inner.store.opt
-    }
-}
-
-impl Deref for Bucket {
-    type Target = Inner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
 /// The main entry point for the Mace storage engine.
 #[derive(Clone)]
 pub struct Mace {
@@ -235,6 +92,8 @@ pub struct Mace {
 /// Shutdown is reachable only from `Inner::drop`, so no public API admits a
 /// transaction or view while the store is quitting: begin/view require a live bucket
 /// borrow, and the last `Arc<Inner>` drop is the only caller of `quit`.
+///
+/// Bucket creation/opening/unloading and deletion live in `store/bucket.rs`.
 impl Mace {
     /// Creates a new Mace instance with the given options.
     pub fn new(opt: ParsedOptions) -> Result<Self, OpCode> {
@@ -263,8 +122,7 @@ impl Mace {
         };
         let mut ctx = recovery_ctx;
         let mut observer = Arc::new(ManifestCheckpointObserver::new(manifest, ctx));
-        let reader = Arc::new(ManifestDataReader::new(manifest));
-        if let Err(err) = manifest.set_context(ctx, reader.clone(), observer.clone()) {
+        if let Err(err) = manifest.set_context(ctx, observer.clone()) {
             // the recovery flusher never started and no logger was detached, so the
             // context is dropped without a barrier; the observer must go first, because it
             // holds a handle to that context
@@ -285,9 +143,7 @@ impl Mace {
         // writers, and this Context becomes the runtime one: restart the flusher on it
         if plan.rebuild_epoch() && !plan.group_resize {
             let mut manifest = store.manifest;
-            if let Err(err) =
-                manifest.restart_checkpoint_flusher(ctx, reader.clone(), observer.clone())
-            {
+            if let Err(err) = manifest.restart_checkpoint_flusher(ctx, observer.clone()) {
                 recover.abort(store.clone());
                 store.raw_ref().abort();
                 return Err(err);
@@ -350,91 +206,6 @@ impl Mace {
         &self.inner.store.opt
     }
 
-    /// Creates a bucket with the given name.
-    /// NOTE: name must be less than 32 bytes.
-    pub fn new_bucket<S: AsRef<str>>(&self, name: S, opt: BucketOptions) -> Result<Bucket, OpCode> {
-        Inner::new_bucket(&self.inner, name.as_ref(), opt.validate())
-    }
-
-    /// Gets an existing bucket with the given name.
-    ///
-    /// If the bucket is not loaded, this fixes its runtime merge operator to `None`
-    /// until the context is unloaded.
-    /// NOTE: name must be less than 32 bytes.
-    pub fn open_bucket<S: AsRef<str>>(&self, name: S) -> Result<Bucket, OpCode> {
-        Inner::open_bucket(&self.inner, name.as_ref())
-    }
-
-    /// Reads the persisted options of a bucket from its metadata without
-    /// loading the bucket context (no page table or runtime state is touched).
-    ///
-    /// Returns `None` when the bucket does not exist. The returned
-    /// [`BucketOptions`] carries the persisted subset only: the runtime merge
-    /// operator is never persisted and is always `None` here — use
-    /// [`Mace::open_bucket_with_options`] to adopt a runtime operator.
-    ///
-    /// NOTE: name must be less than 32 bytes.
-    pub fn get_bucket_options<S: AsRef<str>>(
-        &self,
-        name: S,
-    ) -> Result<Option<BucketOptions>, OpCode> {
-        Inner::get_bucket_options(&self.inner, name.as_ref())
-    }
-
-    /// Gets an existing bucket and uses only the runtime fields of `options`
-    /// (currently the [`crate::MergeOperator`]). Persisted bucket fields always come from
-    /// the stored bucket metadata.
-    ///
-    /// The merge operator is fixed before a newly loaded bucket context is published.
-    /// Re-opening a loaded context with a different operator, or providing one after the
-    /// context was loaded without one, returns [`OpCode::Invalid`]. After
-    /// [`Mace::drop_bucket`] unloads the context, the next load chooses the operator again.
-    /// Providing an operator does not guarantee it matches the one that wrote existing
-    /// merge operands; that semantic contract belongs to the caller.
-    ///
-    /// NOTE: name must be less than 32 bytes.
-    pub fn open_bucket_with_options<S: AsRef<str>>(
-        &self,
-        name: S,
-        opt: BucketOptions,
-    ) -> Result<Bucket, OpCode> {
-        Inner::open_bucket_with_options(&self.inner, name.as_ref(), opt.validate())
-    }
-
-    /// Updates the persisted bucket-scoped options of an existing bucket
-    ///
-    /// Runtime-only fields of the passed options (currently the merge operator)
-    /// are ignored: they are never persisted. For an existing bucket the
-    /// operator is adopted through [`Mace::open_bucket_with_options`]; a new
-    /// bucket adopts it at creation via [`Mace::new_bucket`].
-    ///
-    /// Returns [`OpCode::Again`] if the bucket is currently loaded
-    ///
-    /// Returns [`OpCode::Invalid`] if the requested [`BucketOptions`] conflict with
-    /// persisted compatibility-sensitive bucket options, including an increase to `inline_size`
-    pub fn update_bucket_opt<S: AsRef<str>>(
-        &self,
-        name: S,
-        opt: BucketOptions,
-    ) -> Result<(), OpCode> {
-        Inner::update_bucket_opt(&self.inner, name.as_ref(), opt.validate())
-    }
-
-    /// Returns a list of all active bucket names.
-    pub fn active_buckets(&self) -> Vec<String> {
-        self.inner.store.manifest.loaded_bucket_names()
-    }
-
-    /// Manually unloads a bucket to release memory.
-    pub fn drop_bucket<S: AsRef<str>>(&self, name: S) -> Result<(), OpCode> {
-        Inner::drop_bucket(&self.inner, name.as_ref())
-    }
-
-    /// Deletes a bucket and all its data.
-    pub fn del_bucket<S: AsRef<str>>(&self, name: S) -> Result<(), OpCode> {
-        Inner::del_bucket(&self.inner, name.as_ref())
-    }
-
     /// Disables garbage collection.
     pub fn disable_gc(&self) {
         self.inner.gc.pause();
@@ -458,15 +229,6 @@ impl Mace {
     /// Returns the number of blob garbage collection cycles performed.
     pub fn blob_gc_count(&self) -> u64 {
         self.inner.gc.blob_gc_count()
-    }
-
-    /// Returns the total number of buckets, including active and pending deletion ones.
-    pub fn nr_buckets(&self) -> u64 {
-        self.inner
-            .store
-            .manifest
-            .nr_buckets
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Synchronizes all WAL to disk.
@@ -521,7 +283,7 @@ fn install_target_context(
 ) -> Result<(Handle<Context>, Arc<ManifestCheckpointObserver>), OpCode> {
     let mut manifest = store.manifest;
     assert!(
-        manifest.buckets.buckets.is_empty(),
+        manifest.buckets.contexts_is_empty(),
         "context handoff requires every recovery-loaded bucket to be evicted first"
     );
     if let Some(flush) = manifest.take_checkpoint_flusher() {
@@ -548,8 +310,7 @@ fn install_target_context(
     }
 
     let observer = Arc::new(ManifestCheckpointObserver::new(manifest, ctx));
-    let reader = Arc::new(ManifestDataReader::new(manifest));
-    if let Err(err) = manifest.set_context(ctx, reader, observer.clone()) {
+    if let Err(err) = manifest.set_context(ctx, observer.clone()) {
         // the target Context was never published and never started, so no holder may
         // keep its handle: drop the observer, then the context, without a barrier
         drop(observer);

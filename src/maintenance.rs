@@ -9,14 +9,14 @@ pub use crate::cc::wal::{
     EntryType, IWalCodec, PayloadType, WalAbort, WalCheckpoint, WalUpdate, ptr_to, wal_record_sz,
 };
 pub use crate::io::{File, FileSystem, GatherIO, OpenOptions};
-pub use crate::map::data::MetaReader;
+pub use crate::map::data::{FileReader, MetaReader, try_new_reader};
 pub use crate::meta::{
     BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BUCKET_METAS, BUCKET_MISC,
     BUCKET_OBSOLETE_BLOB, BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, BUCKET_VERSION,
-    BucketDurableFrontier, BucketMeta, CURRENT_VERSION, FileKind, FileReader, IMetaCodec,
-    IntervalPair, OPTIONS_KEY, ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, PersistStat,
-    StatInner, VERSION_KEY, WAL_RECYCLE_PREFIX, WalRecycleState, data_interval_name,
-    interval_bucket_name, orphan_data_marker_key, page_table_name, try_new_reader, wal_recycle_key,
+    BucketDurableFrontier, BucketMeta, CURRENT_VERSION, FileKind, IMetaCodec, IntervalPair,
+    OPTIONS_KEY, ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, PersistStat, StatInner,
+    VERSION_KEY, WAL_RECYCLE_PREFIX, WalRecycleState, data_interval_name, interval_bucket_name,
+    orphan_data_marker_key, page_table_name, wal_recycle_key,
 };
 pub use crate::types::header::{BaseHeader, DeltaHeader, NodeType, TagFlag, TagKind};
 pub use crate::types::refbox::{BaseView, BoxRef, DeltaView};

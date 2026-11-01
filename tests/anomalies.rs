@@ -466,6 +466,7 @@ fn history() -> Result<(), OpCode> {
 struct Executor {
     map: HashMap<usize, (Arc<SyncClosure>, Arc<AtomicBool>)>,
     db: Arc<Mace>,
+    _path: Arc<RandomPath>,
     handle: Vec<Option<JoinHandle<()>>>,
 }
 
@@ -486,7 +487,7 @@ impl Executor {
     }
 
     fn launch2(workers: &[usize], tmp: bool) -> Self {
-        let path = RandomPath::new();
+        let path = RandomPath::tmp();
         let mut opt = Options::new(&*path);
 
         opt.tmp_store = tmp;
@@ -515,7 +516,12 @@ impl Executor {
             map.insert(*c, (cond, quit));
         }
 
-        let this = Self { map, db, handle };
+        let this = Self {
+            map,
+            db,
+            _path: Arc::new(path),
+            handle,
+        };
         let mut s = this.session(workers[0]);
         s.begin();
         s.put("1", "10");
@@ -531,6 +537,7 @@ impl Executor {
             kv: None,
             db,
             cond: cond.clone(),
+            _path: self._path.clone(),
         }
     }
 }
@@ -557,6 +564,7 @@ struct Session {
     kv: Option<TxnKV<'static>>,
     db: Arc<Bucket>,
     cond: Arc<SyncClosure>,
+    _path: Arc<RandomPath>,
 }
 
 struct SyncPtr {

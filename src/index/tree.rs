@@ -1029,7 +1029,15 @@ impl Tree {
         if self.bucket.table.get(page.pid()) != page.swip() {
             return Err(OpCode::Again);
         }
-        self.rewrite_node(g, page)
+        if !page.has_retained_abort(self.store.context) {
+            return Ok(false);
+        }
+        let removed = self.rewrite_node(g, page)?;
+        hot_true!(
+            removed,
+            "retained-abort scan must match the compaction filter"
+        );
+        Ok(removed)
     }
 
     // foreground retry uses head-gated cleanup to avoid no-op page compaction under concurrent updates
@@ -1649,22 +1657,7 @@ impl<'a> Iter<'a> {
         }
     }
 
-    fn bounds_ok(&self, item: &IterItem<'a, Loader>, forward: bool) -> bool {
-        let lo_ok = match &self.lo {
-            Bound::Unbounded => true,
-            Bound::Included(b) => item.cmp_key(b.as_slice()).is_ge(),
-            Bound::Excluded(b) => item.cmp_key(b.as_slice()).is_gt(),
-        };
-        if forward {
-            if !lo_ok {
-                return false;
-            }
-            return match &self.hi {
-                Bound::Unbounded => true,
-                Bound::Included(h) => item.cmp_key(h.as_slice()).is_le(),
-                Bound::Excluded(h) => item.cmp_key(h.as_slice()).is_lt(),
-            };
-        }
+    fn bounds_ok(&self, item: &IterItem<'a, Loader>) -> bool {
         let hi_ok = match &self.hi {
             Bound::Unbounded => true,
             Bound::Included(h) => item.cmp_key(h.as_slice()).is_le(),
@@ -1736,6 +1729,84 @@ impl<'a> Iter<'a> {
         self.bound_from_item = true;
     }
 
+    /// consumes one raw leaf candidate for either scan direction.
+    ///
+    /// returns the item to yield, or `None` when the candidate is skipped:
+    /// out of bounds, invisible to this snapshot, a duplicate of the last
+    /// returned/resolved key, a tombstone, or a merge chain that folded away.
+    /// `forward` only selects the direction's bound acceptance rule; every
+    /// other step is shared.
+    fn consume_candidate(
+        &mut self,
+        item: IterItem<'a, Loader>,
+        forward: bool,
+    ) -> Result<Option<IterItem<'a, Loader>>, OpCode> {
+        let accepted = if forward {
+            self.lower_bound_ok(&item)
+        } else {
+            self.bounds_ok(&item)
+        };
+        if !accepted {
+            return Ok(None);
+        }
+        // step past versions invisible to this snapshot: the leaf
+        // iterator yields the key's older versions next, so an
+        // invisible head never needs the shared resolver
+        if !is_visible_to(
+            &self.tree.store.context,
+            self.snapshot,
+            item.val.group_id(),
+            item.txid(),
+        ) {
+            return Ok(None);
+        }
+        // The common non-merge workload only needs the original
+        // deduplication/tombstone filter. If a merge appears after
+        // iterator creation, switch to the full resolver below.
+        let kind = item.val.kind();
+        if !self.merge_mode {
+            if self.same_last_key(&item) {
+                return Ok(None);
+            }
+            let _ = item.assembled_key();
+            self.remember_candidate(&item);
+            if kind == Val::DEL_BIT {
+                return Ok(None);
+            }
+            if kind == 0 {
+                return Ok(Some(item));
+            }
+            self.merge_mode = true;
+            self.has_last = false;
+        }
+        // cached_key holds the last returned/resolved key; do not
+        // re-resolve older versions from the same key run
+        if self.same_last_key(&item) {
+            return Ok(None);
+        }
+        if kind == 0 {
+            let _ = item.assembled_key();
+            self.remember_candidate(&item);
+            return Ok(Some(item));
+        }
+        let raw = item.assembled_key();
+        self.remember_candidate(&item);
+        if kind == Val::DEL_BIT {
+            // a visible tombstone is the newest visible version of
+            // the run: no visible operand sits above it, so the
+            // run is deleted
+            return Ok(None);
+        }
+        // visible merge head: the shared resolver folds the chain
+        match self.resolve_item(raw.as_slice())? {
+            None => {
+                // the whole chain folded to "deleted": skip the run
+                Ok(None)
+            }
+            Some((gid, data)) => Ok(Some(item.with_folded(gid, data))),
+        }
+    }
+
     #[inline(always)]
     pub fn try_next(&mut self) -> Result<Option<IterItem<'a, Loader>>, OpCode> {
         self.rev_iter.take();
@@ -1788,67 +1859,8 @@ impl<'a> Iter<'a> {
                 };
                 match next {
                     Ok(Some(item)) => {
-                        let lo_ok = self.lower_bound_ok(&item);
-                        if !lo_ok {
-                            continue;
-                        }
-                        // step past versions invisible to this snapshot: the leaf
-                        // iterator yields the key's older versions next, so an
-                        // invisible head never needs the shared resolver
-                        if !is_visible_to(
-                            &self.tree.store.context,
-                            self.snapshot,
-                            item.val.group_id(),
-                            item.txid(),
-                        ) {
-                            continue;
-                        }
-                        // The common non-merge workload only needs the original
-                        // deduplication/tombstone filter. If a merge appears after
-                        // iterator creation, switch to the full resolver below.
-                        let kind = item.val.kind();
-                        if !self.merge_mode {
-                            if self.same_last_key(&item) {
-                                continue;
-                            }
-                            let _ = item.assembled_key();
-                            self.remember_candidate(&item);
-                            if kind == Val::DEL_BIT {
-                                continue;
-                            }
-                            if kind == 0 {
-                                break Some(item);
-                            }
-                            self.merge_mode = true;
-                            self.has_last = false;
-                        }
-                        // cached_key holds the last returned/resolved key; do not
-                        // re-resolve older versions from the same key run
-                        if self.same_last_key(&item) {
-                            continue;
-                        }
-                        if kind == 0 {
-                            let _ = item.assembled_key();
-                            self.remember_candidate(&item);
+                        if let Some(item) = self.consume_candidate(item, true)? {
                             break Some(item);
-                        }
-                        let raw = item.assembled_key();
-                        self.remember_candidate(&item);
-                        if kind == Val::DEL_BIT {
-                            // a visible tombstone is the newest visible version of
-                            // the run: no visible operand sits above it, so the
-                            // run is deleted
-                            continue;
-                        }
-                        // visible merge head: the shared resolver folds the chain
-                        match self.resolve_item(raw.as_slice())? {
-                            None => {
-                                // the whole chain folded to "deleted": skip the run
-                                continue;
-                            }
-                            Some((gid, data)) => {
-                                break Some(item.with_folded(gid, data));
-                            }
                         }
                     }
                     Ok(None) => break None,
@@ -1944,63 +1956,8 @@ impl<'a> Iter<'a> {
                 };
                 match next {
                     Ok(Some(item)) => {
-                        if !self.bounds_ok(&item, false) {
-                            continue;
-                        }
-                        // step past versions invisible to this snapshot: the leaf
-                        // iterator yields the key's older versions next, so an
-                        // invisible head never needs the shared resolver
-                        if !is_visible_to(
-                            &self.tree.store.context,
-                            self.snapshot,
-                            item.val.group_id(),
-                            item.txid(),
-                        ) {
-                            continue;
-                        }
-                        let kind = item.val.kind();
-                        if !self.merge_mode {
-                            if self.same_last_key(&item) {
-                                continue;
-                            }
-                            let _ = item.assembled_key();
-                            self.remember_candidate(&item);
-                            if kind == Val::DEL_BIT {
-                                continue;
-                            }
-                            if kind == 0 {
-                                break Some(item);
-                            }
-                            self.merge_mode = true;
-                            self.has_last = false;
-                        }
-                        // cached_key holds the last returned/resolved key; do not
-                        // re-resolve older versions from the same key run
-                        if self.same_last_key(&item) {
-                            continue;
-                        }
-                        if kind == 0 {
-                            let _ = item.assembled_key();
-                            self.remember_candidate(&item);
+                        if let Some(item) = self.consume_candidate(item, false)? {
                             break Some(item);
-                        }
-                        let raw = item.assembled_key();
-                        self.remember_candidate(&item);
-                        if kind == Val::DEL_BIT {
-                            // a visible tombstone is the newest visible version of
-                            // the run: no visible operand sits above it, so the
-                            // run is deleted
-                            continue;
-                        }
-                        // visible merge head: the shared resolver folds the chain
-                        match self.resolve_item(raw.as_slice())? {
-                            None => {
-                                // the whole chain folded to "deleted": skip the run
-                                continue;
-                            }
-                            Some((gid, data)) => {
-                                break Some(item.with_folded(gid, data));
-                            }
                         }
                     }
                     Ok(None) => break None,
@@ -2216,7 +2173,7 @@ mod merge_test {
     }
 
     /// drives safe_exclusive past `txid` deterministically (extra_check wake)
-    fn wait_safe_past(db: &crate::store::store::Bucket, txid: u64) {
+    fn wait_safe_past(db: &crate::store::bucket::Bucket, txid: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while crate::testing::safe_exclusive(db) <= txid {
             assert!(

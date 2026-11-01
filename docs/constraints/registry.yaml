@@ -20,8 +20,8 @@ entries:
       generation still publishes a fact. A crash right after loses a transaction the caller was told is
       durable.
     anchors:
-      - src/index/txn.rs
-      - src/cc/log.rs
+      - src/index/txn/kv.rs
+      - src/cc/log/sync.rs
     reproducer: durable_commit_publishes_fact_only_after_wal_cut_is_durable
   - id: durable_generation_sync_covers_all_sealed_writers
     title: only a generation leader syncs, and it syncs every writer sealed by its cut
@@ -37,7 +37,7 @@ entries:
       A writer detached by rotation is never synced. Its committed records live only in the page cache, so
       a crash right after the commit returned loses a transaction the caller was told is durable.
     anchors:
-      - src/cc/log.rs
+      - src/cc/log/sync.rs
     reproducer: rotation_writers_are_synced_by_generation_and_survive_reopen
   - id: protocol.data_blob_file_version_gate
     title: data and blob readers must reject unsupported footer versions and fields
@@ -54,7 +54,8 @@ entries:
       A payload file written by a different format version is parsed as ours, so its records are read as
       valid data and its bytes are rewritten in our layout. Committed values are silently corrupted.
     anchors:
-      - src/map/data.rs
+      - src/map/data/file_reader.rs
+      - src/map/data/file_builder.rs
     reproducer: rewrite_builder_keeps_compressed_v1_records_compressed
   - id: protocol.filesystem_io_errors_do_not_collapse_to_absence
     title: startup directory prep, recovery bootstrap, and runtime probe/open paths must not collapse fs faults into absence
@@ -97,7 +98,7 @@ entries:
     anchors:
       - src/map/flush.rs
       - src/store/store.rs
-      - src/store/gc.rs
+      - src/store/gc/rewrite.rs
     reproducer: oversized_data_rewrite_splits_outputs_and_reopens
   - id: protocol.graceful_exit_flushes_all_dirty_pages
     title: graceful exit must flush every dirty page with a full fsync
@@ -115,7 +116,7 @@ entries:
       loss.
     anchors:
       - src/map/flush.rs
-      - src/map/buffer.rs
+      - src/map/buffer/bucket.rs
     reproducer: durable_exit_leaves_all_committed_in_data_files
   - id: protocol.wal_recycle_safe_boundary
     title: WAL recycling must stay behind active txn, checkpoint, and pending abort-clean boundaries
@@ -134,8 +135,9 @@ entries:
       next open finds a gap inside a retained range and refuses the database, losing every commit after
       the gap.
     anchors:
-      - src/meta/manifest.rs
-      - src/store/recovery.rs
+      - src/meta/manifest/recycle.rs
+      - src/store/gc/wal_recycle.rs
+      - src/store/recovery/scan.rs
     reproducer: abort_clean_pin_is_published_before_logging_handoff_releases
   - id: protocol.wal_update_validation_precedes_consumption
     title: WAL Update bounds, checksum, and layout must validate before consumption
@@ -154,7 +156,7 @@ entries:
       from the open phase, not a global constant, so a retired group id is never answered as history.
     anchors:
       - src/cc/wal.rs
-      - src/store/recovery.rs
+      - src/store/recovery/scan.rs
     reproducer: update_record_validation_rejects_inconsistent_layout
   - id: protocol.invariant_failure_is_fail_stop
     title: an invariant failure prints its report and then aborts the process
@@ -189,8 +191,8 @@ entries:
       stale boundary: it either replays a segment that was already deleted, or refuses the database, so a
       clean shutdown is not recoverable.
     anchors:
-      - src/meta/manifest.rs
-      - src/store/recovery.rs
+      - src/meta/manifest/recycle.rs
+      - src/store/recovery/transition.rs
     reproducer: remove_wal_prefix_enumerates_present_files_instead_of_sparse_ids
   - id: wal_position_epoch_monotonic_across_route_switch
     title: every route-switch, layout-migration, or width-change reopen starts the new era at a globally monotonic file-id epoch; same-route matched-layout reopens continue in-stream
@@ -209,8 +211,8 @@ entries:
       boundary. The next open then sees a gap inside a retained range and refuses the database, or replays
       a mix of two eras into one tree.
     anchors:
-      - src/store/recovery.rs
-      - src/meta/manifest.rs
+      - src/store/recovery/transition.rs
+      - src/meta/manifest/frontier.rs
       - src/cc/log.rs
     reproducer: migration_retires_every_source_stream_and_records_the_target_width
   - id: wal_recovery_truncates_at_first_malformed_record
@@ -230,7 +232,7 @@ entries:
       replayed data and a crash during recovery re-applies effects that were already durable. With
       truncation disabled the same tail must refuse the open instead of guessing.
     anchors:
-      - src/store/recovery.rs
+      - src/store/recovery/scan.rs
     reproducer: wal_tail_corruption_truncates_at_first_bad_record
   - id: protocol.bucket_delete_two_phase_counter
     title: bucket deletion is two-phase and nr_buckets includes pending delete buckets until physical cleanup finishes
@@ -246,8 +248,8 @@ entries:
       dies in between. Decrementing the bucket counter before the physical cleanup leaves a half-deleted
       bucket the next open still has to reconcile, and its payload lingers.
     anchors:
-      - src/store/gc.rs
-      - src/meta/manifest.rs
+      - src/store/gc/bucket_cleanup.rs
+      - src/meta/manifest/catalog.rs
     reproducer: fast_pending_delete_counter
   - id: protocol.orphan_marker_is_only_cleanup_source
     title: orphan files are cleaned only through explicit Sequences markers
@@ -264,7 +266,7 @@ entries:
       reclaimed.
     anchors:
       - src/meta/builder.rs
-      - src/meta/manifest.rs
+      - src/meta/manifest/files.rs
     reproducer: chaos_failpoint_recovery_orphan_cleanup_after_data_dir_sync_before_marker_clear
   - id: protocol.persist_stat_decode_bounds
     title: persisted stat metadata must be bounds-checked before unsafe decoding
@@ -305,6 +307,7 @@ entries:
       reclaim, so the data directory grows under steady load with no way to shrink it.
     anchors:
       - src/meta/stat.rs
+      - src/meta/stat/apply.rs
       - src/meta/entry.rs
     reproducer: full_mask_persistence_keeps_prior_inactive_sequences
   - id: protocol.persist_stat_matches_payload_relocations
@@ -324,7 +327,8 @@ entries:
       file as junk and unlinks it, losing the committed data in it.
     anchors:
       - src/meta/stat.rs
-      - src/store/gc.rs
+      - src/store/gc/obsolete.rs
+      - src/store/gc/rewrite.rs
     reproducer: persisted_data_and_blob_stats_match_payloads_through_gc_and_reopen
   - id: protocol.reloc_completeness_for_mapped_addrs
     title: every mapped address in a published flush batch must resolve through reloc metadata
@@ -338,7 +342,8 @@ entries:
       A mapped address has no relocation entry. The bytes behind it can never be reclaimed, and a read of
       that address fails instead of returning the value the map promised.
     anchors:
-      - src/map/data.rs
+      - src/map/data/file_reader.rs
+      - src/map/data/file_builder.rs
       - src/meta/stat.rs
     reproducer: data_dump_load
   - id: protocol.stat_retirement_and_rewrite_junk_handoff
@@ -357,8 +362,9 @@ entries:
       stay unreachable forever, or an old stat is resurrected after its file is gone, so a read resolves a
       deleted file.
     anchors:
-      - src/store/gc.rs
-      - src/meta/stat.rs
+      - src/map/adapter/publish.rs
+      - src/store/gc/rewrite.rs
+      - src/meta/stat/apply.rs
     reproducer: lagging_checkpoint_cannot_resurrect_retired_stats_at_any_reclaim_cut
   - id: protocol.junk_admission_gate_is_bounded_and_fair
     title: junk admission gates close and reopen without accepting or starving producers
@@ -375,9 +381,9 @@ entries:
       A producer can mutate owner accounting during a reclaim cut, or a permit can remain held forever,
       leaving checkpoints blocked, the collector spinning, or the process unable to make progress.
     anchors:
-      - src/meta/stat.rs
-      - src/map/adapter.rs
-      - src/store/gc.rs
+      - src/meta/stat/junk.rs
+      - src/map/adapter/publish.rs
+      - src/store/gc/rewrite.rs
     reproducer: junk_gate_rejects_permits_until_drain_and_drop
   - id: protocol.reclaim_delete_tolerates_a_prior_retirement
     title: a reclaim-path metadata delete tolerates a key an earlier round already retired
@@ -401,7 +407,7 @@ entries:
     anchors:
       - src/meta/entry.rs
       - src/meta/txn.rs
-      - src/store/gc.rs
+      - src/store/gc/obsolete.rs
     reproducer: bucket_delete_racing_obsolete_reclaim_keeps_committed_values
   - id: protocol.transaction_checkpoint_span_follows_group_counter
     title: max_ckpt_per_txn enforcement follows the transaction's own logical-group checkpoint counter
@@ -440,8 +446,8 @@ entries:
       same cut is what lets a flush close an old generation and release its bytes, so a broken cut also
       strands dirty pages and their space.
     anchors:
-      - src/map/buffer.rs
-      - src/map/data.rs
+      - src/map/buffer/generation.rs
+      - src/map/data/checkpoint_task.rs
     reproducer: checkpoint_cut_keeps_post_cut_writer_visible
   - id: emergent.reachable_junk_lifecycle
     title: a reachable address stays readable until its metadata is durable, and junk retires atomically with its owner page
@@ -464,9 +470,9 @@ entries:
       view observes false key loss; the same retirement boundary is what makes the bytes reclaimable at
       all, so a half-published retirement also leaks pages that were never durably retired.
     anchors:
-      - src/map/buffer.rs
-      - src/map/data.rs
-      - src/store/gc.rs
+      - src/map/buffer/generation.rs
+      - src/map/data/checkpoint_task.rs
+      - src/store/gc/obsolete.rs
     reproducer: reachable_junk_regression_guard
   - id: protocol.abort_clean_visibility_and_retirement
     title: an aborted version stays invisible until abort-clean retires it, and that retirement is gated behind recovery
@@ -494,10 +500,9 @@ entries:
       transaction comes back after reopen; recycling the WAL that abort-clean still needs also makes the
       following recovery unrecoverable.
     anchors:
-      - src/store/gc.rs
-      - src/store/recovery.rs
+      - src/store/gc/abort_clean.rs
+      - src/store/recovery/scan.rs
       - src/cc/log.rs
-      - src/map/adapter.rs
     reproducer: abort_clean_hint_window_same_file
   - id: protocol.concurrent_write_epoch_migration
     title: a concurrent_write change migrates the epoch instead of rejecting the open, and is recorded only once it completed
@@ -528,7 +533,7 @@ entries:
       wrong width also loses history on the next open.
     anchors:
       - src/meta/builder.rs
-      - src/store/recovery.rs
+      - src/store/recovery/transition.rs
       - src/store/store.rs
     reproducer: global_options_resize_migrates_the_epoch_and_writes_options_back
   - id: protocol.graceful_exit_wal_independent_visibility
@@ -583,9 +588,9 @@ entries:
       that was never committed; after a crash recovery either replays an already-absorbed operand or skips
       a committed one, and a rebuilt row with a null address reads back as NotFound for a key that exists.
     anchors:
-      - src/types/node.rs
-      - src/map/buffer.rs
-      - src/store/recovery.rs
+      - src/types/node/compact.rs
+      - src/map/buffer/generation.rs
+      - src/store/recovery/redo.rs
     reproducer: materializing_compact_keeps_long_view_stable
   - id: protocol.positive_proof_rechecks_abort_state
     title: a reader's visible set is monotone -- a rising watermark, and one re-checked verdict
@@ -639,8 +644,8 @@ entries:
       crash mid-publish recoverable instead of half-visible.
     anchors:
       - src/meta/txn.rs
-      - src/store/recovery.rs
-      - src/meta/manifest.rs
+      - src/store/recovery/scan.rs
+      - src/meta/manifest/frontier.rs
     reproducer: remote_blob_update_from_other_group_stays_deleted_after_reopen
   - id: protocol.snapshot_candidate_traversal_complete
     title: every read of a key resolves exactly the snapshot-visible value and never leaves the key's history region
@@ -666,8 +671,8 @@ entries:
       decoding as a tombstone, which after a reopen would silently drop a committed value.
     anchors:
       - src/index/tree.rs
-      - src/types/node.rs
-      - src/types/base.rs
+      - src/types/node/iter.rs
+      - src/types/base/iter.rs
     reproducer: checkpointed_invisible_head_resolves_visible_history_in_both_scan_directions
 
   - id: protocol.ccpool_free_list_excludes_live_pins
@@ -689,5 +694,65 @@ entries:
       views. The same window loses a pin, so a live reader can name a page that was already reclaimed
       - which is memory corruption and an unexplainable wrong value, not merely a lost update.
     anchors:
-      - src/cc/context.rs
+      - src/cc/context/collector.rs
     reproducer: ccpool_local_never_hands_one_node_to_two_live_views
+  - id: protocol.persisted_layout_matches_v1_fixture
+    title: every persisted byte layout matches the checked-in v1 fixtures, or its version axis rises in the same commit
+    protects: data-loss
+    status: active
+    statement: >
+      The bytes `docs/format.md` fixes (data/blob frames, tables and footer; Bw-Tree box, base, delta and
+      remote payloads; metadata key encodings and value layouts; the canonical options JSON; the five WAL
+      records) must match the checked-in v1 fixtures exactly. A change to any of those bytes must move the
+      axis that governs it in the same commit: the per-file data/blob `version` while keeping the old
+      decoder, or the whole-database `version/current_version` together with an offline migration. A WAL
+      layout change has no version axis, so it only needs the pre-upgrade drain rule and updated fixtures.
+      Writer-guaranteed zero padding is not part of the check: v1 readers ignore it.
+    break_consequence: >
+      An existing database is silently reinterpreted under a new layout: a reader decodes a committed value
+      at the wrong offset, follows a wrong length, or trusts a field that moved, so keys come back corrupted
+      or missing after a reopen instead of the open failing with a version error.
+    anchors:
+      - src/format_fixture.rs
+      - docs/format.md
+    reproducer: data_and_blob_files_pin_frames_tables_and_footer
+  - id: protocol.bucket_metadata_read_is_not_absence
+    title: bucket metadata, interval, and pending reads propagate errors instead of becoming absence or an empty set
+    protects: data-loss
+    status: active
+    statement: >
+      A failed metadata-store read while resolving a bucket name/id/options, loading global
+      sequences/options at open, recovering a bucket's interval maps, or scanning
+      pending-delete/page-table/interval/orphan-marker keys must return an error for every read
+      failure other than the modeled absence of an auxiliary page-table/interval btree that the
+      cleanup itself already finalized; that one case is an empty remaining batch. It must not
+      otherwise be reported as NotFound or an empty interval map. Pending-delete cleanup retains
+      the pending record and the bucket count when a read fails.
+    break_consequence: >
+      A transient read error can make an existing bucket look free, causing create to overwrite its
+      catalog record; a partially loaded interval map can reuse logical addresses that are still
+      referenced; a failed pending scan can finalize deletion while bytes remain. Each is silent data
+      loss or unreachable bytes misreported as cleaned.
+    anchors:
+      - src/meta/manifest/catalog.rs
+      - src/store/gc/bucket_cleanup.rs
+      - src/meta/builder.rs
+    reproducer: bucket_metadata_read_error_is_not_absent
+  - id: protocol.bucket_meta_decode_bounds
+    title: bucket metadata and frontier decoding validates length and identity before use
+    protects: crash-safety
+    status: active
+    statement: >
+      BucketMeta and BucketDurableFrontier decode only after an explicit length/alignment check, and
+      key/payload identity is checked at the catalog or builder read site where both are visible. A
+      duplicate bucket id, a frontier whose key and payload bucket id disagree, or a next_bucket_id
+      below an existing bucket id rejects the open instead of silently overwriting or reusing identity.
+    break_consequence: >
+      A short or mismatched metadata value is read out of bounds or accepted as a different bucket,
+      so the process aborts in the decoder or two buckets share one id/page table; a later create can
+      overwrite live metadata. The database may fail to reopen or expose the wrong bucket's state.
+    anchors:
+      - src/meta/entry.rs
+      - src/meta/manifest/catalog.rs
+      - src/meta/builder.rs
+    reproducer: bucket_meta_decode_bounds_rejected
