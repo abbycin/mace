@@ -115,11 +115,13 @@ impl BucketCatalog {
     }
 
     pub(crate) fn nr_buckets(&self) -> u64 {
+        let _lock = self.structural_lock.lock();
         self.nr_buckets.load(Acquire)
     }
 
     /// the active bucket names: an unloaded bucket stays listed, a logically deleted one does not
     pub(crate) fn active_names(&self) -> Vec<String> {
+        let _lock = self.structural_lock.lock();
         self.names.iter().map(|x| x.key().clone()).collect()
     }
 
@@ -174,22 +176,17 @@ impl BucketCatalog {
         })
     }
 
-    /// reserve a name, id, count and the three physical btree buckets for a new bucket
+    /// reserve an id and the three physical btree buckets for a new bucket
     ///
-    /// the reservation stays visible through the catalog before the metadata transaction commits,
-    /// but the guard returned here owns the structural lock until it is consumed or dropped:
-    /// creation is serialized against open, option updates, unload and delete, and the rollback
-    /// runs under the same lock. Everything is undone by [`CreateGuard`] unless `commit` consumes
-    /// the guard after the durable publish succeeded.
-    ///
-    /// the caller must initialize the context through the lock-free loader: taking the lock again
-    /// in `load_bucket_context` would deadlock, and releasing it early would let an option update
-    /// commit between the reservation and the publish.
+    /// nothing is published to the catalog or the bucket manager here. The guard owns the
+    /// structural lock and the local runtime/lease until [`CreateGuard::commit`] publishes the
+    /// fully initialized bucket after the metadata transaction committed. Creation is serialized
+    /// against open, option updates, unload and delete by that lock; a rollback deletes only the
+    /// three empty btree buckets.
     pub(crate) fn begin_create<'a>(
         &'a self,
         btree: &'a BTree,
         next_bucket_id: &AtomicU64,
-        manager: &BucketManager,
         name: &str,
         opt: &BucketOptions,
     ) -> Result<CreateGuard<'a>, OpCode> {
@@ -209,11 +206,8 @@ impl BucketCatalog {
         ] {
             Manifest::ensure_btree_bucket(btree, &btree_bucket);
         }
-        self.names.insert(name.to_string(), bucket_id);
-        self.options
-            .insert(bucket_id, PersistedBucketOptions::from(opt));
-        self.nr_buckets.fetch_add(1, AcqRel);
-        let lease = manager.ensure_runtime(bucket_id).acquire_lease();
+        let runtime = Arc::new(BucketRuntime::new());
+        let lease = runtime.acquire_lease();
 
         Ok(CreateGuard {
             catalog: self,
@@ -221,15 +215,15 @@ impl BucketCatalog {
             _lock: lock,
             name: name.to_string(),
             bucket_id,
+            options: PersistedBucketOptions::from(opt),
+            runtime,
             lease: Some(lease),
+            durable: false,
             committed: false,
         })
     }
 
-    fn rollback_create(&self, btree: &BTree, name: &str, bucket_id: u64) {
-        self.names.remove(name);
-        self.options.remove(&bucket_id);
-        self.nr_buckets.fetch_sub(1, AcqRel);
+    fn rollback_create(&self, btree: &BTree, bucket_id: u64) {
         for btree_bucket in [
             super::super::page_table_name(bucket_id),
             super::super::data_interval_name(bucket_id),
@@ -237,8 +231,8 @@ impl BucketCatalog {
         ] {
             match btree.del_bucket(&btree_bucket) {
                 Ok(()) | Err(BTreeError::BucketNotFound) => {}
-                // the reservation is already gone from the catalog; a retry of this create
-                // recreates the bucket from empty metadata
+                // nothing referenced this id in the catalog; a retry recreates it from empty
+                // metadata under a new id
                 Err(err) => log::error!(
                     "can't roll back btree-store bucket {btree_bucket} of bucket {bucket_id}: {err:?}"
                 ),
@@ -346,19 +340,21 @@ pub(crate) struct BucketOpen {
 
 /// reservation returned by [`BucketCatalog::begin_create`]
 ///
-/// it owns the catalog's structural lock for its whole life, so context initialization and the
-/// metadata publish cannot interleave with an option update, an open, an unload or a delete.
-/// Dropping it without `commit` rolls the name, id, count and physical btree buckets back under
-/// that lock, so a failed context/interval initialization leaves no visible bucket and no
-/// inflated count.
+/// it owns the catalog's structural lock for its whole life. Nothing is visible until `commit`
+/// publishes the runtime, context, frontier, options, name and count after the metadata
+/// transaction committed. A pre-commit drop deletes only the three empty btree buckets; a
+/// post-commit drop never deletes them, because the committed metadata references them.
 pub(crate) struct CreateGuard<'a> {
     catalog: &'a BucketCatalog,
     btree: &'a BTree,
-    /// released after the rollback: struct fields drop after `Drop::drop`
+    /// released after the rollback/publish: struct fields drop after `Drop::drop`
     _lock: parking_lot::MutexGuard<'a, ()>,
     name: String,
     bucket_id: u64,
+    options: PersistedBucketOptions,
+    runtime: Arc<BucketRuntime>,
     lease: Option<BucketLease>,
+    durable: bool,
     committed: bool,
 }
 
@@ -367,18 +363,60 @@ impl CreateGuard<'_> {
         self.bucket_id
     }
 
-    /// the durable publish succeeded: keep the reservation and hand out the creation lease
-    pub(crate) fn commit(mut self) -> BucketLease {
+    pub(crate) fn runtime(&self) -> &Arc<BucketRuntime> {
+        &self.runtime
+    }
+
+    /// the metadata transaction returned: the three btree tables are now referenced durably
+    pub(crate) fn mark_durable(&mut self) {
+        self.durable = true;
+    }
+
+    /// publish the fully initialized bucket under the structural lock
+    pub(crate) fn commit(
+        mut self,
+        manager: &BucketManager,
+        bucket_frontier: &DashMap<u64, GroupPositions>,
+        ctx: Arc<BucketContext>,
+        frontier: GroupPositions,
+    ) -> BucketLease {
+        // every panic-capable check runs before the first shared write
+        debug_assert!(
+            manager.runtime(self.bucket_id).is_none(),
+            "create guard must publish a fresh runtime"
+        );
+        debug_assert!(
+            self.durable,
+            "creation must commit metadata before publishing"
+        );
+        let lease = must_exist!(self.lease.take(), "create guard must hold its lease");
+
+        manager.insert_runtime(self.bucket_id, self.runtime.clone());
+        ctx.publish();
+        manager.insert_context(self.bucket_id, ctx);
+        bucket_frontier.insert(self.bucket_id, frontier);
+        self.catalog.options.insert(self.bucket_id, self.options);
+        self.catalog.names.insert(self.name.clone(), self.bucket_id);
+        self.catalog.nr_buckets.fetch_add(1, AcqRel);
+
         self.committed = true;
-        must_exist!(self.lease.take(), "create guard must hold its lease")
+        lease
     }
 }
 
 impl Drop for CreateGuard<'_> {
     fn drop(&mut self) {
-        if !self.committed {
-            self.catalog
-                .rollback_create(self.btree, &self.name, self.bucket_id);
+        if !self.durable {
+            self.catalog.rollback_create(self.btree, self.bucket_id);
+        } else if !self.committed {
+            // commit returned but the in-memory publish did not finish (test unwind). The btree
+            // tables are referenced by committed metadata and must stay; removing them here would
+            // make the next open fail in recover_intervals.
+            log::error!(
+                "bucket {} ({}) committed but was not published; leaving btree tables intact",
+                self.name,
+                self.bucket_id
+            );
         }
     }
 }
@@ -431,6 +469,9 @@ impl Manifest {
         &self,
         name: &str,
     ) -> Result<Option<PersistedBucketOptions>, OpCode> {
+        // creation publishes the btree record before the in-memory catalog; hold the same lock so
+        // this read cannot observe a bucket that is still being published
+        let _lock = self.catalog.lock();
         let mut options = None;
         let mut decode_error = None;
         self.btree
@@ -457,19 +498,16 @@ impl Manifest {
         name: &str,
         opt: BucketOptions,
     ) -> Result<(BucketLease, Arc<BucketContext>), OpCode> {
-        let guard = self.catalog.begin_create(
-            &self.btree,
-            &self.sequences.next_bucket_id,
-            &self.buckets,
-            name,
-            &opt,
-        )?;
+        let mut guard =
+            self.catalog
+                .begin_create(&self.btree, &self.sequences.next_bucket_id, name, &opt)?;
         let bucket_id = guard.bucket_id();
-        // the guard holds the structural lock, so the loader must be the lock-free one: taking it
-        // again would deadlock, and dropping it here would let an option update commit in between
-        // this initialization and the metadata publish below
-        // context/interval initialization failures roll the reservation back through the guard
-        let bucket_ctx = self.load_bucket_context_locked(bucket_id, Some(&opt))?;
+
+        // the guard holds the structural lock; options are not in the catalog yet, so build the
+        // context from the requested values and the guard's local runtime
+        let mut runtime_opt = PersistedBucketOptions::from(&opt).to_runtime();
+        runtime_opt.merge_operator = opt.merge_operator.clone();
+        let bucket_ctx = self.build_bucket_context(bucket_id, guard.runtime(), runtime_opt)?;
 
         // inactive floors are not durable positions
         let mut frontier = self.current_group_checkpoints();
@@ -478,7 +516,6 @@ impl Manifest {
                 *slot = Position::MIN;
             }
         }
-        self.bucket_frontier.insert(bucket_id, frontier);
         let frontier_rec = BucketDurableFrontier::new(bucket_id, frontier);
 
         let meta = BucketMeta {
@@ -489,13 +526,28 @@ impl Manifest {
         txn.record(MetaKind::Sequences, self.sequences.as_ref());
         txn.record(MetaKind::BucketFrontier, &frontier_rec);
         txn.put_record(BUCKET_METAS, name.as_bytes().to_vec(), &meta);
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_bucket_create_sync_point(
+            crate::testing::BucketCreateSyncPoint::BeforeManifestCommit,
+            bucket_id,
+            name,
+        );
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash("mace_bucket_create_before_manifest_commit");
         txn.commit();
+        guard.mark_durable();
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_bucket_create_sync_point(
+            crate::testing::BucketCreateSyncPoint::AfterCommitBeforePublish,
+            bucket_id,
+            name,
+        );
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash("mace_bucket_create_after_manifest_commit");
 
-        Ok((guard.commit(), bucket_ctx))
+        let ctx_for_return = bucket_ctx.clone();
+        let lease = guard.commit(&self.buckets, &self.bucket_frontier, bucket_ctx, frontier);
+        Ok((lease, ctx_for_return))
     }
 
     fn bucket_option_conflicts(
@@ -604,28 +656,17 @@ impl Manifest {
         })
     }
 
-    fn load_bucket_context_locked(
+    /// build a context without publishing it or consulting the catalog
+    ///
+    /// used by creation (options are not in the catalog yet) and by the locked load path. It must
+    /// keep the full `table.recover` + `recover_intervals` sequence and must reuse the passed
+    /// runtime's state/compressors; lifecycle and "already loaded" checks belong to the caller.
+    fn build_bucket_context(
         &self,
         bucket_id: u64,
-        runtime_opt: Option<&BucketOptions>,
+        runtime: &Arc<BucketRuntime>,
+        opt: BucketOptions,
     ) -> Result<Arc<BucketContext>, OpCode> {
-        // double check
-        if let Some(ctx) = self.buckets.context(bucket_id) {
-            ctx.validate_merge_operator(runtime_opt.and_then(|opt| opt.merge_operator.as_ref()))?;
-            return Ok(ctx);
-        }
-
-        // lifecycle first: a logically deleted bucket already left the catalog, and its runtime
-        // is what tells that apart from a caller asking for an id this store never had
-        let runtime = must_exist!(
-            self.buckets.runtime(bucket_id),
-            "bucket {bucket_id} has no runtime"
-        );
-        if !runtime.state.is_active() || !self.catalog.contains(bucket_id) {
-            // deleting/dropping contexts are never published to a new reader
-            return Err(OpCode::NotFound);
-        }
-
         let state = runtime.state.clone();
 
         // PageMap lazy load
@@ -636,14 +677,6 @@ impl Manifest {
         };
 
         let flush = must_exist!(self.buckets.flush.as_ref(), "flusher started").clone();
-        let persisted = must_exist!(
-            self.catalog.options(bucket_id),
-            "bucket meta must exist for a catalogued bucket"
-        );
-        let mut opt = persisted.to_runtime();
-        if let Some(runtime_opt) = runtime_opt {
-            opt.merge_operator.clone_from(&runtime_opt.merge_operator);
-        }
         let ctx = Arc::new(BucketContext::new(
             self.buckets.ctx,
             &self.opt,
@@ -662,7 +695,41 @@ impl Manifest {
         ));
 
         self.recover_intervals(bucket_id, &ctx)?;
+        Ok(ctx)
+    }
 
+    fn load_bucket_context_locked(
+        &self,
+        bucket_id: u64,
+        runtime_opt: Option<&BucketOptions>,
+    ) -> Result<Arc<BucketContext>, OpCode> {
+        // double check: the unlocked hit path may have raced with another loader
+        if let Some(ctx) = self.buckets.context(bucket_id) {
+            ctx.validate_merge_operator(runtime_opt.and_then(|opt| opt.merge_operator.as_ref()))?;
+            return Ok(ctx);
+        }
+
+        // lifecycle first: a logically deleted bucket already left the catalog, and its runtime
+        // is what tells that apart from a caller asking for an id this store never had
+        let runtime = must_exist!(
+            self.buckets.runtime(bucket_id),
+            "bucket {bucket_id} has no runtime"
+        );
+        if !runtime.state.is_active() || !self.catalog.contains(bucket_id) {
+            // deleting/dropping contexts are never published to a new reader
+            return Err(OpCode::NotFound);
+        }
+
+        let persisted = must_exist!(
+            self.catalog.options(bucket_id),
+            "bucket meta must exist for a catalogued bucket"
+        );
+        let mut opt = persisted.to_runtime();
+        if let Some(runtime_opt) = runtime_opt {
+            opt.merge_operator.clone_from(&runtime_opt.merge_operator);
+        }
+        let ctx = self.build_bucket_context(bucket_id, &runtime, opt)?;
+        ctx.publish();
         self.buckets.insert_context(bucket_id, ctx.clone());
         Ok(ctx)
     }
@@ -861,33 +928,163 @@ mod tests {
             .begin_create(
                 &manifest.btree,
                 &manifest.sequences.next_bucket_id,
-                &manifest.buckets,
                 "broken",
                 &opt,
             )
             .expect("reservation must succeed");
         let reserved_id = guard.bucket_id();
 
+        // the reservation and context build must not publish anything
+        assert_eq!(manifest.catalog.nr_buckets.load(Acquire), 0);
+        assert!(manifest.catalog.id("broken").is_none());
+        assert!(manifest.catalog.options(reserved_id).is_none());
+        assert!(manifest.buckets.runtime(reserved_id).is_none());
+        assert!(!manifest.buckets.contains_context(reserved_id));
+        assert!(!manifest.bucket_frontier.contains_key(&reserved_id));
+
         // break an interval table the reservation just ensured, so context initialization fails
         manifest
             .btree
             .del_bucket(data_interval_name(reserved_id))
             .expect("interval table must be deletable");
+        let mut runtime_opt = PersistedBucketOptions::from(&opt).to_runtime();
+        runtime_opt.merge_operator = opt.merge_operator.clone();
         assert!(
             manifest
-                .load_bucket_context_locked(reserved_id, Some(&opt))
+                .build_bucket_context(reserved_id, guard.runtime(), runtime_opt)
                 .is_err(),
             "a missing interval table must fail context initialization"
         );
 
         drop(guard);
-        assert_eq!(manifest.catalog.nr_buckets(), 0, "the count must roll back");
+        assert_eq!(
+            manifest.catalog.nr_buckets.load(Acquire),
+            0,
+            "the count must never have been raised"
+        );
         assert!(!manifest.catalog.contains(reserved_id));
         assert!(manifest.catalog.id("broken").is_none());
+        for table in [
+            crate::meta::page_table_name(reserved_id),
+            crate::meta::blob_interval_name(reserved_id),
+        ] {
+            assert!(
+                manifest.btree.view(&table, |_| Ok(())).is_err(),
+                "rollback must delete {table}"
+            );
+        }
+        assert_eq!(
+            mace.update_bucket_opt("broken", BucketOptions::default()),
+            Err(OpCode::NotFound)
+        );
+        assert_eq!(mace.drop_bucket("broken"), Err(OpCode::NotFound));
+        assert_eq!(mace.del_bucket("broken"), Err(OpCode::NotFound));
+        assert!(
+            mace.get_bucket_options("broken")
+                .expect("options read")
+                .is_none()
+        );
+        assert!(!mace.active_buckets().iter().any(|name| name == "broken"));
+        assert_eq!(mace.nr_buckets(), 0);
 
         let retried = mace
             .new_bucket("broken", BucketOptions::default())
             .expect("the rolled-back name must be reusable");
         assert_ne!(retried.id(), reserved_id);
+    }
+
+    #[cfg(feature = "extra_check")]
+    #[test]
+    fn bucket_create_publishes_only_after_commit() {
+        use crate::testing::{self, BucketCreateSyncPoint};
+        use std::sync::Mutex;
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                testing::clear_bucket_create_hook();
+            }
+        }
+
+        let (_root, mace) = open_mace();
+        let _reset = Reset;
+        let manifest = mace.inner.store.manifest;
+        let (paused_tx, paused_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        testing::set_bucket_create_hook(Some(Arc::new(move |point, id, name: &str| {
+            if name == "paused" && point == BucketCreateSyncPoint::BeforeManifestCommit {
+                paused_tx.send(id).expect("signal paused create");
+                release_rx
+                    .lock()
+                    .expect("lock release receiver")
+                    .recv()
+                    .expect("wait for release");
+            }
+        })));
+
+        let creator = mace.clone();
+        let create =
+            std::thread::spawn(move || creator.new_bucket("paused", BucketOptions::default()));
+        let bucket_id = paused_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("create must pause before commit");
+
+        // lock-free internal probes: the guard holds the structural lock, so public reads would
+        // block rather than prove the pre-commit state
+        assert!(manifest.catalog.id("paused").is_none());
+        assert_eq!(manifest.catalog.nr_buckets.load(Acquire), 0);
+        assert!(manifest.catalog.options(bucket_id).is_none());
+        assert!(manifest.buckets.runtime(bucket_id).is_none());
+        assert!(!manifest.buckets.contains_context(bucket_id));
+        assert!(!manifest.bucket_frontier.contains_key(&bucket_id));
+
+        release_tx.send(()).expect("release create");
+        let bucket = create
+            .join()
+            .expect("creator thread must finish")
+            .expect("create");
+        assert_eq!(bucket.id(), bucket_id);
+        assert!(manifest.catalog.id("paused").is_some());
+        assert_eq!(manifest.catalog.nr_buckets.load(Acquire), 1);
+        drop(bucket);
+    }
+
+    #[test]
+    fn bucket_create_at_limit_consumes_nothing() {
+        let (_root, mace) = open_mace();
+        let manifest = mace.inner.store.manifest;
+        manifest.catalog.nr_buckets.store(MAX_BUCKETS, Release);
+        let before = manifest.sequences.next_bucket_id.load(Relaxed);
+
+        let err = manifest
+            .catalog
+            .begin_create(
+                &manifest.btree,
+                &manifest.sequences.next_bucket_id,
+                "limit",
+                &BucketOptions::default(),
+            )
+            .err()
+            .expect("a full catalog must reject creation");
+        assert_eq!(err, OpCode::NoSpace);
+        assert_eq!(manifest.sequences.next_bucket_id.load(Relaxed), before);
+        assert!(manifest.catalog.id("limit").is_none());
+        assert!(manifest.catalog.options(before).is_none());
+        assert!(manifest.buckets.runtime(before).is_none());
+        for table in [
+            crate::meta::page_table_name(before),
+            crate::meta::data_interval_name(before),
+            crate::meta::blob_interval_name(before),
+        ] {
+            assert!(
+                manifest.btree.view(&table, |_| Ok(())).is_err(),
+                "a rejected create must not reserve {table}"
+            );
+        }
+
+        manifest.catalog.nr_buckets.store(0, Release);
     }
 }

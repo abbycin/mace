@@ -5,6 +5,7 @@
 ### Changes
 - Documented persistent format v1 byte by byte in `docs/format.md` and froze it: compile-time size/offset pins and checked-in golden fixtures now fail on layout drift that a reader would otherwise accept. Data/blob files stay versioned per file and metadata keeps its whole-database version; the WAL makes no cross-version compatibility promise, so a clean shutdown that drains it is required before upgrading.
 - Split maintenance tooling into the `mace-kv-cli` package, moved checker APIs behind the engine's internal `maintenance` feature, and let the CLI depend on compatible `mace-kv` patch releases within the same minor version.
+- Bucket creation now publishes the catalog name, options, count, frontier map and runtime only after the bucket metadata commits. `active_buckets`, `nr_buckets` and `get_bucket_options` no longer observe an in-flight creation; they block while a catalog operation holds the structural lock, including the creation's metadata commit. Open, option updates, unload and delete were already serialized on that lock and keep their existing behavior.
 
 ## [0.2.0] 2026-10-20
 ### New Features

@@ -756,3 +756,26 @@ entries:
       - src/meta/manifest/catalog.rs
       - src/meta/builder.rs
     reproducer: bucket_meta_decode_bounds_rejected
+  - id: protocol.bucket_create_atomic_publication
+    title: bucket creation publishes catalog-visible state only after its metadata commit
+    protects: visibility
+    status: active
+    statement: >
+      A creating bucket reserves only its id and three empty btree tables. The name, options,
+      bucket count, in-memory frontier, runtime and loaded context must not be observable through
+      `active_buckets`, `nr_buckets`, `get_bucket_options` or `open_bucket*` until the metadata
+      transaction that writes `bucket_metas`, the durable frontier and sequences has returned.
+      Publication happens under the catalog structural lock in the order runtime, context, frontier,
+      options, name, count; a pre-commit drop removes only the three empty btree tables, while a
+      post-commit drop must not delete tables the committed metadata references. Never: a reader
+      listing a bucket that cannot be opened, and never a rollback leaving an observable name or count.
+      Promote to active once `bucket_create_is_invisible_until_manifest_commit` and
+      `bucket_create_publish_waits_for_lock_after_commit` run in the default `extra_check` matrix.
+    break_consequence: >
+      A caller observes a bucket during creation that later disappears on rollback, or blocks on a
+      partially published catalog entry; the same window can leave the bucket count inconsistent
+      with the catalog. The bucket's key/value data is not exposed, but the catalog read is wrong.
+    anchors:
+      - src/meta/manifest/catalog.rs
+      - src/store/bucket.rs
+    reproducer: bucket_create_is_invisible_until_manifest_commit

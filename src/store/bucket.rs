@@ -187,6 +187,9 @@ impl Mace {
     /// operator is never persisted and is always `None` here — use
     /// [`Mace::open_bucket_with_options`] to adopt a runtime operator.
     ///
+    /// Blocks while a catalog operation holds the structural lock, including bucket creation,
+    /// option updates and the start of an unload/delete.
+    ///
     /// NOTE: name must be less than 32 bytes.
     pub fn get_bucket_options<S: AsRef<str>>(
         &self,
@@ -238,6 +241,9 @@ impl Mace {
     ///
     /// The list comes from the bucket catalog, not from the set of loaded contexts: a bucket
     /// that is merely unloaded stays listed, while a logically deleted one does not.
+    ///
+    /// Blocks while a catalog operation holds the structural lock, including bucket creation,
+    /// option updates and the start of an unload/delete.
     pub fn active_buckets(&self) -> Vec<String> {
         self.inner.store.manifest.catalog.active_names()
     }
@@ -256,6 +262,9 @@ impl Mace {
     }
 
     /// Returns the total number of buckets, including active and pending deletion ones.
+    ///
+    /// Blocks while a catalog operation holds the structural lock, including bucket creation,
+    /// option updates and the start of an unload/delete.
     pub fn nr_buckets(&self) -> u64 {
         self.inner.store.manifest.catalog.nr_buckets()
     }

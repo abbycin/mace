@@ -21,7 +21,10 @@ use crate::{
     map::{
         SharedState,
         adapter::ManifestCheckpointObserver,
-        buffer::{BucketContext, BucketLease, BucketManager, BucketRewritePermit, ReclaimMode},
+        buffer::{
+            BucketContext, BucketLease, BucketManager, BucketRewritePermit, BucketRuntime,
+            ReclaimMode,
+        },
         flush::Checkpoint,
         table::PageMap,
     },

@@ -346,6 +346,9 @@ pub(crate) struct BucketContext {
     evict_pending: AtomicBool,
     final_checkpointed: AtomicBool,
     reclaimed: AtomicBool,
+    /// a context built for creation but not yet published must not checkpoint on drop: its
+    /// bucket has no runtime in the manager yet, and a queued task would abort the flusher
+    unpublished: AtomicBool,
 }
 
 impl BucketContext {
@@ -394,7 +397,13 @@ impl BucketContext {
             evict_pending: AtomicBool::new(false),
             final_checkpointed: AtomicBool::new(false),
             reclaimed: AtomicBool::new(false),
+            unpublished: AtomicBool::new(true),
         }
+    }
+
+    /// the context is now visible through the bucket manager and may checkpoint on drop
+    pub(crate) fn publish(&self) {
+        self.unpublished.store(false, Release);
     }
 
     /// validates a runtime operator against the one fixed when this context was loaded
@@ -621,7 +630,10 @@ impl BucketContext {
         // buckets may still be reclaimed without an explicit final checkpoint path; a bucket that
         // is unloading or deleting already had its dirty state published or discarded by the
         // reclaim site, so a context that outlived it must not queue a fresh batch
-        if !self.final_checkpointed.swap(false, AcqRel) && self.state.is_active() {
+        if !self.unpublished.load(Acquire)
+            && !self.final_checkpointed.swap(false, AcqRel)
+            && self.state.is_active()
+        {
             self.flush_and_wait();
         }
         self.reclaim_pages();
@@ -776,6 +788,18 @@ impl BucketManager {
             .or_insert_with(|| Arc::new(BucketRuntime::new()))
             .value()
             .clone()
+    }
+
+    /// publish the runtime a create guard has already bound to its context and lease
+    ///
+    /// creation must insert this exact `Arc`; allocating another runtime here would split the
+    /// lease/state identity from the one the loaded context uses
+    pub(crate) fn insert_runtime(&self, bucket_id: u64, runtime: Arc<BucketRuntime>) {
+        debug_assert!(
+            self.runtime(bucket_id).is_none(),
+            "bucket {bucket_id} already had a runtime"
+        );
+        self.runtimes.insert(bucket_id, runtime);
     }
 
     pub(crate) fn remove_runtime(&self, bucket_id: u64) {

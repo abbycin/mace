@@ -137,6 +137,14 @@ pub enum CheckpointSyncPoint {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BucketCreateSyncPoint {
+    /// reservation and context build finished, the metadata transaction has not committed yet
+    BeforeManifestCommit,
+    /// the metadata transaction committed, the catalog/runtime publication has not started
+    AfterCommitBeforePublish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalSyncPoint {
     /// a durable commit/abort/barrier registered as the generation leader and
     /// is about to re-acquire the shared logging lock to seal
@@ -1084,6 +1092,7 @@ type TxnAbortHook = dyn Fn(TxnAbortSyncPoint, u64) + Send + Sync + 'static;
 type AbortCleanHook = dyn Fn(AbortCleanSyncPoint, u64) + Send + Sync + 'static;
 type TreeUpdateHook = dyn Fn(TreeUpdateSyncPoint, u64) + Send + Sync + 'static;
 type CheckpointHook = dyn Fn(CheckpointSyncPoint, u64) + Send + Sync + 'static;
+type BucketCreateHook = dyn Fn(BucketCreateSyncPoint, u64, &str) + Send + Sync + 'static;
 type WalSyncHook = dyn Fn(WalSyncPoint) + Send + Sync + 'static;
 type GcRewriteHook = dyn Fn(GcRewriteSyncPoint, u64, &Path) + Send + Sync + 'static;
 type GcStatHook = dyn Fn(GcStatSyncPoint, u64, &Path) + Send + Sync + 'static;
@@ -1102,6 +1111,7 @@ struct TestingHooks {
     abort_clean: Option<Arc<AbortCleanHook>>,
     tree_update: Option<Arc<TreeUpdateHook>>,
     checkpoint: Option<Arc<CheckpointHook>>,
+    bucket_create: Option<Arc<BucketCreateHook>>,
     wal_sync: Option<Arc<WalSyncHook>>,
     gc_rewrite: Option<Arc<GcRewriteHook>>,
     gc_stat: Option<Arc<GcStatHook>>,
@@ -1149,6 +1159,10 @@ pub fn set_tree_update_hook(hook: Option<Arc<TreeUpdateHook>>) {
 
 pub fn set_checkpoint_hook(hook: Option<Arc<CheckpointHook>>) {
     hooks().lock().checkpoint = hook;
+}
+
+pub fn set_bucket_create_hook(hook: Option<Arc<BucketCreateHook>>) {
+    hooks().lock().bucket_create = hook;
 }
 
 pub fn set_wal_sync_hook(hook: Option<Arc<WalSyncHook>>) {
@@ -1211,6 +1225,10 @@ pub fn clear_checkpoint_hook() {
     set_checkpoint_hook(None);
 }
 
+pub fn clear_bucket_create_hook() {
+    set_bucket_create_hook(None);
+}
+
 pub fn clear_wal_sync_hook() {
     set_wal_sync_hook(None);
 }
@@ -1245,6 +1263,7 @@ pub fn clear_hooks() {
     clear_abort_clean_hook();
     clear_tree_update_hook();
     clear_checkpoint_hook();
+    clear_bucket_create_hook();
     clear_wal_sync_hook();
     clear_gc_rewrite_hook();
     clear_gc_stat_hook();
@@ -1334,6 +1353,17 @@ pub(crate) fn fire_checkpoint_sync_point(point: CheckpointSyncPoint, bucket_id: 
     let hook = hooks().lock().checkpoint.clone();
     if let Some(hook) = hook {
         hook(point, bucket_id);
+    }
+}
+
+pub(crate) fn fire_bucket_create_sync_point(
+    point: BucketCreateSyncPoint,
+    bucket_id: u64,
+    name: &str,
+) {
+    let hook = hooks().lock().bucket_create.clone();
+    if let Some(hook) = hook {
+        hook(point, bucket_id, name);
     }
 }
 

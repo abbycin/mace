@@ -6,6 +6,56 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "extra_check")]
+struct BucketCreateHookReset;
+
+#[cfg(feature = "extra_check")]
+impl Drop for BucketCreateHookReset {
+    fn drop(&mut self) {
+        mace::testing::clear_bucket_create_hook();
+    }
+}
+
+#[cfg(feature = "extra_check")]
+fn bucket_create_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("bucket create test lock")
+}
+
+/// start a probe and prove it reached the call before asserting that it has not returned
+///
+/// a bare `recv_timeout` on the result can pass when the probe thread was never scheduled. The
+/// started handshake removes that scheduling hole; the caller still joins the handle for the
+/// post-release result assertion.
+#[cfg(feature = "extra_check")]
+fn spawn_blocked_probe<T, F>(f: F) -> std::thread::JoinHandle<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let (started_tx, started_rx) = channel();
+    let (done_tx, done_rx) = channel();
+    let handle = std::thread::spawn(move || {
+        started_tx.send(()).expect("signal probe start");
+        let result = f();
+        let _ = done_tx.send(());
+        result
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("probe thread must start");
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "probe must block while creation holds the structural lock"
+    );
+    handle
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PersistedBucketMeta {
@@ -1167,42 +1217,271 @@ fn bucket_unload_rewrite_returns_again() -> Result<(), OpCode> {
     Ok(())
 }
 
+#[cfg(feature = "extra_check")]
 #[test]
-fn bucket_update_during_create_returns_again() -> Result<(), OpCode> {
-    use std::time::{Duration, Instant};
+fn bucket_create_is_invisible_until_manifest_commit() -> Result<(), OpCode> {
+    let _serial = bucket_create_test_lock();
+    use mace::testing::{self, BucketCreateSyncPoint};
+    use std::sync::Mutex;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
 
+    let _reset = BucketCreateHookReset;
     let path = RandomPath::tmp();
-    let opt = Options::new(&*path);
-    let mace = Mace::new(opt.validate()?)?;
+    let mace = Mace::new(Options::new(&*path).validate()?)?;
+    let (paused_tx, paused_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    testing::set_bucket_create_hook(Some(Arc::new(move |point, id, name: &str| {
+        if name == "atomic" && point == BucketCreateSyncPoint::BeforeManifestCommit {
+            paused_tx.send(id).expect("signal paused create");
+            release_rx
+                .lock()
+                .expect("lock release receiver")
+                .recv()
+                .expect("wait for release");
+        }
+    })));
 
     let creator = mace.clone();
-    let handle = std::thread::spawn(move || creator.new_bucket("during", BucketOptions::default()));
+    let create = std::thread::spawn(move || creator.new_bucket("atomic", BucketOptions::default()));
+    let bucket_id = paused_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("create must pause before the manifest commit");
 
-    // the name enters the catalog while the create holds the lifecycle lock, before the context
-    // and the metadata publish: an option update issued now must wait for that create and then
-    // observe a loaded bucket
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !mace.active_buckets().iter().any(|name| name == "during") {
-        assert!(
-            Instant::now() < deadline,
-            "the create must publish its name"
-        );
-        std::thread::yield_now();
-    }
-    let updated = mace.update_bucket_opt(
-        "during",
-        BucketOptions {
-            cache_evict_pct: 30,
-            ..BucketOptions::default()
-        },
+    let m = mace.clone();
+    let active = spawn_blocked_probe(move || m.active_buckets());
+
+    let m = mace.clone();
+    let nr = spawn_blocked_probe(move || m.nr_buckets());
+
+    let m = mace.clone();
+    let options = spawn_blocked_probe(move || m.get_bucket_options("atomic"));
+
+    let m = mace.clone();
+    let open = spawn_blocked_probe(move || m.open_bucket("atomic").map(|bucket| bucket.id()));
+
+    let m = mace.clone();
+    let update = spawn_blocked_probe(move || {
+        m.update_bucket_opt(
+            "atomic",
+            BucketOptions {
+                cache_evict_pct: 30,
+                ..BucketOptions::default()
+            },
+        )
+    });
+
+    let m = mace.clone();
+    let drop_probe = spawn_blocked_probe(move || m.drop_bucket("atomic"));
+
+    let m = mace.clone();
+    let del = spawn_blocked_probe(move || m.del_bucket("atomic"));
+
+    release_tx.send(()).expect("release create");
+    let bucket = create.join().expect("creator thread must finish")?;
+    assert_eq!(bucket.id(), bucket_id);
+    assert_eq!(open.join().expect("open thread"), Ok(bucket_id));
+    assert_eq!(update.join().expect("update thread"), Err(OpCode::Again));
+    assert_eq!(
+        drop_probe.join().expect("drop thread"),
+        Err(OpCode::Again),
+        "the creator still holds the lease"
     );
     assert_eq!(
-        updated,
+        del.join().expect("delete thread"),
         Err(OpCode::Again),
-        "an option update must not commit between creation's reservation and its publish"
+        "the creator still holds the lease"
     );
+    assert!(
+        active
+            .join()
+            .expect("active thread")
+            .iter()
+            .any(|name| name == "atomic")
+    );
+    assert_eq!(nr.join().expect("count thread"), 1);
+    assert!(
+        options.join().expect("options thread")?.is_some(),
+        "options are published with the bucket"
+    );
+    drop(bucket);
+    Ok(())
+}
 
-    let bucket = handle.join().expect("creator thread must finish")?;
+#[cfg(feature = "extra_check")]
+#[test]
+fn bucket_create_publish_waits_for_lock_after_commit() -> Result<(), OpCode> {
+    let _serial = bucket_create_test_lock();
+    use mace::testing::{self, BucketCreateSyncPoint};
+    use std::sync::Mutex;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let _reset = BucketCreateHookReset;
+    let path = RandomPath::tmp();
+    let mace = Mace::new(Options::new(&*path).validate()?)?;
+    let (paused_tx, paused_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    testing::set_bucket_create_hook(Some(Arc::new(move |point, id, name: &str| {
+        if name == "commit" && point == BucketCreateSyncPoint::AfterCommitBeforePublish {
+            paused_tx.send(id).expect("signal committed create");
+            release_rx
+                .lock()
+                .expect("lock release receiver")
+                .recv()
+                .expect("wait for release");
+        }
+    })));
+
+    let creator = mace.clone();
+    let create = std::thread::spawn(move || creator.new_bucket("commit", BucketOptions::default()));
+    let bucket_id = paused_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("create must pause after commit");
+
+    let m = mace.clone();
+    let active = spawn_blocked_probe(move || m.active_buckets());
+
+    let m = mace.clone();
+    let nr = spawn_blocked_probe(move || m.nr_buckets());
+
+    let m = mace.clone();
+    let options = spawn_blocked_probe(move || m.get_bucket_options("commit"));
+
+    let m = mace.clone();
+    let open = spawn_blocked_probe(move || m.open_bucket("commit").map(|bucket| bucket.id()));
+
+    release_tx.send(()).expect("release create");
+    let bucket = create.join().expect("creator thread must finish")?;
+    assert_eq!(bucket.id(), bucket_id);
+    assert!(
+        active
+            .join()
+            .expect("active thread")
+            .iter()
+            .any(|name| name == "commit")
+    );
+    assert_eq!(nr.join().expect("count thread"), 1);
+    assert!(
+        options.join().expect("options thread")?.is_some(),
+        "options are published with the bucket"
+    );
+    assert_eq!(open.join().expect("open thread"), Ok(bucket_id));
+    let opened = mace.open_bucket("commit")?;
+    let txn = opened.begin()?;
+    txn.put("k", "v")?;
+    txn.commit()?;
+    {
+        let view = opened.view()?;
+        assert_eq!(view.get("k")?.slice(), b"v");
+    }
+    drop(opened);
+    drop(bucket);
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn concurrent_bucket_create_publishes_exactly_once() -> Result<(), OpCode> {
+    let _serial = bucket_create_test_lock();
+    use mace::testing::{self, BucketCreateSyncPoint};
+    use std::sync::Mutex;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let _reset = BucketCreateHookReset;
+    let path = RandomPath::tmp();
+    let mace = Mace::new(Options::new(&*path).validate()?)?;
+    let (paused_tx, paused_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    testing::set_bucket_create_hook(Some(Arc::new(move |point, _, name: &str| {
+        if name == "race" && point == BucketCreateSyncPoint::BeforeManifestCommit {
+            paused_tx.send(()).expect("signal paused create");
+            release_rx
+                .lock()
+                .expect("lock release receiver")
+                .recv()
+                .expect("wait for release");
+        }
+    })));
+
+    let first = mace.clone();
+    let create = std::thread::spawn(move || first.new_bucket("race", BucketOptions::default()));
+    paused_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first create must pause");
+
+    let second = mace.clone();
+    let duplicate =
+        spawn_blocked_probe(move || second.new_bucket("race", BucketOptions::default()));
+
+    release_tx.send(()).expect("release first create");
+    let bucket = create.join().expect("first creator")?;
+    assert!(matches!(
+        duplicate.join().expect("duplicate creator"),
+        Err(OpCode::Exist)
+    ));
+    assert_eq!(mace.nr_buckets(), 1);
+    assert_eq!(
+        mace.active_buckets()
+            .iter()
+            .filter(|name| *name == "race")
+            .count(),
+        1
+    );
+    drop(bucket);
+    Ok(())
+}
+
+#[cfg(feature = "extra_check")]
+#[test]
+fn bucket_update_during_create_returns_again() -> Result<(), OpCode> {
+    let _serial = bucket_create_test_lock();
+    use mace::testing::{self, BucketCreateSyncPoint};
+    use std::sync::Mutex;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let _reset = BucketCreateHookReset;
+    let path = RandomPath::tmp();
+    let mace = Mace::new(Options::new(&*path).validate()?)?;
+    let (paused_tx, paused_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    testing::set_bucket_create_hook(Some(Arc::new(move |point, _, name: &str| {
+        if name == "during" && point == BucketCreateSyncPoint::BeforeManifestCommit {
+            paused_tx.send(()).expect("signal paused create");
+            release_rx
+                .lock()
+                .expect("lock release receiver")
+                .recv()
+                .expect("wait for release");
+        }
+    })));
+
+    let creator = mace.clone();
+    let create = std::thread::spawn(move || creator.new_bucket("during", BucketOptions::default()));
+    paused_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("create must pause");
+
+    let updater = mace.clone();
+    let update = spawn_blocked_probe(move || {
+        updater.update_bucket_opt(
+            "during",
+            BucketOptions {
+                cache_evict_pct: 30,
+                ..BucketOptions::default()
+            },
+        )
+    });
+
+    release_tx.send(()).expect("release create");
+    let bucket = create.join().expect("creator thread must finish")?;
+    assert_eq!(update.join().expect("update thread"), Err(OpCode::Again));
     drop(bucket);
 
     let persisted = mace

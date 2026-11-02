@@ -5,7 +5,8 @@ mod generation;
 mod pool;
 
 pub(crate) use bucket::{
-    BucketContext, BucketLease, BucketManager, BucketRewritePermit, BucketState, ReclaimMode,
+    BucketContext, BucketLease, BucketManager, BucketRewritePermit, BucketRuntime, BucketState,
+    ReclaimMode,
 };
 #[allow(unused_imports)]
 pub(crate) use generation::Current;
