@@ -121,6 +121,8 @@ chaos_cases=(
   "prod_recovery_failpoints:wal_recycle_done_does_not_weaken_gap_detection_after_frontier"
   "prod_recovery_failpoints:chaos_failpoint_txn_commit_after_wal_file_sync_before_dir_sync"
   "prod_recovery_failpoints:chaos_failpoint_txn_commit_after_record_commit"
+  "prod_recovery_failpoints:chaos_failpoint_txn_prefix_after_record_commit"
+  "prod_recovery_failpoints:chaos_failpoint_txn_prefix_after_wal_sync"
   "prod_recovery_failpoints:chaos_failpoint_txn_commit_after_wal_sync"
   "prod_recovery_failpoints:chaos_failpoint_bucket_create_before_manifest_commit"
   "prod_recovery_failpoints:chaos_failpoint_bucket_create_after_manifest_commit"

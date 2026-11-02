@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 const ENV_CHILD: &str = "MACE_PROD_FP_CHILD";
 const ENV_CASE: &str = "MACE_PROD_FP_CASE";
 const ENV_DB_ROOT: &str = "MACE_PROD_FP_DB_ROOT";
+const ENV_ACK: &str = "MACE_PROD_FP_ACK";
 const BUCKET_METAS: &str = "bucket_metas";
 const BUCKET_PENDING_DEL: &str = "pending_del";
 const BUCKET_MISC: &str = "misc";
@@ -90,6 +91,21 @@ fn data_interval_name(bucket_id: u64) -> String {
 
 fn blob_interval_name(bucket_id: u64) -> String {
     format!("blob_interval_{bucket_id}")
+}
+
+fn spawn_child_unarmed(case: &str, db_root: &Path, ack: &Path) -> ExitStatus {
+    let exe = std::env::current_exe().expect("load current exe failed");
+    child_test_command(&exe)
+        .arg("--exact")
+        .arg("failpoint_child")
+        .arg("--nocapture")
+        .env(ENV_CHILD, "1")
+        .env(ENV_CASE, case)
+        .env(ENV_DB_ROOT, db_root.as_os_str())
+        .env(ENV_ACK, ack.as_os_str())
+        .env("MACE_FAILPOINT", "")
+        .status()
+        .expect("spawn unarmed failpoint child failed")
 }
 
 fn spawn_child(case: &str, db_root: &Path, failpoint: &str) -> ExitStatus {
@@ -1335,6 +1351,51 @@ fn child_case_reopen_common(db_root: &Path) -> ! {
     panic!("recovery failpoint did not fire")
 }
 
+fn child_case_txn_prefix_ack(db_root: &Path, ack: &Path, window: &str) -> ! {
+    use std::io::Write;
+
+    const TXNS: usize = 32;
+    const KEYS: usize = 3;
+
+    let (_mace, bucket) = child_setup_common(db_root);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ack)
+        .expect("open ack file failed");
+
+    for txn in 0..TXNS {
+        let t = bucket.begin().expect("begin prefix txn failed");
+        let mut line = format!("{txn}");
+        for i in 0..KEYS {
+            let key = format!("t{txn:04}_{i}");
+            let value = format!("v{txn}_{i}");
+            t.upsert(&key, &value).expect("upsert prefix key failed");
+            line.push_str(&format!(" {key}={value}"));
+        }
+        t.commit().expect("commit prefix txn failed");
+        writeln!(file, "{line}").expect("write ack line failed");
+        file.flush().expect("flush ack failed");
+        file.sync_all().expect("fsync ack failed");
+    }
+
+    let armed = mace::failpoint_testing::snapshot();
+    assert!(
+        !armed.contains(window),
+        "target rule was armed before the delayed window: {armed}"
+    );
+
+    mace::testing::failpoint_scope(&format!("{window}=abort@1"), || {
+        let t = bucket.begin().expect("begin interrupted txn failed");
+        for i in 0..KEYS {
+            t.upsert(format!("t{TXNS:04}_{i}"), format!("v{TXNS}_{i}"))
+                .expect("upsert interrupted key failed");
+        }
+        let _ = t.commit();
+    });
+    panic!("delayed failpoint did not fire")
+}
+
 fn child_case_txn_commit_abort_window(db_root: &Path) -> ! {
     let (_mace, bucket) = child_setup_common(db_root);
     seed_committed_and_uncommitted(&bucket, 64, 24);
@@ -1678,6 +1739,14 @@ fn failpoint_child() {
         "bucket_delete" => child_case_bucket_delete(&db_root),
         "pending_bucket_reap" => child_case_pending_bucket_reap(&db_root),
         "txn_commit_after_record_commit" => child_case_txn_commit_abort_window(&db_root),
+        "txn_prefix_after_record_commit" => {
+            let ack = PathBuf::from(std::env::var(ENV_ACK).expect("missing ack path"));
+            child_case_txn_prefix_ack(&db_root, &ack, "mace_txn_commit_after_record_commit")
+        }
+        "txn_prefix_after_wal_sync" => {
+            let ack = PathBuf::from(std::env::var(ENV_ACK).expect("missing ack path"));
+            child_case_txn_prefix_ack(&db_root, &ack, "mace_txn_commit_after_wal_sync")
+        }
         "txn_commit_after_wal_sync" => child_case_txn_commit_abort_window(&db_root),
         "txn_commit_after_wal_file_sync_before_dir_sync" => {
             child_case_txn_commit_abort_window(&db_root)
@@ -2235,6 +2304,120 @@ fn chaos_failpoint_txn_commit_after_wal_file_sync_before_dir_sync() {
         "txn-after-wal-file-sync-before-dir-sync failpoint child should abort",
     );
     assert_visibility_after_reopen(&path, 64, 24);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interrupted {
+    AllOrNone,
+    Present,
+}
+
+fn read_ack(ack: &Path) -> Vec<(usize, Vec<(String, String)>)> {
+    let text = std::fs::read_to_string(ack).expect("read ack failed");
+    let Some((complete, _tail)) = text.rsplit_once('\n') else {
+        return Vec::new();
+    };
+    if complete.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for line in complete.split('\n') {
+        let mut parts = line.split_whitespace();
+        let txn: usize = parts.next().expect("ack txn").parse().expect("ack txn id");
+        let mut pairs = Vec::new();
+        for pair in parts {
+            let (k, v) = pair.split_once('=').expect("ack key=value");
+            pairs.push((k.to_string(), v.to_string()));
+        }
+        assert!(seen.insert(txn), "duplicate ack transaction id {txn}");
+        out.push((txn, pairs));
+    }
+    out
+}
+
+fn assert_txn_prefix(db_root: &Path, ack: &Path, interrupted: Interrupted) {
+    let records = read_ack(ack);
+    assert_eq!(records.len(), 32, "ack line count");
+
+    let mace = open_with_tune(db_root, |opt| {
+        opt.gc_timeout = 60_000;
+        opt.gc_eager = true;
+    });
+    let bucket = mace.open_bucket("prod").expect("bucket prod should exist");
+    let view = bucket.view().expect("open verify view failed");
+
+    for (txn, pairs) in &records {
+        assert_eq!(pairs.len(), 3, "acked txn {txn} key count");
+        for (key, value) in pairs {
+            let got = view
+                .get(key.as_bytes())
+                .unwrap_or_else(|err| panic!("acked key {key} missing: {err:?}"));
+            assert_eq!(got.slice(), value.as_bytes(), "acked txn {txn} key {key}");
+        }
+    }
+
+    for txn in 0..33usize {
+        let present = (0..3)
+            .filter(|i| view.get(format!("t{txn:04}_{i}")).is_ok())
+            .count();
+        assert!(
+            present == 0 || present == 3,
+            "torn transaction {txn}: {present}/3 keys present"
+        );
+        if txn == 32 && present == 3 {
+            for i in 0..3 {
+                let key = format!("t{txn:04}_{i}");
+                let expected = format!("v{txn}_{i}");
+                let got = view.get(key.as_bytes()).expect("interrupted key missing");
+                assert_eq!(got.slice(), expected.as_bytes(), "interrupted key {key}");
+            }
+            if interrupted == Interrupted::Present {
+                // presence itself is the window-specific assertion above
+            }
+        }
+        if txn == 32 && interrupted == Interrupted::Present {
+            assert_eq!(present, 3, "durable interrupted transaction is missing");
+        }
+    }
+
+    let persisted = load_persisted_global_options(db_root).expect("persisted options");
+    assert!(
+        persisted.sync_on_write,
+        "child did not persist sync_on_write"
+    );
+}
+
+fn txn_prefix_case(case: &str, interrupted: Interrupted, tag: &str) {
+    let path = RandomPath::tmp();
+    let ack = std::env::temp_dir().join(format!("mace_ack_{tag}_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&ack);
+
+    let status = spawn_child_unarmed(case, &path, &ack);
+    assert_child_aborted(status, "txn prefix child should abort");
+
+    assert_txn_prefix(&path, &ack, interrupted);
+    let _ = std::fs::remove_file(&ack);
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_txn_prefix_after_record_commit() {
+    txn_prefix_case(
+        "txn_prefix_after_record_commit",
+        Interrupted::AllOrNone,
+        "record",
+    );
+}
+
+#[test]
+#[ignore]
+fn chaos_failpoint_txn_prefix_after_wal_sync() {
+    txn_prefix_case(
+        "txn_prefix_after_wal_sync",
+        Interrupted::Present,
+        "wal_sync",
+    );
 }
 
 #[test]
