@@ -1,11 +1,13 @@
-## [Unreleased]
+## [0.2.1] 2026-11-05
 ### New Features
-- Added offline `mace-kv leak-check <db-dir> [--fix]` to detect missing inactive marks from fixed-root reachability and safely repair eligible stat records before rechecking.
+- Added `mace-kv leak-check <db-dir> [--fix]`, which derives per-bucket reachability from the fixed root, reports unmarked unreachable relocations as `junk_leak`, and can add the missing inactive marks in one metadata transaction.
 
 ### Changes
-- Documented persistent format v1 byte by byte in `docs/format.md` and froze it: compile-time size/offset pins and checked-in golden fixtures now fail on layout drift that a reader would otherwise accept. Data/blob files stay versioned per file and metadata keeps its whole-database version; the WAL makes no cross-version compatibility promise, so a clean shutdown that drains it is required before upgrading.
-- Split maintenance tooling into the `mace-kv-cli` package, moved checker APIs behind the engine's internal `maintenance` feature, and let the CLI depend on compatible `mace-kv` patch releases within the same minor version.
-- Bucket creation now publishes the catalog name, options, count, frontier map and runtime only after the bucket metadata commits. `active_buckets`, `nr_buckets` and `get_bucket_options` no longer observe an in-flight creation; they block while a catalog operation holds the structural lock, including the creation's metadata commit. Open, option updates, unload and delete were already serialized on that lock and keep their existing behavior.
+- Documented persistent format v1 byte by byte in `docs/format.md` and froze it: layout size/offset pins and golden fixtures fail on drift, and the WAL stays valid across upgrades only after a clean shutdown drains it.
+- Moved the offline checker out of `mace` into the `mace-kv-cli` package; its API now lives there behind the engine's internal `maintenance` feature, and the CLI follows compatible `mace-kv` patch releases.
+- Bucket creation now commits metadata before publishing the catalog name, options, count, frontier and runtime, so `active_buckets`, `nr_buckets` and `get_bucket_options` block under the structural lock instead of observing a partial creation.
+- Split the engine and checker internals into focused modules with unchanged public API and persisted bytes, and made background abort-clean skip pages that hold no retained aborted version.
+- Added deterministic event traces to the SI anomaly tests, crash-window coverage for multi-key transaction prefix durability, and a randomized churn plus offline-check model test.
 
 ## [0.2.0] 2026-10-20
 ### New Features
