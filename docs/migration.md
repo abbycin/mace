@@ -4,9 +4,10 @@ docs/migration/ and a README.md there holds that hop's runbook, expected output,
 verified evidence.
 
 To add a migration: create docs/migration/<from>-<to>/README.md from an existing hop, append one row
-to "Migrations", and keep the shared sections (What is versioned, Tools, Procedure, Verifying, Using
-the migrated database, Rolling back, Troubleshooting, Notes) free of version-specific steps and
-messages. A hop that needs more than the shared procedure says so in its own README.
+to "Migrations", and keep the shared sections (What is versioned, WAL layout changes, Tools,
+Procedure, Verifying, Using the migrated database, Rolling back, Troubleshooting, Notes) free of
+version-specific steps and messages. A hop that needs more than the shared procedure says so in its
+own README.
 -->
 
 # Migrating a database
@@ -37,9 +38,46 @@ read it (`... is format <n> ...`), which selects the next hop.
   not change.)
 - Payload files (`<db>/data/*`) and WAL files (`<db>/log/wal_*`, `<db>/log/group_wal_*`) are not
   rewritten by a migration unless its own guide says so.
-- A database that was not closed cleanly is migrated the same way, and the committed records still in
-  its WAL are replayed on the first open by the newer build, exactly as that build's recovery would
-  replay them without a migration.
+- A database that was not closed cleanly is migrated the same way when the hop keeps the WAL record
+  layout: the committed records still in its WAL are replayed on the first open by the newer build,
+  exactly as that build's recovery would replay them without a migration. A release that changes the
+  WAL layout has no such replay path; drain it with the old build instead (see
+  [WAL layout changes](#wal-layout-changes)).
+
+## WAL layout changes
+
+The WAL carries no file header, version field or layout tag, so a release that changes its record
+layout cannot migrate it: a segment written by another layout is indistinguishable from a damaged
+tail. Such a release ships no WAL hop. The old WAL is drained with the old build before the new binary
+opens the directory:
+
+1. Open the database with the old build and close it normally. Normal shutdown drains abort cleanup,
+   performs a final checkpoint of every dirty bucket and syncs the WAL, but it runs no recycle round:
+   GC is already stopped when that checkpoint publishes.
+2. Open and close it normally a second time. This run starts from the durable checkpoint, so nothing
+   left in the WAL is still the only copy of a committed write; its recycle rounds retire covered
+   segments as they run.
+3. With every process stopped, delete the remaining segments (`wal_*` and `group_wal_*`, or confirm
+   they were recycled). Under `Options::log_root` they live there instead of `<db>/log`.
+4. Start the new build.
+
+Opening and dropping an instance is that shutdown; run it once per cycle:
+
+```rust
+use mace::{Mace, OpCode, Options};
+
+fn main() -> Result<(), OpCode> {
+    let mace = Mace::new(Options::new("/srv/myapp/data/mydb").validate()?)?;
+    drop(mace); // normal shutdown
+    Ok(())
+}
+```
+
+A crash followed directly by an upgrade is unsupported: the new build reads the old WAL as a malformed
+tail, so with the default `truncate_corrupted_wal = true` it truncates at the first bad record and
+loses the uncheckpointed committed writes, and with the option disabled it does not open. When the
+same release also changes the metadata store format, drain the WAL on the source database with the old
+build first and only then run the hop's rebuild: the new build cannot open the old manifest.
 
 ## Tools
 

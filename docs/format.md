@@ -803,12 +803,15 @@ payload types `klen + value_len <= MAX_KV_SIZE`.
 The WAL layout may change in any release, because it carries no version and promises nothing. In
 exchange, the upgrade rule is mandatory:
 
-1. Before replacing the binary, start the current binary against the database and close it normally.
+1. Before replacing the binary, open the database with the current binary and close it normally.
    Normal shutdown drains abort cleanup, performs a final checkpoint of every dirty bucket and syncs
-   the WAL.
-2. Then delete the WAL files (`wal_*` and `group_wal_*`) or confirm they were recycled, and only then
-   run the new binary.
-3. A crash followed directly by an upgrade is not supported. A WAL written by a different layout has
+   the WAL, but it runs no WAL recycle round: GC is already stopped when that checkpoint publishes.
+2. Open and close it normally a second time. This run starts from the durable checkpoint, so no
+   record left in the WAL is still the only copy of a committed write, and its recycle rounds retire
+   the covered segments as they run.
+3. Then delete the remaining WAL files (`wal_*` and `group_wal_*`) or confirm they were recycled, and
+   only then run the new binary.
+4. A crash followed directly by an upgrade is not supported. A WAL written by a different layout has
    no recognizable marker, so the new binary treats it as a malformed tail: with the default option it
    truncates at the first bad record and some uncheckpointed committed writes are lost; with the option
    disabled the database does not open.

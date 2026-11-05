@@ -850,11 +850,15 @@ layout tag, so a WAL written by a different layout is indistinguishable from a d
 belongs to the binary that wrote it. Any WAL layout change is therefore allowed without a version
 axis and without a migration, under one mandatory prerequisite:
 
-- before replacing the binary, start the current binary against the database and close it normally.
+- before replacing the binary, open the database with the current binary and close it normally.
   Normal shutdown drains abort cleanup, performs a final checkpoint of every dirty bucket and syncs
-  the WAL.
-- then remove the `wal_*` and `group_wal_*` files (or confirm they were recycled) before running the
-  new binary.
+  the WAL, but GC is already stopped when that checkpoint publishes, so no recycle round retires the
+  segments it covers.
+- open and close it normally a second time. This run starts from the durable checkpoint, so no record
+  left in the WAL is still the only copy of a committed write, and its recycle rounds retire covered
+  segments as they run.
+- then remove the remaining `wal_*` and `group_wal_*` files (or confirm they were recycled) before
+  running the new binary.
 
 Crashing and then upgrading directly is unsupported. A WAL of a different layout has no recognizable
 marker, so the new binary treats it as a malformed tail: with the default

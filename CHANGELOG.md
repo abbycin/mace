@@ -3,7 +3,7 @@
 - Added `mace-kv leak-check <db-dir> [--fix]`, which derives per-bucket reachability from the fixed root, reports unmarked unreachable relocations as `junk_leak`, and can add the missing inactive marks in one metadata transaction.
 
 ### Changes
-- Documented persistent format v1 byte by byte in `docs/format.md` and froze it: layout size/offset pins and golden fixtures fail on drift, and the WAL stays valid across upgrades only after a clean shutdown drains it.
+- Documented persistent format v1 byte by byte in `docs/format.md` and froze it: layout size/offset pins and golden fixtures fail on drift, and a release that changes the WAL layout ships no migration — the old WAL is drained with the old build (two clean open/close cycles, then the segments are removed) before the new binary opens the directory.
 - Moved the offline checker out of `mace` into the `mace-kv-cli` package; its API now lives there behind the engine's internal `maintenance` feature, and the CLI follows compatible `mace-kv` patch releases.
 - Bucket creation now commits metadata before publishing the catalog name, options, count, frontier and runtime, so `active_buckets`, `nr_buckets` and `get_bucket_options` block under the structural lock instead of observing a partial creation.
 - Split the engine and checker internals into focused modules with unchanged public API and persisted bytes, and made background abort-clean skip pages that hold no retained aborted version.
