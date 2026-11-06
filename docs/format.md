@@ -681,8 +681,11 @@ Startup reads `version/current_version` before any state:
 1. If the key exists, the version is the little-endian u64 in its first eight bytes (exactly eight
    bytes is a writer guarantee).
 2. The value must be `1`; anything else is `BadVersion`.
-3. If the key is absent, the store must be pristine (no buckets, no state). A pristine store is
-   bootstrapped with `current_version = 1` and `misc/options`.
+3. If the key is absent, the store predates the version record. An absent `misc/options` must
+   mean a pristine store (no buckets, no state), which is bootstrapped with
+   `current_version = 1` and `misc/options`. Otherwise the catalog, frontier and stats are
+   loaded as v1 and `current_version = 1` is written back in one metadata transaction; a
+   `misc/sequences` record without a version record is `BadVersion` (step 5).
 4. `misc/options` must exist whenever the version record exists; a missing options record on a
    non-pristine store is `Corruption`. Bad JSON is `Corruption`.
 5. A `misc/sequences` record without a version record is `BadVersion`; an absent one means the

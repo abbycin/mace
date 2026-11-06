@@ -1,12 +1,14 @@
-//! internal on-disk inspection surface for the pinned maintenance CLI
+//! internal on-disk inspection surface for the compatible maintenance CLI
 //!
 //! these are the format definitions the engine writes with. they are grouped
 //! here, behind a non-default feature, so the engine's stable API does not
-//! carry the checker's vocabulary. the CLI depends on this module with an
-//! exact version pin; changing one of these items is a compile error there.
+//! carry the checker's vocabulary. the CLI depends on a semver-compatible
+//! library release; changes to this surface or the on-disk format require
+//! coordinated package updates.
 
 pub use crate::cc::wal::{
-    EntryType, IWalCodec, PayloadType, WalAbort, WalCheckpoint, WalUpdate, ptr_to, wal_record_sz,
+    EntryType, IWalCodec, PayloadType, WalAbort, WalCheckpoint, WalUpdate, wal_abort_at,
+    wal_checkpoint_at, wal_record_sz, wal_update_at,
 };
 pub use crate::io::{File, FileSystem, GatherIO, OpenOptions};
 pub use crate::map::data::{FileReader, MetaReader, try_new_reader};

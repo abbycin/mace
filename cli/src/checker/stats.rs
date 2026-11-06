@@ -278,7 +278,36 @@ pub(super) fn read_stats(
             };
             match <[u8; 8]>::try_from(&key[..]) {
                 Ok(bytes) if u64::from_le_bytes(bytes) == inner.file_id => {}
-                _ => unattributed = true,
+                Ok(bytes) => {
+                    unattributed = true;
+                    let stored_id = u64::from_le_bytes(bytes);
+                    diagnostics.push(
+                        Diagnostic::new(
+                            CheckCategory::BadStatAccounting,
+                            format!(
+                                "stat record for file {} is stored under key {stored_id}",
+                                inner.file_id
+                            ),
+                        )
+                        .with_bucket(inner.bucket_id)
+                        .with_file(inner.file_id),
+                    );
+                }
+                Err(_) => {
+                    unattributed = true;
+                    diagnostics.push(
+                        Diagnostic::new(
+                            CheckCategory::BadStatAccounting,
+                            format!(
+                                "stat record for file {} has a {}-byte key",
+                                inner.file_id,
+                                key.len()
+                            ),
+                        )
+                        .with_bucket(inner.bucket_id)
+                        .with_file(inner.file_id),
+                    );
+                }
             }
             // a payload file that cannot be opened is reported by the payload phase, and
             // its record's mask cannot be bounded by the file, so the mask is not decoded
@@ -445,6 +474,9 @@ fn check_intervals_against_stats(
             continue;
         };
         if stat.bucket_id != interval.bucket_id {
+            // the interval owner and the stat ledger disagree: the leak phase must not derive
+            // a reachability verdict for this file from either bucket
+            checks.contradicted.insert(file_id);
             report.push_diagnostic(
                 Diagnostic::new(
                     CheckCategory::BadInterval,

@@ -21,6 +21,8 @@ pub(super) struct PayloadChecks {
     decoders: Option<Arc<DecompressorPool>>,
     reported: std::collections::HashSet<(FileKind, u64)>,
     referenced: std::collections::HashMap<FileKind, std::collections::HashSet<u64>>,
+    /// files whose interval rows name a different owning bucket than the stat record
+    pub(super) contradicted: std::collections::HashSet<u64>,
 }
 
 impl PayloadChecks {

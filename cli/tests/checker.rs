@@ -3,7 +3,8 @@
 mod common;
 
 use btree_store::BTree;
-use mace::{Mace, OpCode, Options, RandomPath};
+use mace::maintenance::{BUCKET_DATA_STAT, BUCKET_FRONTIER, IMetaCodec, PersistStat};
+use mace::{BucketOptions, Mace, OpCode, Options, RandomPath};
 use mace_kv_cli::{CheckCategory, check_database};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -917,12 +918,104 @@ fn a_pending_delete_window_checks_clean() -> Result<(), OpCode> {
     Ok(())
 }
 
+#[test]
+fn a_malformed_frontier_row_is_reported() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let mace = Mace::new(Options::new(&*path).validate()?)?;
+    {
+        let bucket = mace.new_bucket("frontier", BucketOptions::default())?;
+        let txn = bucket.begin()?;
+        txn.put("k", vec![1u8; 8])?;
+        txn.commit()?;
+        bucket.checkpoint_and_wait();
+    }
+    drop(mace);
+
+    let opt = Options::new(&*path);
+    let tree = BTree::open(opt.manifest()).unwrap();
+    let mut key = Vec::new();
+    tree.view(BUCKET_FRONTIER, |tx| {
+        let mut iter = tx.iter();
+        let (mut k, mut v) = (Vec::new(), Vec::new());
+        assert!(iter.next_ref(&mut k, &mut v), "one frontier row");
+        key = k.clone();
+        Ok(())
+    })
+    .unwrap();
+    tree.exec(BUCKET_FRONTIER, |tx| tx.put(key, vec![0u8; 8]))
+        .unwrap();
+    drop(tree);
+
+    let report = check_database(&opt);
+    assert_eq!(
+        report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.category == CheckCategory::BadLifecycleState)
+            .count(),
+        1,
+        "{report:?}"
+    );
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.category == CheckCategory::BadLifecycleState
+                && diagnostic.detail.contains("durable frontier row")
+        }),
+        "a frontier row the engine rejects must be reported: {report:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_stat_record_under_a_mismatched_key_is_reported() -> Result<(), OpCode> {
+    let path = RandomPath::tmp();
+    let mace = Mace::new(Options::new(&*path).validate()?)?;
+    {
+        let bucket = mace.new_bucket("stat", BucketOptions::default())?;
+        let txn = bucket.begin()?;
+        txn.put("k", vec![1u8; 8])?;
+        txn.commit()?;
+        bucket.checkpoint_and_wait();
+    }
+    drop(mace);
+
+    let opt = Options::new(&*path);
+    let tree = BTree::open(opt.manifest()).unwrap();
+    let mut stored = None;
+    tree.view(BUCKET_DATA_STAT, |tx| {
+        let mut iter = tx.iter();
+        let (mut k, mut v) = (Vec::new(), Vec::new());
+        while iter.next_ref(&mut k, &mut v) {
+            stored = Some((k.clone(), PersistStat::decode(&v)));
+        }
+        Ok(())
+    })
+    .unwrap();
+    let (key, mut stat) = stored.expect("one data stat record");
+    stat.inner.file_id = stat.inner.file_id.wrapping_add(1);
+    let mut bytes = vec![0u8; stat.packed_size()];
+    stat.encode(&mut bytes);
+    tree.exec(BUCKET_DATA_STAT, |tx| tx.put(key, bytes))
+        .unwrap();
+    drop(tree);
+
+    let report = check_database(&opt);
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.category == CheckCategory::BadStatAccounting
+                && diagnostic.detail.contains("stored under key")
+        }),
+        "a stat record under the wrong key must be reported: {report:?}"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "extra_check")]
 mod leaks {
     use super::*;
     use mace::maintenance::{
-        BUCKET_BLOB_STAT, BUCKET_DATA_STAT, FileKind, IHeader, IMetaCodec, MetaReader, PersistStat,
-        ROOT_PID, page_table_name,
+        BUCKET_BLOB_STAT, BUCKET_DATA_STAT, FileKind, IHeader, IMetaCodec, IntervalPair,
+        MetaReader, PersistStat, ROOT_PID, interval_bucket_name, page_table_name,
     };
     use mace::testing::{
         add_inactive_mark_for_leak_test, drop_one_inactive_mark_for_leak_test,
@@ -1499,6 +1592,144 @@ mod leaks {
             );
             assert_eq!(before, fingerprint(&root));
         }
+    }
+
+    #[test]
+    fn a_stat_owned_by_another_bucket_is_not_repaired() {
+        let root = RandomPath::tmp();
+        let (opt, id) = seed_junk(&root);
+        let other_id = {
+            let mut other_opt = Options::new(&*root);
+            other_opt.gc_timeout = 0;
+            other_opt.sync_on_write = true;
+            let mace = Mace::new(other_opt.validate().unwrap()).unwrap();
+            let other = mace.new_bucket("other", BucketOptions::default()).unwrap();
+            other.checkpoint_and_wait();
+            let other_id = other.id();
+            drop(other);
+            drop(mace);
+            other_id
+        };
+
+        let mut bad = stats(&opt, FileKind::Data)
+            .into_iter()
+            .find(|stat| stat.bucket_id == id && stat.active_elems > 0)
+            .expect("the seeded bucket has an active data file");
+        bad.bucket_id = other_id;
+        write_stat(&opt, FileKind::Data, &bad);
+        let before = stats(&opt, FileKind::Data)
+            .into_iter()
+            .find(|stat| stat.file_id == bad.file_id)
+            .expect("patched stat record");
+
+        let result = leak_check_database(&opt, true);
+        assert!(result.fault.is_none(), "{result:?}");
+        assert!(
+            result.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.category == CheckCategory::BadInterval
+                    && diagnostic.file_id == Some(bad.file_id)
+            }),
+            "the ownership contradiction must be reported: {result:?}"
+        );
+        assert!(
+            result.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.category == CheckCategory::LeakUndecidable
+                    && diagnostic.file_id == Some(bad.file_id)
+            }),
+            "the contradicted file must stay visible as an undecidable leak: {result:?}"
+        );
+        assert!(
+            !result
+                .report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.category == CheckCategory::JunkLeak
+                    && diagnostic.file_id == Some(bad.file_id)),
+            "a file owned by another bucket must not be reported as junk: {result:?}"
+        );
+        assert!(
+            result
+                .repairs
+                .iter()
+                .all(|repair| repair.file_id != bad.file_id),
+            "a file whose intervals name another bucket must not be repaired: {result:?}"
+        );
+        let after = stats(&opt, FileKind::Data)
+            .into_iter()
+            .find(|stat| stat.file_id == bad.file_id)
+            .expect("patched stat record");
+        assert_eq!(before.bucket_id, after.bucket_id);
+        assert_eq!(before.active_elems, after.active_elems);
+        assert_eq!(before.inactive_elems, after.inactive_elems);
+    }
+
+    #[test]
+    fn an_unresolvable_interval_start_does_not_suppress_the_repair() {
+        let root = RandomPath::tmp();
+        let (opt, id) = seed_junk(&root);
+        let target = stats(&opt, FileKind::Data)
+            .into_iter()
+            .find(|stat| !stat.inactive_elems.is_empty())
+            .expect("the seeded store has a mixed data file");
+        let file = target.file_id;
+        drop_one_inactive_mark_for_leak_test(&opt, FileKind::Data, file);
+        let baseline = leak_check_database(&opt, false);
+        assert!(
+            baseline.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.category == CheckCategory::JunkLeak && diagnostic.file_id == Some(file)
+            }),
+            "the dropped mark must show up as a leak: {baseline:?}"
+        );
+
+        // rewrite one interval row that names this file so its start no longer resolves,
+        // while the stat ledger owner (and therefore the ownership pair) stays correct
+        let bucket = interval_bucket_name(FileKind::Data, id);
+        let tree = BTree::open(opt.manifest()).unwrap();
+        let mut row = None;
+        tree.view(&bucket, |tx| {
+            let mut iter = tx.iter();
+            let (mut key, mut value) = (Vec::new(), Vec::new());
+            while iter.next_ref(&mut key, &mut value) {
+                if value.len() >= std::mem::size_of::<IntervalPair>() {
+                    let pair = IntervalPair::decode(&value);
+                    if pair.file_id == file {
+                        row = Some((key.clone(), pair));
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        let (key, mut pair) = row.expect("one interval row must name the junk file");
+        pair.lo_addr = u64::MAX;
+        let mut bytes = vec![0u8; pair.packed_size()];
+        pair.encode(&mut bytes);
+        tree.exec(&bucket, |tx| tx.put(key, bytes)).unwrap();
+        drop(tree);
+
+        let result = leak_check_database(&opt, true);
+        assert!(result.fault.is_none(), "{result:?}");
+        assert!(
+            result.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.category == CheckCategory::BadInterval
+                    && diagnostic
+                        .detail
+                        .contains("interval start does not resolve")
+            }),
+            "the unresolvable interval start must be reported: {result:?}"
+        );
+        assert!(
+            !result.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.category == CheckCategory::LeakUndecidable
+                    && diagnostic.file_id == Some(file)
+            }),
+            "an unrelated BadInterval must not make the file undecidable: {result:?}"
+        );
+        assert!(
+            result.repairs.iter().any(|repair| repair.file_id == file),
+            "the leaked file must still be repaired: {result:?}"
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use mace::maintenance::{
-    BucketDurableFrontier, EntryType, File, GatherIO, Options, PayloadType, Position, WalAbort,
-    WalCheckpoint, WalUpdate, ptr_to, wal_record_sz,
+    BucketDurableFrontier, EntryType, File, GatherIO, Options, PayloadType, Position, WalUpdate,
+    wal_abort_at, wal_checkpoint_at, wal_record_sz, wal_update_at,
 };
 
 use super::{CheckCategory, CheckReport, Diagnostic};
@@ -151,7 +151,10 @@ fn check_wal_segment(
         let reason = match wal_record_len(&data, offset) {
             Ok(len) => {
                 if EntryType::try_from(data[offset]) == Ok(EntryType::Update) {
-                    let update = ptr_to::<WalUpdate>(unsafe { data.as_ptr().add(offset) });
+                    let Some(update) = wal_update_at(&data, offset) else {
+                        offset += len;
+                        continue;
+                    };
                     let bucket_id = update.bucket_id;
                     let group = update.group_id as usize;
                     if group >= Options::MAX_CONCURRENT_WRITE as usize {
@@ -215,7 +218,14 @@ fn wal_record_len(data: &[u8], offset: usize) -> Result<usize, &'static str> {
     }
     match kind {
         EntryType::Update => {
-            let update = ptr_to::<WalUpdate>(unsafe { data.as_ptr().add(offset) });
+            // validate the payload discriminant before borrowing the header: the accessor
+            // rejects invalid discriminants, and this check keeps the precise reason
+            if PayloadType::try_from(data[offset + 1]).is_err() {
+                return Err("unknown payload type");
+            }
+            let Some(update) = wal_update_at(data, offset) else {
+                return Err("truncated record header");
+            };
             let Ok(payload_len) = WalUpdate::checked_payload_len(update.size) else {
                 return Err("payload length is out of range");
             };
@@ -228,12 +238,9 @@ fn wal_record_len(data: &[u8], offset: usize) -> Result<usize, &'static str> {
             if !update.is_intact() {
                 return Err("record checksum mismatch");
             }
-            // recovery refuses a record whose payload layout does not validate
-            // (`PayloadType::try_from` + `WalUpdate::validate_record`), so the checker
-            // must not walk past it and call the stream clean
-            if PayloadType::try_from(data[offset + 1]).is_err() {
-                return Err("unknown payload type");
-            }
+            // recovery refuses a record whose payload layout does not validate, so the checker
+            // must not walk past it and call the stream clean (the payload type was checked
+            // before the header borrow)
             if update
                 .validate_record(&data[offset..offset + total_len])
                 .is_err()
@@ -243,14 +250,18 @@ fn wal_record_len(data: &[u8], offset: usize) -> Result<usize, &'static str> {
             Ok(total_len)
         }
         EntryType::CheckPoint => {
-            let checkpoint = ptr_to::<WalCheckpoint>(unsafe { data.as_ptr().add(offset) });
+            let Some(checkpoint) = wal_checkpoint_at(data, offset) else {
+                return Err("truncated record header");
+            };
             if !checkpoint.is_intact() {
                 return Err("checkpoint record checksum mismatch");
             }
             Ok(header_len)
         }
         EntryType::Begin | EntryType::Commit | EntryType::Abort => {
-            let terminal = ptr_to::<WalAbort>(unsafe { data.as_ptr().add(offset) });
+            let Some(terminal) = wal_abort_at(data, offset) else {
+                return Err("truncated record header");
+            };
             if !terminal.is_intact() {
                 return Err("terminal record checksum mismatch");
             }

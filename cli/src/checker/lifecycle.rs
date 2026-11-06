@@ -71,13 +71,38 @@ pub(super) fn check_lifecycle(
                                     facts.frontiers.insert(id, frontier);
                                 } else {
                                     facts.healthy = false;
+                                    report.push_diagnostic(
+                                        Diagnostic::new(
+                                            CheckCategory::BadLifecycleState,
+                                            format!(
+                                                "durable frontier row {id} carries bucket id {}",
+                                                frontier.bucket_id
+                                            ),
+                                        )
+                                        .with_bucket(id),
+                                    );
                                 }
                             } else {
                                 facts.healthy = false;
+                                report.push_diagnostic(
+                                    Diagnostic::new(
+                                        CheckCategory::BadLifecycleState,
+                                        format!(
+                                            "durable frontier row {id} carries {} bytes, expected {}",
+                                            value.len(),
+                                            size_of::<BucketDurableFrontier>()
+                                        ),
+                                    )
+                                    .with_bucket(id),
+                                );
                             }
                         }
                     } else {
                         facts.healthy = false;
+                        report.push_diagnostic(Diagnostic::new(
+                            CheckCategory::BadLifecycleState,
+                            format!("lifecycle row in {bucket} has a {}-byte key", key.len()),
+                        ));
                     }
                 }
                 Ok(())

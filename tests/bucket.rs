@@ -17,11 +17,10 @@ impl Drop for BucketCreateHookReset {
 }
 
 #[cfg(feature = "extra_check")]
-fn bucket_create_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .expect("bucket create test lock")
+fn bucket_create_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    // the hook is process-global; use the shared poison-free lock so an earlier panic
+    // cannot cascade into the remaining hook tests
+    mace::testing::hooks_lock()
 }
 
 /// start a probe and prove it reached the call before asserting that it has not returned

@@ -428,8 +428,10 @@ impl Options {
     /// Sets the process-wide diagnostics level.
     ///
     /// Every `Mace` instance in the process shares it, an open does not change it, and the
-    /// default is [`DiagLevel::Warn`]. [`DiagLevel::Off`] silences every diagnostic; the
-    /// fail-stop report in `crate::error` is never filtered.
+    /// default is [`DiagLevel::Warn`]. [`DiagLevel::Off`] silences every filtered diagnostic.
+    /// Reports that bypass the filter (a corrupt merge operand) and reports emitted on a fatal
+    /// path (a flush-publish abort) are not filtered, and neither is the fail-stop report in
+    /// `crate::error`.
     pub fn set_diag_level(level: DiagLevel) {
         diag::set_diag_level(level);
     }

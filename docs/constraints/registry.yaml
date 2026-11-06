@@ -769,8 +769,6 @@ entries:
       options, name, count; a pre-commit drop removes only the three empty btree tables, while a
       post-commit drop must not delete tables the committed metadata references. Never: a reader
       listing a bucket that cannot be opened, and never a rollback leaving an observable name or count.
-      Promote to active once `bucket_create_is_invisible_until_manifest_commit` and
-      `bucket_create_publish_waits_for_lock_after_commit` run in the default `extra_check` matrix.
     break_consequence: >
       A caller observes a bucket during creation that later disappears on rollback, or blocks on a
       partially published catalog entry; the same window can leave the bucket count inconsistent

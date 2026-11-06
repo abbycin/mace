@@ -493,8 +493,16 @@ pub(crate) struct MaskPin<'a> {
 
 impl Drop for MaskPin<'_> {
     fn drop(&mut self) {
+        let mut reinsert = false;
         if let Some(mut stat) = self.accounting.map.get_mut(&self.file_id) {
             stat.mask_pins = stat.mask_pins.saturating_sub(1);
+            // an eviction that ran while this pin was held skipped the mask; re-admit it once
+            // the last pin is gone so the mask cache budget still bounds the resident masks
+            reinsert = stat.mask_pins == 0 && stat.mask.is_some();
+            drop(stat);
+        }
+        if reinsert {
+            self.accounting.record_mask_use(self.file_id);
         }
     }
 }
@@ -550,6 +558,8 @@ mod tests {
         assert_eq!(accounting.map.get(&1).unwrap().mask_pins, 1);
         drop(pin);
         assert_eq!(accounting.map.get(&1).unwrap().mask_pins, 0);
+        // the eviction skipped this mask while it was pinned, so the unpin must re-admit it
+        assert!(accounting.mask_cache.get(&1).is_some());
     }
 
     #[test]

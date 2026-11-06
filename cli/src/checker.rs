@@ -293,7 +293,7 @@ mod tests {
     #[cfg(feature = "extra_check")]
     use std::sync::Arc;
 
-    use super::leak::{classify_leaks, leak_bad_stat};
+    use super::leak::{RepairBlocks, classify_leaks, leak_bad_stat};
     use super::payload::payload_path;
     use super::stats::{StatRecord, StatView};
     use super::{CheckCategory, check_database, classify_open_error};
@@ -349,7 +349,10 @@ mod tests {
                 kind,
                 &view,
                 &BTreeSet::from([10]),
-                &HashSet::new(),
+                RepairBlocks {
+                    files: &HashSet::new(),
+                    contradicted: &HashSet::new(),
+                },
                 &mut report,
             )
             .unwrap();
@@ -1227,7 +1230,7 @@ mod tests {
     /// checksum is intact
     #[test]
     fn a_wal_record_with_an_invalid_payload_layout_is_reported() {
-        use mace::maintenance::{IWalCodec, PayloadType, WalUpdate, ptr_to};
+        use mace::maintenance::{IWalCodec, PayloadType, WalUpdate, wal_update_at};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -1267,7 +1270,7 @@ mod tests {
         record[prefix..prefix + 4].copy_from_slice(&(value.len() as u32).to_le_bytes());
         record[prefix + 4..].copy_from_slice(value);
         {
-            let header = ptr_to::<WalUpdate>(record.as_ptr());
+            let header = wal_update_at(&record, 0).expect("crafted wal header");
             let checksum = header.calc_checksum();
             let slot = record
                 .as_mut_ptr()
@@ -1276,7 +1279,9 @@ mod tests {
             unsafe { slot.write_unaligned(checksum) };
         }
         assert!(
-            ptr_to::<WalUpdate>(record.as_ptr()).is_intact(),
+            wal_update_at(&record, 0)
+                .expect("crafted wal header")
+                .is_intact(),
             "the crafted record must carry a valid checksum"
         );
         let segment = opt.group_wal_file(1);
@@ -1297,7 +1302,7 @@ mod tests {
 
     #[test]
     fn a_checksum_valid_out_of_range_group_id_is_reported() {
-        use mace::maintenance::{EntryType, WalUpdate, ptr_to, wal_record_sz};
+        use mace::maintenance::{EntryType, WalUpdate, wal_record_sz, wal_update_at};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -1323,7 +1328,7 @@ mod tests {
                 break;
             }
             if kind == EntryType::Update {
-                let update = ptr_to::<WalUpdate>(unsafe { data.as_ptr().add(offset) });
+                let update = wal_update_at(&data, offset).expect("framed wal header");
                 let payload_len = WalUpdate::checked_payload_len(update.size).expect("payload");
                 let total_len = WalUpdate::checked_encoded_len(payload_len).expect("record");
                 if offset + total_len > data.len() {
@@ -1331,7 +1336,7 @@ mod tests {
                 }
                 let record = &mut data[offset..offset + total_len];
                 record[std::mem::offset_of!(WalUpdate, group_id)] = u8::MAX;
-                let update = ptr_to::<WalUpdate>(record.as_ptr());
+                let update = wal_update_at(record, 0).expect("framed wal header");
                 let checksum = update.calc_checksum();
                 let checksum_offset = std::mem::offset_of!(WalUpdate, checksum);
                 unsafe {
@@ -1393,7 +1398,7 @@ mod tests {
     /// tail rule must not hide)
     #[test]
     fn a_wal_checksum_mismatch_is_reported() {
-        use mace::maintenance::{EntryType, WalUpdate, ptr_to, wal_record_sz};
+        use mace::maintenance::{EntryType, WalUpdate, wal_record_sz, wal_update_at};
 
         let root = RandomPath::tmp();
         std::fs::create_dir_all(&*root).expect("scratch dir");
@@ -1426,7 +1431,7 @@ mod tests {
             }
             match kind {
                 EntryType::Update => {
-                    let update = ptr_to::<WalUpdate>(unsafe { data.as_ptr().add(offset) });
+                    let update = wal_update_at(&data, offset).expect("framed wal header");
                     let Ok(payload_len) = WalUpdate::checked_payload_len(update.size) else {
                         break;
                     };

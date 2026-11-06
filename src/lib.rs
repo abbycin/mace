@@ -31,12 +31,12 @@ mod utils;
 mod types;
 pub use index::{Iter, ValRef};
 
-/// internal on-disk inspection surface for the pinned maintenance CLI
+/// internal on-disk inspection surface for the compatible maintenance CLI
 ///
 /// nothing in here is part of the engine's stable API. it exists so the
 /// offline checker can read the same format definitions the engine writes;
-/// the CLI pins this crate's exact version, so a change is a compile error
-/// there rather than a silent format drift.
+/// the CLI depends on a semver-compatible library release, so changes to
+/// this surface or the on-disk format require coordinated package updates.
 #[cfg(feature = "maintenance")]
 #[doc(hidden)]
 pub mod maintenance;

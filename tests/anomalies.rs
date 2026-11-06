@@ -513,6 +513,45 @@ fn history() -> Result<(), OpCode> {
     Ok(())
 }
 
+#[test]
+fn committed_delete_reads_absent_without_stale_read() {
+    let (mut s1, mut s2, e) = prelude!(1, 2);
+
+    s1.begin();
+    s1.replace("1", "11").unwrap();
+    s1.commit();
+
+    s2.begin();
+    assert_eq!(s2.get("1").unwrap().as_slice(), "11".as_bytes());
+    s2.commit();
+
+    s1.begin();
+    s1.del("1").unwrap();
+    s1.commit();
+
+    s2.begin();
+    assert!(matches!(s2.get("1"), Err(OpCode::NotFound)));
+    s2.commit();
+
+    e.finish(0);
+}
+
+#[test]
+fn own_delete_then_read_is_accepted() {
+    let (mut s1, e) = prelude!(1);
+
+    s1.begin();
+    s1.replace("1", "11").unwrap();
+    s1.commit();
+
+    s1.begin();
+    s1.del("1").unwrap();
+    assert!(matches!(s1.get("1"), Err(OpCode::NotFound)));
+    s1.commit();
+
+    e.finish(0);
+}
+
 //////////////////////// auxiliaries ////////////////////////
 
 struct Executor {
@@ -957,7 +996,13 @@ impl Session {
                 .unwrap_or(trace::Owner::View);
             self.trace.read(owner, &key, bytes.as_deref());
         }
-        v.unwrap()
+        let result = v.unwrap();
+        if is_del && let Some(txn) = self.txn {
+            // a committed delete is a tombstone version; without it a later absent read
+            // compares against the pre-delete version and looks like a stale read
+            self.trace.write(txn, &key, result.is_ok(), None);
+        }
+        result
     }
 
     fn sync(&self) {
@@ -1039,6 +1084,66 @@ mod checker {
             "{}",
             v.describe()
         );
+    }
+
+    #[test]
+    fn a_committed_tombstone_makes_an_absent_read_current() {
+        let rec = Recorder::new();
+        let put = rec.alloc_txn();
+        rec.begin(put);
+        write(&rec, put, "k", "v");
+        rec.commit(put, true);
+
+        let del = rec.alloc_txn();
+        rec.begin(del);
+        rec.write(del, b"k", true, None).unwrap();
+        rec.commit(del, true);
+
+        rec.read(Owner::View, b"k", None);
+        let v = rec.verdict();
+        assert!(v.accepted(), "{}", v.describe());
+        assert_eq!(v.inconclusive, 0);
+    }
+
+    #[test]
+    fn reading_the_value_after_a_committed_tombstone_is_stale() {
+        let rec = Recorder::new();
+        let put = rec.alloc_txn();
+        rec.begin(put);
+        write(&rec, put, "k", "v");
+        rec.commit(put, true);
+
+        let del = rec.alloc_txn();
+        rec.begin(del);
+        rec.write(del, b"k", true, None).unwrap();
+        rec.commit(del, true);
+
+        rec.read(Owner::View, b"k", Some(b"v"));
+        let v = rec.verdict();
+        assert!(
+            v.violations.iter().any(|x| x.rule == Rule::StaleRead),
+            "{}",
+            v.describe()
+        );
+    }
+
+    #[test]
+    fn own_delete_then_read_builds_no_cycle() {
+        let rec = Recorder::new();
+        let t = rec.alloc_txn();
+        rec.begin(t);
+        write(&rec, t, "k", "v");
+        rec.commit(t, true);
+
+        let r = rec.alloc_txn();
+        rec.begin(r);
+        rec.write(r, b"k", true, None).unwrap();
+        rec.read(Owner::Txn(r), b"k", None);
+        rec.commit(r, true);
+
+        let v = rec.verdict();
+        assert!(v.accepted(), "{}", v.describe());
+        assert_eq!(v.inconclusive, 0);
     }
 
     #[test]

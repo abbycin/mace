@@ -306,6 +306,9 @@ pub(super) fn classify_database_leaks(
     report: &mut CheckReport,
 ) -> Vec<RepairPlan> {
     let stats = FileKind::ALL.map(|kind| read_stats(opt, btree, kind).0);
+    // the interval phase records the exact files whose owning bucket contradicts the stat
+    // ledger; only those lose their reachability source
+    let contradicted = checks.contradicted.clone();
     let mut repairs = Vec::new();
     if lifecycle.inventory_complete {
         for (kind, view) in FileKind::ALL.into_iter().zip(&stats) {
@@ -394,7 +397,10 @@ pub(super) fn classify_database_leaks(
                 kind,
                 view,
                 &closure.seen,
-                &lifecycle.blocked_files,
+                RepairBlocks {
+                    files: &lifecycle.blocked_files,
+                    contradicted: &contradicted,
+                },
                 report,
             ) {
                 Ok(plans) => repairs.extend(plans),
@@ -410,17 +416,39 @@ pub(super) fn classify_database_leaks(
     repairs
 }
 
+/// files a repair must not touch
+pub(super) struct RepairBlocks<'a> {
+    /// lifecycle markers already blocked this file
+    pub(super) files: &'a HashSet<(FileKind, u64)>,
+    /// the interval owner contradicts the stat ledger for this file
+    pub(super) contradicted: &'a HashSet<u64>,
+}
+
 pub(super) fn classify_leaks(
     opt: &Options,
     bucket: u64,
     kind: FileKind,
     stats: &StatView,
     reachable: &BTreeSet<u64>,
-    blocked: &HashSet<(FileKind, u64)>,
+    blocks: RepairBlocks<'_>,
     report: &mut CheckReport,
 ) -> Result<Vec<RepairPlan>, Diagnostic> {
     let mut files = Vec::new();
     for stat in stats.records.iter().filter(|stat| stat.bucket_id == bucket) {
+        // the interval rows of another bucket name this file: the stat ledger cannot decide
+        // which bucket owns its reachability, so report that and derive no mark from either
+        // bucket's closure
+        if blocks.contradicted.contains(&stat.file_id) {
+            report.push_diagnostic(
+                undecidable(
+                    bucket,
+                    kind,
+                    "interval ownership contradicts the stat ledger",
+                )
+                .with_file(stat.file_id),
+            );
+            continue;
+        }
         let path = payload_path(opt, kind, stat.file_id);
         let relocs = MetaReader::try_new(opt.fs(), &path)
             .and_then(|mut reader| reader.try_get_reloc())
@@ -514,7 +542,7 @@ pub(super) fn classify_leaks(
                 .with_address(addr),
             );
         }
-        if leaked.is_empty() || overmarked || blocked.contains(&(kind, stat.file_id)) {
+        if leaked.is_empty() || overmarked || blocks.files.contains(&(kind, stat.file_id)) {
             continue;
         }
         let added_inactive = leaked.len();

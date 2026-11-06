@@ -178,6 +178,11 @@ impl BucketState {
     }
 
     #[inline]
+    pub(crate) fn is_deleting(&self) -> bool {
+        Lifecycle::from_raw(self.lifecycle.load(SeqCst)) == Lifecycle::Deleting
+    }
+
+    #[inline]
     pub(crate) fn is_busy(&self) -> bool {
         self.txn_ref.load(Acquire) > 0
     }

@@ -470,18 +470,81 @@ pub(crate) struct Location {
     pub(crate) pos: Position,
 }
 
-pub fn ptr_to<T>(x: *const u8) -> &'static T {
+pub(crate) fn ptr_to<T>(x: *const u8) -> &'static T {
     unsafe { &*x.cast::<T>() }
+}
+
+/// borrows the `update` header at `offset`
+///
+/// the header is `packed`, so the borrow has no alignment requirement, and the returned
+/// lifetime ties it to `buf`; `None` means `buf` does not cover the whole header. the caller
+/// still has to frame the record before reading its payload.
+#[cfg(feature = "maintenance")]
+pub fn wal_update_at(buf: &[u8], offset: usize) -> Option<&WalUpdate> {
+    let end = offset.checked_add(size_of::<WalUpdate>())?;
+    let bytes = buf.get(offset..end)?;
+    // a reference to an out-of-range enum discriminant is invalid, so the header is only
+    // borrowed after both discriminants validate
+    EntryType::try_from(bytes[0]).ok()?;
+    PayloadType::try_from(bytes[1]).ok()?;
+    // SAFETY: `WalUpdate` is `packed(1)`; `bytes` covers the complete header and outlives the ref
+    Some(unsafe { &*bytes.as_ptr().cast::<WalUpdate>() })
+}
+
+/// borrows the checkpoint header at `offset`, see [`wal_update_at`]
+#[cfg(feature = "maintenance")]
+pub fn wal_checkpoint_at(buf: &[u8], offset: usize) -> Option<&WalCheckpoint> {
+    let end = offset.checked_add(size_of::<WalCheckpoint>())?;
+    let bytes = buf.get(offset..end)?;
+    EntryType::try_from(bytes[0]).ok()?;
+    // SAFETY: `WalCheckpoint` is `packed(1)`; the slice covers the header and outlives the ref
+    Some(unsafe { &*bytes.as_ptr().cast::<WalCheckpoint>() })
+}
+
+/// borrows the terminal (begin/commit/abort) header at `offset`, see [`wal_update_at`]
+#[cfg(feature = "maintenance")]
+pub fn wal_abort_at(buf: &[u8], offset: usize) -> Option<&WalAbort> {
+    let end = offset.checked_add(size_of::<WalAbort>())?;
+    let bytes = buf.get(offset..end)?;
+    EntryType::try_from(bytes[0]).ok()?;
+    // SAFETY: `WalAbort` is `packed(1)`; the slice covers the header and outlives the ref
+    Some(unsafe { &*bytes.as_ptr().cast::<WalAbort>() })
 }
 
 #[cfg(test)]
 mod test {
     use crate::cc::wal::{
-        EntryType, IWalCodec, PayloadType, WalBegin, WalPut, WalReplace, WalUpdate, ptr_to,
+        EntryType, IWalCodec, PayloadType, WalAbort, WalBegin, WalCheckpoint, WalPut, WalReplace,
+        WalUpdate, ptr_to,
     };
     use crate::utils::OpCode;
     use crate::utils::data::Position;
     use crate::utils::options::Options;
+
+    #[cfg(feature = "maintenance")]
+    #[test]
+    fn wal_accessors_reject_invalid_discriminants() {
+        let mut update = vec![0u8; std::mem::size_of::<WalUpdate>()];
+        update[0] = EntryType::Update as u8;
+        update[1] = 0xff;
+        assert!(super::wal_update_at(&update, 0).is_none());
+        update[1] = PayloadType::Insert as u8;
+        assert!(super::wal_update_at(&update, 0).is_some());
+
+        let mut checkpoint = vec![0u8; std::mem::size_of::<WalCheckpoint>()];
+        checkpoint[0] = 0xff;
+        assert!(super::wal_checkpoint_at(&checkpoint, 0).is_none());
+        checkpoint[0] = EntryType::CheckPoint as u8;
+        assert!(super::wal_checkpoint_at(&checkpoint, 0).is_some());
+
+        let mut abort = vec![0u8; std::mem::size_of::<WalAbort>()];
+        abort[0] = 0xff;
+        assert!(super::wal_abort_at(&abort, 0).is_none());
+        abort[0] = EntryType::Abort as u8;
+        assert!(super::wal_abort_at(&abort, 0).is_some());
+
+        assert!(super::wal_update_at(&update, 1).is_none());
+    }
 
     #[test]
     fn dump_load() {

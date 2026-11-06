@@ -1,7 +1,7 @@
 //! dependency-free diagnostics: timestamp, os thread id, level, file:line.
 //!
 //! there is no registration step and no global logger object. the level filter is one
-//! atomic, applied by `Options::validate`, and the sink is stderr, so a report cannot be
+//! atomic, applied by `Options::set_diag_level`, and the sink is stderr, so a report cannot be
 //! lost because the embedder forgot to install something. a disabled level costs one
 //! atomic load and never formats its arguments.
 //!

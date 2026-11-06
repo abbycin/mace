@@ -66,7 +66,8 @@ If the binary was installed from the older `mace-kv` package, run `cargo uninsta
 add `--force`; cargo will not overwrite a binary owned by another package.
 
 The library crate is still published as `mace-kv` and imported as `mace`; the two packages version
-independently, while the CLI pins the library exactly because the tool reads its on-disk format.
+independently, while the CLI accepts semver-compatible library releases because the tool reads the
+library's on-disk format definitions.
 
 ## Status
 

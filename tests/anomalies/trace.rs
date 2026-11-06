@@ -48,6 +48,7 @@ pub enum Ev {
         key: Vec<u8>,
         ok: bool,
         wref: Option<WriteRef>,
+        tombstone: bool,
     },
     Commit {
         txn: TxnId,
@@ -70,7 +71,7 @@ struct State {
     next_txn: TxnId,
     next_op: BTreeMap<TxnId, u32>,
     seeds: Vec<(Vec<u8>, Vec<u8>)>,
-    writes: Vec<(WriteRef, Vec<u8>, Vec<u8>)>,
+    writes: Vec<(WriteRef, Vec<u8>, Option<Vec<u8>>)>,
 }
 
 impl Default for Recorder {
@@ -127,7 +128,7 @@ impl Recorder {
             let wref = WriteRef { txn, op: *op };
             *op += 1;
             st.writes
-                .push((wref, key.to_vec(), bytes.unwrap_or_default().to_vec()));
+                .push((wref, key.to_vec(), bytes.map(ToOwned::to_owned)));
             Some(wref)
         } else {
             None
@@ -137,6 +138,7 @@ impl Recorder {
             key: key.to_vec(),
             ok,
             wref,
+            tombstone: bytes.is_none(),
         });
         wref
     }
@@ -178,7 +180,7 @@ impl State {
             }
         }
         for (wref, write_key, write_bytes) in &self.writes {
-            if write_key == key && write_bytes == bytes {
+            if write_key == key && write_bytes.as_deref() == Some(bytes) {
                 candidates.push(Attr::Unique(*wref));
             }
         }
@@ -278,6 +280,7 @@ impl Verdict {
 struct Version {
     order: u64,
     wref: Option<WriteRef>,
+    tombstone: bool,
 }
 
 struct Index {
@@ -285,6 +288,7 @@ struct Index {
     commit_idx: BTreeMap<TxnId, usize>,
     versions: BTreeMap<Vec<u8>, Vec<Version>>,
     order_of: BTreeMap<WriteRef, u64>,
+    tombstones: BTreeSet<WriteRef>,
 }
 
 fn build_index(events: &[Ev]) -> Index {
@@ -313,7 +317,20 @@ fn build_index(events: &[Ev]) -> Index {
             versions.entry(key.clone()).or_default().push(Version {
                 order: *next,
                 wref: None,
+                tombstone: false,
             });
+        }
+    }
+
+    let mut tombstones = BTreeSet::new();
+    for ev in events {
+        if let Ev::Write {
+            wref: Some(wref),
+            tombstone: true,
+            ..
+        } = ev
+        {
+            tombstones.insert(*wref);
         }
     }
 
@@ -349,6 +366,7 @@ fn build_index(events: &[Ev]) -> Index {
             list.push(Version {
                 order: next,
                 wref: Some(wref),
+                tombstone: tombstones.contains(&wref),
             });
             order_of.insert(wref, next);
         }
@@ -359,6 +377,7 @@ fn build_index(events: &[Ev]) -> Index {
         commit_idx,
         versions,
         order_of,
+        tombstones,
     }
 }
 
@@ -424,17 +443,22 @@ pub fn check(events: &[Ev]) -> Verdict {
                         inconclusive += 1;
                         continue;
                     }
-                    if *attr != Attr::Unique(prior) {
+                    let expected = if index.tombstones.contains(&prior) {
+                        Attr::Absent
+                    } else {
+                        Attr::Unique(prior)
+                    };
+                    if *attr != expected {
                         verdict.violations.push(Violation {
                             rule: Rule::SelfRead,
                             detail: format!(
-                                "txn {owner_txn:?} read key {key:?} as {attr:?}, expected own write {prior:?}"
+                                "txn {owner_txn:?} read key {key:?} as {attr:?}, expected {expected:?} from own write {prior:?}"
                             ),
                         });
                     }
                 } else if let Some(snapshot) = snapshot_event(events, *owner, idx) {
                     let newest = newest_before(&index, key, snapshot);
-                    match observed_order(&index, *attr) {
+                    match read_order(&index, key, *attr, Some(snapshot)) {
                         Some(order) => {
                             verdict.coverage.boundary += 1;
                             if let Some(newest) = newest
@@ -465,7 +489,12 @@ pub fn check(events: &[Ev]) -> Verdict {
                     }
                 }
 
-                if let Some(order) = observed_order(&index, *attr) {
+                // a read that reflects the transaction's own write has no external order to
+                // compare against; only foreign observations enter the stability check
+                if own_prior.is_none()
+                    && let Some(order) =
+                        read_order(&index, key, *attr, snapshot_event(events, *owner, idx))
+                {
                     let slot = (*owner, key.clone());
                     if let Some(prev) = seen.get(&slot) {
                         verdict.coverage.stability += 1;
@@ -487,7 +516,11 @@ pub fn check(events: &[Ev]) -> Verdict {
                     {
                         edges.entry(wref.txn).or_default().push((t, false));
                     }
-                    if let Some(order) = observed_order(&index, *attr)
+                    // an own-write observation is not an anti-dependency on the background
+                    // version; the uncommitted write has no index order yet
+                    if own_prior.is_none()
+                        && let Some(order) =
+                            read_order(&index, key, *attr, snapshot_event(events, *owner, idx))
                         && let Some(list) = index.versions.get(key)
                     {
                         for version in list {
@@ -644,9 +677,14 @@ fn newest_before(index: &Index, key: &[u8], snapshot: usize) -> Option<Version> 
     newest
 }
 
-fn observed_order(index: &Index, attr: Attr) -> Option<u64> {
+fn read_order(index: &Index, key: &[u8], attr: Attr, snapshot: Option<usize>) -> Option<u64> {
     match attr {
-        Attr::Absent => Some(0),
+        // an absent read stands at the newest visible tombstone when one exists; order 0 is
+        // the initial (absent) state, so the two cases must not be conflated
+        Attr::Absent => match snapshot.and_then(|at| newest_before(index, key, at)) {
+            Some(version) if version.tombstone => Some(version.order),
+            _ => Some(0),
+        },
         Attr::Seed => Some(1),
         Attr::Unique(wref) => index.order_of.get(&wref).copied(),
         _ => None,

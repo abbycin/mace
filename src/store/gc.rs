@@ -228,7 +228,10 @@ impl GarbageCollector {
         for kind in FileKind::ALL {
             self.process_files(kind);
         }
-        must_ok!(self.process_pending_buckets());
+        if let Err(err) = self.process_pending_buckets() {
+            // a read failure keeps the pending record and the bucket count; retry next round
+            diag::error!("pending bucket cleanup skipped: {err:?}");
+        }
         must_ok!(self.store.manifest.delete_files());
         #[cfg(feature = "metrics")]
         self.store.opt.observer.histogram(

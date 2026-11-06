@@ -254,6 +254,20 @@ impl BucketCatalog {
         mode: BucketRemoveMode,
     ) -> Result<u64, OpCode> {
         let _lock = self.structural_lock.lock();
+        self.begin_reclaim_locked(manager, name, mode)
+    }
+
+    /// the body of [`Self::begin_reclaim`]; the caller holds the structural lock
+    ///
+    /// a delete releases the lock after this point and re-takes it for the unpublish and the
+    /// metadata commit, so the name stays visible until then and no create can write the
+    /// record the delete transaction is about to remove
+    fn begin_reclaim_locked(
+        &self,
+        manager: &BucketManager,
+        name: &str,
+        mode: BucketRemoveMode,
+    ) -> Result<u64, OpCode> {
         let bucket_id = self.id(name).ok_or(OpCode::NotFound)?;
         let runtime = manager.runtime(bucket_id).ok_or(OpCode::NotFound)?;
         let busy = !runtime.state.is_active()
@@ -277,13 +291,23 @@ impl BucketCatalog {
         }
         runtime.state.wait_nudge_quiescent();
 
-        if matches!(mode, BucketRemoveMode::Delete) {
-            // logical delete: the name leaves the catalog now, the count keeps the pending bucket
-            self.names.remove(name);
-            self.options.remove(&bucket_id);
-            self.pending.insert(bucket_id);
-        }
         Ok(bucket_id)
+    }
+
+    /// unpublish a logically deleted bucket
+    ///
+    /// the caller holds the structural lock and has already dropped the sealed batch, so the
+    /// name stays visible until this point: a same-name create cannot pass the duplicate-name
+    /// check and write the record the delete transaction is about to remove
+    fn unpublish_delete(&self, name: &str, bucket_id: u64) {
+        debug_assert!(
+            self.structural_lock.is_locked(),
+            "delete must unpublish under the structural lock"
+        );
+        debug_assert_eq!(self.id(name), Some(bucket_id), "delete lost its name");
+        self.names.remove(name);
+        self.options.remove(&bucket_id);
+        self.pending.insert(bucket_id);
     }
 
     fn end_unload(&self, manager: &BucketManager, bucket_id: u64) {
@@ -577,6 +601,11 @@ impl Manifest {
         let _lock = self.catalog.lock();
         let bucket_id = self.catalog.id(name).ok_or(OpCode::NotFound)?;
         let runtime = self.buckets.get_runtime(bucket_id);
+        if runtime.state.is_deleting() {
+            // a deleting bucket keeps its name until the metadata commit; an update that
+            // commits before that is erased by the delete, so treat it as already gone
+            return Err(OpCode::NotFound);
+        }
 
         if self.buckets.contains_context(bucket_id) || runtime.has_rewrite() {
             diag::info!(
@@ -748,9 +777,19 @@ impl Manifest {
     }
 
     pub(crate) fn delete_bucket(&self, name: &str) -> Result<(), OpCode> {
-        let bucket_id =
+        // record the discard mode under the lock, then drop the sealed batch unlocked: the name
+        // stays in the catalog until the metadata commit, so a same-name create cannot write
+        // the record this transaction is about to delete
+        let bucket_id = {
+            let _lock = self.catalog.lock();
             self.catalog
-                .begin_reclaim(&self.buckets, name, BucketRemoveMode::Delete)?;
+                .begin_reclaim_locked(&self.buckets, name, BucketRemoveMode::Delete)?
+        };
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_bucket_delete_sync_point(
+            crate::testing::BucketDeleteSyncPoint::AfterDiscardModeRecorded,
+            bucket_id,
+        );
 
         // a logical delete drops the sealed batch instead of publishing it
         self.buckets.reclaim_bucket(bucket_id, ReclaimMode::Discard);
@@ -760,36 +799,53 @@ impl Manifest {
         for kind in FileKind::ALL {
             files[kind.slot()] = self.file_state(kind).stat.bucket_file_ids(bucket_id);
         }
+        #[cfg(feature = "extra_check")]
+        crate::testing::fire_bucket_delete_sync_point(
+            crate::testing::BucketDeleteSyncPoint::AfterDiscardBeforeCommit,
+            bucket_id,
+        );
 
         // commit transaction (logical delete)
         let mut txn = self.begin();
 
-        // remove from BUCKET_METAS
-        txn.del(BUCKET_METAS, name.as_bytes().to_vec());
-
-        // record for physical cleanup in background
-        txn.put(BUCKET_PENDING_DEL, bucket_id.to_le_bytes().to_vec(), vec![]);
-        if self.bucket_frontier.contains_key(&bucket_id) {
-            txn.del(BUCKET_FRONTIER, bucket_id.to_le_bytes().to_vec());
-        }
-
-        // record obsolete files
-        for kind in FileKind::ALL {
-            if files[kind.slot()].is_empty() {
-                continue;
-            }
-            // bucket delete is already unpublished and must not publish retired keys
-            txn.record(
-                delete_meta_kind(kind),
-                &Delete::from(files[kind.slot()].clone()),
+        {
+            // the name leaves the catalog in the same critical section as the durable delete,
+            // so creation and deletion of one name cannot interleave inside a transaction
+            let _lock = self.catalog.lock();
+            self.catalog.unpublish_delete(name, bucket_id);
+            #[cfg(feature = "extra_check")]
+            crate::testing::fire_bucket_delete_sync_point(
+                crate::testing::BucketDeleteSyncPoint::AfterUnpublishBeforeCommit,
+                bucket_id,
             );
-        }
 
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_bucket_delete_before_manifest_commit");
-        txn.commit();
-        #[cfg(feature = "failpoints")]
-        crate::utils::failpoint::crash("mace_bucket_delete_after_manifest_commit");
+            // remove from BUCKET_METAS
+            txn.del(BUCKET_METAS, name.as_bytes().to_vec());
+
+            // record for physical cleanup in background
+            txn.put(BUCKET_PENDING_DEL, bucket_id.to_le_bytes().to_vec(), vec![]);
+            if self.bucket_frontier.contains_key(&bucket_id) {
+                txn.del(BUCKET_FRONTIER, bucket_id.to_le_bytes().to_vec());
+            }
+
+            // record obsolete files
+            for kind in FileKind::ALL {
+                if files[kind.slot()].is_empty() {
+                    continue;
+                }
+                // bucket delete is already unpublished and must not publish retired keys
+                txn.record(
+                    delete_meta_kind(kind),
+                    &Delete::from(files[kind.slot()].clone()),
+                );
+            }
+
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_bucket_delete_before_manifest_commit");
+            txn.commit();
+            #[cfg(feature = "failpoints")]
+            crate::utils::failpoint::crash("mace_bucket_delete_after_manifest_commit");
+        }
 
         // in-memory cleanup for stats
         // once a bucket enters pending-delete, its file metadata must no longer participate in
@@ -897,10 +953,17 @@ mod tests {
         drop(bucket);
         mace.drop_bucket("victim").expect("unload");
 
-        let id = manifest
-            .catalog
-            .begin_reclaim(&manifest.buckets, "victim", BucketRemoveMode::Delete)
-            .expect("logical delete must begin");
+        // the delete records the mode and unpublishes under the structural lock; the test
+        // drives the same sequence so teardown does not carry a deleting runtime
+        let id = {
+            let _lock = manifest.catalog.lock();
+            let id = manifest
+                .catalog
+                .begin_reclaim_locked(&manifest.buckets, "victim", BucketRemoveMode::Delete)
+                .expect("logical delete must begin");
+            manifest.catalog.unpublish_delete("victim", bucket_id);
+            id
+        };
         assert_eq!(id, bucket_id);
         assert!(
             matches!(
@@ -910,7 +973,6 @@ mod tests {
             "a deleting bucket context must not be published to a new load"
         );
 
-        // finish the logical phase locally so teardown does not carry a deleting runtime
         manifest
             .buckets
             .reclaim_bucket(bucket_id, ReclaimMode::Discard);
