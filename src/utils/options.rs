@@ -7,6 +7,8 @@ use std::{
 use crate::io;
 use crate::must_ok;
 use crate::static_assert;
+use crate::utils::diag;
+use crate::utils::diag::DiagLevel;
 use crate::utils::merge_operator::MergeOperator;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::{NoopObserver, Observer};
@@ -423,6 +425,15 @@ impl Deref for ParsedOptions {
 }
 
 impl Options {
+    /// Sets the process-wide diagnostics level.
+    ///
+    /// Every `Mace` instance in the process shares it, an open does not change it, and the
+    /// default is [`DiagLevel::Warn`]. [`DiagLevel::Off`] silences every diagnostic; the
+    /// fail-stop report in `crate::error` is never filtered.
+    pub fn set_diag_level(level: DiagLevel) {
+        diag::set_diag_level(level);
+    }
+
     pub const SEP: &'static str = "_";
     pub const DATA_PREFIX: &'static str = "data";
     pub const BLOB_PREFIX: &'static str = "blob";
@@ -648,7 +659,7 @@ impl PersistedOptions {
 impl Drop for ParsedOptions {
     fn drop(&mut self) {
         if self.inner.tmp_store {
-            log::info!("remove db_root {:?}", self.inner.db_root);
+            diag::info!("remove db_root {:?}", self.inner.db_root);
             let _ = std::fs::remove_dir_all(&self.inner.db_root);
         }
     }

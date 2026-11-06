@@ -16,6 +16,7 @@ pub(crate) mod block;
 pub(crate) mod compress;
 pub(crate) mod countblock;
 pub(crate) mod data;
+pub(crate) mod diag;
 #[cfg(feature = "failpoints")]
 pub(crate) mod failpoint;
 pub(crate) mod imtree;

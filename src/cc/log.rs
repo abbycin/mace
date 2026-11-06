@@ -3,6 +3,7 @@ use crate::types::data::Key;
 use crate::utils::MutRef;
 use crate::utils::block::Ring;
 use crate::utils::data::Position;
+use crate::utils::diag;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::{
     CounterMetric, HistogramMetric, LATENCY_SAMPLE_SHIFT, observe_elapsed, sampled_instant,
@@ -246,14 +247,14 @@ impl Logging {
     /// the caller must hold this logger's mutex
     pub(crate) fn check_detachable(&self, epoch_start: u64) -> Result<(), OpCode> {
         if self.writer.is_none() {
-            log::error!(
+            diag::error!(
                 "refusing to detach stream {}: writer already detached",
                 self.wal_id
             );
             return Err(OpCode::IoError);
         }
         if let Some(why) = self.era_switch_blocker(epoch_start) {
-            log::error!(
+            diag::error!(
                 "refusing to detach the recovery wal writer of stream {}: {} (epoch_start={} oldest={} detached={})",
                 self.wal_id,
                 why,
@@ -284,7 +285,7 @@ impl Logging {
     /// logger detached for the caller's abort cleanup instead of half-installed
     pub(crate) fn install_epoch_writer(&mut self, epoch_start: u64) -> Result<(), OpCode> {
         if self.writer.is_some() {
-            log::error!(
+            diag::error!(
                 "refusing to install an epoch writer on stream {}: writer still attached",
                 self.wal_id
             );
@@ -294,7 +295,7 @@ impl Logging {
         // the second half of the switch and must not inherit a live generation or a queued
         // byte from anywhere but its own detach
         if let Some(why) = self.era_switch_blocker(epoch_start) {
-            log::error!(
+            diag::error!(
                 "refusing to install an epoch writer on stream {}: {} (epoch_start={} oldest={})",
                 self.wal_id,
                 why,
@@ -311,14 +312,14 @@ impl Logging {
         // closed era, and `append` never truncates them away
         let offset = writer.try_pos()?;
         if offset != 0 {
-            log::error!("epoch wal file {:?} is not empty: {offset} bytes", path);
+            diag::error!("epoch wal file {:?} is not empty: {offset} bytes", path);
             return Err(OpCode::Corruption);
         }
         // the floor vector follows the owning Context's width, so a relaxed stream outside it
         // would be an error, and it must be refused before the writer becomes observable
         let width = self.logical_checkpoint.len();
         if !self.opt.sync_on_write && (self.wal_id as usize) >= width {
-            log::error!(
+            diag::error!(
                 "relaxed wal stream {} outside the context width {}",
                 self.wal_id,
                 width

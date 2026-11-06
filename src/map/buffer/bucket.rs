@@ -38,6 +38,7 @@ use super::pool::Pool;
 use crate::map::adapter::ManifestCheckpointObserver;
 use crate::map::flow::{FlowController, ForegroundWritePermit};
 use crate::map::flush::Checkpoint;
+use crate::utils::diag;
 
 /// what a bucket-lifecycle transition does with the bucket's dirty state
 ///
@@ -692,7 +693,7 @@ impl BucketManager {
         // be stopped first belongs here: an overwritten `Checkpoint` has no `Drop`, so its
         // thread and its tasks would outlive the rebind
         if self.flush.is_some() {
-            log::error!("refusing to start a checkpoint flusher while one is running");
+            diag::error!("refusing to start a checkpoint flusher while one is running");
             return Err(OpCode::IoError);
         }
         // build the flusher before rebinding: a failed spawn must leave the manager on its

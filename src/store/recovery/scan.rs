@@ -1,4 +1,5 @@
 use super::*;
+use crate::utils::diag;
 
 impl Recovery {
     pub(super) fn mark_aborted(&mut self, store: &Store, txid: u64, oldest_file_id: Option<u64>) {
@@ -195,7 +196,7 @@ impl Recovery {
         for i in file_id..=latest_file_id {
             let path = self.opt.physical_wal_path(group_id, i);
             if !self.opt.fs.try_exists(&path)? {
-                log::error!(
+                diag::error!(
                     "wal gap detected after recycled prefix, group={group_id} file_id={i} oldest={oldest_file_id} latest={latest_file_id}"
                 );
                 return Err(OpCode::Corruption);
@@ -216,7 +217,7 @@ impl Recovery {
             loc.pos.file_id = i;
             pos = if i == file_id { offset } else { 0 };
 
-            log::trace!("{path:?} pos {pos} end {end}");
+            diag::trace!("{path:?} pos {pos} end {end}");
             while pos < end {
                 let start_pos = pos;
                 let Some((et, total)) = Self::read_wal_record(&mut f, pos, end, block)? else {
@@ -230,7 +231,7 @@ impl Recovery {
                         break;
                     }
                 };
-                log::trace!("pos {start_pos} total {total} {et:?}");
+                diag::trace!("pos {start_pos} total {total} {et:?}");
                 let ptr = block.data();
                 match et {
                     EntryType::Commit => {
@@ -240,7 +241,7 @@ impl Recovery {
                             break;
                         }
                         let txid = { a.txid };
-                        log::trace!("{a:?}");
+                        diag::trace!("{a:?}");
                         self.mark_committed(&store, txid);
                         oracle = max(txid, oracle);
                     }
@@ -251,7 +252,7 @@ impl Recovery {
                             break;
                         }
                         let txid = { a.txid };
-                        log::trace!("{a:?}");
+                        diag::trace!("{a:?}");
                         self.mark_aborted(&store, txid, Some(oldest_file_id));
                         oracle = max(txid, oracle);
                     }
@@ -262,7 +263,7 @@ impl Recovery {
                             break;
                         }
                         let txid = { b.txid };
-                        log::trace!("{b:?}");
+                        diag::trace!("{b:?}");
                         self.in_progress_txns.insert(txid);
                         self.committed_txns.remove(&txid);
                         self.pin_file
@@ -293,7 +294,7 @@ impl Recovery {
                             }
                         };
                         loc.bucket_id = bucket_id;
-                        log::trace!("{start_pos} => update txid={txid}");
+                        diag::trace!("{start_pos} => update txid={txid}");
                         loc.pos.offset = start_pos;
 
                         if !self.handle_update(&g, &mut loc, block, store.clone())? {
@@ -335,7 +336,7 @@ impl Recovery {
                     return Err(OpCode::Corruption);
                 }
                 // truncate the WAL if it's incomplete
-                log::trace!("truncate {path:?} from {end} to {pos}");
+                diag::trace!("truncate {path:?} from {end} to {pos}");
                 f.truncate(pos)?;
                 #[cfg(feature = "metrics")]
                 self.opt

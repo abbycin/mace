@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::meta::entry::{IMetaCodec, MetaOp, MetaRecord, encode_record};
 use crate::must_true;
+use crate::utils::diag;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::CounterMetric;
 
@@ -108,7 +109,7 @@ impl<'a> Txn<'a> {
                 self.ops.clear();
             }
             Err(e) => {
-                log::error!("Metadata multi-bucket commit fail: {:?}", e);
+                diag::error!("Metadata multi-bucket commit fail: {:?}", e);
                 panic!("Metadata multi-bucket commit fail: {:?}", e)
             }
         }

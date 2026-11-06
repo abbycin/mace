@@ -30,6 +30,7 @@ use crate::{
 use std::time::Instant;
 
 use super::GarbageCollector;
+use crate::utils::diag;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Score {
@@ -836,10 +837,10 @@ impl<'a> RewriteBuilder<'a> {
         writer.sync();
         match kind {
             FileKind::Data => {
-                log::info!("compacted to {path:?} {footer:?}");
+                diag::info!("compacted to {path:?} {footer:?}");
             }
             FileKind::Blob => {
-                log::info!("compacted [{beg}, {end}] to {path:?} {footer:?}");
+                diag::info!("compacted [{beg}, {end}] to {path:?} {footer:?}");
             }
         }
 

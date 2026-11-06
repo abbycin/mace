@@ -2,6 +2,7 @@ use crossbeam_epoch::Guard;
 use std::collections::HashSet;
 
 use super::GarbageCollector;
+use crate::utils::diag;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::CounterMetric;
 use crate::{
@@ -155,7 +156,7 @@ impl GarbageCollector {
                                     task.txid,
                                 );
                             }
-                            log::error!("abort clean failed, txid={} error={:?}", task.txid, e);
+                            diag::error!("abort clean failed, txid={} error={:?}", task.txid, e);
                         }
                     }
                 }
@@ -178,7 +179,7 @@ impl GarbageCollector {
             ) {
                 Ok(()) => true,
                 Err(e) => {
-                    log::error!(
+                    diag::error!(
                         "abort clean checkpoint batch failed, tasks={}, buckets={}, error={:?}",
                         cleaned_txids.len(),
                         round_stabilize_buckets.len(),

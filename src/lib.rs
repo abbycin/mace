@@ -8,6 +8,7 @@ pub(crate) use store::store::Store;
 pub use utils::observe;
 pub use utils::{
     OpCode, RandomPath,
+    diag::DiagLevel,
     merge_operator::{MergeOperator, U64AddOperator, u64_add_operator},
     options::{BucketOptions, Options, PersistedBucketOptions},
 };

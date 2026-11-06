@@ -322,6 +322,13 @@ fn record_stat_update(txn: &mut Txn<'_>, kind: FileKind, stat: &PersistStat) {
 #[cfg(feature = "failpoints")]
 #[cold]
 fn abort_flush_publish(stage: &str, err: OpCode) -> ! {
-    log::error!("flush publish {} failed: {:?}", stage, err);
+    // the process is about to abort, so the report is not filtered: a configured level
+    // must not be able to hide why the engine died
+    crate::utils::diag::emit(
+        crate::utils::diag::DiagLevel::Error,
+        file!(),
+        line!(),
+        format_args!("flush publish {stage} failed: {err:?}"),
+    );
     std::process::abort()
 }

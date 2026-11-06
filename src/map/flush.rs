@@ -7,6 +7,7 @@ use crate::utils::NULL_ADDR;
 use crate::utils::OpCode;
 use crate::utils::countblock::Countblock;
 use crate::utils::data::{GatherWriter, GroupPositions, Interval};
+use crate::utils::diag;
 use crate::utils::options::ParsedOptions;
 use crate::utils::{Handle, MutRef};
 use std::collections::VecDeque;
@@ -248,7 +249,7 @@ fn checkpoint_thread(
 
             process_task(&mut q, ctx, observer.as_ref());
             sync.notify_done();
-            log::info!("checkpoint thread exit");
+            diag::info!("checkpoint thread exit");
         })
         // a thread-creation failure must reach the caller: the open can still abort
         // and return, and a fatal invariant abort here would take the process down

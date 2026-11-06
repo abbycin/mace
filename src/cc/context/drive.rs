@@ -1,4 +1,5 @@
 use super::*;
+use crate::utils::diag;
 
 impl Context {
     /// publish shared-stream floors before runtime checkpointing or GC
@@ -15,8 +16,7 @@ impl Context {
                     Some(pin) => {
                         let pin_pos = Position::new(pin, 0);
                         if *pos > pin_pos {
-                            log::warn!(
-                                "abort-clean pin clamped shared floor[{:?}] from {:?} to {:?} (pin={:?})",
+                            diag::warn!("abort-clean pin clamped shared floor[{:?}] from {:?} to {:?} (pin={:?})",
                                 slot,
                                 pos,
                                 pin_pos,
@@ -70,7 +70,7 @@ impl Context {
         // a foreground writer exists only after `init_safe_exclusive`, so the recovery
         // window is what makes "no append in flight" true rather than merely likely
         if !self.recovering() {
-            log::error!("refusing to detach recovery writers outside the recovery window");
+            diag::error!("refusing to detach recovery writers outside the recovery window");
             return Err(OpCode::IoError);
         }
         let loggings = self.writer_loggings();

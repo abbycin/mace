@@ -1,4 +1,5 @@
 use crate::must_true;
+use crate::utils::diag;
 use std::{
     sync::{
         Arc,
@@ -212,5 +213,5 @@ fn evictor_loop(mut e: Evictor) {
     }
 
     let _ = e.tx.send(());
-    log::info!("evictor thread exit");
+    diag::info!("evictor thread exit");
 }

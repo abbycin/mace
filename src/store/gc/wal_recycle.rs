@@ -1,4 +1,5 @@
 use super::GarbageCollector;
+use crate::utils::diag;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::CounterMetric;
 use crate::{
@@ -135,7 +136,7 @@ impl GarbageCollector {
             if !must_ok!(ctx.opt.fs.try_exists(&from), "can't stat {:?}", from) {
                 continue;
             }
-            log::info!("unlink {from:?}");
+            diag::info!("unlink {from:?}");
             must_ok!(
                 ctx.opt.fs.remove_file_if_exists(&from),
                 "can't remove {from:?}"

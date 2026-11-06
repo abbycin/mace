@@ -1,4 +1,5 @@
 use super::*;
+use crate::utils::diag;
 
 impl Manifest {
     pub(crate) fn mark_retired_stats(&self, kind: FileKind, bucket_id: u64, file_ids: &[u64]) {
@@ -189,7 +190,7 @@ impl Manifest {
                         false
                     }
                     Err(err) => {
-                        log::warn!("obsolete stat remove failed, path={path:?}, error={err:?}");
+                        diag::warn!("obsolete stat remove failed, path={path:?}, error={err:?}");
                         true
                     }
                 }

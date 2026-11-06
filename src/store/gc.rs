@@ -1,3 +1,4 @@
+use crate::utils::diag;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering::Relaxed},
@@ -68,7 +69,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
                     },
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(e) => {
-                        log::error!("gc receive error {e}");
+                        diag::error!("gc receive error {e}");
                         break;
                     }
                 }
@@ -86,7 +87,7 @@ fn gc_thread(mut gc: GarbageCollector, rx: Receiver<i32>, sem: Arc<Countblock>) 
             }
 
             sem.post();
-            log::info!("garbage-collector thread exit");
+            diag::info!("garbage-collector thread exit");
         })
         .expect("can't start garbage-collector thread")
 }

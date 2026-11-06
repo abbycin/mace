@@ -8,6 +8,7 @@ use crate::types::refbox::DeltaView;
 use crate::types::sst::Sst;
 use crate::types::traits::{IAsBoxRef, IBoxHeader, IDecode, IHeader, ILoader};
 use crate::utils::data::Position;
+use crate::utils::diag;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::{
     CounterMetric, EventKind, HistogramMetric, LATENCY_SAMPLE_SHIFT, ObserveEvent, observe_elapsed,
@@ -1281,13 +1282,13 @@ impl Tree {
             });
         }
         if let Ok(s) = std::str::from_utf8(key) {
-            log::error!(
+            diag::error!(
                 "merge contract violation: bucket={} key={:?}",
                 self.bucket.bucket_id,
                 s
             );
         } else {
-            log::error!(
+            diag::error!(
                 "merge contract violation: bucket={} key={:?}",
                 self.bucket.bucket_id,
                 key

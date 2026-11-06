@@ -1,3 +1,4 @@
+use crate::utils::diag;
 use crate::{must_ok, must_true};
 use std::cell::RefCell;
 use std::cmp::max;
@@ -233,7 +234,7 @@ impl Recovery {
         store.context.rebase_logging_positions_to_physical_eof();
         #[cfg(feature = "failpoints")]
         crate::utils::failpoint::crash("mace_recovery_abort_clean_after_drain_before_start");
-        log::trace!("oracle {oracle}");
+        diag::trace!("oracle {oracle}");
         store.manifest.sequences.oracle.store(oracle, Relaxed);
         #[cfg(feature = "metrics")]
         {

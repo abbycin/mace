@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering::Release;
 
 use super::*;
+use crate::utils::diag;
 
 /// how an in-place lifecycle transition takes a bucket out of service
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,7 +234,7 @@ impl BucketCatalog {
                 Ok(()) | Err(BTreeError::BucketNotFound) => {}
                 // nothing referenced this id in the catalog; a retry recreates it from empty
                 // metadata under a new id
-                Err(err) => log::error!(
+                Err(err) => diag::error!(
                     "can't roll back btree-store bucket {btree_bucket} of bucket {bucket_id}: {err:?}"
                 ),
             }
@@ -412,7 +413,7 @@ impl Drop for CreateGuard<'_> {
             // commit returned but the in-memory publish did not finish (test unwind). The btree
             // tables are referenced by committed metadata and must stay; removing them here would
             // make the next open fail in recover_intervals.
-            log::error!(
+            diag::error!(
                 "bucket {} ({}) committed but was not published; leaving btree tables intact",
                 self.name,
                 self.bucket_id
@@ -578,7 +579,7 @@ impl Manifest {
         let runtime = self.buckets.get_runtime(bucket_id);
 
         if self.buckets.contains_context(bucket_id) || runtime.has_rewrite() {
-            log::info!(
+            diag::info!(
                 "bucket {}({}) is busy, reject bucket option update",
                 name,
                 bucket_id
@@ -595,7 +596,7 @@ impl Manifest {
 
         let conflicts = Self::bucket_option_conflicts(&old_persisted, &new_persisted);
         if !conflicts.is_empty() {
-            log::error!(
+            diag::error!(
                 "bucket {}({}) option update conflicts on [{}], old: {:?}, new: {:?}",
                 name,
                 bucket_id,

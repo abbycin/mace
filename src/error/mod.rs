@@ -41,25 +41,37 @@ pub fn must_true_failed(target: &str, message: &str, args: &[String]) -> ! {
 #[cold]
 #[inline(never)]
 #[track_caller]
-fn emit_failure<E>(kind: &str, target: &str, message: &str, args: &[String], err: Option<&E>)
-where
-    E: Display,
-{
+fn emit_failure<W: Write, E: Display>(
+    out: &mut W,
+    kind: &str,
+    target: &str,
+    message: &str,
+    args: &[String],
+    err: Option<&E>,
+) {
     let caller = Location::caller();
-    eprintln!("fatal invariant failure");
-    eprintln!("check={kind}");
-    eprintln!("target={target}");
-    eprintln!("caller={}:{}", caller.file(), caller.line());
-    eprintln!("context={message}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "{} {} fatal invariant failure",
+        crate::utils::diag::timestamp(now),
+        crate::utils::diag::thread_tag()
+    );
+    let _ = writeln!(out, "check={kind}");
+    let _ = writeln!(out, "target={target}");
+    let _ = writeln!(out, "caller={}:{}", caller.file(), caller.line());
+    let _ = writeln!(out, "context={message}");
     for arg in args {
-        eprintln!("arg={arg}");
+        let _ = writeln!(out, "arg={arg}");
     }
     if let Some(err) = err {
-        eprintln!("error={err}");
+        let _ = writeln!(out, "error={err}");
     }
     // the process aborts instead of unwinding, so no panic hook runs: the report must
     // carry its own backtrace
-    emit_backtrace(caller);
+    emit_backtrace(out, caller);
 }
 
 /// reports the failed invariant and then aborts the process
@@ -82,19 +94,22 @@ fn abort_after_report<E>(
 where
     E: Display,
 {
-    emit_failure(kind, target, message, args, err);
+    let stderr = std::io::stderr();
+    let mut out = stderr.lock();
+    emit_failure(&mut out, kind, target, message, args, err);
     // the message must survive the abort even when the backtrace could not be symbolized,
     // so it is also the last line of the report
-    eprintln!("fatal: {kind} failed: {message}");
+    let _ = writeln!(out, "fatal: {kind} failed: {message}");
     // stderr writes are unbuffered, but stdout is line buffered, and the process is about
     // to die without unwinding: flush both so the report and the program's own output
     // survive the abort
     let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
+    let _ = out.flush();
+    drop(out);
     std::process::abort()
 }
 
-fn emit_backtrace(caller: &Location<'_>) {
+fn emit_backtrace<W: Write>(out: &mut W, caller: &Location<'_>) {
     let bt = Backtrace::new();
     let mut frames = Vec::new();
 
@@ -121,21 +136,22 @@ fn emit_backtrace(caller: &Location<'_>) {
         return;
     }
 
-    eprintln!("backtrace:");
-    eprintln!("   0: {}", frames[0].0);
-    eprintln!(
+    let _ = writeln!(out, "backtrace:");
+    let _ = writeln!(out, "   0: {}", frames[0].0);
+    let _ = writeln!(
+        out,
         "             at {}:{}:{}",
         caller.file(),
         caller.line(),
         caller.column()
     );
     for (idx, (name, file, line, col)) in frames.into_iter().enumerate().skip(1) {
-        eprintln!("   {idx}: {name}");
+        let _ = writeln!(out, "   {idx}: {name}");
         if let (Some(file), Some(line)) = (file, line) {
             if let Some(col) = col {
-                eprintln!("             at {file}:{line}:{col}");
+                let _ = writeln!(out, "             at {file}:{line}:{col}");
             } else {
-                eprintln!("             at {file}:{line}");
+                let _ = writeln!(out, "             at {file}:{line}");
             }
         }
     }
