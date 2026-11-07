@@ -11,6 +11,7 @@
 
 ### Bug Fixes
 - Fixed the `Sequences` allocator counters (`next_file_id`, `next_bucket_id`, `oracle`) being encoded when an operation was recorded rather than when its metadata transaction committed, which let a later commit with a stale snapshot roll a durable counter back and reuse a live file id or bucket id. The counters are now snapshotted inside the metadata commit's writer lock, and a stale bucket or file id counter found on open is raised and persisted instead of rejecting the open or truncating a live file.
+- Reclaimed empty page-table/interval btree tables left by a bucket create that crashed before its metadata commit, and made the delete unpublish path require the structural lock at the type level.
 
 ## [0.2.0] 2026-10-20
 ### New Features

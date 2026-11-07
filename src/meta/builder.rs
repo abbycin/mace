@@ -1,4 +1,5 @@
 use btree_store::Error as BTreeError;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -7,7 +8,7 @@ use crate::meta::entry::IMetaCodec;
 use crate::meta::{
     BUCKET_FRONTIER, BUCKET_VERSION, BucketCatalog, BucketDurableFrontier, CURRENT_VERSION,
     FileKind, MemStat, ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, PersistStat,
-    SEQUENCES_KEY, VERSION_KEY,
+    SEQUENCES_KEY, VERSION_KEY, blob_interval_name, data_interval_name, page_table_name,
 };
 use crate::must_ok;
 use crate::utils::diag;
@@ -352,6 +353,7 @@ impl ManifestBuilder {
         // both cleanups sync the data directory, and this runs before recovery: a failed sync
         // must fail the open with an error, which the caller reports as a failed open
         self.clean_orphans()?;
+        self.clean_orphan_btree_buckets()?;
         self.inner.delete_files()?;
 
         #[cfg(feature = "extra_check")]
@@ -382,6 +384,36 @@ impl ManifestBuilder {
         }
 
         Ok(self.inner)
+    }
+
+    /// remove btree tables reserved by a create that never committed its metadata
+    ///
+    /// open is single-threaded here, so no create can race the sweep; a table is orphaned only
+    /// when its id is in neither the active catalog nor the pending-delete set
+    fn clean_orphan_btree_buckets(&self) -> Result<(), OpCode> {
+        let names = self.inner.btree.buckets().map_err(OpCode::from)?;
+        let mut orphans = BTreeSet::new();
+        for name in names {
+            let Some(id) = orphan_table_id(&name) else {
+                continue;
+            };
+            if !self.inner.catalog.contains(id) && !self.inner.catalog.is_pending(id) {
+                orphans.insert(id);
+            }
+        }
+        for id in orphans {
+            for name in [
+                page_table_name(id),
+                data_interval_name(id),
+                blob_interval_name(id),
+            ] {
+                match self.inner.btree.del_bucket(&name) {
+                    Ok(()) | Err(BTreeError::BucketNotFound) => {}
+                    Err(err) => return Err(OpCode::from(err)),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn clean_orphans(&mut self) -> Result<(), OpCode> {
@@ -477,6 +509,13 @@ impl ManifestBuilder {
     }
 }
 
+/// the bucket id of an engine-owned page-table/interval btree name, when the name has that shape
+fn orphan_table_id(name: &str) -> Option<u64> {
+    ["page_table_", "data_interval_", "blob_interval_"]
+        .into_iter()
+        .find_map(|prefix| name.strip_prefix(prefix)?.parse().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ManifestBuilder, OpenPlan};
@@ -485,6 +524,7 @@ mod tests {
     };
     use crate::meta::{
         BUCKET_DATA_STAT, BUCKET_METAS, BUCKET_MISC, BUCKET_PENDING_DEL, SEQUENCES_KEY,
+        blob_interval_name, data_interval_name, page_table_name,
     };
     use crate::utils::options::PersistedBucketOptions;
     use crate::{BucketOptions, Options, RandomPath};
@@ -943,6 +983,57 @@ mod tests {
             Some(crate::OpCode::Corruption),
             "a next id at u64::MAX would wrap on the following allocation"
         );
+    }
+
+    #[test]
+    fn orphan_btree_tables_are_reclaimed_on_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "active", 5);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_PENDING_DEL, |txn| txn.put(9u64.to_le_bytes(), []))
+            .expect("pending record must be staged");
+        for id in [5u64, 9, 99] {
+            for name in [
+                page_table_name(id),
+                data_interval_name(id),
+                blob_interval_name(id),
+            ] {
+                builder
+                    .inner
+                    .btree
+                    .new_bucket(&name, false)
+                    .expect("table must be created");
+            }
+        }
+        builder.load().expect("catalog must include the staged ids");
+
+        let manifest = builder.finish().expect("finish must sweep");
+        let names = manifest.btree.buckets().expect("buckets must list");
+        for id in [5u64, 9] {
+            for name in [
+                page_table_name(id),
+                data_interval_name(id),
+                blob_interval_name(id),
+            ] {
+                assert!(
+                    names.contains(&name),
+                    "active or pending table {name} must survive"
+                );
+            }
+        }
+        for name in [
+            page_table_name(99),
+            data_interval_name(99),
+            blob_interval_name(99),
+        ] {
+            assert!(
+                !names.contains(&name),
+                "orphan table {name} must be reclaimed"
+            );
+        }
     }
 
     #[test]

@@ -8,13 +8,6 @@ mod txn;
 pub(crate) use guard::DeletionGuard;
 
 use crate::map::buffer::BucketContext;
-#[allow(unused_imports)]
-pub use crate::map::data::FileReader;
-#[allow(unused_imports)]
-pub(crate) use crate::map::data::new_reader;
-#[cfg(feature = "maintenance")]
-#[allow(unused_imports)]
-pub use crate::map::data::try_new_reader;
 use crate::utils::interval::IntervalMap;
 use crate::utils::options::ParsedOptions;
 #[allow(unused_imports)]

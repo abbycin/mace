@@ -769,13 +769,17 @@ entries:
       transaction that writes `bucket_metas`, the durable frontier and sequences has returned.
       Publication happens under the catalog structural lock in the order runtime, context, frontier,
       options, name, count; a pre-commit drop removes only the three empty btree tables, while a
-      post-commit drop must not delete tables the committed metadata references. Never: a reader
-      listing a bucket that cannot be opened, and never a rollback leaving an observable name or count.
+      post-commit drop must not delete tables the committed metadata references. An open-time sweep
+      reclaims any engine-owned table whose id is in neither the active catalog nor the
+      pending-delete set, so a crash between table creation and the metadata commit cannot strand
+      the empty tables. Never: a reader listing a bucket that cannot be opened, and never a rollback
+      leaving an observable name or count.
     break_consequence: >
       A caller observes a bucket during creation that later disappears on rollback, or blocks on a
       partially published catalog entry; the same window can leave the bucket count inconsistent
       with the catalog. The bucket's key/value data is not exposed, but the catalog read is wrong.
     anchors:
       - src/meta/manifest/catalog.rs
+      - src/meta/builder.rs
       - src/store/bucket.rs
     reproducer: bucket_create_is_invisible_until_manifest_commit

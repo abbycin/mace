@@ -141,6 +141,10 @@ impl BucketCatalog {
         self.options.contains_key(&bucket_id)
     }
 
+    pub(crate) fn is_pending(&self, bucket_id: u64) -> bool {
+        self.pending.contains(&bucket_id)
+    }
+
     pub(crate) fn options(&self, bucket_id: u64) -> Option<PersistedBucketOptions> {
         self.options.get(&bucket_id).map(|x| *x.value())
     }
@@ -302,11 +306,12 @@ impl BucketCatalog {
     /// the caller holds the structural lock and has already dropped the sealed batch, so the
     /// name stays visible until this point: a same-name create cannot pass the duplicate-name
     /// check and write the record the delete transaction is about to remove
-    fn unpublish_delete(&self, name: &str, bucket_id: u64) {
-        debug_assert!(
-            self.structural_lock.is_locked(),
-            "delete must unpublish under the structural lock"
-        );
+    fn unpublish_delete(
+        &self,
+        _lock: &parking_lot::MutexGuard<'_, ()>,
+        name: &str,
+        bucket_id: u64,
+    ) {
         debug_assert_eq!(self.id(name), Some(bucket_id), "delete lost its name");
         self.names.remove(name);
         self.options.remove(&bucket_id);
@@ -814,8 +819,8 @@ impl Manifest {
         {
             // the name leaves the catalog in the same critical section as the durable delete,
             // so creation and deletion of one name cannot interleave inside a transaction
-            let _lock = self.catalog.lock();
-            self.catalog.unpublish_delete(name, bucket_id);
+            let lock = self.catalog.lock();
+            self.catalog.unpublish_delete(&lock, name, bucket_id);
             #[cfg(feature = "extra_check")]
             crate::testing::fire_bucket_delete_sync_point(
                 crate::testing::BucketDeleteSyncPoint::AfterUnpublishBeforeCommit,
@@ -959,12 +964,14 @@ mod tests {
         // the delete records the mode and unpublishes under the structural lock; the test
         // drives the same sequence so teardown does not carry a deleting runtime
         let id = {
-            let _lock = manifest.catalog.lock();
+            let lock = manifest.catalog.lock();
             let id = manifest
                 .catalog
                 .begin_reclaim_locked(&manifest.buckets, "victim", BucketRemoveMode::Delete)
                 .expect("logical delete must begin");
-            manifest.catalog.unpublish_delete("victim", bucket_id);
+            manifest
+                .catalog
+                .unpublish_delete(&lock, "victim", bucket_id);
             id
         };
         assert_eq!(id, bucket_id);
