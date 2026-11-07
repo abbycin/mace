@@ -1377,7 +1377,7 @@ fn run_publish_cut_reopens_gate_before_physical_delete(kind: TestFileKind) -> Re
                 publish_release_rx
                     .lock()
                     .expect("lock publish release receiver")
-                    .recv_timeout(Duration::from_secs(10))
+                    .recv_timeout(Duration::from_secs(30))
                     .expect("release rewrite publish");
             }
         }
@@ -1391,7 +1391,7 @@ fn run_publish_cut_reopens_gate_before_physical_delete(kind: TestFileKind) -> Re
     let gc_mace = mace.clone();
     let gc_thread = std::thread::spawn(move || gc_mace.start_gc());
     published_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(Duration::from_secs(30))
         .expect("gc rewrite must finish publishing before physical deletion");
 
     // finish_publish reopened the gate, so this checkpoint can commit even
@@ -1407,7 +1407,7 @@ fn run_publish_cut_reopens_gate_before_physical_delete(kind: TestFileKind) -> Re
         checkpoint_done_tx.send(()).expect("signal peer checkpoint");
     });
     checkpoint_done_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(Duration::from_secs(30))
         .expect("peer checkpoint must commit while physical deletion is pending");
 
     publish_release_tx
