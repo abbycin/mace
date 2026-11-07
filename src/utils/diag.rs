@@ -99,15 +99,12 @@ fn raw_tid() -> i64 {
     }
 }
 
-/// `tid/name` when the thread was named, bare `tid` otherwise
+/// the os thread id as a string
 ///
-/// the engine names its own threads, so a log line points at the subsystem that produced
-/// it; unnamed pool threads still get the id
+/// names are not unique across instances and add noise to every line; the id is the stable
+/// per-thread identity
 pub(crate) fn thread_tag() -> String {
-    match std::thread::current().name() {
-        Some(name) => format!("{}/{}", tid(), name),
-        None => tid().to_string(),
-    }
+    tid().to_string()
 }
 
 #[cold]
@@ -130,7 +127,7 @@ pub(crate) fn emit(level: DiagLevel, file: &str, line: u32, args: std::fmt::Argu
     let _ = std::io::stderr().write_all(record.as_bytes());
 }
 
-/// `YYYY-MM-DD HH:MM:SS.ffffff tid/name [LEVEL] file:line message`
+/// `YYYY-MM-DD HH:MM:SS.ffffff tid [LEVEL] file:line message`
 ///
 /// utc, so reports from different hosts order without a timezone database and without
 /// the `chrono` dependency a local-time formatter would need
@@ -219,19 +216,19 @@ mod tests {
             "src/store/gc.rs",
             71,
             now,
-            "4123/garbage-collector".to_owned(),
+            "4123".to_owned(),
             "wal gap detected after recycled prefix",
         );
         assert_eq!(
             line,
-            "2026-04-24 04:08:43.123456 4123/garbage-collector [ERROR] src/store/gc.rs:71 \
+            "2026-04-24 04:08:43.123456 4123 [ERROR] src/store/gc.rs:71 \
              wal gap detected after recycled prefix\n"
         );
     }
 
-    /// an unnamed thread still identifies itself
+    /// every thread reports its bare os thread id
     #[test]
-    fn an_unnamed_thread_reports_a_bare_id() {
+    fn a_thread_reports_a_bare_id() {
         let line = format_record(
             DiagLevel::Warn,
             "src/meta/manifest/files.rs",

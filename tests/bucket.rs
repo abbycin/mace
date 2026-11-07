@@ -3,7 +3,9 @@ mod common;
 use btree_store::BTree;
 use mace::{BucketOptions, Mace, OpCode, Options, PersistedBucketOptions, RandomPath};
 use serde_json::Value;
+#[cfg(feature = "extra_check")]
 use std::sync::Arc;
+#[cfg(feature = "extra_check")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "extra_check")]
@@ -119,55 +121,48 @@ fn bucket_interval_recovery_error_fails_load() {
     );
 }
 
+#[cfg(feature = "extra_check")]
 #[test]
-fn bucket_concurrency_non_blocking() {
+fn bucket_open_waits_for_create_lock_then_completes() -> Result<(), OpCode> {
+    use mace::testing::{self, BucketCreateSyncPoint};
+    use std::sync::Mutex;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let _serial = bucket_create_test_lock();
+    let _reset = BucketCreateHookReset;
     let path = RandomPath::tmp();
-    let opt = Options::new(&*path);
-    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let mace = Mace::new(Options::new(&*path).validate()?)?;
+    let stable_id = mace.new_bucket("stable", BucketOptions::default())?.id();
 
-    mace.new_bucket("stable", BucketOptions::default()).unwrap();
-
-    let mace_clone = mace.clone();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
-
-    let t1 = std::thread::spawn(move || {
-        let mut count = 0;
-        while !stop_clone.load(Ordering::Relaxed) {
-            let name = format!("temp_{}", count);
-            let b = mace_clone
-                .new_bucket(&name, BucketOptions::default())
-                .unwrap();
-            drop(b); // ensure count drops
-            let _ = mace_clone.del_bucket(&name);
-            count += 1;
+    let (paused_tx, paused_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    testing::set_bucket_create_hook(Some(Arc::new(move |point, id, name: &str| {
+        if name == "temporary" && point == BucketCreateSyncPoint::BeforeManifestCommit {
+            paused_tx.send(id).expect("signal paused create");
+            release_rx
+                .lock()
+                .expect("lock release receiver")
+                .recv()
+                .expect("wait for release");
         }
-    });
+    })));
 
-    let start = std::time::Instant::now();
-    let mut iterations = 0;
-    while iterations < 100_000 {
-        mace.open_bucket("stable").unwrap();
-        iterations += 1;
+    let creator = mace.clone();
+    let create =
+        std::thread::spawn(move || creator.new_bucket("temporary", BucketOptions::default()));
+    paused_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("create must pause before the manifest commit");
 
-        // if it's blocked, it might take a long time to finish 100k iterations
-        // on a modern machine, lock-free DashMap::get should easily do this in < 1s
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            break;
-        }
-    }
+    let opener = mace.clone();
+    let open = spawn_blocked_probe(move || opener.open_bucket("stable").map(|bucket| bucket.id()));
 
-    let elapsed = start.elapsed();
-    stop.store(true, Ordering::Relaxed);
-    t1.join().unwrap();
-
-    // assert that we completed the iterations within a reasonable time
-    assert!(
-        iterations == 100_000,
-        "Lookups were likely blocked, only completed {} in {:?}",
-        iterations,
-        elapsed
-    );
+    release_tx.send(()).expect("release create");
+    create.join().expect("creator thread must finish")?;
+    assert_eq!(open.join().expect("open thread"), Ok(stable_id));
+    Ok(())
 }
 
 #[test]

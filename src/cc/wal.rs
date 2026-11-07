@@ -514,9 +514,10 @@ pub fn wal_abort_at(buf: &[u8], offset: usize) -> Option<&WalAbort> {
 #[cfg(test)]
 mod test {
     use crate::cc::wal::{
-        EntryType, IWalCodec, PayloadType, WalAbort, WalBegin, WalCheckpoint, WalPut, WalReplace,
-        WalUpdate, ptr_to,
+        EntryType, IWalCodec, PayloadType, WalBegin, WalPut, WalReplace, WalUpdate, ptr_to,
     };
+    #[cfg(feature = "maintenance")]
+    use crate::cc::wal::{WalAbort, WalCheckpoint};
     use crate::utils::OpCode;
     use crate::utils::data::Position;
     use crate::utils::options::Options;
