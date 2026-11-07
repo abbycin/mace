@@ -7,7 +7,9 @@ use crate::utils::diag;
 use crate::utils::observe::CounterMetric;
 
 use super::entry::StatMissKind;
-use super::{BUCKET_BLOB_STAT, BUCKET_DATA_STAT, Manifest, MetaKind, PersistStat};
+use super::{
+    BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_MISC, Manifest, MetaKind, PersistStat, SEQUENCES_KEY,
+};
 
 pub(crate) struct Txn<'a> {
     manifest: &'a Manifest,
@@ -41,6 +43,16 @@ impl<'a> Txn<'a> {
             .push(MetaOp::Del(key));
     }
 
+    /// record the allocator counters; the value is snapshotted by `commit` inside the btree
+    /// writer lock, because a record-time snapshot can be overwritten by a later commit that
+    /// read an older value before this transaction acquired the lock
+    pub(crate) fn put_sequences(&mut self) {
+        self.ops
+            .entry(BUCKET_MISC.to_string())
+            .or_default()
+            .push(MetaOp::PutSequences);
+    }
+
     #[cfg(test)]
     pub(crate) fn ops_mut(&mut self) -> &mut BTreeMap<String, Vec<MetaOp>> {
         &mut self.ops
@@ -58,12 +70,18 @@ impl<'a> Txn<'a> {
         // perform an atomic multi-bucket commit
         // all updates across different buckets are applied and flushed to disk
         // in a single SuperBlock write, significantly reducing I/O overhead
+        let sequences = &self.manifest.sequences;
         let res = self.manifest.btree.exec_multi(|multi_txn| {
             for (bucket, bucket_ops) in &self.ops {
                 multi_txn.exec(bucket, |tree_txn| {
                     for op in bucket_ops {
                         match op {
                             MetaOp::Put(k, v) => tree_txn.put(k, v)?,
+                            MetaOp::PutSequences => {
+                                // inside the writer lock, so commit order == value order
+                                let value = sequences.snapshot_bytes();
+                                tree_txn.put(SEQUENCES_KEY, value)?;
+                            }
                             MetaOp::Update(k, v, _miss_kind) => {
                                 if !tree_txn.update(k, v)? {
                                     #[cfg(feature = "metrics")]

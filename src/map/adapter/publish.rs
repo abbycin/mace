@@ -229,7 +229,7 @@ pub(super) fn commit_metadata(
 
     txn.record(MetaKind::BucketFrontier, bucket_frontier);
     txn.record(MetaKind::Map, &result.map_table);
-    txn.record(MetaKind::Sequences, observer.manifest.sequences.deref());
+    txn.put_sequences();
 
     #[cfg(feature = "failpoints")]
     if let Err(e) = crate::utils::failpoint::check("mace_flush_before_manifest_commit") {

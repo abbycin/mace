@@ -3,16 +3,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     ops::{Deref, DerefMut},
-    ptr::addr_of_mut,
-    sync::atomic::AtomicU64,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 
 use crate::{
     OpCode, PersistedBucketOptions,
     meta::{
-        BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BUCKET_MISC, BUCKET_OBSOLETE_BLOB,
-        BUCKET_OBSOLETE_DATA, SEQUENCES_KEY, blob_interval_name, data_interval_name,
-        page_table_name,
+        BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_FRONTIER, BUCKET_OBSOLETE_BLOB,
+        BUCKET_OBSOLETE_DATA, blob_interval_name, data_interval_name, page_table_name,
     },
     types::traits::IAsSlice,
     utils::{
@@ -35,7 +33,6 @@ impl_ias_slice!(
     PageTableHdr,
     BucketDurableFrontier,
     WalRecycleState,
-    Sequences,
     DeleteHdr,
     IntervalPair,
     DelIntervalStartHdr,
@@ -45,7 +42,6 @@ impl_ias_slice!(
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 pub enum MetaKind {
-    Sequences,
     DataInterval,
     BlobInterval,
     DataStat,
@@ -472,6 +468,18 @@ impl WalRecycleState {
     }
 }
 
+impl Sequences {
+    /// the on-disk form is the raw `#[repr(C)]` image; read each atomic separately instead of
+    /// slicing the struct while another thread may be advancing it
+    pub(crate) fn snapshot_bytes(&self) -> [u8; size_of::<Self>()] {
+        let mut out = [0u8; size_of::<Self>()];
+        out[0..8].copy_from_slice(&self.next_file_id.load(Relaxed).to_ne_bytes());
+        out[8..16].copy_from_slice(&self.next_bucket_id.load(Relaxed).to_ne_bytes());
+        out[16..24].copy_from_slice(&self.oracle.load(Relaxed).to_ne_bytes());
+        out
+    }
+}
+
 impl Default for Sequences {
     fn default() -> Self {
         Self {
@@ -479,16 +487,6 @@ impl Default for Sequences {
             next_bucket_id: AtomicU64::new(INIT_ID),
             oracle: AtomicU64::new(INIT_ORACLE),
         }
-    }
-}
-
-impl Clone for Sequences {
-    // a snapshot of atomic values, that's ok for data sync
-    fn clone(&self) -> Self {
-        let mut tmp = Sequences::default();
-        let dst = addr_of_mut!(tmp);
-        unsafe { std::ptr::copy_nonoverlapping(self, dst, 1) };
-        tmp
     }
 }
 
@@ -673,6 +671,9 @@ pub(crate) enum StatMissKind {
 
 pub enum MetaOp {
     Put(Vec<u8>, Vec<u8>),
+    /// the value is taken inside the commit critical section, not when the op is recorded:
+    /// `Sequences` is a set of monotonic allocators shared by concurrent writers
+    PutSequences,
     Update(Vec<u8>, Vec<u8>, StatMissKind),
     Del(Vec<u8>),
     /// delete that tolerates an already-absent key, for stat keys two producers
@@ -737,16 +738,39 @@ macro_rules! impl_fixed_codec {
     };
 }
 
-impl_fixed_codec!(WalRecycleState, Sequences, IntervalPair);
+impl_fixed_codec!(WalRecycleState, IntervalPair);
+
+impl IMetaCodec for Sequences {
+    fn packed_size(&self) -> usize {
+        size_of::<Self>()
+    }
+
+    fn encode(&self, to: &mut [u8]) {
+        must_true!(eq to.len(), self.packed_size());
+        to.copy_from_slice(&self.snapshot_bytes());
+    }
+
+    fn decode(src: &[u8]) -> Self {
+        must_true!(src.len() >= size_of::<Self>());
+        let out = Sequences::default();
+        out.next_file_id.store(
+            u64::from_ne_bytes(src[0..8].try_into().expect("sequences width")),
+            Relaxed,
+        );
+        out.next_bucket_id.store(
+            u64::from_ne_bytes(src[8..16].try_into().expect("sequences width")),
+            Relaxed,
+        );
+        out.oracle.store(
+            u64::from_ne_bytes(src[16..24].try_into().expect("sequences width")),
+            Relaxed,
+        );
+        out
+    }
+}
 
 pub(crate) trait MetaRecord: IMetaCodec {
     fn record(&self, kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>);
-}
-
-impl MetaRecord for Sequences {
-    fn record(&self, _kind: MetaKind, ops: &mut BTreeMap<String, Vec<MetaOp>>) {
-        push_put(ops, BUCKET_MISC, SEQUENCES_KEY.as_bytes().to_vec(), self);
-    }
 }
 
 impl MetaRecord for PageTable {
@@ -871,6 +895,9 @@ static_assert!(size_of::<StatHdr>() == 8);
 static_assert!(size_of::<StatInner>() == 56);
 static_assert!(std::mem::offset_of!(StatInner, bucket_id) == 48);
 static_assert!(size_of::<Sequences>() == 24);
+static_assert!(std::mem::offset_of!(Sequences, next_file_id) == 0);
+static_assert!(std::mem::offset_of!(Sequences, next_bucket_id) == 8);
+static_assert!(std::mem::offset_of!(Sequences, oracle) == 16);
 static_assert!(size_of::<WalRecycleState>() == 24);
 static_assert!(size_of::<BucketDurableFrontier>() == 2056);
 static_assert!(size_of::<BucketMeta>() == 56);

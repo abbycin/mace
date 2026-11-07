@@ -1,7 +1,6 @@
 use crc32c::Crc32cHasher;
 use std::{
-    cmp::Ordering, collections::HashMap, hash::Hasher, ops::Deref, sync::Arc,
-    sync::atomic::Ordering::AcqRel,
+    cmp::Ordering, collections::HashMap, hash::Hasher, sync::Arc, sync::atomic::Ordering::AcqRel,
 };
 
 #[cfg(feature = "metrics")]
@@ -486,7 +485,7 @@ impl GarbageCollector {
         gate.drain();
         let cut = junk.begin_publish(kind, registration, gate);
         let mut txn = self.store.manifest.begin();
-        txn.record(MetaKind::Sequences, self.store.manifest.sequences.deref());
+        txn.put_sequences();
 
         let (fstats, stats) = self.store.manifest.prepare_stat_intervals(
             kind,

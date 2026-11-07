@@ -38,6 +38,7 @@ impl BucketCatalog {
     }
 
     /// loads and validates the persisted catalog, returning it with the highest stored bucket id
+    /// across the active catalog and the pending-delete set
     ///
     /// duplicate ids, undecodable metadata and malformed pending keys reject the open: the same
     /// identity may never be handed out twice
@@ -92,10 +93,12 @@ impl BucketCatalog {
                             return Ok(());
                         }
                     };
-                    if !catalog.pending.insert(u64::from_le_bytes(key_id)) {
+                    let id = u64::from_le_bytes(key_id);
+                    if !catalog.pending.insert(id) {
                         error = Some(OpCode::Corruption);
                         return Ok(());
                     }
+                    max_id = Some(max_id.map_or(id, |stored| stored.max(id)));
                 }
                 Ok(())
             })
@@ -548,7 +551,7 @@ impl Manifest {
             options: PersistedBucketOptions::from(&opt),
         };
         let mut txn = self.begin();
-        txn.record(MetaKind::Sequences, self.sequences.as_ref());
+        txn.put_sequences();
         txn.record(MetaKind::BucketFrontier, &frontier_rec);
         txn.put_record(BUCKET_METAS, name.as_bytes().to_vec(), &meta);
         #[cfg(feature = "extra_check")]

@@ -745,8 +745,10 @@ entries:
     statement: >
       BucketMeta and BucketDurableFrontier decode only after an explicit length/alignment check, and
       key/payload identity is checked at the catalog or builder read site where both are visible. A
-      duplicate bucket id, a frontier whose key and payload bucket id disagree, or a next_bucket_id
-      below an existing bucket id rejects the open instead of silently overwriting or reusing identity.
+      duplicate bucket id or a frontier whose key and payload bucket id disagree rejects the open. A
+      next_bucket_id that is not above the highest id in the active catalog and the pending-delete set
+      is stale derived state: the open raises it above that bound and persists the repair, so it can
+      never silently overwrite or reuse identity.
     break_consequence: >
       A short or mismatched metadata value is read out of bounds or accepted as a different bucket,
       so the process aborts in the decoder or two buckets share one id/page table; a later create can

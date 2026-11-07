@@ -10,6 +10,7 @@ use crate::meta::{
     SEQUENCES_KEY, VERSION_KEY,
 };
 use crate::must_ok;
+use crate::utils::diag;
 use crate::{
     OpCode,
     meta::{
@@ -82,6 +83,8 @@ pub(crate) struct LoadOutcome {
 pub(crate) struct ManifestBuilder {
     inner: Manifest,
     max_file_id: u64,
+    // a derived counter was raised while loading, so finish must persist the repair
+    repair_sequences: bool,
     // accumulated sizes for DataStat to avoid re-iteration in finish(), by FileKind::slot
     active_sizes: [u64; 2],
     total_sizes: [u64; 2],
@@ -99,12 +102,14 @@ impl ManifestBuilder {
         Ok(Self {
             inner: Manifest::new(opt, tx, rx)?,
             max_file_id: 0,
+            repair_sequences: false,
             active_sizes: [0; 2],
             total_sizes: [0; 2],
         })
     }
 
     pub(crate) fn load(&mut self) -> Result<LoadOutcome, OpCode> {
+        self.repair_sequences = false;
         let current = PersistedOptions::from_options(self.inner.opt.as_ref());
         let (has_version, persisted, persisted_source) = self.load_config(&current)?;
         let needs_writeback = persisted != current;
@@ -208,10 +213,19 @@ impl ManifestBuilder {
 
     fn load_catalog(&mut self) -> Result<(), OpCode> {
         let (catalog, max_bucket_id) = BucketCatalog::load(&self.inner.btree)?;
-        if let Some(max_id) = max_bucket_id
-            && self.inner.sequences.next_bucket_id.load(Relaxed) <= max_id
-        {
-            return Err(OpCode::Corruption);
+        if let Some(max_id) = max_bucket_id {
+            let next = self.inner.sequences.next_bucket_id.load(Relaxed);
+            if next <= max_id {
+                // the counter is derived state: raise it instead of refusing the open, so a
+                // stale value can never hand the same id to a second bucket
+                let raised = max_id
+                    .checked_add(1)
+                    .filter(|raised| *raised < u64::MAX)
+                    .ok_or(OpCode::Corruption)?;
+                self.inner.sequences.next_bucket_id.store(raised, Relaxed);
+                self.repair_sequences = true;
+                diag::warn!("raised stale next_bucket_id {} to {}", next, raised);
+            }
         }
         // the runtime entry exists for every catalogued bucket from open on: lifecycle state and
         // compression contexts outlive a lazy context load, and background GC reads them
@@ -260,9 +274,12 @@ impl ManifestBuilder {
         Ok(())
     }
 
-    fn load_file_stats(&self) -> Result<([u64; 2], [u64; 2]), OpCode> {
+    fn load_file_stats(&mut self) -> Result<([u64; 2], [u64; 2]), OpCode> {
         let mut active_sizes = [0u64; 2];
         let mut total_sizes = [0u64; 2];
+        // every id still referenced by a stat or an obsolete record must never be handed out
+        // again, even if the durable counter predates a concurrent checkpoint
+        let mut max_file_id = self.max_file_id;
         for kind in FileKind::ALL {
             let mut active_size = 0;
             let mut total_size = 0;
@@ -276,6 +293,7 @@ impl ManifestBuilder {
                         let inner = PersistStat::decode_inner_only(&v);
                         active_size += inner.active_size as u64;
                         total_size += inner.total_size as u64;
+                        max_file_id = max_file_id.max(inner.file_id);
                         let fstat = MemStat::from_parts(inner, None);
                         self.inner.file_state(kind).stat.insert_loaded_stat(fstat);
                         self.inner
@@ -305,6 +323,7 @@ impl ManifestBuilder {
                             let id_bytes: [u8; 8] =
                                 k[..8].try_into().expect("obsolete file key must be a u64");
                             let id = u64::from_le_bytes(id_bytes);
+                            max_file_id = max_file_id.max(id);
                             obs.push(id);
                         }
                         Ok(())
@@ -312,6 +331,11 @@ impl ManifestBuilder {
                 )
                 .map_err(|_| OpCode::IoError)?;
         }
+        if max_file_id > self.max_file_id {
+            // a durable file id, or an obsolete one, is above the persisted counter
+            self.repair_sequences = true;
+        }
+        self.max_file_id = max_file_id;
         Ok((active_sizes, total_sizes))
     }
 
@@ -338,10 +362,24 @@ impl ManifestBuilder {
             );
         }
 
+        let next_file_id = self
+            .max_file_id
+            .checked_add(1)
+            .filter(|next| *next < u64::MAX)
+            .ok_or(OpCode::Corruption)?;
         self.inner
             .sequences
             .next_file_id
-            .store(self.max_file_id + 1, Relaxed);
+            .store(next_file_id, Relaxed);
+        if self.repair_sequences {
+            // open is single-threaded here, so a direct put is the commit-time value; a failed
+            // repair write must surface as a failed open instead of aborting the process
+            let value = self.inner.sequences.snapshot_bytes();
+            self.inner
+                .btree
+                .exec(BUCKET_MISC, |txn| txn.put(SEQUENCES_KEY, value))
+                .map_err(OpCode::from)?;
+        }
 
         Ok(self.inner)
     }
@@ -422,6 +460,10 @@ impl ManifestBuilder {
     }
 
     fn observe_orphan_id(&mut self, id: u64) {
+        if id > self.max_file_id {
+            // an unpublished file id above the persisted counter must be skipped on reuse
+            self.repair_sequences = true;
+        }
         self.max_file_id = self.max_file_id.max(id);
     }
 
@@ -438,11 +480,16 @@ impl ManifestBuilder {
 #[cfg(test)]
 mod tests {
     use super::{ManifestBuilder, OpenPlan};
-    use crate::meta::entry::{BucketDurableFrontier, BucketMeta, IMetaCodec};
-    use crate::meta::{BUCKET_METAS, BUCKET_MISC, BUCKET_PENDING_DEL};
+    use crate::meta::entry::{
+        BucketDurableFrontier, BucketMeta, IMetaCodec, PersistStat, Sequences, StatInner,
+    };
+    use crate::meta::{
+        BUCKET_DATA_STAT, BUCKET_METAS, BUCKET_MISC, BUCKET_PENDING_DEL, SEQUENCES_KEY,
+    };
     use crate::utils::options::PersistedBucketOptions;
     use crate::{BucketOptions, Options, RandomPath};
     use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
     use std::sync::mpsc::channel;
 
     fn open_builder() -> (
@@ -691,16 +738,211 @@ mod tests {
     }
 
     #[test]
-    fn bucket_low_next_id_is_rejected() {
+    fn stale_next_bucket_id_is_raised_instead_of_rejecting_the_open() {
         let (mut builder, _opt, _root) = open_builder();
         builder.load().expect("initial load must work");
         put_bucket_meta(&builder, "a", 5);
+        builder.inner.sequences.next_bucket_id.store(0, Relaxed);
+
+        builder.load().expect("a stale counter must be repaired");
+        assert_eq!(builder.inner.sequences.next_bucket_id.load(Relaxed), 6);
+
+        let manifest = builder.finish().expect("repair must finish");
+        let raw = manifest
+            .btree
+            .view(BUCKET_MISC, |txn| txn.get(SEQUENCES_KEY))
+            .expect("the repair must be durable");
+        let seq = Sequences::decode(&raw);
+        assert_eq!(seq.next_bucket_id.load(Relaxed), 6);
+    }
+
+    #[test]
+    fn pending_bucket_id_participates_in_the_next_id_bound() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        // active max is 5, but the highest id was logically deleted and awaits cleanup
+        put_bucket_meta(&builder, "a", 5);
         builder
             .inner
-            .sequences
-            .next_bucket_id
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(builder.load().err(), Some(crate::OpCode::Corruption));
+            .btree
+            .exec(BUCKET_PENDING_DEL, |txn| txn.put(9u64.to_le_bytes(), []))
+            .expect("pending record must be staged");
+        builder.inner.sequences.next_bucket_id.store(6, Relaxed);
+
+        builder.load().expect("pending ids must raise the bound");
+        assert_eq!(
+            builder.inner.sequences.next_bucket_id.load(Relaxed),
+            10,
+            "a pending id at 9 must keep the next id above it"
+        );
+    }
+
+    #[test]
+    fn file_id_counter_covers_ids_still_referenced_by_stats() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "a", 5);
+        let inner = StatInner {
+            file_id: 100,
+            up1: 0,
+            up2: 0,
+            active_elems: 0,
+            total_elems: 0,
+            active_size: 0,
+            total_size: 0,
+            bucket_id: 5,
+        };
+        let stat = PersistStat::from_parts(inner, Vec::new());
+        let mut buf = vec![0u8; stat.packed_size()];
+        stat.encode(&mut buf);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_DATA_STAT, |txn| txn.put(100u64.to_le_bytes(), &buf))
+            .expect("stat must be staged");
+        builder.inner.sequences.next_file_id.store(10, Relaxed);
+
+        builder.load().expect("stats must raise the file id bound");
+        let manifest = builder.finish().expect("repair must finish");
+        let raw = manifest
+            .btree
+            .view(BUCKET_MISC, |txn| txn.get(SEQUENCES_KEY))
+            .expect("the repair must be durable");
+        let seq = Sequences::decode(&raw);
+        assert_eq!(
+            seq.next_file_id.load(Relaxed),
+            101,
+            "a stat for file 100 must keep the next id above it"
+        );
+    }
+
+    #[test]
+    fn sequences_commit_uses_the_value_at_commit_not_at_record() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        let manifest = builder.finish().expect("manifest must finish");
+
+        let mut first = manifest.begin();
+        first.put_sequences();
+        // a concurrent writer advances the counters after `first` recorded but before it commits
+        manifest.sequences.next_file_id.store(11, Relaxed);
+        manifest.sequences.next_bucket_id.store(22, Relaxed);
+        manifest.sequences.oracle.store(33, Relaxed);
+        let mut second = manifest.begin();
+        second.put_sequences();
+        second.commit();
+
+        first.commit();
+        let raw = manifest
+            .btree
+            .view(BUCKET_MISC, |txn| txn.get(SEQUENCES_KEY))
+            .expect("sequences must be durable");
+        let seq = Sequences::decode(&raw);
+        assert_eq!(seq.next_file_id.load(Relaxed), 11);
+        assert_eq!(seq.next_bucket_id.load(Relaxed), 22);
+        assert_eq!(seq.oracle.load(Relaxed), 33);
+    }
+
+    #[test]
+    fn max_file_id_overflow_rejects_the_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "a", 5);
+        let inner = StatInner {
+            file_id: u64::MAX,
+            up1: 0,
+            up2: 0,
+            active_elems: 0,
+            total_elems: 0,
+            active_size: 0,
+            total_size: 0,
+            bucket_id: 5,
+        };
+        let stat = PersistStat::from_parts(inner, Vec::new());
+        let mut buf = vec![0u8; stat.packed_size()];
+        stat.encode(&mut buf);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_DATA_STAT, |txn| {
+                txn.put(u64::MAX.to_le_bytes(), &buf)
+            })
+            .expect("stat must be staged");
+        builder.load().expect("the stat must load");
+        assert_eq!(
+            builder.finish().err(),
+            Some(crate::OpCode::Corruption),
+            "a file id at u64::MAX cannot be raised to a next id"
+        );
+    }
+
+    #[test]
+    fn max_pending_bucket_id_overflow_rejects_the_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_PENDING_DEL, |txn| {
+                txn.put(u64::MAX.to_le_bytes(), [])
+            })
+            .expect("pending record must be staged");
+        assert_eq!(
+            builder.load().err(),
+            Some(crate::OpCode::Corruption),
+            "a pending bucket id at u64::MAX cannot be raised to a next id"
+        );
+    }
+
+    #[test]
+    fn bucket_id_at_the_counter_boundary_rejects_the_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_PENDING_DEL, |txn| {
+                txn.put((u64::MAX - 1).to_le_bytes(), [])
+            })
+            .expect("pending record must be staged");
+        assert_eq!(
+            builder.load().err(),
+            Some(crate::OpCode::Corruption),
+            "a bound at u64::MAX - 1 leaves no room before the counter wraps"
+        );
+    }
+
+    #[test]
+    fn file_id_at_the_counter_boundary_rejects_the_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "a", 5);
+        let inner = StatInner {
+            file_id: u64::MAX - 1,
+            up1: 0,
+            up2: 0,
+            active_elems: 0,
+            total_elems: 0,
+            active_size: 0,
+            total_size: 0,
+            bucket_id: 5,
+        };
+        let stat = PersistStat::from_parts(inner, Vec::new());
+        let mut buf = vec![0u8; stat.packed_size()];
+        stat.encode(&mut buf);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_DATA_STAT, |txn| {
+                txn.put((u64::MAX - 1).to_le_bytes(), &buf)
+            })
+            .expect("stat must be staged");
+        builder.load().expect("the stat must load");
+        assert_eq!(
+            builder.finish().err(),
+            Some(crate::OpCode::Corruption),
+            "a next id at u64::MAX would wrap on the following allocation"
+        );
     }
 
     #[test]
