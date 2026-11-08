@@ -1,19 +1,22 @@
+use btree_store::Error as BTreeError;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::map::SharedState;
 use crate::meta::entry::IMetaCodec;
 use crate::meta::{
-    BUCKET_FRONTIER, BUCKET_VERSION, BucketDurableFrontier, CURRENT_VERSION, FileKind, MemStat,
-    ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, PersistStat, SEQUENCES_KEY, VERSION_KEY,
-    entry::BucketMeta,
+    BUCKET_FRONTIER, BUCKET_VERSION, BucketCatalog, BucketDurableFrontier, CURRENT_VERSION,
+    FileKind, MemStat, ORPHAN_BLOB_MARKER_PREFIX, ORPHAN_DATA_MARKER_PREFIX, PersistStat,
+    SEQUENCES_KEY, VERSION_KEY, blob_interval_name, data_interval_name, page_table_name,
 };
 use crate::must_ok;
+use crate::utils::diag;
 use crate::{
     OpCode,
     meta::{
-        BUCKET_BLOB_STAT, BUCKET_DATA_STAT, BUCKET_METAS, BUCKET_MISC, BUCKET_OBSOLETE_BLOB,
-        BUCKET_OBSOLETE_DATA, BUCKET_PENDING_DEL, Manifest, entry::Sequences,
+        BUCKET_MISC, BUCKET_OBSOLETE_BLOB, BUCKET_OBSOLETE_DATA, Manifest, entry::Sequences,
+        stat_bucket, stat_file_path,
     },
     utils::options::{Options, ParsedOptions, PersistedOptions},
 };
@@ -81,11 +84,11 @@ pub(crate) struct LoadOutcome {
 pub(crate) struct ManifestBuilder {
     inner: Manifest,
     max_file_id: u64,
-    // accumulated sizes for DataStat to avoid re-iteration in finish()
-    data_active_size: u64,
-    data_total_size: u64,
-    blob_active_size: u64,
-    blob_total_size: u64,
+    // a derived counter was raised while loading, so finish must persist the repair
+    repair_sequences: bool,
+    // accumulated sizes for DataStat to avoid re-iteration in finish(), by FileKind::slot
+    active_sizes: [u64; 2],
+    total_sizes: [u64; 2],
 }
 
 impl ManifestBuilder {
@@ -100,45 +103,16 @@ impl ManifestBuilder {
         Ok(Self {
             inner: Manifest::new(opt, tx, rx)?,
             max_file_id: 0,
-            data_active_size: 0,
-            data_total_size: 0,
-            blob_active_size: 0,
-            blob_total_size: 0,
+            repair_sequences: false,
+            active_sizes: [0; 2],
+            total_sizes: [0; 2],
         })
     }
 
     pub(crate) fn load(&mut self) -> Result<LoadOutcome, OpCode> {
-        let sequences_ref = &self.inner.sequences;
+        self.repair_sequences = false;
         let current = PersistedOptions::from_options(self.inner.opt.as_ref());
-
-        // 0. check version
-        let mut has_version = false;
-        if let Ok(val) = self
-            .inner
-            .btree
-            .view(BUCKET_VERSION, |txn| txn.get(VERSION_KEY))
-        {
-            let ver = u64::from_le_bytes(val[..8].try_into().map_err(|_| OpCode::Corruption)?);
-            if ver != CURRENT_VERSION {
-                return Err(OpCode::BadVersion);
-            }
-            has_version = true;
-        }
-
-        // 1. load persisted global options
-        let mut persisted_source: Option<(u8, bool)> = None;
-        let persisted = match self.inner.load_persisted_options_if_present()? {
-            Some(persisted) => {
-                persisted_source = Some((persisted.concurrent_write, persisted.sync_on_write));
-                persisted
-            }
-            None if !has_version && self.inner.is_pristine_uninitialized()? => {
-                self.inner.bootstrap_persisted_options(&current)?;
-                has_version = true;
-                current.clone()
-            }
-            None => return Err(OpCode::Corruption),
-        };
+        let (has_version, persisted, persisted_source) = self.load_config(&current)?;
         let needs_writeback = persisted != current;
         // the open plan is the single place that decides source/target widths and routes
         let durable_legacy_per_group_wal =
@@ -149,70 +123,122 @@ impl ManifestBuilder {
             durable_legacy_per_group_wal,
         );
 
-        // 2. load sequences
-        if let Ok(val) = self
+        self.load_sequences(has_version)?;
+        self.load_catalog()?;
+        self.load_bucket_frontier()?;
+        let (active_sizes, total_sizes) = self.load_file_stats()?;
+        self.active_sizes = active_sizes;
+        self.total_sizes = total_sizes;
+
+        if !has_version {
+            self.backfill_legacy_version()?;
+        }
+
+        Ok(LoadOutcome {
+            plan,
+            writeback: needs_writeback.then_some(current),
+        })
+    }
+
+    /// loads the format version and the persisted option subset; a pristine database
+    /// bootstraps both in one transaction, while a legacy database is upgraded later
+    fn load_config(
+        &self,
+        current: &PersistedOptions,
+    ) -> Result<(bool, PersistedOptions, Option<(u8, bool)>), OpCode> {
+        let mut has_version = false;
+        match self
+            .inner
+            .btree
+            .view(BUCKET_VERSION, |txn| txn.get(VERSION_KEY))
+        {
+            Ok(val) => {
+                let ver = u64::from_le_bytes(val[..8].try_into().map_err(|_| OpCode::Corruption)?);
+                if ver != CURRENT_VERSION {
+                    return Err(OpCode::BadVersion);
+                }
+                has_version = true;
+            }
+            Err(BTreeError::KeyNotFound) => {}
+            Err(err) => return Err(OpCode::from(err)),
+        }
+
+        let mut persisted_source: Option<(u8, bool)> = None;
+        let persisted = match self.inner.load_persisted_options_if_present()? {
+            Some(persisted) => {
+                persisted_source = Some((persisted.concurrent_write, persisted.sync_on_write));
+                persisted
+            }
+            None if !has_version && self.inner.is_pristine_uninitialized()? => {
+                self.inner.bootstrap_persisted_options(current)?;
+                has_version = true;
+                current.clone()
+            }
+            None => return Err(OpCode::Corruption),
+        };
+        Ok((has_version, persisted, persisted_source))
+    }
+
+    fn load_sequences(&mut self, has_version: bool) -> Result<(), OpCode> {
+        match self
             .inner
             .btree
             .view(BUCKET_MISC, |txn| txn.get(SEQUENCES_KEY))
         {
-            if !has_version {
-                return Err(OpCode::BadVersion);
-            }
-            let src = Sequences::decode(&val);
-            macro_rules! set {
-                ($dst:expr, $src:expr; $($field:ident),*) => {
-                    $(
-                        $dst.$field.fetch_max($src.$field.load(Relaxed), Relaxed);
-                    )*
-                };
-            }
-            set!(
-                sequences_ref,
-                src;
-                next_file_id,
-                next_bucket_id,
-                oracle
-            );
-            self.max_file_id = src.next_file_id.load(Relaxed).saturating_sub(1);
-        }
-
-        // 3. load BucketMeta
-        self.inner
-            .btree
-            .view(BUCKET_METAS, |txn| {
-                let mut iter = txn.iter();
-                let mut k = Vec::new();
-                let mut v = Vec::new();
-                while iter.next_ref(&mut k, &mut v) {
-                    let meta = BucketMeta::decode(&v);
-                    let name =
-                        std::str::from_utf8(&k).expect("bucket metadata key must be valid utf-8");
-                    let meta = Arc::new(meta);
-                    let bucket_id = meta.id;
-                    self.inner
-                        .bucket_metas_by_id
-                        .insert(bucket_id, meta.clone());
-                    self.inner.bucket_metas.insert(name.into(), meta);
-                    self.inner.ensure_bucket_runtime(bucket_id);
+            Ok(val) => {
+                if !has_version {
+                    return Err(OpCode::BadVersion);
                 }
-                Ok(())
-            })
-            .map_err(|_| OpCode::IoError)?;
-
-        // 2.1 count pending buckets
-        let mut nr_buckets = self.inner.bucket_metas.len() as u64;
-        let _ = self.inner.btree.view(BUCKET_PENDING_DEL, |txn| {
-            let mut iter = txn.iter();
-            let mut k = Vec::new();
-            let mut v = Vec::new();
-            while iter.next_ref(&mut k, &mut v) {
-                nr_buckets += 1;
+                let src = Sequences::decode(&val);
+                macro_rules! set {
+                    ($dst:expr, $src:expr; $($field:ident),*) => {
+                        $(
+                            $dst.$field.fetch_max($src.$field.load(Relaxed), Relaxed);
+                        )*
+                    };
+                }
+                set!(
+                    self.inner.sequences,
+                    src;
+                    next_file_id,
+                    next_bucket_id,
+                    oracle
+                );
+                self.max_file_id = src.next_file_id.load(Relaxed).saturating_sub(1);
             }
-            Ok(())
-        });
-        self.inner.nr_buckets.store(nr_buckets, Relaxed);
+            Err(BTreeError::KeyNotFound) => {}
+            Err(err) => return Err(OpCode::from(err)),
+        }
+        Ok(())
+    }
 
-        // 3. load bucket durable frontier
+    fn load_catalog(&mut self) -> Result<(), OpCode> {
+        let (catalog, max_bucket_id) = BucketCatalog::load(&self.inner.btree)?;
+        if let Some(max_id) = max_bucket_id {
+            let next = self.inner.sequences.next_bucket_id.load(Relaxed);
+            if next <= max_id {
+                // the counter is derived state: raise it instead of refusing the open, so a
+                // stale value can never hand the same id to a second bucket
+                let raised = max_id
+                    .checked_add(1)
+                    .filter(|raised| *raised < u64::MAX)
+                    .ok_or(OpCode::Corruption)?;
+                self.inner.sequences.next_bucket_id.store(raised, Relaxed);
+                self.repair_sequences = true;
+                diag::warn!("raised stale next_bucket_id {} to {}", next, raised);
+            }
+        }
+        // the runtime entry exists for every catalogued bucket from open on: lifecycle state and
+        // compression contexts outlive a lazy context load, and background GC reads them
+        for bucket_id in catalog.ids() {
+            self.inner.buckets.ensure_runtime(bucket_id);
+        }
+        self.inner.catalog = catalog;
+        Ok(())
+    }
+
+    fn load_bucket_frontier(&self) -> Result<(), OpCode> {
+        let mut frontier_error = None;
         self.inner
             .btree
             .view(BUCKET_FRONTIER, |txn| {
@@ -220,42 +246,67 @@ impl ManifestBuilder {
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 while iter.next_ref(&mut k, &mut v) {
-                    let item = BucketDurableFrontier::decode(&v);
+                    let key_id = match k.as_slice().try_into() {
+                        Ok(bytes) => u64::from_le_bytes(bytes),
+                        Err(_) => {
+                            frontier_error = Some(OpCode::Corruption);
+                            return Ok(());
+                        }
+                    };
+                    let item = match BucketDurableFrontier::try_decode(&v) {
+                        Ok(item) => item,
+                        Err(err) => {
+                            frontier_error = Some(err);
+                            return Ok(());
+                        }
+                    };
+                    if item.bucket_id != key_id {
+                        frontier_error = Some(OpCode::Corruption);
+                        return Ok(());
+                    }
                     self.inner.bucket_frontier.insert(item.bucket_id, item.lsn);
                 }
                 Ok(())
             })
-            .map_err(|_| OpCode::IoError)?;
+            .map_err(OpCode::from)?;
+        if let Some(err) = frontier_error {
+            return Err(err);
+        }
+        Ok(())
+    }
 
+    fn load_file_stats(&mut self) -> Result<([u64; 2], [u64; 2]), OpCode> {
+        let mut active_sizes = [0u64; 2];
+        let mut total_sizes = [0u64; 2];
+        // every id still referenced by a stat or an obsolete record must never be handed out
+        // again, even if the durable counter predates a concurrent checkpoint
+        let mut max_file_id = self.max_file_id;
         for kind in FileKind::ALL {
             let mut active_size = 0;
             let mut total_size = 0;
             self.inner
                 .btree
-                .view(
-                    match kind {
-                        FileKind::Data => BUCKET_DATA_STAT,
-                        FileKind::Blob => BUCKET_BLOB_STAT,
-                    },
-                    |txn| {
-                        let mut iter = txn.iter();
-                        let mut k = Vec::new();
-                        let mut v = Vec::new();
-                        while iter.next_ref(&mut k, &mut v) {
-                            let inner = PersistStat::decode_inner_only(&v);
-                            active_size += inner.active_size as u64;
-                            total_size += inner.total_size as u64;
-                            let fstat = MemStat::from_parts(inner, None);
-                            self.inner.stat_ctx(kind).insert_loaded_stat(fstat);
-                            self.inner
-                                .get_bucket_runtime(inner.bucket_id)
-                                .observe_stat_epoch(kind, inner.up1, inner.up2);
-                        }
-                        Ok(())
-                    },
-                )
+                .view(stat_bucket(kind), |txn| {
+                    let mut iter = txn.iter();
+                    let mut k = Vec::new();
+                    let mut v = Vec::new();
+                    while iter.next_ref(&mut k, &mut v) {
+                        let inner = PersistStat::decode_inner_only(&v);
+                        active_size += inner.active_size as u64;
+                        total_size += inner.total_size as u64;
+                        max_file_id = max_file_id.max(inner.file_id);
+                        let fstat = MemStat::from_parts(inner, None);
+                        self.inner.file_state(kind).stat.insert_loaded_stat(fstat);
+                        self.inner
+                            .buckets
+                            .get_runtime(inner.bucket_id)
+                            .observe_stat_epoch(kind, inner.up1, inner.up2);
+                    }
+                    Ok(())
+                })
                 .map_err(|_| OpCode::IoError)?;
-            self.set_loaded_sizes(kind, active_size, total_size);
+            active_sizes[kind.slot()] = active_size;
+            total_sizes[kind.slot()] = total_size;
 
             self.inner
                 .btree
@@ -273,6 +324,7 @@ impl ManifestBuilder {
                             let id_bytes: [u8; 8] =
                                 k[..8].try_into().expect("obsolete file key must be a u64");
                             let id = u64::from_le_bytes(id_bytes);
+                            max_file_id = max_file_id.max(id);
                             obs.push(id);
                         }
                         Ok(())
@@ -280,91 +332,122 @@ impl ManifestBuilder {
                 )
                 .map_err(|_| OpCode::IoError)?;
         }
-
-        if !has_version {
-            self.inner
-                .btree
-                .exec(BUCKET_VERSION, |txn| {
-                    txn.put(VERSION_KEY, CURRENT_VERSION.to_le_bytes())
-                })
-                .map_err(|_| OpCode::IoError)?;
+        if max_file_id > self.max_file_id {
+            // a durable file id, or an obsolete one, is above the persisted counter
+            self.repair_sequences = true;
         }
+        self.max_file_id = max_file_id;
+        Ok((active_sizes, total_sizes))
+    }
 
-        Ok(LoadOutcome {
-            plan,
-            writeback: needs_writeback.then_some(current),
-        })
+    fn backfill_legacy_version(&self) -> Result<(), OpCode> {
+        self.inner
+            .btree
+            .exec(BUCKET_VERSION, |txn| {
+                txn.put(VERSION_KEY, CURRENT_VERSION.to_le_bytes())
+            })
+            .map_err(|_| OpCode::IoError)
     }
 
     pub(crate) fn finish(mut self) -> Result<Manifest, OpCode> {
         // both cleanups sync the data directory, and this runs before recovery: a failed sync
         // must fail the open with an error, which the caller reports as a failed open
         self.clean_orphans()?;
+        self.clean_orphan_btree_buckets()?;
         self.inner.delete_files()?;
 
         #[cfg(feature = "extra_check")]
-        self.inner
-            .stat_ctx(FileKind::Data)
-            .update_size(self.data_active_size, self.data_total_size);
+        for kind in FileKind::ALL {
+            self.inner.file_state(kind).stat.update_size(
+                self.active_sizes[kind.slot()],
+                self.total_sizes[kind.slot()],
+            );
+        }
 
-        #[cfg(feature = "extra_check")]
-        self.inner
-            .stat_ctx(FileKind::Blob)
-            .update_size(self.blob_active_size, self.blob_total_size);
-
+        let next_file_id = self
+            .max_file_id
+            .checked_add(1)
+            .filter(|next| *next < u64::MAX)
+            .ok_or(OpCode::Corruption)?;
         self.inner
             .sequences
             .next_file_id
-            .store(self.max_file_id + 1, Relaxed);
+            .store(next_file_id, Relaxed);
+        if self.repair_sequences {
+            // open is single-threaded here, so a direct put is the commit-time value; a failed
+            // repair write must surface as a failed open instead of aborting the process
+            let value = self.inner.sequences.snapshot_bytes();
+            self.inner
+                .btree
+                .exec(BUCKET_MISC, |txn| txn.put(SEQUENCES_KEY, value))
+                .map_err(OpCode::from)?;
+        }
 
         Ok(self.inner)
     }
 
-    fn set_loaded_sizes(&mut self, kind: FileKind, active_size: u64, total_size: u64) {
-        match kind {
-            FileKind::Data => {
-                self.data_active_size = active_size;
-                self.data_total_size = total_size;
-            }
-            FileKind::Blob => {
-                self.blob_active_size = active_size;
-                self.blob_total_size = total_size;
+    /// remove btree tables reserved by a create that never committed its metadata
+    ///
+    /// open is single-threaded here, so no create can race the sweep; a table is orphaned only
+    /// when its id is in neither the active catalog nor the pending-delete set
+    fn clean_orphan_btree_buckets(&self) -> Result<(), OpCode> {
+        let names = self.inner.btree.buckets().map_err(OpCode::from)?;
+        let mut orphans = BTreeSet::new();
+        for name in names {
+            let Some(id) = orphan_table_id(&name) else {
+                continue;
+            };
+            if !self.inner.catalog.contains(id) && !self.inner.catalog.is_pending(id) {
+                orphans.insert(id);
             }
         }
+        for id in orphans {
+            for name in [
+                page_table_name(id),
+                data_interval_name(id),
+                blob_interval_name(id),
+            ] {
+                match self.inner.btree.del_bucket(&name) {
+                    Ok(()) | Err(BTreeError::BucketNotFound) => {}
+                    Err(err) => return Err(OpCode::from(err)),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn clean_orphans(&mut self) -> Result<(), OpCode> {
         let mut markers: [Vec<(u64, Vec<u8>)>; 2] = [Vec::new(), Vec::new()];
 
-        let _ = self.inner.btree.view(BUCKET_MISC, |txn| {
-            // file ids can be sparse because some ids are reserved before any file is flushed
-            // rely on explicit per-file markers instead of max_id tail probing or directory scan
-            let mut iter = txn.iter();
-            let mut k = Vec::new();
-            let mut v = Vec::new();
-            while iter.next_ref(&mut k, &mut v) {
-                for kind in FileKind::ALL {
-                    let prefix = match kind {
-                        FileKind::Data => ORPHAN_DATA_MARKER_PREFIX,
-                        FileKind::Blob => ORPHAN_BLOB_MARKER_PREFIX,
-                    };
-                    if let Some(id) = Self::parse_orphan_marker_id(&k, prefix) {
-                        markers[kind.slot()].push((id, k.clone()));
-                        break;
+        self.inner
+            .btree
+            .view(BUCKET_MISC, |txn| {
+                // file ids can be sparse because some ids are reserved before any file is flushed
+                // rely on explicit per-file markers instead of max_id tail probing or directory scan
+                let mut iter = txn.iter();
+                let mut k = Vec::new();
+                let mut v = Vec::new();
+                while iter.next_ref(&mut k, &mut v) {
+                    for kind in FileKind::ALL {
+                        let prefix = match kind {
+                            FileKind::Data => ORPHAN_DATA_MARKER_PREFIX,
+                            FileKind::Blob => ORPHAN_BLOB_MARKER_PREFIX,
+                        };
+                        if let Some(id) = Self::parse_orphan_marker_id(&k, prefix) {
+                            markers[kind.slot()].push((id, k.clone()));
+                            break;
+                        }
                     }
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            })
+            .map_err(OpCode::from)?;
 
         let mut cleaned_marker_keys: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
         for kind in FileKind::ALL {
             for (id, key) in markers[kind.slot()].drain(..) {
                 self.observe_orphan_id(id);
-                let path = match kind {
-                    FileKind::Data => self.inner.opt.data_file(id),
-                    FileKind::Blob => self.inner.opt.blob_file(id),
-                };
+                let path = stat_file_path(self.inner.opt.as_ref(), kind, id);
                 // this unlink runs only from `Store::new` while opening the instance, so
                 // it can never overlap a checkpoint (which requires an already-open
                 // instance) and does not claim a `DeletionGuard` slot. moving orphan
@@ -409,6 +492,10 @@ impl ManifestBuilder {
     }
 
     fn observe_orphan_id(&mut self, id: u64) {
+        if id > self.max_file_id {
+            // an unpublished file id above the persisted counter must be skipped on reuse
+            self.repair_sequences = true;
+        }
         self.max_file_id = self.max_file_id.max(id);
     }
 
@@ -422,10 +509,60 @@ impl ManifestBuilder {
     }
 }
 
+/// the bucket id of an engine-owned page-table/interval btree name, when the name has that shape
+fn orphan_table_id(name: &str) -> Option<u64> {
+    ["page_table_", "data_interval_", "blob_interval_"]
+        .into_iter()
+        .find_map(|prefix| name.strip_prefix(prefix)?.parse().ok())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::OpenPlan;
-    use crate::Options;
+    use super::{ManifestBuilder, OpenPlan};
+    use crate::meta::entry::{
+        BucketDurableFrontier, BucketMeta, IMetaCodec, PersistStat, Sequences, StatInner,
+    };
+    use crate::meta::{
+        BUCKET_DATA_STAT, BUCKET_METAS, BUCKET_MISC, BUCKET_PENDING_DEL, SEQUENCES_KEY,
+        blob_interval_name, data_interval_name, page_table_name,
+    };
+    use crate::utils::options::PersistedBucketOptions;
+    use crate::{BucketOptions, Options, RandomPath};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::mpsc::channel;
+
+    fn open_builder() -> (
+        ManifestBuilder,
+        Arc<crate::utils::options::ParsedOptions>,
+        RandomPath,
+    ) {
+        let root = RandomPath::tmp();
+        let opt = Arc::new(
+            Options::new(&*root)
+                .validate()
+                .expect("options must validate"),
+        );
+        let (tx, _rx) = channel();
+        let (_ack_tx, ack_rx) = channel();
+        let builder =
+            ManifestBuilder::new_with_channels(opt.clone(), tx, ack_rx).expect("builder must open");
+        (builder, opt, root)
+    }
+
+    fn put_bucket_meta(builder: &ManifestBuilder, name: &str, id: u64) {
+        let meta = BucketMeta {
+            id,
+            options: PersistedBucketOptions::from(&BucketOptions::default()),
+        };
+        let mut buf = vec![0u8; meta.packed_size()];
+        meta.encode(&mut buf);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_METAS, |txn| txn.put(name.as_bytes(), &buf))
+            .expect("bucket meta must be staged");
+    }
 
     fn requested(groups: u8, durable: bool) -> Options {
         let mut opt = Options::new("/tmp/mace-open-plan-test");
@@ -474,6 +611,448 @@ mod tests {
             Some(crate::OpCode::IoError),
             "a failed data-directory sync during orphan cleanup must fail the open"
         );
+    }
+
+    #[test]
+    fn pristine_bootstrap_reopens_with_version_and_options() {
+        let (mut builder, opt, _root) = open_builder();
+        builder.load().expect("pristine bootstrap must load");
+        let version = builder
+            .inner
+            .btree
+            .view(crate::meta::BUCKET_VERSION, |txn| {
+                txn.get(crate::meta::VERSION_KEY)
+            })
+            .expect("version must be written");
+        assert_eq!(
+            u64::from_le_bytes(version[..8].try_into().expect("version width")),
+            crate::meta::CURRENT_VERSION
+        );
+        assert!(
+            builder
+                .inner
+                .btree
+                .view(crate::meta::BUCKET_MISC, |txn| {
+                    txn.get(crate::meta::OPTIONS_KEY)
+                })
+                .is_ok(),
+            "options must be written"
+        );
+        builder.finish().expect("manifest must finish");
+
+        let (tx, _rx) = channel();
+        let (_ack_tx, ack_rx) = channel();
+        let mut reopened =
+            ManifestBuilder::new_with_channels(opt, tx, ack_rx).expect("reopen must open");
+        reopened.load().expect("reopen must load");
+    }
+
+    #[test]
+    fn legacy_database_without_version_backfills_after_validation() {
+        let (mut builder, opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        builder
+            .inner
+            .btree
+            .exec(crate::meta::BUCKET_VERSION, |txn| {
+                txn.del(crate::meta::VERSION_KEY)
+            })
+            .expect("version must be deletable");
+        builder.finish().expect("manifest must finish");
+
+        let (tx, _rx) = channel();
+        let (_ack_tx, ack_rx) = channel();
+        let mut reopened =
+            ManifestBuilder::new_with_channels(opt, tx, ack_rx).expect("legacy open must open");
+        reopened.load().expect("legacy load must backfill");
+        assert!(
+            reopened
+                .inner
+                .btree
+                .view(crate::meta::BUCKET_VERSION, |txn| {
+                    txn.get(crate::meta::VERSION_KEY)
+                })
+                .is_ok(),
+            "legacy load must write the version back"
+        );
+    }
+
+    #[test]
+    fn legacy_backfill_stays_after_validation_failure() {
+        let (mut builder, opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        builder
+            .inner
+            .btree
+            .exec(crate::meta::BUCKET_VERSION, |txn| {
+                txn.del(crate::meta::VERSION_KEY)
+            })
+            .expect("version must be deletable");
+        let mut lsn = crate::utils::data::init_group_pos();
+        lsn[0] = crate::utils::data::Position::new(1, 0);
+        let frontier = BucketDurableFrontier::new(2, lsn);
+        let mut buf = vec![0u8; frontier.packed_size()];
+        frontier.encode(&mut buf);
+        builder
+            .inner
+            .btree
+            .exec(crate::meta::BUCKET_FRONTIER, |txn| {
+                txn.put(1u64.to_le_bytes(), &buf)
+            })
+            .expect("frontier must be staged");
+        builder.finish().expect("manifest must finish");
+
+        let (tx, _rx) = channel();
+        let (_ack_tx, ack_rx) = channel();
+        let mut reopened =
+            ManifestBuilder::new_with_channels(opt, tx, ack_rx).expect("legacy open must open");
+        assert_eq!(
+            reopened.load().err(),
+            Some(crate::OpCode::Corruption),
+            "validation must reject the mismatched frontier"
+        );
+        assert!(
+            reopened
+                .inner
+                .btree
+                .view(crate::meta::BUCKET_VERSION, |txn| {
+                    txn.get(crate::meta::VERSION_KEY)
+                })
+                .is_err(),
+            "a failed legacy load must not backfill the version"
+        );
+    }
+
+    #[test]
+    fn bucket_metadata_read_error_is_not_absent() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        let manifest = builder.finish().expect("manifest must finish");
+        manifest
+            .btree
+            .del_bucket(BUCKET_METAS)
+            .expect("bucket meta table must be deletable");
+        assert!(
+            manifest.load_bucket_options("missing").is_err(),
+            "metadata read failure must not become None"
+        );
+    }
+
+    #[test]
+    fn bucket_builder_pending_scan_error_propagates() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        builder
+            .inner
+            .btree
+            .del_bucket(BUCKET_PENDING_DEL)
+            .expect("pending bucket table must be deletable");
+        assert!(
+            builder.load().is_err(),
+            "pending scan read error must fail the open"
+        );
+    }
+
+    #[test]
+    fn bucket_orphan_marker_scan_error_propagates() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        builder
+            .inner
+            .btree
+            .del_bucket(BUCKET_MISC)
+            .expect("misc bucket must be deletable");
+        assert!(
+            builder.finish().is_err(),
+            "orphan marker scan read error must fail the open"
+        );
+    }
+
+    #[test]
+    fn bucket_duplicate_id_rejected() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "a", 7);
+        put_bucket_meta(&builder, "b", 7);
+        assert_eq!(builder.load().err(), Some(crate::OpCode::Corruption));
+    }
+
+    #[test]
+    fn stale_next_bucket_id_is_raised_instead_of_rejecting_the_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "a", 5);
+        builder.inner.sequences.next_bucket_id.store(0, Relaxed);
+
+        builder.load().expect("a stale counter must be repaired");
+        assert_eq!(builder.inner.sequences.next_bucket_id.load(Relaxed), 6);
+
+        let manifest = builder.finish().expect("repair must finish");
+        let raw = manifest
+            .btree
+            .view(BUCKET_MISC, |txn| txn.get(SEQUENCES_KEY))
+            .expect("the repair must be durable");
+        let seq = Sequences::decode(&raw);
+        assert_eq!(seq.next_bucket_id.load(Relaxed), 6);
+    }
+
+    #[test]
+    fn pending_bucket_id_participates_in_the_next_id_bound() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        // active max is 5, but the highest id was logically deleted and awaits cleanup
+        put_bucket_meta(&builder, "a", 5);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_PENDING_DEL, |txn| txn.put(9u64.to_le_bytes(), []))
+            .expect("pending record must be staged");
+        builder.inner.sequences.next_bucket_id.store(6, Relaxed);
+
+        builder.load().expect("pending ids must raise the bound");
+        assert_eq!(
+            builder.inner.sequences.next_bucket_id.load(Relaxed),
+            10,
+            "a pending id at 9 must keep the next id above it"
+        );
+    }
+
+    #[test]
+    fn file_id_counter_covers_ids_still_referenced_by_stats() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "a", 5);
+        let inner = StatInner {
+            file_id: 100,
+            up1: 0,
+            up2: 0,
+            active_elems: 0,
+            total_elems: 0,
+            active_size: 0,
+            total_size: 0,
+            bucket_id: 5,
+        };
+        let stat = PersistStat::from_parts(inner, Vec::new());
+        let mut buf = vec![0u8; stat.packed_size()];
+        stat.encode(&mut buf);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_DATA_STAT, |txn| txn.put(100u64.to_le_bytes(), &buf))
+            .expect("stat must be staged");
+        builder.inner.sequences.next_file_id.store(10, Relaxed);
+
+        builder.load().expect("stats must raise the file id bound");
+        let manifest = builder.finish().expect("repair must finish");
+        let raw = manifest
+            .btree
+            .view(BUCKET_MISC, |txn| txn.get(SEQUENCES_KEY))
+            .expect("the repair must be durable");
+        let seq = Sequences::decode(&raw);
+        assert_eq!(
+            seq.next_file_id.load(Relaxed),
+            101,
+            "a stat for file 100 must keep the next id above it"
+        );
+    }
+
+    #[test]
+    fn sequences_commit_uses_the_value_at_commit_not_at_record() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        let manifest = builder.finish().expect("manifest must finish");
+
+        let mut first = manifest.begin();
+        first.put_sequences();
+        // a concurrent writer advances the counters after `first` recorded but before it commits
+        manifest.sequences.next_file_id.store(11, Relaxed);
+        manifest.sequences.next_bucket_id.store(22, Relaxed);
+        manifest.sequences.oracle.store(33, Relaxed);
+        let mut second = manifest.begin();
+        second.put_sequences();
+        second.commit();
+
+        first.commit();
+        let raw = manifest
+            .btree
+            .view(BUCKET_MISC, |txn| txn.get(SEQUENCES_KEY))
+            .expect("sequences must be durable");
+        let seq = Sequences::decode(&raw);
+        assert_eq!(seq.next_file_id.load(Relaxed), 11);
+        assert_eq!(seq.next_bucket_id.load(Relaxed), 22);
+        assert_eq!(seq.oracle.load(Relaxed), 33);
+    }
+
+    #[test]
+    fn max_file_id_overflow_rejects_the_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "a", 5);
+        let inner = StatInner {
+            file_id: u64::MAX,
+            up1: 0,
+            up2: 0,
+            active_elems: 0,
+            total_elems: 0,
+            active_size: 0,
+            total_size: 0,
+            bucket_id: 5,
+        };
+        let stat = PersistStat::from_parts(inner, Vec::new());
+        let mut buf = vec![0u8; stat.packed_size()];
+        stat.encode(&mut buf);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_DATA_STAT, |txn| {
+                txn.put(u64::MAX.to_le_bytes(), &buf)
+            })
+            .expect("stat must be staged");
+        builder.load().expect("the stat must load");
+        assert_eq!(
+            builder.finish().err(),
+            Some(crate::OpCode::Corruption),
+            "a file id at u64::MAX cannot be raised to a next id"
+        );
+    }
+
+    #[test]
+    fn max_pending_bucket_id_overflow_rejects_the_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_PENDING_DEL, |txn| {
+                txn.put(u64::MAX.to_le_bytes(), [])
+            })
+            .expect("pending record must be staged");
+        assert_eq!(
+            builder.load().err(),
+            Some(crate::OpCode::Corruption),
+            "a pending bucket id at u64::MAX cannot be raised to a next id"
+        );
+    }
+
+    #[test]
+    fn bucket_id_at_the_counter_boundary_rejects_the_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_PENDING_DEL, |txn| {
+                txn.put((u64::MAX - 1).to_le_bytes(), [])
+            })
+            .expect("pending record must be staged");
+        assert_eq!(
+            builder.load().err(),
+            Some(crate::OpCode::Corruption),
+            "a bound at u64::MAX - 1 leaves no room before the counter wraps"
+        );
+    }
+
+    #[test]
+    fn file_id_at_the_counter_boundary_rejects_the_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "a", 5);
+        let inner = StatInner {
+            file_id: u64::MAX - 1,
+            up1: 0,
+            up2: 0,
+            active_elems: 0,
+            total_elems: 0,
+            active_size: 0,
+            total_size: 0,
+            bucket_id: 5,
+        };
+        let stat = PersistStat::from_parts(inner, Vec::new());
+        let mut buf = vec![0u8; stat.packed_size()];
+        stat.encode(&mut buf);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_DATA_STAT, |txn| {
+                txn.put((u64::MAX - 1).to_le_bytes(), &buf)
+            })
+            .expect("stat must be staged");
+        builder.load().expect("the stat must load");
+        assert_eq!(
+            builder.finish().err(),
+            Some(crate::OpCode::Corruption),
+            "a next id at u64::MAX would wrap on the following allocation"
+        );
+    }
+
+    #[test]
+    fn orphan_btree_tables_are_reclaimed_on_open() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        put_bucket_meta(&builder, "active", 5);
+        builder
+            .inner
+            .btree
+            .exec(BUCKET_PENDING_DEL, |txn| txn.put(9u64.to_le_bytes(), []))
+            .expect("pending record must be staged");
+        for id in [5u64, 9, 99] {
+            for name in [
+                page_table_name(id),
+                data_interval_name(id),
+                blob_interval_name(id),
+            ] {
+                builder
+                    .inner
+                    .btree
+                    .new_bucket(&name, false)
+                    .expect("table must be created");
+            }
+        }
+        builder.load().expect("catalog must include the staged ids");
+
+        let manifest = builder.finish().expect("finish must sweep");
+        let names = manifest.btree.buckets().expect("buckets must list");
+        for id in [5u64, 9] {
+            for name in [
+                page_table_name(id),
+                data_interval_name(id),
+                blob_interval_name(id),
+            ] {
+                assert!(
+                    names.contains(&name),
+                    "active or pending table {name} must survive"
+                );
+            }
+        }
+        for name in [
+            page_table_name(99),
+            data_interval_name(99),
+            blob_interval_name(99),
+        ] {
+            assert!(
+                !names.contains(&name),
+                "orphan table {name} must be reclaimed"
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_frontier_identity_mismatch_rejected() {
+        let (mut builder, _opt, _root) = open_builder();
+        builder.load().expect("initial load must work");
+        let mut lsn = crate::utils::data::init_group_pos();
+        lsn[0] = crate::utils::data::Position::new(1, 0);
+        let frontier = BucketDurableFrontier::new(2, lsn);
+        let mut buf = vec![0u8; frontier.packed_size()];
+        frontier.encode(&mut buf);
+        builder
+            .inner
+            .btree
+            .exec(crate::meta::BUCKET_FRONTIER, |txn| {
+                txn.put(1u64.to_le_bytes(), &buf)
+            })
+            .expect("frontier must be staged");
+        assert_eq!(builder.load().err(), Some(crate::OpCode::Corruption));
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! `mace-kv` maintenance command line tool.
 //!
-//! one read-only subcommand today:
+//! offline consistency and inactive-ledger maintenance:
 //!
 //! ```text
 //! mace-kv check <db-dir>
+//! mace-kv leak-check <db-dir> [--fix]
 //! ```
 //!
 //! exit codes are stable:
@@ -15,8 +16,8 @@
 //! `--help`/`--version` exit `0` and print to stdout; a usage error exits `2` and prints
 //! to stderr, which is clap's default and the documented contract above.
 //!
-//! the tool is read-only: it never creates, deletes or repairs a file, and it never
-//! runs the writeback recovery that opening a [`mace::Mace`] instance would run.
+//! inspection is read-only; leak-check --fix adds missing inactive marks in one
+//! metadata transaction. neither mode runs engine writeback recovery.
 //!
 //! fatal metadata page damage is not isolated: `btree-store` intentionally logs a
 //! `BTREE_FATAL_*` diagnostic and then aborts, and this process terminates the same way;
@@ -24,7 +25,8 @@
 //! offset and generation.
 
 use clap::{Parser, Subcommand};
-use mace::{CheckReport, Diagnostic, Options, check_database};
+use mace::Options;
+use mace_kv_cli::{CheckReport, Diagnostic, check_database, leak_check_database};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -38,7 +40,7 @@ const EXIT_DAMAGE: u8 = 1;
     name = "mace-kv",
     version,
     about = "mace-kv maintenance tooling",
-    long_about = "mace-kv maintenance tooling: read-only inspection of a mace database directory.\n\
+    long_about = "mace-kv maintenance tooling: offline inspection and stat-ledger repair.\n\
                   a usage error exits 2, a reported damage exits 1, a clean check exits 0."
 )]
 struct Cli {
@@ -53,11 +55,45 @@ enum Command {
         /// database directory to check
         dir: std::path::PathBuf,
     },
+    /// detect unreachable records missing from the inactive ledger, optionally repairing marks
+    LeakCheck {
+        /// database directory to check
+        dir: std::path::PathBuf,
+        /// add missing inactive marks to stat records
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Check { dir } => check(&dir),
+        Command::LeakCheck { dir, fix } => {
+            let result = leak_check_database(&Options::new(&dir), fix);
+            if let Some(fault) = &result.fault {
+                eprintln!("leak-check repair failed: {fault}");
+            }
+            print_diagnostics(&result.report);
+            for repair in &result.repairs {
+                println!(
+                    "repaired: {} bucket={} file={} added_inactive={} active_elems={}->{} active_size={}->{}",
+                    repair.kind,
+                    repair.bucket_id,
+                    repair.file_id,
+                    repair.added_inactive,
+                    repair.active_elems.0,
+                    repair.active_elems.1,
+                    repair.active_size.0,
+                    repair.active_size.1
+                );
+            }
+            print_summary(&dir, &result.report);
+            ExitCode::from(if result.fault.is_some() {
+                2
+            } else {
+                result.report.exit_code() as u8
+            })
+        }
     }
 }
 
@@ -72,9 +108,17 @@ fn check(dir: &Path) -> ExitCode {
 }
 
 fn print_report(dir: &Path, report: &CheckReport) {
+    print_diagnostics(report);
+    print_summary(dir, report);
+}
+
+fn print_diagnostics(report: &CheckReport) {
     for diagnostic in &report.diagnostics {
         println!("{}", render(diagnostic));
     }
+}
+
+fn print_summary(dir: &Path, report: &CheckReport) {
     let counts: Vec<String> = report
         .summary()
         .into_iter()

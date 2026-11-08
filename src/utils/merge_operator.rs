@@ -49,10 +49,18 @@ impl U64AddOperator {
             u64::from_le_bytes(raw.try_into().expect("exact u64 slice"))
         } else {
             // reference behavior: a malformed payload contributes zero
-            log::error!(
-                "uint64 value corruption, size: {} > {}",
-                raw.len(),
-                size_of::<u64>()
+            //
+            // unfiltered: `U64AddOperator` is a unit struct the embedder constructs, so no
+            // instance level reaches it, and a corrupt persisted value must not be silent
+            crate::utils::diag::emit(
+                crate::utils::diag::DiagLevel::Error,
+                file!(),
+                line!(),
+                format_args!(
+                    "uint64 value corruption, size: {} > {}",
+                    raw.len(),
+                    size_of::<u64>()
+                ),
             );
             0
         }

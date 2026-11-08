@@ -1,5 +1,5 @@
 use crate::types::traits::IAsSlice;
-use crate::{OpCode, Options, must_ok};
+use crate::{OpCode, Options, must_ok, static_assert};
 
 use crate::io::{self, FileSystem, GatherIO, IoVec};
 use std::fmt::Debug;
@@ -34,15 +34,15 @@ impl LenSeq {
 #[repr(C, packed(1))]
 pub struct Reloc {
     /// frame offset in page file
-    pub(crate) off: usize,
+    pub off: usize,
     /// decoded record length
-    pub(crate) raw_len: u32,
+    pub raw_len: u32,
     /// stored compressed length, 0 means raw
-    pub(crate) compressed_len: u32,
+    pub compressed_len: u32,
     /// index in relocation table
-    pub(crate) seq: u32,
+    pub seq: u32,
     /// checksum of page
-    pub(crate) crc: u32,
+    pub crc: u32,
 }
 
 impl Reloc {
@@ -74,9 +74,9 @@ impl Reloc {
 #[repr(C, packed(1))]
 pub struct AddrPair {
     /// logical address
-    pub(crate) key: u64,
+    pub key: u64,
     /// relocated address
-    pub(crate) val: Reloc,
+    pub val: Reloc,
 }
 
 impl AddrPair {
@@ -103,6 +103,11 @@ impl AddrPair {
 }
 
 impl IAsSlice for AddrPair {}
+
+static_assert!(size_of::<Reloc>() == 24);
+static_assert!(size_of::<AddrPair>() == 32);
+static_assert!(size_of::<Interval>() == 16);
+static_assert!(size_of::<Position>() == 16);
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed(1))]
@@ -229,11 +234,6 @@ impl GatherWriter {
             .expect("owned payload must exist")
             .as_slice();
         self.queue.push(slice.into());
-    }
-
-    #[allow(unused)]
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
     }
 
     pub fn pos(&self) -> u64 {

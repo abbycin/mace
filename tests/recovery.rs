@@ -3,7 +3,7 @@ use std::sync::{Arc, Barrier};
 
 #[test]
 fn intact_meta() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mut saved = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
@@ -49,7 +49,7 @@ fn intact_meta() {
 
 #[test]
 fn bad_meta() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
@@ -78,7 +78,7 @@ fn bad_meta() {
 
 #[test]
 fn crash_again() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
 
@@ -125,7 +125,7 @@ fn crash_again() {
 
 #[test]
 fn recover_after_insert() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
@@ -158,7 +158,7 @@ fn recover_after_insert() {
 
 #[test]
 fn recover_after_update() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
@@ -208,7 +208,7 @@ fn recover_after_update() {
 
 #[test]
 fn recover_after_remove() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mut save = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
@@ -246,7 +246,7 @@ fn recover_after_remove() {
 }
 
 fn ckpt_wal(keys: usize, wal_len: u32) {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.data_file_size = 512 << 10;
     opt.wal_file_size = wal_len;
@@ -295,7 +295,7 @@ fn roll_log() {
 }
 
 fn long_txn_impl(before: bool) {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.wal_file_size = 1024;
     let mut save = opt.clone();
@@ -357,4 +357,35 @@ fn long_txn_impl(before: bool) {
 fn long_txn() {
     long_txn_impl(true);
     long_txn_impl(false);
+}
+
+#[test]
+fn tiny_handle_cache_still_reads_persisted_pages() {
+    // zero disables the cache; 1..7 used to round down to zero per shard, so a page read
+    // retried the insertion forever instead of returning the reader it just built
+    for cache_capacity in [0, 1, 7] {
+        tiny_handle_cache_roundtrip(cache_capacity);
+    }
+}
+
+fn tiny_handle_cache_roundtrip(cache_capacity: usize) {
+    let path = RandomPath::tmp();
+    let opt = Options::new(&*path);
+    let mut saved = opt.clone();
+    let mace = Mace::new(opt.validate().unwrap()).unwrap();
+    let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
+    let tx = db.begin().unwrap();
+    tx.put(b"key", b"value").unwrap();
+    tx.commit().unwrap();
+
+    drop(db);
+    drop(mace);
+
+    saved.tmp_store = true;
+    saved.data_handle_cache_capacity = cache_capacity;
+    saved.blob_handle_cache_capacity = cache_capacity;
+    let mace = Mace::new(saved.validate().unwrap()).unwrap();
+    let db = mace.open_bucket("x").unwrap();
+    let view = db.view().unwrap();
+    assert_eq!(view.get(b"key").unwrap().slice(), b"value");
 }

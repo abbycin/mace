@@ -42,7 +42,7 @@ impl SnapshotStamp {
 ///
 /// a persisted record group id never carries the runtime-only merge tag bit, so a value at or
 /// beyond `Options::MAX_CONCURRENT_WRITE` is page corruption: rejecting it here keeps the
-/// settled-history branch from mislabelling an impossible group as settled history
+/// settled-history branch from mislabeling an impossible group as settled history
 #[inline(always)]
 fn is_settled_history(ctx: &Context, record_gid: u8) -> bool {
     must_true!(

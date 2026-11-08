@@ -7,28 +7,6 @@ The live correctness constraints, their evidence, and their verifier coverage ar
 `docs/constraints/registry.yaml`. This document does not duplicate that ledger and does not serve
 as a source-code tour.
 
-## 0. Upstream contracts Mace relies on
-
-`btree-store` owns the metadata store. Four of its contracts are load-bearing, and a
-checker or a reviewer should be able to find them here rather than in a test index:
-
-- **conditional update.** `exec`/`update` on an existing key changes it and reports success;
-  on an absent key it changes nothing and reports a miss. Mace treats that miss as
-  "someone deleted this stat first" and never recreates the record.
-- **conditional delete.** `del` on an existing key removes it and reports success; on an absent
-  key it removes nothing and reports a miss. Mace tolerates that miss only for idempotent reclaim
-  and cleanup deletes: a stat record, an obsolete-file marker, and an orphan marker cleared during
-  open cleanup. Every other metadata delete treats a miss as an invariant failure.
-- **one-generation publication.** `exec_multi` publishes every bucket-root change of one
-  manifest transaction in a single generation. On failure it restores the previous bucket roots;
-  consumed metadata high-water state may still be published as a rollback generation. Mace relies
-  on the bucket-root property to publish map, frontier, stats and sequences as one step.
-- **fatal page damage.** Corruption that only a page read reaches terminates the process:
-  `btree-store` prints a `BTREE_FATAL_*` line and aborts. The I/O variant names the file and
-  offset; the corruption variant names the fault, generation and page identity instead. A
-  read-only consumer of a database directory (the offline checker) inherits that termination
-  instead of reporting a partial picture.
-
 ## 1. System Overview
 
 Mace is an embedded key-value engine built around:
@@ -138,13 +116,19 @@ Creating a bucket allocates a durable bucket ID, stores the bucket options, and 
 durable frontier in one metadata publication. Global bucket accounting is runtime state: it is
 incremented with the creation and recomputed from the catalog plus pending deletes on open.
 
-The name enters the in-memory catalog before that transaction commits, so a concurrent reader can
-observe the bucket during creation. The new bucket's runtime context and root leaf are initialized
-as part of creation; other buckets stay lazy.
+Creating a bucket reserves only the bucket ID and its empty metadata tables. The bucket metadata,
+durable frontier and sequences are committed in one metadata transaction. The in-memory catalog
+entry, options, bucket count, frontier map, runtime and loaded context become visible only after
+that transaction returns. Concurrent public catalog readers and open attempts serialize on the
+structural lock: while a creation is in flight they block until publication, and then observe the
+fully initialized bucket. Absence is observable only when no creation is in flight or after a
+rollback has released the lock; a partially created bucket is never reachable. A context built for
+creation is not live until publication: it is not inserted into the bucket manager early, and
+dropping it before publication must not enqueue a checkpoint. Other buckets stay lazy.
 
 ### 3.2 Loading
 
-Loading a bucket reconstructs its runtime from:
+Loading a bucket reconstructs its loaded bucket context from:
 
 - bucket options
 - page table entries
@@ -154,19 +138,21 @@ The durable frontier and per-file accounting are manifest-global state. Checkpoi
 reads them; recovery compares bucket frontiers with WAL positions. They are not per-bucket load
 inputs.
 
-The loaded runtime owns the bucket cache, dirty generations, address allocator, checkpoint state,
-and flow-control state.
+The loaded bucket context owns the bucket cache, dirty generations, address allocator, checkpoint
+state, and flow-control state.
 
 ### 3.3 Unloading
 
-Unloading removes the cached bucket runtime. A live bucket is final-checkpointed before its
-runtime is dropped, so dirty pages, its page table, frontier and statistics are published first;
-delete instead discards the sealed batch and removes the bucket. The active WAL route is
-synchronized before unload.
+Unloading removes the loaded bucket context after a live bucket is final-checkpointed, so dirty
+pages, its page table, frontier and statistics are published first. The bucket runtime state is
+kept separately across load and unload for lifecycle coordination and background maintenance; it is
+removed only when physical deletion finishes. Delete instead discards the sealed batch and removes
+the bucket from the active catalog. The active WAL route is synchronized before unload.
 
-An unload or delete attempt while abort-clean work is pending is refused with `Again`, so the
-bucket remains loaded until that task has completed its page rewrite, durable checkpoint, and
-reader-quiescence phase.
+An unload or delete attempt is refused with `Again` while the bucket has a live lease, active
+transactions, a rewrite, a reclaim transition, or pending abort-clean work. A bucket with pending
+abort-clean work therefore remains loaded until that task has completed its page rewrite, durable
+checkpoint, and reader-quiescence phase.
 
 ### 3.4 Deletion
 
@@ -817,7 +803,9 @@ The filesystem object is process-local and is not part of persisted engine optio
 ## 15. Persistent Format And Upgrade Model
 
 Mace currently supports 64-bit little-endian platforms. Persisted scalar and packed-layout handling
-is defined under that platform boundary.
+is defined under that platform boundary. The byte-level specification, the fixed sizes and offsets,
+and the reader validation list are in [format.md](./format.md); this section only states which version
+axis owns which change.
 
 There are three format families:
 
@@ -832,7 +820,9 @@ payload frames do not carry a separate format version. Writers emit version 1, a
 unknown versions or unsupported footer fields.
 
 Checkpoint and GC rewrite emit version 1. A future format version must define its reader support and
-an explicit migration boundary before it can coexist with the current format.
+an explicit migration boundary before it can coexist with the current format. Because the version is
+per file, coexistence is per file as well: a bucket may hold files of different versions, each decoded
+by its own footer, and a `file_id` may be reused only when source and target versions are equal.
 
 ### 15.2 Metadata format
 
@@ -845,19 +835,37 @@ format in place. The 0.1.2 -> 0.2.0 hop moves the `btree-store` manifest format 
 `current_version` stays 1. The migrations, the format versions they move between, and the procedure
 are in [docs/migration.md](./migration.md).
 
+`misc/options` is a metadata record, so its JSON field set belongs to `current_version`. Adding,
+removing or retyping a field changes persisted bytes and must raise `current_version` and ship a
+migration; reader tolerance for unknown fields (`serde(default)`) must not be used to keep two
+versions reading the same bytes differently.
+
 ### 15.3 WAL format
 
 The current route split changes physical stream placement but not WAL record encoding. Both routes
 use the same WAL record format and recovery decoder.
 
-WAL format evolution under the current release model is one-way: only newer binaries open a
-directory after merge-capable payloads are written, so additive payload types (such as the merge
-operand payload) require no migration barrier and no old-binary compatibility window. Deploying a
-binary that writes new WAL payload kinds therefore commits that directory to binaries of at least
-that capability level; downgrades are unsupported. This boundary applies to additive payload types
-under an unchanged record envelope. Any change to the shared Update envelope itself, or any other
-non-additive encoding change, still requires a migration design that first reaches a WAL-independent
-durable state.
+The WAL makes no cross-version compatibility promise. It has no file header, no version field and no
+layout tag, so a WAL written by a different layout is indistinguishable from a damaged tail: it
+belongs to the binary that wrote it. Any WAL layout change is therefore allowed without a version
+axis and without a migration, under one mandatory prerequisite:
+
+- before replacing the binary, open the database with the current binary and close it normally.
+  Normal shutdown drains abort cleanup, performs a final checkpoint of every dirty bucket and syncs
+  the WAL, but GC is already stopped when that checkpoint publishes, so no recycle round retires the
+  segments it covers.
+- open and close it normally a second time. This run starts from the durable checkpoint, so no record
+  left in the WAL is still the only copy of a committed write, and its recycle rounds retire covered
+  segments as they run.
+- then remove the remaining `wal_*` and `group_wal_*` files (or confirm they were recycled) before
+  running the new binary.
+
+Crashing and then upgrading directly is unsupported. A WAL of a different layout has no recognizable
+marker, so the new binary treats it as a malformed tail: with the default
+`truncate_corrupted_wal = true` it truncates at the first bad record and loses the uncheckpointed
+committed writes, and with the option disabled the database does not open. That is a consequence of
+the no-compatibility rule rather than a defect. The byte-level layout, the record checks and the
+drain rule are in [format.md](./format.md).
 
 ## 16. Observability
 

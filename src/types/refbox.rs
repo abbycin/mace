@@ -27,11 +27,11 @@ unsafe impl Sync for BoxRef {}
 pub struct BoxView(*mut BoxHeader);
 
 #[derive(Clone, Copy)]
-pub(crate) struct DeltaView(pub(super) *mut DeltaHeader);
+pub struct DeltaView(pub(super) *mut DeltaHeader);
 
 /// both base node and sibling share same layout
 #[derive(Clone, Copy)]
-pub(crate) struct BaseView(pub(super) *mut BaseHeader);
+pub struct BaseView(pub(super) *mut BaseHeader);
 
 /// used for large key-val
 #[derive(Clone, Copy)]
@@ -69,14 +69,14 @@ impl BoxView {
         unsafe { self.0.add(1).cast::<T>() }
     }
 
-    pub(crate) fn as_delta(&self) -> DeltaView {
+    pub fn as_delta(&self) -> DeltaView {
         match self.header().kind {
             TagKind::Delta => DeltaView(self.cast_to::<_>()),
             _ => unreachable!("invalid kind {:?}", self.header()),
         }
     }
 
-    pub(crate) fn as_base(&self) -> BaseView {
+    pub fn as_base(&self) -> BaseView {
         match self.header().kind {
             TagKind::Base => BaseView(self.cast_to::<_>()),
             _ => unreachable!("invalid kind {:?}", self.header()),
@@ -93,7 +93,7 @@ impl BoxView {
 
 impl BoxRef {
     pub(crate) const HDR_LEN: usize = size_of::<BoxHeader>();
-    pub(crate) const DUMP_HDR_LEN: usize = size_of::<BoxHeader>() - size_of::<AtomicU32>();
+    pub const DUMP_HDR_LEN: usize = size_of::<BoxHeader>() - size_of::<AtomicU32>();
     pub(crate) const MAX_PERSISTED_HEAD_LEN: usize = Self::DUMP_HDR_LEN + size_of::<BaseHeader>();
 
     pub(crate) const fn real_size(size: u32) -> u32 {
@@ -248,8 +248,8 @@ impl BoxRef {
         }
     }
 
-    fn payload_header_len(&self) -> usize {
-        match self.header().kind {
+    const fn payload_header_len(kind: TagKind) -> usize {
+        match kind {
             TagKind::Base => size_of::<BaseHeader>(),
             TagKind::Delta => size_of::<DeltaHeader>(),
             TagKind::Remote => size_of::<RemoteHeader>(),
@@ -258,7 +258,7 @@ impl BoxRef {
 
     fn persisted_body(&self) -> &[u8] {
         let payload_len = self.persisted_payload_len();
-        let hdr_len = self.payload_header_len();
+        let hdr_len = Self::payload_header_len(self.header().kind);
         let payload = &self.data_slice::<u8>()[..payload_len];
         &payload[hdr_len..]
     }
@@ -308,34 +308,23 @@ impl BoxRef {
         }
 
         let payload = &raw[Self::DUMP_HDR_LEN..];
-        if payload.len() != box_hdr.payload_size as usize {
+        if payload.len() != box_hdr.payload_size as usize
+            || payload.len() < Self::payload_header_len(kind)
+        {
             return Err(OpCode::Corruption);
         }
 
         let payload_header = match kind {
             TagKind::Base => {
-                if payload.len() < size_of::<DiskBaseHeader>() {
-                    return Err(OpCode::Corruption);
-                }
                 let disk = DiskBaseHeader::from_slice(payload);
                 if disk.merging > 1 || disk.is_index > 1 || disk.has_multiple_versions > 1 {
                     return Err(OpCode::Corruption);
                 }
                 PersistedPayloadHeaderV1::Base(disk)
             }
-            TagKind::Delta => {
-                if payload.len() < size_of::<DiskDeltaHeader>() {
-                    return Err(OpCode::Corruption);
-                }
-                let disk = DiskDeltaHeader::from_slice(payload);
-                PersistedPayloadHeaderV1::Delta(disk)
-            }
+            TagKind::Delta => PersistedPayloadHeaderV1::Delta(DiskDeltaHeader::from_slice(payload)),
             TagKind::Remote => {
-                if payload.len() < size_of::<DiskRemoteHeader>() {
-                    return Err(OpCode::Corruption);
-                }
-                let disk = DiskRemoteHeader::from_slice(payload);
-                PersistedPayloadHeaderV1::Remote(disk)
+                PersistedPayloadHeaderV1::Remote(DiskRemoteHeader::from_slice(payload))
             }
         };
 
@@ -398,11 +387,7 @@ impl BoxRef {
             }
         }
 
-        let hdr_len = match payload_header {
-            PersistedPayloadHeaderV1::Base(_) => size_of::<BaseHeader>(),
-            PersistedPayloadHeaderV1::Delta(_) => size_of::<DeltaHeader>(),
-            PersistedPayloadHeaderV1::Remote(_) => size_of::<RemoteHeader>(),
-        };
+        let hdr_len = Self::payload_header_len(kind);
         let payload_len = box_hdr.payload_size as usize;
         if payload_len < hdr_len {
             return Err(OpCode::Corruption);
@@ -411,7 +396,7 @@ impl BoxRef {
     }
 
     /// NOTE: for T is not u8, the caller **MUST** make sure T is aligned to pointer size
-    pub(crate) fn data_slice<'a, T>(&self) -> &'a [T] {
+    pub fn data_slice<T>(&self) -> &[T] {
         let h = self.header();
         let len = h.total_size as usize - Self::HDR_LEN;
         unsafe { std::slice::from_raw_parts(self.0.add(1).cast::<_>(), len / size_of::<T>()) }
@@ -425,7 +410,7 @@ impl BoxRef {
         unsafe { std::slice::from_raw_parts_mut(self.0.add(1).cast::<_>(), len / size_of::<T>()) }
     }
 
-    pub(crate) fn view(&self) -> BoxView {
+    pub fn view(&self) -> BoxView {
         BoxView(self.0)
     }
 }

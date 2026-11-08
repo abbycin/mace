@@ -42,26 +42,27 @@ struct CacheItem {
 }
 
 impl CacheItem {
-    fn warm(&self) {
+    /// one CAS loop for both clock directions; returns the value actually stored
+    fn transition<F: Fn(CacheState) -> CacheState>(&self, next: F) -> CacheState {
         let mut cur = self.state.load(Relaxed);
         loop {
-            let next = CacheState::from(cur).warm() as u32;
-            match self.state.compare_exchange(cur, next, Relaxed, Relaxed) {
-                Ok(_) => return,
+            let next = next(CacheState::from(cur));
+            match self
+                .state
+                .compare_exchange(cur, next as u32, Relaxed, Relaxed)
+            {
+                Ok(_) => return next,
                 Err(v) => cur = v,
             }
         }
     }
 
+    fn warm(&self) {
+        self.transition(CacheState::warm);
+    }
+
     fn cool(&self) -> CacheState {
-        let mut cur = self.state.load(Relaxed);
-        loop {
-            let next = CacheState::from(cur).cool() as u32;
-            match self.state.compare_exchange(cur, next, Relaxed, Relaxed) {
-                Ok(_) => return next.into(),
-                Err(v) => cur = v,
-            }
-        }
+        self.transition(CacheState::cool)
     }
 }
 
@@ -78,42 +79,32 @@ impl NodeCache {
         }
     }
 
-    pub(crate) fn insert(&self, pid: u64, state: CacheState, size: isize) {
-        let e = self.map.entry(pid);
-        match e {
+    fn upsert(&self, pid: u64, size: isize, init: CacheState, on_hit: impl FnOnce(&CacheItem)) {
+        match self.map.entry(pid) {
             dashmap::Entry::Occupied(mut o) => {
                 let old = o.get_mut();
                 self.used.fetch_add(size - old.size, AcqRel);
                 old.size = size;
-                old.state.store(state as u32, Relaxed);
+                on_hit(old);
             }
             dashmap::Entry::Vacant(v) => {
                 self.used.fetch_add(size, AcqRel);
                 v.insert(CacheItem {
-                    state: AtomicU32::new(state as u32),
+                    state: AtomicU32::new(init as u32),
                     size,
                 });
             }
         }
     }
 
+    pub(crate) fn insert(&self, pid: u64, state: CacheState, size: isize) {
+        self.upsert(pid, size, state, |item| {
+            item.state.store(state as u32, Relaxed)
+        });
+    }
+
     pub(crate) fn touch(&self, pid: u64, size: isize) {
-        let e = self.map.entry(pid);
-        match e {
-            dashmap::Entry::Occupied(mut o) => {
-                let old = o.get_mut();
-                self.used.fetch_add(size - old.size, AcqRel);
-                old.size = size;
-                old.warm();
-            }
-            dashmap::Entry::Vacant(v) => {
-                self.used.fetch_add(size, AcqRel);
-                v.insert(CacheItem {
-                    state: AtomicU32::new(CacheState::Warm as u32),
-                    size,
-                });
-            }
-        }
+        self.upsert(pid, size, CacheState::Warm, CacheItem::warm);
     }
 
     pub(crate) fn warm(&self, pid: u64) {

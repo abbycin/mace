@@ -5,7 +5,7 @@ use crate::{static_assert, utils::data::Position};
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[repr(u8)]
-pub(crate) enum TagKind {
+pub enum TagKind {
     Delta = 1,
     Base = 2,
     Remote = 3,
@@ -13,14 +13,14 @@ pub(crate) enum TagKind {
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[repr(u8)]
-pub(crate) enum NodeType {
+pub enum NodeType {
     Leaf = 1,
     Intl = 2,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[repr(u8)]
-pub(crate) enum TagFlag {
+pub enum TagFlag {
     Normal = 1,
     Sibling = 2,
 }
@@ -29,48 +29,48 @@ pub(crate) enum TagFlag {
 #[repr(C, align(8))]
 pub struct BoxHeader {
     pub(super) refs: AtomicU32,
-    pub(crate) kind: TagKind,
-    pub(crate) node_type: NodeType,
-    pub(crate) flag: TagFlag,
-    pub(crate) group: u8,
-    pub(crate) total_size: u32,
-    pub(crate) payload_size: u32,
-    pub(crate) pid: u64,
-    pub(crate) txid: u64,
+    pub kind: TagKind,
+    pub node_type: NodeType,
+    pub flag: TagFlag,
+    pub group: u8,
+    pub total_size: u32,
+    pub payload_size: u32,
+    pub pid: u64,
+    pub txid: u64,
     /// current BoxRef's logical address which is monotonically increasing
-    pub(crate) addr: u64,
+    pub addr: u64,
     /// logical address link to next BoxRef
-    pub(crate) link: u64,
-    pub(crate) lsn: Position,
+    pub link: u64,
+    pub lsn: Position,
 }
 
 #[derive(Debug)]
 #[repr(C, align(8))]
-pub(crate) struct DeltaHeader {
-    pub(crate) klen: u32,
-    pub(crate) vlen: u32,
+pub struct DeltaHeader {
+    pub klen: u32,
+    pub vlen: u32,
 } // key-val
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C, align(8))]
-pub(crate) struct BaseHeader {
+pub struct BaseHeader {
     /// key-value count
-    pub(crate) elems: u16,
+    pub elems: u16,
     /// elems to trigger merge when necessary, set when split happen, deprecated, becuase we're not
     /// split by node size anymore, we keep it to avoid passing node elems limit configuration
-    pub(crate) split_elems: u16,
+    pub split_elems: u16,
     /// total size (including header, remote address)
-    pub(crate) size: u32,
+    pub size: u32,
     /// pid of right sibling, when it the right most node, it should be 0
-    pub(crate) right_sibling: u64,
-    pub(crate) merging_child: u64,
-    pub(crate) lo_len: u32,
-    pub(crate) hi_len: u32,
-    pub(crate) prefix_len: u32,
-    pub(crate) merging: bool,
-    pub(crate) is_index: bool,
-    pub(crate) has_multiple_versions: bool,
-    pub(crate) padding: u8,
+    pub right_sibling: u64,
+    pub merging_child: u64,
+    pub lo_len: u32,
+    pub hi_len: u32,
+    pub prefix_len: u32,
+    pub merging: bool,
+    pub is_index: bool,
+    pub has_multiple_versions: bool,
+    pub padding: u8,
 } // sst
 
 #[repr(C, align(8))]
@@ -149,6 +149,18 @@ static_assert!(size_of::<DiskBoxHeader>() == size_of::<BoxHeader>() - size_of::<
 static_assert!(size_of::<DiskBaseHeader>() == size_of::<BaseHeader>());
 static_assert!(size_of::<DiskDeltaHeader>() == size_of::<DeltaHeader>());
 static_assert!(size_of::<DiskRemoteHeader>() == size_of::<RemoteHeader>());
+
+// these are the persisted sizes and the offsets `docs/format.md` indexes; the
+// mem and disk structs must not drift from the specified layout
+static_assert!(size_of::<DiskBoxHeader>() == 60);
+static_assert!(std::mem::offset_of!(DiskBoxHeader, pid) == 12);
+static_assert!(std::mem::offset_of!(DiskBoxHeader, lsn) == 44);
+static_assert!(size_of::<DiskBaseHeader>() == 40);
+static_assert!(std::mem::offset_of!(DiskBaseHeader, size) == 4);
+static_assert!(std::mem::offset_of!(DiskBaseHeader, lo_len) == 24);
+static_assert!(std::mem::offset_of!(DiskBaseHeader, prefix_len) == 32);
+static_assert!(size_of::<DiskDeltaHeader>() == 8);
+static_assert!(size_of::<DiskRemoteHeader>() == 8);
 
 pub(crate) type SlotType = u32;
 pub(crate) const SLOT_LEN: usize = size_of::<SlotType>();

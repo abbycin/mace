@@ -49,8 +49,6 @@ pub trait IKey: Default + IKeyCodec + Ord {
     fn raw(&self) -> &[u8];
 
     fn txid(&self) -> u64;
-
-    fn to_string(&self) -> String;
 }
 
 pub trait IDecode {
@@ -71,6 +69,7 @@ pub trait IVal: ICodec + Clone {
     fn is_tombstone(&self) -> bool;
 }
 
+#[allow(clippy::len_without_is_empty)]
 pub trait IAsSlice: Sized {
     fn as_slice(&self) -> &[u8] {
         let p = self as *const Self;

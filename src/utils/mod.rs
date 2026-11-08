@@ -16,6 +16,7 @@ pub(crate) mod block;
 pub(crate) mod compress;
 pub(crate) mod countblock;
 pub(crate) mod data;
+pub(crate) mod diag;
 #[cfg(feature = "failpoints")]
 pub(crate) mod failpoint;
 pub(crate) mod imtree;
@@ -109,10 +110,10 @@ impl From<btree_store::Error> for OpCode {
     }
 }
 
-pub(crate) const NULL_PID: u64 = 0;
+pub const NULL_PID: u64 = 0;
 /// it's same to DEFAULT_BUCKET_ID
 pub(crate) const ROOT_PID: u64 = 1;
-pub(crate) const NULL_ADDR: u64 = 0;
+pub const NULL_ADDR: u64 = 0;
 /// starts from 1 make sure remapped addr will always greater than NULL_ADDR
 pub(crate) const INIT_ADDR: u64 = 1;
 pub const ADDR_LEN: usize = size_of::<u64>();
@@ -230,16 +231,11 @@ impl RandomPath {
 
     /// Creates a new temporary path that will NOT be deleted on drop by default.
     pub fn new() -> Self {
+        let root = std::env::var_os(Self::TMP_ROOT_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
         Self {
-            path: Self::gen_path(&std::env::temp_dir()),
-            del: false,
-        }
-    }
-
-    /// Creates a new temporary path under the given root.
-    pub fn from_root<P: AsRef<Path>>(root: P) -> Self {
-        Self {
-            path: Self::gen_path(&root.as_ref().to_path_buf()),
+            path: Self::gen_path(&root),
             del: false,
         }
     }
@@ -284,10 +280,6 @@ impl<T> MutRefInner<T> {
             refcnt: AtomicU32::new(1),
         }
     }
-}
-
-impl<T> Drop for MutRefInner<T> {
-    fn drop(&mut self) {}
 }
 
 pub struct MutRef<T> {

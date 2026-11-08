@@ -7,7 +7,7 @@ use crate::{
     utils::{OpCode, data::Position, options::Options},
 };
 
-pub(crate) trait IWalCodec {
+pub trait IWalCodec {
     fn encoded_len(&self) -> usize;
 
     fn size() -> usize;
@@ -21,7 +21,7 @@ pub(crate) trait IWalPayload {
 
 #[repr(u8)]
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub(crate) enum EntryType {
+pub enum EntryType {
     Update,
     Begin,
     Commit,
@@ -43,7 +43,7 @@ impl TryFrom<u8> for EntryType {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PayloadType {
+pub enum PayloadType {
     Insert,
     Update,
     Delete,
@@ -62,19 +62,19 @@ impl TryFrom<u8> for PayloadType {
 }
 
 #[repr(C, packed(1))]
-pub(crate) struct WalUpdate {
-    pub(crate) wal_type: EntryType,
-    pub(crate) sub_type: PayloadType,
-    pub(crate) bucket_id: u64,
-    pub(crate) group_id: u8,
+pub struct WalUpdate {
+    pub wal_type: EntryType,
+    pub sub_type: PayloadType,
+    pub bucket_id: u64,
+    pub group_id: u8,
     /// payload size
-    pub(crate) size: u32,
-    pub(crate) cmd_id: u32,
-    pub(crate) klen: u32,
-    pub(crate) txid: u64,
-    pub(crate) prev_id: u64,
-    pub(crate) prev_off: u64,
-    pub(crate) checksum: u32,
+    pub size: u32,
+    pub cmd_id: u32,
+    pub klen: u32,
+    pub txid: u64,
+    pub prev_id: u64,
+    pub prev_off: u64,
+    pub checksum: u32,
 }
 
 impl Debug for WalUpdate {
@@ -105,10 +105,10 @@ pub(crate) struct WalBegin {
 
 #[repr(C, packed(1))]
 #[derive(Debug)]
-pub(crate) struct WalAbort {
-    pub(crate) wal_type: EntryType,
-    pub(crate) txid: u64,
-    pub(crate) checksum: u32,
+pub struct WalAbort {
+    pub wal_type: EntryType,
+    pub txid: u64,
+    pub checksum: u32,
 }
 
 #[repr(C, packed(1))]
@@ -127,11 +127,21 @@ static_assert!(size_of::<WalCommit>() == size_of::<WalBegin>());
 // it does not imply that all transactions are committed; active transactions may exist
 #[repr(C, packed(1))]
 #[derive(Debug)]
-pub(crate) struct WalCheckpoint {
-    pub(crate) wal_type: EntryType,
-    pub(crate) checkpoint: Position,
-    pub(crate) checksum: u32,
+pub struct WalCheckpoint {
+    pub wal_type: EntryType,
+    pub checkpoint: Position,
+    pub checksum: u32,
 }
+
+static_assert!(size_of::<WalUpdate>() == 51);
+static_assert!(std::mem::offset_of!(WalUpdate, bucket_id) == 2);
+static_assert!(std::mem::offset_of!(WalUpdate, size) == 11);
+static_assert!(std::mem::offset_of!(WalUpdate, checksum) == 47);
+static_assert!(size_of::<WalBegin>() == 13);
+static_assert!(size_of::<WalCommit>() == 13);
+static_assert!(size_of::<WalAbort>() == 13);
+static_assert!(size_of::<WalCheckpoint>() == 21);
+static_assert!(std::mem::offset_of!(WalCheckpoint, checkpoint) == 1);
 
 macro_rules! impl_checksum {
     ($t:ty) => {
@@ -149,7 +159,7 @@ macro_rules! impl_checksum {
                 h.finish() as u32
             }
 
-            pub(crate) fn is_intact(&self) -> bool {
+            pub fn is_intact(&self) -> bool {
                 self.checksum == self.calc_checksum()
             }
         }
@@ -162,7 +172,7 @@ impl_checksum!(WalAbort);
 impl_checksum!(WalCheckpoint);
 
 impl WalUpdate {
-    pub(crate) fn checked_payload_len(payload_size: u32) -> Result<usize, OpCode> {
+    pub fn checked_payload_len(payload_size: u32) -> Result<usize, OpCode> {
         let payload_len = usize::try_from(payload_size).map_err(|_| OpCode::Corruption)?;
         let max_payload = Options::MAX_KV_SIZE
             .checked_add(size_of::<WalReplace>())
@@ -174,13 +184,13 @@ impl WalUpdate {
         }
     }
 
-    pub(crate) fn checked_encoded_len(payload_len: usize) -> Result<usize, OpCode> {
+    pub fn checked_encoded_len(payload_len: usize) -> Result<usize, OpCode> {
         Self::size()
             .checked_add(payload_len)
             .ok_or(OpCode::Corruption)
     }
 
-    pub(crate) fn validate_record(&self, record: &[u8]) -> Result<(), OpCode> {
+    pub fn validate_record(&self, record: &[u8]) -> Result<(), OpCode> {
         let header_len = Self::size();
         if record.len() < header_len || record[0] != EntryType::Update as u8 {
             return Err(OpCode::Corruption);
@@ -272,7 +282,7 @@ impl WalUpdate {
         self.cast_to::<WalReplace>()
     }
 
-    pub(crate) fn calc_checksum(&self) -> u32 {
+    pub fn calc_checksum(&self) -> u32 {
         let ptr = self as *const Self as *const u8;
         let header_size = self.encoded_len();
         let checksum_offset = header_size - size_of_val(&{ self.checksum });
@@ -289,7 +299,7 @@ impl WalUpdate {
         h.finish() as u32
     }
 
-    pub(crate) fn is_intact(&self) -> bool {
+    pub fn is_intact(&self) -> bool {
         let expected = { self.checksum };
         let actual = self.calc_checksum();
         expected == actual
@@ -440,7 +450,7 @@ impl IWalCodec for &[u8] {
     }
 }
 
-pub(crate) fn wal_record_sz(e: EntryType) -> Result<usize, OpCode> {
+pub fn wal_record_sz(e: EntryType) -> Result<usize, OpCode> {
     match e {
         EntryType::Abort | EntryType::Begin | EntryType::Commit => Ok(WalAbort::size()),
         EntryType::Update => Ok(WalUpdate::size()),
@@ -464,14 +474,78 @@ pub(crate) fn ptr_to<T>(x: *const u8) -> &'static T {
     unsafe { &*x.cast::<T>() }
 }
 
+/// borrows the `update` header at `offset`
+///
+/// the header is `packed`, so the borrow has no alignment requirement, and the returned
+/// lifetime ties it to `buf`; `None` means `buf` does not cover the whole header. the caller
+/// still has to frame the record before reading its payload.
+#[cfg(feature = "maintenance")]
+pub fn wal_update_at(buf: &[u8], offset: usize) -> Option<&WalUpdate> {
+    let end = offset.checked_add(size_of::<WalUpdate>())?;
+    let bytes = buf.get(offset..end)?;
+    // a reference to an out-of-range enum discriminant is invalid, so the header is only
+    // borrowed after both discriminants validate
+    EntryType::try_from(bytes[0]).ok()?;
+    PayloadType::try_from(bytes[1]).ok()?;
+    // SAFETY: `WalUpdate` is `packed(1)`; `bytes` covers the complete header and outlives the ref
+    Some(unsafe { &*bytes.as_ptr().cast::<WalUpdate>() })
+}
+
+/// borrows the checkpoint header at `offset`, see [`wal_update_at`]
+#[cfg(feature = "maintenance")]
+pub fn wal_checkpoint_at(buf: &[u8], offset: usize) -> Option<&WalCheckpoint> {
+    let end = offset.checked_add(size_of::<WalCheckpoint>())?;
+    let bytes = buf.get(offset..end)?;
+    EntryType::try_from(bytes[0]).ok()?;
+    // SAFETY: `WalCheckpoint` is `packed(1)`; the slice covers the header and outlives the ref
+    Some(unsafe { &*bytes.as_ptr().cast::<WalCheckpoint>() })
+}
+
+/// borrows the terminal (begin/commit/abort) header at `offset`, see [`wal_update_at`]
+#[cfg(feature = "maintenance")]
+pub fn wal_abort_at(buf: &[u8], offset: usize) -> Option<&WalAbort> {
+    let end = offset.checked_add(size_of::<WalAbort>())?;
+    let bytes = buf.get(offset..end)?;
+    EntryType::try_from(bytes[0]).ok()?;
+    // SAFETY: `WalAbort` is `packed(1)`; the slice covers the header and outlives the ref
+    Some(unsafe { &*bytes.as_ptr().cast::<WalAbort>() })
+}
+
 #[cfg(test)]
 mod test {
     use crate::cc::wal::{
         EntryType, IWalCodec, PayloadType, WalBegin, WalPut, WalReplace, WalUpdate, ptr_to,
     };
+    #[cfg(feature = "maintenance")]
+    use crate::cc::wal::{WalAbort, WalCheckpoint};
     use crate::utils::OpCode;
     use crate::utils::data::Position;
     use crate::utils::options::Options;
+
+    #[cfg(feature = "maintenance")]
+    #[test]
+    fn wal_accessors_reject_invalid_discriminants() {
+        let mut update = vec![0u8; std::mem::size_of::<WalUpdate>()];
+        update[0] = EntryType::Update as u8;
+        update[1] = 0xff;
+        assert!(super::wal_update_at(&update, 0).is_none());
+        update[1] = PayloadType::Insert as u8;
+        assert!(super::wal_update_at(&update, 0).is_some());
+
+        let mut checkpoint = vec![0u8; std::mem::size_of::<WalCheckpoint>()];
+        checkpoint[0] = 0xff;
+        assert!(super::wal_checkpoint_at(&checkpoint, 0).is_none());
+        checkpoint[0] = EntryType::CheckPoint as u8;
+        assert!(super::wal_checkpoint_at(&checkpoint, 0).is_some());
+
+        let mut abort = vec![0u8; std::mem::size_of::<WalAbort>()];
+        abort[0] = 0xff;
+        assert!(super::wal_abort_at(&abort, 0).is_none());
+        abort[0] = EntryType::Abort as u8;
+        assert!(super::wal_abort_at(&abort, 0).is_some());
+
+        assert!(super::wal_update_at(&update, 1).is_none());
+    }
 
     #[test]
     fn dump_load() {

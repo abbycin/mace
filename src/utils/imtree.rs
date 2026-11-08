@@ -47,10 +47,6 @@ where
         }
     }
 
-    pub(crate) fn set_comparator(&mut self, c: Comparator<K>) {
-        self.c = c;
-    }
-
     pub(crate) fn update(&self, k: K) -> Self {
         let mut tmp = self.clone();
         tmp.insert(k);
@@ -600,16 +596,13 @@ impl<'a, K: Copy> Iter<'a, K> {
 
     #[inline]
     fn update_exhausted(&mut self, has_next: bool, other_side_yielded: bool) -> bool {
-        let done = should_exhaust(
+        mark_exhausted(
+            &mut self.exhausted,
             has_next,
             other_side_yielded,
             self.fwd.leaf_pos(),
             self.bwd.leaf_pos(),
-        );
-        if done {
-            self.exhausted = true;
-        }
-        done
+        )
     }
 }
 
@@ -674,17 +667,29 @@ impl<'a, K: Copy, T> RangeIter<'a, K, T> {
 
     #[inline]
     fn update_exhausted(&mut self, has_next: bool, other_side_yielded: bool) -> bool {
-        let done = should_exhaust(
+        mark_exhausted(
+            &mut self.exhausted,
             has_next,
             other_side_yielded,
             self.fwd.leaf_pos(),
             self.bwd.leaf_pos(),
-        );
-        if done {
-            self.exhausted = true;
-        }
-        done
+        )
     }
+}
+
+#[inline]
+fn mark_exhausted<K>(
+    exhausted: &mut bool,
+    has_next: bool,
+    other_side_yielded: bool,
+    fwd: Option<(usize, *const Leaf<K>)>,
+    bwd: Option<(usize, *const Leaf<K>)>,
+) -> bool {
+    let done = should_exhaust(has_next, other_side_yielded, fwd, bwd);
+    if done {
+        *exhausted = true;
+    }
+    done
 }
 
 #[inline]

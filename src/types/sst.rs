@@ -5,7 +5,7 @@ use crate::{
     types::{
         data::{Index, IntlKey, Key, Val, Ver},
         header::SlotType,
-        traits::{IDecode, IKey, IKeyCodec, ILoader},
+        traits::{IDecode, IKey, IKeyCodec},
     },
     utils::{raw_ptr_to_ref, varint::Varint32},
 };
@@ -165,26 +165,5 @@ where
         let k = K::decode_from(raw);
         let v = V::decode_from(&raw[k.packed_size()..]);
         (k, v)
-    }
-
-    pub(crate) fn show_intl(&self, pid: u64, addr: u64) {
-        let elems = self.header().elems as usize;
-        log::debug!("---------- show page {pid} {addr} elems {elems} ----------");
-        for i in 0..elems {
-            let (k, v) = self.kv_at::<Index>(i);
-            log::debug!("{} => {}", k.to_string(), v);
-        }
-        log::debug!("---------- end ----------");
-    }
-
-    pub(crate) fn show_leaf<L: ILoader>(&self, l: &L, pid: u64, addr: u64) {
-        let elems = self.header().elems as usize;
-        log::debug!("---------- show page {pid} {addr} elems {elems} ----------");
-        for i in 0..elems {
-            let (k, v) = self.kv_at::<Val>(i);
-            let (r, _) = v.get_record(l);
-            log::debug!("{} => {}", k.to_string(), r);
-        }
-        log::debug!("---------- end ----------");
     }
 }

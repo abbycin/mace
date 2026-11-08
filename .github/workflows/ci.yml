@@ -33,13 +33,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build -p mace-kv --verbose
 
       - name: Build maintenance CLI
-        run: cargo build --verbose --bin mace-kv
+        run: cargo build -p mace-kv-cli --bin mace-kv --verbose
 
       - name: Run Tests
-        run: cargo test --features extra_check --verbose -- --nocapture
+        run: cargo test -p mace-kv -p mace-kv-cli --features extra_check --verbose -- --nocapture
 
   test-prod-all:
     name: Prod Test Flow (all) (${{ matrix.os }} ${{ matrix.arch }})
@@ -88,29 +88,20 @@ jobs:
           prepare: |
             pkg install -y rust
           run: |
-            cargo test --features extra_check --verbose -- --nocapture
+            cargo test -p mace-kv -p mace-kv-cli --features extra_check --verbose -- --nocapture
 
-  # Job 3: Linux ARM64 (Cross-compile check)
-  # This verifies that the code compiles for Linux on ARM.
-  # We use 'cross' to simplify cross-compilation.
+  # Job 3: Linux ARM64
   test-linux-arm64:
-    name: Linux (ARM64 cross-compile)
-    runs-on: ubuntu-latest
+    name: Linux (ARM64)
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
 
-      - name: Install cross
-        run: cargo install cross
+      - name: Build
+        run: cargo build -p mace-kv -p mace-kv-cli --verbose
 
-      - name: Build for ARM64
-        run: cross build --target aarch64-unknown-linux-gnu --verbose
-
-      # Note: Running tests for ARM64 on x86_64 requires QEMU via cross.
-      # If you want to actually run the tests:
-      - name: Run tests for ARM64
-        run: cross test --features extra_check --target aarch64-unknown-linux-gnu --verbose -- --nocapture
+      - name: Run tests
+        run: cargo test -p mace-kv -p mace-kv-cli --features extra_check --verbose -- --nocapture

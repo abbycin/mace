@@ -9,7 +9,10 @@
 Cargo.lock
 *.md
 !docs/design.md
+!docs/format.md
 !docs/migration.md
+!docs/cli.md
 !README.md
 !CHANGELOG.md
 !docs/constraints/retired.md
+docs/proposals

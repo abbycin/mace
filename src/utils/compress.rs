@@ -19,6 +19,15 @@ const DECOMPRESS_IO_BUF: usize = 128 << 10;
 /// earlier put) are parked here up to this cap, then released
 const MAX_OVERFLOW_CODECS: usize = 2;
 
+fn park_overflow<T: Send + 'static>(local: &LocalSlot<T>, pool: &Mutex<Vec<T>>, codec: T) {
+    if let Err(codec) = local.try_put(codec) {
+        let mut overflow = pool.lock();
+        if overflow.len() < MAX_OVERFLOW_CODECS {
+            overflow.push(codec);
+        }
+    }
+}
+
 pub(crate) struct EncodedRecord {
     pub(crate) bytes: Option<Vec<u8>>,
     pub(crate) raw_len: u32,
@@ -208,12 +217,7 @@ impl CompressorPool {
     fn release(&self, compressor: RecordCompressor) {
         // put into the executing thread's slot; if that slot already holds a
         // codec, park in bounded overflow, releasing the excess
-        if let Err(compressor) = self.local.try_put(compressor) {
-            let mut overflow = self.pool.lock();
-            if overflow.len() < MAX_OVERFLOW_CODECS {
-                overflow.push(compressor);
-            }
-        }
+        park_overflow(&self.local, &self.pool, compressor);
     }
 }
 
@@ -382,7 +386,7 @@ impl RecordDecompressor {
     }
 }
 
-pub(crate) struct DecompressorPool {
+pub struct DecompressorPool {
     /// bounded overflow buffer (see CompressorPool.pool)
     pool: Mutex<Vec<RecordDecompressor>>,
     /// per-thread decoder cache
@@ -390,7 +394,7 @@ pub(crate) struct DecompressorPool {
 }
 
 impl DecompressorPool {
-    pub(crate) fn new() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
             pool: Mutex::new(Vec::new()),
             local: LocalSlot::new(),
@@ -405,12 +409,7 @@ impl DecompressorPool {
         let ret = f(&mut decoder);
         // return the decoder regardless of f's result; a slot already holding a
         // decoder (reentrant put) parks this one in bounded overflow or releases it
-        if let Err(decoder) = self.local.try_put(decoder) {
-            let mut overflow = self.pool.lock();
-            if overflow.len() < MAX_OVERFLOW_CODECS {
-                overflow.push(decoder);
-            }
-        }
+        park_overflow(&self.local, &self.pool, decoder);
         ret
     }
 }

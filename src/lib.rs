@@ -1,13 +1,14 @@
 pub use index::txn::{TxnKV, TxnView};
 pub use store::VacuumStats;
-pub use store::checker::{CheckCategory, CheckReport, Diagnostic, check_database};
+pub use store::bucket::Bucket;
 pub use store::checkpoint::{BucketFrontier, CheckpointInfo, GroupPosition};
+pub use store::store::Mace;
 pub(crate) use store::store::Store;
-pub use store::store::{Bucket, Mace};
 #[cfg(feature = "metrics")]
 pub use utils::observe;
 pub use utils::{
     OpCode, RandomPath,
+    diag::DiagLevel,
     merge_operator::{MergeOperator, U64AddOperator, u64_add_operator},
     options::{BucketOptions, Options, PersistedBucketOptions},
 };
@@ -16,6 +17,8 @@ mod cc;
 mod error;
 #[cfg(any(feature = "extra_check", feature = "failpoints"))]
 pub mod failpoint_testing;
+#[cfg(test)]
+mod format_fixture;
 mod index;
 mod io;
 mod map;
@@ -27,3 +30,13 @@ mod utils;
 
 mod types;
 pub use index::{Iter, ValRef};
+
+/// internal on-disk inspection surface for the compatible maintenance CLI
+///
+/// nothing in here is part of the engine's stable API. it exists so the
+/// offline checker can read the same format definitions the engine writes;
+/// the CLI depends on a semver-compatible library release, so changes to
+/// this surface or the on-disk format require coordinated package updates.
+#[cfg(feature = "maintenance")]
+#[doc(hidden)]
+pub mod maintenance;

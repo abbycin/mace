@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::BTreeMap;
 
 #[derive(Default)]
 pub struct IntervalMap {
@@ -70,20 +70,6 @@ impl IntervalMap {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn update(&mut self, lo: u64, _hi: u64, val: u64) {
-        let e = self.map.entry(lo);
-        match e {
-            Entry::Occupied(mut o) => {
-                let v = o.get_mut();
-                #[cfg(feature = "extra_check")]
-                assert_eq!(v.0, _hi);
-                v.1 = val;
-            }
-            _ => unreachable!("impossible for update"),
-        }
-    }
-
     pub fn remove(&mut self, lo: u64) -> Option<(u64, u64)> {
         self.map.remove(&lo)
     }
@@ -101,13 +87,6 @@ impl IntervalMap {
     #[cfg(feature = "extra_check")]
     pub(crate) fn entries(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
         self.map.iter().map(|(&lo, &(hi, val))| (lo, hi, val))
-    }
-
-    #[allow(dead_code)]
-    pub fn show(&self) {
-        for (lo, (hi, val)) in self.map.iter() {
-            println!("[{}, {}] => {}", lo, hi, val);
-        }
     }
 }
 

@@ -64,7 +64,7 @@ fn concurrent_short_lived_views(
 
 #[test]
 fn put_get() -> Result<(), OpCode> {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let opt = Options::new(&*path);
     let mut saved = opt.clone();
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
@@ -220,7 +220,8 @@ fn get_del() -> Result<(), OpCode> {
 #[test]
 fn rollback() {
     let groups = 12;
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     opts.sync_on_write = false;
     opts.concurrent_write = 16;
@@ -277,7 +278,8 @@ fn rollback() {
 
 #[test]
 fn rollback_multiple_updates_in_same_txn_restores_committed_value() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap())?;
     let db = mace.new_bucket("x", BucketOptions::default())?;
@@ -299,7 +301,8 @@ fn rollback_multiple_updates_in_same_txn_restores_committed_value() -> Result<()
 
 #[test]
 fn get_compacted_shared_hist_page_keeps_key_local_old_versions() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     opts.sync_on_write = false;
     let mace = Mace::new(opts.validate().unwrap())?;
@@ -355,7 +358,8 @@ fn get_compacted_shared_hist_page_keeps_key_local_old_versions() -> Result<(), O
 
 #[test]
 fn get_never_crosses_into_next_key_hist_region_when_own_hist_invisible() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     opts.sync_on_write = false;
     let mace = Mace::new(opts.validate().unwrap())?;
@@ -403,7 +407,8 @@ fn get_never_crosses_into_next_key_hist_region_when_own_hist_invisible() -> Resu
 
 #[test]
 fn rollback_upsert_replace_on_tombstone_restores_delete() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap())?;
     let db = mace.new_bucket("x", BucketOptions::default())?;
@@ -428,7 +433,8 @@ fn rollback_upsert_replace_on_tombstone_restores_delete() -> Result<(), OpCode> 
 
 #[test]
 fn rollback_delete_restores_committed_value() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap())?;
     let db = mace.new_bucket("x", BucketOptions::default())?;
@@ -449,7 +455,8 @@ fn rollback_delete_restores_committed_value() -> Result<(), OpCode> {
 
 #[test]
 fn range_simple() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -505,7 +512,8 @@ fn range_simple() -> Result<(), OpCode> {
     drop(mace);
 
     {
-        let mut opts = Options::new(&*RandomPath::new());
+        let mace_root = RandomPath::tmp();
+        let mut opts = Options::new(&*mace_root);
         opts.tmp_store = true;
         let mace = Mace::new(opts.validate().unwrap()).unwrap();
         let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -539,7 +547,8 @@ fn range_simple() -> Result<(), OpCode> {
 
 #[test]
 fn seek_stops_when_key_no_longer_matches_prefix() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -591,7 +600,8 @@ fn seek_stops_when_key_no_longer_matches_prefix() -> Result<(), OpCode> {
 
 #[test]
 fn seek_supports_next_back_in_descending_key_order() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -622,7 +632,8 @@ fn seek_supports_next_back_in_descending_key_order() -> Result<(), OpCode> {
 
 #[test]
 fn seek_next_back_crosses_binary_leaf_boundary_without_skipping() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace
@@ -664,7 +675,8 @@ fn seek_next_back_crosses_binary_leaf_boundary_without_skipping() -> Result<(), 
 
 #[test]
 fn seek_next_and_next_back_share_one_shrinking_range() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -688,7 +700,8 @@ fn seek_next_and_next_back_share_one_shrinking_range() -> Result<(), OpCode> {
 
 #[test]
 fn seek_next_back_keeps_prefix_upper_bound() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -718,7 +731,8 @@ fn seek_next_back_keeps_prefix_upper_bound() -> Result<(), OpCode> {
 
 #[test]
 fn seek_next_back_keeps_latest_visible_version_per_raw_key() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -752,7 +766,8 @@ fn seek_next_back_keeps_latest_visible_version_per_raw_key() -> Result<(), OpCod
 
 #[test]
 fn seek_next_back_falls_back_to_older_visible_delta_version() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -786,7 +801,8 @@ fn seek_next_back_falls_back_to_older_visible_delta_version() -> Result<(), OpCo
 
 #[test]
 fn txn_range_respects_view_and_own_write_visibility() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace.new_bucket("x", BucketOptions::default()).unwrap();
@@ -832,7 +848,8 @@ fn txn_range_respects_view_and_own_write_visibility() -> Result<(), OpCode> {
 
 #[test]
 fn txn_range_cross_node_respects_view_and_own_write_visibility() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace
@@ -896,7 +913,8 @@ fn txn_range_cross_node_respects_view_and_own_write_visibility() -> Result<(), O
 
 #[test]
 fn txn_range_cross_node_supports_reverse_iteration() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace
@@ -970,7 +988,8 @@ fn txn_range_cross_node_supports_reverse_iteration() -> Result<(), OpCode> {
 
 #[test]
 fn txn_range_cross_node_reverse_respects_upper_bound() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace
@@ -1023,7 +1042,8 @@ fn txn_range_cross_node_reverse_respects_upper_bound() -> Result<(), OpCode> {
 
 #[test]
 fn txn_range_excluded_start_keeps_first_in_range_key() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     let db = mace
@@ -1063,12 +1083,23 @@ fn txn_range_excluded_start_keeps_first_in_range_key() -> Result<(), OpCode> {
         .map(|item| item.key().to_vec())
         .collect();
     assert_eq!(got_absent_start, vec![vec![127, 254]]);
+
+    let got_rev: Vec<Vec<u8>> = view
+        .range::<_, _>((
+            std::ops::Bound::Excluded(vec![1, 1, 128, 127, 0]),
+            std::ops::Bound::Excluded(vec![128, 2]),
+        ))
+        .rev()
+        .map(|item| item.key().to_vec())
+        .collect();
+    assert_eq!(got_rev, vec![vec![127, 254]]);
     Ok(())
 }
 
 #[test]
 fn range_in_one_node() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
     const N: usize = 10;
@@ -1143,7 +1174,8 @@ fn range_in_one_node() -> Result<(), OpCode> {
 
 #[test]
 fn range_cross_node() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.sync_on_write = false;
     opts.tmp_store = true;
     let mace = Mace::new(opts.validate().unwrap()).unwrap();
@@ -1209,7 +1241,7 @@ fn range_cross_node() -> Result<(), OpCode> {
 
 #[test]
 fn cross_txn() {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
     opt.concurrent_write = 4;
@@ -1269,7 +1301,7 @@ fn cross_txn() {
 
 #[test]
 fn smo_during_scan() -> Result<(), OpCode> {
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opt = Options::new(&*path);
     opt.tmp_store = true;
     let mace = Mace::new(opt.validate().unwrap()).unwrap();
@@ -1403,7 +1435,8 @@ fn counter(snapshot: &ObserveSnapshot, metric: CounterMetric) -> u64 {
 #[test]
 #[cfg(feature = "metrics")]
 fn smo_merge_preserves_final_state() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     let observer = Arc::new(InMemoryObserver::new(256));
     opts.tmp_store = true;
     opts.sync_on_write = false;
@@ -1540,7 +1573,8 @@ fn smo_merge_preserves_final_state() -> Result<(), OpCode> {
 #[test]
 #[cfg(feature = "metrics")]
 fn smo_scan_remains_ordered_under_merge_churn() -> Result<(), OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     let observer = Arc::new(InMemoryObserver::new(256));
     opts.tmp_store = true;
     opts.sync_on_write = false;

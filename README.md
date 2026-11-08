@@ -53,6 +53,22 @@ fn main() -> Result<(), OpCode> {
 
 Additional runnable examples are available in the [examples/](./examples/) directory.
 
+## Maintenance CLI
+
+The offline maintenance tool ships as its own package, so it can be released independently of the
+library:
+
+```bash
+cargo install mace-kv-cli   # installs the `mace-kv` binary
+```
+
+If the binary was installed from the older `mace-kv` package, run `cargo uninstall mace-kv` first or
+add `--force`; cargo will not overwrite a binary owned by another package.
+
+The library crate is still published as `mace-kv` and imported as `mace`; the two packages version
+independently, while the CLI accepts semver-compatible library releases because the tool reads the
+library's on-disk format definitions.
+
 ## Status
 
 Storage format and public APIs are essentially stable and ready for production evaluation.

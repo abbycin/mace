@@ -108,14 +108,22 @@ impl<'a, K, V> LruShardGuard<'a, K, V>
 where
     K: Eq + Hash + Clone,
 {
-    pub(crate) fn add_if_missing<F>(mut self, f: F)
+    pub(crate) fn get_or_insert_with<F>(mut self, f: F) -> V
     where
-        F: Fn() -> V,
+        V: Clone,
+        F: FnOnce() -> V,
     {
-        if !self.map.contains_key(&self.k) {
-            let v = f();
-            self.lru.add_unlocked(&mut self.map, self.cap, self.k, v);
+        if let Some(node) = self.map.get(&self.k).copied() {
+            Node::move_back(self.lru.head, node);
+            return unsafe { (*node).val.as_ref().expect("lru value must exist").clone() };
         }
+        // insert and return a clone even when cap is zero and the new node is evicted
+        // immediately, so a caller can never retry the insertion forever
+        let value = f();
+        let out = value.clone();
+        self.lru
+            .add_unlocked(&mut self.map, self.cap, self.k, value);
+        out
     }
 }
 
@@ -451,7 +459,13 @@ impl<V, const LRU_SHARD: usize> ShardLru<V, LRU_SHARD> {
     pub(crate) fn new(cap: usize) -> Self {
         assert!(LRU_SHARD > 0);
         assert!(LRU_SHARD.is_power_of_two());
-        let cap = cap / LRU_SHARD;
+        // a nonzero budget below the shard count must keep one entry per shard; rounding
+        // it to zero silently disables the cache and opens a file per read under the lock
+        let cap = if cap == 0 {
+            0
+        } else {
+            (cap / LRU_SHARD).max(1)
+        };
         Self {
             shard: std::array::from_fn(|_| Lru::new()),
             cap,
@@ -461,15 +475,6 @@ impl<V, const LRU_SHARD: usize> ShardLru<V, LRU_SHARD> {
     #[inline(always)]
     fn get_shard(k: u64) -> usize {
         spooky_hash(k) as usize & Self::LRU_SHARD_MASK
-    }
-
-    #[allow(unused)]
-    pub(crate) fn add(&self, k: u64, v: V) {
-        self.shard[Self::get_shard(k)].add(self.cap, k, v);
-    }
-
-    pub(crate) fn get<'a>(&'a self, k: u64) -> Option<LruGuard<'a, u64, V, *mut Node<u64, V>>> {
-        self.shard[Self::get_shard(k)].get(&k)
     }
 
     pub(crate) fn del(&self, k: u64) {

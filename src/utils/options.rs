@@ -6,6 +6,9 @@ use std::{
 
 use crate::io;
 use crate::must_ok;
+use crate::static_assert;
+use crate::utils::diag;
+use crate::utils::diag::DiagLevel;
 use crate::utils::merge_operator::MergeOperator;
 #[cfg(feature = "metrics")]
 use crate::utils::observe::{NoopObserver, Observer};
@@ -115,8 +118,10 @@ pub struct Options {
     /// Bitmap-cache entry count for data and blob stats.
     pub stat_mask_cache_count: usize,
     /// Maximum number of open data-file handles cached concurrently, used for loading data pages.
+    /// Values below the shard count are rounded up to one handle per shard; zero disables the cache.
     pub data_handle_cache_capacity: usize,
     /// Maximum number of open blob-file handles cached concurrently, used for loading blob pages.
+    /// Values below the shard count are rounded up to one handle per shard; zero disables the cache.
     pub blob_handle_cache_capacity: usize,
     /// Size limit of a data file. Zero selects the default [`Self::DATA_FILE_SIZE`]
     pub data_file_size: usize,
@@ -178,6 +183,12 @@ pub struct PersistedBucketOptions {
     pub enable_backpressure: bool,
     pub _padding: [u8; 2],
 }
+
+// `docs/format.md` specifies this as the persisted bucket options block
+static_assert!(size_of::<PersistedBucketOptions>() == 48);
+static_assert!(std::mem::offset_of!(PersistedBucketOptions, inline_size) == 32);
+static_assert!(std::mem::offset_of!(PersistedBucketOptions, split_elems) == 40);
+static_assert!(std::mem::offset_of!(PersistedBucketOptions, enable_compression) == 44);
 
 impl From<&BucketOptions> for PersistedBucketOptions {
     fn from(opt: &BucketOptions) -> Self {
@@ -393,16 +404,10 @@ impl Options {
 
     /// Creates the directory structure for the database.
     pub fn create_dir(&self) -> std::io::Result<()> {
-        let (db_root, data_root, log_root) = (self.db_root(), self.data_root(), self.log_root());
-
-        if !self.fs.try_exists(&db_root)? {
-            create_dir_all_and_sync(self.fs.as_ref(), &db_root)?;
-        }
-        if !self.fs.try_exists(&data_root)? {
-            create_dir_all_and_sync(self.fs.as_ref(), &data_root)?;
-        }
-        if !self.fs.try_exists(&log_root)? {
-            create_dir_all_and_sync(self.fs.as_ref(), &log_root)?;
+        for dir in [self.db_root(), self.data_root(), self.log_root()] {
+            if !self.fs.try_exists(&dir)? {
+                create_dir_all_and_sync(self.fs.as_ref(), &dir)?;
+            }
         }
         Ok(())
     }
@@ -420,6 +425,17 @@ impl Deref for ParsedOptions {
 }
 
 impl Options {
+    /// Sets the process-wide diagnostics level.
+    ///
+    /// Every `Mace` instance in the process shares it, an open does not change it, and the
+    /// default is [`DiagLevel::Warn`]. [`DiagLevel::Off`] silences every filtered diagnostic.
+    /// Reports that bypass the filter (a corrupt merge operand) and reports emitted on a fatal
+    /// path (a flush-publish abort) are not filtered, and neither is the fail-stop report in
+    /// `crate::error`.
+    pub fn set_diag_level(level: DiagLevel) {
+        diag::set_diag_level(level);
+    }
+
     pub const SEP: &'static str = "_";
     pub const DATA_PREFIX: &'static str = "data";
     pub const BLOB_PREFIX: &'static str = "blob";
@@ -433,14 +449,16 @@ impl Options {
         self.db_root().join("data")
     }
 
+    fn file_with_id(root: PathBuf, prefix: &str, id: u64) -> PathBuf {
+        root.join(format!("{}{}{}", prefix, Self::SEP, id))
+    }
+
     pub fn data_file(&self, id: u64) -> PathBuf {
-        self.data_root()
-            .join(format!("{}{}{}", Self::DATA_PREFIX, Self::SEP, id))
+        Self::file_with_id(self.data_root(), Self::DATA_PREFIX, id)
     }
 
     pub fn blob_file(&self, id: u64) -> PathBuf {
-        self.data_root()
-            .join(format!("{}{}{}", Self::BLOB_PREFIX, Self::SEP, id))
+        Self::file_with_id(self.data_root(), Self::BLOB_PREFIX, id)
     }
 
     pub fn log_root(&self) -> PathBuf {
@@ -468,8 +486,7 @@ impl Options {
 
     /// durable shared stream file: `group_wal_<seq>`
     pub fn group_wal_file(&self, seq: u64) -> PathBuf {
-        self.log_root()
-            .join(format!("{}{}{}", Self::GROUP_WAL_PREFIX, Self::SEP, seq))
+        Self::file_with_id(self.log_root(), Self::GROUP_WAL_PREFIX, seq)
     }
 
     /// path for a physical WAL stream
@@ -542,9 +559,30 @@ impl Options {
     }
 }
 
+#[cfg(feature = "maintenance")]
+impl Options {
+    /// the filesystem hook the offline maintenance checker must use
+    #[doc(hidden)]
+    pub fn fs(&self) -> &dyn crate::io::FileSystem {
+        self.fs.as_ref()
+    }
+
+    /// shared handle to the filesystem hook, for readers that outlive the call
+    #[doc(hidden)]
+    pub fn fs_arc(&self) -> std::sync::Arc<dyn crate::io::FileSystem> {
+        self.fs.clone()
+    }
+
+    /// inject a filesystem for the maintenance checker's own tests
+    #[doc(hidden)]
+    pub fn set_fs(&mut self, fs: std::sync::Arc<dyn crate::io::FileSystem>) {
+        self.fs = fs;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub(crate) struct PersistedOptions {
+pub struct PersistedOptions {
     pub concurrent_write: u8,
     pub sync_on_write: bool,
     pub gc_timeout: u64,
@@ -611,7 +649,7 @@ impl PersistedOptions {
         }
     }
 
-    pub(crate) fn from_json(buf: &[u8]) -> Result<Self, OpCode> {
+    pub fn from_json(buf: &[u8]) -> Result<Self, OpCode> {
         serde_json::from_slice(buf).map_err(|_| OpCode::Corruption)
     }
 
@@ -623,7 +661,7 @@ impl PersistedOptions {
 impl Drop for ParsedOptions {
     fn drop(&mut self) {
         if self.inner.tmp_store {
-            log::info!("remove db_root {:?}", self.inner.db_root);
+            diag::info!("remove db_root {:?}", self.inner.db_root);
             let _ = std::fs::remove_dir_all(&self.inner.db_root);
         }
     }

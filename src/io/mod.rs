@@ -35,7 +35,7 @@ pub trait GatherIO {
 }
 
 /// filesystem hook for namespace operations and runtime file opens
-pub(crate) trait FileSystem: Send + Sync {
+pub trait FileSystem: Send + Sync {
     fn open(&self, path: &Path, opt: &OpenOptions) -> Result<File, io::Error>;
 
     fn try_exists(&self, path: &Path) -> Result<bool, io::Error>;
@@ -127,11 +127,7 @@ impl OpenOptions {
         self
     }
 
-    pub(crate) fn open<P: AsRef<Path>>(
-        &self,
-        fs: &dyn FileSystem,
-        path: P,
-    ) -> Result<File, io::Error> {
+    pub fn open<P: AsRef<Path>>(&self, fs: &dyn FileSystem, path: P) -> Result<File, io::Error> {
         fs.open(path.as_ref(), self)
     }
 }
@@ -224,8 +220,8 @@ fn copy_file(from: &Path, to: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) mod testfs {
+#[cfg(any(test, feature = "extra_check"))]
+pub mod testfs {
     use std::{
         io,
         path::{Path, PathBuf},
@@ -235,7 +231,7 @@ pub(crate) mod testfs {
     use super::{File, FileSystem, OpenOptions, OsFileSystem};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum InjectOp {
+    pub enum InjectOp {
         Open,
         TryExists,
         CreateDir,
@@ -264,28 +260,34 @@ pub(crate) mod testfs {
         calls: Vec<(InjectOp, PathBuf)>,
     }
 
-    pub(crate) struct InjectedFileSystem {
+    pub struct InjectedFileSystem {
         state: Mutex<State>,
         os: OsFileSystem,
     }
 
+    impl Default for InjectedFileSystem {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl InjectedFileSystem {
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             Self {
                 state: Mutex::new(State::default()),
                 os: OsFileSystem,
             }
         }
 
-        pub(crate) fn fail_once<P: AsRef<Path>>(&self, op: InjectOp, path: P, kind: io::ErrorKind) {
+        pub fn fail_once<P: AsRef<Path>>(&self, op: InjectOp, path: P, kind: io::ErrorKind) {
             self.fail_nth(op, Some(path.as_ref().to_path_buf()), 1, kind);
         }
 
-        pub(crate) fn fail_nth_any(&self, op: InjectOp, nth: usize, kind: io::ErrorKind) {
+        pub fn fail_nth_any(&self, op: InjectOp, nth: usize, kind: io::ErrorKind) {
             self.fail_nth(op, None, nth, kind);
         }
 
-        pub(crate) fn calls(&self) -> Vec<(InjectOp, PathBuf)> {
+        pub fn calls(&self) -> Vec<(InjectOp, PathBuf)> {
             self.state
                 .lock()
                 .expect("fs state lock must work")
@@ -400,7 +402,8 @@ mod tests {
 
     #[test]
     fn remove_file_if_exists_propagates_non_not_found_error() {
-        let path = PathBuf::from(&*RandomPath::tmp());
+        let root = RandomPath::tmp();
+        let path = PathBuf::from(&*root);
         std::fs::write(&path, b"x").expect("seed file must be created");
         let fs = InjectedFileSystem::new();
         fs.fail_once(InjectOp::RemoveFile, &path, ErrorKind::PermissionDenied);
@@ -416,7 +419,8 @@ mod tests {
 
     #[test]
     fn injected_fs_supports_nth_call_and_records_calls() {
-        let path = PathBuf::from(&*RandomPath::tmp());
+        let root = RandomPath::tmp();
+        let path = PathBuf::from(&*root);
         std::fs::write(&path, b"x").expect("seed file must be created");
         let fs = InjectedFileSystem::new();
         fs.fail_nth_any(InjectOp::TryExists, 2, ErrorKind::PermissionDenied);

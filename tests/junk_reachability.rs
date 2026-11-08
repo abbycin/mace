@@ -254,6 +254,7 @@ fn checkpoint_snapshot_holds_ebr_guard_before_wait_zero() -> Result<(), OpCode> 
                 CheckpointSyncPoint::AfterSnapshotBuilt => {
                     let _ = built_tx.send(());
                 }
+                CheckpointSyncPoint::BeforeFlushDirective => {}
             }
         }
     })));

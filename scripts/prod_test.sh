@@ -28,7 +28,6 @@ chaos_retry="${CHAOS_RETRY:-3}"
 failures=()
 
 fast_targets=(
-  cli
   prod_bucket
   prod_concurrency
   prod_evictor
@@ -122,6 +121,8 @@ chaos_cases=(
   "prod_recovery_failpoints:wal_recycle_done_does_not_weaken_gap_detection_after_frontier"
   "prod_recovery_failpoints:chaos_failpoint_txn_commit_after_wal_file_sync_before_dir_sync"
   "prod_recovery_failpoints:chaos_failpoint_txn_commit_after_record_commit"
+  "prod_recovery_failpoints:chaos_failpoint_txn_prefix_after_record_commit"
+  "prod_recovery_failpoints:chaos_failpoint_txn_prefix_after_wal_sync"
   "prod_recovery_failpoints:chaos_failpoint_txn_commit_after_wal_sync"
   "prod_recovery_failpoints:chaos_failpoint_bucket_create_before_manifest_commit"
   "prod_recovery_failpoints:chaos_failpoint_bucket_create_after_manifest_commit"
@@ -219,6 +220,14 @@ run_fast() {
 
   if ! run_cmd "fast" "$fast_timeout" cargo "${args[@]}"; then
     failures+=("fast")
+  fi
+
+  # the maintenance CLI is its own package now, so the multi-target invocation
+  # above cannot reach it; keep its acceptance tests in the same fast gate
+  if ! run_cmd "fast:cli" "$fast_timeout" \
+    cargo test -p mace-kv-cli --features "$features" --test cli --test checker \
+      -- --nocapture --test-threads="$test_threads"; then
+    failures+=("fast:cli")
   fi
 
   # the shared-durable-wal generation/route-switch crash windows require BOTH

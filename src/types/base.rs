@@ -14,16 +14,10 @@ use crate::{
     utils::{NULL_ADDR, NULL_PID, OpCode, data::Position},
 };
 
+use self::iter::FuseBaseIter;
+
 impl BaseView {
-    #[cfg(not(test))]
-    const HIST_PAGE_BUDGET: usize = 128 * 1024;
-    #[cfg(test)]
-    const TEST_HIST_PAGE_BUDGET: usize = 256;
-    const HDR_LEN: usize = size_of::<BaseHeader>();
-    const SIBLING_HINT_CNT_LEN: usize = size_of::<u32>();
-    const SIBLING_HINT_ADDR_LEN: usize = size_of::<u64>();
-    const REMOTE_HINT_CNT_LEN: usize = size_of::<u32>();
-    const REMOTE_HINT_ADDR_LEN: usize = size_of::<u64>();
+    pub(super) const HDR_LEN: usize = size_of::<BaseHeader>();
 
     pub(crate) fn null() -> Self {
         Self(null_mut())
@@ -42,510 +36,6 @@ impl BaseView {
         } else {
             0
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_leaf<'a, A, L, I>(
-        a: &mut A,
-        l: &L,
-        lo: &[u8],
-        hi: Option<&[u8]>,
-        right_sibling: u64,
-        iter: &mut I,
-        txid: u64,
-        group: u8,
-        lsn: Position,
-    ) -> BoxRef
-    where
-        A: IFrameAlloc,
-        L: ILoader,
-        I: LeafCompactSource<'a> + ?Sized,
-    {
-        let lsn = lsn.max(a.checkpoint_lsn(group));
-        let inline_size = a.inline_size();
-        let mut elems = 0;
-        let mut hints: VecDeque<(usize, usize)> = VecDeque::new();
-        let mut is_new_sibling = false;
-        let mut remote_hint_cnt = 0usize;
-        let mut last_raw: Option<LeafSeg<'a>> = None;
-        let mut pos = 0;
-        let mut payload_sz = 0;
-        let mut seekable = SeekableIter::new();
-        let mut fold_scratch: Vec<u8> = Vec::new();
-        let prefix_len = Self::calc_prefix(lo, &hi);
-        #[cfg(feature = "extra_check")]
-        let mut last_k: Option<LeafSeg> = None;
-
-        while let Some((ks, cv)) = iter.next_compact(&mut fold_scratch) {
-            #[cfg(feature = "extra_check")]
-            {
-                if let Some(x) = last_k {
-                    // merge path may interleave segments from different prefixes
-                    assert!(x.cmp(&ks).is_lt());
-                }
-                last_k = Some(ks);
-            }
-
-            let k = ks.remove_prefix(prefix_len);
-            // rows whose record reaches the inline boundary end up as remote
-            // envelopes in the rebuilt leaf; that includes stored inline rows
-            // above a lowered bucket threshold, which materialize in pass 2
-            if cv.is_remote() || cv.data_size() >= inline_size {
-                remote_hint_cnt += 1;
-            }
-            let vsz = cv.data_size();
-            let same_as_last = matches!(
-                (&last_raw, &k),
-                (Some(raw), kk) if raw.raw_cmp(kk).is_eq()
-            );
-
-            if same_as_last {
-                if !is_new_sibling {
-                    is_new_sibling = true;
-                    payload_sz += Val::calc_size(true, inline_size, vsz);
-                    hints.push_back((pos - 1, 0));
-                }
-
-                let (_, cnt) = must_exist!(hints.back_mut());
-                *cnt += 1;
-                pos += 1;
-                seekable.add(k, cv);
-                continue;
-            }
-
-            pos += 1;
-            last_raw = Some(k);
-            is_new_sibling = false;
-            payload_sz += k.packed_size();
-            payload_sz += Val::calc_size(false, inline_size, vsz);
-            elems += 1;
-            seekable.add(k, cv);
-        }
-
-        let hdr_sz = elems * SLOT_LEN + Self::HDR_LEN;
-        // history region refs for all sibling slots in Node
-        let mut sibling_refs = VecDeque::with_capacity(hints.len());
-        let mut sibling_hint_addrs = Vec::new();
-        let mut remote_hint_addrs = Vec::with_capacity(remote_hint_cnt);
-        if !hints.is_empty() {
-            sibling_refs = Self::save_hist_regions(
-                a,
-                l,
-                &hints,
-                &seekable,
-                txid,
-                group,
-                lsn,
-                &mut sibling_hint_addrs,
-                &mut remote_hint_addrs,
-            );
-        }
-        let hint_sz = Self::leaf_hint_size(sibling_hint_addrs.len(), remote_hint_cnt);
-        seekable.seek_to(0);
-
-        let b = Self::try_alloc::<false, _>(
-            a,
-            hdr_sz + payload_sz,
-            hint_sz,
-            lo,
-            hi,
-            elems,
-            right_sibling,
-            prefix_len,
-            txid,
-            group,
-            lsn,
-        );
-
-        let mut base = b.view().as_base();
-        let mut has_multiple_versions = false;
-        let mut builder = Builder::from(base.data_mut(), elems);
-        builder.setup_boundary_keys(lo, hi);
-
-        pos = 0;
-        while let Some((k, v)) = seekable.next() {
-            // blob-destined fold results allocate their remote box here, where the
-            // frame allocator is available; the box enters the allocator map like
-            // any large-value write (lsn/group aligned for GC retirement)
-            let (r, remote) = match v.materialize_blob(a, group, lsn) {
-                Some(x) => x,
-                None => v.record_with_remote(a, l, group, lsn),
-            };
-            if remote != NULL_ADDR {
-                remote_hint_addrs.push(remote);
-            }
-            let mut hist = None;
-            if let Some((idx, cnt)) = hints.front().copied()
-                && pos == idx
-            {
-                hints.pop_front().expect("must exist");
-                hist = Some(sibling_refs.pop_front().expect("must exist"));
-                has_multiple_versions = true;
-                if cnt != 0 {
-                    seekable.seek_to(pos + cnt + 1);
-                    pos += cnt;
-                }
-            }
-            builder.add_leaf(inline_size, k, &r, hist, remote);
-            pos += 1;
-        }
-        hot_true!(hints.is_empty());
-        hot_true!(sibling_refs.is_empty());
-        base.header_mut().has_multiple_versions = has_multiple_versions;
-        if !sibling_hint_addrs.is_empty() || !remote_hint_addrs.is_empty() {
-            base.write_leaf_hints(&sibling_hint_addrs, &remote_hint_addrs);
-        }
-        b
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_intl<'a, A, I, F>(
-        a: &mut A,
-        lo: &[u8],
-        hi: Option<&[u8]>,
-        sibling: u64,
-        f: F,
-        txid: u64,
-        group: u8,
-        lsn: Position,
-    ) -> BoxRef
-    where
-        A: IFrameAlloc,
-        I: Iterator<Item = (IntlSeg<'a>, Index)>,
-        F: Fn() -> I,
-    {
-        let lsn = lsn.max(a.checkpoint_lsn(group));
-        let prefix_len = Self::calc_prefix(lo, &hi);
-        let mut elems = 0;
-        let sz: usize = f()
-            .map(|(k, v)| {
-                elems += 1;
-                let ksz = k.remove_prefix(prefix_len).packed_size();
-                let vsz = v.packed_size();
-                ksz + vsz
-            })
-            .sum();
-
-        let hdr_sz = elems * SLOT_LEN + Self::HDR_LEN;
-        let b = Self::try_alloc::<true, _>(
-            a,
-            hdr_sz + sz,
-            0,
-            lo,
-            hi,
-            elems,
-            sibling,
-            prefix_len,
-            txid,
-            group,
-            lsn,
-        );
-        let mut base = b.view().as_base();
-        let mut builder = Builder::from(base.data_mut(), elems);
-        builder.setup_boundary_keys(lo, hi);
-
-        let iter = f();
-        for (k, v) in iter {
-            let k = k.remove_prefix(prefix_len);
-            builder.add_intl(&k, &v);
-        }
-
-        b
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn save_hist_regions<'a, A: IFrameAlloc, L: ILoader>(
-        a: &mut A,
-        l: &L,
-        hints: &VecDeque<(usize, usize)>,
-        iter: &SeekableIter<'a>,
-        txid: u64,
-        group: u8,
-        lsn: Position,
-        hint_addrs: &mut Vec<u64>,
-        remote_hint_addrs: &mut Vec<u64>,
-    ) -> VecDeque<HistRef> {
-        struct HistRegion {
-            start: usize,
-            count: usize,
-        }
-
-        if hints.is_empty() {
-            return VecDeque::new();
-        }
-
-        let mut regions = Vec::with_capacity(hints.len());
-        let mut old_vers: Vec<(Ver, CompactVal)> = Vec::new();
-        for &(idx, cnt) in hints {
-            hot_true!(cnt > 0);
-            let start = old_vers.len();
-            iter.seek_to(idx + 1);
-            for _ in 0..cnt {
-                let (k, v) = iter.next().expect("must exist");
-                old_vers.push((k.ver, v.clone()));
-            }
-            regions.push(HistRegion { start, count: cnt });
-        }
-        if old_vers.is_empty() {
-            return VecDeque::new();
-        }
-
-        let inline_size = a.inline_size();
-        let frame_budget = Self::hist_page_budget();
-        let mut page_ranges = Vec::new();
-        let mut beg = 0usize;
-
-        while beg < old_vers.len() {
-            let saved = beg;
-            let mut len = Self::HDR_LEN;
-            while beg < old_vers.len() {
-                let (_, v) = &old_vers[beg];
-                let sz = Ver::len() + Val::calc_size(false, inline_size, v.data_size());
-                let tmp = len + sz + SLOT_LEN;
-                if tmp > frame_budget {
-                    break;
-                }
-                len = tmp;
-                beg += 1;
-            }
-            if saved == beg {
-                beg += 1;
-            }
-            page_ranges.push((saved, beg));
-        }
-
-        let mut entry_loc = vec![(0usize, 0u16); old_vers.len()];
-        for (pid, &(start, end)) in page_ranges.iter().enumerate() {
-            for (slot, i) in (start..end).enumerate() {
-                entry_loc[i] = (pid, slot as u16);
-            }
-        }
-
-        let mut refs_idx = VecDeque::with_capacity(regions.len());
-        for region in &regions {
-            let (pid, slot) = entry_loc[region.start];
-            refs_idx.push_back((pid, slot, region.count as u32));
-        }
-
-        let mut tail: Option<BaseView> = None;
-        let mut page_addrs = Vec::with_capacity(page_ranges.len());
-        for &(start, end) in &page_ranges {
-            let mut len = Self::HDR_LEN;
-            for (_, v) in old_vers.iter().take(end).skip(start) {
-                let sz = Ver::len() + Val::calc_size(false, inline_size, v.data_size());
-                len += sz + SLOT_LEN;
-            }
-            let b = Self::try_alloc::<false, _>(
-                a,
-                len,
-                0,
-                &[],
-                None,
-                end - start,
-                NULL_PID,
-                0,
-                txid,
-                group,
-                lsn,
-            );
-            // NOTE: this is the only place to set flag to Sibling
-            let mut base = b.view().as_base();
-            base.box_header_mut().flag = TagFlag::Sibling;
-            let mut builder = Builder::from(base.data_mut(), end - start);
-            builder.setup_boundary_keys(&[], None);
-
-            for (k, v) in old_vers[start..end].iter() {
-                // blob-destined fold rows allocate their remote box here, exactly
-                // like the main second pass; get_remote() alone would encode a
-                // dangling address for them
-                let (r, remote) = match v.materialize_blob(a, group, lsn) {
-                    Some(x) => x,
-                    None => v.record_with_remote(a, l, group, lsn),
-                };
-                if remote != NULL_ADDR {
-                    remote_hint_addrs.push(remote);
-                }
-                builder.add_leaf(inline_size, k, &r, None, remote);
-            }
-
-            let addr = base.box_header().addr;
-            hint_addrs.push(addr);
-            page_addrs.push(addr);
-
-            if let Some(mut last) = tail {
-                last.box_header_mut().link = addr;
-            }
-            tail = Some(base);
-        }
-        refs_idx
-            .into_iter()
-            .map(|(pid, slot, count)| HistRef::new(page_addrs[pid], slot, count))
-            .collect()
-    }
-
-    #[inline]
-    const fn hist_page_budget() -> usize {
-        #[cfg(test)]
-        {
-            Self::TEST_HIST_PAGE_BUDGET
-        }
-        #[cfg(not(test))]
-        {
-            Self::HIST_PAGE_BUDGET
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn try_alloc<const IS_INDEX: bool, A: IFrameAlloc>(
-        a: &mut A,
-        mut size: usize,
-        extra_payload: usize,
-        lo: &[u8],
-        hi: Option<&[u8]>,
-        elems: usize,
-        right_sibling: u64,
-        prefix_len: usize,
-        txid: u64,
-        group: u8,
-        lsn: Position,
-    ) -> BoxRef {
-        let hi_len = hi.map_or(0, |x| x.len());
-
-        // we don't use slot to encode lo/hi length, since the length has been saved in header
-        // and the lo/hi keys are both stored in sst directly discard it's length
-        size += lo.len() + hi.map_or(0, |x| x.len());
-
-        let mut p = a.alloc((size + extra_payload) as u32);
-        let h = p.header_mut();
-        h.kind = TagKind::Base;
-        h.link = NULL_ADDR;
-        h.txid = txid;
-        h.group = group;
-        h.lsn = lsn;
-        h.node_type = if IS_INDEX {
-            NodeType::Intl
-        } else {
-            NodeType::Leaf
-        };
-
-        let mut b = p.view().as_base();
-        let h = b.header_mut();
-        h.elems = elems as u16;
-        h.size = size as u32;
-        h.right_sibling = right_sibling;
-        h.lo_len = lo.len() as u32;
-        h.hi_len = hi_len as u32;
-        h.split_elems = 0;
-        h.merging_child = NULL_ADDR;
-        h.merging = false;
-        h.prefix_len = prefix_len as u32;
-        h.is_index = IS_INDEX;
-        h.has_multiple_versions = false;
-        h.padding = 0;
-
-        p
-    }
-
-    const fn sibling_hint_size(nr_heads: usize) -> usize {
-        Self::SIBLING_HINT_CNT_LEN + nr_heads * Self::SIBLING_HINT_ADDR_LEN
-    }
-
-    const fn leaf_hint_size(nr_heads: usize, nr_remotes: usize) -> usize {
-        if nr_heads == 0 && nr_remotes == 0 {
-            0
-        } else {
-            Self::sibling_hint_size(nr_heads)
-                + Self::REMOTE_HINT_CNT_LEN
-                + nr_remotes * Self::REMOTE_HINT_ADDR_LEN
-        }
-    }
-
-    fn write_leaf_hints(&mut self, heads: &[u64], remotes: &[u64]) {
-        hot_true!(!self.header().is_index);
-        let off = self.header().size as usize;
-        hot_true!(
-            self.box_header().payload_size as usize
-                >= off + Self::leaf_hint_size(heads.len(), remotes.len())
-        );
-
-        let p = self.0.cast::<u8>();
-        unsafe {
-            p.add(off).cast::<u32>().write_unaligned(heads.len() as u32);
-            let sibling_off = off + Self::SIBLING_HINT_CNT_LEN;
-            if !heads.is_empty() {
-                let src = heads.as_ptr().cast::<u8>();
-                let dst = p.add(sibling_off);
-                std::ptr::copy_nonoverlapping(src, dst, heads.len() * Self::SIBLING_HINT_ADDR_LEN);
-            }
-            let remote_cnt_off = sibling_off + heads.len() * Self::SIBLING_HINT_ADDR_LEN;
-            p.add(remote_cnt_off)
-                .cast::<u32>()
-                .write_unaligned(remotes.len() as u32);
-            if !remotes.is_empty() {
-                let src = remotes.as_ptr().cast::<u8>();
-                let dst = p.add(remote_cnt_off + Self::REMOTE_HINT_CNT_LEN);
-                std::ptr::copy_nonoverlapping(src, dst, remotes.len() * Self::REMOTE_HINT_ADDR_LEN);
-            }
-        }
-    }
-
-    fn leaf_hint_layout(&self) -> Option<(usize, usize, usize)> {
-        hot_true!(!self.header().is_index);
-        let payload = self.box_header().payload_size as usize;
-        let off = self.header().size as usize;
-        if payload == off {
-            return None;
-        }
-        hot_true!(payload >= off + Self::SIBLING_HINT_CNT_LEN);
-        let p = self.0.cast::<u8>();
-        let cnt = unsafe { p.add(off).cast::<u32>().read_unaligned() as usize };
-        let remote_cnt_off = off + Self::sibling_hint_size(cnt);
-        hot_true!(payload >= remote_cnt_off + Self::REMOTE_HINT_CNT_LEN);
-        let remote_cnt = unsafe { p.add(remote_cnt_off).cast::<u32>().read_unaligned() as usize };
-        hot_true!(
-            payload
-                >= remote_cnt_off
-                    + Self::REMOTE_HINT_CNT_LEN
-                    + remote_cnt * Self::REMOTE_HINT_ADDR_LEN
-        );
-        Some((off, cnt, remote_cnt))
-    }
-
-    pub(crate) fn load_sibling_heads_hint(&self, out: &mut Vec<u64>) -> bool {
-        let Some((off, cnt, _)) = self.leaf_hint_layout() else {
-            return false;
-        };
-        if cnt == 0 {
-            return false;
-        }
-        let p = self.0.cast::<u8>();
-        let start = out.len();
-        out.resize(start + cnt, 0);
-        unsafe {
-            let src = p.add(off + Self::SIBLING_HINT_CNT_LEN).cast::<u8>();
-            let dst = out.as_mut_ptr().add(start).cast::<u8>();
-            std::ptr::copy_nonoverlapping(src, dst, cnt * Self::SIBLING_HINT_ADDR_LEN);
-        }
-        true
-    }
-
-    pub(crate) fn load_remote_hints(&self, out: &mut Vec<u64>) -> bool {
-        let Some((off, sibling_cnt, remote_cnt)) = self.leaf_hint_layout() else {
-            return false;
-        };
-        if remote_cnt == 0 {
-            return false;
-        }
-        let p = self.0.cast::<u8>();
-        let remote_off = off + Self::sibling_hint_size(sibling_cnt) + Self::REMOTE_HINT_CNT_LEN;
-        let start = out.len();
-        out.resize(start + remote_cnt, 0);
-        unsafe {
-            let src = p.add(remote_off).cast::<u8>();
-            let dst = out.as_mut_ptr().add(start).cast::<u8>();
-            std::ptr::copy_nonoverlapping(src, dst, remote_cnt * Self::REMOTE_HINT_ADDR_LEN);
-        }
-        true
     }
 
     pub(crate) fn merge<A: IFrameAlloc, L: ILoader>(
@@ -586,7 +76,7 @@ impl BaseView {
     }
 
     /// the data means slot + hi/lo + key-value, excluding header and remotes
-    fn data_mut(&mut self) -> &mut [u8] {
+    pub(super) fn data_mut(&mut self) -> &mut [u8] {
         let h = self.header();
         unsafe {
             std::slice::from_raw_parts_mut(
@@ -596,7 +86,7 @@ impl BaseView {
         }
     }
 
-    fn data(&self) -> &[u8] {
+    pub(super) fn data(&self) -> &[u8] {
         let h = self.header();
         unsafe {
             std::slice::from_raw_parts(self.0.add(1).cast::<u8>(), h.size as usize - Self::HDR_LEN)
@@ -644,440 +134,30 @@ impl BaseView {
     }
 }
 
-#[repr(C)]
-pub(crate) struct BaseIter<'a, L, K>
-where
-    L: ILoader,
-    K: IKey,
-{
-    beg: usize,
-    end: usize,
-    sst: Sst<K>,
-    pub loader: &'a L,
-    hist: Option<HistIter<'a>>,
-    keepalive: Vec<BoxRef>,
-}
+mod builder;
+mod history;
+mod iter;
+mod layout;
 
-#[repr(C)]
-pub(crate) struct BaseRevIter<'a, L, K>
-where
-    L: ILoader,
-    K: IKey,
-{
-    cur: isize,
-    end: isize,
-    sst: Sst<K>,
-    pub loader: &'a L,
-    hist: Option<HistIter<'a>>,
-    keepalive: Vec<BoxRef>,
-}
-
-struct HistIter<'a> {
-    key_raw: &'a [u8],
-    page: BoxRef,
-    slot: usize,
-    remaining: usize,
-}
-
-impl HistIter<'_> {
-    #[inline]
-    fn current_page(&self) -> BaseView {
-        self.page.view().as_base()
-    }
-}
-
-impl<'a, L, K> BaseIter<'a, L, K>
-where
-    L: ILoader,
-    K: IKey,
-{
-    fn new(loader: &'a L, sst: Sst<K>, beg: usize, end: usize) -> Self {
-        Self {
-            loader,
-            sst,
-            beg,
-            end,
-            hist: None,
-            keepalive: Vec::new(),
-        }
-    }
-}
-
-impl<'a, L, K> BaseRevIter<'a, L, K>
-where
-    L: ILoader,
-    K: IKey,
-{
-    pub(crate) fn new(loader: &'a L, sst: Sst<K>, start: isize, end: isize) -> Self {
-        Self {
-            loader,
-            sst,
-            cur: start,
-            end,
-            hist: None,
-            keepalive: Vec::new(),
-        }
-    }
-}
-
-impl<'a, L> Iterator for BaseIter<'a, L, Key<'a>>
-where
-    L: ILoader,
-{
-    type Item = (Key<'a>, Val<'a>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_with_sibling(|_| {})
-    }
-}
-
-impl<'a, L> BaseIter<'a, L, Key<'a>>
-where
-    L: ILoader,
-{
-    pub(crate) fn try_next_with_sibling<F>(
-        &mut self,
-        mut on_sibling: F,
-    ) -> Result<Option<(Key<'a>, Val<'a>)>, OpCode>
-    where
-        F: FnMut(u64),
-    {
-        while let Some(state) = self.hist.as_mut() {
-            if state.remaining == 0 {
-                self.hist = None;
-                continue;
-            }
-            let page = state.current_page();
-
-            let elems = page.header().elems as usize;
-            if state.slot >= elems {
-                let link = page.box_header().link;
-                if link == NULL_ADDR {
-                    self.hist = None;
-                    continue;
-                }
-                on_sibling(link);
-                let page = self.loader.load_sibling(link);
-                self.keepalive.push(page.clone());
-                state.page = page;
-                state.slot = 0;
-                continue;
-            }
-
-            let (ver, val) = page.sst::<Ver>().kv_at(state.slot);
-            state.slot += 1;
-            state.remaining -= 1;
-            let k = Key::new(state.key_raw, ver);
-            return Ok(Some((k, val)));
-        }
-        if self.beg < self.end {
-            let (k, v) = self.sst.kv_at::<Val>(self.beg);
-            self.beg += 1;
-            if let Some(hist) = v.get_hist() {
-                on_sibling(hist.page_addr);
-                let page = self.loader.load_sibling(hist.page_addr);
-                self.keepalive.push(page.clone());
-                self.hist = Some(HistIter {
-                    key_raw: k.raw,
-                    page,
-                    slot: hist.slot as usize,
-                    remaining: hist.count as usize,
-                });
-                // the sibling is still in `v`
-                Ok(Some((k, v)))
-            } else {
-                Ok(Some((k, v)))
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub(crate) fn next_with_sibling<F>(&mut self, mut on_sibling: F) -> Option<(Key<'a>, Val<'a>)>
-    where
-        F: FnMut(u64),
-    {
-        self.try_next_with_sibling(&mut on_sibling)
-            .expect("must exist")
-    }
-}
-
-impl<'a, L> BaseRevIter<'a, L, Key<'a>>
-where
-    L: ILoader,
-{
-    pub(crate) fn try_next_back_with_sibling<F>(
-        &mut self,
-        mut on_sibling: F,
-    ) -> Result<Option<(Key<'a>, Val<'a>)>, OpCode>
-    where
-        F: FnMut(u64),
-    {
-        while let Some(state) = self.hist.as_mut() {
-            if state.remaining == 0 {
-                self.hist = None;
-                continue;
-            }
-            let page = state.current_page();
-
-            let elems = page.header().elems as usize;
-            if state.slot >= elems {
-                let link = page.box_header().link;
-                if link == NULL_ADDR {
-                    self.hist = None;
-                    continue;
-                }
-                on_sibling(link);
-                let page = self.loader.load_sibling(link);
-                self.keepalive.push(page.clone());
-                state.page = page;
-                state.slot = 0;
-                continue;
-            }
-
-            let (ver, val) = page.sst::<Ver>().kv_at(state.slot);
-            state.slot += 1;
-            state.remaining -= 1;
-            let k = Key::new(state.key_raw, ver);
-            return Ok(Some((k, val)));
-        }
-
-        if self.cur >= self.end {
-            let pos = self.cur as usize;
-            let (k, v) = self.sst.kv_at::<Val>(pos);
-            self.cur -= 1;
-            if let Some(hist) = v.get_hist() {
-                on_sibling(hist.page_addr);
-                let page = self.loader.load_sibling(hist.page_addr);
-                self.keepalive.push(page.clone());
-                self.hist = Some(HistIter {
-                    key_raw: k.raw,
-                    page,
-                    slot: hist.slot as usize,
-                    remaining: hist.count as usize,
-                });
-            }
-            Ok(Some((k, v)))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl<'a, L> Iterator for BaseIter<'a, L, IntlKey<'a>>
-where
-    L: ILoader,
-{
-    type Item = (IntlKey<'a>, Index);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.beg < self.end {
-            let (k, v) = self.sst.kv_at(self.beg);
-            self.beg += 1;
-            Some((k, v))
-        } else {
-            None
-        }
-    }
-}
-
-struct FuseBaseIter<'a, L, K>
-where
-    L: ILoader,
-    K: IKey,
-{
-    prefix1: &'a [u8],
-    prefix2: &'a [u8],
-    iter1: BaseIter<'a, L, K>,
-    iter2: BaseIter<'a, L, K>,
-}
-
-impl<'a, L, K> FuseBaseIter<'a, L, K>
-where
-    L: ILoader,
-    K: IKey,
-{
-    fn new(
-        prefix1: &'a [u8],
-        prefix2: &'a [u8],
-        i1: BaseIter<'a, L, K>,
-        i2: BaseIter<'a, L, K>,
-    ) -> Self {
-        Self {
-            prefix1,
-            prefix2,
-            iter1: i1,
-            iter2: i2,
-        }
-    }
-}
-
-impl<'a, L> Iterator for FuseBaseIter<'a, L, Key<'a>>
-where
-    L: ILoader,
-{
-    type Item = (LeafSeg<'a>, Val<'a>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some((k, v)) = self.iter1.next() {
-            Some((LeafSeg::new(self.prefix1, k.raw, k.ver), v))
-        } else {
-            self.iter2
-                .next()
-                .map(|(k, v)| (LeafSeg::new(self.prefix2, k.raw, k.ver), v))
-        }
-    }
-}
-
-impl<'a, L> Iterator for FuseBaseIter<'a, L, IntlKey<'a>>
-where
-    L: ILoader,
-{
-    type Item = (IntlSeg<'a>, Index);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some((k, v)) = self.iter1.next() {
-            Some((IntlSeg::new(self.prefix1, k.raw), v))
-        } else {
-            self.iter2
-                .next()
-                .map(|(k, v)| (IntlSeg::new(self.prefix2, k.raw), v))
-        }
-    }
-}
-
-/// the layout of sst:
-/// ```text
-/// +---------+-------------+---------+--------+----------+
-/// | header  | index table | low key | hi key |key-value |
-/// +---------+-------------+---------+--------+----------+
-/// ```
-struct Builder<'a> {
-    slots: &'a mut [SlotType],
-    payload: &'a mut [u8],
-    pos: usize,
-    index: usize,
-    offset: usize,
-}
-
-impl<'a> Builder<'a> {
-    /// the `s` is starts from index table
-    fn from(s: &'a mut [u8], elems: usize) -> Self {
-        let offset = elems * SLOT_LEN;
-        let slots = unsafe {
-            let p = s.as_mut_ptr().cast::<SlotType>();
-            std::slice::from_raw_parts_mut(p, elems)
-        };
-        Self {
-            slots,
-            payload: s,
-            pos: BaseView::HDR_LEN,
-            index: 0,
-            offset,
-        }
-    }
-
-    fn setup_boundary_keys(&mut self, lo: &[u8], hi: Option<&[u8]>) {
-        let hi_len = hi.map_or(0, |x| x.len());
-        let boundary_len = lo.len() + hi_len;
-
-        if boundary_len > 0 {
-            self.payload[self.offset..self.offset + lo.len()].copy_from_slice(lo);
-            self.offset += lo.len();
-            self.payload[self.offset..self.offset + hi_len].copy_from_slice(hi.map_or(&[], |x| x));
-            self.offset += hi_len;
-        }
-    }
-
-    #[inline]
-    fn slice(&mut self, b: usize, len: usize) -> &mut [u8] {
-        &mut self.payload[b..b + len]
-    }
-
-    fn add_intl<K>(&mut self, k: &K, v: &Index)
-    where
-        K: ICodec,
-    {
-        let (ksz, vsz) = (k.packed_size(), v.packed_size());
-        k.encode_to(self.slice(self.offset, ksz));
-        v.encode_to(self.slice(self.offset + ksz, vsz));
-
-        self.update_slot(ksz + vsz);
-    }
-
-    fn add_leaf<K>(&mut self, limit: usize, k: &K, v: &Record, hist: Option<HistRef>, remote: u64)
-    where
-        K: ICodec,
-    {
-        let ksz = k.packed_size();
-        let vsz = v.packed_size();
-        let val_sz = Val::calc_size(hist.is_some(), limit, vsz);
-
-        k.encode_to(self.slice(self.offset, ksz));
-        if vsz < limit {
-            #[cfg(feature = "extra_check")]
-            assert_eq!(remote, NULL_ADDR);
-            Val::encode_inline(self.slice(self.offset + ksz, val_sz), hist, v);
-        } else {
-            Val::encode_remote(self.slice(self.offset + ksz, val_sz), hist, remote, v);
-        }
-
-        self.update_slot(ksz + val_sz);
-    }
-
-    #[inline(always)]
-    fn update_slot(&mut self, total_size: usize) {
-        self.slots[self.index] = (self.pos + self.offset) as SlotType;
-        self.index += 1;
-        self.offset += total_size;
-    }
-}
-
-struct SeekableIter<'a> {
-    data: Vec<(LeafSeg<'a>, CompactVal<'a>)>,
-    index: Cell<usize>,
-}
-
-impl<'a> SeekableIter<'a> {
-    fn new() -> Self {
-        Self {
-            data: Vec::with_capacity(BucketOptions::MAX_SPLIT_ELEMS as usize * 2),
-            index: Cell::new(0),
-        }
-    }
-
-    fn add(&mut self, k: LeafSeg<'a>, v: CompactVal<'a>) {
-        self.data.push((k, v));
-    }
-
-    fn seek_to(&self, pos: usize) {
-        self.index.set(pos);
-    }
-
-    fn next(&self) -> Option<&(LeafSeg<'a>, CompactVal<'a>)> {
-        let idx = self.index.get();
-        if idx < self.data.len() {
-            self.index.set(idx + 1);
-            Some(&self.data[idx])
-        } else {
-            None
-        }
-    }
-}
+pub(crate) use iter::{BaseIter, BaseRevIter};
 
 #[cfg(test)]
 mod test {
+    use super::builder::SeekableIter;
     use crate::{
         types::{
             data::{Index, IntlKey, IntlSeg, Key, LeafSeg, Record, Val, Ver},
-            header::TagKind,
-            node::PlainValSource,
+            header::{SLOT_LEN, TagKind},
+            node::{CompactVal, PlainValSource},
             refbox::{BaseView, BoxRef, BoxView},
             traits::{IBoxHeader, ICodec, IFrameAlloc, IHeader, ILoader},
         },
         utils::{MutRef, NULL_ADDR, NULL_ORACLE, NULL_PID, data::Position, options::BucketOptions},
     };
-    use std::{cell::Cell, collections::HashMap};
+    use std::{
+        cell::Cell,
+        collections::{HashMap, VecDeque},
+    };
 
     struct Inner {
         off: Cell<u64>,
@@ -1087,15 +167,21 @@ mod test {
     #[derive(Clone)]
     struct Allocator {
         inner: MutRef<Inner>,
+        inline_size: usize,
     }
 
     impl Allocator {
         fn new() -> Self {
+            Self::with_inline(BucketOptions::MIN_INLINE_SIZE)
+        }
+
+        fn with_inline(inline_size: usize) -> Self {
             Self {
                 inner: MutRef::new(Inner {
                     off: Cell::new(0),
                     map: HashMap::new(),
                 }),
+                inline_size,
             }
         }
     }
@@ -1111,7 +197,7 @@ mod test {
         }
 
         fn inline_size(&self) -> usize {
-            BucketOptions::MIN_INLINE_SIZE
+            self.inline_size
         }
     }
 
@@ -1158,6 +244,14 @@ mod test {
             let (k, v) = self.data[index];
             Some((k, v))
         }
+    }
+
+    fn gen_history_val(a: &mut Allocator, data: &[u8]) -> Val<'static> {
+        let r = Record::normal(1, data);
+        let sz = Val::calc_size(false, a.inline_size(), r.packed_size());
+        let mut b = a.alloc(sz as u32);
+        Val::encode_inline(b.data_slice_mut::<u8>(), None, &r);
+        Val::from_raw(unsafe { std::mem::transmute::<&[u8], &[u8]>(b.data_slice::<u8>()) })
     }
 
     #[test]
@@ -1450,5 +544,132 @@ mod test {
         check(&tail_k, &tail_v, &l, "z", 30, 1, "vz", 1);
         assert!(tail_v.get_hist().is_none());
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn history_pages_pack_regions_and_bytes() {
+        let mut a = Allocator::new();
+        let mut iter = SeekableIter::new();
+        iter.add(
+            LeafSeg::new(&[], b"skip", Ver::new(0, 0)),
+            CompactVal::Page(gen_history_val(&mut a, b"skip")),
+        );
+        let keys: Vec<Vec<u8>> = (1..=6u64).map(|i| i.to_le_bytes().to_vec()).collect();
+        let mut record_sizes = Vec::new();
+        for (i, key) in (1..=6u64).zip(keys.iter()) {
+            let val = gen_history_val(&mut a, &[b'x'; 40]);
+            record_sizes.push(
+                Ver::len() + Val::calc_size(false, a.inline_size(), val.data_size()) + SLOT_LEN,
+            );
+            iter.add(
+                LeafSeg::new(&[], key, Ver::new(i, 1)),
+                CompactVal::Page(val),
+            );
+        }
+        let hints = VecDeque::from([(0, 3), (3, 2), (5, 1)]);
+        let mut hint_addrs = Vec::new();
+        let mut remote_hints = Vec::new();
+        let l = a.clone();
+        let refs = BaseView::save_hist_regions(
+            &mut a,
+            &l,
+            &hints,
+            &iter,
+            100,
+            1,
+            Position::MIN,
+            &mut hint_addrs,
+            &mut remote_hints,
+        );
+        assert_eq!(refs.len(), 3);
+        assert_eq!(hint_addrs.len(), 2);
+        assert!(remote_hints.is_empty());
+
+        let mut page_elems = Vec::new();
+        let mut record_at = 0;
+        for &addr in &hint_addrs {
+            let page = a.load_sibling(addr).view().as_base();
+            let elems = page.header().elems as usize;
+            let expected = BaseView::HDR_LEN
+                + record_sizes[record_at..record_at + elems]
+                    .iter()
+                    .sum::<usize>();
+            assert_eq!(page.header().size as usize, expected);
+            page_elems.push(elems);
+            record_at += elems;
+        }
+
+        let mut starts = Vec::new();
+        let mut acc = 0;
+        for elems in &page_elems {
+            starts.push(acc);
+            acc += elems;
+        }
+        assert_eq!(acc, 6);
+        assert_eq!(page_elems, vec![3, 3]);
+
+        let region_starts = [0usize, 3, 5];
+        for (i, r) in refs.iter().enumerate() {
+            let start = region_starts[i];
+            let pid = starts.iter().rposition(|&s| s <= start).unwrap();
+            assert_eq!(r.page_addr, hint_addrs[pid]);
+            assert_eq!(r.slot as usize, start - starts[pid]);
+            assert_eq!(r.count as usize, hints[i].1);
+        }
+        assert_eq!(
+            refs.iter().map(|r| r.slot).collect::<Vec<_>>(),
+            vec![0, 0, 2]
+        );
+        assert_eq!(
+            refs.iter().map(|r| r.count).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn history_oversized_record_gets_its_own_page() {
+        let mut a = Allocator::with_inline(4096);
+        let mut iter = SeekableIter::new();
+        iter.add(
+            LeafSeg::new(&[], b"skip", Ver::new(0, 0)),
+            CompactVal::Page(gen_history_val(&mut a, b"skip")),
+        );
+        let oversized = gen_history_val(&mut a, &[b'v'; 300]);
+        let oversized_size = oversized.data_size();
+        iter.add(
+            LeafSeg::new(&[], b"k", Ver::new(1, 1)),
+            CompactVal::Page(oversized),
+        );
+        let hints = VecDeque::from([(0, 1)]);
+        let mut hint_addrs = Vec::new();
+        let mut remote_hints = Vec::new();
+        let l = a.clone();
+        let refs = BaseView::save_hist_regions(
+            &mut a,
+            &l,
+            &hints,
+            &iter,
+            100,
+            1,
+            Position::MIN,
+            &mut hint_addrs,
+            &mut remote_hints,
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(hint_addrs.len(), 1);
+        assert_eq!(refs[0].page_addr, hint_addrs[0]);
+        assert_eq!(refs[0].slot, 0);
+        assert_eq!(refs[0].count, 1);
+        let page = a.load_sibling(hint_addrs[0]).view().as_base();
+        assert_eq!(page.header().elems, 1);
+        let expected = BaseView::HDR_LEN
+            + Ver::len()
+            + Val::calc_size(false, a.inline_size(), oversized_size)
+            + SLOT_LEN;
+        assert_eq!(page.header().size as usize, expected);
+        assert!(
+            page.header().size as usize > 256,
+            "an oversized history record must exceed the test page budget"
+        );
     }
 }

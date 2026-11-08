@@ -20,40 +20,45 @@ fn suite_lock() -> parking_lot::MutexGuard<'static, ()> {
     mace::testing::hooks_lock()
 }
 
-fn open_visibility_bucket() -> Result<Bucket, OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+fn open_visibility_bucket() -> Result<(RandomPath, Bucket), OpCode> {
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     opts.sync_on_write = false;
     opts.concurrent_write = 1;
     let mace = mace::Mace::new(opts.validate().unwrap())?;
-    mace.new_bucket(
+    let bucket = mace.new_bucket(
         "x",
         BucketOptions {
             consolidate_threshold: 4,
             split_elems: 32,
             ..BucketOptions::default()
         },
-    )
+    )?;
+    Ok((mace_root, bucket))
 }
 
-fn open_visibility_bucket_with_groups(groups: u8) -> Result<Bucket, OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+fn open_visibility_bucket_with_groups(groups: u8) -> Result<(RandomPath, Bucket), OpCode> {
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     opts.sync_on_write = false;
     opts.concurrent_write = groups;
     let mace = mace::Mace::new(opts.validate().unwrap())?;
-    mace.new_bucket(
+    let bucket = mace.new_bucket(
         "x",
         BucketOptions {
             consolidate_threshold: 4,
             split_elems: 32,
             ..BucketOptions::default()
         },
-    )
+    )?;
+    Ok((mace_root, bucket))
 }
 
-fn open_lagging_view_bucket() -> Result<Bucket, OpCode> {
-    let mut opts = Options::new(&*RandomPath::new());
+fn open_lagging_view_bucket() -> Result<(RandomPath, Bucket), OpCode> {
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     opts.concurrent_write = 1;
     opts.data_file_size = 16 << 10;
@@ -62,7 +67,7 @@ fn open_lagging_view_bucket() -> Result<Bucket, OpCode> {
     opts.blob_garbage_ratio = 0;
     opts.gc_eager = true;
     let mace = mace::Mace::new(opts.validate().unwrap())?;
-    mace.new_bucket(
+    let bucket = mace.new_bucket(
         "x",
         BucketOptions {
             inline_size: 128,
@@ -74,7 +79,8 @@ fn open_lagging_view_bucket() -> Result<Bucket, OpCode> {
             cache_evict_pct: 100,
             ..BucketOptions::default()
         },
-    )
+    )?;
+    Ok((mace_root, bucket))
 }
 
 fn vis_key(idx: usize) -> String {
@@ -227,7 +233,7 @@ fn run_model_schedule_case(case: ModelScheduleCase<'_>) -> Result<(), OpCode> {
         observed_keys,
         churn_after_reader,
     } = case;
-    let db = open_visibility_bucket_with_groups(groups)?;
+    let (_root, db) = open_visibility_bucket_with_groups(groups)?;
 
     let mut committed = BTreeMap::new();
     for &(key, value) in base {
@@ -310,7 +316,7 @@ fn run_model_schedule_case(case: ModelScheduleCase<'_>) -> Result<(), OpCode> {
 #[test]
 fn lagging_snapshot_survives_after_prior_quiescent_view() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_lagging_view_bucket()?;
+    let (_root, db) = open_lagging_view_bucket()?;
 
     drop(db.view()?);
 
@@ -360,7 +366,7 @@ fn lagging_snapshot_survives_after_prior_quiescent_view() -> Result<(), OpCode> 
 #[test]
 fn txn_reads_own_writes_in_command_order() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let seed = db.begin()?;
     seed.put("k_existing", "base")?;
@@ -404,7 +410,7 @@ fn txn_reads_own_writes_in_command_order() -> Result<(), OpCode> {
 #[test]
 fn view_must_not_see_writer_whose_start_ts_equals_snapshot_ts() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let seed = db.begin()?;
     seed.put("k", "v0")?;
@@ -434,7 +440,7 @@ fn view_must_not_see_writer_whose_start_ts_equals_snapshot_ts() -> Result<(), Op
 #[test]
 fn view_keeps_pre_snapshot_version_when_older_active_tx_commits_later() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
@@ -476,7 +482,7 @@ fn view_keeps_pre_snapshot_version_when_older_active_tx_commits_later() -> Resul
 fn newer_live_view_keeps_snapshot_when_older_view_is_still_alive_during_churn() -> Result<(), OpCode>
 {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
@@ -530,7 +536,7 @@ fn newer_live_view_keeps_snapshot_when_older_view_is_still_alive_during_churn() 
 #[test]
 fn view_must_not_see_same_group_txn_that_was_active_at_snapshot() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
@@ -564,7 +570,7 @@ fn view_must_not_see_same_group_txn_that_was_active_at_snapshot() -> Result<(), 
 #[test]
 fn same_key_overlapping_put_and_upsert_allow_only_first_writer() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket_with_groups(2)?;
+    let (_root, db) = open_visibility_bucket_with_groups(2)?;
 
     let first = db.begin()?;
     let second = db.begin()?;
@@ -583,7 +589,7 @@ fn same_key_overlapping_put_and_upsert_allow_only_first_writer() -> Result<(), O
 #[test]
 fn same_key_overlapping_delete_and_upsert_allow_only_first_writer() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket_with_groups(2)?;
+    let (_root, db) = open_visibility_bucket_with_groups(2)?;
 
     let seed = db.begin()?;
     seed.put("k", "v0")?;
@@ -606,7 +612,7 @@ fn same_key_overlapping_delete_and_upsert_allow_only_first_writer() -> Result<()
 #[test]
 fn same_key_forced_race_commits_at_most_one_writer() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket_with_groups(2)?;
+    let (_root, db) = open_visibility_bucket_with_groups(2)?;
 
     let seed = db.begin()?;
     seed.put("k", "v0")?;
@@ -659,7 +665,7 @@ fn same_key_forced_race_commits_at_most_one_writer() -> Result<(), OpCode> {
 #[test]
 fn abort_exact_fact_stays_invisible_across_abort_publication() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
@@ -734,7 +740,7 @@ fn abort_exact_fact_stays_invisible_across_abort_publication() -> Result<(), OpC
 #[test]
 fn abort_clean_pin_is_published_before_logging_handoff_releases() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
     let observed = Arc::new(AtomicBool::new(false));
     let _reset = HookReset;
     testing::set_txn_abort_hook(Some(Arc::new({
@@ -761,7 +767,7 @@ fn abort_clean_pin_is_published_before_logging_handoff_releases() -> Result<(), 
 #[test]
 fn retained_abort_publish_updates_floor_and_membership() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
     let observed = Arc::new(AtomicBool::new(false));
     let _reset = HookReset;
     testing::set_txn_abort_hook(Some(Arc::new({
@@ -792,7 +798,7 @@ fn retained_abort_publish_updates_floor_and_membership() -> Result<(), OpCode> {
 #[test]
 fn same_key_retry_rechecks_latest_head_after_abort_during_meta_window() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
@@ -844,7 +850,8 @@ fn same_key_retry_rechecks_latest_head_after_abort_during_meta_window() -> Resul
 fn same_key_page_replacement_retry_still_enforces_first_writer_wins() -> Result<(), OpCode> {
     let _guard = suite_lock();
     let observer = Arc::new(InMemoryObserver::new(64));
-    let mut opts = Options::new(&*RandomPath::new());
+    let mace_root = RandomPath::tmp();
+    let mut opts = Options::new(&*mace_root);
     opts.tmp_store = true;
     opts.sync_on_write = false;
     opts.concurrent_write = 2;
@@ -946,7 +953,7 @@ fn same_key_page_replacement_retry_still_enforces_first_writer_wins() -> Result<
 fn iterator_page_capture_keeps_snapshot_for_forward_and_reverse_after_late_commit()
 -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k0", "v0")?;
@@ -1041,7 +1048,7 @@ fn iterator_page_capture_keeps_snapshot_for_forward_and_reverse_after_late_commi
 #[test]
 fn txn_must_not_see_same_group_txn_that_was_active_at_start() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
@@ -1077,7 +1084,7 @@ fn txn_must_not_see_same_group_txn_that_was_active_at_start() -> Result<(), OpCo
 fn snapshot_point_and_forward_reverse_traversal_match_reference_after_churn() -> Result<(), OpCode>
 {
     let _guard = suite_lock();
-    let db = open_lagging_view_bucket()?;
+    let (_root, db) = open_lagging_view_bucket()?;
     let key_count = 32usize;
     let deleted = [4usize, 11, 18, 25];
 
@@ -1202,7 +1209,7 @@ fn snapshot_point_and_forward_reverse_traversal_match_reference_after_churn() ->
 #[test]
 fn same_group_active_hole_keeps_later_commits_visible_without_range_proof() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let seed = db.begin()?;
     seed.put("seed", "v0")?;
@@ -1245,7 +1252,7 @@ fn same_group_active_hole_keeps_later_commits_visible_without_range_proof() -> R
 #[test]
 fn late_same_group_commit_remains_invisible_after_collector_cut() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let seed = db.begin()?;
     seed.put("seed", "v0")?;
@@ -1398,7 +1405,7 @@ fn model_reference_schedules_match_point_forward_and_reverse_visibility() -> Res
 #[test]
 fn iterator_must_not_see_same_group_txn_that_was_active_at_snapshot() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k0", "v0")?;
@@ -1431,7 +1438,7 @@ fn iterator_must_not_see_same_group_txn_that_was_active_at_snapshot() -> Result<
 #[test]
 fn txn_keeps_pre_snapshot_version_when_older_active_tx_commits_later() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
@@ -1473,7 +1480,7 @@ fn txn_keeps_pre_snapshot_version_when_older_active_tx_commits_later() -> Result
 #[test]
 fn range_iterator_keeps_pre_snapshot_version_across_later_commit_and_churn() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k0", "v0")?;
@@ -1513,7 +1520,7 @@ fn range_iterator_keeps_pre_snapshot_version_across_later_commit_and_churn() -> 
 #[test]
 fn reopen_preserves_snapshot_visibility_for_recovered_state_and_new_churn() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let path = RandomPath::new();
+    let path = RandomPath::tmp();
     let mut opts = Options::new(&*path);
     opts.sync_on_write = false;
     let mut saved = opts.clone();
@@ -1579,7 +1586,7 @@ impl Drop for HookReset {
 #[test]
 fn snapshot_cut_commit_publication_witness() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
@@ -1674,7 +1681,7 @@ fn durable_commit_publishes_fact_only_after_wal_cut_is_durable() -> Result<(), O
 fn txn_exact_read_waits_for_commit_publication_after_commit_timestamp_alloc() -> Result<(), OpCode>
 {
     let _guard = suite_lock();
-    let db = open_visibility_bucket_with_groups(2)?;
+    let (_root, db) = open_visibility_bucket_with_groups(2)?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
@@ -1719,7 +1726,7 @@ fn txn_exact_read_waits_for_commit_publication_after_commit_timestamp_alloc() ->
 #[test]
 fn collector_cut_includes_begin_registration_before_fact_publish() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("seed", "v0")?;
@@ -1790,7 +1797,7 @@ fn collector_cut_includes_begin_registration_before_fact_publish() -> Result<(),
 #[test]
 fn post_cut_view_registration_does_not_pin_safe_boundary() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("seed", "v0")?;
@@ -1897,7 +1904,7 @@ fn post_cut_view_registration_does_not_pin_safe_boundary() -> Result<(), OpCode>
 #[test]
 fn exact_miss_rereads_safe_after_prune() -> Result<(), OpCode> {
     let _guard = suite_lock();
-    let db = open_visibility_bucket()?;
+    let (_root, db) = open_visibility_bucket()?;
 
     let tx = db.begin()?;
     tx.put("k", "v0")?;
